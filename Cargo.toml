@@ -2,6 +2,12 @@
 
 [workspace]
 resolver = "2"
+# GrokPtah fork: desktop bridge lives in nested workspace (desktop/src-tauri)
+exclude = [
+    "crates/codegen/grokptah-agent-bridge",
+    "desktop",
+    "desktop/src-tauri",
+]
 members = [
     "crates/build/xai-proto-build",
     "crates/codegen/ptyctl",

@@ -1,0 +1,29 @@
+[package]
+name = "grokptah-agent-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "In-process agent host for GrokPtah desktop (ACP-shaped sessions, streaming, permissions)"
+authors = ["GrokPtah"]
+
+# Own workspace root (excluded from monorepo root Cargo.toml).
+[workspace]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+regex = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "test-util"] }
+tempfile = "3"

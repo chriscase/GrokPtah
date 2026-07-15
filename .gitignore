@@ -1,3 +1,9 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# GrokPtah desktop
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+crates/codegen/grokptah-agent-bridge/target/

@@ -1,0 +1,343 @@
+:root {
+  color-scheme: dark;
+  --bg: #0c1210;
+  --bg-elevated: #121a17;
+  --bg-panel: #15201c;
+  --border: #24332d;
+  --text: #e7f2ec;
+  --muted: #8aa399;
+  --accent: #2dd4a8;
+  --accent-dim: #0f766e;
+  --danger: #f87171;
+  --warn: #fbbf24;
+  --thought: #7dd3fc;
+  --tool: #c4b5fd;
+  --radius: 10px;
+  --font: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.7rem;
+}
+
+button:hover {
+  border-color: var(--accent-dim);
+}
+
+button.primary {
+  background: linear-gradient(135deg, #0f766e, #134e4a);
+  border-color: var(--accent-dim);
+}
+
+button.danger {
+  border-color: #7f1d1d;
+  color: var(--danger);
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 240px 1fr 300px;
+  grid-template-rows: 48px 1fr 28px;
+  height: 100%;
+  gap: 0;
+}
+
+.titlebar {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 1rem;
+  background: linear-gradient(90deg, #0f1f1a, #0c1210 40%, #12201c);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+.brand-mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: radial-gradient(circle at 30% 30%, #ecfdf5, #14b8a6 55%, #115e59);
+  box-shadow: 0 0 16px rgba(45, 212, 168, 0.35);
+}
+
+.title-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.sidebar,
+.rightbar {
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+  overflow: auto;
+  padding: 0.75rem;
+}
+
+.rightbar {
+  border-right: none;
+  border-left: 1px solid var(--border);
+}
+
+.main {
+  display: grid;
+  grid-template-rows: 1fr auto auto;
+  min-width: 0;
+  background: var(--bg);
+}
+
+.section-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 0.75rem 0 0.4rem;
+}
+
+.session-item,
+.file-item,
+.nav-tab {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin-bottom: 0.25rem;
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 0.45rem 0.55rem;
+  border-radius: 8px;
+}
+
+.session-item.active,
+.nav-tab.active {
+  background: rgba(45, 212, 168, 0.08);
+  border-color: var(--accent-dim);
+}
+
+.transcript {
+  overflow: auto;
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.bubble {
+  max-width: 52rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 0.9rem;
+  background: var(--bg-elevated);
+  white-space: pre-wrap;
+  line-height: 1.45;
+}
+
+.bubble.user {
+  align-self: flex-end;
+  border-color: #1e3a34;
+  background: #10241f;
+}
+
+.bubble.thought {
+  color: var(--thought);
+  font-size: 0.9rem;
+  border-style: dashed;
+}
+
+.bubble.tool {
+  color: var(--tool);
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+
+.bubble.plan {
+  border-color: #854d0e;
+  background: #1c1917;
+}
+
+.composer-wrap {
+  border-top: 1px solid var(--border);
+  padding: 0.75rem 1rem 0.5rem;
+  background: var(--bg-elevated);
+}
+
+.composer-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-end;
+}
+
+.composer-row textarea {
+  flex: 1;
+  min-height: 72px;
+  max-height: 180px;
+  resize: vertical;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  padding: 0.7rem 0.8rem;
+}
+
+.composer-meta {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+  align-items: center;
+}
+
+.composer-meta select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.3rem 0.5rem;
+}
+
+.slash-menu {
+  margin-bottom: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  max-height: 140px;
+  overflow: auto;
+}
+
+.slash-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  padding: 0.4rem 0.6rem;
+}
+
+.slash-item:hover {
+  background: rgba(45, 212, 168, 0.1);
+}
+
+.status-bar {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0.75rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  background: #0a100e;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+
+.modal {
+  width: min(420px, 92vw);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+}
+
+.modal h3 {
+  margin: 0 0 0.5rem;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+
+.panel-block {
+  margin-bottom: 0.75rem;
+  padding: 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  font-size: 0.85rem;
+}
+
+.panel-block pre {
+  margin: 0.35rem 0 0;
+  white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+  max-height: 140px;
+  overflow: auto;
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-bottom: 0.5rem;
+}
+
+.term-host {
+  height: 180px;
+  border-top: 1px solid var(--border);
+  background: #050807;
+  padding: 0.25rem;
+}
+
+.term-host .xterm {
+  height: 100%;
+}
+
+.warn-pill {
+  color: var(--warn);
+  border: 1px solid #854d0e;
+  border-radius: 999px;
+  padding: 0.1rem 0.45rem;
+}
+
+.yolo-on {
+  color: var(--danger);
+  font-weight: 600;
+}
