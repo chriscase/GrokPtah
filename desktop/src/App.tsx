@@ -11,6 +11,8 @@ import {
   type SessionSummary,
   type SessionUpdate,
 } from "./lib/protocol";
+import { BrandMark } from "./components/BrandMark";
+import { Splash } from "./components/Splash";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 
 type TranscriptItem =
@@ -219,8 +221,8 @@ export default function App() {
     <div className="app-shell">
       <header className="titlebar">
         <div className="brand">
-          <div className="brand-mark" />
-          <span>{product.name}</span>
+          <BrandMark size={24} className="brand-mark-img" />
+          <span className="brand-name">{product.name || "GrokPtah"}</span>
         </div>
         <div className="title-actions">
           <span>{status?.project_cwd ?? "No project"}</span>
@@ -352,10 +354,13 @@ export default function App() {
       <main className="main">
         <div className="transcript">
           {transcript.length === 0 && (
-            <div className="bubble thought">
-              Welcome to GrokPtah. Open a project folder, then chat. Try{" "}
-              <code>/help</code>, <code>list files</code>, or{" "}
-              <code>make a plan</code>. Agent runs in-process (no stdio child).
+            <div className="empty-hero">
+              <Splash subtitle="Open a project, then chat with the in-process agent" />
+              <div className="bubble thought empty-hint">
+                Try <code>/help</code>, <code>list files</code>, or{" "}
+                <code>make a plan</code>. Shell tools stream live into the
+                terminal (no re-run attach).
+              </div>
             </div>
           )}
           {transcript.map((item, i) => (
@@ -834,12 +839,23 @@ export default function App() {
 
       {aboutOpen && (
         <div className="modal-backdrop" onClick={() => setAboutOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>{product.name}</h3>
-            <p>
-              Desktop coding agent · bridge {product.bridgeVersion}
+          <div
+            className="modal about-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="about-hero">
+              <BrandMark size={56} />
+              <h3>GrokPtah</h3>
+            </div>
+            <p className="about-body">
+              GrokPtah is a desktop coding agent for local projects: Tauri UI,
+              in-process agent host, and the upstream Grok Build CLI/TUI kept
+              available in this repo.
               <br />
-              Apache-2.0 · fork of xai-org/grok-build
+              <br />
+              Bridge {product.bridgeVersion} · Apache-2.0
+              <br />
+              Upstream foundation: xai-org/grok-build
               <br />
               Upstream CLI auto-update:{" "}
               {product.autoUpdateEnabled ? "enabled" : "disabled"}

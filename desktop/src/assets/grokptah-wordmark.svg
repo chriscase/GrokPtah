@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 48" role="img" aria-label="GrokPtah">
+  <defs>
+    <linearGradient id="gp-wm" x1="0" y1="0" x2="280" y2="48" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ecfdf5"/>
+      <stop offset="1" stop-color="#5eead4"/>
+    </linearGradient>
+  </defs>
+  <!-- Inline mark -->
+  <g transform="translate(0,2) scale(0.72)">
+    <rect x="4" y="4" width="56" height="56" rx="14" fill="#0f766e"/>
+    <path fill="#ecfdf5" d="M30 14h4v10h8.5a1.5 1.5 0 0 1 1.1 2.5L32 42.2 20.4 26.5A1.5 1.5 0 0 1 21.5 24H30V14z"/>
+    <rect x="18" y="44" width="28" height="4" rx="1.5" fill="#99f6e4"/>
+  </g>
+  <text x="56" y="33" font-family="IBM Plex Sans, Segoe UI, system-ui, sans-serif" font-size="28" font-weight="650" letter-spacing="0.04em" fill="url(#gp-wm)">GrokPtah</text>
+</svg>

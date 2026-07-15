@@ -8,7 +8,7 @@ that keeps the upstream CLI/TUI and adds a **desktop client** on Tauri 2 + React
 | Decision | Choice |
 |----------|--------|
 | Agent bridge | **In-process** — no `grok agent stdio` child on the happy path |
-| UI | React + Vite (NexaDeck-style), dark desktop chrome |
+| UI | React + Vite, dark desktop chrome (GrokPtah branding only) |
 | Scope | TUI **capability** parity (not pixel-perfect ratatui) |
 | CLI | `xai-grok-pager-bin` remains independently buildable |
 
