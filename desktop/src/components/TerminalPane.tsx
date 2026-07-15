@@ -7,15 +7,28 @@ import { api } from "../lib/api";
 
 type PtyOutput = { id: string; data: string };
 
+export type ToolShellAttach = {
+  callId: string;
+  command: string;
+};
+
 /**
- * Multi-tab terminal: each tab owns a PTY id; active tab receives output events
- * and keyboard input. Backlog is replayed on switch.
+ * Multi-tab interactive PTY + tool-shell stream attach.
+ *
+ * Tool shells are attached by streaming output events from the *same*
+ * process the agent spawned — never by re-executing the command.
  */
-export function TerminalPane({ attachCommand }: { attachCommand?: string | null }) {
+export function TerminalPane({
+  toolShell,
+}: {
+  toolShell?: ToolShellAttach | null;
+}) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [tabs, setTabs] = useState<string[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [mode, setMode] = useState<"pty" | "tool">("pty");
   const activeIdRef = useRef<string | null>(null);
+  const toolCallIdRef = useRef<string | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
 
@@ -47,7 +60,8 @@ export function TerminalPane({ attachCommand }: { attachCommand?: string | null 
     fitRef.current = fit;
 
     let disposed = false;
-    let unlisten: (() => void) | undefined;
+    let unlistenPty: (() => void) | undefined;
+    let unlistenSession: (() => void) | undefined;
 
     (async () => {
       try {
@@ -58,22 +72,59 @@ export function TerminalPane({ attachCommand }: { attachCommand?: string | null 
         }
         setActiveId(id);
         activeIdRef.current = id;
+        setMode("pty");
         await refreshTabs();
-        term.writeln(`\x1b[32mGrokPtah terminal\x1b[0m — ${id.slice(0, 8)}`);
+        term.writeln(`\x1b[32mGrokPtah terminal\x1b[0m — interactive PTY ${id.slice(0, 8)}`);
 
         term.onData((data) => {
-          const cur = activeIdRef.current;
-          if (cur) void api.ptyWrite(cur, data);
+          // Only forward keystrokes to interactive PTY, not tool stream view
+          if (modeRef.current === "pty") {
+            const cur = activeIdRef.current;
+            if (cur) void api.ptyWrite(cur, data);
+          }
         });
         term.onResize(({ cols, rows }) => {
           const cur = activeIdRef.current;
-          if (cur) void api.ptyResize(cur, cols, rows);
+          if (cur && modeRef.current === "pty") {
+            void api.ptyResize(cur, cols, rows);
+          }
         });
 
-        unlisten = await listen<PtyOutput>("pty://output", (ev) => {
+        unlistenPty = await listen<PtyOutput>("pty://output", (ev) => {
+          if (modeRef.current !== "pty") return;
           const payload = ev.payload;
           if (payload.id === activeIdRef.current) {
             term.write(payload.data);
+          }
+        });
+
+        // Session updates are also forwarded via parent; listen raw for shell stream
+        unlistenSession = await listen("session://update", (ev) => {
+          const raw = ev.payload as Record<string, unknown>;
+          let u: Record<string, unknown> | null = null;
+          if (typeof raw?.type === "string") {
+            u = raw;
+          } else {
+            const k = Object.keys(raw || {})[0];
+            if (k && raw[k] && typeof raw[k] === "object") {
+              u = { type: k, ...(raw[k] as Record<string, unknown>) };
+            }
+          }
+          if (!u) return;
+          if (u.type === "shell_output") {
+            if (String(u.call_id) === toolCallIdRef.current) {
+              term.write(String(u.data ?? ""));
+            }
+          }
+          if (u.type === "shell_session_ended") {
+            if (String(u.call_id) === toolCallIdRef.current) {
+              const cancelled = Boolean(u.cancelled);
+              term.writeln(
+                cancelled
+                  ? "\r\n\x1b[31m[tool shell cancelled]\x1b[0m"
+                  : "\r\n\x1b[90m[tool shell ended]\x1b[0m",
+              );
+            }
           }
         });
       } catch (e) {
@@ -87,43 +138,36 @@ export function TerminalPane({ attachCommand }: { attachCommand?: string | null 
     return () => {
       disposed = true;
       window.removeEventListener("resize", onResize);
-      unlisten?.();
+      unlistenPty?.();
+      unlistenSession?.();
       term.dispose();
       const cur = activeIdRef.current;
       if (cur) void api.ptyKill(cur);
     };
   }, [refreshTabs]);
 
-  // Attach agent-spawned command PTY when requested
+  const modeRef = useRef<"pty" | "tool">("pty");
   useEffect(() => {
-    if (!attachCommand || !termRef.current) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const term = termRef.current!;
-        const id = await api.ptyCreateCommand(
-          attachCommand,
-          term.cols,
-          term.rows,
-        );
-        if (cancelled) {
-          await api.ptyKill(id);
-          return;
-        }
-        await switchTo(id, true);
-      } catch (e) {
-        termRef.current?.writeln("attach failed: " + String(e));
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [attachCommand]);
+    modeRef.current = mode;
+  }, [mode]);
+
+  // Attach to existing tool shell stream (display only — never re-exec).
+  useEffect(() => {
+    if (!toolShell || !termRef.current) return;
+    const term = termRef.current;
+    toolCallIdRef.current = toolShell.callId;
+    setMode("tool");
+    term.reset();
+    term.writeln(
+      `\x1b[36m[attached tool shell]\x1b[0m $ ${toolShell.command}\r\n\x1b[90m(streaming live process — not re-executed)\x1b[0m\r\n`,
+    );
+  }, [toolShell]);
 
   async function switchTo(id: string, clear = true) {
     const term = termRef.current;
     if (!term) return;
+    setMode("pty");
+    toolCallIdRef.current = null;
     setActiveId(id);
     activeIdRef.current = id;
     if (clear) term.reset();
@@ -175,12 +219,14 @@ export function TerminalPane({ attachCommand }: { attachCommand?: string | null 
           flexWrap: "wrap",
         }}
       >
-        <span style={{ color: "var(--muted)" }}>Terminal:</span>
+        <span style={{ color: "var(--muted)" }}>
+          {mode === "tool" ? "Tool shell (live)" : "Terminal:"}
+        </span>
         {tabs.map((t) => (
           <button
             key={t}
             type="button"
-            className={t === activeId ? "warn-pill" : ""}
+            className={t === activeId && mode === "pty" ? "warn-pill" : ""}
             onClick={() => void switchTo(t, true)}
           >
             {t.slice(0, 8)}

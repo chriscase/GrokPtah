@@ -2,14 +2,17 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::process::Command;
+use tokio::io::{AsyncReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex as TokioMutex;
+use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::events::ToolCallKind;
 
-#[allow(dead_code)]
 pub struct ToolResult {
     pub title: String,
     pub kind: ToolCallKind,
@@ -17,6 +20,29 @@ pub struct ToolResult {
     pub output: String,
     pub needs_permission: bool,
     pub permission_summary: String,
+    /// True when the tool was stopped by cancellation.
+    pub cancelled: bool,
+}
+
+impl ToolResult {
+    fn basic(
+        title: String,
+        kind: ToolCallKind,
+        input: serde_json::Value,
+        output: String,
+        needs_permission: bool,
+        permission_summary: String,
+    ) -> Self {
+        Self {
+            title,
+            kind,
+            input,
+            output,
+            needs_permission,
+            permission_summary,
+            cancelled: false,
+        }
+    }
 }
 
 pub fn resolve_under_cwd(cwd: &Path, rel: &str) -> Result<PathBuf> {
@@ -25,10 +51,7 @@ pub fn resolve_under_cwd(cwd: &Path, rel: &str) -> Result<PathBuf> {
     } else {
         cwd.join(rel)
     };
-    let canon_cwd = cwd
-        .canonicalize()
-        .unwrap_or_else(|_| cwd.to_path_buf());
-    // Best-effort containment: if path exists, canonicalize; else check parent.
+    let canon_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     if p.exists() {
         let c = p.canonicalize().context("canonicalize path")?;
         if !c.starts_with(&canon_cwd) {
@@ -50,14 +73,14 @@ pub async fn tool_read_file(cwd: &Path, path: &str) -> Result<ToolResult> {
     } else {
         text
     };
-    Ok(ToolResult {
-        title: format!("Read {}", path),
-        kind: ToolCallKind::Read,
-        input: serde_json::json!({ "path": path }),
-        output: truncated,
-        needs_permission: false,
-        permission_summary: String::new(),
-    })
+    Ok(ToolResult::basic(
+        format!("Read {path}"),
+        ToolCallKind::Read,
+        serde_json::json!({ "path": path }),
+        truncated,
+        false,
+        String::new(),
+    ))
 }
 
 pub async fn tool_list_dir(cwd: &Path, path: &str) -> Result<ToolResult> {
@@ -74,21 +97,25 @@ pub async fn tool_list_dir(cwd: &Path, path: &str) -> Result<ToolResult> {
         entries.push(format!("{ty}\t{name}"));
     }
     entries.sort();
-    Ok(ToolResult {
-        title: format!("List {}", path),
-        kind: ToolCallKind::Read,
-        input: serde_json::json!({ "path": path }),
-        output: entries.join("\n"),
-        needs_permission: false,
-        permission_summary: String::new(),
-    })
+    Ok(ToolResult::basic(
+        format!("List {path}"),
+        ToolCallKind::Read,
+        serde_json::json!({ "path": path }),
+        entries.join("\n"),
+        false,
+        String::new(),
+    ))
 }
 
 pub async fn tool_grep(cwd: &Path, pattern: &str, path: &str) -> Result<ToolResult> {
     let re = regex::Regex::new(pattern).context("invalid regex")?;
     let root = resolve_under_cwd(cwd, if path.is_empty() { "." } else { path })?;
     let mut hits = Vec::new();
-    for entry in WalkDir::new(&root).max_depth(6).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(&root)
+        .max_depth(6)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -117,21 +144,20 @@ pub async fn tool_grep(cwd: &Path, pattern: &str, path: &str) -> Result<ToolResu
             break;
         }
     }
-    Ok(ToolResult {
-        title: format!("Search /{pattern}/"),
-        kind: ToolCallKind::Search,
-        input: serde_json::json!({ "pattern": pattern, "path": path }),
-        output: if hits.is_empty() {
+    Ok(ToolResult::basic(
+        format!("Search /{pattern}/"),
+        ToolCallKind::Search,
+        serde_json::json!({ "pattern": pattern, "path": path }),
+        if hits.is_empty() {
             "(no matches)".into()
         } else {
             hits.join("\n")
         },
-        needs_permission: false,
-        permission_summary: String::new(),
-    })
+        false,
+        String::new(),
+    ))
 }
 
-#[allow(dead_code)]
 pub async fn tool_write_file(cwd: &Path, path: &str, content: &str) -> Result<ToolResult> {
     let full = resolve_under_cwd(cwd, path)?;
     if let Some(parent) = full.parent() {
@@ -140,49 +166,164 @@ pub async fn tool_write_file(cwd: &Path, path: &str, content: &str) -> Result<To
     tokio::fs::write(&full, content)
         .await
         .with_context(|| format!("write {}", full.display()))?;
-    Ok(ToolResult {
-        title: format!("Write {}", path),
-        kind: ToolCallKind::Edit,
-        input: serde_json::json!({ "path": path, "bytes": content.len() }),
-        output: format!("Wrote {} bytes to {}", content.len(), path),
-        needs_permission: true,
-        permission_summary: format!("Write file {path}"),
-    })
+    Ok(ToolResult::basic(
+        format!("Write {path}"),
+        ToolCallKind::Edit,
+        serde_json::json!({ "path": path, "bytes": content.len() }),
+        format!("Wrote {} bytes to {path}", content.len()),
+        true,
+        format!("Write file {path}"),
+    ))
 }
 
-pub async fn tool_shell(cwd: &Path, command: &str) -> Result<ToolResult> {
-    let output = Command::new("sh")
+/// Slot for the live shell child so [`crate::host::AgentHostHandle::cancel_turn`] can kill it.
+pub type LiveShellSlot = Arc<TokioMutex<Option<Child>>>;
+
+/// Run a shell command with streamed stdout/stderr, cancellable via `cancel`
+/// (kills the child process — works for any command, not only sleep).
+pub async fn tool_shell_streaming<F>(
+    cwd: &Path,
+    command: &str,
+    cancel: CancellationToken,
+    live_shell: LiveShellSlot,
+    mut on_chunk: F,
+) -> Result<ToolResult>
+where
+    F: FnMut(String) + Send,
+{
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .await
+        .kill_on_drop(true)
+        .spawn()
         .context("spawn shell")?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let err = String::from_utf8_lossy(&output.stderr);
-    if !err.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
+
+    let stdout = child.stdout.take().context("stdout")?;
+    let stderr = child.stderr.take().context("stderr")?;
+
+    {
+        let mut slot = live_shell.lock().await;
+        *slot = Some(child);
+    }
+
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let tx_out = chunk_tx.clone();
+    let tx_err = chunk_tx;
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
+        let mut buf = [0u8; 1024];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    if tx_out.send(s).is_err() {
+                        break;
+                    }
+                }
+            }
         }
-        text.push_str(&err);
+    });
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut buf = [0u8; 1024];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    if tx_err.send(s).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut collected = String::new();
+    let mut cancelled = false;
+    let mut exit_code: Option<i32> = None;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                cancelled = true;
+                let mut slot = live_shell.lock().await;
+                if let Some(mut child) = slot.take() {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+                break;
+            }
+            msg = chunk_rx.recv() => {
+                match msg {
+                    Some(s) => {
+                        collected.push_str(&s);
+                        if collected.len() > 32_000 {
+                            collected.truncate(32_000);
+                            collected.push_str("\n… (truncated)");
+                        } else {
+                            on_chunk(s);
+                        }
+                    }
+                    None => {
+                        // both pipes closed — wait for child
+                        let mut slot = live_shell.lock().await;
+                        if let Some(mut child) = slot.take() {
+                            match child.wait().await {
+                                Ok(status) => exit_code = status.code(),
+                                Err(_) => {}
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
-    if text.len() > 32_000 {
-        text.truncate(32_000);
-        text.push_str("\n… (truncated)");
+
+    // Drain any remaining buffered chunks without blocking forever
+    while let Ok(s) = chunk_rx.try_recv() {
+        collected.push_str(&s);
+        on_chunk(s);
     }
+
+    // Ensure slot cleared
+    {
+        let mut slot = live_shell.lock().await;
+        if let Some(mut child) = slot.take() {
+            if cancelled {
+                let _ = child.kill().await;
+            }
+            if let Ok(status) = child.wait().await {
+                exit_code = status.code();
+            }
+        }
+    }
+
+    let output = if cancelled {
+        if collected.is_empty() {
+            "(cancelled)".into()
+        } else {
+            format!("{collected}\n(cancelled)")
+        }
+    } else if collected.is_empty() {
+        format!("(exit {})", exit_code.unwrap_or(-1))
+    } else {
+        collected
+    };
+
     Ok(ToolResult {
         title: format!("$ {command}"),
         kind: ToolCallKind::Execute,
         input: serde_json::json!({ "command": command }),
-        output: if text.is_empty() {
-            format!("(exit {})", output.status.code().unwrap_or(-1))
-        } else {
-            text
-        },
+        output,
         needs_permission: true,
         permission_summary: format!("Run shell: {command}"),
+        cancelled,
     })
 }
 

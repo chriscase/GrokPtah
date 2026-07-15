@@ -81,6 +81,8 @@ struct Inner {
     event_tx: mpsc::UnboundedSender<SessionUpdate>,
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
+    /// Live tool shell child — killed by [`AgentHostHandle::cancel_turn`].
+    live_shell: local_tools::LiveShellSlot,
 }
 
 /// Shared handle used by Tauri state and tests.
@@ -127,6 +129,7 @@ impl AgentHost {
             turn_cancel: None,
             event_tx,
             edited_files: Vec::new(),
+            live_shell: Arc::new(tokio::sync::Mutex::new(None)),
         };
         AgentHostHandle {
             inner: Arc::new(Mutex::new(inner)),
@@ -731,13 +734,34 @@ impl AgentHostHandle {
     }
 
     pub fn cancel_turn(&self) -> Result<()> {
-        let g = self.inner.lock();
-        if let Some(c) = &g.turn_cancel {
-            c.cancel();
-            Ok(())
+        let live_shell = {
+            let g = self.inner.lock();
+            if let Some(c) = &g.turn_cancel {
+                c.cancel();
+            } else {
+                bail!("no active turn");
+            }
+            g.live_shell.clone()
+        };
+        // Kill live shell child immediately (not only cooperative sleep).
+        let handle = tokio::runtime::Handle::try_current();
+        if let Ok(h) = handle {
+            h.spawn(async move {
+                let mut slot = live_shell.lock().await;
+                if let Some(mut child) = slot.take() {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+            });
         } else {
-            bail!("no active turn");
+            // Sync fallback: try_lock and kill
+            if let Ok(mut slot) = live_shell.try_lock() {
+                if let Some(mut child) = slot.take() {
+                    let _ = child.start_kill();
+                }
+            }
         }
+        Ok(())
     }
 
     pub async fn session_prompt(&self, session_id: Uuid, prompt: String) -> Result<()> {
@@ -978,53 +1002,8 @@ impl AgentHostHandle {
         }
 
         if let Some(cmd) = extract_shell(prompt) {
-            let cmd_owned = cmd.clone();
-            let cwd_owned = cwd.to_path_buf();
-            let cancel_shell = cancel.clone();
-            self.run_tool_call(
-                session_id,
-                "run_terminal_cmd",
-                move || async move {
-                    // Cooperative cancel for long sleeps so cancel_turn is testable
-                    if let Some(rest) = cmd_owned.strip_prefix("sleep ") {
-                        if let Ok(secs) = rest.trim().parse::<u64>() {
-                            let steps = (secs * 10).max(1);
-                            for _ in 0..steps {
-                                if cancel_shell.is_cancelled() {
-                                    return Ok(local_tools::ToolResult {
-                                        title: format!("$ {cmd_owned}"),
-                                        kind: crate::events::ToolCallKind::Execute,
-                                        input: serde_json::json!({"command": cmd_owned}),
-                                        output: "(cancelled)".into(),
-                                        needs_permission: true,
-                                        permission_summary: format!("Run shell: {cmd_owned}"),
-                                    });
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
-                            return Ok(local_tools::ToolResult {
-                                title: format!("$ {cmd_owned}"),
-                                kind: crate::events::ToolCallKind::Execute,
-                                input: serde_json::json!({"command": cmd_owned}),
-                                output: format!("slept {secs}s"),
-                                needs_permission: true,
-                                permission_summary: format!("Run shell: {cmd_owned}"),
-                            });
-                        }
-                    }
-                    local_tools::tool_shell(&cwd_owned, &cmd_owned).await
-                },
-                &cancel,
-                &event_tx,
-            )
-            .await?;
-            // Surface attach hint for UI terminal
-            let _ = event_tx.send(SessionUpdate::BackgroundTask {
-                session_id: Some(session_id),
-                task_id: format!("pty-attach:{cmd}"),
-                title: format!("terminal:{cmd}"),
-                status: "attachable".into(),
-            });
+            self.run_shell_tool(session_id, cwd, &cmd, &cancel, &event_tx)
+                .await?;
         }
 
         if cancel.is_cancelled() {
@@ -1058,6 +1037,137 @@ impl AgentHostHandle {
             tokio::time::sleep(std::time::Duration::from_millis(3)).await;
         }
         push_assistant(self, session_id, &reply);
+        Ok(())
+    }
+
+    /// Run a shell tool with a single live child process. Streams stdout/stderr
+    /// to the UI for attach (no second re-exec). Cancel kills the child.
+    async fn run_shell_tool(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        command: &str,
+        cancel: &CancellationToken,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) -> Result<()> {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let call_id = Uuid::new_v4().to_string();
+        let needs_perm = true;
+        let always = {
+            let g = self.inner.lock();
+            g.always_approve
+                || g.always_allowed_tools.contains("run_terminal_cmd")
+                || g.permission_mode == "bypassPermissions"
+        };
+
+        if needs_perm && !always {
+            let req = PermissionRequest {
+                id: Uuid::new_v4(),
+                session_id,
+                tool_name: "run_terminal_cmd".into(),
+                summary: format!("Allow tool `run_terminal_cmd`?"),
+                detail: serde_json::json!({ "tool": "run_terminal_cmd", "command": command }),
+            };
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut g = self.inner.lock();
+                g.pending_permissions
+                    .insert(req.id, PendingPermission { tx });
+            }
+            let _ = event_tx.send(SessionUpdate::PermissionRequired {
+                session_id,
+                request: req,
+            });
+            let decision = tokio::select! {
+                d = rx => d.unwrap_or(PermissionDecision::Deny),
+                _ = cancel.cancelled() => PermissionDecision::Deny,
+            };
+            if decision == PermissionDecision::Deny {
+                let _ = event_tx.send(SessionUpdate::ToolCall {
+                    session_id,
+                    call_id: call_id.clone(),
+                    title: "run_terminal_cmd".into(),
+                    kind: ToolCallKind::Execute,
+                    status: ToolCallStatus::Denied,
+                    input: serde_json::json!({ "command": command }),
+                });
+                return Ok(());
+            }
+            if decision == PermissionDecision::AlwaysAllow {
+                let mut g = self.inner.lock();
+                g.always_allowed_tools.insert("run_terminal_cmd".into());
+            }
+        }
+
+        let _ = event_tx.send(SessionUpdate::ToolCall {
+            session_id,
+            call_id: call_id.clone(),
+            title: "run_terminal_cmd".into(),
+            kind: ToolCallKind::Execute,
+            status: ToolCallStatus::Running,
+            input: serde_json::json!({ "command": command }),
+        });
+        // UI attaches to THIS stream — do not re-run the command in another PTY.
+        let _ = event_tx.send(SessionUpdate::ShellSessionStarted {
+            session_id,
+            call_id: call_id.clone(),
+            command: command.to_string(),
+        });
+
+        let live_shell = self.inner.lock().live_shell.clone();
+        let event_tx_chunks = event_tx.clone();
+        let call_id_chunks = call_id.clone();
+        let result = local_tools::tool_shell_streaming(
+            cwd,
+            command,
+            cancel.clone(),
+            live_shell,
+            move |chunk| {
+                let _ = event_tx_chunks.send(SessionUpdate::ShellOutput {
+                    session_id,
+                    call_id: call_id_chunks.clone(),
+                    data: chunk,
+                });
+            },
+        )
+        .await;
+
+        match result {
+            Ok(tr) => {
+                let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
+                    session_id,
+                    call_id: call_id.clone(),
+                    exit_code: if tr.cancelled { None } else { Some(0) },
+                    cancelled: tr.cancelled,
+                });
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: if tr.cancelled {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    },
+                    output: Some(tr.output),
+                });
+            }
+            Err(e) => {
+                let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
+                    session_id,
+                    call_id: call_id.clone(),
+                    exit_code: None,
+                    cancelled: cancel.is_cancelled(),
+                });
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: ToolCallStatus::Failed,
+                    output: Some(e.to_string()),
+                });
+            }
+        }
         Ok(())
     }
 

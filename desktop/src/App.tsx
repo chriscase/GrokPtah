@@ -11,7 +11,7 @@ import {
   type SessionSummary,
   type SessionUpdate,
 } from "./lib/protocol";
-import { TerminalPane } from "./components/TerminalPane";
+import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 
 type TranscriptItem =
   | { kind: "user"; text: string }
@@ -71,7 +71,7 @@ export default function App() {
     autoUpdateEnabled: false,
   });
   const [showTerm, setShowTerm] = useState(false);
-  const [attachCmd, setAttachCmd] = useState<string | null>(null);
+  const [toolShell, setToolShell] = useState<ToolShellAttach | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -101,14 +101,10 @@ export default function App() {
     listen("session://update", (event) => {
       const u = normalizeSessionUpdate(event.payload);
       if (!u) return;
-      if (
-        u.type === "background_task" &&
-        u.status === "attachable" &&
-        u.title.startsWith("terminal:")
-      ) {
-        const cmd = u.title.slice("terminal:".length);
+      // Attach terminal to the *existing* tool shell stream — never re-exec.
+      if (u.type === "shell_session_started") {
         setShowTerm(true);
-        setAttachCmd(cmd);
+        setToolShell({ callId: u.call_id, command: u.command });
       }
       applyUpdate(u, setTranscript, setPermission, setPlan, setBusy);
     }).then((fn) => {
@@ -405,7 +401,7 @@ export default function App() {
           <div ref={bottomRef} />
         </div>
 
-        {showTerm && <TerminalPane attachCommand={attachCmd} />}
+        {showTerm && <TerminalPane toolShell={toolShell} />}
 
         <div className="composer-wrap">
           {slashOpen && slashHits.length > 0 && (

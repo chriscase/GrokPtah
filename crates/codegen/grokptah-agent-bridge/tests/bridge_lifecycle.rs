@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use grokptah_agent_bridge::{
-    AgentHost, HostConfig, PermissionDecision, SessionUpdate, desktop_auto_update_enabled,
+    desktop_auto_update_enabled, AgentHost, HostConfig, PermissionDecision, SessionUpdate,
 };
 use tokio::time::timeout;
 
@@ -100,7 +100,6 @@ async fn permission_request_round_trip_allow() {
             .await
     });
 
-    // Wait for permission required
     let mut req_id = None;
     loop {
         let ev = timeout(Duration::from_secs(5), rx.recv())
@@ -118,13 +117,24 @@ async fn permission_request_round_trip_allow() {
 
     prompt.await.unwrap().unwrap();
 
-    // Drain remaining
     let mut saw_tool = false;
+    let mut saw_shell_started = false;
     let mut saw_complete = false;
-    while let Ok(Some(ev)) = timeout(Duration::from_millis(500), rx.recv()).await {
+    let mut saw_reattach_reexec = false;
+    while let Ok(Some(ev)) = timeout(Duration::from_millis(800), rx.recv()).await {
         match &ev {
             SessionUpdate::ToolCall { title, .. } if title == "run_terminal_cmd" => {
                 saw_tool = true;
+            }
+            SessionUpdate::ShellSessionStarted { command, .. } => {
+                saw_shell_started = true;
+                assert!(command.contains("echo"));
+            }
+            SessionUpdate::BackgroundTask {
+                status, title, ..
+            } if status == "attachable" && title.starts_with("terminal:") => {
+                // This was the double-exec path — must never fire.
+                saw_reattach_reexec = true;
             }
             SessionUpdate::TurnComplete { .. } => {
                 saw_complete = true;
@@ -134,6 +144,14 @@ async fn permission_request_round_trip_allow() {
         }
     }
     assert!(saw_tool, "shell tool should run after allow");
+    assert!(
+        saw_shell_started,
+        "must emit ShellSessionStarted for live attach"
+    );
+    assert!(
+        !saw_reattach_reexec,
+        "must not emit attachable terminal: background task (re-exec)"
+    );
     assert!(saw_complete);
 }
 
@@ -185,8 +203,10 @@ async fn permission_deny_skips_tool() {
 }
 
 #[tokio::test]
-async fn cancel_turn_marks_cancelled() {
+async fn cancel_kills_real_shell_child_not_only_sleep_stub() {
     let dir = tempfile::tempdir().unwrap();
+    // Marker file written only if sleep completes — cancel must prevent this.
+    let marker = dir.path().join("should_not_exist.txt");
     let host = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
@@ -196,43 +216,102 @@ async fn cancel_turn_marks_cancelled() {
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
 
+    let cmd = format!(
+        "sleep 30; echo done > '{}'",
+        marker.display()
+    );
     let host2 = host.clone();
     let prompt = tokio::spawn(async move {
-        // Cooperative sleep path inside bridge (10 * 100ms steps for "sleep 2")
         host2
-            .session_prompt(session.id, "run sleep 2".into())
+            .session_prompt(session.id, format!("run {cmd}"))
             .await
     });
 
-    // Wait until tool is running, then cancel
+    // Wait until live shell session started (real child spawned)
     loop {
-        let ev = timeout(Duration::from_secs(3), rx.recv())
+        let ev = timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("event")
             .expect("open");
         match &ev {
-            SessionUpdate::ToolCall { title, .. } if title == "run_terminal_cmd" => break,
-            SessionUpdate::PermissionRequired { .. } => break,
+            SessionUpdate::ShellSessionStarted { .. } => break,
+            SessionUpdate::ToolCall { title, .. } if title == "run_terminal_cmd" => {
+                // continue until shell started
+            }
             _ => {}
         }
     }
+
     host.cancel_turn().expect("cancel");
     let _ = prompt.await;
 
     let mut cancelled = false;
-    while let Ok(Some(ev)) = timeout(Duration::from_secs(3), rx.recv()).await {
-        if let SessionUpdate::TurnComplete {
-            cancelled: c,
-            ..
-        } = ev
-        {
-            cancelled = c;
-            break;
+    let mut shell_cancelled = false;
+    while let Ok(Some(ev)) = timeout(Duration::from_secs(5), rx.recv()).await {
+        match &ev {
+            SessionUpdate::ShellSessionEnded {
+                cancelled: c, ..
+            } => {
+                shell_cancelled = *c;
+            }
+            SessionUpdate::TurnComplete {
+                cancelled: c, ..
+            } => {
+                cancelled = *c;
+                break;
+            }
+            _ => {}
         }
     }
+    assert!(cancelled, "TurnComplete.cancelled must be true");
     assert!(
-        cancelled,
-        "TurnComplete must report cancelled=true after cancel_turn"
+        shell_cancelled,
+        "ShellSessionEnded.cancelled must be true for killed child"
+    );
+    // Give OS a moment; marker must not appear
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !marker.exists(),
+        "cancelled shell must not run post-sleep commands (double-exec or unkillable child)"
+    );
+}
+
+#[tokio::test]
+async fn shell_streams_output_without_reexec_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let s = host.session_new().unwrap();
+    host.session_prompt(s.id, "run echo unique-stream-token-xyz".into())
+        .await
+        .unwrap();
+    let events = drain_until_turn_complete(&mut rx).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionUpdate::ShellSessionStarted { .. })),
+        "ShellSessionStarted"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SessionUpdate::ShellOutput { data, .. } if data.contains("unique-stream-token-xyz")
+        )),
+        "live ShellOutput from the tool process, got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            SessionUpdate::BackgroundTask { status, title, .. }
+                if status == "attachable" && title.starts_with("terminal:")
+        )),
+        "must not advertise re-exec attach"
     );
 }
 

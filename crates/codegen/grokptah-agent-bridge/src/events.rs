@@ -85,4 +85,24 @@ pub enum SessionUpdate {
         title: String,
         status: String,
     },
+    /// Shell tool session started — UI should show the terminal pane and
+    /// attach to *this* stream (do not re-exec the command).
+    ShellSessionStarted {
+        session_id: Uuid,
+        call_id: String,
+        command: String,
+    },
+    /// Live stdout/stderr from the tool-spawned shell process.
+    ShellOutput {
+        session_id: Uuid,
+        call_id: String,
+        data: String,
+    },
+    /// Shell tool process ended (exit or kill).
+    ShellSessionEnded {
+        session_id: Uuid,
+        call_id: String,
+        exit_code: Option<i32>,
+        cancelled: bool,
+    },
 }

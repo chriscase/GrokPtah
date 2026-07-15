@@ -60,6 +60,25 @@ export type SessionUpdate =
       task_id: string;
       title: string;
       status: string;
+    }
+  | {
+      type: "shell_session_started";
+      session_id: string;
+      call_id: string;
+      command: string;
+    }
+  | {
+      type: "shell_output";
+      session_id: string;
+      call_id: string;
+      data: string;
+    }
+  | {
+      type: "shell_session_ended";
+      session_id: string;
+      call_id: string;
+      exit_code?: number | null;
+      cancelled: boolean;
     };
 
 export interface PermissionRequest {
