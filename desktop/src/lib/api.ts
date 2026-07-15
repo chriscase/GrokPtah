@@ -38,10 +38,14 @@ export const api = {
   signInLocal: (displayName: string) =>
     invoke<AuthState>("sign_in_local", { displayName }),
   signOut: () => invoke<AuthState>("sign_out"),
+  authSetApiKey: (apiKey: string, displayName: string) =>
+    invoke<AuthState>("auth_set_api_key", { apiKey, displayName }),
+  authOpenLogin: () => invoke<string>("auth_open_login"),
   fileTree: () => invoke<string[]>("file_tree"),
   fuzzyOpen: (query: string) => invoke<string[]>("fuzzy_open", { query }),
   gitStatus: () => invoke<string>("git_status"),
   gitDiff: () => invoke<string>("git_diff"),
+  agentEditDiffs: () => invoke<string>("agent_edit_diffs"),
   gitStageAll: () => invoke<string>("git_stage_all"),
   gitCommit: (message: string) => invoke<string>("git_commit", { message }),
   listWorktrees: () => invoke<string>("list_worktrees"),
@@ -49,9 +53,12 @@ export const api = {
   mcpSetEnabled: (name: string, enabled: boolean) =>
     invoke("mcp_set_enabled", { name, enabled }),
   mcpDoctor: () => invoke<string[]>("mcp_doctor"),
+  mcpAddStdio: (name: string, command: string, args: string[]) =>
+    invoke<void>("mcp_add_stdio", { name, command, args }),
   pluginsList: () => invoke<unknown[]>("plugins_list"),
   pluginInstall: (id: string) => invoke("plugin_install", { id }),
   skillsList: () => invoke<unknown[]>("skills_list"),
+  hooksConfig: () => invoke<string>("hooks_config"),
   subagentsList: () => invoke<unknown[]>("subagents_list"),
   backgroundTasks: () => invoke<unknown[]>("background_tasks"),
   cancelBackgroundTask: (id: string) =>
@@ -79,10 +86,13 @@ export const api = {
     ),
   ptyCreate: (cols: number, rows: number) =>
     invoke<string>("pty_create", { cols, rows }),
+  ptyCreateCommand: (command: string, cols: number, rows: number) =>
+    invoke<string>("pty_create_command", { command, cols, rows }),
   ptyWrite: (id: string, data: string) =>
     invoke<void>("pty_write", { id, data }),
   ptyResize: (id: string, cols: number, rows: number) =>
     invoke<void>("pty_resize", { id, cols, rows }),
   ptyKill: (id: string) => invoke<void>("pty_kill", { id }),
   ptyList: () => invoke<string[]>("pty_list"),
+  ptyBacklog: (id: string) => invoke<string>("pty_backlog", { id }),
 };

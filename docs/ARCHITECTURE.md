@@ -49,7 +49,11 @@ The bridge:
 - Accepts prompts, streams `message` / `thought` / `tool_call` / `tool_call_update` / `plan`
 - Completes permission requests from the UI
 - Supports cancel, fork, rewind, compact, sessions list
-- Runs **local tools** (read/list/grep-ish, shell, write with permission) in-process
+- Runs **local tools** (read/list/grep, shell, write with permission) in-process
+- When an xAI API key is present (OS keychain via `auth_set_api_key` or `XAI_API_KEY`), calls the live chat completions API for the final reply
+- Discovers MCP servers from `~/.grokptah/mcp.json` / project `.mcp.json`, skills under `~/.grokptah/skills` and project skill dirs, plugins under `~/.grokptah/plugins` + local catalog
+- Background tasks run real async work (directory walk) via `tokio::spawn`
+- Integrated terminal PTYs forward stdout to the UI (`pty://output`) with multi-tab backlog replay
 
 ## Workspace layout
 

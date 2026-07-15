@@ -71,7 +71,9 @@ export default function App() {
     autoUpdateEnabled: false,
   });
   const [showTerm, setShowTerm] = useState(false);
+  const [attachCmd, setAttachCmd] = useState<string | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [apiKeyInput, setApiKeyInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const refreshChrome = useCallback(async () => {
@@ -99,6 +101,15 @@ export default function App() {
     listen("session://update", (event) => {
       const u = normalizeSessionUpdate(event.payload);
       if (!u) return;
+      if (
+        u.type === "background_task" &&
+        u.status === "attachable" &&
+        u.title.startsWith("terminal:")
+      ) {
+        const cmd = u.title.slice("terminal:".length);
+        setShowTerm(true);
+        setAttachCmd(cmd);
+      }
       applyUpdate(u, setTranscript, setPermission, setPlan, setBusy);
     }).then((fn) => {
       unlisten = fn;
@@ -225,18 +236,45 @@ export default function App() {
               type="button"
               onClick={async () => setAuth(await api.signOut())}
             >
-              Sign out ({auth.display_name})
+              Sign out ({auth.display_name} · {auth.method})
             </button>
           ) : (
-            <button
-              type="button"
-              className="primary"
-              onClick={async () =>
-                setAuth(await api.signInLocal("GrokPtah User"))
-              }
-            >
-              Sign in
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={async () => {
+                  await api.authOpenLogin();
+                }}
+              >
+                Open console
+              </button>
+              <input
+                type="password"
+                placeholder="xAI API key"
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                style={{
+                  width: 140,
+                  background: "var(--bg)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 6,
+                  padding: "0.25rem 0.4rem",
+                }}
+              />
+              <button
+                type="button"
+                className="primary"
+                onClick={async () => {
+                  if (!apiKeyInput.trim()) return;
+                  setAuth(
+                    await api.authSetApiKey(apiKeyInput.trim(), "API key"),
+                  );
+                  setApiKeyInput("");
+                }}
+              >
+                Save key
+              </button>
+            </>
           )}
           <button type="button" onClick={() => setAboutOpen(true)}>
             About
@@ -367,7 +405,7 @@ export default function App() {
           <div ref={bottomRef} />
         </div>
 
-        {showTerm && <TerminalPane />}
+        {showTerm && <TerminalPane attachCommand={attachCmd} />}
 
         <div className="composer-wrap">
           {slashOpen && slashHits.length > 0 && (
@@ -523,6 +561,12 @@ export default function App() {
               <strong>Diff</strong>
               <pre>{gitDiff || "(no diff)"}</pre>
             </div>
+            <button
+              type="button"
+              onClick={async () => setGitDiff(await api.agentEditDiffs())}
+            >
+              Agent edit diffs
+            </button>
             <div className="panel-block">
               <strong>Worktrees</strong>
               <pre>{worktrees || "(none)"}</pre>
@@ -561,6 +605,16 @@ export default function App() {
               <strong>Doctor</strong>
               <pre>{mcpDoctor.join("\n")}</pre>
             </div>
+            <button
+              type="button"
+              onClick={async () => {
+                await api.mcpAddStdio("echo-tool", "echo", ["mcp-ok"]);
+                setMcp(await api.mcpList());
+                setMcpDoctor(await api.mcpDoctor());
+              }}
+            >
+              Add sample stdio MCP
+            </button>
           </>
         )}
 
@@ -582,13 +636,32 @@ export default function App() {
             </div>
           ))}
 
-        {rightTab === "skills" &&
-          skills.map((s) => (
-            <div key={s.id} className="panel-block">
-              <strong>{s.name}</strong>
-              <div style={{ color: "var(--muted)" }}>{s.description}</div>
+        {rightTab === "skills" && (
+          <>
+            {skills.map((s) => (
+              <div key={s.id} className="panel-block">
+                <strong>{s.name}</strong>
+                <div style={{ color: "var(--muted)" }}>{s.description}</div>
+              </div>
+            ))}
+            <div className="panel-block">
+              <strong>Hooks config</strong>
+              <pre>
+                {/* loaded on demand */}
+                {String((settings as any)._hooks || "Open settings refresh or click Load hooks")}
+              </pre>
+              <button
+                type="button"
+                onClick={async () => {
+                  const h = await api.hooksConfig();
+                  setSettings((s) => ({ ...s, _hooks: h }));
+                }}
+              >
+                Load hooks
+              </button>
             </div>
-          ))}
+          </>
+        )}
 
         {rightTab === "settings" && (
           <>

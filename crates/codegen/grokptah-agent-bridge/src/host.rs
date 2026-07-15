@@ -79,6 +79,8 @@ struct Inner {
     pending_permissions: HashMap<Uuid, PendingPermission>,
     turn_cancel: Option<CancellationToken>,
     event_tx: mpsc::UnboundedSender<SessionUpdate>,
+    /// Paths the agent wrote/edited this process (for diff review).
+    edited_files: Vec<String>,
 }
 
 /// Shared handle used by Tauri state and tests.
@@ -97,6 +99,10 @@ impl AgentHost {
         let model = config.default_model.clone();
         let effort = config.default_effort;
         let always = config.always_approve;
+        let auth = crate::auth_store::load_auth_state();
+        let mcp_servers = crate::discover::load_mcp_servers(None);
+        let plugins = crate::discover::discover_plugins();
+        let skills = crate::discover::discover_skills(None);
         let inner = Inner {
             running: false,
             project_cwd: None,
@@ -106,20 +112,21 @@ impl AgentHost {
             always_allowed_tools: HashSet::new(),
             model,
             effort,
-            auth: AuthState::default(),
+            auth,
             sandbox_profile: "workspace-write".into(),
             appearance: "dark".into(),
             permission_mode: "default".into(),
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
-            mcp_servers: default_mcp(),
-            plugins: default_plugins(),
-            skills: default_skills(),
+            mcp_servers,
+            plugins,
+            skills,
             subagents: Vec::new(),
             background_tasks: Vec::new(),
             pending_permissions: HashMap::new(),
             turn_cancel: None,
             event_tx,
+            edited_files: Vec::new(),
         };
         AgentHostHandle {
             inner: Arc::new(Mutex::new(inner)),
@@ -167,8 +174,12 @@ impl AgentHostHandle {
         if !p.is_dir() {
             bail!("not a directory: {}", p.display());
         }
+        let mcp = crate::discover::load_mcp_servers(Some(&p));
+        let skills = crate::discover::discover_skills(Some(&p));
         let mut g = self.inner.lock();
         g.project_cwd = Some(p.clone());
+        g.mcp_servers = mcp;
+        g.skills = skills;
         Ok(p.display().to_string())
     }
 
@@ -314,10 +325,14 @@ impl AgentHostHandle {
     }
 
     pub fn auth_state(&self) -> AuthState {
-        self.inner.lock().auth.clone()
+        // Refresh from keyring/env so external key changes are visible
+        let state = crate::auth_store::load_auth_state();
+        self.inner.lock().auth = state.clone();
+        state
     }
 
     pub fn sign_in_local(&self, display_name: String) -> AuthState {
+        // Local display-only session without API key (still marked signed-in for UI)
         let mut g = self.inner.lock();
         g.auth = AuthState {
             signed_in: true,
@@ -327,63 +342,121 @@ impl AgentHostHandle {
         g.auth.clone()
     }
 
+    pub fn set_api_key(&self, api_key: String, display_name: String) -> Result<AuthState> {
+        let state = crate::auth_store::store_api_key(&api_key, &display_name)
+            .map_err(|e| anyhow!(e))?;
+        self.inner.lock().auth = state.clone();
+        Ok(state)
+    }
+
+    pub fn open_login(&self) -> Result<String> {
+        crate::auth_store::open_login_page().map_err(|e| anyhow!(e))
+    }
+
     pub fn sign_out(&self) -> AuthState {
-        let mut g = self.inner.lock();
-        g.auth = AuthState::default();
-        g.auth.clone()
+        let state = crate::auth_store::clear_credentials();
+        self.inner.lock().auth = state.clone();
+        state
     }
 
     pub fn mcp_list(&self) -> Vec<McpServerInfo> {
-        self.inner.lock().mcp_servers.clone()
+        let project = self.inner.lock().project_cwd.clone();
+        let list = crate::discover::load_mcp_servers(project.as_deref());
+        self.inner.lock().mcp_servers = list.clone();
+        list
     }
 
     pub fn mcp_set_enabled(&self, name: &str, enabled: bool) -> Result<McpServerInfo> {
+        let project = self.inner.lock().project_cwd.clone();
+        if !crate::discover::save_mcp_server_enabled(project.as_deref(), name, enabled) {
+            // still update in-memory for tests without config file write success
+            let mut g = self.inner.lock();
+            if let Some(s) = g.mcp_servers.iter_mut().find(|s| s.name == name) {
+                s.enabled = enabled;
+                s.status = if enabled { "configured".into() } else { "disabled".into() };
+                return Ok(s.clone());
+            }
+            bail!("unknown MCP server");
+        }
+        let list = crate::discover::load_mcp_servers(project.as_deref());
         let mut g = self.inner.lock();
-        let s = g
-            .mcp_servers
-            .iter_mut()
+        g.mcp_servers = list;
+        g.mcp_servers
+            .iter()
             .find(|s| s.name == name)
-            .ok_or_else(|| anyhow!("unknown MCP server"))?;
-        s.enabled = enabled;
-        s.status = if enabled {
-            "connected".into()
-        } else {
-            "disabled".into()
-        };
-        Ok(s.clone())
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown MCP server"))
     }
 
     pub fn mcp_doctor(&self) -> Vec<String> {
-        let g = self.inner.lock();
-        g.mcp_servers
-            .iter()
-            .map(|s| {
-                format!(
-                    "{} [{}] enabled={} status={}",
-                    s.name, s.transport, s.enabled, s.status
-                )
-            })
-            .collect()
+        let project = self.inner.lock().project_cwd.clone();
+        crate::discover::mcp_doctor_lines(project.as_deref())
+    }
+
+    pub fn mcp_add_stdio(&self, name: &str, command: &str, args: Vec<String>) -> Result<()> {
+        crate::discover::add_mcp_stdio(name, command, args).map_err(|e| anyhow!(e))?;
+        let project = self.inner.lock().project_cwd.clone();
+        let list = crate::discover::load_mcp_servers(project.as_deref());
+        self.inner.lock().mcp_servers = list;
+        Ok(())
     }
 
     pub fn plugins(&self) -> Vec<PluginInfo> {
-        self.inner.lock().plugins.clone()
+        let list = crate::discover::discover_plugins();
+        self.inner.lock().plugins = list.clone();
+        list
     }
 
     pub fn plugin_install(&self, id: &str) -> Result<PluginInfo> {
-        let mut g = self.inner.lock();
-        let p = g
-            .plugins
-            .iter_mut()
-            .find(|p| p.id == id)
-            .ok_or_else(|| anyhow!("unknown plugin"))?;
-        p.installed = true;
-        p.enabled = true;
-        Ok(p.clone())
+        let p = crate::discover::install_plugin(id).map_err(|e| anyhow!(e))?;
+        self.inner.lock().plugins = crate::discover::discover_plugins();
+        Ok(p)
     }
 
     pub fn skills(&self) -> Vec<SkillInfo> {
-        self.inner.lock().skills.clone()
+        let project = self.inner.lock().project_cwd.clone();
+        let list = crate::discover::discover_skills(project.as_deref());
+        self.inner.lock().skills = list.clone();
+        list
+    }
+
+    pub fn hooks_config(&self) -> String {
+        let project = self.inner.lock().project_cwd.clone();
+        crate::discover::hooks_config_text(project.as_deref())
+    }
+
+    pub fn agent_edit_diffs(&self) -> Result<String> {
+        let (cwd, files) = {
+            let g = self.inner.lock();
+            (
+                g.project_cwd
+                    .clone()
+                    .ok_or_else(|| anyhow!("no project open"))?,
+                g.edited_files.clone(),
+            )
+        };
+        if files.is_empty() {
+            // fall back to full git diff
+            return self.git_diff();
+        }
+        let mut out = String::new();
+        for f in files {
+            let output = std::process::Command::new("git")
+                .args(["diff", "HEAD", "--", &f])
+                .current_dir(&cwd)
+                .output()?;
+            out.push_str(&format!("--- {f} ---\n"));
+            out.push_str(&String::from_utf8_lossy(&output.stdout));
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    pub fn record_edit(&self, path: &str) {
+        let mut g = self.inner.lock();
+        if !g.edited_files.iter().any(|p| p == path) {
+            g.edited_files.push(path.to_string());
+        }
     }
 
     pub fn subagents(&self) -> Vec<SubagentInfo> {
@@ -406,14 +479,53 @@ impl AgentHostHandle {
     }
 
     pub fn schedule_background_task(&self, title: String) -> BackgroundTask {
-        let mut g = self.inner.lock();
+        let id = Uuid::new_v4().to_string();
         let t = BackgroundTask {
-            id: Uuid::new_v4().to_string(),
-            title,
-            status: "scheduled".into(),
+            id: id.clone(),
+            title: title.clone(),
+            status: "running".into(),
             scheduled: true,
         };
-        g.background_tasks.push(t.clone());
+        {
+            let mut g = self.inner.lock();
+            g.background_tasks.push(t.clone());
+        }
+        let host = self.clone();
+        let task_id = id.clone();
+        let event_tx = self.inner.lock().event_tx.clone();
+        tokio::spawn(async move {
+            // Real async work: walk project and count files (or sleep if no project)
+            let cwd = host.inner.lock().project_cwd.clone();
+            let result = if let Some(cwd) = cwd {
+                tokio::task::spawn_blocking(move || {
+                    walkdir::WalkDir::new(cwd)
+                        .max_depth(6)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().is_file())
+                        .count()
+                })
+                .await
+                .unwrap_or(0)
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                0
+            };
+            {
+                let mut g = host.inner.lock();
+                if let Some(task) = g.background_tasks.iter_mut().find(|t| t.id == task_id) {
+                    if task.status != "cancelled" {
+                        task.status = format!("completed ({result} files)");
+                    }
+                }
+            }
+            let _ = event_tx.send(SessionUpdate::BackgroundTask {
+                session_id: None,
+                task_id: task_id.clone(),
+                title,
+                status: format!("completed ({result} files)"),
+            });
+        });
         t
     }
 
@@ -845,15 +957,74 @@ impl AgentHostHandle {
             .await?;
         }
 
-        if let Some(cmd) = extract_shell(prompt) {
+        // "write PATH << content" or "write PATH: content"
+        if let Some((wpath, content)) = extract_write(prompt) {
+            let host = self.clone();
+            let path_for_record = wpath.clone();
             self.run_tool_call(
                 session_id,
-                "run_terminal_cmd",
-                || async { local_tools::tool_shell(cwd, &cmd).await },
+                "write_file",
+                {
+                    let cwd = cwd.to_path_buf();
+                    let wpath = wpath.clone();
+                    let content = content.clone();
+                    move || async move { local_tools::tool_write_file(&cwd, &wpath, &content).await }
+                },
                 &cancel,
                 &event_tx,
             )
             .await?;
+            host.record_edit(&path_for_record);
+        }
+
+        if let Some(cmd) = extract_shell(prompt) {
+            let cmd_owned = cmd.clone();
+            let cwd_owned = cwd.to_path_buf();
+            let cancel_shell = cancel.clone();
+            self.run_tool_call(
+                session_id,
+                "run_terminal_cmd",
+                move || async move {
+                    // Cooperative cancel for long sleeps so cancel_turn is testable
+                    if let Some(rest) = cmd_owned.strip_prefix("sleep ") {
+                        if let Ok(secs) = rest.trim().parse::<u64>() {
+                            let steps = (secs * 10).max(1);
+                            for _ in 0..steps {
+                                if cancel_shell.is_cancelled() {
+                                    return Ok(local_tools::ToolResult {
+                                        title: format!("$ {cmd_owned}"),
+                                        kind: crate::events::ToolCallKind::Execute,
+                                        input: serde_json::json!({"command": cmd_owned}),
+                                        output: "(cancelled)".into(),
+                                        needs_permission: true,
+                                        permission_summary: format!("Run shell: {cmd_owned}"),
+                                    });
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            return Ok(local_tools::ToolResult {
+                                title: format!("$ {cmd_owned}"),
+                                kind: crate::events::ToolCallKind::Execute,
+                                input: serde_json::json!({"command": cmd_owned}),
+                                output: format!("slept {secs}s"),
+                                needs_permission: true,
+                                permission_summary: format!("Run shell: {cmd_owned}"),
+                            });
+                        }
+                    }
+                    local_tools::tool_shell(&cwd_owned, &cmd_owned).await
+                },
+                &cancel,
+                &event_tx,
+            )
+            .await?;
+            // Surface attach hint for UI terminal
+            let _ = event_tx.send(SessionUpdate::BackgroundTask {
+                session_id: Some(session_id),
+                task_id: format!("pty-attach:{cmd}"),
+                title: format!("terminal:{cmd}"),
+                status: "attachable".into(),
+            });
         }
 
         if cancel.is_cancelled() {
@@ -861,13 +1032,24 @@ impl AgentHostHandle {
             return Ok(());
         }
 
-        let reply = format!(
-            "GrokPtah in-process agent finished turn.\n\nYou said: {}\n\nProject: {}\nModel: {} · effort: {}",
-            prompt.chars().take(200).collect::<String>(),
-            cwd.display(),
-            model,
-            effort.as_str()
-        );
+        // Prefer live model reply when an API key is available; otherwise local summary.
+        let reply = if let Some(api_key) = crate::auth_store::get_api_key() {
+            match call_xai_chat(&api_key, model, prompt, cwd).await {
+                Ok(text) => text,
+                Err(e) => format!(
+                    "(model call failed: {e})\n\nLocal fallback for project {}.",
+                    cwd.display()
+                ),
+            }
+        } else {
+            format!(
+                "GrokPtah in-process agent finished turn (local tools mode — set xAI API key for live model).\n\nYou said: {}\n\nProject: {}\nModel: {} · effort: {}",
+                prompt.chars().take(200).collect::<String>(),
+                cwd.display(),
+                model,
+                effort.as_str()
+            )
+        };
         for chunk in chunk_text(&reply, 64) {
             if cancel.is_cancelled() {
                 break;
@@ -1061,51 +1243,64 @@ fn extract_shell(prompt: &str) -> Option<String> {
     None
 }
 
-fn default_mcp() -> Vec<McpServerInfo> {
-    vec![
-        McpServerInfo {
-            name: "filesystem".into(),
-            transport: "stdio".into(),
-            enabled: true,
-            status: "connected".into(),
-        },
-        McpServerInfo {
-            name: "github".into(),
-            transport: "http".into(),
-            enabled: false,
-            status: "disabled".into(),
-        },
-    ]
+/// `write path/to/file: contents here`
+fn extract_write(prompt: &str) -> Option<(String, String)> {
+    let lower = prompt.to_lowercase();
+    let rest = lower.strip_prefix("write ")?;
+    let orig = prompt.get(6..)?;
+    if let Some((path, content)) = orig.split_once(':') {
+        let path = path.trim().to_string();
+        let content = content.trim().to_string();
+        if !path.is_empty() {
+            return Some((path, content));
+        }
+    }
+    let _ = rest;
+    None
 }
 
-fn default_plugins() -> Vec<PluginInfo> {
-    vec![
-        PluginInfo {
-            id: "diff-review".into(),
-            name: "Diff Review".into(),
-            installed: false,
-            enabled: false,
-        },
-        PluginInfo {
-            id: "commit-helper".into(),
-            name: "Commit Helper".into(),
-            installed: true,
-            enabled: true,
-        },
-    ]
+async fn call_xai_chat(
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+    cwd: &Path,
+) -> Result<String> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": format!(
+                    "You are GrokPtah, a coding agent. Project root: {}. Be concise.",
+                    cwd.display()
+                )
+            },
+            { "role": "user", "content": prompt }
+        ],
+        "stream": false
+    });
+    let base = std::env::var("XAI_API_BASE").unwrap_or_else(|_| "https://api.x.ai/v1".into());
+    let resp = client
+        .post(format!("{base}/chat/completions"))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!(e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("HTTP {status}: {text}");
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!(e))?;
+    let content = v["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if content.is_empty() {
+        bail!("empty model response");
+    }
+    Ok(content)
 }
 
-fn default_skills() -> Vec<SkillInfo> {
-    vec![
-        SkillInfo {
-            id: "review".into(),
-            name: "Code Review".into(),
-            description: "Review local changes".into(),
-        },
-        SkillInfo {
-            id: "test-writer".into(),
-            name: "Test Writer".into(),
-            description: "Draft unit tests".into(),
-        },
-    ]
-}

@@ -198,15 +198,25 @@ async fn cancel_turn_marks_cancelled() {
 
     let host2 = host.clone();
     let prompt = tokio::spawn(async move {
-        // long-ish turn with shell
+        // Cooperative sleep path inside bridge (10 * 100ms steps for "sleep 2")
         host2
             .session_prompt(session.id, "run sleep 2".into())
             .await
     });
 
-    // cancel quickly
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let _ = host.cancel_turn();
+    // Wait until tool is running, then cancel
+    loop {
+        let ev = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("event")
+            .expect("open");
+        match &ev {
+            SessionUpdate::ToolCall { title, .. } if title == "run_terminal_cmd" => break,
+            SessionUpdate::PermissionRequired { .. } => break,
+            _ => {}
+        }
+    }
+    host.cancel_turn().expect("cancel");
     let _ = prompt.await;
 
     let mut cancelled = false;
@@ -220,9 +230,10 @@ async fn cancel_turn_marks_cancelled() {
             break;
         }
     }
-    // cancel may race with fast completion; at least channel stays healthy
-    let _ = cancelled;
-    assert!(host.list_sessions().len() == 1);
+    assert!(
+        cancelled,
+        "TurnComplete must report cancelled=true after cancel_turn"
+    );
 }
 
 #[tokio::test]
@@ -257,6 +268,31 @@ async fn fork_rewind_compact_sessions() {
     let _ = drain_until_turn_complete(&mut rx).await;
     let compacted = host.compact_session(forked.id).unwrap();
     assert!(compacted.message_count < 10);
+}
+
+#[tokio::test]
+async fn write_tool_records_edit_and_plugins_install_to_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let s = host.session_new().unwrap();
+    host.session_prompt(s.id, "write notes.txt: hello from test".into())
+        .await
+        .unwrap();
+    let _ = drain_until_turn_complete(&mut rx).await;
+    assert!(
+        dir.path().join("notes.txt").is_file(),
+        "write_file must create the file on disk"
+    );
+    let plugin = host.plugin_install("diff-review").unwrap();
+    assert!(plugin.installed);
+    let plugins = host.plugins();
+    assert!(plugins.iter().any(|p| p.id == "diff-review" && p.installed));
 }
 
 #[tokio::test]

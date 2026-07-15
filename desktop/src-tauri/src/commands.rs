@@ -176,6 +176,23 @@ pub fn sign_out(state: State<'_, AppState>) -> AuthState {
 }
 
 #[tauri::command]
+pub fn auth_set_api_key(
+    state: State<'_, AppState>,
+    api_key: String,
+    display_name: String,
+) -> Result<AuthState, String> {
+    state
+        .host
+        .set_api_key(api_key, display_name)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn auth_open_login(state: State<'_, AppState>) -> Result<String, String> {
+    state.host.open_login().map_err(map_err)
+}
+
+#[tauri::command]
 pub fn file_tree(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     state.host.file_tree().map_err(map_err)
 }
@@ -193,6 +210,11 @@ pub fn git_status(state: State<'_, AppState>) -> Result<String, String> {
 #[tauri::command]
 pub fn git_diff(state: State<'_, AppState>) -> Result<String, String> {
     state.host.git_diff().map_err(map_err)
+}
+
+#[tauri::command]
+pub fn agent_edit_diffs(state: State<'_, AppState>) -> Result<String, String> {
+    state.host.agent_edit_diffs().map_err(map_err)
 }
 
 #[tauri::command]
@@ -230,6 +252,19 @@ pub fn mcp_doctor(state: State<'_, AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
+pub fn mcp_add_stdio(
+    state: State<'_, AppState>,
+    name: String,
+    command: String,
+    args: Vec<String>,
+) -> Result<(), String> {
+    state
+        .host
+        .mcp_add_stdio(&name, &command, args)
+        .map_err(map_err)
+}
+
+#[tauri::command]
 pub fn plugins_list(state: State<'_, AppState>) -> Vec<PluginInfo> {
     state.host.plugins()
 }
@@ -242,6 +277,11 @@ pub fn plugin_install(state: State<'_, AppState>, id: String) -> Result<PluginIn
 #[tauri::command]
 pub fn skills_list(state: State<'_, AppState>) -> Vec<SkillInfo> {
     state.host.skills()
+}
+
+#[tauri::command]
+pub fn hooks_config(state: State<'_, AppState>) -> String {
+    state.host.hooks_config()
 }
 
 #[tauri::command]
@@ -360,4 +400,22 @@ pub fn pty_kill(state: State<'_, AppState>, id: String) -> Result<(), String> {
 #[tauri::command]
 pub fn pty_list(state: State<'_, AppState>) -> Vec<String> {
     state.pty.list()
+}
+
+#[tauri::command]
+pub fn pty_backlog(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    state.pty.backlog(&id).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn pty_create_command(
+    state: State<'_, AppState>,
+    command: String,
+    cols: u16,
+    rows: u16,
+) -> Result<String, String> {
+    state
+        .pty
+        .create_command(&command, cols, rows)
+        .map_err(map_err)
 }

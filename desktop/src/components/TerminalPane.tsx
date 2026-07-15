@@ -1,18 +1,31 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { api } from "../lib/api";
 
+type PtyOutput = { id: string; data: string };
+
 /**
- * Integrated terminal using xterm.js + in-process PTY via Tauri.
- * Output streaming is best-effort (PTY drain on backend); input/resize wired fully.
+ * Multi-tab terminal: each tab owns a PTY id; active tab receives output events
+ * and keyboard input. Backlog is replayed on switch.
  */
-export function TerminalPane() {
+export function TerminalPane({ attachCommand }: { attachCommand?: string | null }) {
   const hostRef = useRef<HTMLDivElement>(null);
-  const [ptyId, setPtyId] = useState<string | null>(null);
   const [tabs, setTabs] = useState<string[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const activeIdRef = useRef<string | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
+
+  const refreshTabs = useCallback(async () => {
+    setTabs(await api.ptyList());
+  }, []);
 
   useEffect(() => {
     if (!hostRef.current) return;
@@ -31,27 +44,37 @@ export function TerminalPane() {
     term.open(hostRef.current);
     fit.fit();
     termRef.current = term;
+    fitRef.current = fit;
 
-    let id: string | null = null;
     let disposed = false;
+    let unlisten: (() => void) | undefined;
 
     (async () => {
       try {
-        const cols = term.cols;
-        const rows = term.rows;
-        id = await api.ptyCreate(cols, rows);
+        const id = await api.ptyCreate(term.cols, term.rows);
         if (disposed) {
           await api.ptyKill(id);
           return;
         }
-        setPtyId(id);
-        setTabs(await api.ptyList());
-        term.writeln("\x1b[32mGrokPtah terminal\x1b[0m — PTY " + id.slice(0, 8));
+        setActiveId(id);
+        activeIdRef.current = id;
+        await refreshTabs();
+        term.writeln(`\x1b[32mGrokPtah terminal\x1b[0m — ${id.slice(0, 8)}`);
+
         term.onData((data) => {
-          if (id) void api.ptyWrite(id, data);
+          const cur = activeIdRef.current;
+          if (cur) void api.ptyWrite(cur, data);
         });
         term.onResize(({ cols, rows }) => {
-          if (id) void api.ptyResize(id, cols, rows);
+          const cur = activeIdRef.current;
+          if (cur) void api.ptyResize(cur, cols, rows);
+        });
+
+        unlisten = await listen<PtyOutput>("pty://output", (ev) => {
+          const payload = ev.payload;
+          if (payload.id === activeIdRef.current) {
+            term.write(payload.data);
+          }
         });
       } catch (e) {
         term.writeln("PTY unavailable: " + String(e));
@@ -64,10 +87,79 @@ export function TerminalPane() {
     return () => {
       disposed = true;
       window.removeEventListener("resize", onResize);
+      unlisten?.();
       term.dispose();
-      if (id) void api.ptyKill(id);
+      const cur = activeIdRef.current;
+      if (cur) void api.ptyKill(cur);
     };
-  }, []);
+  }, [refreshTabs]);
+
+  // Attach agent-spawned command PTY when requested
+  useEffect(() => {
+    if (!attachCommand || !termRef.current) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const term = termRef.current!;
+        const id = await api.ptyCreateCommand(
+          attachCommand,
+          term.cols,
+          term.rows,
+        );
+        if (cancelled) {
+          await api.ptyKill(id);
+          return;
+        }
+        await switchTo(id, true);
+      } catch (e) {
+        termRef.current?.writeln("attach failed: " + String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attachCommand]);
+
+  async function switchTo(id: string, clear = true) {
+    const term = termRef.current;
+    if (!term) return;
+    setActiveId(id);
+    activeIdRef.current = id;
+    if (clear) term.reset();
+    try {
+      const backlog = await api.ptyBacklog(id);
+      if (backlog) term.write(backlog);
+      else term.writeln(`\x1b[90m[tab ${id.slice(0, 8)}]\x1b[0m`);
+      await api.ptyResize(id, term.cols, term.rows);
+    } catch (e) {
+      term.writeln(String(e));
+    }
+    await refreshTabs();
+  }
+
+  async function newTab() {
+    const term = termRef.current;
+    if (!term) return;
+    const id = await api.ptyCreate(term.cols, term.rows);
+    await switchTo(id, true);
+  }
+
+  async function closeActive() {
+    const id = activeIdRef.current;
+    if (!id) return;
+    await api.ptyKill(id);
+    const list = await api.ptyList();
+    setTabs(list);
+    if (list.length) {
+      await switchTo(list[0], true);
+    } else {
+      setActiveId(null);
+      activeIdRef.current = null;
+      termRef.current?.reset();
+      await newTab();
+    }
+  }
 
   return (
     <div>
@@ -79,23 +171,26 @@ export function TerminalPane() {
           borderTop: "1px solid var(--border)",
           background: "var(--bg-elevated)",
           fontSize: 12,
+          alignItems: "center",
+          flexWrap: "wrap",
         }}
       >
-        <span style={{ color: "var(--muted)" }}>Terminal tabs:</span>
+        <span style={{ color: "var(--muted)" }}>Terminal:</span>
         {tabs.map((t) => (
-          <span key={t} className={t === ptyId ? "warn-pill" : ""}>
+          <button
+            key={t}
+            type="button"
+            className={t === activeId ? "warn-pill" : ""}
+            onClick={() => void switchTo(t, true)}
+          >
             {t.slice(0, 8)}
-          </span>
+          </button>
         ))}
-        <button
-          type="button"
-          onClick={async () => {
-            const id = await api.ptyCreate(80, 24);
-            setTabs(await api.ptyList());
-            setPtyId(id);
-          }}
-        >
+        <button type="button" onClick={() => void newTab()}>
           New tab
+        </button>
+        <button type="button" onClick={() => void closeActive()}>
+          Close tab
         </button>
       </div>
       <div className="term-host" ref={hostRef} />

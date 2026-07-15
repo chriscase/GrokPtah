@@ -5,6 +5,7 @@ mod event_forward;
 mod pty_host;
 
 use grokptah_agent_bridge::{AgentHost, HostConfig};
+use tauri::Manager;
 
 pub struct AppState {
     pub host: grokptah_agent_bridge::AgentHostHandle,
@@ -24,10 +25,11 @@ pub fn run() {
             pty: pty_host::PtyHub::new(),
         })
         .setup(move |app| {
-            // Auto-start in-process agent
+            let handle = app.handle().clone();
+            app.state::<AppState>().pty.set_app(handle.clone());
             let _ = host.start();
             if let Some(rx) = event_rx {
-                event_forward::spawn_event_forwarder(app.handle().clone(), rx);
+                event_forward::spawn_event_forwarder(handle, rx);
             }
             Ok(())
         })
@@ -53,6 +55,8 @@ pub fn run() {
             commands::auth_state,
             commands::sign_in_local,
             commands::sign_out,
+            commands::auth_set_api_key,
+            commands::auth_open_login,
             commands::file_tree,
             commands::fuzzy_open,
             commands::git_status,
@@ -60,12 +64,15 @@ pub fn run() {
             commands::git_stage_all,
             commands::git_commit,
             commands::list_worktrees,
+            commands::agent_edit_diffs,
             commands::mcp_list,
             commands::mcp_set_enabled,
             commands::mcp_doctor,
+            commands::mcp_add_stdio,
             commands::plugins_list,
             commands::plugin_install,
             commands::skills_list,
+            commands::hooks_config,
             commands::subagents_list,
             commands::background_tasks,
             commands::cancel_background_task,
@@ -85,6 +92,8 @@ pub fn run() {
             commands::pty_resize,
             commands::pty_kill,
             commands::pty_list,
+            commands::pty_backlog,
+            commands::pty_create_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running GrokPtah");
