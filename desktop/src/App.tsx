@@ -100,6 +100,76 @@ type TranscriptRenderRow =
   | { type: "item"; item: TranscriptItem; index: number }
   | { type: "debug"; key: string; lines: string[]; live: boolean };
 
+/**
+ * After a turn completes, ensure we show each assistant reply once.
+ * Streamed events and the sessionPrompt return value are the same text;
+ * without this, races leave two identical assistant bubbles.
+ */
+function finalizeTurnTranscript(
+  transcript: TranscriptItem[],
+  reply: string | null | undefined,
+): TranscriptItem[] {
+  let lastUser = -1;
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    if (transcript[i].kind === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  const head = lastUser >= 0 ? transcript.slice(0, lastUser + 1) : [];
+  const tail =
+    lastUser >= 0 ? transcript.slice(lastUser + 1) : [...transcript];
+
+  const collapsed: TranscriptItem[] = collapseAdjacentDuplicateAssistants(
+    tail,
+  ).map((item) => {
+    if (item.kind === "assistant") {
+      return { kind: "assistant", text: item.text, streaming: false };
+    }
+    if (item.kind === "thought") {
+      return { kind: "thought", text: item.text, streaming: false };
+    }
+    return item;
+  });
+
+  const hasAssistant = collapsed.some((i) => i.kind === "assistant");
+  const trimmed = reply?.trim() ?? "";
+  if (!hasAssistant && trimmed) {
+    collapsed.push({ kind: "assistant", text: trimmed, streaming: false });
+  }
+
+  return [...head, ...collapsed];
+}
+
+/** Merge consecutive assistant bubbles that are the same (or prefix/suffix). */
+function collapseAdjacentDuplicateAssistants(
+  items: TranscriptItem[],
+): TranscriptItem[] {
+  const out: TranscriptItem[] = [];
+  for (const item of items) {
+    const prev = out[out.length - 1];
+    if (item.kind === "assistant" && prev?.kind === "assistant") {
+      const a = prev.text.trim();
+      const b = item.text.trim();
+      if (!a) {
+        out[out.length - 1] = { ...item, streaming: false };
+        continue;
+      }
+      if (!b || a === b || b.startsWith(a) || a.startsWith(b)) {
+        const text = b.length >= a.length ? item.text : prev.text;
+        out[out.length - 1] = {
+          kind: "assistant",
+          text,
+          streaming: false,
+        };
+        continue;
+      }
+    }
+    out.push(item);
+  }
+  return out;
+}
+
 /** Collapse host status crumbs into one diagnostics chip per run. */
 function groupTranscript(items: TranscriptItem[]): TranscriptRenderRow[] {
   const out: TranscriptRenderRow[] = [];
@@ -827,53 +897,17 @@ export default function App() {
         return;
       }
       const reply = await api.sessionPrompt(id, prompt);
-      // Surface the final reply only if events did not already stream it.
-      // Errors are emitted as a single assistant bubble via the event path;
-      // never append a second copy (dedup must tolerate multi-listener ghosts).
-      if (reply?.trim()) {
-        const head = reply.slice(0, 48).trim();
-        patchTab(id, (t) => {
-          const already = t.transcript.some((item) => {
-            if (item.kind !== "assistant" && item.kind !== "error") return false;
-            if (item.text === reply) return true;
-            if (head && item.text.includes(head)) return true;
-            if (item.text && reply.includes(item.text.slice(0, 48))) return true;
-            return false;
-          });
-          if (already) {
-            return {
-              ...t,
-              busy: false,
-              activity: doneActivity(false),
-              transcript: t.transcript.map((item) =>
-                item.kind === "assistant" || item.kind === "thought"
-                  ? { ...item, streaming: false }
-                  : item,
-              ),
-            };
-          }
-          return {
-            ...t,
-            busy: false,
-            activity: doneActivity(false),
-            transcript: [
-              ...t.transcript,
-              { kind: "assistant", text: reply },
-            ],
-          };
-        });
-      } else {
-        patchTab(id, (t) => ({
-          ...t,
-          busy: false,
-          activity: doneActivity(false),
-          transcript: t.transcript.map((item) =>
-            item.kind === "assistant" || item.kind === "thought"
-              ? { ...item, streaming: false }
-              : item,
-          ),
-        }));
-      }
+      // Events stream the assistant text AND the invoke returns the same
+      // string. React state from events can still be pending when we get
+      // here, so naive "if not already" checks append a second identical
+      // bubble. Always finalize the turn: collapse duplicate assistants
+      // after the last user message; only append reply if none exist.
+      patchTab(id, (t) => ({
+        ...t,
+        busy: false,
+        activity: doneActivity(false),
+        transcript: finalizeTurnTranscript(t.transcript, reply),
+      }));
       setSubagents(await api.subagentsList());
       setBgTasks(await api.backgroundTasks());
       await refreshChrome();

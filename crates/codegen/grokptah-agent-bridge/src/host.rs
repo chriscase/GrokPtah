@@ -1481,18 +1481,10 @@ impl AgentHostHandle {
                     true,
                 )
             };
-            if is_err {
-                emit_message(&event_tx, session_id, &reply);
-                push_assistant(self, session_id, &reply);
-                return Ok(reply);
-            }
-            for chunk in chunk_text(&reply, 48) {
-                if cancel.is_cancelled() {
-                    break;
-                }
-                emit_message(&event_tx, session_id, &chunk);
-                tokio::time::sleep(std::time::Duration::from_millis(8)).await;
-            }
+            // Single emit (not typewriter chunks): UI also receives the same
+            // text via the invoke return value, and chunked streaming raced
+            // into duplicate assistant bubbles.
+            emit_message(&event_tx, session_id, &reply);
             push_assistant(self, session_id, &reply);
             return Ok(reply);
         }
@@ -1702,19 +1694,9 @@ impl AgentHostHandle {
                 true,
             )
         };
-        // Don't typewriter-chunk error messages (avoids garbled/overlapping UI).
-        if is_error {
-            emit_message(&event_tx, session_id, &reply);
-            push_assistant(self, session_id, &reply);
-            return Ok(reply);
-        }
-        for chunk in chunk_text(&reply, 64) {
-            if cancel.is_cancelled() {
-                break;
-            }
-            emit_message(&event_tx, session_id, &chunk);
-            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-        }
+        // Single emit + disk append. UI finalizes the turn and dedupes against
+        // the invoke return value (chunked streaming caused double bubbles).
+        emit_message(&event_tx, session_id, &reply);
         push_assistant(self, session_id, &reply);
         Ok(reply)
     }
