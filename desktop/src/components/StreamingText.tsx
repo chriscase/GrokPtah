@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 
 /**
- * Gemini-style “beam in”: new tokens arrive with blur → clarity + soft glow,
- * not a plain dump of text. Fresh segments keep the animation class briefly
- * even after streaming ends so the last tokens still finish the effect.
+ * Gemini-style “beam in”: new tokens arrive with blur → clarity + soft glow.
+ *
+ * Important: do **not** seed `segments` with the full `text` and also run an
+ * effect that appends `text.slice(prevLen)`. That double-painted one-shot
+ * replies (chat invoke returns the full string at once) as "HelloHello".
  */
 export function StreamingText({
   text,
@@ -15,7 +17,7 @@ export function StreamingText({
   const prevLen = useRef(0);
   const [segments, setSegments] = useState<
     { id: number; text: string; fresh: boolean }[]
-  >(() => (text ? [{ id: 0, text, fresh: false }] : []));
+  >([]);
   const idSeq = useRef(1);
   const settleTimers = useRef<number[]>([]);
 
@@ -26,24 +28,31 @@ export function StreamingText({
   }, []);
 
   useEffect(() => {
+    // Shorter text = reset (rewind / replace with collapsed reply).
     if (text.length < prevLen.current) {
-      prevLen.current = text.length;
-      setSegments(text ? [{ id: idSeq.current++, text, fresh: false }] : []);
+      prevLen.current = 0;
+      setSegments([]);
+    }
+
+    if (text.length === prevLen.current) {
       return;
     }
-    if (text.length === prevLen.current) return;
 
     const added = text.slice(prevLen.current);
     prevLen.current = text.length;
     if (!added) return;
 
     const id = idSeq.current++;
+    // One-shot full message (typical chat path): single settled segment, no beam spam.
+    if (!streaming && prevLen.current === added.length) {
+      setSegments([{ id, text: added, fresh: false }]);
+      return;
+    }
+
     setSegments((segs) => {
-      // Keep a bounded number of segments so huge replies stay light.
       const settled = segs.map((s) => (s.fresh ? { ...s, fresh: false } : s));
       const next = [...settled, { id, text: added, fresh: true }];
       if (next.length > 80) {
-        // Collapse oldest into one frozen segment
         const head = next
           .slice(0, next.length - 40)
           .map((s) => s.text)
@@ -54,7 +63,6 @@ export function StreamingText({
       return next;
     });
 
-    // Clear “fresh” after animation completes so we don’t re-fire forever.
     const t = window.setTimeout(() => {
       setSegments((segs) =>
         segs.map((s) => (s.id === id ? { ...s, fresh: false } : s)),
@@ -65,7 +73,6 @@ export function StreamingText({
 
   useEffect(() => {
     if (!streaming) {
-      // Leave a short window so the last beam finishes.
       const t = window.setTimeout(() => {
         setSegments((segs) => segs.map((s) => ({ ...s, fresh: false })));
       }, 400);
@@ -74,6 +81,16 @@ export function StreamingText({
   }, [streaming]);
 
   if (!text) return null;
+
+  // Fallback if effect hasn't painted yet (first frame).
+  if (segments.length === 0) {
+    return (
+      <span className={`stream-text ${streaming ? "is-streaming" : ""}`}>
+        {text}
+        {streaming && <span className="stream-caret" aria-hidden />}
+      </span>
+    );
+  }
 
   return (
     <span className={`stream-text ${streaming ? "is-streaming" : ""}`}>
