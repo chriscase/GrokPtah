@@ -6,7 +6,7 @@ import {
 } from "../lib/debugTrace";
 import { ActivityIndicator } from "./ActivityIndicator";
 import { DebugTrace } from "./DebugTrace";
-import { MarkdownBody } from "./MarkdownBody";
+import { StreamingMarkdown } from "./StreamingMarkdown";
 import { StreamingText } from "./StreamingText";
 import { ToolCallCard, ToolHistoryGroup } from "./ToolCallCard";
 import { api } from "../lib/api";
@@ -219,12 +219,12 @@ export function SessionPane({
                   )}
                 </>
               )}
-              {item.kind === "assistant" &&
-                (item.streaming ? (
-                  <StreamingText text={item.text} streaming />
-                ) : (
-                  <MarkdownBody text={item.text} />
-                ))}
+              {item.kind === "assistant" && (
+                <StreamingMarkdown
+                  text={item.text}
+                  streaming={!!item.streaming}
+                />
+              )}
               {item.kind === "thought" && (
                 <StreamingText text={item.text} streaming={item.streaming} />
               )}

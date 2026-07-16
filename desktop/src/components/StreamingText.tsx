@@ -63,11 +63,12 @@ export function StreamingText({
       return next;
     });
 
+    // Hold the beam long enough to read the Gemini-style blur → clear settle.
     const t = window.setTimeout(() => {
       setSegments((segs) =>
         segs.map((s) => (s.id === id ? { ...s, fresh: false } : s)),
       );
-    }, 520);
+    }, 720);
     settleTimers.current.push(t);
   }, [text, streaming]);
 
@@ -75,7 +76,7 @@ export function StreamingText({
     if (!streaming) {
       const t = window.setTimeout(() => {
         setSegments((segs) => segs.map((s) => ({ ...s, fresh: false })));
-      }, 400);
+      }, 480);
       settleTimers.current.push(t);
     }
   }, [streaming]);

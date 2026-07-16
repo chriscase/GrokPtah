@@ -624,60 +624,107 @@ button:disabled {
   border-radius: 999px;
 }
 
+/* Gemini-style progressive markdown + beam-in for the live tail */
+.stream-md {
+  display: block;
+}
+
+.stream-md.is-streaming .stream-md-stable {
+  /* Settled markdown stays crisp */
+  opacity: 1;
+}
+
+.stream-md-tail {
+  display: inline;
+}
+
+.stream-md-settled {
+  animation: stream-md-settle 0.35s ease-out both;
+}
+
+@keyframes stream-md-settle {
+  from {
+    filter: brightness(1.04);
+  }
+  to {
+    filter: none;
+  }
+}
+
+/* When stable markdown ends mid-flow, tail continues inline-ish */
+.stream-md-stable .md-body > :last-child {
+  margin-bottom: 0.35em;
+}
+
 /* Gemini-style “beam in” for streamed tokens */
 .stream-text {
   display: inline;
 }
 
 .stream-text.is-streaming {
-  /* subtle ambient wash while the model is talking */
-  text-shadow: 0 0 24px rgba(240, 180, 41, 0.06);
+  /* warm ambient wash while tokens arrive */
+  text-shadow:
+    0 0 18px rgba(240, 180, 41, 0.12),
+    0 0 36px rgba(160, 200, 255, 0.08);
 }
 
 .stream-token {
   display: inline;
+  white-space: pre-wrap;
 }
 
 .stream-token-beam {
-  animation: stream-beam-in 0.55s cubic-bezier(0.16, 1, 0.3, 1) both;
-  will-change: opacity, filter, transform;
+  animation: stream-beam-in 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+  will-change: opacity, filter, transform, text-shadow;
 }
 
 .stream-caret {
   display: inline-block;
-  width: 0.45em;
-  height: 1em;
-  margin-left: 1px;
+  width: 0.5em;
+  height: 1.05em;
+  margin-left: 2px;
   vertical-align: text-bottom;
   background: linear-gradient(
     180deg,
-    rgba(240, 180, 41, 0.9),
-    rgba(240, 180, 41, 0.25)
+    rgba(240, 180, 41, 1),
+    rgba(240, 180, 41, 0.35) 55%,
+    rgba(160, 200, 255, 0.45)
   );
   border-radius: 1px;
-  animation: stream-caret-blink 0.9s ease-in-out infinite;
+  box-shadow:
+    0 0 8px rgba(240, 180, 41, 0.55),
+    0 0 16px rgba(160, 200, 255, 0.25);
+  animation: stream-caret-blink 0.85s ease-in-out infinite;
 }
 
 @keyframes stream-beam-in {
   0% {
     opacity: 0;
-    filter: blur(6px) brightness(1.6);
-    transform: translateY(0.35em) scale(0.98);
+    filter: blur(8px) brightness(1.85) saturate(1.25);
+    transform: translateY(0.4em) scale(0.96);
     text-shadow:
-      0 0 14px rgba(240, 180, 41, 0.55),
-      0 0 28px rgba(200, 220, 255, 0.35);
+      0 0 18px rgba(240, 180, 41, 0.75),
+      0 0 36px rgba(160, 200, 255, 0.45),
+      0 0 4px rgba(255, 255, 255, 0.5);
   }
-  55% {
+  40% {
     opacity: 1;
-    filter: blur(1px) brightness(1.15);
-    transform: translateY(0.05em) scale(1);
+    filter: blur(2.5px) brightness(1.35) saturate(1.1);
+    transform: translateY(0.12em) scale(0.99);
     text-shadow:
-      0 0 8px rgba(240, 180, 41, 0.25),
-      0 0 16px rgba(200, 220, 255, 0.12);
+      0 0 12px rgba(240, 180, 41, 0.45),
+      0 0 22px rgba(160, 200, 255, 0.28);
+  }
+  72% {
+    filter: blur(0.6px) brightness(1.08);
+    transform: translateY(0.02em) scale(1);
+    text-shadow:
+      0 0 6px rgba(240, 180, 41, 0.18),
+      0 0 12px rgba(160, 200, 255, 0.1);
   }
   100% {
     opacity: 1;
-    filter: blur(0) brightness(1);
+    filter: blur(0) brightness(1) saturate(1);
     transform: none;
     text-shadow: none;
   }
@@ -686,7 +733,7 @@ button:disabled {
 @keyframes stream-caret-blink {
   0%,
   100% {
-    opacity: 0.2;
+    opacity: 0.25;
   }
   50% {
     opacity: 1;
@@ -754,6 +801,7 @@ button:disabled {
 @media (prefers-reduced-motion: reduce) {
   .stream-token-beam,
   .stream-caret,
+  .stream-md-settled,
   .attn-dot.unseen,
   .attn-dot.permission {
     animation: none;
@@ -761,6 +809,12 @@ button:disabled {
   .busy-dot {
     animation: none;
     opacity: 1;
+  }
+  .stream-token-beam {
+    filter: none;
+    text-shadow: none;
+    opacity: 1;
+    transform: none;
   }
 }
 
