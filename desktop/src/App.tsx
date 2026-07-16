@@ -161,18 +161,36 @@ export default function App() {
           ...t,
           { kind: "assistant", text: "Conversation compacted." },
         ]);
-        setBusy(false);
         return;
       }
-      await api.sessionPrompt(id, prompt);
+      const reply = await api.sessionPrompt(id, prompt);
+      // Always surface the final reply (events may have streamed already).
+      if (reply?.trim()) {
+        setTranscript((t) => {
+          const last = t[t.length - 1];
+          if (last?.kind === "assistant" && last.text.includes(reply.slice(0, 40))) {
+            return t;
+          }
+          // If streaming already built the same text, skip duplicate.
+          const already = t.some(
+            (item) =>
+              item.kind === "assistant" &&
+              (item.text === reply || reply.startsWith(item.text.slice(0, 80))),
+          );
+          if (already) return t;
+          return [...t, { kind: "assistant", text: reply }];
+        });
+      }
       setSessions(await api.sessionList());
       setSubagents(await api.subagentsList());
       setBgTasks(await api.backgroundTasks());
+      await refreshChrome();
     } catch (e) {
       setTranscript((t) => [
         ...t,
         { kind: "error", text: String(e) },
       ]);
+    } finally {
       setBusy(false);
     }
   }
@@ -233,12 +251,24 @@ export default function App() {
           <button type="button" onClick={() => void openProject()}>
             Open folder
           </button>
+          <span
+            className="path-chip"
+            title={
+              auth.signed_in
+                ? `${auth.display_name} (${auth.method})`
+                : "Not signed in — uses ~/.grok/auth.json from `grok login`, or API key"
+            }
+          >
+            {auth.signed_in
+              ? `auth: ${auth.method}`
+              : "auth: none"}
+          </span>
           {auth.signed_in ? (
             <button
               type="button"
               onClick={async () => setAuth(await api.signOut())}
             >
-              Sign out ({auth.display_name} · {auth.method})
+              Clear API key
             </button>
           ) : (
             <>
@@ -248,19 +278,21 @@ export default function App() {
                   await api.authOpenLogin();
                 }}
               >
-                Open console
+                console.x.ai
               </button>
               <input
                 type="password"
-                placeholder="xAI API key"
+                placeholder="xAI API key (optional)"
                 value={apiKeyInput}
                 onChange={(e) => setApiKeyInput(e.target.value)}
                 style={{
-                  width: 140,
-                  background: "var(--bg)",
+                  width: 150,
+                  background: "var(--bg-input)",
                   border: "1px solid var(--border)",
                   borderRadius: 6,
                   padding: "0.25rem 0.4rem",
+                  fontFamily: "var(--font)",
+                  fontSize: 11,
                 }}
               />
               <button
@@ -366,17 +398,21 @@ export default function App() {
               </div>
               <ul>
                 <li>
-                  Open a project folder (toolbar), then type a prompt below
+                  Auth: reuses <code>~/.grok/auth.json</code> from{" "}
+                  <code>grok login</code> (or paste an API key)
                 </li>
                 <li>
-                  Slash commands: <code>/help</code> <code>/plan</code>{" "}
-                  <code>/yolo</code>
+                  Open a project folder, then type a prompt below
                 </li>
                 <li>
-                  Tools: <code>list files</code>, <code>read path</code>,{" "}
-                  <code>run …</code> (permission gated)
+                  Slash: <code>/help</code> <code>/plan</code>{" "}
+                  <code>/yolo</code> · tools: <code>list files</code>,{" "}
+                  <code>run …</code>
                 </li>
-                <li>CLI/TUI still available: cargo run -p xai-grok-pager-bin</li>
+                <li>
+                  Console TUI:{" "}
+                  <code>cargo run -p xai-grok-pager-bin</code>
+                </li>
               </ul>
             </div>
           )}

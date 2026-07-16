@@ -31,7 +31,7 @@ pub struct HostConfig {
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
-            default_model: "grok-build".into(),
+            default_model: "grok-3".into(),
             default_effort: EffortLevel::Medium,
             always_approve: false,
         }
@@ -310,8 +310,8 @@ impl AgentHostHandle {
     pub fn models(&self) -> Vec<ModelInfo> {
         vec![
             ModelInfo {
-                id: "grok-build".into(),
-                display_name: "Grok Build".into(),
+                id: "grok-3".into(),
+                display_name: "Grok 3".into(),
                 supports_effort: true,
             },
             ModelInfo {
@@ -322,6 +322,11 @@ impl AgentHostHandle {
             ModelInfo {
                 id: "grok-3-mini".into(),
                 display_name: "Grok 3 Mini".into(),
+                supports_effort: false,
+            },
+            ModelInfo {
+                id: "grok-2".into(),
+                display_name: "Grok 2".into(),
                 supports_effort: false,
             },
         ]
@@ -764,12 +769,17 @@ impl AgentHostHandle {
         Ok(())
     }
 
-    pub async fn session_prompt(&self, session_id: Uuid, prompt: String) -> Result<()> {
+    /// Run a turn. Returns the final assistant text so the UI always has a
+    /// reply even if event delivery is delayed.
+    pub async fn session_prompt(&self, session_id: Uuid, prompt: String) -> Result<String> {
         let (cwd, model, effort, plan_mode, cancel, event_tx) = {
             let mut g = self.inner.lock();
             if !g.running {
                 bail!("agent not started");
             }
+            // Keep session model in sync with host selection
+            let model = g.model.clone();
+            let effort = g.effort;
             let cancel = CancellationToken::new();
             g.turn_cancel = Some(cancel.clone());
             let event_tx = g.event_tx.clone();
@@ -777,6 +787,8 @@ impl AgentHostHandle {
                 .sessions
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
+            s.model = model.clone();
+            s.effort = effort;
             s.transcript.push(TranscriptEntry {
                 role: "user".into(),
                 text: prompt.clone(),
@@ -787,8 +799,8 @@ impl AgentHostHandle {
             s.updated_at = Utc::now();
             (
                 s.cwd.clone(),
-                s.model.clone(),
-                s.effort,
+                model,
+                effort,
                 s.plan_mode,
                 cancel,
                 event_tx,
@@ -815,12 +827,12 @@ impl AgentHostHandle {
 
         let cancelled = cancel.is_cancelled();
         match result {
-            Ok(()) => {
+            Ok(reply) => {
                 let _ = event_tx.send(SessionUpdate::TurnComplete {
                     session_id,
                     cancelled,
                 });
-                Ok(())
+                Ok(reply)
             }
             Err(e) => {
                 let _ = event_tx.send(SessionUpdate::Error {
@@ -846,15 +858,21 @@ impl AgentHostHandle {
         prompt: &str,
         cancel: CancellationToken,
         event_tx: mpsc::UnboundedSender<SessionUpdate>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok("(cancelled)".into());
         }
 
+        let auth_label = crate::auth_store::resolve_wire_credentials()
+            .map(|w| format!("{} via {}", w.display_name, w.method))
+            .unwrap_or_else(|| "no credentials".into());
         emit_thought(
             &event_tx,
             session_id,
-            &format!("Using model {model} (effort {})…", effort.as_str()),
+            &format!(
+                "model={model} effort={} auth={auth_label}",
+                effort.as_str()
+            ),
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
@@ -878,13 +896,10 @@ impl AgentHostHandle {
                 steps,
                 status: "proposed".into(),
             });
-            emit_message(
-                &event_tx,
-                session_id,
-                "Plan proposed. Accept or reject from the plan panel.",
-            );
-            push_assistant(self, session_id, "Plan proposed.");
-            return Ok(());
+            let msg = "Plan proposed. Accept or reject from the plan panel.";
+            emit_message(&event_tx, session_id, msg);
+            push_assistant(self, session_id, msg);
+            return Ok(msg.into());
         }
 
         if let Some(rest) = prompt.strip_prefix('/') {
@@ -895,13 +910,14 @@ impl AgentHostHandle {
                         "Commands: /help /model /effort /clear /compact /plan /explore /task /yolo";
                     emit_message(&event_tx, session_id, text);
                     push_assistant(self, session_id, text);
-                    return Ok(());
+                    return Ok(text.into());
                 }
                 "yolo" => {
                     self.set_always_approve(true);
-                    emit_message(&event_tx, session_id, "Always-approve enabled.");
-                    push_assistant(self, session_id, "Always-approve enabled.");
-                    return Ok(());
+                    let text = "Always-approve enabled.";
+                    emit_message(&event_tx, session_id, text);
+                    push_assistant(self, session_id, text);
+                    return Ok(text.into());
                 }
                 _ => {}
             }
@@ -1008,21 +1024,32 @@ impl AgentHostHandle {
 
         if cancel.is_cancelled() {
             emit_message(&event_tx, session_id, "(cancelled)");
-            return Ok(());
+            return Ok("(cancelled)".into());
         }
 
-        // Prefer live model reply when an API key is available; otherwise local summary.
-        let reply = if let Some(api_key) = crate::auth_store::get_api_key() {
-            match call_xai_chat(&api_key, model, prompt, cwd).await {
+        // Live model when Grok Build session / API key is available.
+        let reply = if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
+            emit_thought(
+                &event_tx,
+                session_id,
+                &format!("calling xAI chat API as {}…", creds.method),
+            );
+            match call_xai_chat(&creds, model, prompt, cwd).await {
                 Ok(text) => text,
                 Err(e) => format!(
-                    "(model call failed: {e})\n\nLocal fallback for project {}.",
+                    "Model call failed: {e}\n\n\
+                     Auth source: {} ({})\n\
+                     Tips: run `grok login` if the CLI session expired, or set XAI_API_KEY / Save key.\n\
+                     Project: {}",
+                    creds.display_name,
+                    creds.method,
                     cwd.display()
                 ),
             }
         } else {
             format!(
-                "GrokPtah in-process agent finished turn (local tools mode — set xAI API key for live model).\n\nYou said: {}\n\nProject: {}\nModel: {} · effort: {}",
+                "{}\n\nYou said: {}\nProject: {}\nModel: {} · effort: {}",
+                crate::auth_store::auth_help_message(),
                 prompt.chars().take(200).collect::<String>(),
                 cwd.display(),
                 model,
@@ -1037,7 +1064,7 @@ impl AgentHostHandle {
             tokio::time::sleep(std::time::Duration::from_millis(3)).await;
         }
         push_assistant(self, session_id, &reply);
-        Ok(())
+        Ok(reply)
     }
 
     /// Run a shell tool with a single live child process. Streams stdout/stderr
@@ -1370,19 +1397,28 @@ fn extract_write(prompt: &str) -> Option<(String, String)> {
 }
 
 async fn call_xai_chat(
-    api_key: &str,
+    creds: &crate::auth_store::WireCredentials,
     model: &str,
     prompt: &str,
     cwd: &Path,
 ) -> Result<String> {
-    let client = reqwest::Client::new();
+    // Map desktop aliases to API model ids
+    let model_id = match model {
+        "grok-build" => "grok-3",
+        other => other,
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| anyhow!(e))?;
     let body = serde_json::json!({
-        "model": model,
+        "model": model_id,
         "messages": [
             {
                 "role": "system",
                 "content": format!(
-                    "You are GrokPtah, a coding agent. Project root: {}. Be concise.",
+                    "You are GrokPtah, a desktop coding agent built on Grok Build. \
+                     Working directory: {}. Be helpful and concise. Prefer concrete code changes.",
                     cwd.display()
                 )
             },
@@ -1391,25 +1427,32 @@ async fn call_xai_chat(
         "stream": false
     });
     let base = std::env::var("XAI_API_BASE").unwrap_or_else(|_| "https://api.x.ai/v1".into());
-    let resp = client
+    let mut req = client
         .post(format!("{base}/chat/completions"))
-        .bearer_auth(api_key)
+        .bearer_auth(&creds.bearer)
+        .header("Content-Type", "application/json");
+    // OIDC sessions from `grok login` need the same header Grok Build uses.
+    if creds.oidc_token_auth {
+        req = req.header("X-XAI-Token-Auth", "true");
+    }
+    let resp = req
         .json(&body)
         .send()
         .await
-        .map_err(|e| anyhow!(e))?;
+        .map_err(|e| anyhow!("request error: {e}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("HTTP {status}: {text}");
+        let clipped: String = text.chars().take(800).collect();
+        bail!("HTTP {status}: {clipped}");
     }
-    let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!(e))?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
     let content = v["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("")
         .to_string();
     if content.is_empty() {
-        bail!("empty model response");
+        bail!("empty model response: {v}");
     }
     Ok(content)
 }

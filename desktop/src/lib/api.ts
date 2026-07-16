@@ -16,7 +16,7 @@ export const api = {
   sessionLoad: (id: string) => invoke<SessionSummary>("session_load", { id }),
   sessionList: () => invoke<SessionSummary[]>("session_list"),
   sessionPrompt: (sessionId: string, prompt: string) =>
-    invoke<void>("session_prompt", { sessionId, prompt }),
+    invoke<string>("session_prompt", { sessionId, prompt }),
   sessionCancel: () => invoke<void>("session_cancel"),
   sessionFork: (sourceId: string) =>
     invoke<SessionSummary>("session_fork", { sourceId }),

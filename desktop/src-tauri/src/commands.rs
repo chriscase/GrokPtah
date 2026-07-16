@@ -75,7 +75,7 @@ pub async fn session_prompt(
     state: State<'_, AppState>,
     session_id: String,
     prompt: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state.host.session_prompt(id, prompt).await.map_err(map_err)
 }
