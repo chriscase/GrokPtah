@@ -1518,7 +1518,8 @@ impl AgentHostHandle {
             match cmd {
                 "help" => {
                     let text =
-                        "Commands: /help /model /effort /clear /compact /plan /explore /task /yolo";
+                        "Commands: /help /compact /plan /yolo. Build mode uses a multi-step tool loop \
+                         (list_dir, read_file, grep, write_file, run_terminal_cmd) until the task is done.";
                     emit_message(&event_tx, session_id, text);
                     push_assistant(self, session_id, text);
                     return Ok(text.into());
@@ -1534,172 +1535,561 @@ impl AgentHostHandle {
             }
         }
 
-        if lower.contains("explore") || lower.contains("subagent") {
-            let sid = Uuid::new_v4().to_string();
-            {
-                let mut g = self.inner.lock();
-                g.subagents.push(SubagentInfo {
-                    id: sid.clone(),
-                    kind: "explore".into(),
-                    title: "Explore codebase".into(),
-                    status: "running".into(),
-                });
-            }
-            let _ = event_tx.send(SessionUpdate::SubagentSpawned {
-                session_id,
-                subagent_id: sid.clone(),
-                kind: "explore".into(),
-                title: "Explore codebase".into(),
-            });
-            let _ = event_tx.send(SessionUpdate::SubagentUpdate {
-                session_id,
-                subagent_id: sid.clone(),
-                status: "completed".into(),
-                detail: Some("Indexed project files".into()),
-            });
-            {
-                let mut g = self.inner.lock();
-                if let Some(a) = g.subagents.iter_mut().find(|a| a.id == sid) {
-                    a.status = "completed".into();
-                }
-            }
-        }
+        // ── Real multi-step coding agent (tool-calling loop) ─────────────
+        let Some(creds) = crate::auth_store::resolve_wire_credentials() else {
+            let msg = format!(
+                "{}\n\nYou said: {}\nProject: {}\nModel: {} · effort: {}",
+                crate::auth_store::auth_help_message(),
+                prompt.chars().take(200).collect::<String>(),
+                cwd.display(),
+                model,
+                effort.as_str()
+            );
+            emit_message(&event_tx, session_id, &msg);
+            push_assistant(self, session_id, &msg);
+            return Ok(msg);
+        };
 
-        if lower.contains("background") || lower.contains("schedule") {
-            let task = self.schedule_background_task("Background index".into());
-            let _ = event_tx.send(SessionUpdate::BackgroundTask {
-                session_id: Some(session_id),
-                task_id: task.id,
-                title: task.title,
-                status: task.status,
-            });
-        }
-
-        if lower.contains("list") || lower.contains("files") || lower.contains("ls ") {
-            self.run_tool_call(
-                session_id,
-                "list_dir",
-                || async { local_tools::tool_list_dir(cwd, ".").await },
-                &cancel,
-                &event_tx,
-            )
-            .await?;
-        }
-
-        if let Some(path) = extract_read_path(prompt) {
-            self.run_tool_call(
-                session_id,
-                "read_file",
-                || async { local_tools::tool_read_file(cwd, &path).await },
-                &cancel,
-                &event_tx,
-            )
-            .await?;
-        }
-
-        if let Some(pat) = extract_search_pattern(prompt) {
-            self.run_tool_call(
-                session_id,
-                "grep",
-                || async { local_tools::tool_grep(cwd, &pat, ".").await },
-                &cancel,
-                &event_tx,
-            )
-            .await?;
-        }
-
-        // "write PATH << content" or "write PATH: content"
-        if let Some((wpath, content)) = extract_write(prompt) {
-            let host = self.clone();
-            let path_for_record = wpath.clone();
-            self.run_tool_call(
-                session_id,
-                "write_file",
-                {
-                    let cwd = cwd.to_path_buf();
-                    let wpath = wpath.clone();
-                    let content = content.clone();
-                    move || async move { local_tools::tool_write_file(&cwd, &wpath, &content).await }
-                },
-                &cancel,
-                &event_tx,
-            )
-            .await?;
-            host.record_edit(&path_for_record);
-        }
-
-        if let Some(cmd) = extract_shell(prompt) {
-            self.run_shell_tool(session_id, cwd, &cmd, &cancel, &event_tx)
-                .await?;
-        }
-
-        if cancel.is_cancelled() {
-            emit_message(&event_tx, session_id, "(cancelled)");
-            return Ok("(cancelled)".into());
-        }
-
-        // Live model when Grok Build session / API key is available.
-        let (wire_messages, compacted_summary) = {
+        let (wire_history, compacted_summary) = {
             let g = self.inner.lock();
             let s = g
                 .sessions
                 .get(&session_id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
-            (
-                api_context_messages(s),
-                s.compacted_summary.clone(),
-            )
+            (api_context_messages(s), s.compacted_summary.clone())
         };
-        let (reply, is_error) = if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
-            emit_thought(
-                &event_tx,
+
+        match self
+            .run_coding_agent_loop(
                 session_id,
-                &format!("calling chat API as {}…", creds.method),
-            );
-            match call_xai_chat(
-                &creds,
-                model,
-                &wire_messages,
-                compacted_summary.as_deref(),
                 cwd,
-                SessionKind::Build,
+                model,
+                &creds,
+                &wire_history,
+                compacted_summary.as_deref(),
+                &cancel,
+                &event_tx,
             )
             .await
-            {
-                Ok(text) => (text, false),
-                Err(e) => (
-                    format!(
-                        "Model call failed: {e}\n\n\
-                         Auth source: {} ({})\n\
-                         Tips: run `grok login` if the CLI session expired, or set XAI_API_KEY / Save key.\n\
-                         Project: {}",
-                        creds.display_name,
-                        creds.method,
-                        cwd.display()
-                    ),
-                    true,
-                ),
+        {
+            Ok(reply) => Ok(reply),
+            Err(e) => {
+                let msg = format!(
+                    "Agent failed: {e}\n\nAuth: {} ({})\nProject: {}\n\
+                     Tips: run `grok login` if needed.",
+                    creds.display_name,
+                    creds.method,
+                    cwd.display()
+                );
+                emit_message(&event_tx, session_id, &msg);
+                push_assistant(self, session_id, &msg);
+                Ok(msg)
             }
-        } else {
-            (
-                format!(
-                    "{}\n\nYou said: {}\nProject: {}\nModel: {} · effort: {}",
-                    crate::auth_store::auth_help_message(),
-                    prompt.chars().take(200).collect::<String>(),
-                    cwd.display(),
-                    model,
-                    effort.as_str()
-                ),
-                true,
-            )
-        };
-        emit_message(&event_tx, session_id, &reply);
-        push_assistant(self, session_id, &reply);
-        Ok(reply)
+        }
     }
 
-    /// Run a shell tool with a single live child process. Streams stdout/stderr
-    /// to the UI for attach (no second re-exec). Cancel kills the child.
+    /// Multi-round tool loop: model proposes tools → we run them → feed results
+    /// back until a final text answer or max rounds.
+    async fn run_coding_agent_loop(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        model: &str,
+        creds: &crate::auth_store::WireCredentials,
+        history: &[(String, String)],
+        compacted_summary: Option<&str>,
+        cancel: &CancellationToken,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) -> Result<String> {
+        const MAX_ROUNDS: usize = 24;
+        let mut messages = build_agent_messages(history, compacted_summary, cwd);
+        let tools = coding_agent_tools();
+
+        emit_thought(
+            event_tx,
+            session_id,
+            &format!(
+                "agent loop starting (tools on, max {MAX_ROUNDS} rounds) as {}…",
+                creds.method
+            ),
+        );
+
+        for round in 1..=MAX_ROUNDS {
+            if cancel.is_cancelled() {
+                let msg = "(cancelled)".to_string();
+                emit_message(event_tx, session_id, &msg);
+                push_assistant(self, session_id, &msg);
+                return Ok(msg);
+            }
+
+            emit_thought(
+                event_tx,
+                session_id,
+                &format!("agent round {round}/{MAX_ROUNDS}…"),
+            );
+
+            let step = call_xai_agent_step(creds, model, &messages, &tools).await?;
+
+            match step {
+                AgentStep::Final(text) => {
+                    let text = if text.trim().is_empty() {
+                        "(agent finished with empty reply)".into()
+                    } else {
+                        text
+                    };
+                    emit_message(event_tx, session_id, &text);
+                    push_assistant(self, session_id, &text);
+                    return Ok(text);
+                }
+                AgentStep::ToolCalls {
+                    content,
+                    tool_calls,
+                } => {
+                    if let Some(c) = content.as_ref().filter(|s| !s.trim().is_empty()) {
+                        // Mid-turn narration (optional)
+                        emit_message(event_tx, session_id, c);
+                    }
+
+                    // OpenAI-style assistant message carrying tool_calls
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": tool_calls.iter().map(|tc| serde_json::json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                            }
+                        })).collect::<Vec<_>>(),
+                    }));
+
+                    for tc in &tool_calls {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        emit_thought(
+                            event_tx,
+                            session_id,
+                            &format!("tool `{}`…", tc.name),
+                        );
+                        let output = self
+                            .dispatch_agent_tool(
+                                session_id,
+                                cwd,
+                                &tc.name,
+                                &tc.arguments,
+                                cancel,
+                                event_tx,
+                            )
+                            .await;
+                        let content = match &output {
+                            Ok(s) => s.clone(),
+                            Err(e) => format!("ERROR: {e}"),
+                        };
+                        // Cap tool output size for the wire
+                        let content = if content.len() > 24_000 {
+                            format!(
+                                "{}…\n(truncated {} bytes)",
+                                &content[..24_000],
+                                content.len()
+                            )
+                        } else {
+                            content
+                        };
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": content,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let msg = format!(
+            "Stopped after {MAX_ROUNDS} tool rounds without a final answer. \
+             Ask me to continue, or narrow the task."
+        );
+        emit_message(event_tx, session_id, &msg);
+        push_assistant(self, session_id, &msg);
+        Ok(msg)
+    }
+
+    /// Run one model-requested tool with permissions + UI events.
+    async fn dispatch_agent_tool(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        name: &str,
+        arguments_json: &str,
+        cancel: &CancellationToken,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) -> Result<String> {
+        let args: serde_json::Value =
+            serde_json::from_str(arguments_json).unwrap_or_else(|_| serde_json::json!({}));
+
+        match name {
+            "list_dir" => {
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string();
+                self.run_tool_for_output(
+                    session_id,
+                    "list_dir",
+                    &args,
+                    || {
+                        let cwd = cwd.to_path_buf();
+                        let path = path.clone();
+                        async move { local_tools::tool_list_dir(&cwd, &path).await }
+                    },
+                    cancel,
+                    event_tx,
+                )
+                .await
+            }
+            "read_file" => {
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("read_file requires path"))?
+                    .to_string();
+                self.run_tool_for_output(
+                    session_id,
+                    "read_file",
+                    &args,
+                    || {
+                        let cwd = cwd.to_path_buf();
+                        let path = path.clone();
+                        async move { local_tools::tool_read_file(&cwd, &path).await }
+                    },
+                    cancel,
+                    event_tx,
+                )
+                .await
+            }
+            "grep" => {
+                let pattern = args
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("grep requires pattern"))?
+                    .to_string();
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string();
+                self.run_tool_for_output(
+                    session_id,
+                    "grep",
+                    &args,
+                    || {
+                        let cwd = cwd.to_path_buf();
+                        let pattern = pattern.clone();
+                        let path = path.clone();
+                        async move { local_tools::tool_grep(&cwd, &pattern, &path).await }
+                    },
+                    cancel,
+                    event_tx,
+                )
+                .await
+            }
+            "write_file" => {
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("write_file requires path"))?
+                    .to_string();
+                let content = args
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("write_file requires content"))?
+                    .to_string();
+                let path_record = path.clone();
+                let out = self
+                    .run_tool_for_output(
+                        session_id,
+                        "write_file",
+                        &args,
+                        || {
+                            let cwd = cwd.to_path_buf();
+                            let path = path.clone();
+                            let content = content.clone();
+                            async move {
+                                local_tools::tool_write_file(&cwd, &path, &content).await
+                            }
+                        },
+                        cancel,
+                        event_tx,
+                    )
+                    .await;
+                if out.is_ok() {
+                    self.record_edit(&path_record);
+                }
+                out
+            }
+            "run_terminal_cmd" => {
+                let command = args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("run_terminal_cmd requires command"))?
+                    .to_string();
+                self.run_shell_tool_for_output(
+                    session_id,
+                    cwd,
+                    &command,
+                    cancel,
+                    event_tx,
+                )
+                .await
+            }
+            other => Ok(format!(
+                "Unknown tool `{other}`. Available: list_dir, read_file, grep, write_file, run_terminal_cmd"
+            )),
+        }
+    }
+
+    /// Like run_tool_call but returns the tool output string (or denial).
+    async fn run_tool_for_output<F, Fut>(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        input: &serde_json::Value,
+        f: F,
+        cancel: &CancellationToken,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) -> Result<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<local_tools::ToolResult>>,
+    {
+        if cancel.is_cancelled() {
+            return Ok("(cancelled)".into());
+        }
+        let call_id = Uuid::new_v4().to_string();
+        let needs_perm = matches!(tool_name, "run_terminal_cmd" | "write_file");
+        let always = {
+            let g = self.inner.lock();
+            g.always_approve
+                || g.always_allowed_tools.contains(tool_name)
+                || g.permission_mode == "bypassPermissions"
+        };
+
+        if needs_perm && !always {
+            let req = PermissionRequest {
+                id: Uuid::new_v4(),
+                session_id,
+                tool_name: tool_name.into(),
+                summary: format!("Allow tool `{tool_name}`?"),
+                detail: input.clone(),
+            };
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut g = self.inner.lock();
+                g.pending_permissions
+                    .insert(req.id, PendingPermission { tx });
+            }
+            let _ = event_tx.send(SessionUpdate::PermissionRequired {
+                session_id,
+                request: req,
+            });
+            let decision = tokio::select! {
+                d = rx => d.unwrap_or(PermissionDecision::Deny),
+                _ = cancel.cancelled() => PermissionDecision::Deny,
+            };
+            if decision == PermissionDecision::Deny {
+                let _ = event_tx.send(SessionUpdate::ToolCall {
+                    session_id,
+                    call_id: call_id.clone(),
+                    title: tool_name.into(),
+                    kind: tool_kind(tool_name),
+                    status: ToolCallStatus::Denied,
+                    input: input.clone(),
+                });
+                return Ok(format!("DENIED: user denied tool `{tool_name}`"));
+            }
+            if decision == PermissionDecision::AlwaysAllow {
+                let mut g = self.inner.lock();
+                g.always_allowed_tools.insert(tool_name.into());
+            }
+        }
+
+        let _ = event_tx.send(SessionUpdate::ToolCall {
+            session_id,
+            call_id: call_id.clone(),
+            title: tool_name.into(),
+            kind: tool_kind(tool_name),
+            status: ToolCallStatus::Running,
+            input: input.clone(),
+        });
+
+        match f().await {
+            Ok(tr) => {
+                let out = tr.output.clone();
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: if tr.cancelled {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    },
+                    output: Some(out.clone()),
+                });
+                Ok(out)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: ToolCallStatus::Failed,
+                    output: Some(msg.clone()),
+                });
+                Ok(format!("ERROR: {msg}"))
+            }
+        }
+    }
+
+    async fn run_shell_tool_for_output(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        command: &str,
+        cancel: &CancellationToken,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) -> Result<String> {
+        if cancel.is_cancelled() {
+            return Ok("(cancelled)".into());
+        }
+        let call_id = Uuid::new_v4().to_string();
+        let always = {
+            let g = self.inner.lock();
+            g.always_approve
+                || g.always_allowed_tools.contains("run_terminal_cmd")
+                || g.permission_mode == "bypassPermissions"
+        };
+
+        if !always {
+            let req = PermissionRequest {
+                id: Uuid::new_v4(),
+                session_id,
+                tool_name: "run_terminal_cmd".into(),
+                summary: format!("Allow shell: {command}"),
+                detail: serde_json::json!({ "tool": "run_terminal_cmd", "command": command }),
+            };
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut g = self.inner.lock();
+                g.pending_permissions
+                    .insert(req.id, PendingPermission { tx });
+            }
+            let _ = event_tx.send(SessionUpdate::PermissionRequired {
+                session_id,
+                request: req,
+            });
+            let decision = tokio::select! {
+                d = rx => d.unwrap_or(PermissionDecision::Deny),
+                _ = cancel.cancelled() => PermissionDecision::Deny,
+            };
+            if decision == PermissionDecision::Deny {
+                let _ = event_tx.send(SessionUpdate::ToolCall {
+                    session_id,
+                    call_id: call_id.clone(),
+                    title: "run_terminal_cmd".into(),
+                    kind: ToolCallKind::Execute,
+                    status: ToolCallStatus::Denied,
+                    input: serde_json::json!({ "command": command }),
+                });
+                return Ok(format!("DENIED: user denied shell `{command}`"));
+            }
+            if decision == PermissionDecision::AlwaysAllow {
+                let mut g = self.inner.lock();
+                g.always_allowed_tools.insert("run_terminal_cmd".into());
+            }
+        }
+
+        let _ = event_tx.send(SessionUpdate::ToolCall {
+            session_id,
+            call_id: call_id.clone(),
+            title: "run_terminal_cmd".into(),
+            kind: ToolCallKind::Execute,
+            status: ToolCallStatus::Running,
+            input: serde_json::json!({ "command": command }),
+        });
+        let _ = event_tx.send(SessionUpdate::ShellSessionStarted {
+            session_id,
+            call_id: call_id.clone(),
+            command: command.to_string(),
+        });
+
+        let live_shell = self.inner.lock().live_shell.clone();
+        let event_tx_chunks = event_tx.clone();
+        let call_id_chunks = call_id.clone();
+        let result = local_tools::tool_shell_streaming(
+            cwd,
+            command,
+            cancel.clone(),
+            live_shell,
+            move |chunk| {
+                let _ = event_tx_chunks.send(SessionUpdate::ShellOutput {
+                    session_id,
+                    call_id: call_id_chunks.clone(),
+                    data: chunk,
+                });
+            },
+        )
+        .await;
+
+        match result {
+            Ok(tr) => {
+                let cancelled = tr.cancelled;
+                let out = tr.output.clone();
+                let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
+                    session_id,
+                    call_id: call_id.clone(),
+                    exit_code: None,
+                    cancelled,
+                });
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: if cancelled {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    },
+                    output: Some(out.clone()),
+                });
+                Ok(if cancelled {
+                    format!("{out}\n(cancelled)")
+                } else {
+                    out
+                })
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
+                    session_id,
+                    call_id: call_id.clone(),
+                    exit_code: None,
+                    cancelled: cancel.is_cancelled(),
+                });
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: ToolCallStatus::Failed,
+                    output: Some(msg.clone()),
+                });
+                Ok(format!("ERROR: {msg}"))
+            }
+        }
+    }
+
+    /// Legacy shell helper (unused by agent loop; kept for call sites).
+    #[allow(dead_code)]
     async fn run_shell_tool(
         &self,
         session_id: Uuid,
@@ -1829,6 +2219,7 @@ impl AgentHostHandle {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn run_tool_call<F, Fut>(
         &self,
         session_id: Uuid,
@@ -1958,75 +2349,299 @@ fn emit_thought(tx: &mpsc::UnboundedSender<SessionUpdate>, session_id: Uuid, tex
     });
 }
 
-fn chunk_text(s: &str, size: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for ch in s.chars() {
-        cur.push(ch);
-        if cur.chars().count() >= size {
-            out.push(std::mem::take(&mut cur));
-        }
+fn tool_kind(name: &str) -> ToolCallKind {
+    match name {
+        "read_file" | "list_dir" => ToolCallKind::Read,
+        "write_file" => ToolCallKind::Edit,
+        "grep" => ToolCallKind::Search,
+        "run_terminal_cmd" => ToolCallKind::Execute,
+        _ => ToolCallKind::Other,
     }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
 }
 
-fn extract_read_path(prompt: &str) -> Option<String> {
-    let lower = prompt.to_lowercase();
-    for prefix in ["read ", "open ", "cat "] {
-        if let Some(i) = lower.find(prefix) {
-            let rest = &prompt[i + prefix.len()..];
-            let token = rest.split_whitespace().next()?;
-            if token.contains('.') || token.contains('/') {
-                return Some(token.to_string());
+struct AgentToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+enum AgentStep {
+    Final(String),
+    ToolCalls {
+        content: Option<String>,
+        tool_calls: Vec<AgentToolCall>,
+    },
+}
+
+fn coding_agent_tools() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List files and directories under a path relative to the project root.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Relative directory path. Use \".\" for the project root."
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a text file relative to the project root.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative file path" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Search file contents with a regex pattern under a path.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Regex pattern" },
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path to search (file or directory). Default \".\""
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Create or overwrite a file with the given content. Prefer complete file contents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative file path" },
+                        "content": { "type": "string", "description": "Full file contents to write" }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_terminal_cmd",
+                "description": "Run a shell command in the project working directory (tests, builds, git, etc.).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Shell command to execute" }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }
+    ])
+}
+
+fn build_agent_messages(
+    history: &[(String, String)],
+    compacted_summary: Option<&str>,
+    cwd: &Path,
+) -> Vec<serde_json::Value> {
+    let system = format!(
+        "You are GrokPtah, a desktop coding agent (Grok Build–style).\n\
+         Working directory: {}.\n\
+         Use tools to explore and change the codebase. Do not invent file contents — read or list first.\n\
+         Prefer small, concrete edits via write_file. Run tests/builds with run_terminal_cmd when useful.\n\
+         When the task is done, respond with a clear final summary and no more tool calls.\n\
+         Be concise in narration; put substantial content into tool arguments.",
+        cwd.display()
+    );
+    let mut messages = Vec::with_capacity(history.len() + 3);
+    messages.push(serde_json::json!({
+        "role": "system",
+        "content": system
+    }));
+    if let Some(summary) = compacted_summary.filter(|s| !s.is_empty()) {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": format!(
+                "Earlier conversation was compacted for context limits \
+                 (full history retained only on the user's machine).\n\n{summary}"
+            )
+        }));
+    }
+    if history.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": "(empty)"
+        }));
+    } else {
+        for (role, content) in history {
+            let role = match role.as_str() {
+                "assistant" => "assistant",
+                "system" => "system",
+                _ => "user",
+            };
+            messages.push(serde_json::json!({
+                "role": role,
+                "content": content
+            }));
+        }
+    }
+    messages
+}
+
+fn resolve_api_base(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+) -> (String, String) {
+    let entry = crate::models_catalog::lookup(model);
+    let model_id = entry
+        .as_ref()
+        .map(|e| e.wire_model.as_str())
+        .unwrap_or(model)
+        .to_string();
+    let base = if let Ok(env) = std::env::var("XAI_API_BASE") {
+        env
+    } else if creds.oidc_token_auth {
+        entry
+            .as_ref()
+            .and_then(|e| e.base_url.clone())
+            .filter(|u| u.contains("cli-chat-proxy") || u.contains("x.ai"))
+            .unwrap_or_else(|| "https://cli-chat-proxy.grok.com/v1".into())
+    } else if let Some(u) = entry.as_ref().and_then(|e| e.base_url.clone()) {
+        u
+    } else {
+        "https://api.x.ai/v1".into()
+    };
+    (base, model_id)
+}
+
+async fn call_xai_agent_step(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    messages: &[serde_json::Value],
+    tools: &serde_json::Value,
+) -> Result<AgentStep> {
+    let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
+    let (base, model_id) = resolve_api_base(&creds, model);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .user_agent(format!(
+            "grok/{} (GrokPtah)",
+            crate::auth_store::client_version_header()
+        ))
+        .build()
+        .map_err(|e| anyhow!(e))?;
+
+    let body = serde_json::json!({
+        "model": model_id,
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+        "stream": false
+    });
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+
+    let send_once = |c: &crate::auth_store::WireCredentials| {
+        let req = client
+            .post(&url)
+            .header("Content-Type", "application/json");
+        let req = crate::auth_store::apply_auth_headers(req, c, &base);
+        req.json(&body)
+    };
+
+    let mut resp = send_once(&creds).send().await.map_err(|e| {
+        anyhow!("request error for {url}: {e}")
+    })?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
+        match crate::auth_store::force_refresh(&creds).await {
+            Ok(fresh) => {
+                creds = fresh;
+                resp = send_once(&creds)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("request error after refresh: {e}"))?;
+            }
+            Err(e) => {
+                let text = resp.text().await.unwrap_or_default();
+                bail!("HTTP 401 (refresh failed: {e}): {}", text.chars().take(400).collect::<String>());
             }
         }
     }
-    None
-}
 
-fn extract_search_pattern(prompt: &str) -> Option<String> {
-    let lower = prompt.to_lowercase();
-    for prefix in ["search ", "grep ", "find "] {
-        if let Some(i) = lower.find(prefix) {
-            let rest = &prompt[i + prefix.len()..];
-            let token = rest.split_whitespace().next()?;
-            return Some(token.trim_matches('"').to_string());
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("HTTP {status}: {}", text.chars().take(800).collect::<String>());
+    }
+
+    let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
+    let msg = &v["choices"][0]["message"];
+
+    // Tool calls present → agent continues
+    if let Some(arr) = msg["tool_calls"].as_array() {
+        if !arr.is_empty() {
+            let mut tool_calls = Vec::new();
+            for tc in arr {
+                let id = tc["id"]
+                    .as_str()
+                    .unwrap_or_else(|| "call")
+                    .to_string();
+                let name = tc["function"]["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let arguments = match &tc["function"]["arguments"] {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                tool_calls.push(AgentToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
+            }
+            if !tool_calls.is_empty() {
+                let content = msg["content"].as_str().map(|s| s.to_string());
+                return Ok(AgentStep::ToolCalls {
+                    content,
+                    tool_calls,
+                });
+            }
         }
     }
-    None
-}
 
-fn extract_shell(prompt: &str) -> Option<String> {
-    let lower = prompt.to_lowercase();
-    if lower.starts_with("run ") {
-        return Some(prompt[4..].trim().to_string());
-    }
-    if lower.starts_with("shell ") {
-        return Some(prompt[6..].trim().to_string());
-    }
-    if lower.starts_with("$ ") {
-        return Some(prompt[2..].trim().to_string());
-    }
-    None
-}
-
-/// `write path/to/file: contents here`
-fn extract_write(prompt: &str) -> Option<(String, String)> {
-    let lower = prompt.to_lowercase();
-    let rest = lower.strip_prefix("write ")?;
-    let orig = prompt.get(6..)?;
-    if let Some((path, content)) = orig.split_once(':') {
-        let path = path.trim().to_string();
-        let content = content.trim().to_string();
-        if !path.is_empty() {
-            return Some((path, content));
+    if let Some(content) = msg["content"].as_str() {
+        if !content.is_empty() {
+            return Ok(AgentStep::Final(content.to_string()));
         }
     }
-    let _ = rest;
-    None
+    // reasoning-only or empty — treat as final empty
+    if let Some(r) = msg["reasoning_content"].as_str() {
+        if !r.is_empty() {
+            return Ok(AgentStep::Final(r.to_string()));
+        }
+    }
+    bail!("empty agent response: {v}");
 }
 
 /// Build the extractive summary for transcript entries that leave the API window.
