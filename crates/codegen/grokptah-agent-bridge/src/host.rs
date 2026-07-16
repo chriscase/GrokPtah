@@ -31,7 +31,9 @@ pub struct HostConfig {
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
-            default_model: "grok-3".into(),
+            // Same source as Grok Build: config.toml [models].default, else
+            // preferred id from ~/.grok/models_cache.json, else "grok-build".
+            default_model: crate::models_catalog::resolve_default_model(),
             default_effort: EffortLevel::Medium,
             always_approve: false,
         }
@@ -325,28 +327,11 @@ impl AgentHostHandle {
     }
 
     pub fn models(&self) -> Vec<ModelInfo> {
-        vec![
-            ModelInfo {
-                id: "grok-3".into(),
-                display_name: "Grok 3".into(),
-                supports_effort: true,
-            },
-            ModelInfo {
-                id: "grok-4".into(),
-                display_name: "Grok 4".into(),
-                supports_effort: true,
-            },
-            ModelInfo {
-                id: "grok-3-mini".into(),
-                display_name: "Grok 3 Mini".into(),
-                supports_effort: false,
-            },
-            ModelInfo {
-                id: "grok-2".into(),
-                display_name: "Grok 2".into(),
-                supports_effort: false,
-            },
-        ]
+        // Live catalog from Grok Build's models_cache.json + builtins (grok-build, …).
+        crate::models_catalog::load_catalog()
+            .into_iter()
+            .map(|m| m.info)
+            .collect()
     }
 
     pub fn auth_state(&self) -> AuthState {
@@ -1440,10 +1425,23 @@ async fn call_xai_chat(
     prompt: &str,
     cwd: &Path,
 ) -> Result<String> {
-    // Map desktop aliases to API model ids
-    let model_id = match model {
-        "grok-build" => "grok-3",
-        other => other,
+    // Use the same catalog Grok Build wrote (wire id + base_url). Do not remap
+    // `grok-build` → `grok-3` — that made the desktop look stuck on old models.
+    let entry = crate::models_catalog::lookup(model);
+    let model_id = entry
+        .as_ref()
+        .map(|e| e.wire_model.as_str())
+        .unwrap_or(model);
+    // OIDC / cli session: prefer the proxy base from models_cache (cli-chat-proxy).
+    // API keys: public api.x.ai unless the catalog specifies otherwise or env overrides.
+    let base = if let Ok(env) = std::env::var("XAI_API_BASE") {
+        env
+    } else if let Some(u) = entry.as_ref().and_then(|e| e.base_url.clone()) {
+        u
+    } else if creds.oidc_token_auth {
+        "https://cli-chat-proxy.grok.com/v1".into()
+    } else {
+        "https://api.x.ai/v1".into()
     };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -1464,9 +1462,8 @@ async fn call_xai_chat(
         ],
         "stream": false
     });
-    let base = std::env::var("XAI_API_BASE").unwrap_or_else(|_| "https://api.x.ai/v1".into());
     let mut req = client
-        .post(format!("{base}/chat/completions"))
+        .post(format!("{}/chat/completions", base.trim_end_matches('/')))
         .bearer_auth(&creds.bearer)
         .header("Content-Type", "application/json");
     // OIDC sessions from `grok login` need the same header Grok Build uses.

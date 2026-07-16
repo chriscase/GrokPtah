@@ -680,7 +680,13 @@ export default function App() {
           )}
           <div className="composer-meta">
             <select
-              value={status?.model ?? "grok-build"}
+              value={
+                // Prefer host selection; fall back to first catalog entry
+                // (Grok Build default / latest), not a hard-coded grok-3.
+                models.some((m) => m.id === status?.model)
+                  ? (status?.model ?? models[0]?.id ?? "grok-build")
+                  : (models[0]?.id ?? status?.model ?? "grok-build")
+              }
               onChange={async (e) => {
                 await api.setModel(e.target.value);
                 await refreshChrome();

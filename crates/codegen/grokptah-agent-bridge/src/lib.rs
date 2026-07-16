@@ -8,6 +8,7 @@ mod discover;
 mod events;
 mod host;
 mod local_tools;
+mod models_catalog;
 mod permission;
 mod session;
 mod types;
