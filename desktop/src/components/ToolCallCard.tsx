@@ -28,7 +28,7 @@ function statusGlyph(status: string): string {
   }
 }
 
-function shortOutput(output?: string, max = 100): string {
+function shortOutput(output?: string, max = 88): string {
   if (!output) return "";
   const one = output.replace(/\s+/g, " ").trim();
   if (one.length <= max) return one;
@@ -36,33 +36,34 @@ function shortOutput(output?: string, max = 100): string {
 }
 
 /**
- * Compact tool call row. Uses <details> so it stays visible even if custom
- * button styles fight the chrome, and so output is expandable for power users.
+ * Compact tool row — collapsed by default.
+ *
+ * Only auto-expands while status is running/pending. On complete/fail it
+ * collapses again unless the user has manually toggled this card.
  */
-export function ToolCallCard({
-  item,
-  defaultOpen,
-}: {
-  item: ToolItem;
-  defaultOpen?: boolean;
-}) {
+export function ToolCallCard({ item }: { item: ToolItem }) {
   const status = statusLabel(item.status);
   const live = status === "running" || status === "pending";
-  const [open, setOpen] = useState(Boolean(defaultOpen) || live);
-  const preview = shortOutput(item.output);
+  /** null = follow automatic open rules; boolean = user override */
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const title = item.title?.trim() || "tool";
+  const preview = shortOutput(item.output);
 
-  // When a tool finishes and gains output, keep collapsed unless user opened it;
-  // when it starts running, auto-open briefly for live feedback.
+  // New tool identity → clear any previous manual open state
   useEffect(() => {
-    if (live) setOpen(true);
-  }, [live]);
+    setUserOpen(null);
+  }, [item.callId]);
+
+  const open = userOpen !== null ? userOpen : live;
 
   return (
     <details
       className={`tool-card status-${status} ${live ? "is-live" : ""}`}
       open={open}
-      onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+      onToggle={(e) => {
+        // Capture user intent so we don't re-open finished tools after they click.
+        setUserOpen((e.target as HTMLDetailsElement).open);
+      }}
     >
       <summary className="tool-card-header">
         <span className="tool-card-glyph" aria-hidden>
@@ -74,6 +75,9 @@ export function ToolCallCard({
           <span className="tool-card-preview" title={item.output}>
             {preview}
           </span>
+        ) : null}
+        {!open && live && !preview ? (
+          <span className="tool-card-preview">running…</span>
         ) : null}
       </summary>
       {item.output ? (
@@ -87,10 +91,13 @@ export function ToolCallCard({
   );
 }
 
-/** Collapse older tool calls into a single expandable group. */
+/**
+ * Show recent tools as compact rows; older ones stay behind a toggle.
+ * Nothing is force-expanded when complete.
+ */
 export function ToolHistoryGroup({
   tools,
-  keepRecent = 6,
+  keepRecent = 8,
 }: {
   tools: { item: ToolItem; index: number }[];
   keepRecent?: number;
@@ -122,16 +129,8 @@ export function ToolHistoryGroup({
         older.map(({ item, index }) => (
           <ToolCallCard key={`tool-old-${item.callId || index}`} item={item} />
         ))}
-      {recent.map(({ item, index }, i) => (
-        <ToolCallCard
-          key={`tool-r-${item.callId || index}`}
-          item={item}
-          defaultOpen={
-            i === recent.length - 1 &&
-            (statusLabel(item.status) === "running" ||
-              statusLabel(item.status) === "pending")
-          }
-        />
+      {recent.map(({ item, index }) => (
+        <ToolCallCard key={`tool-r-${item.callId || index}`} item={item} />
       ))}
     </div>
   );
