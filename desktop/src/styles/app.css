@@ -624,48 +624,63 @@ button:disabled {
   border-radius: 999px;
 }
 
-/* Gemini-style progressive markdown + beam-in for the live tail */
+/* Gemini-style progressive markdown + materializing beam */
 .stream-md {
   display: block;
+  position: relative;
+}
+
+.stream-md.is-streaming {
+  /* soft aura around the whole live reply */
+  text-shadow: 0 0 40px rgba(240, 180, 41, 0.04);
 }
 
 .stream-md.is-streaming .stream-md-stable {
-  /* Settled markdown stays crisp */
   opacity: 1;
 }
 
 .stream-md-tail {
   display: inline;
+  /* Live tip sits in a faint warm pool so beams read clearly */
+  padding: 0 0.05em;
+  border-radius: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(240, 180, 41, 0.04) 20%,
+    rgba(160, 200, 255, 0.05) 80%,
+    transparent
+  );
 }
 
 .stream-md-settled {
-  animation: stream-md-settle 0.35s ease-out both;
+  animation: stream-md-settle 0.45s ease-out both;
 }
 
 @keyframes stream-md-settle {
-  from {
-    filter: brightness(1.04);
+  0% {
+    filter: brightness(1.08) saturate(1.05);
+    opacity: 0.92;
   }
-  to {
+  100% {
     filter: none;
+    opacity: 1;
   }
 }
 
-/* When stable markdown ends mid-flow, tail continues inline-ish */
 .stream-md-stable .md-body > :last-child {
   margin-bottom: 0.35em;
 }
 
-/* Gemini-style “beam in” for streamed tokens */
+/* Word-level beam spans */
 .stream-text {
   display: inline;
 }
 
 .stream-text.is-streaming {
-  /* warm ambient wash while tokens arrive */
   text-shadow:
-    0 0 18px rgba(240, 180, 41, 0.12),
-    0 0 36px rgba(160, 200, 255, 0.08);
+    0 0 20px rgba(240, 180, 41, 0.14),
+    0 0 40px rgba(160, 200, 255, 0.1);
 }
 
 .stream-token {
@@ -674,58 +689,63 @@ button:disabled {
 }
 
 .stream-token-beam {
-  animation: stream-beam-in 0.7s cubic-bezier(0.16, 1, 0.3, 1) both;
+  display: inline;
+  animation: stream-beam-in 0.95s cubic-bezier(0.14, 1, 0.3, 1) both;
   will-change: opacity, filter, transform, text-shadow;
 }
 
 .stream-caret {
   display: inline-block;
-  width: 0.5em;
-  height: 1.05em;
+  width: 0.55em;
+  height: 1.1em;
   margin-left: 2px;
   vertical-align: text-bottom;
   background: linear-gradient(
     180deg,
-    rgba(240, 180, 41, 1),
-    rgba(240, 180, 41, 0.35) 55%,
-    rgba(160, 200, 255, 0.45)
+    #ffe08a 0%,
+    rgba(240, 180, 41, 0.95) 40%,
+    rgba(140, 190, 255, 0.7) 100%
   );
-  border-radius: 1px;
+  border-radius: 1.5px;
   box-shadow:
-    0 0 8px rgba(240, 180, 41, 0.55),
-    0 0 16px rgba(160, 200, 255, 0.25);
-  animation: stream-caret-blink 0.85s ease-in-out infinite;
+    0 0 10px rgba(240, 180, 41, 0.75),
+    0 0 22px rgba(160, 200, 255, 0.4),
+    0 0 4px rgba(255, 255, 255, 0.5);
+  animation: stream-caret-blink 0.75s ease-in-out infinite;
 }
 
 @keyframes stream-beam-in {
   0% {
     opacity: 0;
-    filter: blur(8px) brightness(1.85) saturate(1.25);
-    transform: translateY(0.4em) scale(0.96);
+    filter: blur(10px) brightness(2.1) saturate(1.4);
+    transform: translateY(0.55em) scale(0.94);
+    color: #fff6d0;
     text-shadow:
-      0 0 18px rgba(240, 180, 41, 0.75),
-      0 0 36px rgba(160, 200, 255, 0.45),
-      0 0 4px rgba(255, 255, 255, 0.5);
+      0 0 22px rgba(240, 180, 41, 0.95),
+      0 0 44px rgba(160, 200, 255, 0.55),
+      0 0 8px rgba(255, 255, 255, 0.7);
   }
-  40% {
+  28% {
     opacity: 1;
-    filter: blur(2.5px) brightness(1.35) saturate(1.1);
-    transform: translateY(0.12em) scale(0.99);
+    filter: blur(4px) brightness(1.55) saturate(1.2);
+    transform: translateY(0.2em) scale(0.98);
     text-shadow:
-      0 0 12px rgba(240, 180, 41, 0.45),
-      0 0 22px rgba(160, 200, 255, 0.28);
+      0 0 16px rgba(240, 180, 41, 0.65),
+      0 0 30px rgba(160, 200, 255, 0.4);
   }
-  72% {
-    filter: blur(0.6px) brightness(1.08);
-    transform: translateY(0.02em) scale(1);
+  58% {
+    filter: blur(1.2px) brightness(1.18);
+    transform: translateY(0.04em) scale(1);
+    color: inherit;
     text-shadow:
-      0 0 6px rgba(240, 180, 41, 0.18),
-      0 0 12px rgba(160, 200, 255, 0.1);
+      0 0 8px rgba(240, 180, 41, 0.28),
+      0 0 16px rgba(160, 200, 255, 0.15);
   }
   100% {
     opacity: 1;
     filter: blur(0) brightness(1) saturate(1);
     transform: none;
+    color: inherit;
     text-shadow: none;
   }
 }
@@ -733,10 +753,12 @@ button:disabled {
 @keyframes stream-caret-blink {
   0%,
   100% {
-    opacity: 0.25;
+    opacity: 0.2;
+    transform: scaleY(0.92);
   }
   50% {
     opacity: 1;
+    transform: scaleY(1);
   }
 }
 
@@ -3258,11 +3280,17 @@ button:disabled {
   align-self: center;
 }
 
-.session-tab-split:hover,
+.session-tab-split:hover:not(:disabled),
 .session-tab-split.on {
   border-color: var(--accent-dim);
   color: var(--accent);
   background: var(--accent-bg);
+}
+
+.session-tab-split:disabled,
+.session-tab-split.is-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* ── Fleet strip ── */
@@ -3367,7 +3395,8 @@ button:disabled {
   /* density class is on main; shell columns stay; extra space is for panes */
 }
 
-@media (max-width: 1439px) {
+/* Fleet strip only on wide+; match SPLIT_MIN_WIDTH (1180) in layout.ts */
+@media (max-width: 1179px) {
   .fleet-strip {
     display: none;
   }

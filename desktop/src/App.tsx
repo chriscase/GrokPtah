@@ -23,7 +23,11 @@ import { SessionBrowser } from "./components/SessionBrowser";
 import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
-import { canSplitSessions, useLayoutDensity } from "./lib/layout";
+import {
+  canSplitSessions,
+  SPLIT_MIN_WIDTH,
+  useLayoutDensity,
+} from "./lib/layout";
 import {
   collapseRepeatedText,
   mergeAssistantChunk,
@@ -328,54 +332,6 @@ export default function App() {
     });
   }, []);
 
-  const openBeside = useCallback(
-    async (sessionId: string) => {
-      if (!splitOk) return;
-      if (sessionId === activeSessionId) {
-        const other = tabs.find((t) => t.id !== sessionId);
-        if (other) setSideSessionId(other.id);
-        return;
-      }
-      let summary = sessions.find((s) => s.id === sessionId);
-      if (!summary) {
-        try {
-          summary = await api.sessionLoad(sessionId);
-        } catch {
-          return;
-        }
-      }
-      const keepFocus = activeSessionId;
-      const already = tabs.some((t) => t.id === sessionId);
-      await openTab(summary, !already);
-      // openTab focuses the opened session — restore primary focus.
-      if (keepFocus) setActiveSessionId(keepFocus);
-      setSideSessionId(sessionId);
-    },
-    [splitOk, activeSessionId, tabs, sessions, openTab],
-  );
-
-  // Drop side pane when the window is too narrow for split.
-  useEffect(() => {
-    if (!splitOk) setSideSessionId(null);
-  }, [splitOk]);
-
-  // ⌘\ / Ctrl+\ — open another open tab beside the focused session.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey) || e.key !== "\\") return;
-      e.preventDefault();
-      if (!splitOk || !activeSessionId) return;
-      if (sideSessionId) {
-        setSideSessionId(null);
-        return;
-      }
-      const other = tabs.find((t) => t.id !== activeSessionId);
-      if (other) void openBeside(other.id);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [splitOk, activeSessionId, sideSessionId, tabs, openBeside]);
-
   const refreshSessions = useCallback(async () => {
     try {
       setSessions(await api.sessionListByKind(workspaceMode, false));
@@ -668,6 +624,78 @@ export default function App() {
     [status?.project_cwd, openTab, refreshSessions, refreshChrome],
   );
 
+  /**
+   * Open a session in the side pane (Phase 14 split).
+   * - `sessionId` omitted / same as primary → use another open tab, or create one
+   * - Requires wide layout (`splitOk`); no-op when too narrow
+   */
+  const openBeside = useCallback(
+    async (sessionId?: string) => {
+      if (!splitOk) return;
+      const primary = activeSessionId;
+
+      // Toggle / pick another open tab when no specific target
+      if (!sessionId || sessionId === primary) {
+        const other = tabs.find((t) => t.id !== primary);
+        if (other) {
+          setSideSessionId(other.id);
+          return;
+        }
+        // Only one tab (or none): create a fresh session for the side pane
+        const s = await createSession(workspaceMode);
+        if (!s) return;
+        if (primary) setActiveSessionId(primary);
+        setSideSessionId(s.id);
+        return;
+      }
+
+      let summary = sessions.find((s) => s.id === sessionId);
+      if (!summary) {
+        try {
+          summary = await api.sessionLoad(sessionId);
+        } catch {
+          return;
+        }
+      }
+      const keepFocus = primary;
+      const already = tabs.some((t) => t.id === sessionId);
+      await openTab(summary, !already);
+      // openTab focuses the opened session — restore primary focus.
+      if (keepFocus) setActiveSessionId(keepFocus);
+      setSideSessionId(sessionId);
+    },
+    [
+      splitOk,
+      activeSessionId,
+      tabs,
+      sessions,
+      openTab,
+      createSession,
+      workspaceMode,
+    ],
+  );
+
+  // Drop side pane when the window is too narrow for split.
+  useEffect(() => {
+    if (!splitOk) setSideSessionId(null);
+  }, [splitOk]);
+
+  // ⌘\ / Ctrl+\ — toggle side pane (creates a second session if needed).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key !== "\\") return;
+      e.preventDefault();
+      if (!splitOk) return;
+      if (sideSessionId) {
+        setSideSessionId(null);
+        return;
+      }
+      void openBeside();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [splitOk, sideSessionId, openBeside]);
+
   async function ensureSession(): Promise<string> {
     // Prefer the active tab only when its kind matches Builds/Chats mode.
     // Otherwise a build tab left open would answer "chat" prompts as kind=build.
@@ -737,7 +765,9 @@ export default function App() {
           {
             type: "item",
             id: "beside",
-            label: splitOk ? "Open beside" : "Open beside (need wider window)",
+            label: splitOk
+              ? "Open beside"
+              : `Open beside (widen to ≥${SPLIT_MIN_WIDTH}px)`,
             disabled: !splitOk,
             onClick: () => {
               void openBeside(sessionId);
@@ -1144,8 +1174,8 @@ export default function App() {
             : "Coding builds with tools."}
           <span className="session-hint-ctx">
             {splitOk
-              ? " Right-click → Open beside · ⌘\\ toggles split."
-              : " Right-click a session for actions. Widen for side-by-side."}
+              ? " Split: ⧉ in the tab bar, right-click → Open beside, or ⌘\\."
+              : ` Split needs window ≥${SPLIT_MIN_WIDTH}px (then ⧉ or ⌘\\).`}
           </span>
         </p>
         <div className="session-list">
@@ -1281,22 +1311,25 @@ export default function App() {
             >
               +
             </button>
-            {splitOk && tabs.length >= 2 && (
+            {tabs.length >= 1 && (
               <button
                 type="button"
-                className={`session-tab-split ${sideSessionId ? "on" : ""}`}
+                className={`session-tab-split ${sideSessionId ? "on" : ""} ${!splitOk ? "is-disabled" : ""}`}
+                disabled={!splitOk}
                 title={
-                  sideSessionId
-                    ? "Close side pane (⌘\\)"
-                    : "Open another tab beside (⌘\\)"
+                  !splitOk
+                    ? `Widen the window to at least ${SPLIT_MIN_WIDTH}px to split sessions`
+                    : sideSessionId
+                      ? "Close side pane (⌘\\)"
+                      : "Split view — open another session beside (⌘\\)"
                 }
                 onClick={() => {
+                  if (!splitOk) return;
                   if (sideSessionId) {
                     setSideSessionId(null);
                     return;
                   }
-                  const other = tabs.find((t) => t.id !== activeSessionId);
-                  if (other) void openBeside(other.id);
+                  void openBeside();
                 }}
               >
                 ⧉
@@ -1360,8 +1393,8 @@ export default function App() {
                   </li>
                   <li>
                     {splitOk
-                      ? "Wide layout: right-click → Open beside for split view"
-                      : "Widen the window (≥1440px) for side-by-side sessions"}
+                      ? "Click ⧉ in the tab bar or press ⌘\\ for side-by-side sessions"
+                      : `Widen the window (≥${SPLIT_MIN_WIDTH}px), then ⧉ or ⌘\\ for split`}
                   </li>
                 </ul>
               </div>
