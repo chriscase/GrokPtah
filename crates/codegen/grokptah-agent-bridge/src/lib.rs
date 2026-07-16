@@ -15,6 +15,7 @@ mod session;
 mod session_store;
 mod types;
 
+pub use discover::{grokptah_home, set_grokptah_home_override};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use permission::{PermissionDecision, PermissionRequest};

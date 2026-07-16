@@ -1,11 +1,58 @@
 //! Integration tests drive the **shipped** AgentHostHandle API (not a reimplementation).
+//!
+//! All tests install an isolated GrokPtah home so they never pollute the
+//! developer's real `~/.grokptah` session list.
 
+use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use grokptah_agent_bridge::{
-    desktop_auto_update_enabled, AgentHost, HostConfig, PermissionDecision, SessionUpdate,
+    desktop_auto_update_enabled, set_grokptah_home_override, AgentHost, HostConfig,
+    PermissionDecision, SessionUpdate,
 };
 use tokio::time::timeout;
+
+/// Serialize tests that mutate the process-wide home override.
+fn home_serial() -> &'static Mutex<()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+}
+
+/// RAII: point `grokptah_home()` at a temp dir for the duration of a test.
+struct IsolatedHome {
+    _tmp: tempfile::TempDir,
+    _lock: MutexGuard<'static, ()>,
+    prev: Option<PathBuf>,
+}
+
+impl IsolatedHome {
+    fn install() -> Self {
+        let lock = home_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let prev = {
+            // Capture current override so we can restore (usually None).
+            // Reading via env is fine; override API only exposes set.
+            None
+        };
+        let tmp = tempfile::tempdir().expect("isolated home tempdir");
+        let home = tmp.path().join(".grokptah");
+        std::fs::create_dir_all(home.join("sessions")).expect("sessions dir");
+        std::fs::create_dir_all(home.join("plugins")).ok();
+        std::fs::create_dir_all(home.join("skills")).ok();
+        set_grokptah_home_override(Some(home));
+        Self {
+            _tmp: tmp,
+            _lock: lock,
+            prev,
+        }
+    }
+}
+
+impl Drop for IsolatedHome {
+    fn drop(&mut self) {
+        set_grokptah_home_override(self.prev.take());
+    }
+}
 
 async fn drain_until_turn_complete(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>,
@@ -27,6 +74,7 @@ async fn drain_until_turn_complete(
 
 #[tokio::test]
 async fn start_stop_and_status() {
+    let _iso = IsolatedHome::install();
     let host = AgentHost::create(HostConfig::default());
     assert!(!host.status().running);
     host.start().unwrap();
@@ -39,6 +87,7 @@ async fn start_stop_and_status() {
 
 #[tokio::test]
 async fn session_lifecycle_prompt_streams_message_and_thought() {
+    let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.txt"), "hello grokptah").unwrap();
 
@@ -83,6 +132,7 @@ async fn session_lifecycle_prompt_streams_message_and_thought() {
 
 #[tokio::test]
 async fn permission_request_round_trip_allow() {
+    let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     let host = AgentHost::create(HostConfig {
         always_approve: false,
@@ -157,6 +207,7 @@ async fn permission_request_round_trip_allow() {
 
 #[tokio::test]
 async fn permission_deny_skips_tool() {
+    let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     let host = AgentHost::create(HostConfig::default());
     let mut rx = host.take_event_receiver().unwrap();
@@ -204,6 +255,7 @@ async fn permission_deny_skips_tool() {
 
 #[tokio::test]
 async fn cancel_kills_real_shell_child_not_only_sleep_stub() {
+    let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     // Marker file written only if sleep completes — cancel must prevent this.
     let marker = dir.path().join("should_not_exist.txt");
@@ -216,10 +268,7 @@ async fn cancel_kills_real_shell_child_not_only_sleep_stub() {
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
 
-    let cmd = format!(
-        "sleep 30; echo done > '{}'",
-        marker.display()
-    );
+    let cmd = format!("sleep 30; echo done > '{}'", marker.display());
     let host2 = host.clone();
     let prompt = tokio::spawn(async move {
         host2
@@ -278,6 +327,7 @@ async fn cancel_kills_real_shell_child_not_only_sleep_stub() {
 
 #[tokio::test]
 async fn shell_streams_output_without_reexec_event() {
+    let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     let host = AgentHost::create(HostConfig {
         always_approve: true,
@@ -317,6 +367,7 @@ async fn shell_streams_output_without_reexec_event() {
 
 #[tokio::test]
 async fn fork_rewind_compact_sessions() {
+    let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     let host = AgentHost::create(HostConfig {
         always_approve: true,
@@ -378,6 +429,7 @@ async fn fork_rewind_compact_sessions() {
 
 #[tokio::test]
 async fn session_set_cwd_updates_session_and_host_project() {
+    let _iso = IsolatedHome::install();
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let host = AgentHost::create(HostConfig {
@@ -410,6 +462,7 @@ async fn session_set_cwd_updates_session_and_host_project() {
 
 #[tokio::test]
 async fn write_tool_records_edit_and_plugins_install_to_disk() {
+    let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     let host = AgentHost::create(HostConfig {
         always_approve: true,
@@ -435,6 +488,7 @@ async fn write_tool_records_edit_and_plugins_install_to_disk() {
 
 #[tokio::test]
 async fn plan_mode_emits_plan_update() {
+    let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     let host = AgentHost::create(HostConfig::default());
     let mut rx = host.take_event_receiver().unwrap();
@@ -453,4 +507,42 @@ async fn plan_mode_emits_plan_update() {
         } if status == "proposed"
     )));
     host.accept_plan(s.id).unwrap();
+}
+
+/// Regression: tests must not leave sessions in the real user home.
+#[tokio::test]
+async fn isolated_home_does_not_touch_user_sessions_dir() {
+    let user_sessions = dirs::home_dir()
+        .unwrap()
+        .join(".grokptah")
+        .join("sessions");
+    let before: Vec<_> = std::fs::read_dir(&user_sessions)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    {
+        let _iso = IsolatedHome::install();
+        let dir = tempfile::tempdir().unwrap();
+        let host = AgentHost::create(HostConfig::default());
+        host.start().unwrap();
+        host.set_project_cwd(dir.path()).unwrap();
+        let _ = host.session_new().unwrap();
+        let _ = host.session_new().unwrap();
+    }
+
+    let after: Vec<_> = std::fs::read_dir(&user_sessions)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        before, after,
+        "creating sessions under IsolatedHome must not add dirs under ~/.grokptah/sessions"
+    );
 }

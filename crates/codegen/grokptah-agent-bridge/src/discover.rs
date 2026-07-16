@@ -2,13 +2,49 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::types::{McpServerInfo, PluginInfo, SkillInfo};
 
+/// Process-wide override for the GrokPtah data directory.
+///
+/// Integration tests set this so they never write into the developer's real
+/// `~/.grokptah` (which previously polluted the desktop session list).
+fn home_override() -> &'static Mutex<Option<PathBuf>> {
+    static O: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    O.get_or_init(|| Mutex::new(None))
+}
+
+/// Set or clear the data-dir override.
+///
+/// Callers that run concurrent tests must serialize access (see test helpers).
+pub fn set_grokptah_home_override(path: Option<PathBuf>) {
+    if let Ok(mut g) = home_override().lock() {
+        *g = path;
+    }
+}
+
+/// Resolve the GrokPtah home directory.
+///
+/// Order:
+/// 1. In-process override (tests)
+/// 2. `GROKPTAH_HOME` env (CI / custom installs)
+/// 3. `~/.grokptah`
 pub fn grokptah_home() -> PathBuf {
+    if let Ok(g) = home_override().lock() {
+        if let Some(p) = g.as_ref() {
+            return p.clone();
+        }
+    }
+    if let Ok(p) = std::env::var("GROKPTAH_HOME") {
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".grokptah")
@@ -19,6 +55,7 @@ pub fn ensure_home() -> PathBuf {
     let _ = fs::create_dir_all(&h);
     let _ = fs::create_dir_all(h.join("plugins"));
     let _ = fs::create_dir_all(h.join("skills"));
+    let _ = fs::create_dir_all(h.join("sessions"));
     h
 }
 
