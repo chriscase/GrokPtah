@@ -3593,7 +3593,7 @@ button:disabled {
   text-transform: none;
 }
 
-/* Cards grow to fill unused horizontal space */
+/* Content-sized cards in a stable row (scroll if many) */
 .fleet-cards {
   display: flex;
   gap: 0.35rem;
@@ -3610,10 +3610,11 @@ button:disabled {
   flex-direction: column;
   align-items: stretch;
   gap: 0.15rem;
-  /* Grow equally across the rail — use the ultrawide */
-  flex: 1 1 0;
-  min-width: 7rem;
-  max-width: none;
+  /* Title-readable, not stretched across ultrawide */
+  flex: 0 0 auto;
+  width: max-content;
+  min-width: 10.5rem;
+  max-width: 16rem;
   padding: 0.35rem 0.55rem 0.35rem 0.65rem;
   border-radius: 8px;
   border: 1px solid var(--border-soft);
@@ -3622,17 +3623,12 @@ button:disabled {
   cursor: pointer;
   transition:
     border-color 0.12s ease,
-    background 0.12s ease,
-    transform 0.08s ease;
+    background 0.12s ease;
 }
 
 .fleet-card:hover {
   border-color: var(--border);
   background: rgba(255, 255, 255, 0.04);
-}
-
-.fleet-card:active {
-  transform: scale(0.985);
 }
 
 .fleet-card.primary {
@@ -3704,7 +3700,8 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  min-width: 0;
+  min-width: 8rem;
+  max-width: 13rem;
   flex: 1 1 auto;
   color: var(--text);
 }
@@ -3747,15 +3744,18 @@ button:disabled {
   font-weight: 560;
 }
 
-/* Wide stage: taller touch targets, more readable phase line */
+/* Slightly roomier on wide stages — still title-sized, not full-bleed */
 .main.density-wide .fleet-card,
 .main.density-ultrawide .fleet-card {
-  min-width: 9rem;
+  min-width: 11.5rem;
+  max-width: 17rem;
   padding: 0.4rem 0.65rem 0.4rem 0.75rem;
 }
 
 .main.density-ultrawide .fleet-card-title {
   font-size: 12.5px;
+  min-width: 9rem;
+  max-width: 14rem;
 }
 
 .main.density-ultrawide .fleet-card-phase {
