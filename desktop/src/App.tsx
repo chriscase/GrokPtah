@@ -29,6 +29,7 @@ import {
   mergeAssistantChunk,
   subscribeSessionUpdates,
 } from "./lib/sessionEvents";
+import { entriesToTranscriptItems } from "./lib/transcript";
 import {
   doneActivity,
   errorActivity,
@@ -304,11 +305,7 @@ export default function App() {
             return {
               ...t,
               title: summary.title,
-              transcript: entries.map((e) =>
-                e.role === "user"
-                  ? ({ kind: "user" as const, text: e.text })
-                  : ({ kind: "assistant" as const, text: e.text }),
-              ),
+              transcript: entriesToTranscriptItems(entries),
             };
           }),
         );
@@ -808,11 +805,7 @@ export default function App() {
                   const entries = await api.sessionTranscript(sessionId);
                   patchTab(sessionId, (t) => ({
                     ...t,
-                    transcript: entries.map((e) =>
-                      e.role === "user"
-                        ? ({ kind: "user" as const, text: e.text })
-                        : ({ kind: "assistant" as const, text: e.text }),
-                    ),
+                    transcript: entriesToTranscriptItems(entries),
                   }));
                 } catch {
                   /* keep local view */
@@ -912,14 +905,7 @@ export default function App() {
             ...t,
             busy: false,
             activity: doneActivity(false),
-            transcript: entries.map((e) =>
-              e.role === "user"
-                ? ({ kind: "user" as const, text: e.text })
-                : ({
-                    kind: "assistant" as const,
-                    text: e.text,
-                  }),
-            ),
+            transcript: entriesToTranscriptItems(entries),
           }));
         } catch {
           patchTab(id, (t) => ({
@@ -938,17 +924,33 @@ export default function App() {
         return;
       }
       const reply = await api.sessionPrompt(id, prompt);
-      // Events stream the assistant text AND the invoke returns the same
-      // string. React state from events can still be pending when we get
-      // here, so naive "if not already" checks append a second identical
-      // bubble. Always finalize the turn: collapse duplicate assistants
-      // after the last user message; only append reply if none exist.
-      patchTab(id, (t) => ({
-        ...t,
-        busy: false,
-        activity: doneActivity(false),
-        transcript: finalizeTurnTranscript(t.transcript, reply),
-      }));
+      // Prefer durable transcript (includes tool rows) over pure event state.
+      // Events may lag or miss tool cards; disk is the source of truth after the turn.
+      try {
+        const entries = await api.sessionTranscript(id);
+        if (entries.length > 0) {
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: doneActivity(false),
+            transcript: entriesToTranscriptItems(entries),
+          }));
+        } else {
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: doneActivity(false),
+            transcript: finalizeTurnTranscript(t.transcript, reply),
+          }));
+        }
+      } catch {
+        patchTab(id, (t) => ({
+          ...t,
+          busy: false,
+          activity: doneActivity(false),
+          transcript: finalizeTurnTranscript(t.transcript, reply),
+        }));
+      }
       setSubagents(await api.subagentsList());
       setBgTasks(await api.backgroundTasks());
       await refreshChrome();

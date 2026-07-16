@@ -52,8 +52,72 @@ pub struct SessionSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
+    /// `user` | `assistant` | `system` | `tool` | `thought`
     pub role: String,
+    /// Primary display text (user/assistant body; tool title line).
     pub text: String,
+    /// Tool call id when `role == "tool"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_output: Option<String>,
+}
+
+impl TranscriptEntry {
+    pub fn user(text: impl Into<String>) -> Self {
+        Self {
+            role: "user".into(),
+            text: text.into(),
+            tool_call_id: None,
+            tool_title: None,
+            tool_status: None,
+            tool_output: None,
+        }
+    }
+
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".into(),
+            text: text.into(),
+            tool_call_id: None,
+            tool_title: None,
+            tool_status: None,
+            tool_output: None,
+        }
+    }
+
+    pub fn system(text: impl Into<String>) -> Self {
+        Self {
+            role: "system".into(),
+            text: text.into(),
+            tool_call_id: None,
+            tool_title: None,
+            tool_status: None,
+            tool_output: None,
+        }
+    }
+
+    pub fn tool(
+        call_id: impl Into<String>,
+        title: impl Into<String>,
+        status: impl Into<String>,
+        output: Option<String>,
+    ) -> Self {
+        let title = title.into();
+        let status = status.into();
+        Self {
+            role: "tool".into(),
+            text: format!("{title} · {status}"),
+            tool_call_id: Some(call_id.into()),
+            tool_title: Some(title),
+            tool_status: Some(status),
+            tool_output: output,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

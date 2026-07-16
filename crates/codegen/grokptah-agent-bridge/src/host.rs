@@ -812,12 +812,9 @@ impl AgentHostHandle {
                     let total = s.transcript.len();
                     let in_window = total - new_start;
                     // Additive local notice only — never deletes prior entries.
-                    s.transcript.push(TranscriptEntry {
-                        role: "system".into(),
-                        text: format!(
-                            "[context compacted for server: {in_window} recent messages stay in the API window; full local history retained ({total} messages before this notice)]"
-                        ),
-                    });
+                    s.transcript.push(TranscriptEntry::system(format!(
+                        "[context compacted for server: {in_window} recent messages stay in the API window; full local history retained ({total} messages before this notice)]"
+                    )));
                     debug_assert!(s.transcript.len() >= len_before);
                 }
             }
@@ -1585,10 +1582,7 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("unknown session"))?;
             s.model = model.clone();
             s.effort = effort;
-            s.transcript.push(TranscriptEntry {
-                role: "user".into(),
-                text: prompt.clone(),
-            });
+            s.transcript.push(TranscriptEntry::user(prompt.clone()));
             if s.title == "New session" || s.title == "New chat" {
                 s.title = prompt.chars().take(48).collect();
             }
@@ -2612,10 +2606,18 @@ impl AgentHostHandle {
                 });
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
-                    call_id,
+                    call_id: call_id.clone(),
                     status: ToolCallStatus::Completed,
                     output: Some(out.clone()),
                 });
+                push_tool(
+                    self,
+                    session_id,
+                    &call_id,
+                    "glob_files",
+                    ToolCallStatus::Completed,
+                    Some(out.clone()),
+                );
                 Ok(out)
             }
             "apply_patch" => {
@@ -2703,20 +2705,36 @@ impl AgentHostHandle {
                         }
                         let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                             session_id,
-                            call_id,
+                            call_id: call_id.clone(),
                             status: ToolCallStatus::Completed,
                             output: Some(report.clone()),
                         });
+                        push_tool(
+                            self,
+                            session_id,
+                            &call_id,
+                            "apply_patch",
+                            ToolCallStatus::Completed,
+                            Some(report.clone()),
+                        );
                         Ok(report)
                     }
                     Err(e) => {
                         let msg = e.to_string();
                         let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                             session_id,
-                            call_id,
+                            call_id: call_id.clone(),
                             status: ToolCallStatus::Failed,
                             output: Some(msg.clone()),
                         });
+                        push_tool(
+                            self,
+                            session_id,
+                            &call_id,
+                            "apply_patch",
+                            ToolCallStatus::Failed,
+                            Some(msg.clone()),
+                        );
                         Ok(format!("ERROR: {msg}"))
                     }
                 }
@@ -2753,10 +2771,18 @@ impl AgentHostHandle {
                 });
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
-                    call_id,
+                    call_id: call_id.clone(),
                     status: ToolCallStatus::Completed,
                     output: Some(rendered.clone()),
                 });
+                push_tool(
+                    self,
+                    session_id,
+                    &call_id,
+                    "todo_write",
+                    ToolCallStatus::Completed,
+                    Some(rendered.clone()),
+                );
                 Ok(rendered)
             }
             "memory_write" => {
@@ -2788,10 +2814,18 @@ impl AgentHostHandle {
                 });
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
-                    call_id,
+                    call_id: call_id.clone(),
                     status: ToolCallStatus::Completed,
                     output: Some(out.clone()),
                 });
+                push_tool(
+                    self,
+                    session_id,
+                    &call_id,
+                    "memory_write",
+                    ToolCallStatus::Completed,
+                    Some(out.clone()),
+                );
                 Ok(out)
             }
             "memory_read" => {
@@ -2821,10 +2855,18 @@ impl AgentHostHandle {
                 });
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
-                    call_id,
+                    call_id: call_id.clone(),
                     status: ToolCallStatus::Completed,
                     output: Some(out.clone()),
                 });
+                push_tool(
+                    self,
+                    session_id,
+                    &call_id,
+                    "memory_read",
+                    ToolCallStatus::Completed,
+                    Some(out.clone()),
+                );
                 Ok(out)
             }
             "web_fetch" => {
@@ -3201,6 +3243,14 @@ impl AgentHostHandle {
             status: ToolCallStatus::Running,
             input: input.clone(),
         });
+        push_tool(
+            self,
+            session_id,
+            &call_id,
+            tool_name,
+            ToolCallStatus::Running,
+            None,
+        );
 
         match f().await {
             Ok(tr) => {
@@ -3219,10 +3269,18 @@ impl AgentHostHandle {
                 );
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
-                    call_id,
+                    call_id: call_id.clone(),
                     status,
                     output: Some(out.clone()),
                 });
+                push_tool(
+                    self,
+                    session_id,
+                    &call_id,
+                    tool_name,
+                    status,
+                    Some(out.clone()),
+                );
                 Ok(out)
             }
             Err(e) => {
@@ -3235,10 +3293,18 @@ impl AgentHostHandle {
                 );
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
-                    call_id,
+                    call_id: call_id.clone(),
                     status: ToolCallStatus::Failed,
                     output: Some(msg.clone()),
                 });
+                push_tool(
+                    self,
+                    session_id,
+                    &call_id,
+                    tool_name,
+                    ToolCallStatus::Failed,
+                    Some(msg.clone()),
+                );
                 Ok(format!("ERROR: {msg}"))
             }
         }
@@ -3294,6 +3360,14 @@ impl AgentHostHandle {
                     status: ToolCallStatus::Denied,
                     input: serde_json::json!({ "command": command }),
                 });
+                push_tool(
+                    self,
+                    session_id,
+                    &call_id,
+                    "run_terminal_cmd",
+                    ToolCallStatus::Denied,
+                    Some(format!("DENIED: user denied shell `{command}`")),
+                );
                 return Ok(format!("DENIED: user denied shell `{command}`"));
             }
             if decision == PermissionDecision::AlwaysAllow {
@@ -3310,6 +3384,14 @@ impl AgentHostHandle {
             status: ToolCallStatus::Running,
             input: serde_json::json!({ "command": command }),
         });
+        push_tool(
+            self,
+            session_id,
+            &call_id,
+            "run_terminal_cmd",
+            ToolCallStatus::Running,
+            None,
+        );
         let _ = event_tx.send(SessionUpdate::ShellSessionStarted {
             session_id,
             call_id: call_id.clone(),
@@ -3338,6 +3420,11 @@ impl AgentHostHandle {
             Ok(tr) => {
                 let cancelled = tr.cancelled;
                 let out = tr.output.clone();
+                let status = if cancelled {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
                 let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
                     session_id,
                     call_id: call_id.clone(),
@@ -3346,14 +3433,18 @@ impl AgentHostHandle {
                 });
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
-                    call_id,
-                    status: if cancelled {
-                        ToolCallStatus::Failed
-                    } else {
-                        ToolCallStatus::Completed
-                    },
+                    call_id: call_id.clone(),
+                    status,
                     output: Some(out.clone()),
                 });
+                push_tool(
+                    self,
+                    session_id,
+                    &call_id,
+                    "run_terminal_cmd",
+                    status,
+                    Some(out.clone()),
+                );
                 Ok(if cancelled {
                     format!("{out}\n(cancelled)")
                 } else {
@@ -3370,10 +3461,18 @@ impl AgentHostHandle {
                 });
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
-                    call_id,
+                    call_id: call_id.clone(),
                     status: ToolCallStatus::Failed,
                     output: Some(msg.clone()),
                 });
+                push_tool(
+                    self,
+                    session_id,
+                    &call_id,
+                    "run_terminal_cmd",
+                    ToolCallStatus::Failed,
+                    Some(msg.clone()),
+                );
                 Ok(format!("ERROR: {msg}"))
             }
         }
@@ -3616,14 +3715,53 @@ impl AgentHostHandle {
 fn push_assistant(host: &AgentHostHandle, session_id: Uuid, text: &str) {
     let mut g = host.inner.lock();
     if let Some(s) = g.sessions.get_mut(&session_id) {
-        s.transcript.push(TranscriptEntry {
-            role: "assistant".into(),
-            text: text.into(),
-        });
+        s.transcript.push(TranscriptEntry::assistant(text));
         s.updated_at = Utc::now();
     }
     // Disk flush is append-only at turn end (session_prompt) so large replies
     // don't rewrite multi-MB files mid-stream.
+}
+
+/// Record a tool call on the durable transcript (so UI reload / post-turn
+/// hydrate still shows tools — not only ephemeral session://update events).
+fn push_tool(
+    host: &AgentHostHandle,
+    session_id: Uuid,
+    call_id: &str,
+    title: &str,
+    status: ToolCallStatus,
+    output: Option<String>,
+) {
+    let status_s = match status {
+        ToolCallStatus::Pending => "pending",
+        ToolCallStatus::Running => "running",
+        ToolCallStatus::Completed => "completed",
+        ToolCallStatus::Failed => "failed",
+        ToolCallStatus::Denied => "denied",
+    };
+    let mut g = host.inner.lock();
+    if let Some(s) = g.sessions.get_mut(&session_id) {
+        // Update in place if we already recorded this call_id (running → done).
+        if let Some(existing) = s
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|e| e.role == "tool" && e.tool_call_id.as_deref() == Some(call_id))
+        {
+            existing.tool_status = Some(status_s.into());
+            existing.text = format!("{title} · {status_s}");
+            if output.is_some() {
+                existing.tool_output = output;
+            }
+            if existing.tool_title.is_none() {
+                existing.tool_title = Some(title.into());
+            }
+        } else {
+            s.transcript
+                .push(TranscriptEntry::tool(call_id, title, status_s, output));
+        }
+        s.updated_at = Utc::now();
+    }
 }
 
 fn emit_message(tx: &mpsc::UnboundedSender<SessionUpdate>, session_id: Uuid, text: &str) {

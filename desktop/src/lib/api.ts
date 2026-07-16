@@ -79,9 +79,16 @@ export const api = {
       sessionId: sessionId ?? null,
     }),
   sessionTranscript: (sessionId: string) =>
-    invoke<{ role: string; text: string }[]>("session_transcript", {
-      sessionId,
-    }),
+    invoke<
+      {
+        role: string;
+        text: string;
+        tool_call_id?: string | null;
+        tool_title?: string | null;
+        tool_status?: string | null;
+        tool_output?: string | null;
+      }[]
+    >("session_transcript", { sessionId }),
   sessionFork: (sourceId: string) =>
     invoke<SessionSummary>("session_fork", { sourceId }),
   sessionRewind: (sessionId: string, keepMessages: number) =>

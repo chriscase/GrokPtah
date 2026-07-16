@@ -259,6 +259,37 @@ async fn compact_never_shrinks_local_transcript() {
 }
 
 #[tokio::test]
+async fn tools_persist_on_transcript_after_offline_write() {
+    let _iso = IsolatedHome::install();
+    let dir = fixture_repo();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let s = host.session_new().unwrap();
+    host.session_prompt(s.id, "write tool-persist.txt: hello tools".into())
+        .await
+        .unwrap();
+    drain(&mut rx).await;
+    let entries = host.session_transcript(s.id).unwrap();
+    assert!(
+        entries.iter().any(|e| e.role == "tool"),
+        "durable transcript must include tool rows, got {entries:?}"
+    );
+    let tool = entries.iter().find(|e| e.role == "tool").unwrap();
+    assert_eq!(tool.tool_title.as_deref(), Some("write_file"));
+    assert!(
+        tool.tool_status.as_deref() == Some("completed")
+            || tool.tool_status.as_deref() == Some("running"),
+        "tool status: {:?}",
+        tool.tool_status
+    );
+}
+
+#[tokio::test]
 async fn smoke_web_fetch_offline() {
     let _iso = IsolatedHome::install();
     let dir = fixture_repo();
