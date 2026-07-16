@@ -1211,6 +1211,180 @@ button:disabled {
   font-size: 11px;
 }
 
+.tool-output-details {
+  margin-top: 0.35rem;
+}
+
+.tool-output-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+  user-select: none;
+}
+
+.tool-output-details summary:hover {
+  color: var(--text);
+}
+
+.tool-output-details[open] summary {
+  margin-bottom: 0.25rem;
+  color: var(--tool);
+}
+
+/* ── Collapsed diagnostics chip (host status crumbs) ── */
+.debug-trace {
+  align-self: flex-start;
+  position: relative;
+  max-width: min(28rem, 100%);
+  margin: 0.1rem 0 0.15rem;
+}
+
+.debug-trace-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  height: 24px;
+  padding: 0 0.55rem 0 0.4rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--muted);
+  font-size: 11px;
+  font-family: var(--font-ui);
+  letter-spacing: 0.01em;
+  transition:
+    border-color 0.12s ease,
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+.debug-trace-chip:hover {
+  border-color: var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+.debug-trace.is-open .debug-trace-chip {
+  border-color: rgba(240, 180, 41, 0.35);
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.debug-trace.is-live .debug-trace-glyph {
+  color: var(--accent);
+  animation: busy-pulse 1.4s ease-in-out infinite;
+}
+
+.debug-trace-glyph {
+  display: inline-flex;
+  opacity: 0.9;
+}
+
+.debug-trace-label {
+  font-weight: 500;
+}
+
+.debug-trace-count {
+  min-width: 1.15rem;
+  height: 1.15rem;
+  padding: 0 0.3rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 10px;
+  font-family: var(--font);
+  line-height: 1.15rem;
+  text-align: center;
+  color: var(--muted);
+}
+
+.debug-trace.is-open .debug-trace-count {
+  background: rgba(240, 180, 41, 0.18);
+  color: var(--accent);
+}
+
+.debug-trace-caret {
+  font-size: 9px;
+  opacity: 0.7;
+}
+
+.debug-trace-panel {
+  margin-top: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #12151c;
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.25),
+    0 12px 28px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  animation: debug-panel-in 0.12s ease-out;
+}
+
+@keyframes debug-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.debug-trace-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.4rem 0.55rem;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.debug-trace-copy {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+}
+
+.debug-trace-copy:hover {
+  color: var(--accent);
+  background: var(--accent-bg);
+  border-color: transparent;
+}
+
+.debug-trace-list {
+  margin: 0;
+  padding: 0.4rem 0.55rem 0.5rem;
+  list-style: none;
+  max-height: 160px;
+  overflow: auto;
+}
+
+.debug-trace-list li {
+  margin: 0;
+  padding: 0.22rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.debug-trace-list li:last-child {
+  border-bottom: none;
+}
+
+.debug-trace-list code {
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--thought);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
 .bubble.plan {
   border-color: var(--accent-dim);
 }

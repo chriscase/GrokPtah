@@ -19,10 +19,15 @@ import {
   ContextMenu,
   type ContextMenuState,
 } from "./components/ContextMenu";
+import { DebugTrace } from "./components/DebugTrace";
 import { SearchPanel } from "./components/SearchPanel";
 import { SessionBrowser } from "./components/SessionBrowser";
 import { StreamingText } from "./components/StreamingText";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
+import {
+  expandDebugLines,
+  isDebugThought,
+} from "./lib/debugTrace";
 import {
   doneActivity,
   errorActivity,
@@ -90,6 +95,38 @@ function withActivity(
 
 /** Ref used by applyUpdate so background tabs can be marked unseen. */
 let activeSessionIdForEvents: string | null = null;
+
+type TranscriptRenderRow =
+  | { type: "item"; item: TranscriptItem; index: number }
+  | { type: "debug"; key: string; lines: string[]; live: boolean };
+
+/** Collapse host status crumbs into one diagnostics chip per run. */
+function groupTranscript(items: TranscriptItem[]): TranscriptRenderRow[] {
+  const out: TranscriptRenderRow[] = [];
+  let i = 0;
+  while (i < items.length) {
+    const item = items[i];
+    if (item.kind === "thought" && isDebugThought(item.text)) {
+      const start = i;
+      const lines: string[] = [];
+      let live = false;
+      while (i < items.length) {
+        const cur = items[i];
+        if (cur.kind !== "thought" || !isDebugThought(cur.text)) break;
+        if (cur.streaming) live = true;
+        for (const line of expandDebugLines(cur.text)) {
+          if (!lines.includes(line)) lines.push(line);
+        }
+        i += 1;
+      }
+      out.push({ type: "debug", key: `dbg-${start}`, lines, live });
+      continue;
+    }
+    out.push({ type: "item", item, index: i });
+    i += 1;
+  }
+  return out;
+}
 
 /** Shorten a filesystem path for chrome (prefer last two segments). */
 function shortPath(path: string | null | undefined, max = 42): string {
@@ -1232,49 +1269,66 @@ export default function App() {
               </ul>
             </div>
           )}
-          {transcript.map((item, i) => (
-            <div key={i} className={`bubble ${item.kind}`}>
-              {item.kind === "tool" && (
-                <>
-                  <strong>
-                    {item.title} · {item.status}
-                  </strong>
-                  {item.output && <pre>{item.output}</pre>}
-                </>
-              )}
-              {item.kind === "plan" && (
-                <>
-                  <strong>Plan ({item.status})</strong>
-                  <ol>
-                    {item.steps.map((s, j) => (
-                      <li key={j}>{s}</li>
-                    ))}
-                  </ol>
-                  {activeSessionId && item.status === "proposed" && (
-                    <div className="modal-actions">
-                      <button
-                        type="button"
-                        className="primary"
-                        onClick={() => void api.acceptPlan(activeSessionId)}
-                      >
-                        Accept
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void api.rejectPlan(activeSessionId)}
-                      >
-                        Reject
-                      </button>
-                    </div>
-                  )}
-                </>
-              )}
-              {(item.kind === "assistant" || item.kind === "thought") && (
-                <StreamingText text={item.text} streaming={item.streaming} />
-              )}
-              {(item.kind === "user" || item.kind === "error") && item.text}
-            </div>
-          ))}
+          {groupTranscript(transcript).map((row) => {
+            if (row.type === "debug") {
+              return (
+                <DebugTrace
+                  key={row.key}
+                  lines={row.lines}
+                  live={busy && row.live}
+                />
+              );
+            }
+            const { item, index: i } = row;
+            return (
+              <div key={i} className={`bubble ${item.kind}`}>
+                {item.kind === "tool" && (
+                  <>
+                    <strong>
+                      {item.title} · {item.status}
+                    </strong>
+                    {item.output && (
+                      <details className="tool-output-details">
+                        <summary>Output</summary>
+                        <pre>{item.output}</pre>
+                      </details>
+                    )}
+                  </>
+                )}
+                {item.kind === "plan" && (
+                  <>
+                    <strong>Plan ({item.status})</strong>
+                    <ol>
+                      {item.steps.map((s, j) => (
+                        <li key={j}>{s}</li>
+                      ))}
+                    </ol>
+                    {activeSessionId && item.status === "proposed" && (
+                      <div className="modal-actions">
+                        <button
+                          type="button"
+                          className="primary"
+                          onClick={() => void api.acceptPlan(activeSessionId)}
+                        >
+                          Accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void api.rejectPlan(activeSessionId)}
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    )}
+                  </>
+                )}
+                {(item.kind === "assistant" || item.kind === "thought") && (
+                  <StreamingText text={item.text} streaming={item.streaming} />
+                )}
+                {(item.kind === "user" || item.kind === "error") && item.text}
+              </div>
+            );
+          })}
           <div ref={bottomRef} />
         </div>
 
