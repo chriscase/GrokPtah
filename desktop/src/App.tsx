@@ -14,10 +14,22 @@ import {
   type TranscriptItem,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
+import { ActivityIndicator } from "./components/ActivityIndicator";
 import { SearchPanel } from "./components/SearchPanel";
 import { SessionBrowser } from "./components/SessionBrowser";
 import { StreamingText } from "./components/StreamingText";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
+import {
+  doneActivity,
+  errorActivity,
+  idleActivity,
+  phaseFromPermission,
+  phaseFromStream,
+  phaseFromThought,
+  phaseFromTool,
+  queuedActivity,
+  type ActivityState,
+} from "./lib/activity";
 
 type WorkspaceMode = "build" | "chat";
 
@@ -32,7 +44,30 @@ type RightTab =
   | "rules";
 
 function emptyTab(id: string, title = "New session"): SessionTab {
-  return { id, title, transcript: [], busy: false, plan: null };
+  return {
+    id,
+    title,
+    transcript: [],
+    busy: false,
+    plan: null,
+    activity: idleActivity(),
+  };
+}
+
+function withActivity(
+  tab: SessionTab,
+  patch: Partial<ActivityState> & Pick<ActivityState, "phase" | "label">,
+): SessionTab {
+  const at = Date.now();
+  return {
+    ...tab,
+    activity: {
+      ...tab.activity,
+      ...patch,
+      lastEventAt: at,
+      live: patch.live ?? tab.activity.live,
+    },
+  };
 }
 
 export default function App() {
@@ -84,6 +119,7 @@ export default function App() {
   const busy = activeTab?.busy ?? false;
   const plan = activeTab?.plan ?? null;
   const anyBusy = tabs.some((t) => t.busy);
+  const activity = activeTab?.activity ?? idleActivity();
 
   const patchTab = useCallback(
     (id: string, patch: (tab: SessionTab) => SessionTab) => {
@@ -372,8 +408,9 @@ export default function App() {
     patchTab(id, (t) => ({
       ...t,
       busy: true,
+      activity: queuedActivity(),
       title:
-        t.title === "New session"
+        t.title === "New session" || t.title === "New chat"
           ? prompt.slice(0, 48)
           : t.title,
       transcript: [...t.transcript, { kind: "user", text: prompt }],
@@ -384,6 +421,7 @@ export default function App() {
         patchTab(id, (t) => ({
           ...t,
           busy: false,
+          activity: doneActivity(false),
           transcript: [
             ...t.transcript,
             { kind: "assistant", text: "Conversation compacted." },
@@ -403,6 +441,7 @@ export default function App() {
             return {
               ...t,
               busy: false,
+              activity: doneActivity(false),
               transcript: t.transcript.map((item, i) =>
                 i === t.transcript.length - 1 && item.kind === "assistant"
                   ? { ...item, streaming: false }
@@ -420,6 +459,7 @@ export default function App() {
             return {
               ...t,
               busy: false,
+              activity: doneActivity(false),
               transcript: t.transcript.map((item) =>
                 item.kind === "assistant" || item.kind === "thought"
                   ? { ...item, streaming: false }
@@ -430,6 +470,7 @@ export default function App() {
           return {
             ...t,
             busy: false,
+            activity: doneActivity(false),
             transcript: [
               ...t.transcript,
               { kind: "assistant", text: reply },
@@ -440,6 +481,7 @@ export default function App() {
         patchTab(id, (t) => ({
           ...t,
           busy: false,
+          activity: doneActivity(false),
           transcript: t.transcript.map((item) =>
             item.kind === "assistant" || item.kind === "thought"
               ? { ...item, streaming: false }
@@ -447,14 +489,15 @@ export default function App() {
           ),
         }));
       }
-      setSessions(await api.sessionList());
       setSubagents(await api.subagentsList());
       setBgTasks(await api.backgroundTasks());
       await refreshChrome();
+      await refreshSessions();
     } catch (e) {
       patchTab(id, (t) => ({
         ...t,
         busy: false,
+        activity: errorActivity(String(e)),
         transcript: [
           ...t.transcript,
           { kind: "error", text: String(e) },
@@ -891,10 +934,19 @@ export default function App() {
               {(item.kind === "user" || item.kind === "error") && item.text}
             </div>
           ))}
+          {/* Live waiting indicator while the active tab is mid-turn */}
+          {(busy || activity.phase === "done" || activity.phase === "error") && (
+            <div className="activity-in-transcript">
+              <ActivityIndicator activity={activity} busy={busy} />
+            </div>
+          )}
           <div ref={bottomRef} />
         </div>
 
         {showTerm && <TerminalPane toolShell={toolShell} />}
+
+        {/* Always-on strip above composer so idle vs live is never ambiguous */}
+        <ActivityIndicator activity={activity} busy={busy} />
 
         <div className="composer-wrap">
           {slashOpen && slashHits.length > 0 && (
@@ -1291,8 +1343,14 @@ export default function App() {
       </aside>
 
       <footer className="status-bar">
-        <span>
-          {status?.running ? "Agent running (in-process)" : "Agent stopped"} ·{" "}
+        <span className={busy || anyBusy ? "status-live" : "status-idle"}>
+          {busy
+            ? `● Live · ${activity.label}${activity.detail ? ` — ${activity.detail}` : ""}`
+            : anyBusy
+              ? `○ Idle here · ${tabs.filter((t) => t.busy).length} other tab(s) active`
+              : "○ Idle · ready"}
+          {" · "}
+          {status?.running ? "agent up" : "agent stopped"} ·{" "}
           {status?.sandbox_profile}
         </span>
         <span>
@@ -1450,8 +1508,8 @@ function applyUpdate(
 
   switch (u.type) {
     case "agent_message_chunk":
-      withTab(sid!, (tab) =>
-        mapTranscript(
+      withTab(sid!, (tab) => {
+        const next = mapTranscript(
           tab,
           (t) => {
             const last = t[t.length - 1];
@@ -1470,12 +1528,18 @@ function applyUpdate(
             ];
           },
           { busy: true },
-        ),
-      );
+        );
+        return withActivity(next, {
+          ...phaseFromStream(),
+          detail: "Streaming reply…",
+          live: true,
+        });
+      });
       break;
     case "agent_thought_chunk":
-      withTab(sid!, (tab) =>
-        mapTranscript(
+      withTab(sid!, (tab) => {
+        const snippet = u.text.trim().slice(0, 72);
+        const next = mapTranscript(
           tab,
           (t) => {
             const last = t[t.length - 1];
@@ -1494,12 +1558,17 @@ function applyUpdate(
             ];
           },
           { busy: true },
-        ),
-      );
+        );
+        return withActivity(next, {
+          ...phaseFromThought(),
+          detail: snippet || "Reasoning…",
+          live: true,
+        });
+      });
       break;
     case "tool_call":
-      withTab(sid!, (tab) =>
-        mapTranscript(
+      withTab(sid!, (tab) => {
+        const next = mapTranscript(
           tab,
           (t) => [
             ...t,
@@ -1511,12 +1580,16 @@ function applyUpdate(
             },
           ],
           { busy: true },
-        ),
-      );
+        );
+        return withActivity(next, {
+          ...phaseFromTool(u.title),
+          live: true,
+        });
+      });
       break;
     case "tool_call_update":
-      withTab(sid!, (tab) =>
-        mapTranscript(tab, (t) =>
+      withTab(sid!, (tab) => {
+        const next = mapTranscript(tab, (t) =>
           t.map((item) =>
             item.kind === "tool" && item.callId === u.call_id
               ? {
@@ -1526,8 +1599,31 @@ function applyUpdate(
                 }
               : item,
           ),
-        ),
-      );
+        );
+        const running = next.transcript.some(
+          (item) =>
+            item.kind === "tool" &&
+            (item.status === "running" || item.status === "pending"),
+        );
+        const toolRow = next.transcript.find(
+          (item): item is Extract<TranscriptItem, { kind: "tool" }> =>
+            item.kind === "tool" && item.callId === u.call_id,
+        );
+        const toolTitle = toolRow?.title ?? "tool";
+        if (running) {
+          return withActivity(next, {
+            ...phaseFromTool(toolTitle),
+            live: true,
+          });
+        }
+        // Tool finished but turn may continue — keep live if still busy.
+        return withActivity(next, {
+          phase: next.busy ? "streaming" : next.activity.phase,
+          label: next.busy ? "Working" : next.activity.label,
+          detail: `${toolTitle} · ${u.status}`,
+          live: next.busy,
+        });
+      });
       break;
     case "plan":
       withTab(sid!, (tab) =>
@@ -1543,11 +1639,46 @@ function applyUpdate(
       break;
     case "permission_required":
       setPermission(u.request);
+      if (sid) {
+        withTab(sid, (tab) =>
+          withActivity(
+            { ...tab, busy: true },
+            { ...phaseFromPermission(), live: true },
+          ),
+        );
+      }
+      break;
+    case "shell_session_started":
+      withTab(sid!, (tab) =>
+        withActivity(
+          { ...tab, busy: true },
+          {
+            phase: "tool",
+            label: "Shell",
+            detail: u.command?.slice(0, 80) ?? "running command",
+            live: true,
+          },
+        ),
+      );
+      break;
+    case "shell_output":
+      withTab(sid!, (tab) =>
+        withActivity(
+          { ...tab, busy: true },
+          {
+            phase: "tool",
+            label: "Shell",
+            detail: "Streaming command output…",
+            live: true,
+          },
+        ),
+      );
       break;
     case "turn_complete":
       withTab(sid!, (tab) => ({
         ...tab,
         busy: false,
+        activity: doneActivity(!!u.cancelled),
         transcript: tab.transcript.map((item) =>
           item.kind === "assistant" || item.kind === "thought"
             ? { ...item, streaming: false }
@@ -1556,13 +1687,17 @@ function applyUpdate(
       }));
       break;
     case "error":
-      withTab(sid!, (tab) =>
-        mapTranscript(
+      withTab(sid!, (tab) => {
+        const next = mapTranscript(
           tab,
           (t) => [...t, { kind: "error", text: u.message }],
           { busy: false },
-        ),
-      );
+        );
+        return {
+          ...next,
+          activity: errorActivity(u.message),
+        };
+      });
       break;
     default:
       break;

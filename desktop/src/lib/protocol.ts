@@ -1,5 +1,7 @@
 /** Typed client mirror of bridge SessionUpdate + Tauri commands. */
 
+import type { ActivityState } from "./activity";
+
 export type ToolCallKind = "read" | "edit" | "search" | "execute" | "think" | "other";
 export type ToolCallStatus =
   | "pending"
@@ -139,6 +141,8 @@ export interface SessionTab {
   transcript: TranscriptItem[];
   busy: boolean;
   plan: { steps: string[]; status: string } | null;
+  /** Live turn indicator (server activity vs idle/done). */
+  activity: ActivityState;
 }
 
 export type TranscriptItem =
