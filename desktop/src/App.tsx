@@ -1266,7 +1266,23 @@ export default function App() {
         </div>
       </header>
 
-      <aside className="sidebar">
+      <aside
+        className={`sidebar ${sidebarCollapsed ? "is-collapsed" : ""}`}
+        aria-expanded={!sidebarCollapsed}
+      >
+        <button
+          type="button"
+          className="rail-expand"
+          title="Show sessions sidebar (⌘B)"
+          aria-label="Show sessions sidebar"
+          onClick={() => setSidebarCollapsed(false)}
+        >
+          <span className="rail-expand-chevron" aria-hidden>
+            ▸
+          </span>
+          <span className="rail-expand-label">Sessions</span>
+        </button>
+        <div className="panel-body">
         <div className="panel-chrome">
           <span className="panel-chrome-title">Sessions</span>
           <button
@@ -1435,35 +1451,14 @@ export default function App() {
             );
           })}
         </div>
+        </div>
       </aside>
 
       <main
         className={`main density-${layoutDensity} ${
           docks.length > 1 ? "is-split" : ""
-        } ${sidebarCollapsed ? "has-left-edge" : ""} ${rightbarCollapsed ? "has-right-edge" : ""}`}
+        }`}
       >
-        {sidebarCollapsed && (
-          <button
-            type="button"
-            className="edge-reveal edge-reveal-left"
-            title="Show sessions sidebar (⌘B)"
-            aria-label="Show sessions sidebar"
-            onClick={() => setSidebarCollapsed(false)}
-          >
-            <span className="edge-reveal-label">Sessions</span>
-          </button>
-        )}
-        {rightbarCollapsed && (
-          <button
-            type="button"
-            className="edge-reveal edge-reveal-right"
-            title="Show tools panel (⌘⌥B)"
-            aria-label="Show tools panel"
-            onClick={() => setRightbarCollapsed(false)}
-          >
-            <span className="edge-reveal-label">Tools</span>
-          </button>
-        )}
         {tabs.length > 0 && (
           <div className="session-tabs" role="tablist" aria-label="Open sessions">
             {tabs.map((t) => (
@@ -1928,7 +1923,23 @@ export default function App() {
         </div>
       </main>
 
-      <aside className="rightbar">
+      <aside
+        className={`rightbar ${rightbarCollapsed ? "is-collapsed" : ""}`}
+        aria-expanded={!rightbarCollapsed}
+      >
+        <button
+          type="button"
+          className="rail-expand"
+          title="Show tools panel (⌘⌥B)"
+          aria-label="Show tools panel"
+          onClick={() => setRightbarCollapsed(false)}
+        >
+          <span className="rail-expand-chevron" aria-hidden>
+            ◂
+          </span>
+          <span className="rail-expand-label">Tools</span>
+        </button>
+        <div className="panel-body">
         <div className="panel-chrome">
           <button
             type="button"
@@ -2190,6 +2201,7 @@ export default function App() {
             </ol>
           </div>
         )}
+        </div>
       </aside>
 
       <footer className="status-bar">
