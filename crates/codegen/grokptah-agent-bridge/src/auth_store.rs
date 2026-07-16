@@ -30,6 +30,17 @@ const ACCOUNT_DISPLAY: &str = "display-name";
 /// Header value required by cli-chat-proxy nginx auth (matches xai-grok-cli).
 pub const XAI_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
 pub const XAI_AUTHENTICATE_RESPONSE: &str = "authenticate-response";
+/// Proxy version gate (`HTTP 426` if missing/too old). Must be ≥ 0.1.202.
+/// Identify as GrokPtah while reporting a current CLI-compatible version.
+pub fn client_version_header() -> String {
+    if let Ok(v) = std::env::var("GROK_VERSION") {
+        if !v.trim().is_empty() {
+            return v;
+        }
+    }
+    // Floor matches a recent stable CLI line; suffix tags desktop builds.
+    format!("0.2.101 (grokptah-{})", env!("CARGO_PKG_VERSION"))
+}
 
 #[derive(Debug, Clone)]
 pub struct WireCredentials {
@@ -212,7 +223,14 @@ pub fn apply_auth_headers(
     base_url: &str,
 ) -> reqwest::RequestBuilder {
     req = req.header("Authorization", format!("Bearer {}", creds.bearer));
+    // Version gate applies to all cli-chat-proxy traffic (OIDC and otherwise).
     let is_proxy = base_url.contains("cli-chat-proxy") || creds.oidc_token_auth;
+    if is_proxy {
+        // Missing this header → HTTP 426 "CLI version (none) is outdated".
+        req = req.header("x-grok-client-version", client_version_header());
+        // Same metric label family as the interactive CLI (not headless `-p`).
+        req = req.header("x-grok-client-mode", "interactive");
+    }
     if is_proxy && creds.oidc_token_auth {
         // MUST be the CLI product id — `"true"` is rejected as unknown.
         req = req
