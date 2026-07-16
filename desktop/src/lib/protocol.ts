@@ -99,6 +99,16 @@ export interface SessionSummary {
   forked_from?: string | null;
 }
 
+/** Restored from `~/.grokptah/workspace.json` on app launch. */
+export interface WorkspaceUiState {
+  project_cwd?: string | null;
+  active_session?: string | null;
+  open_tab_ids: string[];
+  model: string;
+  effort: string;
+  sessions: SessionSummary[];
+}
+
 /** Client-side open workspace (Claude Code–style concurrent session tab). */
 export interface SessionTab {
   id: string;

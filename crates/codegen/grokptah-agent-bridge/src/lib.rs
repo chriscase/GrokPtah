@@ -11,10 +11,11 @@ mod local_tools;
 mod models_catalog;
 mod permission;
 mod session;
+mod session_store;
 mod types;
 
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
-pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig};
+pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use session::{SessionSummary, TranscriptEntry};
 pub use types::{

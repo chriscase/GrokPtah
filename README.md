@@ -46,7 +46,8 @@ This is **not** an official xAI product. It is a personal/community fork for des
 - **Chat** — multi-line composer, streaming assistant + thought chunks (Gemini-style fade-in), stop/cancel turn  
 - **Tools** — cards for read/search/edit/shell; permission modal (allow / deny / always)  
 - **Plan mode** — propose steps; accept or reject from the UI  
-- **Sessions** — multi-tab concurrent workspaces (Claude Code–style): run several builds in parallel, switch tabs anytime; new / list / load / fork / rewind / compact  
+- **Sessions** — multi-tab concurrent workspaces (Claude Code–style): run several builds in parallel, switch tabs anytime; new / list / load / fork / rewind / compact. **Persisted** under `~/.grokptah/workspace.json` so sessions, tabs, project folder, and model survive app restarts  
+
 - **Project** — open folder (native dialog); rules discovery (`AGENTS.md`, etc.)  
 - **Files & git** — tree, fuzzy open, status/diff/stage/commit, worktree list, agent-edit diffs  
 - **Terminal** — interactive multi-tab PTY; tool shells attach to the **live** tool process stream  

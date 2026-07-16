@@ -42,6 +42,8 @@ pub fn run() {
             commands::session_new,
             commands::session_load,
             commands::session_list,
+            commands::workspace_state,
+            commands::set_open_tabs,
             commands::session_prompt,
             commands::session_cancel,
             commands::session_transcript,

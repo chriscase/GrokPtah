@@ -1,7 +1,7 @@
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo,
     PermissionDecision, PluginInfo, SessionSummary, SkillInfo, SubagentInfo, TranscriptEntry,
-    BRIDGE_VERSION, PRODUCT_NAME,
+    WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -68,6 +68,27 @@ pub fn session_load(state: State<'_, AppState>, id: String) -> Result<SessionSum
 #[tauri::command]
 pub fn session_list(state: State<'_, AppState>) -> Vec<SessionSummary> {
     state.host.list_sessions()
+}
+
+#[tauri::command]
+pub fn workspace_state(state: State<'_, AppState>) -> WorkspaceUiState {
+    state.host.workspace_ui_state()
+}
+
+#[tauri::command]
+pub fn set_open_tabs(
+    state: State<'_, AppState>,
+    tab_ids: Vec<String>,
+    active_id: Option<String>,
+) -> Result<(), String> {
+    let ids: Result<Vec<Uuid>, _> = tab_ids.iter().map(|s| Uuid::parse_str(s)).collect();
+    let ids = ids.map_err(map_err)?;
+    let active = match active_id {
+        Some(s) if !s.is_empty() => Some(Uuid::parse_str(&s).map_err(map_err)?),
+        _ => None,
+    };
+    state.host.set_open_tabs(ids, active);
+    Ok(())
 }
 
 #[tauri::command]

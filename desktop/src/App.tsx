@@ -65,6 +65,8 @@ export default function App() {
   const [toolShell, setToolShell] = useState<ToolShellAttach | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState("");
+  /** False until we finish reopening tabs from ~/.grokptah/workspace.json. */
+  const [workspaceRestored, setWorkspaceRestored] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const activeTab = useMemo(
@@ -182,6 +184,73 @@ export default function App() {
     });
     return () => unlisten?.();
   }, [refreshChrome]);
+
+  // Restore sessions + open tabs from disk (desktop-app durability).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        try {
+          await api.agentStart();
+        } catch {
+          /* already running from Tauri setup */
+        }
+        const ws = await api.workspaceState();
+        if (cancelled) return;
+        setSessions(ws.sessions);
+        const byId = new Map(ws.sessions.map((s) => [s.id, s]));
+        // Prefer last open tabs; else most recent sessions with history.
+        let tabIds = (ws.open_tab_ids ?? []).filter((id) => byId.has(id));
+        if (tabIds.length === 0) {
+          tabIds = ws.sessions
+            .filter((s) => s.message_count > 0)
+            .slice(0, 8)
+            .map((s) => s.id);
+        }
+        for (const id of tabIds) {
+          const summary = byId.get(id);
+          if (!summary) continue;
+          await openTab(summary, true);
+        }
+        const active =
+          (ws.active_session && byId.has(ws.active_session)
+            ? ws.active_session
+            : null) ??
+          tabIds[0] ??
+          null;
+        if (active) {
+          setActiveSessionId(active);
+          try {
+            await api.sessionLoad(active);
+          } catch {
+            /* missing */
+          }
+        }
+        if (ws.project_cwd) {
+          // status refresh will surface path; host already loaded it
+          await refreshChrome();
+        }
+      } catch (e) {
+        console.warn("workspace restore failed", e);
+      } finally {
+        if (!cancelled) setWorkspaceRestored(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // openTab/refreshChrome are stable enough; run once on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist tab strip whenever it changes (after initial restore).
+  useEffect(() => {
+    if (!workspaceRestored) return;
+    void api.setOpenTabs(
+      tabs.map((t) => t.id),
+      activeSessionId,
+    );
+  }, [tabs, activeSessionId, workspaceRestored]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });

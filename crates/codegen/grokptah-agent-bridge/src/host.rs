@@ -16,10 +16,22 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::local_tools;
 use crate::permission::{PermissionDecision, PermissionRequest};
 use crate::session::{Session, SessionSummary, TranscriptEntry};
+use crate::session_store::{self, WorkspaceSnapshot};
 use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo, PluginInfo, SkillInfo,
     SubagentInfo,
 };
+
+/// UI restore payload: open tabs + active session + project (sessions live in list).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceUiState {
+    pub project_cwd: Option<String>,
+    pub active_session: Option<Uuid>,
+    pub open_tab_ids: Vec<Uuid>,
+    pub model: String,
+    pub effort: EffortLevel,
+    pub sessions: Vec<SessionSummary>,
+}
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -63,6 +75,8 @@ struct Inner {
     project_cwd: Option<PathBuf>,
     sessions: HashMap<Uuid, Session>,
     active_session: Option<Uuid>,
+    /// Tab strip order from the last desktop session (persisted).
+    open_tab_ids: Vec<Uuid>,
     always_approve: bool,
     always_allowed_tools: HashSet<String>,
     model: String,
@@ -102,25 +116,48 @@ impl AgentHost {
     /// Create a new host. Events are pulled via [`AgentHostHandle::take_event_receiver`] once.
     pub fn create(config: HostConfig) -> AgentHostHandle {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let model = config.default_model.clone();
-        let effort = config.default_effort;
-        let always = config.always_approve;
         let auth = crate::auth_store::load_auth_state();
-        let mcp_servers = crate::discover::load_mcp_servers(None);
+        let snap = session_store::load().unwrap_or_default();
+        let project_cwd = session_store::cwd_still_valid(snap.project_cwd.as_deref());
+        let mcp_servers = crate::discover::load_mcp_servers(project_cwd.as_deref());
         let plugins = crate::discover::discover_plugins();
-        let skills = crate::discover::discover_skills(None);
+        let skills = crate::discover::discover_skills(project_cwd.as_deref());
+        let sessions = session_store::sessions_map(&snap);
+        // Prefer persisted model; fall back to HostConfig / catalog default.
+        let model = if !snap.model.is_empty() {
+            snap.model.clone()
+        } else {
+            config.default_model.clone()
+        };
+        let mut open_tab_ids = snap.open_tab_ids.clone();
+        // Drop tab ids that no longer exist.
+        open_tab_ids.retain(|id| sessions.contains_key(id));
+        let active_session = snap
+            .active_session
+            .filter(|id| sessions.contains_key(id))
+            .or_else(|| open_tab_ids.first().copied())
+            .or_else(|| sessions.keys().next().copied());
         let inner = Inner {
             running: false,
-            project_cwd: None,
-            sessions: HashMap::new(),
-            active_session: None,
-            always_approve: always,
+            project_cwd,
+            sessions,
+            active_session,
+            open_tab_ids,
+            always_approve: snap.always_approve || config.always_approve,
             always_allowed_tools: HashSet::new(),
             model,
-            effort,
+            effort: snap.effort,
             auth,
-            sandbox_profile: "workspace-write".into(),
-            appearance: "dark".into(),
+            sandbox_profile: if snap.sandbox_profile.is_empty() {
+                "workspace-write".into()
+            } else {
+                snap.sandbox_profile
+            },
+            appearance: if snap.appearance.is_empty() {
+                "dark".into()
+            } else {
+                snap.appearance
+            },
             permission_mode: "default".into(),
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
@@ -145,6 +182,63 @@ impl AgentHost {
 impl AgentHostHandle {
     pub fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<SessionUpdate>> {
         self.event_rx_factory.lock().take()
+    }
+
+    /// Snapshot host state to `~/.grokptah/workspace.json`.
+    pub fn persist(&self) {
+        let snap = {
+            let g = self.inner.lock();
+            WorkspaceSnapshot {
+                version: 1,
+                project_cwd: g
+                    .project_cwd
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                active_session: g.active_session,
+                open_tab_ids: g.open_tab_ids.clone(),
+                model: g.model.clone(),
+                effort: g.effort,
+                sandbox_profile: g.sandbox_profile.clone(),
+                appearance: g.appearance.clone(),
+                always_approve: g.always_approve,
+                sessions: g.sessions.values().cloned().collect(),
+            }
+        };
+        if let Err(e) = session_store::save(&snap) {
+            eprintln!("[grokptah] workspace persist failed: {e:#}");
+        }
+    }
+
+    /// UI restore: sessions list + which tabs were open.
+    pub fn workspace_ui_state(&self) -> WorkspaceUiState {
+        let g = self.inner.lock();
+        let mut sessions: Vec<_> = g.sessions.values().map(|s| s.summary()).collect();
+        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        WorkspaceUiState {
+            project_cwd: g.project_cwd.as_ref().map(|p| p.display().to_string()),
+            active_session: g.active_session,
+            open_tab_ids: g.open_tab_ids.clone(),
+            model: g.model.clone(),
+            effort: g.effort,
+            sessions,
+        }
+    }
+
+    /// Remember open tabs (call when the tab strip changes).
+    pub fn set_open_tabs(&self, ids: Vec<Uuid>, active: Option<Uuid>) {
+        {
+            let mut g = self.inner.lock();
+            g.open_tab_ids = ids
+                .into_iter()
+                .filter(|id| g.sessions.contains_key(id))
+                .collect();
+            if let Some(a) = active {
+                if g.sessions.contains_key(&a) {
+                    g.active_session = Some(a);
+                }
+            }
+        }
+        self.persist();
     }
 
     pub fn status(&self) -> AgentStatus {
@@ -183,39 +277,56 @@ impl AgentHostHandle {
         }
         let mcp = crate::discover::load_mcp_servers(Some(&p));
         let skills = crate::discover::discover_skills(Some(&p));
-        let mut g = self.inner.lock();
-        g.project_cwd = Some(p.clone());
-        g.mcp_servers = mcp;
-        g.skills = skills;
+        {
+            let mut g = self.inner.lock();
+            g.project_cwd = Some(p.clone());
+            g.mcp_servers = mcp;
+            g.skills = skills;
+        }
+        self.persist();
         Ok(p.display().to_string())
     }
 
     pub fn session_new(&self) -> Result<SessionSummary> {
-        let mut g = self.inner.lock();
-        if !g.running {
-            bail!("agent not started");
-        }
-        let cwd = g
-            .project_cwd
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let model = g.model.clone();
-        let effort = g.effort;
-        let s = Session::new(cwd, model, effort);
-        let summary = s.summary();
-        g.active_session = Some(s.id);
-        g.sessions.insert(s.id, s);
+        let summary = {
+            let mut g = self.inner.lock();
+            if !g.running {
+                bail!("agent not started");
+            }
+            let cwd = g
+                .project_cwd
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let model = g.model.clone();
+            let effort = g.effort;
+            let s = Session::new(cwd, model, effort);
+            let summary = s.summary();
+            g.active_session = Some(s.id);
+            if !g.open_tab_ids.contains(&s.id) {
+                g.open_tab_ids.push(s.id);
+            }
+            g.sessions.insert(s.id, s);
+            summary
+        };
+        self.persist();
         Ok(summary)
     }
 
     pub fn session_load(&self, id: Uuid) -> Result<SessionSummary> {
-        let mut g = self.inner.lock();
-        let s = g
-            .sessions
-            .get(&id)
-            .ok_or_else(|| anyhow!("unknown session"))?;
-        let summary = s.summary();
-        g.active_session = Some(id);
+        let summary = {
+            let mut g = self.inner.lock();
+            let s = g
+                .sessions
+                .get(&id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            let summary = s.summary();
+            g.active_session = Some(id);
+            if !g.open_tab_ids.contains(&id) {
+                g.open_tab_ids.push(id);
+            }
+            summary
+        };
+        self.persist();
         Ok(summary)
     }
 
@@ -242,78 +353,98 @@ impl AgentHostHandle {
     }
 
     pub fn fork_session(&self, source: Uuid) -> Result<SessionSummary> {
-        let mut g = self.inner.lock();
-        let src = g
-            .sessions
-            .get(&source)
-            .ok_or_else(|| anyhow!("unknown session"))?
-            .clone();
-        let mut s = Session::new(src.cwd.clone(), src.model.clone(), src.effort);
-        s.transcript = src.transcript.clone();
-        s.title = format!("{} (fork)", src.title);
-        s.forked_from = Some(source);
-        s.plan_mode = src.plan_mode;
-        s.plan_steps = src.plan_steps.clone();
-        let summary = s.summary();
-        g.active_session = Some(s.id);
-        g.sessions.insert(s.id, s);
+        let summary = {
+            let mut g = self.inner.lock();
+            let src = g
+                .sessions
+                .get(&source)
+                .ok_or_else(|| anyhow!("unknown session"))?
+                .clone();
+            let mut s = Session::new(src.cwd.clone(), src.model.clone(), src.effort);
+            s.transcript = src.transcript.clone();
+            s.title = format!("{} (fork)", src.title);
+            s.forked_from = Some(source);
+            s.plan_mode = src.plan_mode;
+            s.plan_steps = src.plan_steps.clone();
+            let summary = s.summary();
+            g.active_session = Some(s.id);
+            if !g.open_tab_ids.contains(&s.id) {
+                g.open_tab_ids.push(s.id);
+            }
+            g.sessions.insert(s.id, s);
+            summary
+        };
+        self.persist();
         Ok(summary)
     }
 
     pub fn rewind_session(&self, id: Uuid, keep_messages: usize) -> Result<SessionSummary> {
-        let mut g = self.inner.lock();
-        let s = g
-            .sessions
-            .get_mut(&id)
-            .ok_or_else(|| anyhow!("unknown session"))?;
-        if keep_messages < s.transcript.len() {
-            s.transcript.truncate(keep_messages);
-        }
-        s.updated_at = Utc::now();
-        Ok(s.summary())
+        let summary = {
+            let mut g = self.inner.lock();
+            let s = g
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            if keep_messages < s.transcript.len() {
+                s.transcript.truncate(keep_messages);
+            }
+            s.updated_at = Utc::now();
+            s.summary()
+        };
+        self.persist();
+        Ok(summary)
     }
 
     pub fn compact_session(&self, id: Uuid) -> Result<SessionSummary> {
-        let mut g = self.inner.lock();
-        let s = g
-            .sessions
-            .get_mut(&id)
-            .ok_or_else(|| anyhow!("unknown session"))?;
-        if s.transcript.len() > 2 {
-            let keep = 2;
-            let drop_n = s.transcript.len() - keep;
-            s.transcript = s.transcript.split_off(drop_n);
-            s.transcript.insert(
-                0,
-                TranscriptEntry {
-                    role: "system".into(),
-                    text: format!("[compacted {drop_n} prior messages]"),
-                },
-            );
-            s.compacted_summary = Some(format!("compacted {drop_n}"));
-        }
-        s.updated_at = Utc::now();
-        Ok(s.summary())
+        let summary = {
+            let mut g = self.inner.lock();
+            let s = g
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            if s.transcript.len() > 2 {
+                let keep = 2;
+                let drop_n = s.transcript.len() - keep;
+                s.transcript = s.transcript.split_off(drop_n);
+                s.transcript.insert(
+                    0,
+                    TranscriptEntry {
+                        role: "system".into(),
+                        text: format!("[compacted {drop_n} prior messages]"),
+                    },
+                );
+                s.compacted_summary = Some(format!("compacted {drop_n}"));
+            }
+            s.updated_at = Utc::now();
+            s.summary()
+        };
+        self.persist();
+        Ok(summary)
     }
 
     pub fn set_model(&self, model: String) {
         self.inner.lock().model = model;
+        self.persist();
     }
 
     pub fn set_effort(&self, effort: EffortLevel) {
         self.inner.lock().effort = effort;
+        self.persist();
     }
 
     pub fn set_always_approve(&self, v: bool) {
         self.inner.lock().always_approve = v;
+        self.persist();
     }
 
     pub fn set_sandbox(&self, profile: String) {
         self.inner.lock().sandbox_profile = profile;
+        self.persist();
     }
 
     pub fn set_appearance(&self, appearance: String) {
         self.inner.lock().appearance = appearance;
+        self.persist();
     }
 
     pub fn set_permission_mode(&self, mode: String) {
@@ -847,6 +978,9 @@ impl AgentHostHandle {
             let mut g = self.inner.lock();
             g.turn_cancels.remove(&session_id);
         }
+        // Persist after every turn (user prompt already in transcript; assistant
+        // text is pushed during run_turn via push_assistant).
+        self.persist();
 
         let cancelled = cancel.is_cancelled();
         match result {
@@ -1324,14 +1458,19 @@ impl AgentHostHandle {
 }
 
 fn push_assistant(host: &AgentHostHandle, session_id: Uuid, text: &str) {
-    let mut g = host.inner.lock();
-    if let Some(s) = g.sessions.get_mut(&session_id) {
-        s.transcript.push(TranscriptEntry {
-            role: "assistant".into(),
-            text: text.into(),
-        });
-        s.updated_at = Utc::now();
+    {
+        let mut g = host.inner.lock();
+        if let Some(s) = g.sessions.get_mut(&session_id) {
+            s.transcript.push(TranscriptEntry {
+                role: "assistant".into(),
+                text: text.into(),
+            });
+            s.updated_at = Utc::now();
+        }
     }
+    // Debounced by turn-end persist; still write on each assistant push so a
+    // crash mid-turn keeps partial progress when the reply was long.
+    host.persist();
 }
 
 fn emit_message(tx: &mpsc::UnboundedSender<SessionUpdate>, session_id: Uuid, text: &str) {

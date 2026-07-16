@@ -19,20 +19,24 @@ pub struct TranscriptEntry {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: Uuid,
     pub title: String,
     pub cwd: std::path::PathBuf,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
     pub transcript: Vec<TranscriptEntry>,
     pub forked_from: Option<Uuid>,
     pub model: String,
     pub effort: crate::types::EffortLevel,
+    #[serde(default)]
     pub plan_mode: bool,
+    #[serde(default)]
     pub plan_steps: Vec<String>,
     /// Compact drops early transcript into a summary blob.
+    #[serde(default)]
     pub compacted_summary: Option<String>,
 }
 

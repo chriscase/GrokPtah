@@ -4,6 +4,7 @@ import type {
   AuthState,
   ModelInfo,
   SessionSummary,
+  WorkspaceUiState,
 } from "./protocol";
 
 export const api = {
@@ -15,6 +16,13 @@ export const api = {
   sessionNew: () => invoke<SessionSummary>("session_new"),
   sessionLoad: (id: string) => invoke<SessionSummary>("session_load", { id }),
   sessionList: () => invoke<SessionSummary[]>("session_list"),
+  /** Full workspace restore (sessions + open tabs + project). */
+  workspaceState: () => invoke<WorkspaceUiState>("workspace_state"),
+  setOpenTabs: (tabIds: string[], activeId?: string | null) =>
+    invoke<void>("set_open_tabs", {
+      tabIds,
+      activeId: activeId ?? null,
+    }),
   sessionPrompt: (sessionId: string, prompt: string) =>
     invoke<string>("session_prompt", { sessionId, prompt }),
   /** Cancel one session's turn, or all active turns when sessionId omitted. */
