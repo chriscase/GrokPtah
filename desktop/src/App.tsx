@@ -14,9 +14,12 @@ import {
   type TranscriptItem,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
+import { SearchPanel } from "./components/SearchPanel";
 import { SessionBrowser } from "./components/SessionBrowser";
 import { StreamingText } from "./components/StreamingText";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
+
+type WorkspaceMode = "build" | "chat";
 
 type RightTab =
   | "files"
@@ -69,6 +72,8 @@ export default function App() {
   /** False until we finish reopening tabs from ~/.grokptah/workspace.json. */
   const [workspaceRestored, setWorkspaceRestored] = useState(false);
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const activeTab = useMemo(
@@ -145,11 +150,16 @@ export default function App() {
 
   const refreshSessions = useCallback(async () => {
     try {
-      setSessions(await api.sessionList());
+      setSessions(await api.sessionListByKind(workspaceMode, false));
     } catch {
       /* bridge down */
     }
-  }, []);
+  }, [workspaceMode]);
+
+  useEffect(() => {
+    if (!workspaceRestored) return;
+    void refreshSessions();
+  }, [workspaceMode, workspaceRestored, refreshSessions]);
 
   /** Open from browser or sidebar; drop from tabs if deleted. */
   const handleSessionBrowserOpen = useCallback(
@@ -161,6 +171,9 @@ export default function App() {
         } catch {
           /* keep trying load */
         }
+      }
+      if (s.kind === "chat" || s.kind === "build") {
+        setWorkspaceMode(s.kind);
       }
       await api.sessionLoad(s.id);
       await openTab(s, true);
@@ -572,18 +585,41 @@ export default function App() {
       </header>
 
       <aside className="sidebar">
-        <div className="section-title">Sessions</div>
+        <div className="section-title">Workspace</div>
+        <div className="workspace-mode" role="tablist" aria-label="Workspace mode">
+          <button
+            type="button"
+            className={workspaceMode === "build" ? "active" : ""}
+            onClick={() => setWorkspaceMode("build")}
+          >
+            Builds
+          </button>
+          <button
+            type="button"
+            className={workspaceMode === "chat" ? "active" : ""}
+            onClick={() => setWorkspaceMode("chat")}
+          >
+            Chats
+          </button>
+        </div>
         <button
           type="button"
           className="primary"
           style={{ width: "100%", marginBottom: 6 }}
           onClick={async () => {
-            const s = await api.sessionNew();
+            const s = await api.sessionNewKind(workspaceMode);
             await openTab(s, false);
-            setSessions(await api.sessionList());
+            await refreshSessions();
           }}
         >
-          New session
+          {workspaceMode === "chat" ? "New chat" : "New build"}
+        </button>
+        <button
+          type="button"
+          style={{ width: "100%", marginBottom: 4 }}
+          onClick={() => setSearchOpen(true)}
+        >
+          Search…
         </button>
         <button
           type="button"
@@ -593,7 +629,9 @@ export default function App() {
           Browse all…
         </button>
         <p className="session-hint">
-          Parallel tabs · rename/archive/folders in the full session browser.
+          {workspaceMode === "chat"
+            ? "Regular Grok conversations — separate from coding builds."
+            : "Coding-agent builds with tools. Switch to Chats for plain Grok."}
         </p>
         {sessions.map((s) => {
           const open = tabs.some((t) => t.id === s.id);
@@ -611,6 +649,9 @@ export default function App() {
             >
               <div className="session-item-title">
                 {running && <span className="busy-dot" title="Running" />}
+                <span className={`kind-chip ${s.kind ?? workspaceMode}`}>
+                  {s.kind ?? workspaceMode}
+                </span>
                 {s.title}
               </div>
               <div style={{ color: "var(--muted)", fontSize: 11 }}>
@@ -942,7 +983,9 @@ export default function App() {
               placeholder={
                 busy
                   ? "This session is running… switch tabs to start another"
-                  : "Message GrokPtah… (Enter send, Shift+Enter newline)"
+                  : workspaceMode === "chat"
+                    ? "Message Grok… (Enter send, Shift+Enter newline)"
+                    : "Message the coding agent… (Enter send, Shift+Enter newline)"
               }
               onChange={(e) => setComposer(e.target.value)}
               onKeyDown={(e) => {
@@ -1308,6 +1351,27 @@ export default function App() {
         onClose={() => setSessionBrowserOpen(false)}
         onOpen={(s) => void handleSessionBrowserOpen(s)}
         onChanged={() => void handleSessionBrowserChanged()}
+      />
+
+      <SearchPanel
+        open={searchOpen}
+        defaultKind={workspaceMode === "chat" ? "chat" : "build"}
+        onClose={() => setSearchOpen(false)}
+        onOpenSession={(sessionId, kind) => {
+          void (async () => {
+            try {
+              if (kind === "chat" || kind === "build") {
+                setWorkspaceMode(kind);
+              }
+              const s = await api.sessionLoad(sessionId);
+              await openTab(s, true);
+              setSearchOpen(false);
+              await refreshSessions();
+            } catch (e) {
+              console.warn(e);
+            }
+          })();
+        }}
       />
 
       {aboutOpen && (

@@ -46,7 +46,8 @@ This is **not** an official xAI product. It is a personal/community fork for des
 - **Chat** — multi-line composer, streaming assistant + thought chunks (Gemini-style fade-in), stop/cancel turn  
 - **Tools** — cards for read/search/edit/shell; permission modal (allow / deny / always)  
 - **Plan mode** — propose steps; accept or reject from the UI  
-- **Sessions** — multi-tab concurrent workspaces; full-screen browser for **rename / delete / archive**, **virtual folders** and **tags**; durable under `~/.grokptah/` (`workspace.json` + per-session `meta.json` + `transcript.jsonl`)  
+- **Sessions** — separate **Builds** (coding agent) and **Chats** (plain Grok); multi-tab; full-screen browser (rename / delete / archive / folders / tags); durable under `~/.grokptah/`  
+- **Search** — hybrid **keyword + semantic (TF–IDF)** search across chats and builds (filter by kind, archive, folder, tag)  
 
 
 - **Project** — open folder (native dialog); rules discovery (`AGENTS.md`, etc.)  

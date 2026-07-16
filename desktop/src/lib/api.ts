@@ -3,6 +3,8 @@ import type {
   AgentStatus,
   AuthState,
   ModelInfo,
+  SearchHit,
+  SessionKind,
   SessionSummary,
   WorkspaceUiState,
 } from "./protocol";
@@ -14,6 +16,31 @@ export const api = {
   setProjectCwd: (path: string) => invoke<string>("set_project_cwd", { path }),
   pickProjectFolder: () => invoke<string | null>("pick_project_folder"),
   sessionNew: () => invoke<SessionSummary>("session_new"),
+  sessionNewKind: (kind: SessionKind | string) =>
+    invoke<SessionSummary>("session_new_kind", { kind }),
+  sessionListByKind: (kind: SessionKind | string, includeArchived = false) =>
+    invoke<SessionSummary[]>("session_list_by_kind", {
+      kind,
+      includeArchived,
+    }),
+  searchSessions: (opts: {
+    query: string;
+    mode?: "hybrid" | "keyword" | "semantic" | string;
+    kind?: "all" | "chat" | "build" | string;
+    includeArchived?: boolean;
+    limit?: number;
+    folder?: string | null;
+    tag?: string | null;
+  }) =>
+    invoke<SearchHit[]>("search_sessions", {
+      query: opts.query,
+      mode: opts.mode ?? "hybrid",
+      kind: opts.kind ?? "all",
+      includeArchived: opts.includeArchived ?? false,
+      limit: opts.limit ?? 40,
+      folder: opts.folder ?? null,
+      tag: opts.tag ?? null,
+    }),
   sessionLoad: (id: string) => invoke<SessionSummary>("session_load", { id }),
   sessionList: () => invoke<SessionSummary[]>("session_list"),
   sessionListArchived: () => invoke<SessionSummary[]>("session_list_archived"),

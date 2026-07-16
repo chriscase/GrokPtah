@@ -101,6 +101,8 @@ pub struct SessionMeta {
     pub archived: bool,
     #[serde(default)]
     pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub kind: crate::session::SessionKind,
 }
 
 // ── Paths ───────────────────────────────────────────────────────────────────
@@ -315,6 +317,7 @@ impl SessionMeta {
             tags: s.tags.clone(),
             archived: s.archived,
             archived_at: s.archived_at,
+            kind: s.kind,
         }
     }
 
@@ -336,6 +339,7 @@ impl SessionMeta {
             tags: self.tags,
             archived: self.archived,
             archived_at: self.archived_at,
+            kind: self.kind,
             transcript_loaded: false,
             // Until load_transcript, treat disk as authoritative length.
             persisted_len: self.message_count,

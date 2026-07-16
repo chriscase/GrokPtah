@@ -89,6 +89,8 @@ export interface PermissionRequest {
   detail: unknown;
 }
 
+export type SessionKind = "build" | "chat";
+
 export interface SessionSummary {
   id: string;
   title: string;
@@ -101,6 +103,23 @@ export interface SessionSummary {
   tags?: string[];
   archived?: boolean;
   archived_at?: string | null;
+  kind?: SessionKind;
+}
+
+export interface SearchHit {
+  session_id: string;
+  title: string;
+  kind: SessionKind;
+  folder?: string | null;
+  tags: string[];
+  archived: boolean;
+  score: number;
+  keyword_score: number;
+  semantic_score: number;
+  snippet: string;
+  match_field: string;
+  message_index?: number | null;
+  updated_at: string;
 }
 
 /** Restored from `~/.grokptah/workspace.json` on app launch. */

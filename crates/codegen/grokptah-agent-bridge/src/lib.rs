@@ -10,6 +10,7 @@ mod host;
 mod local_tools;
 mod models_catalog;
 mod permission;
+mod search_engine;
 mod session;
 mod session_store;
 mod types;
@@ -17,7 +18,8 @@ mod types;
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use permission::{PermissionDecision, PermissionRequest};
-pub use session::{SessionSummary, TranscriptEntry};
+pub use search_engine::{SearchHit, SearchQuery};
+pub use session::{SessionKind, SessionSummary, TranscriptEntry};
 pub use types::{
     AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo, PluginInfo, SkillInfo,
     SubagentInfo,

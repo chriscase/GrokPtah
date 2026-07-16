@@ -11,6 +11,7 @@ export type SessionBrowserProps = {
 };
 
 type Scope = "active" | "archive" | "all";
+type KindFilter = "all" | "chat" | "build";
 
 function fmtDate(iso: string): string {
   try {
@@ -43,6 +44,7 @@ export function SessionBrowser({
   onChanged,
 }: SessionBrowserProps) {
   const [scope, setScope] = useState<Scope>("active");
+  const [kindFilter, setKindFilter] = useState<KindFilter>("all");
   const [rows, setRows] = useState<SessionSummary[]>([]);
   const [folders, setFolders] = useState<string[]>([]);
   const [allTags, setAllTags] = useState<string[]>([]);
@@ -65,12 +67,25 @@ export function SessionBrowser({
     setError(null);
     try {
       const includeArchived = scope !== "active";
-      const [list, f, t] = await Promise.all([
-        scope === "active"
-          ? api.sessionList()
-          : scope === "archive"
-            ? api.sessionListArchived()
-            : api.sessionListAll(),
+      let list: SessionSummary[];
+      if (kindFilter === "all") {
+        list =
+          scope === "active"
+            ? await api.sessionListAll().then((all) =>
+                all.filter((s) => !s.archived),
+              )
+            : scope === "archive"
+              ? await api.sessionListArchived()
+              : await api.sessionListAll();
+      } else {
+        list = await api.sessionListByKind(
+          kindFilter,
+          scope === "archive" || scope === "all",
+        );
+        if (scope === "active") list = list.filter((s) => !s.archived);
+        if (scope === "archive") list = list.filter((s) => s.archived);
+      }
+      const [f, t] = await Promise.all([
         api.sessionListFolders(includeArchived),
         api.sessionListTags(includeArchived),
       ]);
@@ -80,7 +95,7 @@ export function SessionBrowser({
     } catch (e) {
       setError(String(e));
     }
-  }, [scope]);
+  }, [scope, kindFilter]);
 
   useEffect(() => {
     if (!open) return;
@@ -267,6 +282,18 @@ export function SessionBrowser({
             </button>
           ))}
         </div>
+        <select
+          value={kindFilter}
+          onChange={(e) => {
+            setKindFilter(e.target.value as KindFilter);
+            setSelected(new Set());
+          }}
+          title="Chat vs build"
+        >
+          <option value="all">All kinds</option>
+          <option value="chat">Chats</option>
+          <option value="build">Builds</option>
+        </select>
         <input
           className="sb-search"
           placeholder="Search title, path, folder, tags…"
@@ -404,6 +431,9 @@ export function SessionBrowser({
                             onClick={() => onOpen(s)}
                             title="Open session"
                           >
+                            <span className={`sp-kind ${s.kind ?? "build"}`}>
+                              {s.kind ?? "build"}
+                            </span>
                             {s.title}
                             {isActive && <span className="sb-pill">open</span>}
                             {s.archived && <span className="sb-pill archive">archived</span>}

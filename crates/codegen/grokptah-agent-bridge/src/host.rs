@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::local_tools;
 use crate::permission::{PermissionDecision, PermissionRequest};
-use crate::session::{Session, SessionSummary, TranscriptEntry};
+use crate::search_engine::{self, SearchHit, SearchQuery};
+use crate::session::{Session, SessionKind, SessionSummary, TranscriptEntry};
 use crate::session_store::{self, WorkspaceChrome};
 use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo, PluginInfo, SkillInfo,
@@ -373,6 +374,10 @@ impl AgentHostHandle {
     }
 
     pub fn session_new(&self) -> Result<SessionSummary> {
+        self.session_new_kind(SessionKind::Build)
+    }
+
+    pub fn session_new_kind(&self, kind: SessionKind) -> Result<SessionSummary> {
         let summary = {
             let mut g = self.inner.lock();
             if !g.running {
@@ -384,7 +389,7 @@ impl AgentHostHandle {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             let model = g.model.clone();
             let effort = g.effort;
-            let s = Session::new(cwd, model, effort);
+            let s = Session::new_with_kind(cwd, model, effort, kind);
             let summary = s.summary();
             g.active_session = Some(s.id);
             if !g.open_tab_ids.contains(&s.id) {
@@ -397,6 +402,11 @@ impl AgentHostHandle {
         self.persist_session_rewrite(summary.id);
         self.persist_chrome();
         Ok(summary)
+    }
+
+    /// Hybrid / keyword / semantic search over chats + builds.
+    pub fn search_sessions(&self, query: SearchQuery) -> Result<Vec<SearchHit>> {
+        search_engine::search(&query).map_err(|e| anyhow!(e))
     }
 
     pub fn session_load(&self, id: Uuid) -> Result<SessionSummary> {
@@ -440,11 +450,21 @@ impl AgentHostHandle {
 
     /// When `archived_only` is true, return only archived; otherwise only active.
     pub fn list_sessions_filtered(&self, archived_only: bool) -> Vec<SessionSummary> {
+        self.list_sessions_ex(archived_only, None)
+    }
+
+    /// Optional kind filter: Some(Chat) / Some(Build) / None = all kinds.
+    pub fn list_sessions_ex(
+        &self,
+        archived_only: bool,
+        kind: Option<SessionKind>,
+    ) -> Vec<SessionSummary> {
         let g = self.inner.lock();
         let mut v: Vec<_> = g
             .sessions
             .values()
             .filter(|s| s.archived == archived_only)
+            .filter(|s| kind.map(|k| s.kind == k).unwrap_or(true))
             .map(|s| s.summary())
             .collect();
         v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -454,6 +474,19 @@ impl AgentHostHandle {
     pub fn list_all_sessions(&self) -> Vec<SessionSummary> {
         let g = self.inner.lock();
         let mut v: Vec<_> = g.sessions.values().map(|s| s.summary()).collect();
+        v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        v
+    }
+
+    pub fn list_sessions_by_kind(&self, kind: SessionKind, include_archived: bool) -> Vec<SessionSummary> {
+        let g = self.inner.lock();
+        let mut v: Vec<_> = g
+            .sessions
+            .values()
+            .filter(|s| s.kind == kind)
+            .filter(|s| include_archived || !s.archived)
+            .map(|s| s.summary())
+            .collect();
         v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         v
     }
@@ -1194,7 +1227,7 @@ impl AgentHostHandle {
     /// cancellation token keyed by `session_id`.
     pub async fn session_prompt(&self, session_id: Uuid, prompt: String) -> Result<String> {
         self.ensure_transcript_loaded(session_id)?;
-        let (cwd, model, effort, plan_mode, cancel, event_tx) = {
+        let (cwd, model, effort, plan_mode, kind, cancel, event_tx) = {
             let mut g = self.inner.lock();
             if !g.running {
                 bail!("agent not started");
@@ -1220,7 +1253,7 @@ impl AgentHostHandle {
                 role: "user".into(),
                 text: prompt.clone(),
             });
-            if s.title == "New session" {
+            if s.title == "New session" || s.title == "New chat" {
                 s.title = prompt.chars().take(48).collect();
             }
             s.updated_at = Utc::now();
@@ -1229,6 +1262,7 @@ impl AgentHostHandle {
                 model,
                 effort,
                 s.plan_mode,
+                s.kind,
                 cancel,
                 event_tx,
             )
@@ -1243,6 +1277,7 @@ impl AgentHostHandle {
                 &model,
                 effort,
                 plan_mode,
+                kind,
                 &prompt,
                 cancel.clone(),
                 event_tx.clone(),
@@ -1287,6 +1322,7 @@ impl AgentHostHandle {
         model: &str,
         effort: EffortLevel,
         plan_mode: bool,
+        kind: SessionKind,
         prompt: &str,
         cancel: CancellationToken,
         event_tx: mpsc::UnboundedSender<SessionUpdate>,
@@ -1302,13 +1338,53 @@ impl AgentHostHandle {
             &event_tx,
             session_id,
             &format!(
-                "model={model} effort={} auth={auth_label}",
+                "kind={} model={model} effort={} auth={auth_label}",
+                kind.as_str(),
                 effort.as_str()
             ),
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         let lower = prompt.to_lowercase();
+
+        // ── Regular Grok chat: conversational only (no tool loop) ─────────
+        if kind == SessionKind::Chat {
+            if let Some(rest) = prompt.strip_prefix('/') {
+                let cmd = rest.split_whitespace().next().unwrap_or("");
+                if cmd == "help" {
+                    let text = "Chat mode: plain conversation with Grok. Use Builds for coding tools. /help";
+                    emit_message(&event_tx, session_id, text);
+                    push_assistant(self, session_id, text);
+                    return Ok(text.into());
+                }
+            }
+            let reply = if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
+                emit_thought(
+                    &event_tx,
+                    session_id,
+                    &format!("chat API as {}…", creds.method),
+                );
+                match call_xai_chat(&creds, model, prompt, cwd, SessionKind::Chat).await {
+                    Ok(text) => text,
+                    Err(e) => format!(
+                        "Model call failed: {e}\n\nAuth: {} ({})",
+                        creds.display_name, creds.method
+                    ),
+                }
+            } else {
+                "No credentials. Run `grok login` or save an API key to chat.".into()
+            };
+            for chunk in chunk_text(&reply, 48) {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                emit_message(&event_tx, session_id, &chunk);
+                tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+            }
+            push_assistant(self, session_id, &reply);
+            return Ok(reply);
+        }
+
         if plan_mode || lower.starts_with("/plan") || lower.contains("make a plan") {
             let steps = vec![
                 "Explore the relevant files".into(),
@@ -1466,7 +1542,7 @@ impl AgentHostHandle {
                 session_id,
                 &format!("calling xAI chat API as {}…", creds.method),
             );
-            match call_xai_chat(&creds, model, prompt, cwd).await {
+            match call_xai_chat(&creds, model, prompt, cwd, SessionKind::Build).await {
                 Ok(text) => text,
                 Err(e) => format!(
                     "Model call failed: {e}\n\n\
@@ -1835,6 +1911,7 @@ async fn call_xai_chat(
     model: &str,
     prompt: &str,
     cwd: &Path,
+    kind: SessionKind,
 ) -> Result<String> {
     // Use the same catalog Grok Build wrote (wire id + base_url). Do not remap
     // `grok-build` → `grok-3` — that made the desktop look stuck on old models.
@@ -1854,6 +1931,19 @@ async fn call_xai_chat(
     } else {
         "https://api.x.ai/v1".into()
     };
+    let system = match kind {
+        SessionKind::Chat => {
+            "You are Grok, a helpful, witty AI assistant in GrokPtah. \
+             This is a regular conversation — not a coding-agent build session. \
+             Answer clearly; use markdown when useful. Do not invent local file edits."
+                .to_string()
+        }
+        SessionKind::Build => format!(
+            "You are GrokPtah, a desktop coding agent built on Grok Build. \
+             Working directory: {}. Be helpful and concise. Prefer concrete code changes.",
+            cwd.display()
+        ),
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -1863,11 +1953,7 @@ async fn call_xai_chat(
         "messages": [
             {
                 "role": "system",
-                "content": format!(
-                    "You are GrokPtah, a desktop coding agent built on Grok Build. \
-                     Working directory: {}. Be helpful and concise. Prefer concrete code changes.",
-                    cwd.display()
-                )
+                "content": system
             },
             { "role": "user", "content": prompt }
         ],

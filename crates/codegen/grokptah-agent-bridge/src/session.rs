@@ -2,6 +2,33 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Workspace mode: coding agent builds vs plain Grok conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    /// Coding-agent / build session (tools, project cwd, effort).
+    #[default]
+    Build,
+    /// Regular Grok chat — conversational, no tool loop by default.
+    Chat,
+}
+
+impl SessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Chat => "chat",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "chat" | "grok" | "conversation" => Self::Chat,
+            _ => Self::Build,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: Uuid,
@@ -19,6 +46,8 @@ pub struct SessionSummary {
     #[serde(default)]
     pub archived: bool,
     pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub kind: SessionKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +84,8 @@ pub struct Session {
     pub archived: bool,
     #[serde(default)]
     pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub kind: SessionKind,
     /// True once `transcript.jsonl` has been read into `transcript`.
     #[serde(skip)]
     pub transcript_loaded: bool,
@@ -65,10 +96,22 @@ pub struct Session {
 
 impl Session {
     pub fn new(cwd: std::path::PathBuf, model: String, effort: crate::types::EffortLevel) -> Self {
+        Self::new_with_kind(cwd, model, effort, SessionKind::Build)
+    }
+
+    pub fn new_with_kind(
+        cwd: std::path::PathBuf,
+        model: String,
+        effort: crate::types::EffortLevel,
+        kind: SessionKind,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
-            title: "New session".into(),
+            title: match kind {
+                SessionKind::Chat => "New chat".into(),
+                SessionKind::Build => "New session".into(),
+            },
             cwd,
             created_at: now,
             updated_at: now,
@@ -83,6 +126,7 @@ impl Session {
             tags: Vec::new(),
             archived: false,
             archived_at: None,
+            kind,
             transcript_loaded: true,
             persisted_len: 0,
         }
@@ -107,6 +151,7 @@ impl Session {
             tags: self.tags.clone(),
             archived: self.archived,
             archived_at: self.archived_at,
+            kind: self.kind,
         }
     }
 }

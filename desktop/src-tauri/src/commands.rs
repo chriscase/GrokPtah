@@ -1,7 +1,7 @@
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo,
-    PermissionDecision, PluginInfo, SessionSummary, SkillInfo, SubagentInfo, TranscriptEntry,
-    WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    PermissionDecision, PluginInfo, SearchHit, SearchQuery, SessionKind, SessionSummary, SkillInfo,
+    SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -57,6 +57,51 @@ pub async fn pick_project_folder(
 #[tauri::command]
 pub fn session_new(state: State<'_, AppState>) -> Result<SessionSummary, String> {
     state.host.session_new().map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_new_kind(
+    state: State<'_, AppState>,
+    kind: String,
+) -> Result<SessionSummary, String> {
+    state
+        .host
+        .session_new_kind(SessionKind::parse(&kind))
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_list_by_kind(
+    state: State<'_, AppState>,
+    kind: String,
+    include_archived: bool,
+) -> Vec<SessionSummary> {
+    state
+        .host
+        .list_sessions_by_kind(SessionKind::parse(&kind), include_archived)
+}
+
+#[tauri::command]
+pub fn search_sessions(
+    state: State<'_, AppState>,
+    query: String,
+    mode: Option<String>,
+    kind: Option<String>,
+    include_archived: Option<bool>,
+    limit: Option<usize>,
+    folder: Option<String>,
+    tag: Option<String>,
+) -> Result<Vec<SearchHit>, String> {
+    let q = SearchQuery {
+        query,
+        mode: mode.unwrap_or_else(|| "hybrid".into()),
+        kind: kind.unwrap_or_else(|| "all".into()),
+        include_archived: include_archived.unwrap_or(false),
+        limit: limit.unwrap_or(40),
+        folder,
+        tag,
+    };
+    state.host.search_sessions(q).map_err(map_err)
 }
 
 #[tauri::command]
