@@ -21,7 +21,9 @@ Smoke fixtures (`tests/parity_eval.rs`):
 | `smoke_edit_apply_patch_region` | Structured `apply_patch` multi-region-safe edit |
 | `smoke_refuse_unsafe_write_in_readonly` | Sandbox refuse path |
 | `smoke_todo_and_memory_tools` | todo + project memory across sessions |
-| `compact_never_shrinks_local_transcript` | Non-destructive compact |
+| `compact_never_shrinks_local_transcript` | Non-destructive compact + wire preview includes summary |
+| `smoke_web_fetch_offline` | `web_fetch` dispatch offline |
+| `rate_limited_surfaces_user_visible_event` | `RateLimited` event from shipped failure path |
 
 Also:
 

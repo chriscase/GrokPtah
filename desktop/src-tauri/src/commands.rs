@@ -296,12 +296,17 @@ pub fn session_rewind(
 }
 
 #[tauri::command]
-pub fn session_compact(
+pub async fn session_compact(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<SessionSummary, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    state.host.compact_session(id).map_err(map_err)
+    // Prefer model-backed summary when online (same path as slash `/compact`).
+    state
+        .host
+        .compact_session_async(id)
+        .await
+        .map_err(map_err)
 }
 
 #[tauri::command]

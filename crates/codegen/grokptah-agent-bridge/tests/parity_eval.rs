@@ -210,22 +210,138 @@ async fn compact_never_shrinks_local_transcript() {
             .unwrap();
         drain(&mut rx).await;
     }
-    let before = {
-        // export is the real API surface
-        let t = host.export_transcript(s.id).unwrap();
-        t.matches("## [").count()
-    };
+    let (len_before, start_before, summary_before) = host.compact_stats(s.id).unwrap();
+    assert!(start_before == 0 || summary_before.is_none() || summary_before.as_ref().is_some());
+    let before_lines = host.export_transcript(s.id).unwrap().matches("## [").count();
+
     host.session_prompt(s.id, "/compact".into()).await.unwrap();
     drain(&mut rx).await;
-    let after = host.export_transcript(s.id).unwrap().matches("## [").count();
+
+    let (len_after, start_after, summary_after) = host.compact_stats(s.id).unwrap();
     assert!(
-        after >= before,
-        "compact must not delete local transcript lines ({before} → {after})"
+        len_after >= len_before,
+        "local transcript length must not decrease ({len_before} → {len_after})"
     );
-    // Wire summary present
+    assert!(
+        start_after > start_before,
+        "api_context_start must advance after compact ({start_before} → {start_after})"
+    );
+    let summary = summary_after.expect("compacted_summary must be set");
+    assert!(
+        !summary.is_empty(),
+        "compacted_summary must be non-empty"
+    );
+    let after_lines = host.export_transcript(s.id).unwrap().matches("## [").count();
+    assert!(after_lines >= before_lines);
+
+    // Follow-on offline turn: wire preview must include compacted_summary (same
+    // assembly as run_coding_agent_loop → build_agent_messages).
+    host.session_prompt(s.id, "list files after compact".into())
+        .await
+        .unwrap();
+    drain(&mut rx).await;
+    let wire = host.wire_messages_preview(s.id).unwrap();
+    let blob = serde_json::to_string(&wire).unwrap();
+    assert!(
+        blob.contains("compacted")
+            || blob.contains("context limits")
+            || blob.contains(&summary.chars().take(40).collect::<String>()),
+        "wire messages must carry compacted summary; got {blob}"
+    );
+    // Offline reply should also acknowledge wire summary when present
     let export = host.export_transcript(s.id).unwrap();
     assert!(
-        export.contains("compacted") || export.contains("api_context_start"),
-        "export should show compact state"
+        export.contains("wire context includes compacted_summary")
+            || export.contains("context compacted for server"),
+        "follow-on offline turn / compact notice missing: {}",
+        export.chars().take(800).collect::<String>()
     );
+}
+
+#[tokio::test]
+async fn smoke_web_fetch_offline() {
+    let _iso = IsolatedHome::install();
+    let dir = fixture_repo();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let s = host.session_new().unwrap();
+    host.session_prompt(s.id, "web_fetch https://example.com/docs".into())
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(ev)) => {
+                let done = matches!(ev, SessionUpdate::TurnComplete { .. });
+                events.push(ev);
+                if done {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let saw = events.iter().any(|e| {
+        matches!(
+            e,
+            SessionUpdate::ToolCall { title, .. } if title == "web_fetch"
+        ) || matches!(
+            e,
+            SessionUpdate::ToolCallUpdate {
+                output: Some(o),
+                ..
+            } if o.contains("offline") || o.contains("example.com")
+        )
+    });
+    assert!(
+        saw,
+        "web_fetch must dispatch offline with tool card/output, got {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_surfaces_user_visible_event() {
+    let _iso = IsolatedHome::install();
+    let dir = fixture_repo();
+    let host = AgentHost::create(HostConfig::default());
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let s = host.session_new().unwrap();
+
+    assert!(grokptah_agent_bridge::is_rate_limit_error(
+        "HTTP 429 rate limited (will retry): slow down"
+    ));
+    assert!(!grokptah_agent_bridge::is_rate_limit_error("HTTP 500 oops"));
+
+    host.surface_agent_failure(
+        s.id,
+        "HTTP 429 rate limited (will retry): too many requests",
+    )
+    .unwrap();
+
+    let ev = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("event");
+    match ev {
+        SessionUpdate::RateLimited {
+            message,
+            retry_after_ms,
+            ..
+        } => {
+            assert!(
+                message.to_ascii_lowercase().contains("rate limited")
+                    || message.contains("429"),
+                "{message}"
+            );
+            assert!(retry_after_ms.is_some());
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
 }

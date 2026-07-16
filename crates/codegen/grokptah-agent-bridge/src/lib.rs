@@ -24,7 +24,9 @@ pub use memory::{inject_context as memory_inject_context, list_facts as memory_l
 
 pub use discover::{grokptah_home, set_grokptah_home_override};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
-pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
+pub use host::{
+    is_rate_limit_error, AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState,
+};
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use search_engine::{SearchHit, SearchQuery};
 pub use session::{SessionKind, SessionSummary, TranscriptEntry};

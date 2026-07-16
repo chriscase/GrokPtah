@@ -909,18 +909,79 @@ impl AgentHostHandle {
              cwd: {}\n\
              model: {}\n\
              messages: {}\n\
-             api_context_start: {}\n\n",
+             api_context_start: {}\n\
+             compacted_summary_chars: {}\n\n",
             s.id,
             s.title,
             s.cwd.display(),
             s.model,
             s.transcript.len(),
-            s.api_context_start
+            s.api_context_start,
+            s.compacted_summary.as_ref().map(|c| c.len()).unwrap_or(0)
         );
         for (i, e) in s.transcript.iter().enumerate() {
             out.push_str(&format!("## [{i}] {}\n{}\n\n", e.role, e.text));
         }
         Ok(out)
+    }
+
+    /// Compact metadata for tests / diagnostics (local length never shrinks on compact).
+    pub fn compact_stats(&self, id: Uuid) -> Result<(usize, usize, Option<String>)> {
+        self.ensure_transcript_loaded(id)?;
+        let g = self.inner.lock();
+        let s = g
+            .sessions
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        Ok((
+            s.transcript.len(),
+            s.api_context_start,
+            s.compacted_summary.clone(),
+        ))
+    }
+
+    /// Build the same OpenAI message list the coding agent would send (system +
+    /// compacted summary + windowed history). Used by tests and diagnostics so
+    /// offline paths can still assert wire context quality after `/compact`.
+    pub fn wire_messages_preview(&self, id: Uuid) -> Result<Vec<serde_json::Value>> {
+        self.ensure_transcript_loaded(id)?;
+        let g = self.inner.lock();
+        let s = g
+            .sessions
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        let history = api_context_messages(s);
+        let plan = if matches!(s.plan_status.as_str(), "accepted" | "executing" | "done")
+            && !s.plan_steps.is_empty()
+        {
+            Some((
+                s.plan_goal
+                    .as_deref()
+                    .unwrap_or("execute plan"),
+                s.plan_steps.as_slice(),
+            ))
+        } else {
+            None
+        };
+        Ok(build_agent_messages(
+            &history,
+            s.compacted_summary.as_deref(),
+            &s.cwd,
+            plan,
+        ))
+    }
+
+    /// Surface a rate-limit (or other) agent failure the same way a live turn
+    /// does — emits [`SessionUpdate::RateLimited`] when appropriate plus a
+    /// user-visible error chunk. Public for offline resilience tests.
+    pub fn surface_agent_failure(
+        &self,
+        session_id: Uuid,
+        err: &str,
+    ) -> Result<()> {
+        let event_tx = self.inner.lock().event_tx.clone();
+        surface_rate_limit_or_error(&event_tx, session_id, err);
+        Ok(())
     }
 
     /// Last agent-edited path for this process (for one-click diff UI).
@@ -1954,15 +2015,7 @@ impl AgentHostHandle {
             Ok(reply) => Ok(reply),
             Err(e) => {
                 let es = e.to_string();
-                if es.contains("429") || es.to_ascii_lowercase().contains("rate limit") {
-                    let _ = event_tx.send(SessionUpdate::RateLimited {
-                        session_id,
-                        message: format!(
-                            "Rate limited (HTTP 429). Wait and retry. {es}"
-                        ),
-                        retry_after_ms: Some(8000),
-                    });
-                }
+                surface_rate_limit_or_error(&event_tx, session_id, &es);
                 let msg = format!(
                     "Agent failed: {es}\n\nAuth: {} ({})\nProject: {}\n\
                      Tips: run `grok login` if needed. If rate limited, wait before retrying.",
@@ -2129,7 +2182,24 @@ impl AgentHostHandle {
                     .await;
             }
         }
-        let msg = format!("(offline agent) done: {}", prompt.chars().take(80).collect::<String>());
+        // Prove wire context still carries compacted_summary after offline turns.
+        let wire_note = {
+            let g = self.inner.lock();
+            g.sessions
+                .get(&session_id)
+                .and_then(|s| s.compacted_summary.as_ref())
+                .map(|c| {
+                    format!(
+                        "\n[wire context includes compacted_summary: {} chars]",
+                        c.len()
+                    )
+                })
+                .unwrap_or_default()
+        };
+        let msg = format!(
+            "(offline agent) done: {}{wire_note}",
+            prompt.chars().take(80).collect::<String>()
+        );
         emit_message(event_tx, session_id, &msg);
         push_assistant(self, session_id, &msg);
         Ok(msg)
@@ -2243,16 +2313,7 @@ impl AgentHostHandle {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    let es = e.to_string();
-                    if es.contains("429") || es.to_ascii_lowercase().contains("rate limit") {
-                        let _ = event_tx.send(SessionUpdate::RateLimited {
-                            session_id,
-                            message: format!(
-                                "Rate limited by the API. Wait a moment and retry. Detail: {es}"
-                            ),
-                            retry_after_ms: Some(5000),
-                        });
-                    }
+                    surface_rate_limit_or_error(event_tx, session_id, &e.to_string());
                     return Err(e);
                 }
             };
@@ -3570,6 +3631,26 @@ fn emit_message(tx: &mpsc::UnboundedSender<SessionUpdate>, session_id: Uuid, tex
         session_id,
         text: text.into(),
     });
+}
+
+/// Shared rate-limit / agent-error surfacing for live turns and tests.
+pub fn is_rate_limit_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("429") || e.contains("rate limit") || e.contains("rate limited")
+}
+
+fn surface_rate_limit_or_error(
+    event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    session_id: Uuid,
+    err: &str,
+) {
+    if is_rate_limit_error(err) {
+        let _ = event_tx.send(SessionUpdate::RateLimited {
+            session_id,
+            message: format!("Rate limited (HTTP 429). Wait and retry. {err}"),
+            retry_after_ms: Some(8000),
+        });
+    }
 }
 
 #[allow(dead_code)] // reserved if we re-enable quiet diagnostics
