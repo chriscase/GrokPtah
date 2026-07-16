@@ -469,6 +469,32 @@ mod tests {
     }
 
     #[test]
+    fn apply_multi_hunk_update_file_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("multi.txt");
+        fs::write(&p, "line one\nline two\nline three\n").unwrap();
+        let patch = r#"*** Update File: multi.txt
+<<<<<<< SEARCH
+line one
+=======
+LINE ONE
+>>>>>>> REPLACE
+*** Update File: multi.txt
+<<<<<<< SEARCH
+line three
+=======
+LINE THREE
+>>>>>>> REPLACE
+"#;
+        let report = apply_patch(dir.path(), patch).unwrap();
+        assert!(report.contains("updated"), "{report}");
+        let body = fs::read_to_string(p).unwrap();
+        assert!(body.contains("LINE ONE"), "{body}");
+        assert!(body.contains("line two"), "{body}");
+        assert!(body.contains("LINE THREE"), "{body}");
+    }
+
+    #[test]
     fn loads_agents_md() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.md"), "Always use tabs.").unwrap();

@@ -1624,6 +1624,37 @@ export default function App() {
             >
               Agent edit diffs
             </button>
+            <button
+              type="button"
+              onClick={async () => {
+                const path = await api.lastEditedPath();
+                if (path) {
+                  setGitDiff(await api.agentEditDiffs());
+                  setRightTab("git");
+                  // Surface path in status for one-click last edit
+                  setGitStatus((prev) => `Last edit: ${path}\n${prev || ""}`);
+                } else {
+                  setGitDiff("(no agent edits this process)");
+                }
+              }}
+            >
+              Open last edit
+            </button>
+            <button
+              type="button"
+              onClick={async () => {
+                if (!activeSessionId) return;
+                const text = await api.exportTranscript(activeSessionId);
+                try {
+                  await navigator.clipboard.writeText(text);
+                  setGitDiff(`(transcript copied · ${text.length} chars)\n\n${text.slice(0, 4000)}`);
+                } catch {
+                  setGitDiff(text);
+                }
+              }}
+            >
+              Export transcript
+            </button>
             <div className="panel-block">
               <strong>Worktrees</strong>
               <pre>{worktrees || "(none)"}</pre>
@@ -2230,6 +2261,51 @@ function applyUpdate(
           detail: u.path,
           live: true,
         });
+      });
+      break;
+    case "agent_progress":
+      withTab(sid!, (tab) =>
+        withActivity(
+          {
+            ...tab,
+            busy: true,
+            agentRound: u.round,
+            lastTool: u.last_tool ?? tab.lastTool ?? null,
+          },
+          {
+            phase: "tool",
+            label: u.last_tool ? "Tool" : "Round",
+            detail:
+              u.detail ||
+              (u.last_tool
+                ? `${u.last_tool} · ${u.round}/${u.max_rounds}`
+                : `round ${u.round}/${u.max_rounds}`),
+            live: true,
+          },
+        ),
+      );
+      break;
+    case "rate_limited":
+      withTab(sid!, (tab) => {
+        const next = mapTranscript(
+          tab,
+          (t) => [
+            ...t,
+            {
+              kind: "error" as const,
+              text: `Rate limited: ${u.message}${
+                u.retry_after_ms
+                  ? ` (retry ~${Math.ceil(u.retry_after_ms / 1000)}s)`
+                  : ""
+              }`,
+            },
+          ],
+          { busy: false },
+        );
+        return {
+          ...next,
+          activity: errorActivity(u.message),
+        };
       });
       break;
     default:

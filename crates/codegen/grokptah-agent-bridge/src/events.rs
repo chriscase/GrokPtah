@@ -113,4 +113,18 @@ pub enum SessionUpdate {
         /// Truncated unified diff or patch report for the right-rail.
         unified_diff: String,
     },
+    /// Agent loop progress (round / last tool) for fleet strip observability.
+    AgentProgress {
+        session_id: Uuid,
+        round: u32,
+        max_rounds: u32,
+        last_tool: Option<String>,
+        detail: String,
+    },
+    /// Structured rate-limit / retry notice (distinct from generic Error).
+    RateLimited {
+        session_id: Uuid,
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
 }

@@ -72,7 +72,12 @@ export function FleetStrip({
                 {t.needsPermission
                   ? "needs you"
                   : t.busy
-                    ? t.activity.label
+                    ? [
+                        t.agentRound != null ? `r${t.agentRound}` : null,
+                        t.lastTool || t.activity.detail || t.activity.label,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")
                     : t.unseen
                       ? "unseen"
                       : "idle"}

@@ -110,6 +110,15 @@ export const api = {
   gitStatus: () => invoke<string>("git_status"),
   gitDiff: () => invoke<string>("git_diff"),
   agentEditDiffs: () => invoke<string>("agent_edit_diffs"),
+  lastEditedPath: () => invoke<string | null>("last_edited_path"),
+  exportTranscript: (sessionId: string) =>
+    invoke<string>("export_transcript", { sessionId }),
+  memoryList: () =>
+    invoke<{ id: string; text: string; tags: string[]; updated_at: string }[]>(
+      "memory_list",
+    ),
+  memoryRemember: (text: string) =>
+    invoke<string>("memory_remember", { text }),
   gitStageAll: () => invoke<string>("git_stage_all"),
   gitCommit: (message: string) => invoke<string>("git_commit", { message }),
   listWorktrees: () => invoke<string>("list_worktrees"),

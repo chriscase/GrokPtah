@@ -2,29 +2,37 @@
 
 Phase 15 (#93) measures GrokPtah **Build** sessions against Grok Build CLI quality.
 
-## Offline (CI-friendly)
+## Offline smoke (CI-friendly / gating)
+
+From the bridge crate:
 
 ```sh
 cd crates/codegen/grokptah-agent-bridge
+cargo test --lib --tests -- --test-threads=1
+# Smoke-only filter:
+cargo test --test parity_eval -- --test-threads=1
+```
+
+Smoke fixtures (`tests/parity_eval.rs`):
+
+| Task | What it proves |
+|------|----------------|
+| `smoke_search_lists_and_reads` | Offline list + write path |
+| `smoke_edit_apply_patch_region` | Structured `apply_patch` multi-region-safe edit |
+| `smoke_refuse_unsafe_write_in_readonly` | Sandbox refuse path |
+| `smoke_todo_and_memory_tools` | todo + project memory across sessions |
+| `compact_never_shrinks_local_transcript` | Non-destructive compact |
+
+Also:
+
+```sh
 cargo test --lib project_context
-cargo test --test agent_tools
+cargo test --lib memory
+cargo test --lib todo_list
 cargo test --test bridge_lifecycle -- --test-threads=1
 ```
 
-These cover glob/patch/instructions helpers and host lifecycle without requiring network.
-
-## Live agent loop (manual / network)
-
-1. `grok login` (or API key) so `~/.grok/auth.json` is valid.
-2. Launch desktop, **Builds** mode, set cwd to a fixture repo with `AGENTS.md`.
-3. Prompt examples:
-   - “Using tools, list `src/`, read `src/lib.rs`, and apply a small patch adding a comment.”
-   - “Create `hello.txt` with contents hi and confirm with list_dir.”
-4. Confirm multi-round thoughts (`agent round N/24`), tool cards, and a final summary.
-
 ## Phase 15 P1 (streaming / skills / MCP / diffs)
-
-Covered by unit + lifecycle tests offline:
 
 - `project_context` skills inject (`load_skills_context`)
 - `mcp_runtime` function name shape
@@ -34,11 +42,30 @@ Live (manual): Build mode should stream assistant tokens mid-step; Stop cancels 
 
 ## Phase 15 P2 (plan / hooks / slash / sandbox / explore)
 
-- Plan propose → **Accept & execute** runs plan as context (offline plan steps always)
+- Plan propose → **Accept & execute** runs plan as context
 - PreToolUse deny hooks (`hooks.json`)
 - Slash: `/model` `/effort` `/clear` `/context` `/mcp` `/skills` `/sandbox` `/explore` `/compact`
 - Sandbox `read-only` blocks writes; `/explore` emits `SubagentSpawned`
 
-## Full harness (TODO)
+## Phase 15 remainder (#79 #84 #85 #93 #94 #95)
 
-Automate fixture tasks vs CLI in CI once #78/#79 stabilize. Track progress on #93.
+- Tool matrix: `docs/TOOL_MATRIX.md`
+- Compact: extractive offline + LLM summary when online; auto-compact when window > 40
+- Memory: `memory_write` / `memory_read` + inject into Build system context
+- Observability: `AgentProgress`, `RateLimited` events; export transcript API
+- Resilience: cancel mid-shell (lifecycle test); 429 → rate-limit message
+
+## Full / live harness (manual, network)
+
+1. `grok login` so `~/.grok/auth.json` is valid.
+2. Launch desktop, **Builds** mode, cwd = fixture with `AGENTS.md`.
+3. Prompts:
+   - Multi-round: list → read → apply_patch → todo_write
+   - Force long session then `/compact` and continue
+4. Optional: compare same prompts against Grok Build CLI; record rounds/time manually.
+
+Live network is **not** a CI gate (ADR / non-goals).
+
+## Tool inventory
+
+See **[TOOL_MATRIX.md](./TOOL_MATRIX.md)** for upstream → GrokPtah status.

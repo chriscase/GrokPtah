@@ -409,6 +409,43 @@ pub fn agent_edit_diffs(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
+pub fn last_edited_path(state: State<'_, AppState>) -> Option<String> {
+    state.host.last_edited_path()
+}
+
+#[tauri::command]
+pub fn export_transcript(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<String, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state.host.export_transcript(id).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn memory_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let facts = state.host.memory_list().map_err(map_err)?;
+    Ok(facts
+        .into_iter()
+        .map(|f| {
+            serde_json::json!({
+                "id": f.id,
+                "text": f.text,
+                "tags": f.tags,
+                "updated_at": f.updated_at,
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn memory_remember(state: State<'_, AppState>, text: String) -> Result<String, String> {
+    state.host.memory_remember(&text).map_err(map_err)
+}
+
+#[tauri::command]
 pub fn git_stage_all(state: State<'_, AppState>) -> Result<String, String> {
     state.host.git_stage_all().map_err(map_err)
 }

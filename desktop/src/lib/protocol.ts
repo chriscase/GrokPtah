@@ -88,6 +88,20 @@ export type SessionUpdate =
       path: string;
       summary: string;
       unified_diff: string;
+    }
+  | {
+      type: "agent_progress";
+      session_id: string;
+      round: number;
+      max_rounds: number;
+      last_tool?: string | null;
+      detail: string;
+    }
+  | {
+      type: "rate_limited";
+      session_id: string;
+      message: string;
+      retry_after_ms?: number | null;
     };
 
 export interface PermissionRequest {
@@ -153,6 +167,10 @@ export interface SessionTab {
   plan: { steps: string[]; status: string } | null;
   /** Live turn indicator (server activity vs idle/done). */
   activity: ActivityState;
+  /** Agent loop round (from AgentProgress). */
+  agentRound?: number | null;
+  /** Last tool name for fleet strip. */
+  lastTool?: string | null;
   /** Unread activity while the user was on another tab. */
   unseen: boolean;
   /** Distinct “needs your button” state (permission / plan accept). */

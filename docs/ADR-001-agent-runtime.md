@@ -43,3 +43,6 @@ Upstream still has a full stack (`xai-grok-shell`, `xai-grok-tools`, `xai-grok-m
 - P2: real plan propose/accept→execute, PreToolUse hooks, agent-critical slash
   commands, sandbox profiles (read-only / workspace-write / full), explore
   subagent (`/explore` + `spawn_explore`).
+- Remainder: tool matrix + todo/memory/web_fetch; LLM/extractive compact +
+  auto-compact; project memory; parity smoke tests; AgentProgress/RateLimited
+  + export transcript / last-edit UI.

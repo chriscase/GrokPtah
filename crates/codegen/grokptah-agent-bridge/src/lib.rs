@@ -10,13 +10,17 @@ mod hooks;
 mod host;
 mod local_tools;
 mod mcp_runtime;
+mod memory;
 mod models_catalog;
 mod permission;
 mod project_context;
 mod search_engine;
 mod session;
 mod session_store;
+mod todo_list;
 mod types;
+
+pub use memory::{inject_context as memory_inject_context, list_facts as memory_list_facts, remember as memory_remember};
 
 pub use discover::{grokptah_home, set_grokptah_home_override};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};

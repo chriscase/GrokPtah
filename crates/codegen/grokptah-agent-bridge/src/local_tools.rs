@@ -26,7 +26,7 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
-    fn basic(
+    pub fn basic(
         title: String,
         kind: ToolCallKind,
         input: serde_json::Value,

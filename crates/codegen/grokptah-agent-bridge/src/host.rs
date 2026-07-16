@@ -757,37 +757,60 @@ impl AgentHostHandle {
         Ok(summary)
     }
 
-    /// Shrink the *server-facing* context window only.
+    /// Shrink the *server-facing* context window only (sync extractive path).
     ///
     /// Local `transcript.jsonl` is never truncated or rewritten: every message
     /// stays on disk for search, UI, and perpetual history. Compact advances
-    /// [`Session::api_context_start`] and stores an extractive summary of the
-    /// portion that leaves the API window in [`Session::compacted_summary`].
+    /// [`Session::api_context_start`] and stores a summary of the portion that
+    /// leaves the API window in [`Session::compacted_summary`].
     pub fn compact_session(&self, id: Uuid) -> Result<SessionSummary> {
+        self.compact_session_inner(id, None)
+    }
+
+    /// Compact with optional LLM-quality summary text for the leaving window.
+    pub fn compact_session_with_summary(
+        &self,
+        id: Uuid,
+        quality_summary: Option<String>,
+    ) -> Result<SessionSummary> {
+        self.compact_session_inner(id, quality_summary)
+    }
+
+    fn compact_session_inner(
+        &self,
+        id: Uuid,
+        quality_summary: Option<String>,
+    ) -> Result<SessionSummary> {
         self.ensure_transcript_loaded(id)?;
-        /// How many recent transcript entries stay in the wire context window.
         const KEEP_RECENT: usize = 6;
-        let summary = {
+        let (summary, cwd, leaving_for_memory) = {
             let mut g = self.inner.lock();
             let s = g
                 .sessions
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
-            let len = s.transcript.len();
-            if len > KEEP_RECENT {
-                let new_start = len - KEEP_RECENT;
-                // Only advance the window (re-compact moves the cut forward).
-                let old_start = s.api_context_start.min(len);
+            let len_before = s.transcript.len();
+            let mut leaving_texts = Vec::new();
+            if len_before > KEEP_RECENT {
+                let new_start = len_before - KEEP_RECENT;
+                let old_start = s.api_context_start.min(len_before);
                 if new_start > old_start {
                     let leaving = &s.transcript[old_start..new_start];
-                    let piece = build_compact_summary(leaving);
+                    leaving_texts = leaving
+                        .iter()
+                        .filter(|e| e.role == "user" || e.role == "assistant")
+                        .map(|e| e.text.clone())
+                        .collect();
+                    let piece = quality_summary
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| build_compact_summary(leaving));
                     s.compacted_summary = Some(match s.compacted_summary.take() {
                         Some(prev) if !prev.is_empty() => format!("{prev}\n\n{piece}"),
                         _ => piece,
                     });
                     s.api_context_start = new_start;
-                    let total = len;
-                    let in_window = len - new_start;
+                    let total = s.transcript.len();
+                    let in_window = total - new_start;
                     // Additive local notice only — never deletes prior entries.
                     s.transcript.push(TranscriptEntry {
                         role: "system".into(),
@@ -795,15 +818,134 @@ impl AgentHostHandle {
                             "[context compacted for server: {in_window} recent messages stay in the API window; full local history retained ({total} messages before this notice)]"
                         ),
                     });
+                    debug_assert!(s.transcript.len() >= len_before);
                 }
             }
             s.updated_at = Utc::now();
-            s.summary()
+            (s.summary(), s.cwd.clone(), leaving_texts)
         };
-        // Append-only notice (if any) + meta (api_context_start / summary).
-        // Never rewrite_transcript — that would destroy local history.
+        // Best-effort memory flush of key decisions from compacted window.
+        for t in leaving_for_memory.iter().take(12) {
+            let lower = t.to_ascii_lowercase();
+            if lower.contains("always ")
+                || lower.contains("decision:")
+                || lower.contains("remember:")
+                || lower.contains("prefer ")
+            {
+                let clip: String = t.chars().take(400).collect();
+                let _ = crate::memory::remember(&cwd, &clip, &["compact-flush".into()]);
+            }
+        }
         self.persist_session(id);
         Ok(summary)
+    }
+
+    /// Async compact: model-backed summary when online, extractive offline.
+    pub async fn compact_session_async(&self, id: Uuid) -> Result<SessionSummary> {
+        self.ensure_transcript_loaded(id)?;
+        const KEEP_RECENT: usize = 6;
+        let (cwd, leaving, model) = {
+            let g = self.inner.lock();
+            let s = g
+                .sessions
+                .get(&id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            let len = s.transcript.len();
+            if len <= KEEP_RECENT {
+                drop(g);
+                return self.compact_session(id);
+            }
+            let new_start = len - KEEP_RECENT;
+            let old_start = s.api_context_start.min(len);
+            if new_start <= old_start {
+                drop(g);
+                return self.compact_session(id);
+            }
+            let leaving = s.transcript[old_start..new_start].to_vec();
+            (s.cwd.clone(), leaving, g.model.clone())
+        };
+
+        let quality = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
+            None
+        } else if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
+            let blob = build_compact_summary(&leaving);
+            let prompt = format!(
+                "Summarize this coding-agent conversation for future turns. \
+                 Preserve: user goals, decisions, file paths touched, failing tests, open TODOs. \
+                 Be dense (≤600 words). Do not invent facts.\n\n{blob}"
+            );
+            match call_xai_chat(
+                &creds,
+                &model,
+                &[("user".into(), prompt)],
+                None,
+                &cwd,
+                SessionKind::Build,
+            )
+            .await
+            {
+                Ok(t) if !t.trim().is_empty() => Some(format!("LLM compact summary:\n{t}")),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        self.compact_session_with_summary(id, quality)
+    }
+
+    /// Export full local transcript (never truncated by compact) as text.
+    pub fn export_transcript(&self, id: Uuid) -> Result<String> {
+        self.ensure_transcript_loaded(id)?;
+        let g = self.inner.lock();
+        let s = g
+            .sessions
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        let mut out = format!(
+            "# GrokPtah transcript export\n\
+             session: {}\n\
+             title: {}\n\
+             cwd: {}\n\
+             model: {}\n\
+             messages: {}\n\
+             api_context_start: {}\n\n",
+            s.id,
+            s.title,
+            s.cwd.display(),
+            s.model,
+            s.transcript.len(),
+            s.api_context_start
+        );
+        for (i, e) in s.transcript.iter().enumerate() {
+            out.push_str(&format!("## [{i}] {}\n{}\n\n", e.role, e.text));
+        }
+        Ok(out)
+    }
+
+    /// Last agent-edited path for this process (for one-click diff UI).
+    pub fn last_edited_path(&self) -> Option<String> {
+        self.inner.lock().edited_files.last().cloned()
+    }
+
+    pub fn memory_list(&self) -> Result<Vec<crate::memory::MemoryFact>> {
+        let cwd = self
+            .inner
+            .lock()
+            .project_cwd
+            .clone()
+            .ok_or_else(|| anyhow!("no project open"))?;
+        Ok(crate::memory::list_facts(&cwd))
+    }
+
+    pub fn memory_remember(&self, text: &str) -> Result<String> {
+        let cwd = self
+            .inner
+            .lock()
+            .project_cwd
+            .clone()
+            .ok_or_else(|| anyhow!("no project open"))?;
+        crate::memory::remember(&cwd, text, &[]).map_err(|e| anyhow!(e))
     }
 
     pub fn set_model(&self, model: String) {
@@ -1594,11 +1736,28 @@ impl AgentHostHandle {
                     return Ok(text.into());
                 }
                 "compact" => {
-                    let _ = self.compact_session(session_id)?;
-                    let text = "Context compacted for the server. Full local history retained.";
-                    emit_message(&event_tx, session_id, text);
-                    push_assistant(self, session_id, text);
-                    return Ok(text.into());
+                    let before = {
+                        let g = self.inner.lock();
+                        g.sessions
+                            .get(&session_id)
+                            .map(|s| s.transcript.len())
+                            .unwrap_or(0)
+                    };
+                    let _ = self.compact_session_async(session_id).await?;
+                    let after = {
+                        let g = self.inner.lock();
+                        g.sessions
+                            .get(&session_id)
+                            .map(|s| s.transcript.len())
+                            .unwrap_or(0)
+                    };
+                    let text = format!(
+                        "Context compacted for the server. Full local history retained \
+                         (local messages {before} → {after}, never decreased)."
+                    );
+                    emit_message(&event_tx, session_id, &text);
+                    push_assistant(self, session_id, &text);
+                    return Ok(text);
                 }
                 "model" => {
                     if let Some(id) = args.first() {
@@ -1794,9 +1953,19 @@ impl AgentHostHandle {
         {
             Ok(reply) => Ok(reply),
             Err(e) => {
+                let es = e.to_string();
+                if es.contains("429") || es.to_ascii_lowercase().contains("rate limit") {
+                    let _ = event_tx.send(SessionUpdate::RateLimited {
+                        session_id,
+                        message: format!(
+                            "Rate limited (HTTP 429). Wait and retry. {es}"
+                        ),
+                        retry_after_ms: Some(8000),
+                    });
+                }
                 let msg = format!(
-                    "Agent failed: {e}\n\nAuth: {} ({})\nProject: {}\n\
-                     Tips: run `grok login` if needed.",
+                    "Agent failed: {es}\n\nAuth: {} ({})\nProject: {}\n\
+                     Tips: run `grok login` if needed. If rate limited, wait before retrying.",
                     creds.display_name,
                     creds.method,
                     cwd.display()
@@ -1881,6 +2050,85 @@ impl AgentHostHandle {
                 .run_shell_tool_for_output(session_id, cwd, &cmd, cancel, event_tx)
                 .await;
         }
+        // Offline todo: "todo add buy milk" or JSON after "todo "
+        if let Some(rest) = prompt.strip_prefix("todo ") {
+            let args = if rest.trim_start().starts_with('{') || rest.trim_start().starts_with('[') {
+                serde_json::from_str(rest).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "todos": [{ "id": "1", "content": rest.trim(), "status": "pending" }]
+                    })
+                })
+            } else {
+                serde_json::json!({
+                    "todos": [{ "id": "1", "content": rest.trim(), "status": "pending" }]
+                })
+            };
+            let _ = self
+                .dispatch_agent_tool(
+                    session_id,
+                    cwd,
+                    "todo_write",
+                    &args.to_string(),
+                    cancel,
+                    event_tx,
+                    &Default::default(),
+                )
+                .await;
+        }
+        if let Some(rest) = prompt.strip_prefix("remember ") {
+            let _ = self
+                .dispatch_agent_tool(
+                    session_id,
+                    cwd,
+                    "memory_write",
+                    &serde_json::json!({ "text": rest.trim() }).to_string(),
+                    cancel,
+                    event_tx,
+                    &Default::default(),
+                )
+                .await;
+        }
+        if let Some(rest) = prompt.strip_prefix("recall ") {
+            let _ = self
+                .dispatch_agent_tool(
+                    session_id,
+                    cwd,
+                    "memory_read",
+                    &serde_json::json!({ "query": rest.trim() }).to_string(),
+                    cancel,
+                    event_tx,
+                    &Default::default(),
+                )
+                .await;
+        }
+        if let Some(rest) = prompt.strip_prefix("patch ") {
+            let _ = self
+                .dispatch_agent_tool(
+                    session_id,
+                    cwd,
+                    "apply_patch",
+                    &serde_json::json!({ "patch": rest.trim() }).to_string(),
+                    cancel,
+                    event_tx,
+                    &Default::default(),
+                )
+                .await;
+        }
+        if lower.starts_with("web_fetch ") {
+            if let Some(url) = prompt.split_whitespace().nth(1) {
+                let _ = self
+                    .dispatch_agent_tool(
+                        session_id,
+                        cwd,
+                        "web_fetch",
+                        &serde_json::json!({ "url": url }).to_string(),
+                        cancel,
+                        event_tx,
+                        &Default::default(),
+                    )
+                    .await;
+            }
+        }
         let msg = format!("(offline agent) done: {}", prompt.chars().take(80).collect::<String>());
         emit_message(event_tx, session_id, &msg);
         push_assistant(self, session_id, &msg);
@@ -1902,9 +2150,27 @@ impl AgentHostHandle {
         event_tx: &mpsc::UnboundedSender<SessionUpdate>,
     ) -> Result<String> {
         const MAX_ROUNDS: usize = 24;
-        let active_plan = {
+        // Auto-compact when wire window is large (non-destructive local history).
+        {
+            let need = {
+                let g = self.inner.lock();
+                g.sessions
+                    .get(&session_id)
+                    .map(|s| {
+                        let window = s.transcript.len().saturating_sub(s.api_context_start);
+                        window > 40
+                    })
+                    .unwrap_or(false)
+            };
+            if need {
+                let _ = self.compact_session_async(session_id).await;
+            }
+        }
+
+        let (active_plan, compacted_summary) = {
             let g = self.inner.lock();
-            g.sessions.get(&session_id).and_then(|s| {
+            let s = g.sessions.get(&session_id);
+            let plan = s.and_then(|s| {
                 if matches!(s.plan_status.as_str(), "accepted" | "executing" | "done")
                     && !s.plan_steps.is_empty()
                 {
@@ -1917,12 +2183,19 @@ impl AgentHostHandle {
                 } else {
                     None
                 }
-            })
+            });
+            let summary = s.and_then(|s| s.compacted_summary.clone());
+            (plan, summary.or_else(|| compacted_summary.map(|s| s.to_string())))
         };
         let plan_ref = active_plan
             .as_ref()
             .map(|(g, steps)| (g.as_str(), steps.as_slice()));
-        let mut messages = build_agent_messages(history, compacted_summary, cwd, plan_ref);
+        let mut messages = build_agent_messages(
+            history,
+            compacted_summary.as_deref(),
+            cwd,
+            plan_ref,
+        );
 
         // Best-effort MCP discovery (skipped when offline env set for tests).
         let mcp_specs = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some()
@@ -1939,7 +2212,7 @@ impl AgentHostHandle {
         };
         let (tools, mcp_index) = coding_agent_tools(&mcp_specs);
 
-        for _round in 1..=MAX_ROUNDS {
+        for round in 1..=MAX_ROUNDS {
             if cancel.is_cancelled() {
                 let msg = "(cancelled)".to_string();
                 emit_message(event_tx, session_id, &msg);
@@ -1947,7 +2220,15 @@ impl AgentHostHandle {
                 return Ok(msg);
             }
 
-            let step = call_xai_agent_step(
+            let _ = event_tx.send(SessionUpdate::AgentProgress {
+                session_id,
+                round: round as u32,
+                max_rounds: MAX_ROUNDS as u32,
+                last_tool: None,
+                detail: format!("Model step {round}/{MAX_ROUNDS}"),
+            });
+
+            let step = match call_xai_agent_step(
                 creds,
                 model,
                 effort,
@@ -1958,7 +2239,23 @@ impl AgentHostHandle {
                     emit_message(event_tx, session_id, delta);
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let es = e.to_string();
+                    if es.contains("429") || es.to_ascii_lowercase().contains("rate limit") {
+                        let _ = event_tx.send(SessionUpdate::RateLimited {
+                            session_id,
+                            message: format!(
+                                "Rate limited by the API. Wait a moment and retry. Detail: {es}"
+                            ),
+                            retry_after_ms: Some(5000),
+                        });
+                    }
+                    return Err(e);
+                }
+            };
 
             match step {
                 AgentStep::Final { text, streamed } => {
@@ -2002,6 +2299,13 @@ impl AgentHostHandle {
                         if cancel.is_cancelled() {
                             break;
                         }
+                        let _ = event_tx.send(SessionUpdate::AgentProgress {
+                            session_id,
+                            round: round as u32,
+                            max_rounds: MAX_ROUNDS as u32,
+                            last_tool: Some(tc.name.clone()),
+                            detail: format!("Tool `{}` (round {round})", tc.name),
+                        });
                         let output = self
                             .dispatch_agent_tool(
                                 session_id,
@@ -2365,9 +2669,129 @@ impl AgentHostHandle {
                 self.run_explore_subagent(session_id, cwd, &query, cancel, event_tx)
                     .await
             }
+            "todo_write" => {
+                let (items, merge) = crate::todo_list::TodoList::from_tool_args(&args)
+                    .map_err(|e| anyhow!(e))?;
+                let rendered = {
+                    let mut g = self.inner.lock();
+                    let s = g
+                        .sessions
+                        .get_mut(&session_id)
+                        .ok_or_else(|| anyhow!("unknown session"))?;
+                    s.todos.apply_update(items, merge);
+                    s.todos.render()
+                };
+                let call_id = Uuid::new_v4().to_string();
+                let _ = event_tx.send(SessionUpdate::ToolCall {
+                    session_id,
+                    call_id: call_id.clone(),
+                    title: "todo_write".into(),
+                    kind: ToolCallKind::Think,
+                    status: ToolCallStatus::Running,
+                    input: args.clone(),
+                });
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: ToolCallStatus::Completed,
+                    output: Some(rendered.clone()),
+                });
+                Ok(rendered)
+            }
+            "memory_write" => {
+                let text = args
+                    .get("text")
+                    .or_else(|| args.get("fact"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("memory_write requires text"))?
+                    .to_string();
+                let tags: Vec<String> = args
+                    .get("tags")
+                    .and_then(|t| t.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let id = crate::memory::remember(cwd, &text, &tags).map_err(|e| anyhow!(e))?;
+                let out = format!("Remembered fact {id}: {text}");
+                let call_id = Uuid::new_v4().to_string();
+                let _ = event_tx.send(SessionUpdate::ToolCall {
+                    session_id,
+                    call_id: call_id.clone(),
+                    title: "memory_write".into(),
+                    kind: ToolCallKind::Other,
+                    status: ToolCallStatus::Completed,
+                    input: args.clone(),
+                });
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: ToolCallStatus::Completed,
+                    output: Some(out.clone()),
+                });
+                Ok(out)
+            }
+            "memory_read" => {
+                let query = args
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let facts = crate::memory::search(cwd, &query);
+                let out = if facts.is_empty() {
+                    "(no matching project memory)".into()
+                } else {
+                    facts
+                        .iter()
+                        .map(|f| format!("- {}", f.text))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let call_id = Uuid::new_v4().to_string();
+                let _ = event_tx.send(SessionUpdate::ToolCall {
+                    session_id,
+                    call_id: call_id.clone(),
+                    title: "memory_read".into(),
+                    kind: ToolCallKind::Read,
+                    status: ToolCallStatus::Completed,
+                    input: args.clone(),
+                });
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: ToolCallStatus::Completed,
+                    output: Some(out.clone()),
+                });
+                Ok(out)
+            }
+            "web_fetch" => {
+                let url = args
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("web_fetch requires url"))?
+                    .to_string();
+                if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
+                    return Ok("ERROR: sandbox is read-only; web_fetch denied".into());
+                }
+                self.run_tool_for_output(
+                    session_id,
+                    "web_fetch",
+                    &args,
+                    || {
+                        let url = url.clone();
+                        async move { tool_web_fetch(&url).await }
+                    },
+                    cancel,
+                    event_tx,
+                )
+                .await
+            }
             other => Ok(format!(
                 "Unknown tool `{other}`. Available: list_dir, read_file, grep, write_file, \
-                 run_terminal_cmd, glob_files, apply_patch, spawn_explore, and mcp__* tools"
+                 run_terminal_cmd, glob_files, apply_patch, spawn_explore, todo_write, \
+                 memory_write, memory_read, web_fetch, and mcp__* tools"
             )),
         }
     }
@@ -3158,13 +3582,47 @@ fn emit_thought(tx: &mpsc::UnboundedSender<SessionUpdate>, session_id: Uuid, tex
 
 fn tool_kind(name: &str) -> ToolCallKind {
     match name {
-        "read_file" | "list_dir" => ToolCallKind::Read,
+        "read_file" | "list_dir" | "memory_read" => ToolCallKind::Read,
         "write_file" | "apply_patch" => ToolCallKind::Edit,
         "grep" | "glob_files" => ToolCallKind::Search,
-        "run_terminal_cmd" => ToolCallKind::Execute,
+        "run_terminal_cmd" | "web_fetch" => ToolCallKind::Execute,
+        "todo_write" | "spawn_explore" => ToolCallKind::Think,
+        "memory_write" => ToolCallKind::Other,
         n if n.starts_with("mcp__") => ToolCallKind::Other,
         _ => ToolCallKind::Other,
     }
+}
+
+async fn tool_web_fetch(url: &str) -> Result<local_tools::ToolResult> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        anyhow::bail!("url must start with http:// or https://");
+    }
+    if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
+        return Ok(local_tools::ToolResult::basic(
+            format!("Fetch {url}"),
+            ToolCallKind::Execute,
+            serde_json::json!({ "url": url }),
+            format!("(offline) would fetch {url}"),
+            false,
+            format!("web_fetch {url}"),
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("GrokPtah/0.1 (web_fetch)")
+        .build()?;
+    let resp = client.get(url).send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let clipped: String = text.chars().take(24_000).collect();
+    Ok(local_tools::ToolResult::basic(
+        format!("Fetch {url}"),
+        ToolCallKind::Execute,
+        serde_json::json!({ "url": url, "status": status.as_u16() }),
+        format!("HTTP {status}\n{clipped}"),
+        false,
+        format!("web_fetch {url}"),
+    ))
 }
 
 struct AgentToolCall {
@@ -3314,6 +3772,74 @@ fn coding_agent_tools(mcp: &[crate::mcp_runtime::McpToolSpec]) -> (serde_json::V
                         }
                     },
                     "required": ["query"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "todo_write",
+                "description": "Update the session todo list. Pass todos: [{id, content, status}] with status pending|in_progress|completed|cancelled. merge defaults true.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "todos": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "content": { "type": "string" },
+                                    "status": { "type": "string" }
+                                },
+                                "required": ["content"]
+                            }
+                        },
+                        "merge": { "type": "boolean" }
+                    },
+                    "required": ["todos"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "memory_write",
+                "description": "Store a project-scoped fact for future sessions on this cwd.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string", "description": "Fact to remember" },
+                        "tags": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["text"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "memory_read",
+                "description": "Search project memory facts (empty query lists recent).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch a public HTTP(S) URL and return truncated text content (docs, raw files).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string" }
+                    },
+                    "required": ["url"]
                 }
             }
         }),
@@ -3524,6 +4050,13 @@ fn build_agent_messages(
             "content": skills
         }));
     }
+    let mem = crate::memory::inject_context(cwd);
+    if !mem.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": mem
+        }));
+    }
     if let Some((goal, steps)) = active_plan {
         if !steps.is_empty() {
             let mut plan = format!("Accepted plan to execute (goal: {goal}):\n");
@@ -3692,10 +4225,14 @@ where
             || status == reqwest::StatusCode::REQUEST_TIMEOUT
         {
             let text = resp.text().await.unwrap_or_default();
-            last_err = Some(format!(
-                "HTTP {status}: {}",
-                text.chars().take(400).collect::<String>()
-            ));
+            let clipped: String = text.chars().take(400).collect();
+            last_err = Some(if status.as_u16() == 429 {
+                format!(
+                    "HTTP 429 rate limited (will retry): {clipped}"
+                )
+            } else {
+                format!("HTTP {status}: {clipped}")
+            });
             if attempt < 3 {
                 tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << attempt)))
                     .await;

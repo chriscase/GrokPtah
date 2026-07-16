@@ -105,6 +105,9 @@ pub struct Session {
     /// How many prefix entries are already durable on disk (append cursor).
     #[serde(skip)]
     pub persisted_len: usize,
+    /// In-session agent todo list (not durable across restarts by design).
+    #[serde(skip)]
+    pub todos: crate::todo_list::TodoList,
 }
 
 impl Session {
@@ -145,6 +148,7 @@ impl Session {
             kind,
             transcript_loaded: true,
             persisted_len: 0,
+            todos: crate::todo_list::TodoList::default(),
         }
     }
 

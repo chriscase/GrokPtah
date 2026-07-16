@@ -358,6 +358,7 @@ impl SessionMeta {
             transcript_loaded: false,
             // Until load_transcript, treat disk as authoritative length.
             persisted_len: self.message_count,
+            todos: crate::todo_list::TodoList::default(),
         }
     }
 }
