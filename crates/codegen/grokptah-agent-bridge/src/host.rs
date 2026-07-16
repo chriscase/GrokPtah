@@ -1408,6 +1408,7 @@ impl AgentHostHandle {
             return Ok("(cancelled)".into());
         }
 
+        // Single compact status crumb (UI collapses these into a diagnostics chip).
         let auth_label = crate::auth_store::resolve_wire_credentials()
             .map(|w| format!("{} via {}", w.display_name, w.method))
             .unwrap_or_else(|| "no credentials".into());
@@ -1415,9 +1416,11 @@ impl AgentHostHandle {
             &event_tx,
             session_id,
             &format!(
-                "kind={} model={model} effort={} auth={auth_label}",
+                "kind={} model={} effort={} auth={}",
                 kind.as_str(),
-                effort.as_str()
+                model,
+                effort.as_str(),
+                auth_label
             ),
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1451,7 +1454,7 @@ impl AgentHostHandle {
                 emit_thought(
                     &event_tx,
                     session_id,
-                    &format!("chat API as {}…", creds.method),
+                    &format!("calling chat API as {}…", creds.method),
                 );
                 match call_xai_chat(
                     &creds,
