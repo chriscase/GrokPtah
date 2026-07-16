@@ -12,10 +12,17 @@ export function isDebugLine(line: string): boolean {
     return true;
   }
   if (l.includes("calling chat api") || l.includes("chat api as")) return true;
+  if (l.includes("calling xai") || l.includes(" as grok_build")) return true;
   if (l.startsWith("auth=") || l.includes(" via grok_build")) return true;
   if (l.includes("via ") && (l.includes("oidc") || l.includes("api_key"))) {
     return true;
   }
+  // Agent-loop status (must not appear as full thought bubbles)
+  if (l.includes("agent loop starting")) return true;
+  if (/^agent round \d+\/\d+/.test(l)) return true;
+  if (/^tool `[a-z0-9_./-]+`/.test(l)) return true;
+  if (l.includes("tools on") && l.includes("rounds")) return true;
+  if (l.includes("sandbox=") && l.includes("effort=")) return true;
   // Single-line host crumbs that are not natural-language reasoning
   if (/^[a-z_]+=\S+/.test(l) && l.length < 200) return true;
   return false;
@@ -52,6 +59,9 @@ export function expandDebugLines(text: string): string[] {
 /** Short label for the collapsed chip. */
 export function debugChipLabel(lines: string[]): string {
   const blob = lines.join(" ").toLowerCase();
+  if (blob.includes("agent round") || blob.includes("agent loop")) {
+    return "Agent activity";
+  }
   if (blob.includes("kind=chat")) return "Chat turn";
   if (blob.includes("kind=build")) return "Build turn";
   if (blob.includes("chat api") || blob.includes("calling")) return "API call";

@@ -1408,23 +1408,6 @@ impl AgentHostHandle {
             return Ok("(cancelled)".into());
         }
 
-        // Single compact status crumb (UI collapses these into a diagnostics chip).
-        let auth_label = crate::auth_store::resolve_wire_credentials()
-            .map(|w| format!("{} via {}", w.display_name, w.method))
-            .unwrap_or_else(|| "no credentials".into());
-        emit_thought(
-            &event_tx,
-            session_id,
-            &format!(
-                "kind={} model={} effort={} auth={}",
-                kind.as_str(),
-                model,
-                effort.as_str(),
-                auth_label
-            ),
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
         let lower = prompt.to_lowercase();
 
         // ── Regular Grok chat: conversational only (no tool loop) ─────────
@@ -1449,13 +1432,7 @@ impl AgentHostHandle {
                     s.compacted_summary.clone(),
                 )
             };
-            let (reply, is_err) = if let Some(creds) = crate::auth_store::resolve_wire_credentials()
-            {
-                emit_thought(
-                    &event_tx,
-                    session_id,
-                    &format!("calling chat API as {}…", creds.method),
-                );
+            let reply = if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
                 match call_xai_chat(
                     &creds,
                     model,
@@ -1466,20 +1443,14 @@ impl AgentHostHandle {
                 )
                 .await
                 {
-                    Ok(text) => (text, false),
-                    Err(e) => (
-                        format!(
-                            "Model call failed: {e}\n\nAuth: {} ({})\nRun `grok login` if needed.",
-                            creds.display_name, creds.method
-                        ),
-                        true,
+                    Ok(text) => text,
+                    Err(e) => format!(
+                        "Model call failed: {e}\n\nAuth: {} ({})\nRun `grok login` if needed.",
+                        creds.display_name, creds.method
                     ),
                 }
             } else {
-                (
-                    "No credentials. Run `grok login` or save an API key to chat.".into(),
-                    true,
-                )
+                "No credentials. Run `grok login` or save an API key to chat.".into()
             };
             // One message event for live UI; invoke return is the finalize
             // source of truth (SessionPane strips streamed assistants).
@@ -1535,6 +1506,13 @@ impl AgentHostHandle {
             }
         }
 
+        // Offline / CI: no live model (tests set GROKPTAH_AGENT_OFFLINE=1).
+        if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
+            return self
+                .run_offline_build_turn(session_id, cwd, prompt, &cancel, &event_tx)
+                .await;
+        }
+
         // ── Real multi-step coding agent (tool-calling loop) ─────────────
         let Some(creds) = crate::auth_store::resolve_wire_credentials() else {
             let msg = format!(
@@ -1564,6 +1542,7 @@ impl AgentHostHandle {
                 session_id,
                 cwd,
                 model,
+                effort,
                 &creds,
                 &wire_history,
                 compacted_summary.as_deref(),
@@ -1588,6 +1567,72 @@ impl AgentHostHandle {
         }
     }
 
+    /// Deterministic Build turn for offline tests (no network).
+    async fn run_offline_build_turn(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        prompt: &str,
+        cancel: &CancellationToken,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) -> Result<String> {
+        let lower = prompt.to_lowercase();
+        if lower.contains("list") || lower.contains("files") || lower.contains("ls ") {
+            let _ = self
+                .run_tool_for_output(
+                    session_id,
+                    "list_dir",
+                    &serde_json::json!({ "path": "." }),
+                    || {
+                        let cwd = cwd.to_path_buf();
+                        async move { local_tools::tool_list_dir(&cwd, ".").await }
+                    },
+                    cancel,
+                    event_tx,
+                )
+                .await;
+        }
+        if let Some(rest) = prompt.strip_prefix("write ") {
+            if let Some((path, content)) = rest.split_once(':') {
+                let path = path.trim().to_string();
+                let content = content.trim().to_string();
+                let path_rec = path.clone();
+                let _ = self
+                    .run_tool_for_output(
+                        session_id,
+                        "write_file",
+                        &serde_json::json!({ "path": path, "content": content }),
+                        || {
+                            let cwd = cwd.to_path_buf();
+                            let path = path.clone();
+                            let content = content.clone();
+                            async move {
+                                local_tools::tool_write_file(&cwd, &path, &content).await
+                            }
+                        },
+                        cancel,
+                        event_tx,
+                    )
+                    .await;
+                self.record_edit(&path_rec);
+            }
+        }
+        if let Some(cmd) = prompt
+            .strip_prefix("run ")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            let _ = self
+                .run_shell_tool_for_output(session_id, cwd, &cmd, cancel, event_tx)
+                .await;
+        }
+        let msg = format!("(offline agent) done: {}", prompt.chars().take(80).collect::<String>());
+        emit_thought(event_tx, session_id, "offline agent path");
+        emit_message(event_tx, session_id, &msg);
+        push_assistant(self, session_id, &msg);
+        Ok(msg)
+    }
+
     /// Multi-round tool loop: model proposes tools → we run them → feed results
     /// back until a final text answer or max rounds.
     async fn run_coding_agent_loop(
@@ -1595,6 +1640,7 @@ impl AgentHostHandle {
         session_id: Uuid,
         cwd: &Path,
         model: &str,
+        effort: EffortLevel,
         creds: &crate::auth_store::WireCredentials,
         history: &[(String, String)],
         compacted_summary: Option<&str>,
@@ -1605,16 +1651,7 @@ impl AgentHostHandle {
         let mut messages = build_agent_messages(history, compacted_summary, cwd);
         let tools = coding_agent_tools();
 
-        emit_thought(
-            event_tx,
-            session_id,
-            &format!(
-                "agent loop starting (tools on, max {MAX_ROUNDS} rounds) as {}…",
-                creds.method
-            ),
-        );
-
-        for round in 1..=MAX_ROUNDS {
+        for _round in 1..=MAX_ROUNDS {
             if cancel.is_cancelled() {
                 let msg = "(cancelled)".to_string();
                 emit_message(event_tx, session_id, &msg);
@@ -1622,13 +1659,8 @@ impl AgentHostHandle {
                 return Ok(msg);
             }
 
-            emit_thought(
-                event_tx,
-                session_id,
-                &format!("agent round {round}/{MAX_ROUNDS}…"),
-            );
-
-            let step = call_xai_agent_step(creds, model, &messages, &tools).await?;
+            let step =
+                call_xai_agent_step(creds, model, effort, &messages, &tools, cancel).await?;
 
             match step {
                 AgentStep::Final(text) => {
@@ -1668,11 +1700,7 @@ impl AgentHostHandle {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        emit_thought(
-                            event_tx,
-                            session_id,
-                            &format!("tool `{}`…", tc.name),
-                        );
+                        // Tool cards already surface name/status — no thought spam.
                         let output = self
                             .dispatch_agent_tool(
                                 session_id,
@@ -1797,6 +1825,9 @@ impl AgentHostHandle {
                 .await
             }
             "write_file" => {
+                if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
+                    return Ok("ERROR: sandbox is read-only; write_file denied".into());
+                }
                 let path = args
                     .get("path")
                     .and_then(|v| v.as_str())
@@ -1836,6 +1867,11 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("run_terminal_cmd requires command"))?
                     .to_string();
+                if sandbox_blocks_shell(&self.inner.lock().sandbox_profile, &command) {
+                    return Ok(format!(
+                        "ERROR: sandbox profile forbids this shell command: {command}"
+                    ));
+                }
                 self.run_shell_tool_for_output(
                     session_id,
                     cwd,
@@ -1845,8 +1881,140 @@ impl AgentHostHandle {
                 )
                 .await
             }
+            "glob_files" => {
+                let pattern = args
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("glob_files requires pattern"))?
+                    .to_string();
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(80) as usize;
+                let hits = crate::project_context::glob_files(cwd, &pattern, limit);
+                let out = if hits.is_empty() {
+                    "(no matches)".into()
+                } else {
+                    hits.join("\n")
+                };
+                // Emit a lightweight tool card for the UI
+                let call_id = Uuid::new_v4().to_string();
+                let _ = event_tx.send(SessionUpdate::ToolCall {
+                    session_id,
+                    call_id: call_id.clone(),
+                    title: "glob_files".into(),
+                    kind: ToolCallKind::Search,
+                    status: ToolCallStatus::Running,
+                    input: args.clone(),
+                });
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: ToolCallStatus::Completed,
+                    output: Some(out.clone()),
+                });
+                Ok(out)
+            }
+            "apply_patch" => {
+                if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
+                    return Ok("ERROR: sandbox is read-only; apply_patch denied".into());
+                }
+                let patch = args
+                    .get("patch")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| args.get("content").and_then(|v| v.as_str()))
+                    .ok_or_else(|| anyhow!("apply_patch requires patch"))?
+                    .to_string();
+                let input = args.clone();
+                let needs = true;
+                let always = {
+                    let g = self.inner.lock();
+                    g.always_approve
+                        || g.always_allowed_tools.contains("apply_patch")
+                        || g.always_allowed_tools.contains("write_file")
+                        || g.permission_mode == "bypassPermissions"
+                };
+                let call_id = Uuid::new_v4().to_string();
+                if needs && !always {
+                    let req = PermissionRequest {
+                        id: Uuid::new_v4(),
+                        session_id,
+                        tool_name: "apply_patch".into(),
+                        summary: "Allow apply_patch (edit files)?".into(),
+                        detail: input.clone(),
+                    };
+                    let (tx, rx) = oneshot::channel();
+                    {
+                        let mut g = self.inner.lock();
+                        g.pending_permissions
+                            .insert(req.id, PendingPermission { tx });
+                    }
+                    let _ = event_tx.send(SessionUpdate::PermissionRequired {
+                        session_id,
+                        request: req,
+                    });
+                    let decision = tokio::select! {
+                        d = rx => d.unwrap_or(PermissionDecision::Deny),
+                        _ = cancel.cancelled() => PermissionDecision::Deny,
+                    };
+                    if decision == PermissionDecision::Deny {
+                        let _ = event_tx.send(SessionUpdate::ToolCall {
+                            session_id,
+                            call_id: call_id.clone(),
+                            title: "apply_patch".into(),
+                            kind: ToolCallKind::Edit,
+                            status: ToolCallStatus::Denied,
+                            input,
+                        });
+                        return Ok("DENIED: user denied apply_patch".into());
+                    }
+                    if decision == PermissionDecision::AlwaysAllow {
+                        let mut g = self.inner.lock();
+                        g.always_allowed_tools.insert("apply_patch".into());
+                    }
+                }
+                let _ = event_tx.send(SessionUpdate::ToolCall {
+                    session_id,
+                    call_id: call_id.clone(),
+                    title: "apply_patch".into(),
+                    kind: ToolCallKind::Edit,
+                    status: ToolCallStatus::Running,
+                    input,
+                });
+                match crate::project_context::apply_patch(cwd, &patch) {
+                    Ok(report) => {
+                        // Best-effort: record first path mentioned
+                        if let Some(line) = report.lines().next() {
+                            if let Some(p) = line.strip_prefix("updated ") {
+                                let path = p.split(' ').next().unwrap_or("");
+                                if !path.is_empty() {
+                                    self.record_edit(path);
+                                }
+                            }
+                        }
+                        let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                            session_id,
+                            call_id,
+                            status: ToolCallStatus::Completed,
+                            output: Some(report.clone()),
+                        });
+                        Ok(report)
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                            session_id,
+                            call_id,
+                            status: ToolCallStatus::Failed,
+                            output: Some(msg.clone()),
+                        });
+                        Ok(format!("ERROR: {msg}"))
+                    }
+                }
+            }
             other => Ok(format!(
-                "Unknown tool `{other}`. Available: list_dir, read_file, grep, write_file, run_terminal_cmd"
+                "Unknown tool `{other}`. Available: list_dir, read_file, grep, write_file, \
+                 run_terminal_cmd, glob_files, apply_patch"
             )),
         }
     }
@@ -2342,6 +2510,7 @@ fn emit_message(tx: &mpsc::UnboundedSender<SessionUpdate>, session_id: Uuid, tex
     });
 }
 
+#[allow(dead_code)] // reserved if we re-enable quiet diagnostics
 fn emit_thought(tx: &mpsc::UnboundedSender<SessionUpdate>, session_id: Uuid, text: &str) {
     let _ = tx.send(SessionUpdate::AgentThoughtChunk {
         session_id,
@@ -2451,8 +2620,60 @@ fn coding_agent_tools() -> serde_json::Value {
                     "required": ["command"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "glob_files",
+                "description": "Find files by glob pattern (e.g. \"*.rs\", \"src/**/*.ts\"). Returns relative paths.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Glob pattern" },
+                        "limit": { "type": "integer", "description": "Max results (default 80)" }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Apply a targeted edit. Prefer this over write_file for large files. Use either JSON {\"path\",\"old_string\",\"new_string\"} or *** Update File: path blocks with <<<<<<< SEARCH / ======= / >>>>>>> REPLACE.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "patch": {
+                            "type": "string",
+                            "description": "Patch payload (JSON search/replace or Update File blocks)"
+                        }
+                    },
+                    "required": ["patch"]
+                }
+            }
         }
     ])
+}
+
+fn sandbox_is_readonly(profile: &str) -> bool {
+    matches!(
+        profile.trim().to_ascii_lowercase().as_str(),
+        "read-only" | "readonly" | "read_only"
+    )
+}
+
+fn sandbox_blocks_shell(profile: &str, command: &str) -> bool {
+    if !sandbox_is_readonly(profile) {
+        return false;
+    }
+    let c = command.to_ascii_lowercase();
+    // Allow pure read-ish commands; block obvious mutators.
+    let mutators = [
+        "rm ", "rm\t", "mv ", "cp ", ">", ">>", "sed -i", "tee ", "npm i", "npm install",
+        "cargo install", "git commit", "git push", "mkdir ", "touch ", "chmod ", "chown ",
+    ];
+    mutators.iter().any(|m| c.contains(m))
 }
 
 fn build_agent_messages(
@@ -2460,20 +2681,33 @@ fn build_agent_messages(
     compacted_summary: Option<&str>,
     cwd: &Path,
 ) -> Vec<serde_json::Value> {
+    let (instructions, loaded) = crate::project_context::load_project_instructions(cwd);
+    let instr_note = if loaded.is_empty() {
+        String::new()
+    } else {
+        format!("\nLoaded project instruction files: {}.\n", loaded.join(", "))
+    };
     let system = format!(
         "You are GrokPtah, a desktop coding agent (Grok Build–style).\n\
          Working directory: {}.\n\
-         Use tools to explore and change the codebase. Do not invent file contents — read or list first.\n\
-         Prefer small, concrete edits via write_file. Run tests/builds with run_terminal_cmd when useful.\n\
+         Use tools to explore and change the codebase. Do not invent file contents — read, list, or glob first.\n\
+         Prefer apply_patch for targeted edits; use write_file for new files or full rewrites.\n\
+         Run tests/builds with run_terminal_cmd when useful.\n\
          When the task is done, respond with a clear final summary and no more tool calls.\n\
-         Be concise in narration; put substantial content into tool arguments.",
+         Be concise in narration; put substantial content into tool arguments.{instr_note}",
         cwd.display()
     );
-    let mut messages = Vec::with_capacity(history.len() + 3);
+    let mut messages = Vec::with_capacity(history.len() + 4);
     messages.push(serde_json::json!({
         "role": "system",
         "content": system
     }));
+    if !instructions.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": instructions
+        }));
+    }
     if let Some(summary) = compacted_summary.filter(|s| !s.is_empty()) {
         messages.push(serde_json::json!({
             "role": "system",
@@ -2533,8 +2767,10 @@ fn resolve_api_base(
 async fn call_xai_agent_step(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
+    effort: EffortLevel,
     messages: &[serde_json::Value],
     tools: &serde_json::Value,
+    cancel: &CancellationToken,
 ) -> Result<AgentStep> {
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
     let (base, model_id) = resolve_api_base(&creds, model);
@@ -2548,100 +2784,143 @@ async fn call_xai_agent_step(
         .build()
         .map_err(|e| anyhow!(e))?;
 
-    let body = serde_json::json!({
+    // Effort on the wire (chat completions + catalog models that honor it).
+    let mut body = serde_json::json!({
         "model": model_id,
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",
         "stream": false
     });
+    if !matches!(effort, EffortLevel::None) {
+        body["effort"] = serde_json::Value::String(effort.as_str().into());
+        // Some proxy paths also read reasoning.effort
+        body["reasoning"] = serde_json::json!({ "effort": effort.as_str() });
+    }
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
-    let send_once = |c: &crate::auth_store::WireCredentials| {
-        let req = client
-            .post(&url)
-            .header("Content-Type", "application/json");
-        let req = crate::auth_store::apply_auth_headers(req, c, &base);
-        req.json(&body)
-    };
-
-    let mut resp = send_once(&creds).send().await.map_err(|e| {
-        anyhow!("request error for {url}: {e}")
-    })?;
-
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
-        match crate::auth_store::force_refresh(&creds).await {
-            Ok(fresh) => {
-                creds = fresh;
-                resp = send_once(&creds)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("request error after refresh: {e}"))?;
-            }
-            Err(e) => {
-                let text = resp.text().await.unwrap_or_default();
-                bail!("HTTP 401 (refresh failed: {e}): {}", text.chars().take(400).collect::<String>());
-            }
+    // Retries for transient failures (429 / 5xx / connect).
+    let mut last_err = None::<String>;
+    for attempt in 0..4u32 {
+        if cancel.is_cancelled() {
+            bail!("cancelled");
         }
-    }
+        let send_once = |c: &crate::auth_store::WireCredentials| {
+            let req = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("x-grok-effort", effort.as_str());
+            let req = crate::auth_store::apply_auth_headers(req, c, &base);
+            req.json(&body)
+        };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        bail!("HTTP {status}: {}", text.chars().take(800).collect::<String>());
-    }
-
-    let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
-    let msg = &v["choices"][0]["message"];
-
-    // Tool calls present → agent continues
-    if let Some(arr) = msg["tool_calls"].as_array() {
-        if !arr.is_empty() {
-            let mut tool_calls = Vec::new();
-            for tc in arr {
-                let id = tc["id"]
-                    .as_str()
-                    .unwrap_or_else(|| "call")
-                    .to_string();
-                let name = tc["function"]["name"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                let arguments = match &tc["function"]["arguments"] {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                if name.is_empty() {
+        let resp_result = send_once(&creds).send().await;
+        let mut resp = match resp_result {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(format!("request error: {e}"));
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(400 * (1 << attempt)))
+                        .await;
                     continue;
                 }
-                tool_calls.push(AgentToolCall {
-                    id,
-                    name,
-                    arguments,
-                });
+                bail!("{}", last_err.unwrap());
             }
-            if !tool_calls.is_empty() {
-                let content = msg["content"].as_str().map(|s| s.to_string());
-                return Ok(AgentStep::ToolCalls {
-                    content,
-                    tool_calls,
-                });
-            }
-        }
-    }
+        };
 
-    if let Some(content) = msg["content"].as_str() {
-        if !content.is_empty() {
-            return Ok(AgentStep::Final(content.to_string()));
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
+            match crate::auth_store::force_refresh(&creds).await {
+                Ok(fresh) => {
+                    creds = fresh;
+                    resp = send_once(&creds)
+                        .send()
+                        .await
+                        .map_err(|e| anyhow!("request error after refresh: {e}"))?;
+                }
+                Err(e) => {
+                    let text = resp.text().await.unwrap_or_default();
+                    bail!(
+                        "HTTP 401 (refresh failed: {e}): {}",
+                        text.chars().take(400).collect::<String>()
+                    );
+                }
+            }
         }
-    }
-    // reasoning-only or empty — treat as final empty
-    if let Some(r) = msg["reasoning_content"].as_str() {
-        if !r.is_empty() {
-            return Ok(AgentStep::Final(r.to_string()));
+
+        let status = resp.status();
+        if status.as_u16() == 429
+            || status.is_server_error()
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        {
+            let text = resp.text().await.unwrap_or_default();
+            last_err = Some(format!(
+                "HTTP {status}: {}",
+                text.chars().take(400).collect::<String>()
+            ));
+            if attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << attempt)))
+                    .await;
+                continue;
+            }
+            bail!("{}", last_err.unwrap());
         }
+
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            bail!(
+                "HTTP {status}: {}",
+                text.chars().take(800).collect::<String>()
+            );
+        }
+
+        let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
+        let msg = &v["choices"][0]["message"];
+
+        if let Some(arr) = msg["tool_calls"].as_array() {
+            if !arr.is_empty() {
+                let mut tool_calls = Vec::new();
+                for tc in arr {
+                    let id = tc["id"].as_str().unwrap_or("call").to_string();
+                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                    let arguments = match &tc["function"]["arguments"] {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    if name.is_empty() {
+                        continue;
+                    }
+                    tool_calls.push(AgentToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+                if !tool_calls.is_empty() {
+                    let content = msg["content"].as_str().map(|s| s.to_string());
+                    return Ok(AgentStep::ToolCalls {
+                        content,
+                        tool_calls,
+                    });
+                }
+            }
+        }
+
+        if let Some(content) = msg["content"].as_str() {
+            if !content.is_empty() {
+                return Ok(AgentStep::Final(content.to_string()));
+            }
+        }
+        if let Some(r) = msg["reasoning_content"].as_str() {
+            if !r.is_empty() {
+                return Ok(AgentStep::Final(r.to_string()));
+            }
+        }
+        bail!("empty agent response: {v}");
     }
-    bail!("empty agent response: {v}");
+    bail!(
+        "{}",
+        last_err.unwrap_or_else(|| "agent request failed".into())
+    );
 }
 
 /// Build the extractive summary for transcript entries that leave the API window.
