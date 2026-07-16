@@ -1358,22 +1358,34 @@ impl AgentHostHandle {
                     return Ok(text.into());
                 }
             }
-            let reply = if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
+            let (reply, is_err) = if let Some(creds) = crate::auth_store::resolve_wire_credentials()
+            {
                 emit_thought(
                     &event_tx,
                     session_id,
                     &format!("chat API as {}…", creds.method),
                 );
                 match call_xai_chat(&creds, model, prompt, cwd, SessionKind::Chat).await {
-                    Ok(text) => text,
-                    Err(e) => format!(
-                        "Model call failed: {e}\n\nAuth: {} ({})",
-                        creds.display_name, creds.method
+                    Ok(text) => (text, false),
+                    Err(e) => (
+                        format!(
+                            "Model call failed: {e}\n\nAuth: {} ({})\nRun `grok login` if needed.",
+                            creds.display_name, creds.method
+                        ),
+                        true,
                     ),
                 }
             } else {
-                "No credentials. Run `grok login` or save an API key to chat.".into()
+                (
+                    "No credentials. Run `grok login` or save an API key to chat.".into(),
+                    true,
+                )
             };
+            if is_err {
+                emit_message(&event_tx, session_id, &reply);
+                push_assistant(self, session_id, &reply);
+                return Ok(reply);
+            }
             for chunk in chunk_text(&reply, 48) {
                 if cancel.is_cancelled() {
                     break;
@@ -1536,34 +1548,46 @@ impl AgentHostHandle {
         }
 
         // Live model when Grok Build session / API key is available.
-        let reply = if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
+        let (reply, is_error) = if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
             emit_thought(
                 &event_tx,
                 session_id,
-                &format!("calling xAI chat API as {}…", creds.method),
+                &format!("calling chat API as {}…", creds.method),
             );
             match call_xai_chat(&creds, model, prompt, cwd, SessionKind::Build).await {
-                Ok(text) => text,
-                Err(e) => format!(
-                    "Model call failed: {e}\n\n\
-                     Auth source: {} ({})\n\
-                     Tips: run `grok login` if the CLI session expired, or set XAI_API_KEY / Save key.\n\
-                     Project: {}",
-                    creds.display_name,
-                    creds.method,
-                    cwd.display()
+                Ok(text) => (text, false),
+                Err(e) => (
+                    format!(
+                        "Model call failed: {e}\n\n\
+                         Auth source: {} ({})\n\
+                         Tips: run `grok login` if the CLI session expired, or set XAI_API_KEY / Save key.\n\
+                         Project: {}",
+                        creds.display_name,
+                        creds.method,
+                        cwd.display()
+                    ),
+                    true,
                 ),
             }
         } else {
-            format!(
-                "{}\n\nYou said: {}\nProject: {}\nModel: {} · effort: {}",
-                crate::auth_store::auth_help_message(),
-                prompt.chars().take(200).collect::<String>(),
-                cwd.display(),
-                model,
-                effort.as_str()
+            (
+                format!(
+                    "{}\n\nYou said: {}\nProject: {}\nModel: {} · effort: {}",
+                    crate::auth_store::auth_help_message(),
+                    prompt.chars().take(200).collect::<String>(),
+                    cwd.display(),
+                    model,
+                    effort.as_str()
+                ),
+                true,
             )
         };
+        // Don't typewriter-chunk error messages (avoids garbled/overlapping UI).
+        if is_error {
+            emit_message(&event_tx, session_id, &reply);
+            push_assistant(self, session_id, &reply);
+            return Ok(reply);
+        }
         for chunk in chunk_text(&reply, 64) {
             if cancel.is_cancelled() {
                 break;
@@ -1913,21 +1937,30 @@ async fn call_xai_chat(
     cwd: &Path,
     kind: SessionKind,
 ) -> Result<String> {
+    // Prefer a non-expired / refreshed OIDC access token before the first call.
+    let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
+
     // Use the same catalog Grok Build wrote (wire id + base_url). Do not remap
     // `grok-build` → `grok-3` — that made the desktop look stuck on old models.
     let entry = crate::models_catalog::lookup(model);
     let model_id = entry
         .as_ref()
         .map(|e| e.wire_model.as_str())
-        .unwrap_or(model);
+        .unwrap_or(model)
+        .to_string();
     // OIDC / cli session: prefer the proxy base from models_cache (cli-chat-proxy).
     // API keys: public api.x.ai unless the catalog specifies otherwise or env overrides.
+    // Always force cli-chat-proxy for OIDC user tokens — api.x.ai rejects them.
     let base = if let Ok(env) = std::env::var("XAI_API_BASE") {
         env
+    } else if creds.oidc_token_auth {
+        entry
+            .as_ref()
+            .and_then(|e| e.base_url.clone())
+            .filter(|u| u.contains("cli-chat-proxy") || u.contains("x.ai"))
+            .unwrap_or_else(|| "https://cli-chat-proxy.grok.com/v1".into())
     } else if let Some(u) = entry.as_ref().and_then(|e| e.base_url.clone()) {
         u
-    } else if creds.oidc_token_auth {
-        "https://cli-chat-proxy.grok.com/v1".into()
     } else {
         "https://api.x.ai/v1".into()
     };
@@ -1959,19 +1992,42 @@ async fn call_xai_chat(
         ],
         "stream": false
     });
-    let mut req = client
-        .post(format!("{}/chat/completions", base.trim_end_matches('/')))
-        .bearer_auth(&creds.bearer)
-        .header("Content-Type", "application/json");
-    // OIDC sessions from `grok login` need the same header Grok Build uses.
-    if creds.oidc_token_auth {
-        req = req.header("X-XAI-Token-Auth", "true");
-    }
-    let resp = req
-        .json(&body)
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+
+    let send_once = |c: &crate::auth_store::WireCredentials| {
+        let req = client
+            .post(&url)
+            .header("Content-Type", "application/json");
+        let req = crate::auth_store::apply_auth_headers(req, c, &base);
+        req.json(&body)
+    };
+
+    let mut resp = send_once(&creds)
         .send()
         .await
         .map_err(|e| anyhow!("request error: {e}"))?;
+
+    // One retry after OIDC refresh on 401 (expired access token is common).
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
+        match crate::auth_store::force_refresh(&creds).await {
+            Ok(fresh) => {
+                creds = fresh;
+                resp = send_once(&creds)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("request error after refresh: {e}"))?;
+            }
+            Err(e) => {
+                let text = resp.text().await.unwrap_or_default();
+                let clipped: String = text.chars().take(400).collect();
+                bail!(
+                    "HTTP 401 Unauthorized (refresh also failed: {e}). \
+                     Server said: {clipped}. Run `grok login` to re-authenticate."
+                );
+            }
+        }
+    }
+
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -1979,13 +2035,29 @@ async fn call_xai_chat(
         bail!("HTTP {status}: {clipped}");
     }
     let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
-    let content = v["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    if content.is_empty() {
-        bail!("empty model response: {v}");
+    // chat/completions shape
+    if let Some(content) = v["choices"][0]["message"]["content"].as_str() {
+        if !content.is_empty() {
+            return Ok(content.to_string());
+        }
     }
-    Ok(content)
+    // responses API fallback (some catalog models use this backend)
+    if let Some(content) = v["output_text"].as_str() {
+        if !content.is_empty() {
+            return Ok(content.to_string());
+        }
+    }
+    if let Some(arr) = v["output"].as_array() {
+        let mut parts = Vec::new();
+        for item in arr {
+            if let Some(t) = item["content"][0]["text"].as_str() {
+                parts.push(t.to_string());
+            }
+        }
+        if !parts.is_empty() {
+            return Ok(parts.join(""));
+        }
+    }
+    bail!("empty model response: {v}");
 }
 
