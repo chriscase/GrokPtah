@@ -1,24 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="GrokPtah">
-  <defs>
-    <linearGradient id="gp-bg" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#134e4a"/>
-      <stop offset="0.55" stop-color="#0f766e"/>
-      <stop offset="1" stop-color="#115e59"/>
-    </linearGradient>
-    <linearGradient id="gp-glow" x1="20" y1="12" x2="44" y2="48" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#ecfdf5"/>
-      <stop offset="1" stop-color="#5eead4"/>
-    </linearGradient>
-  </defs>
-  <!-- Rounded craft tablet -->
-  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#gp-bg)"/>
-  <!-- Pillar / craftsman spine -->
-  <path fill="url(#gp-glow)" d="M30 14h4v10h8.5a1.5 1.5 0 0 1 1.1 2.5L32 42.2 20.4 26.5A1.5 1.5 0 0 1 21.5 24H30V14z"/>
-  <!-- Base plinth -->
-  <rect x="18" y="44" width="28" height="4" rx="1.5" fill="#99f6e4" opacity="0.95"/>
-  <rect x="22" y="49" width="20" height="3" rx="1.2" fill="#5eead4" opacity="0.75"/>
-  <!-- Sparks / work marks -->
-  <circle cx="46" cy="18" r="1.6" fill="#ecfdf5"/>
-  <circle cx="50" cy="24" r="1.1" fill="#a7f3d0"/>
-  <path stroke="#ecfdf5" stroke-width="1.4" stroke-linecap="round" d="M47.5 30.5l3.5 1.2"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="GrokPtah">
+  <!-- Minimal coding-agent glyph: dark tile + amber caret (Grok Build desktop) -->
+  <rect width="32" height="32" rx="6" fill="#181b22"/>
+  <rect x="1" y="1" width="30" height="30" rx="5" fill="none" stroke="#2a2e38" stroke-width="1"/>
+  <path d="M8 10h4l4 6 4-6h4L18 22h-4L8 10z" fill="#f0b429"/>
+  <rect x="8" y="24" width="16" height="2" rx="1" fill="#5c6470"/>
 </svg>

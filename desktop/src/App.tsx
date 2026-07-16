@@ -12,7 +12,6 @@ import {
   type SessionUpdate,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
-import { Splash } from "./components/Splash";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 
 type TranscriptItem =
@@ -221,11 +220,16 @@ export default function App() {
     <div className="app-shell">
       <header className="titlebar">
         <div className="brand">
-          <BrandMark size={24} className="brand-mark-img" />
-          <span className="brand-name">{product.name || "GrokPtah"}</span>
+          <BrandMark size={20} className="brand-mark-img" />
+          <span className="brand-name">
+            GrokPtah
+            <span className="brand-tag"> · coding agent</span>
+          </span>
         </div>
         <div className="title-actions">
-          <span>{status?.project_cwd ?? "No project"}</span>
+          <span className="path-chip" title={status?.project_cwd ?? ""}>
+            {status?.project_cwd ?? "no project open"}
+          </span>
           <button type="button" onClick={() => void openProject()}>
             Open folder
           </button>
@@ -354,13 +358,26 @@ export default function App() {
       <main className="main">
         <div className="transcript">
           {transcript.length === 0 && (
-            <div className="empty-hero">
-              <Splash subtitle="Open a project, then chat with the in-process agent" />
-              <div className="bubble thought empty-hint">
-                Try <code>/help</code>, <code>list files</code>, or{" "}
-                <code>make a plan</code>. Shell tools stream live into the
-                terminal (no re-run attach).
+            <div className="empty-agent">
+              <h1>GrokPtah</h1>
+              <div className="version-line">
+                Grok Build as a desktop agent · bridge{" "}
+                {product.bridgeVersion}
               </div>
+              <ul>
+                <li>
+                  Open a project folder (toolbar), then type a prompt below
+                </li>
+                <li>
+                  Slash commands: <code>/help</code> <code>/plan</code>{" "}
+                  <code>/yolo</code>
+                </li>
+                <li>
+                  Tools: <code>list files</code>, <code>read path</code>,{" "}
+                  <code>run …</code> (permission gated)
+                </li>
+                <li>CLI/TUI still available: cargo run -p xai-grok-pager-bin</li>
+              </ul>
             </div>
           )}
           {transcript.map((item, i) => (
@@ -844,21 +861,22 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="about-hero">
-              <BrandMark size={56} />
+              <BrandMark size={32} />
               <h3>GrokPtah</h3>
             </div>
             <p className="about-body">
-              GrokPtah is a desktop coding agent for local projects: Tauri UI,
-              in-process agent host, and the upstream Grok Build CLI/TUI kept
-              available in this repo.
+              Desktop shell for Grok Build–style coding agents. Same workflow as
+              the console TUI (sessions, tools, permissions), in a native
+              window. Upstream crates and CLI remain in this repo for merge and
+              console use.
               <br />
               <br />
               Bridge {product.bridgeVersion} · Apache-2.0
               <br />
-              Upstream foundation: xai-org/grok-build
+              Upstream: xai-org/grok-build
               <br />
-              Upstream CLI auto-update:{" "}
-              {product.autoUpdateEnabled ? "enabled" : "disabled"}
+              CLI auto-update:{" "}
+              {product.autoUpdateEnabled ? "on" : "off (desktop)"}
             </p>
             <div className="modal-actions">
               <button type="button" onClick={() => setAboutOpen(false)}>

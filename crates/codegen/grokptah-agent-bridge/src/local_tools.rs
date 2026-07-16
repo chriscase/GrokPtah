@@ -13,6 +13,7 @@ use walkdir::WalkDir;
 
 use crate::events::ToolCallKind;
 
+#[allow(dead_code)] // fields kept for API symmetry / future UI binding
 pub struct ToolResult {
     pub title: String,
     pub kind: ToolCallKind,
