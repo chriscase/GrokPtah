@@ -756,27 +756,31 @@ export default function App() {
     ],
   );
 
-  // Keyboard: multi-zone + chrome
+  // Keyboard: multi-zone + chrome (capture so composer/webview don't eat them)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const meta = e.metaKey || e.ctrlKey;
       if (!meta) return;
 
       // ⌘B left chrome, ⌘⌥B right chrome, ⌘⇧L Live
-      if (e.key === "b" || e.key === "B") {
+      const isB = e.key === "b" || e.key === "B" || e.code === "KeyB";
+      if (isB) {
         if (e.altKey) {
           e.preventDefault();
+          e.stopPropagation();
           setRightbarCollapsed((v) => !v);
           return;
         }
         if (!e.shiftKey) {
           e.preventDefault();
+          e.stopPropagation();
           setSidebarCollapsed((v) => !v);
           return;
         }
       }
-      if (e.shiftKey && (e.key === "l" || e.key === "L")) {
+      if (e.shiftKey && (e.key === "l" || e.key === "L" || e.code === "KeyL")) {
         e.preventDefault();
+        e.stopPropagation();
         setLiveHidden((v) => !v);
         return;
       }
@@ -812,8 +816,8 @@ export default function App() {
         void openBeside();
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [docks, activeSessionId, maxDocks, openBeside]);
 
   async function ensureSession(): Promise<string> {
@@ -1174,42 +1178,53 @@ export default function App() {
               ? shortPath(status.project_cwd, 36)
               : "no project open"}
           </span>
-          <button
-            type="button"
-            className="chrome-toggle"
-            title={
-              sidebarCollapsed
-                ? "Show sessions sidebar (⌘B)"
-                : "Hide sessions sidebar (⌘B)"
-            }
-            onClick={() => setSidebarCollapsed((v) => !v)}
-          >
-            {sidebarCollapsed ? "Sessions" : "◂ Sessions"}
-          </button>
-          <button
-            type="button"
-            className="chrome-toggle"
-            title={
-              rightbarCollapsed
-                ? "Show tools panel (⌘⌥B)"
-                : "Hide tools panel (⌘⌥B)"
-            }
-            onClick={() => setRightbarCollapsed((v) => !v)}
-          >
-            {rightbarCollapsed ? "Tools" : "Tools ▸"}
-          </button>
-          <button
-            type="button"
-            className={`chrome-toggle ${liveHidden ? "" : "is-on"}`}
-            title={
-              liveHidden
-                ? "Show Live session rail (⌘⇧L)"
-                : "Hide Live session rail (⌘⇧L)"
-            }
-            onClick={() => setLiveHidden((v) => !v)}
-          >
-            Live
-          </button>
+          <div className="chrome-toggles" role="group" aria-label="Layout panels">
+            <button
+              type="button"
+              className={`chrome-toggle ${sidebarCollapsed ? "" : "is-on"}`}
+              title={
+                sidebarCollapsed
+                  ? "Show sessions sidebar (⌘B)"
+                  : "Hide sessions sidebar (⌘B)"
+              }
+              aria-pressed={!sidebarCollapsed}
+              onClick={() => setSidebarCollapsed((v) => !v)}
+            >
+              <span className="chrome-toggle-icon" aria-hidden>
+                {sidebarCollapsed ? "▏" : "◂"}
+              </span>
+              Sessions
+            </button>
+            <button
+              type="button"
+              className={`chrome-toggle ${rightbarCollapsed ? "" : "is-on"}`}
+              title={
+                rightbarCollapsed
+                  ? "Show tools panel (⌘⌥B)"
+                  : "Hide tools panel (⌘⌥B)"
+              }
+              aria-pressed={!rightbarCollapsed}
+              onClick={() => setRightbarCollapsed((v) => !v)}
+            >
+              Tools
+              <span className="chrome-toggle-icon" aria-hidden>
+                {rightbarCollapsed ? "▕" : "▸"}
+              </span>
+            </button>
+            <button
+              type="button"
+              className={`chrome-toggle ${liveHidden ? "" : "is-on"}`}
+              title={
+                liveHidden
+                  ? "Show Live session rail (⌘⇧L)"
+                  : "Hide Live session rail (⌘⇧L)"
+              }
+              aria-pressed={!liveHidden}
+              onClick={() => setLiveHidden((v) => !v)}
+            >
+              Live
+            </button>
+          </div>
           <button type="button" onClick={() => void openProject()}>
             Open folder
           </button>
@@ -1252,6 +1267,18 @@ export default function App() {
       </header>
 
       <aside className="sidebar">
+        <div className="panel-chrome">
+          <span className="panel-chrome-title">Sessions</span>
+          <button
+            type="button"
+            className="panel-collapse-btn"
+            title="Hide sessions sidebar (⌘B)"
+            aria-label="Hide sessions sidebar"
+            onClick={() => setSidebarCollapsed(true)}
+          >
+            ◂
+          </button>
+        </div>
         <div className="section-title">Workspace</div>
         <div
           className="workspace-mode"
@@ -1413,8 +1440,30 @@ export default function App() {
       <main
         className={`main density-${layoutDensity} ${
           docks.length > 1 ? "is-split" : ""
-        }`}
+        } ${sidebarCollapsed ? "has-left-edge" : ""} ${rightbarCollapsed ? "has-right-edge" : ""}`}
       >
+        {sidebarCollapsed && (
+          <button
+            type="button"
+            className="edge-reveal edge-reveal-left"
+            title="Show sessions sidebar (⌘B)"
+            aria-label="Show sessions sidebar"
+            onClick={() => setSidebarCollapsed(false)}
+          >
+            <span className="edge-reveal-label">Sessions</span>
+          </button>
+        )}
+        {rightbarCollapsed && (
+          <button
+            type="button"
+            className="edge-reveal edge-reveal-right"
+            title="Show tools panel (⌘⌥B)"
+            aria-label="Show tools panel"
+            onClick={() => setRightbarCollapsed(false)}
+          >
+            <span className="edge-reveal-label">Tools</span>
+          </button>
+        )}
         {tabs.length > 0 && (
           <div className="session-tabs" role="tablist" aria-label="Open sessions">
             {tabs.map((t) => (
@@ -1880,6 +1929,18 @@ export default function App() {
       </main>
 
       <aside className="rightbar">
+        <div className="panel-chrome">
+          <button
+            type="button"
+            className="panel-collapse-btn"
+            title="Hide tools panel (⌘⌥B)"
+            aria-label="Hide tools panel"
+            onClick={() => setRightbarCollapsed(true)}
+          >
+            ▸
+          </button>
+          <span className="panel-chrome-title">Tools</span>
+        </div>
         <div className="tabs">
           {(
             [

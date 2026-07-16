@@ -104,21 +104,142 @@ button:disabled {
   grid-template-columns: 0 minmax(0, 1fr) 0;
 }
 
+.chrome-toggles {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.2);
+}
+
 .chrome-toggle {
   font-size: 11px;
-  padding: 0.2rem 0.45rem;
+  padding: 0.22rem 0.5rem;
   color: var(--muted);
-  border-style: dashed;
+  border: none;
+  border-radius: 0;
+  border-right: 1px solid var(--border-soft);
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  line-height: 1.2;
+}
+
+.chrome-toggles .chrome-toggle:last-child {
+  border-right: none;
 }
 
 .chrome-toggle:hover {
   color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .chrome-toggle.is-on {
   color: var(--accent);
-  border-color: rgba(240, 180, 41, 0.4);
-  border-style: solid;
+  background: rgba(240, 180, 41, 0.1);
+}
+
+.chrome-toggle-icon {
+  font-size: 10px;
+  opacity: 0.85;
+  line-height: 1;
+}
+
+/* Panel header collapse (on the sidebars themselves) */
+.panel-chrome {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+  margin: -0.15rem 0 0.4rem;
+  flex: 0 0 auto;
+}
+
+.rightbar .panel-chrome {
+  justify-content: flex-start;
+}
+
+.panel-chrome-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.panel-collapse-btn {
+  width: 26px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  border: 1px solid var(--border-soft);
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.panel-collapse-btn:hover {
+  color: var(--accent);
+  border-color: rgba(240, 180, 41, 0.45);
+  background: rgba(240, 180, 41, 0.1);
+}
+
+/* Edge re-open tabs when a rail is collapsed */
+.edge-reveal {
+  position: absolute;
+  top: 42%;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  min-height: 88px;
+  padding: 0.55rem 0;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-panel);
+  color: var(--muted);
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+}
+
+.edge-reveal:hover {
+  color: var(--accent);
+  border-color: rgba(240, 180, 41, 0.5);
+  background: rgba(240, 180, 41, 0.08);
+}
+
+.edge-reveal-left {
+  left: 0;
+  border-left: none;
+  border-radius: 0 8px 8px 0;
+}
+
+.edge-reveal-right {
+  right: 0;
+  border-right: none;
+  border-radius: 8px 0 0 8px;
+}
+
+.edge-reveal-label {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  transform: rotate(180deg);
+}
+
+.edge-reveal-right .edge-reveal-label {
+  transform: none;
 }
 
 @media (max-width: 1100px) {
@@ -221,6 +342,7 @@ button:disabled {
  * so "Ready / No active turn" ballooned into the middle of the viewport.
  */
 .main {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-width: 0;
