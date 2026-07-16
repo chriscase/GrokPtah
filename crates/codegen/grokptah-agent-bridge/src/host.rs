@@ -1614,7 +1614,13 @@ impl AgentHostHandle {
                         event_tx,
                     )
                     .await;
-                self.record_edit(&path_rec);
+                self.emit_file_edit(
+                    session_id,
+                    cwd,
+                    &path_rec,
+                    &format!("Wrote {path_rec}"),
+                    event_tx,
+                );
             }
         }
         if let Some(cmd) = prompt
@@ -1648,7 +1654,21 @@ impl AgentHostHandle {
     ) -> Result<String> {
         const MAX_ROUNDS: usize = 24;
         let mut messages = build_agent_messages(history, compacted_summary, cwd);
-        let tools = coding_agent_tools();
+
+        // Best-effort MCP discovery (skipped when offline env set for tests).
+        let mcp_specs = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some()
+            || std::env::var_os("GROKPTAH_MCP_SKIP").is_some()
+        {
+            Vec::new()
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                crate::mcp_runtime::list_mcp_tools(Some(cwd)),
+            )
+            .await
+            .unwrap_or_default()
+        };
+        let (tools, mcp_index) = coding_agent_tools(&mcp_specs);
 
         for _round in 1..=MAX_ROUNDS {
             if cancel.is_cancelled() {
@@ -1658,27 +1678,41 @@ impl AgentHostHandle {
                 return Ok(msg);
             }
 
-            let step =
-                call_xai_agent_step(creds, model, effort, &messages, &tools, cancel).await?;
+            let step = call_xai_agent_step(
+                creds,
+                model,
+                effort,
+                &messages,
+                &tools,
+                cancel,
+                |delta| {
+                    emit_message(event_tx, session_id, delta);
+                },
+            )
+            .await?;
 
             match step {
-                AgentStep::Final(text) => {
+                AgentStep::Final { text, streamed } => {
                     let text = if text.trim().is_empty() {
                         "(agent finished with empty reply)".into()
                     } else {
                         text
                     };
-                    emit_message(event_tx, session_id, &text);
+                    if !streamed {
+                        emit_message(event_tx, session_id, &text);
+                    }
                     push_assistant(self, session_id, &text);
                     return Ok(text);
                 }
                 AgentStep::ToolCalls {
                     content,
                     tool_calls,
+                    streamed,
                 } => {
-                    if let Some(c) = content.as_ref().filter(|s| !s.trim().is_empty()) {
-                        // Mid-turn narration (optional)
-                        emit_message(event_tx, session_id, c);
+                    if !streamed {
+                        if let Some(c) = content.as_ref().filter(|s| !s.trim().is_empty()) {
+                            emit_message(event_tx, session_id, c);
+                        }
                     }
 
                     // OpenAI-style assistant message carrying tool_calls
@@ -1699,7 +1733,6 @@ impl AgentHostHandle {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        // Tool cards already surface name/status — no thought spam.
                         let output = self
                             .dispatch_agent_tool(
                                 session_id,
@@ -1708,6 +1741,7 @@ impl AgentHostHandle {
                                 &tc.arguments,
                                 cancel,
                                 event_tx,
+                                &mcp_index,
                             )
                             .await;
                         let content = match &output {
@@ -1743,6 +1777,25 @@ impl AgentHostHandle {
         Ok(msg)
     }
 
+    /// Emit live diff update after a successful edit tool.
+    fn emit_file_edit(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        path: &str,
+        summary: &str,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) {
+        self.record_edit(path);
+        let unified = crate::project_context::diff_for_path(cwd, path);
+        let _ = event_tx.send(SessionUpdate::FileEdit {
+            session_id,
+            path: path.to_string(),
+            summary: summary.to_string(),
+            unified_diff: unified,
+        });
+    }
+
     /// Run one model-requested tool with permissions + UI events.
     async fn dispatch_agent_tool(
         &self,
@@ -1752,9 +1805,26 @@ impl AgentHostHandle {
         arguments_json: &str,
         cancel: &CancellationToken,
         event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        mcp_index: &McpToolIndex,
     ) -> Result<String> {
         let args: serde_json::Value =
             serde_json::from_str(arguments_json).unwrap_or_else(|_| serde_json::json!({}));
+
+        // Namespaced MCP tools
+        if let Some((server, tool)) = mcp_index.get(name) {
+            return self
+                .run_mcp_tool(
+                    session_id,
+                    cwd,
+                    server,
+                    tool,
+                    name,
+                    &args,
+                    cancel,
+                    event_tx,
+                )
+                .await;
+        }
 
         match name {
             "list_dir" => {
@@ -1855,8 +1925,8 @@ impl AgentHostHandle {
                         event_tx,
                     )
                     .await;
-                if out.is_ok() {
-                    self.record_edit(&path_record);
+                if let Ok(ref report) = out {
+                    self.emit_file_edit(session_id, cwd, &path_record, report, event_tx);
                 }
                 out
             }
@@ -1982,12 +2052,18 @@ impl AgentHostHandle {
                 });
                 match crate::project_context::apply_patch(cwd, &patch) {
                     Ok(report) => {
-                        // Best-effort: record first path mentioned
-                        if let Some(line) = report.lines().next() {
+                        // Record + live-diff every path in the report
+                        for line in report.lines() {
                             if let Some(p) = line.strip_prefix("updated ") {
                                 let path = p.split(' ').next().unwrap_or("");
                                 if !path.is_empty() {
-                                    self.record_edit(path);
+                                    self.emit_file_edit(
+                                        session_id,
+                                        cwd,
+                                        path,
+                                        line,
+                                        event_tx,
+                                    );
                                 }
                             }
                         }
@@ -2013,8 +2089,117 @@ impl AgentHostHandle {
             }
             other => Ok(format!(
                 "Unknown tool `{other}`. Available: list_dir, read_file, grep, write_file, \
-                 run_terminal_cmd, glob_files, apply_patch"
+                 run_terminal_cmd, glob_files, apply_patch, and mcp__* tools"
             )),
+        }
+    }
+
+    async fn run_mcp_tool(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        server: &str,
+        tool: &str,
+        wire_name: &str,
+        args: &serde_json::Value,
+        cancel: &CancellationToken,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) -> Result<String> {
+        if cancel.is_cancelled() {
+            return Ok("(cancelled)".into());
+        }
+        let always = {
+            let g = self.inner.lock();
+            g.always_approve
+                || g.always_allowed_tools.contains(wire_name)
+                || g.always_allowed_tools.contains("mcp")
+                || g.permission_mode == "bypassPermissions"
+        };
+        let call_id = Uuid::new_v4().to_string();
+        if !always {
+            let req = PermissionRequest {
+                id: Uuid::new_v4(),
+                session_id,
+                tool_name: wire_name.into(),
+                summary: format!("Allow MCP tool `{server}/{tool}`?"),
+                detail: args.clone(),
+            };
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut g = self.inner.lock();
+                g.pending_permissions
+                    .insert(req.id, PendingPermission { tx });
+            }
+            let _ = event_tx.send(SessionUpdate::PermissionRequired {
+                session_id,
+                request: req,
+            });
+            let decision = tokio::select! {
+                d = rx => d.unwrap_or(PermissionDecision::Deny),
+                _ = cancel.cancelled() => PermissionDecision::Deny,
+            };
+            if decision == PermissionDecision::Deny {
+                let _ = event_tx.send(SessionUpdate::ToolCall {
+                    session_id,
+                    call_id: call_id.clone(),
+                    title: wire_name.into(),
+                    kind: ToolCallKind::Other,
+                    status: ToolCallStatus::Denied,
+                    input: args.clone(),
+                });
+                return Ok(format!("DENIED: user denied MCP tool `{server}/{tool}`"));
+            }
+            if decision == PermissionDecision::AlwaysAllow {
+                let mut g = self.inner.lock();
+                g.always_allowed_tools.insert(wire_name.into());
+                g.always_allowed_tools.insert("mcp".into());
+            }
+        }
+        let _ = event_tx.send(SessionUpdate::ToolCall {
+            session_id,
+            call_id: call_id.clone(),
+            title: wire_name.into(),
+            kind: ToolCallKind::Other,
+            status: ToolCallStatus::Running,
+            input: args.clone(),
+        });
+        let result = tokio::select! {
+            r = crate::mcp_runtime::call_mcp_tool(Some(cwd), server, tool, args.clone()) => r,
+            _ = cancel.cancelled() => {
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: ToolCallStatus::Failed,
+                    output: Some("(cancelled)".into()),
+                });
+                return Ok("(cancelled)".into());
+            }
+        };
+        match result {
+            Ok(out) => {
+                let clipped = if out.len() > 24_000 {
+                    format!("{}…\n(truncated)", &out[..24_000])
+                } else {
+                    out
+                };
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: ToolCallStatus::Completed,
+                    output: Some(clipped.clone()),
+                });
+                Ok(clipped)
+            }
+            Err(e) => {
+                let msg = format!("MCP error ({server}/{tool}): {e:#}");
+                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                    session_id,
+                    call_id,
+                    status: ToolCallStatus::Failed,
+                    output: Some(msg.clone()),
+                });
+                Ok(msg)
+            }
         }
     }
 
@@ -2520,9 +2705,10 @@ fn emit_thought(tx: &mpsc::UnboundedSender<SessionUpdate>, session_id: Uuid, tex
 fn tool_kind(name: &str) -> ToolCallKind {
     match name {
         "read_file" | "list_dir" => ToolCallKind::Read,
-        "write_file" => ToolCallKind::Edit,
-        "grep" => ToolCallKind::Search,
+        "write_file" | "apply_patch" => ToolCallKind::Edit,
+        "grep" | "glob_files" => ToolCallKind::Search,
         "run_terminal_cmd" => ToolCallKind::Execute,
+        n if n.starts_with("mcp__") => ToolCallKind::Other,
         _ => ToolCallKind::Other,
     }
 }
@@ -2534,16 +2720,24 @@ struct AgentToolCall {
 }
 
 enum AgentStep {
-    Final(String),
+    Final {
+        text: String,
+        /// True when tokens were already emitted as AgentMessageChunk.
+        streamed: bool,
+    },
     ToolCalls {
         content: Option<String>,
         tool_calls: Vec<AgentToolCall>,
+        streamed: bool,
     },
 }
 
-fn coding_agent_tools() -> serde_json::Value {
-    serde_json::json!([
-        {
+/// Map of OpenAI function name → (real server name, real tool name).
+type McpToolIndex = std::collections::HashMap<String, (String, String)>;
+
+fn coding_agent_tools(mcp: &[crate::mcp_runtime::McpToolSpec]) -> (serde_json::Value, McpToolIndex) {
+    let mut tools = vec![
+        serde_json::json!({
             "type": "function",
             "function": {
                 "name": "list_dir",
@@ -2558,8 +2752,8 @@ fn coding_agent_tools() -> serde_json::Value {
                     }
                 }
             }
-        },
-        {
+        }),
+        serde_json::json!({
             "type": "function",
             "function": {
                 "name": "read_file",
@@ -2572,8 +2766,8 @@ fn coding_agent_tools() -> serde_json::Value {
                     "required": ["path"]
                 }
             }
-        },
-        {
+        }),
+        serde_json::json!({
             "type": "function",
             "function": {
                 "name": "grep",
@@ -2590,8 +2784,8 @@ fn coding_agent_tools() -> serde_json::Value {
                     "required": ["pattern"]
                 }
             }
-        },
-        {
+        }),
+        serde_json::json!({
             "type": "function",
             "function": {
                 "name": "write_file",
@@ -2605,8 +2799,8 @@ fn coding_agent_tools() -> serde_json::Value {
                     "required": ["path", "content"]
                 }
             }
-        },
-        {
+        }),
+        serde_json::json!({
             "type": "function",
             "function": {
                 "name": "run_terminal_cmd",
@@ -2619,8 +2813,8 @@ fn coding_agent_tools() -> serde_json::Value {
                     "required": ["command"]
                 }
             }
-        },
-        {
+        }),
+        serde_json::json!({
             "type": "function",
             "function": {
                 "name": "glob_files",
@@ -2634,8 +2828,8 @@ fn coding_agent_tools() -> serde_json::Value {
                     "required": ["pattern"]
                 }
             }
-        },
-        {
+        }),
+        serde_json::json!({
             "type": "function",
             "function": {
                 "name": "apply_patch",
@@ -2651,8 +2845,34 @@ fn coding_agent_tools() -> serde_json::Value {
                     "required": ["patch"]
                 }
             }
-        }
-    ])
+        }),
+    ];
+
+    let mut index = McpToolIndex::new();
+    for t in mcp {
+        let fname = crate::mcp_runtime::mcp_function_name(&t.server, &t.name);
+        index.insert(fname.clone(), (t.server.clone(), t.name.clone()));
+        let desc = if t.description.is_empty() {
+            format!("MCP tool {}.{} (external server)", t.server, t.name)
+        } else {
+            format!("[MCP:{}] {}", t.server, t.description)
+        };
+        let params = if t.input_schema.is_object() {
+            t.input_schema.clone()
+        } else {
+            serde_json::json!({"type":"object","properties":{}})
+        };
+        tools.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": fname,
+                "description": desc,
+                "parameters": params
+            }
+        }));
+    }
+
+    (serde_json::Value::Array(tools), index)
 }
 
 fn sandbox_is_readonly(profile: &str) -> bool {
@@ -2681,6 +2901,7 @@ fn build_agent_messages(
     cwd: &Path,
 ) -> Vec<serde_json::Value> {
     let (instructions, loaded) = crate::project_context::load_project_instructions(cwd);
+    let skills = crate::project_context::load_skills_context(Some(cwd));
     let instr_note = if loaded.is_empty() {
         String::new()
     } else {
@@ -2692,11 +2913,12 @@ fn build_agent_messages(
          Use tools to explore and change the codebase. Do not invent file contents — read, list, or glob first.\n\
          Prefer apply_patch for targeted edits; use write_file for new files or full rewrites.\n\
          Run tests/builds with run_terminal_cmd when useful.\n\
+         MCP tools (if any) are named mcp__<server>__<tool> — use them when they match the task.\n\
          When the task is done, respond with a clear final summary and no more tool calls.\n\
          Be concise in narration; put substantial content into tool arguments.{instr_note}",
         cwd.display()
     );
-    let mut messages = Vec::with_capacity(history.len() + 4);
+    let mut messages = Vec::with_capacity(history.len() + 6);
     messages.push(serde_json::json!({
         "role": "system",
         "content": system
@@ -2705,6 +2927,12 @@ fn build_agent_messages(
         messages.push(serde_json::json!({
             "role": "system",
             "content": instructions
+        }));
+    }
+    if !skills.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": skills
         }));
     }
     if let Some(summary) = compacted_summary.filter(|s| !s.is_empty()) {
@@ -2763,14 +2991,22 @@ fn resolve_api_base(
     (base, model_id)
 }
 
-async fn call_xai_agent_step(
+/// Stream one chat/completions step (tools + tokens). Emits content deltas via `on_delta`.
+/// Cancel aborts the HTTP body read within ~one chunk.
+async fn call_xai_agent_step<F>(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
     effort: EffortLevel,
     messages: &[serde_json::Value],
     tools: &serde_json::Value,
     cancel: &CancellationToken,
-) -> Result<AgentStep> {
+    mut on_delta: F,
+) -> Result<AgentStep>
+where
+    F: FnMut(&str),
+{
+    use futures::StreamExt;
+
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
     let (base, model_id) = resolve_api_base(&creds, model);
     let client = reqwest::Client::builder()
@@ -2783,22 +3019,19 @@ async fn call_xai_agent_step(
         .build()
         .map_err(|e| anyhow!(e))?;
 
-    // Effort on the wire (chat completions + catalog models that honor it).
     let mut body = serde_json::json!({
         "model": model_id,
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",
-        "stream": false
+        "stream": true
     });
     if !matches!(effort, EffortLevel::None) {
         body["effort"] = serde_json::Value::String(effort.as_str().into());
-        // Some proxy paths also read reasoning.effort
         body["reasoning"] = serde_json::json!({ "effort": effort.as_str() });
     }
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
-    // Retries for transient failures (429 / 5xx / connect).
     let mut last_err = None::<String>;
     for attempt in 0..4u32 {
         if cancel.is_cancelled() {
@@ -2808,12 +3041,16 @@ async fn call_xai_agent_step(
             let req = client
                 .post(&url)
                 .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
                 .header("x-grok-effort", effort.as_str());
             let req = crate::auth_store::apply_auth_headers(req, c, &base);
             req.json(&body)
         };
 
-        let resp_result = send_once(&creds).send().await;
+        let resp_result = tokio::select! {
+            r = send_once(&creds).send() => r,
+            _ = cancel.cancelled() => bail!("cancelled"),
+        };
         let mut resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
@@ -2831,10 +3068,11 @@ async fn call_xai_agent_step(
             match crate::auth_store::force_refresh(&creds).await {
                 Ok(fresh) => {
                     creds = fresh;
-                    resp = send_once(&creds)
-                        .send()
-                        .await
-                        .map_err(|e| anyhow!("request error after refresh: {e}"))?;
+                    resp = tokio::select! {
+                        r = send_once(&creds).send() => r
+                            .map_err(|e| anyhow!("request error after refresh: {e}"))?,
+                        _ = cancel.cancelled() => bail!("cancelled"),
+                    };
                 }
                 Err(e) => {
                     let text = resp.text().await.unwrap_or_default();
@@ -2866,60 +3104,252 @@ async fn call_xai_agent_step(
 
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            // Some proxies reject stream+tools — fall back to non-stream once.
+            if attempt == 0 && status.as_u16() == 400 {
+                body["stream"] = serde_json::Value::Bool(false);
+                last_err = Some(format!(
+                    "HTTP {status} (will retry non-stream): {}",
+                    text.chars().take(200).collect::<String>()
+                ));
+                continue;
+            }
             bail!(
                 "HTTP {status}: {}",
                 text.chars().take(800).collect::<String>()
             );
         }
 
-        let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
-        let msg = &v["choices"][0]["message"];
+        // Non-stream JSON body (fallback path)
+        if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
+            let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
+            return parse_agent_step_from_message(&v["choices"][0]["message"], false, &mut on_delta);
+        }
 
-        if let Some(arr) = msg["tool_calls"].as_array() {
-            if !arr.is_empty() {
-                let mut tool_calls = Vec::new();
-                for tc in arr {
-                    let id = tc["id"].as_str().unwrap_or("call").to_string();
-                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                    let arguments = match &tc["function"]["arguments"] {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    if name.is_empty() {
-                        continue;
+        // SSE stream path — cancel kills the body read promptly.
+        let mut stream = resp.bytes_stream();
+        let mut line_buf = String::new();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut streamed_any = false;
+        // index → partial tool call
+        let mut tc_map: std::collections::BTreeMap<u32, (String, String, String)> =
+            std::collections::BTreeMap::new();
+
+        loop {
+            let chunk = tokio::select! {
+                c = stream.next() => c,
+                _ = cancel.cancelled() => {
+                    drop(stream);
+                    bail!("cancelled");
+                }
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
+            let bytes = chunk.map_err(|e| anyhow!("stream: {e}"))?;
+            line_buf.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(nl) = line_buf.find('\n') {
+                let mut line = line_buf[..nl].to_string();
+                line_buf = line_buf[nl + 1..].to_string();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+                let line = line.trim();
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    line_buf.clear();
+                    // force outer break
+                    line_buf.push_str("__DONE__");
+                    break;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+                // Prefer delta (stream) but accept full message (some gateways)
+                let delta = if v["choices"][0]["delta"].is_object() {
+                    &v["choices"][0]["delta"]
+                } else if v["choices"][0]["message"].is_object() {
+                    &v["choices"][0]["message"]
+                } else {
+                    continue;
+                };
+
+                if let Some(c) = delta["content"].as_str() {
+                    if !c.is_empty() {
+                        content.push_str(c);
+                        streamed_any = true;
+                        on_delta(c);
                     }
-                    tool_calls.push(AgentToolCall {
-                        id,
-                        name,
-                        arguments,
-                    });
                 }
-                if !tool_calls.is_empty() {
-                    let content = msg["content"].as_str().map(|s| s.to_string());
-                    return Ok(AgentStep::ToolCalls {
-                        content,
-                        tool_calls,
-                    });
+                if let Some(r) = delta["reasoning_content"].as_str() {
+                    if !r.is_empty() {
+                        reasoning.push_str(r);
+                    }
                 }
+                if let Some(arr) = delta["tool_calls"].as_array() {
+                    for tc in arr {
+                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
+                        let entry = tc_map.entry(idx).or_insert_with(|| {
+                            (
+                                String::new(),
+                                String::new(),
+                                String::new(),
+                            )
+                        });
+                        if let Some(id) = tc["id"].as_str() {
+                            if !id.is_empty() {
+                                entry.0 = id.to_string();
+                            }
+                        }
+                        if let Some(name) = tc["function"]["name"].as_str() {
+                            if !name.is_empty() {
+                                entry.1.push_str(name);
+                            }
+                        }
+                        match &tc["function"]["arguments"] {
+                            serde_json::Value::String(s) => entry.2.push_str(s),
+                            other if !other.is_null() => entry.2.push_str(&other.to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if line_buf == "__DONE__" {
+                break;
             }
         }
 
-        if let Some(content) = msg["content"].as_str() {
-            if !content.is_empty() {
-                return Ok(AgentStep::Final(content.to_string()));
+        let mut tool_calls = Vec::new();
+        for (id, name, arguments) in tc_map.into_values() {
+            if name.is_empty() {
+                continue;
             }
+            tool_calls.push(AgentToolCall {
+                id: if id.is_empty() {
+                    Uuid::new_v4().to_string()
+                } else {
+                    id
+                },
+                name,
+                arguments,
+            });
         }
-        if let Some(r) = msg["reasoning_content"].as_str() {
-            if !r.is_empty() {
-                return Ok(AgentStep::Final(r.to_string()));
+
+        if !tool_calls.is_empty() {
+            let content_opt = if content.trim().is_empty() {
+                None
+            } else {
+                Some(content)
+            };
+            return Ok(AgentStep::ToolCalls {
+                content: content_opt,
+                tool_calls,
+                streamed: streamed_any,
+            });
+        }
+
+        if !content.trim().is_empty() {
+            return Ok(AgentStep::Final {
+                text: content,
+                streamed: streamed_any,
+            });
+        }
+        if !reasoning.trim().is_empty() {
+            if !streamed_any {
+                on_delta(&reasoning);
             }
+            return Ok(AgentStep::Final {
+                text: reasoning,
+                streamed: true,
+            });
         }
-        bail!("empty agent response: {v}");
+        last_err = Some("empty stream response".into());
+        if attempt < 3 {
+            body["stream"] = serde_json::Value::Bool(false);
+            continue;
+        }
+        bail!("{}", last_err.unwrap());
     }
     bail!(
         "{}",
         last_err.unwrap_or_else(|| "agent request failed".into())
     );
+}
+
+fn parse_agent_step_from_message<F>(
+    msg: &serde_json::Value,
+    streamed: bool,
+    on_delta: &mut F,
+) -> Result<AgentStep>
+where
+    F: FnMut(&str),
+{
+    if let Some(arr) = msg["tool_calls"].as_array() {
+        if !arr.is_empty() {
+            let mut tool_calls = Vec::new();
+            for tc in arr {
+                let id = tc["id"].as_str().unwrap_or("call").to_string();
+                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                let arguments = match &tc["function"]["arguments"] {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                tool_calls.push(AgentToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
+            }
+            if !tool_calls.is_empty() {
+                let content = msg["content"].as_str().map(|s| s.to_string());
+                let has_content = content.as_ref().is_some_and(|c| !c.is_empty());
+                if let Some(ref c) = content {
+                    if !c.is_empty() && !streamed {
+                        on_delta(c);
+                    }
+                }
+                return Ok(AgentStep::ToolCalls {
+                    content,
+                    tool_calls,
+                    streamed: streamed || has_content,
+                });
+            }
+        }
+    }
+
+    if let Some(content) = msg["content"].as_str() {
+        if !content.is_empty() {
+            if !streamed {
+                on_delta(content);
+            }
+            return Ok(AgentStep::Final {
+                text: content.to_string(),
+                streamed: true,
+            });
+        }
+    }
+    if let Some(r) = msg["reasoning_content"].as_str() {
+        if !r.is_empty() {
+            if !streamed {
+                on_delta(r);
+            }
+            return Ok(AgentStep::Final {
+                text: r.to_string(),
+                streamed: true,
+            });
+        }
+    }
+    bail!("empty agent response: {msg}");
 }
 
 /// Build the extractive summary for transcript entries that leave the API window.

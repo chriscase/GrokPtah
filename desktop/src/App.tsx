@@ -473,6 +473,22 @@ export default function App() {
         setShowTerm(true);
         setToolShell({ callId: u.call_id, command: u.command });
       }
+      if (u.type === "file_edit") {
+        // Live agent diffs in the git pane (no manual refresh).
+        setRightTab("git");
+        setGitDiff((prev) => {
+          const header = `--- ${u.path} ---`;
+          const block = `${header}\n${u.unified_diff || u.summary}\n`;
+          if (!prev.trim()) return block;
+          const re = new RegExp(
+            `--- ${u.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ---\\n[\\s\\S]*?(?=--- |$)`,
+          );
+          if (re.test(prev)) {
+            return prev.replace(re, block);
+          }
+          return `${prev.trimEnd()}\n${block}`;
+        });
+      }
       applyUpdate(u, setTabs, setPermission);
     });
   }, []);
@@ -2190,6 +2206,30 @@ function applyUpdate(
           ...next,
           activity: errorActivity(u.message),
         };
+      });
+      break;
+    case "file_edit":
+      withTab(sid!, (tab) => {
+        const next = mapTranscript(
+          tab,
+          (t) => [
+            ...t,
+            {
+              kind: "tool" as const,
+              callId: `edit-${u.path}-${t.length}`,
+              title: `edit ${u.path}`,
+              status: "completed",
+              output: u.summary,
+            },
+          ],
+          { busy: true },
+        );
+        return withActivity(next, {
+          phase: "tool",
+          label: "Edit",
+          detail: u.path,
+          live: true,
+        });
       });
       break;
     default:

@@ -8,6 +8,7 @@ mod discover;
 mod events;
 mod host;
 mod local_tools;
+mod mcp_runtime;
 mod models_catalog;
 mod permission;
 mod project_context;

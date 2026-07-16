@@ -105,4 +105,12 @@ pub enum SessionUpdate {
         exit_code: Option<i32>,
         cancelled: bool,
     },
+    /// Agent wrote/edited a file — UI should refresh the live diff pane.
+    FileEdit {
+        session_id: Uuid,
+        path: String,
+        summary: String,
+        /// Truncated unified diff or patch report for the right-rail.
+        unified_diff: String,
+    },
 }

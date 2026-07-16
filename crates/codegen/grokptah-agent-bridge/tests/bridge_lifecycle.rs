@@ -136,6 +136,35 @@ async fn session_lifecycle_prompt_streams_message() {
 }
 
 #[tokio::test]
+async fn offline_write_emits_file_edit() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().expect("event rx");
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    host.session_prompt(session.id, "write hello.txt: hi from offline".into())
+        .await
+        .unwrap();
+
+    let events = drain_until_turn_complete(&mut rx).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SessionUpdate::FileEdit { path, .. } if path == "hello.txt"
+        )),
+        "expected FileEdit for hello.txt, got {events:?}"
+    );
+    let written = std::fs::read_to_string(dir.path().join("hello.txt")).unwrap();
+    assert!(written.contains("hi from offline"));
+}
+
+#[tokio::test]
 async fn permission_request_round_trip_allow() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();

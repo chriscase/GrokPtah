@@ -22,6 +22,16 @@ These cover glob/patch/instructions helpers and host lifecycle without requiring
    - “Create `hello.txt` with contents hi and confirm with list_dir.”
 4. Confirm multi-round thoughts (`agent round N/24`), tool cards, and a final summary.
 
+## Phase 15 P1 (streaming / skills / MCP / diffs)
+
+Covered by unit + lifecycle tests offline:
+
+- `project_context` skills inject (`load_skills_context`)
+- `mcp_runtime` function name shape
+- Offline Build turn emits `FileEdit` after `write …`
+
+Live (manual): Build mode should stream assistant tokens mid-step; Stop cancels HTTP within ~1s; enabled stdio MCP tools appear as `mcp__server__tool`.
+
 ## Full harness (TODO)
 
 Automate fixture tasks vs CLI in CI once #78/#79 stabilize. Track progress on #93.

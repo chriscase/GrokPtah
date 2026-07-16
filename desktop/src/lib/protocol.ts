@@ -81,6 +81,13 @@ export type SessionUpdate =
       call_id: string;
       exit_code?: number | null;
       cancelled: boolean;
+    }
+  | {
+      type: "file_edit";
+      session_id: string;
+      path: string;
+      summary: string;
+      unified_diff: string;
     };
 
 export interface PermissionRequest {

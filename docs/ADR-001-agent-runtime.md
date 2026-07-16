@@ -36,4 +36,7 @@ Upstream still has a full stack (`xai-grok-shell`, `xai-grok-tools`, `xai-grok-m
 
 - cli-chat-proxy accepts `tools` / `tool_calls` on chat completions (verified).
 - Build path runs multi-round loop with local tools + permissions.
-- Next: instructions, effort, expanded tools, retries, fixture evals (this phase).
+- P0: instructions, effort, glob/apply_patch, retries, sandbox gates, evals docs.
+- P1: SSE token streaming during model steps, skill body inject, cancel mid-HTTP,
+  basic stdio MCP tool advertise/dispatch (`mcp__server__tool`), live `FileEdit`
+  events into the git/diff pane.

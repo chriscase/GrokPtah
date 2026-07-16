@@ -352,6 +352,90 @@ fn strip_trailing_nl(s: &str) -> String {
     s.trim_end_matches('\n').trim_end_matches('\r').to_string()
 }
 
+const MAX_SKILLS_CHARS: usize = 10_000;
+const MAX_SKILL_BODY: usize = 2_400;
+
+/// Load discovered skills (catalog + bodies) for Build agent system context.
+///
+/// `SkillInfo.id` is the filesystem path to the skill markdown.
+pub fn load_skills_context(project: Option<&Path>) -> String {
+    let skills = crate::discover::discover_skills(project);
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "Skills available for this session (follow a skill body when the user task matches):\n\n",
+    );
+    let mut used = out.len();
+
+    // Compact catalog first
+    for s in &skills {
+        let line = format!("- **{}**: {}\n", s.name, s.description);
+        if used + line.len() > MAX_SKILLS_CHARS / 3 {
+            break;
+        }
+        out.push_str(&line);
+        used += line.len();
+    }
+    out.push('\n');
+
+    // Full bodies (capped) for the first few skills
+    let mut bodies = 0usize;
+    for s in &skills {
+        if bodies >= 6 || used >= MAX_SKILLS_CHARS {
+            break;
+        }
+        let Ok(body) = std::fs::read_to_string(&s.id) else {
+            continue;
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let room = MAX_SKILLS_CHARS.saturating_sub(used);
+        let cap = MAX_SKILL_BODY.min(room.saturating_sub(64));
+        if cap < 80 {
+            break;
+        }
+        let text = if body.len() > cap {
+            format!("{}…\n(truncated)", &body[..cap])
+        } else {
+            body.to_string()
+        };
+        let block = format!("### Skill: {}\n{}\n\n", s.name, text);
+        out.push_str(&block);
+        used += block.len();
+        bodies += 1;
+    }
+    out
+}
+
+/// Best-effort unified diff for a path after an edit (git, else summary).
+pub fn diff_for_path(cwd: &Path, path: &str) -> String {
+    let output = std::process::Command::new("git")
+        .args(["diff", "--", path])
+        .current_dir(cwd)
+        .output();
+    if let Ok(o) = output {
+        let s = String::from_utf8_lossy(&o.stdout).to_string();
+        if !s.trim().is_empty() {
+            return s.chars().take(12_000).collect();
+        }
+        // untracked new file
+        let staged = std::process::Command::new("git")
+            .args(["diff", "--no-index", "--", "/dev/null", path])
+            .current_dir(cwd)
+            .output();
+        if let Ok(o) = staged {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            if !s.trim().is_empty() {
+                return s.chars().take(12_000).collect();
+            }
+        }
+    }
+    format!("(updated {path})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +475,22 @@ mod tests {
         let (text, loaded) = load_project_instructions(dir.path());
         assert!(loaded.iter().any(|l| l == "AGENTS.md"));
         assert!(text.contains("Always use tabs"));
+    }
+
+    #[test]
+    fn loads_skills_into_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = dir.path().join("skills");
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(
+            skills.join("review.md"),
+            "# Review\n\nAlways mention edge cases.\n",
+        )
+        .unwrap();
+        let ctx = load_skills_context(Some(dir.path()));
+        assert!(
+            ctx.contains("edge cases") || ctx.contains("Review") || ctx.contains("review"),
+            "skills context: {ctx}"
+        );
     }
 }
