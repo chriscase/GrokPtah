@@ -205,6 +205,13 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [composer, setComposer] = useState("");
+  /**
+   * Per-session composer drafts — survive focus switches so you can
+   * pre-type prompts for several agents and send when ready.
+   */
+  const [composerDrafts, setComposerDrafts] = useState<Record<string, string>>(
+    {},
+  );
   /** Taller composer for detailed prompts (power users). */
   const [composerExpanded, setComposerExpanded] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
@@ -354,6 +361,12 @@ export default function App() {
 
   const closeTab = useCallback((id: string) => {
     setDocks((d) => d.filter((x) => x !== id));
+    setComposerDrafts((d) => {
+      if (!(id in d)) return d;
+      const next = { ...d };
+      delete next[id];
+      return next;
+    });
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id);
       setActiveSessionId((cur) => {
@@ -363,6 +376,37 @@ export default function App() {
       return next;
     });
   }, []);
+
+  /** Write composer into the focused session's draft bag. */
+  const updateComposer = useCallback(
+    (text: string) => {
+      setComposer(text);
+      if (activeSessionId) {
+        setComposerDrafts((d) => {
+          if ((d[activeSessionId] ?? "") === text) return d;
+          if (!text) {
+            if (!(activeSessionId in d)) return d;
+            const next = { ...d };
+            delete next[activeSessionId];
+            return next;
+          }
+          return { ...d, [activeSessionId]: text };
+        });
+      }
+    },
+    [activeSessionId],
+  );
+
+  // Restore draft when focus moves between sessions
+  useEffect(() => {
+    if (!activeSessionId) {
+      setComposer("");
+      return;
+    }
+    setComposer(composerDrafts[activeSessionId] ?? "");
+    // Only rehydrate when the target session changes — not on every draft keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: load on focus switch only
+  }, [activeSessionId]);
 
   const undockSession = useCallback((id: string) => {
     setDocks((d) => {
@@ -1030,13 +1074,37 @@ export default function App() {
   async function sendPrompt(text?: string) {
     const prompt = (text ?? composer).trim();
     if (!prompt) return;
-    setComposer("");
+    const fromComposer = text === undefined;
+    if (fromComposer) {
+      setComposer("");
+      if (activeSessionId) {
+        setComposerDrafts((d) => {
+          if (!(activeSessionId in d)) return d;
+          const next = { ...d };
+          delete next[activeSessionId];
+          return next;
+        });
+      }
+    }
     let id: string;
     try {
       id = await ensureSession();
     } catch (e) {
       console.warn(e);
+      // Restore draft if session creation failed after we cleared it
+      if (fromComposer) updateComposer(prompt);
       return;
+    }
+    // After ensureSession, focus may have moved to a new id — clear that draft too
+    if (fromComposer) {
+      setComposer("");
+      setComposerDrafts((d) => {
+        if (!(id in d) && !(activeSessionId && activeSessionId in d)) return d;
+        const next = { ...d };
+        delete next[id];
+        if (activeSessionId) delete next[activeSessionId];
+        return next;
+      });
     }
     patchTab(id, (t) => ({
       ...t,
@@ -1723,7 +1791,7 @@ export default function App() {
                   key={c.cmd}
                   type="button"
                   className="slash-item"
-                  onClick={() => setComposer(c.cmd + " ")}
+                  onClick={() => updateComposer(c.cmd + " ")}
                 >
                   <strong>{c.cmd}</strong>
                   <span className="slash-desc">{c.desc}</span>
@@ -1755,12 +1823,12 @@ export default function App() {
               rows={composerExpanded ? 10 : 2}
               placeholder={
                 busy
-                  ? "Focused session is running… click another zone to message it"
+                  ? "Focused session is running… draft saved when you switch sessions"
                   : workspaceMode === "chat"
-                    ? "Message Grok… (Shift+Enter for newline)"
-                    : "Message the coding agent… (Shift+Enter for newline)"
+                    ? "Message Grok… (drafts keep per session · Shift+Enter newline)"
+                    : "Message the coding agent… (drafts keep per session · Shift+Enter newline)"
               }
-              onChange={(e) => setComposer(e.target.value)}
+              onChange={(e) => updateComposer(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();

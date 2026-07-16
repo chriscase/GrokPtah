@@ -209,7 +209,7 @@ button:disabled {
   overflow-y: auto;
 }
 
-/* Collapsed rail strip — always-on expand target */
+/* Collapsed rail strip — cool slate, visible without loud gold */
 .rail-expand {
   display: none;
   flex: 1 1 auto;
@@ -226,24 +226,24 @@ button:disabled {
   border-radius: 0;
   background: linear-gradient(
     180deg,
-    rgba(240, 180, 41, 0.14),
-    rgba(240, 180, 41, 0.05) 40%,
-    rgba(0, 0, 0, 0.15)
+    #1a1e28 0%,
+    #14171f 45%,
+    #10131a 100%
   );
-  color: var(--accent);
+  color: var(--thought);
   cursor: pointer;
-  box-shadow: inset 0 0 0 1px rgba(240, 180, 41, 0.35);
+  box-shadow: inset 0 0 0 1px #2c3340;
 }
 
 .rail-expand:hover {
   background: linear-gradient(
     180deg,
-    rgba(240, 180, 41, 0.28),
-    rgba(240, 180, 41, 0.1) 45%,
-    rgba(0, 0, 0, 0.12)
+    #232834 0%,
+    #1a1e28 50%,
+    #14171f 100%
   );
   color: var(--text);
-  box-shadow: inset 0 0 0 1px rgba(240, 180, 41, 0.65);
+  box-shadow: inset 0 0 0 1px #3d4658;
 }
 
 .rail-expand-chevron {
@@ -252,13 +252,18 @@ button:disabled {
   font-weight: 700;
   flex-shrink: 0;
   margin-top: 0.15rem;
+  color: var(--muted);
+}
+
+.rail-expand:hover .rail-expand-chevron {
+  color: var(--text);
 }
 
 .rail-expand-label {
   writing-mode: vertical-rl;
   text-orientation: mixed;
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 650;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   transform: rotate(180deg);
@@ -276,11 +281,11 @@ button:disabled {
 }
 
 .sidebar.is-collapsed {
-  border-right: 1px solid rgba(240, 180, 41, 0.35);
+  border-right: 1px solid var(--border);
 }
 
 .rightbar.is-collapsed {
-  border-left: 1px solid rgba(240, 180, 41, 0.35);
+  border-left: 1px solid var(--border);
 }
 
 .sidebar.is-collapsed .panel-body,
