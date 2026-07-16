@@ -192,11 +192,13 @@ button:disabled {
 .main > .session-cwd-bar,
 .main > .terminal-slot,
 .main > .activity-strip,
-.main > .composer-wrap {
+.main > .composer-wrap,
+.main > .fleet-strip {
   flex: 0 0 auto;
 }
 
-.main > .transcript {
+.main > .transcript,
+.main > .pane-row {
   flex: 1 1 auto;
   min-height: 0;
 }
@@ -2569,5 +2571,284 @@ button:disabled {
   }
   .settings-rules {
     grid-template-columns: 1fr;
+  }
+}
+
+/* ── Sidebar action cluster ── */
+.sidebar-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 0.55rem;
+}
+
+.sidebar-action-primary {
+  width: 100%;
+}
+
+.sidebar-action-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.3rem;
+}
+
+.sidebar-action-ghost {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0.35rem 0.4rem;
+}
+
+.sidebar-action-ghost:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+/* ── Split session panes (Phase 14) ── */
+.main > .pane-row {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  gap: 0;
+  overflow: hidden;
+}
+
+.pane-row.single {
+  flex-direction: column;
+}
+
+.pane-row.has-side {
+  flex-direction: row;
+}
+
+.session-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 50%;
+  background: var(--bg);
+  border: 1px solid transparent;
+}
+
+.pane-row.has-side .session-pane {
+  border-right: 1px solid var(--border-soft);
+}
+
+.pane-row.has-side .session-pane:last-child {
+  border-right: none;
+}
+
+.session-pane.is-focused {
+  background: linear-gradient(
+    180deg,
+    rgba(240, 180, 41, 0.04),
+    transparent 48px
+  );
+}
+
+.session-pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  padding: 0.3rem 0.55rem;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-panel);
+  flex: 0 0 auto;
+  min-height: 30px;
+}
+
+.session-pane-title {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.session-pane-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.session-pane-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-shrink: 0;
+}
+
+.session-pane-focus-tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  opacity: 0.85;
+}
+
+.session-pane-close {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 5px;
+  font-size: 14px;
+}
+
+.session-pane-close:hover {
+  color: var(--danger);
+  background: rgba(240, 113, 120, 0.12);
+  border-color: transparent;
+}
+
+.session-pane-transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.pane-empty {
+  margin: auto;
+}
+
+.pane-empty-hint {
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.session-tab.is-side {
+  border-color: rgba(240, 180, 41, 0.35);
+}
+
+.session-tab-split {
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 0.15rem 0.45rem;
+  margin: 0.2rem;
+  color: var(--muted);
+  font-size: 13px;
+  align-self: center;
+}
+
+.session-tab-split:hover,
+.session-tab-split.on {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+
+/* ── Fleet strip ── */
+.fleet-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 0.45rem;
+  padding: 0.3rem 0.55rem;
+  border-top: 1px solid var(--border-soft);
+  background: rgba(0, 0, 0, 0.22);
+  flex: 0 0 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.fleet-strip-label {
+  align-self: center;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  flex-shrink: 0;
+  padding: 0 0.2rem;
+}
+
+.fleet-cards {
+  display: flex;
+  gap: 0.3rem;
+  overflow-x: auto;
+  min-width: 0;
+  flex: 1;
+  padding-bottom: 1px;
+}
+
+.fleet-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  min-width: 7.5rem;
+  max-width: 11rem;
+  padding: 0.3rem 0.45rem;
+  border-radius: 8px;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-elevated);
+  text-align: left;
+  flex-shrink: 0;
+}
+
+.fleet-card:hover {
+  border-color: var(--border);
+}
+
+.fleet-card.primary {
+  border-color: rgba(240, 180, 41, 0.45);
+  background: var(--accent-bg);
+}
+
+.fleet-card.side {
+  border-style: dashed;
+  border-color: rgba(240, 180, 41, 0.35);
+}
+
+.fleet-card.busy .fleet-card-status {
+  color: var(--accent);
+}
+
+.fleet-card.permission {
+  border-color: rgba(192, 132, 252, 0.55);
+}
+
+.fleet-card.permission .fleet-card-status {
+  color: #c084fc;
+}
+
+.fleet-card-status {
+  font-size: 10px;
+  line-height: 1;
+  color: var(--muted);
+}
+
+.fleet-card-title {
+  font-size: 11.5px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.fleet-card-phase {
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.main.density-ultrawide .app-shell,
+.main.density-wide {
+  /* density class is on main; shell columns stay; extra space is for panes */
+}
+
+@media (max-width: 1439px) {
+  .fleet-strip {
+    display: none;
   }
 }

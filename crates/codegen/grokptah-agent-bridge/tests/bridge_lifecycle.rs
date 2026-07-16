@@ -150,16 +150,22 @@ async fn permission_request_round_trip_allow() {
             .await
     });
 
+    // Buffer every event from the first receive through TurnComplete so we
+    // never drop ToolCall / ShellSessionStarted that fire between permission
+    // grant and prompt join (prior flakes: Elapsed while re-draining).
+    let mut events = Vec::new();
     let mut req_id = None;
     loop {
-        let ev = timeout(Duration::from_secs(5), rx.recv())
+        let ev = timeout(Duration::from_secs(8), rx.recv())
             .await
-            .unwrap()
-            .unwrap();
-        if let SessionUpdate::PermissionRequired { request, .. } = ev {
+            .expect("timeout waiting for permission")
+            .expect("channel closed");
+        if let SessionUpdate::PermissionRequired { request, .. } = &ev {
             req_id = Some(request.id);
+            events.push(ev);
             break;
         }
+        events.push(ev);
     }
     let id = req_id.expect("permission id");
     host.permission_respond(id, PermissionDecision::Allow)
@@ -167,42 +173,50 @@ async fn permission_request_round_trip_allow() {
 
     prompt.await.unwrap().unwrap();
 
-    let mut saw_tool = false;
-    let mut saw_shell_started = false;
-    let mut saw_complete = false;
-    let mut saw_reattach_reexec = false;
-    while let Ok(Some(ev)) = timeout(Duration::from_millis(800), rx.recv()).await {
-        match &ev {
-            SessionUpdate::ToolCall { title, .. } if title == "run_terminal_cmd" => {
-                saw_tool = true;
+    // Drain remaining until TurnComplete (or short quiet window after).
+    loop {
+        match timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(ev)) => {
+                let done = matches!(ev, SessionUpdate::TurnComplete { .. });
+                events.push(ev);
+                if done {
+                    break;
+                }
             }
-            SessionUpdate::ShellSessionStarted { command, .. } => {
-                saw_shell_started = true;
-                assert!(command.contains("echo"));
-            }
-            SessionUpdate::BackgroundTask {
-                status, title, ..
-            } if status == "attachable" && title.starts_with("terminal:") => {
-                // This was the double-exec path — must never fire.
-                saw_reattach_reexec = true;
-            }
-            SessionUpdate::TurnComplete { .. } => {
-                saw_complete = true;
-                break;
-            }
-            _ => {}
+            _ => break,
         }
     }
-    assert!(saw_tool, "shell tool should run after allow");
+
+    let saw_tool = events.iter().any(|e| {
+        matches!(
+            e,
+            SessionUpdate::ToolCall { title, .. } if title == "run_terminal_cmd"
+        )
+    });
+    let saw_shell_started = events
+        .iter()
+        .any(|e| matches!(e, SessionUpdate::ShellSessionStarted { command, .. } if command.contains("echo")));
+    let saw_reattach_reexec = events.iter().any(|e| {
+        matches!(
+            e,
+            SessionUpdate::BackgroundTask { status, title, .. }
+                if status == "attachable" && title.starts_with("terminal:")
+        )
+    });
+    let saw_complete = events
+        .iter()
+        .any(|e| matches!(e, SessionUpdate::TurnComplete { .. }));
+
+    assert!(saw_tool, "shell tool should run after allow, got {events:?}");
     assert!(
         saw_shell_started,
-        "must emit ShellSessionStarted for live attach"
+        "must emit ShellSessionStarted for live attach, got {events:?}"
     );
     assert!(
         !saw_reattach_reexec,
         "must not emit attachable terminal: background task (re-exec)"
     );
-    assert!(saw_complete);
+    assert!(saw_complete, "expected TurnComplete, got {events:?}");
 }
 
 #[tokio::test]
@@ -222,35 +236,46 @@ async fn permission_deny_skips_tool() {
             .await
     });
 
+    let mut events = Vec::new();
     loop {
-        let ev = timeout(Duration::from_secs(5), rx.recv())
+        let ev = timeout(Duration::from_secs(8), rx.recv())
             .await
-            .unwrap()
-            .unwrap();
-        if let SessionUpdate::PermissionRequired { request, .. } = ev {
-            host.permission_respond(request.id, PermissionDecision::Deny)
+            .expect("timeout waiting for permission")
+            .expect("channel closed");
+        if let SessionUpdate::PermissionRequired { request, .. } = &ev {
+            let id = request.id;
+            events.push(ev);
+            host.permission_respond(id, PermissionDecision::Deny)
                 .unwrap();
             break;
         }
+        events.push(ev);
     }
     prompt.await.unwrap().unwrap();
 
-    let mut denied = false;
-    while let Ok(Some(ev)) = timeout(Duration::from_millis(500), rx.recv()).await {
-        if matches!(
-            ev,
+    loop {
+        match timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(ev)) => {
+                let done = matches!(ev, SessionUpdate::TurnComplete { .. });
+                events.push(ev);
+                if done {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    let denied = events.iter().any(|e| {
+        matches!(
+            e,
             SessionUpdate::ToolCall {
                 status: grokptah_agent_bridge::ToolCallStatus::Denied,
                 ..
             }
-        ) {
-            denied = true;
-        }
-        if matches!(ev, SessionUpdate::TurnComplete { .. }) {
-            break;
-        }
-    }
-    assert!(denied);
+        )
+    });
+    assert!(denied, "expected denied tool call, got {events:?}");
 }
 
 #[tokio::test]

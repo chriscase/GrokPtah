@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./lib/api";
 import {
   normalizeSessionUpdate,
@@ -13,21 +13,17 @@ import {
   type TranscriptItem,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
-import { ActivityIndicator } from "./components/ActivityIndicator";
 import {
   ContextMenu,
   type ContextMenuState,
 } from "./components/ContextMenu";
-import { DebugTrace } from "./components/DebugTrace";
+import { FleetStrip } from "./components/FleetStrip";
 import { SearchPanel } from "./components/SearchPanel";
 import { SessionBrowser } from "./components/SessionBrowser";
+import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { StreamingText } from "./components/StreamingText";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
-import {
-  expandDebugLines,
-  isDebugThought,
-} from "./lib/debugTrace";
+import { canSplitSessions, useLayoutDensity } from "./lib/layout";
 import {
   collapseRepeatedText,
   mergeAssistantChunk,
@@ -99,10 +95,6 @@ function withActivity(
 
 /** Ref used by applyUpdate so background tabs can be marked unseen. */
 let activeSessionIdForEvents: string | null = null;
-
-type TranscriptRenderRow =
-  | { type: "item"; item: TranscriptItem; index: number }
-  | { type: "debug"; key: string; lines: string[]; live: boolean };
 
 /**
  * After a turn completes, ensure we show each assistant reply once.
@@ -177,34 +169,6 @@ function collapseAdjacentDuplicateAssistants(
   return out;
 }
 
-/** Collapse host status crumbs into one diagnostics chip per run. */
-function groupTranscript(items: TranscriptItem[]): TranscriptRenderRow[] {
-  const out: TranscriptRenderRow[] = [];
-  let i = 0;
-  while (i < items.length) {
-    const item = items[i];
-    if (item.kind === "thought" && isDebugThought(item.text)) {
-      const start = i;
-      const lines: string[] = [];
-      let live = false;
-      while (i < items.length) {
-        const cur = items[i];
-        if (cur.kind !== "thought" || !isDebugThought(cur.text)) break;
-        if (cur.streaming) live = true;
-        for (const line of expandDebugLines(cur.text)) {
-          if (!lines.includes(line)) lines.push(line);
-        }
-        i += 1;
-      }
-      out.push({ type: "debug", key: `dbg-${start}`, lines, live });
-      continue;
-    }
-    out.push({ type: "item", item, index: i });
-    i += 1;
-  }
-  return out;
-}
-
 /** Shorten a filesystem path for chrome (prefer last two segments). */
 function shortPath(path: string | null | undefined, max = 42): string {
   if (!path) return "Set working directory…";
@@ -259,8 +223,11 @@ export default function App() {
   const [workspaceRestored, setWorkspaceRestored] = useState(false);
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  /** Secondary session column on wide layouts (Phase 14 split view). */
+  const [sideSessionId, setSideSessionId] = useState<string | null>(null);
+  const layoutDensity = useLayoutDensity();
+  const splitOk = canSplitSessions(layoutDensity);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
-  const bottomRef = useRef<HTMLDivElement>(null);
 
   // Keep event router aware of focus for unseen badges.
   activeSessionIdForEvents = activeSessionId;
@@ -281,7 +248,6 @@ export default function App() {
       ),
     );
   }, [activeSessionId]);
-  const transcript = activeTab?.transcript ?? [];
   const busy = activeTab?.busy ?? false;
   const plan = activeTab?.plan ?? null;
   const anyBusy = tabs.some((t) => t.busy);
@@ -342,19 +308,65 @@ export default function App() {
     [],
   );
 
-  const closeTab = useCallback(
-    (id: string) => {
-      setTabs((prev) => {
-        const next = prev.filter((t) => t.id !== id);
-        setActiveSessionId((cur) => {
-          if (cur !== id) return cur;
-          return next[next.length - 1]?.id ?? null;
-        });
-        return next;
+  const closeTab = useCallback((id: string) => {
+    setSideSessionId((side) => (side === id ? null : side));
+    setTabs((prev) => {
+      const next = prev.filter((t) => t.id !== id);
+      setActiveSessionId((cur) => {
+        if (cur !== id) return cur;
+        return next[next.length - 1]?.id ?? null;
       });
+      return next;
+    });
+  }, []);
+
+  const openBeside = useCallback(
+    async (sessionId: string) => {
+      if (!splitOk) return;
+      if (sessionId === activeSessionId) {
+        const other = tabs.find((t) => t.id !== sessionId);
+        if (other) setSideSessionId(other.id);
+        return;
+      }
+      let summary = sessions.find((s) => s.id === sessionId);
+      if (!summary) {
+        try {
+          summary = await api.sessionLoad(sessionId);
+        } catch {
+          return;
+        }
+      }
+      const keepFocus = activeSessionId;
+      const already = tabs.some((t) => t.id === sessionId);
+      await openTab(summary, !already);
+      // openTab focuses the opened session — restore primary focus.
+      if (keepFocus) setActiveSessionId(keepFocus);
+      setSideSessionId(sessionId);
     },
-    [],
+    [splitOk, activeSessionId, tabs, sessions, openTab],
   );
+
+  // Drop side pane when the window is too narrow for split.
+  useEffect(() => {
+    if (!splitOk) setSideSessionId(null);
+  }, [splitOk]);
+
+  // ⌘\ / Ctrl+\ — open another open tab beside the focused session.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key !== "\\") return;
+      e.preventDefault();
+      if (!splitOk || !activeSessionId) return;
+      if (sideSessionId) {
+        setSideSessionId(null);
+        return;
+      }
+      const other = tabs.find((t) => t.id !== activeSessionId);
+      if (other) void openBeside(other.id);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [splitOk, activeSessionId, sideSessionId, tabs, openBeside]);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -552,10 +564,6 @@ export default function App() {
     );
   }, [tabs, activeSessionId, workspaceRestored]);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [transcript, activeSessionId]);
-
   const slashOpen = composer.startsWith("/") && !composer.includes(" ");
   const slashHits = useMemo(
     () =>
@@ -697,6 +705,15 @@ export default function App() {
               })();
             },
           },
+          {
+            type: "item",
+            id: "beside",
+            label: splitOk ? "Open beside" : "Open beside (need wider window)",
+            disabled: !splitOk,
+            onClick: () => {
+              void openBeside(sessionId);
+            },
+          },
           ...(isBuild
             ? ([
                 {
@@ -826,6 +843,8 @@ export default function App() {
       closeTab,
       patchTab,
       setWorkingDirectory,
+      splitOk,
+      openBeside,
     ],
   );
 
@@ -1058,33 +1077,42 @@ export default function App() {
             Chats
           </button>
         </div>
-        <button
-          type="button"
-          className="primary"
-          style={{ width: "100%", marginBottom: 6 }}
-          onClick={() => void createSession(workspaceMode)}
-        >
-          {workspaceMode === "chat" ? "New chat" : "New build"}
-        </button>
-        <button
-          type="button"
-          style={{ width: "100%", marginBottom: 4 }}
-          onClick={() => setSearchOpen(true)}
-        >
-          Search…
-        </button>
-        <button
-          type="button"
-          style={{ width: "100%", marginBottom: 8 }}
-          onClick={() => setSessionBrowserOpen(true)}
-        >
-          Browse all…
-        </button>
+        <div className="sidebar-actions">
+          <button
+            type="button"
+            className="primary sidebar-action-primary"
+            onClick={() => void createSession(workspaceMode)}
+          >
+            {workspaceMode === "chat" ? "New chat" : "New build"}
+          </button>
+          <div className="sidebar-action-row">
+            <button
+              type="button"
+              className="sidebar-action-ghost"
+              onClick={() => setSearchOpen(true)}
+              title="Search sessions"
+            >
+              Search
+            </button>
+            <button
+              type="button"
+              className="sidebar-action-ghost"
+              onClick={() => setSessionBrowserOpen(true)}
+              title="Browse all sessions"
+            >
+              Browse
+            </button>
+          </div>
+        </div>
         <p className="session-hint">
           {workspaceMode === "chat"
-            ? "Regular Grok conversations — separate from coding builds."
-            : "Coding-agent builds with tools. Switch to Chats for plain Grok."}
-          <span className="session-hint-ctx"> Right-click a session for actions.</span>
+            ? "Grok chats — separate from coding builds."
+            : "Coding builds with tools."}
+          <span className="session-hint-ctx">
+            {splitOk
+              ? " Right-click → Open beside · ⌘\\ toggles split."
+              : " Right-click a session for actions. Widen for side-by-side."}
+          </span>
         </p>
         <div className="session-list">
           {sessions.map((s) => {
@@ -1162,13 +1190,17 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="main">
+      <main
+        className={`main density-${layoutDensity} ${
+          splitOk && sideSessionId ? "is-split" : ""
+        }`}
+      >
         {tabs.length > 0 && (
           <div className="session-tabs" role="tablist" aria-label="Open sessions">
             {tabs.map((t) => (
               <div
                 key={t.id}
-                className={`session-tab ${t.id === activeSessionId ? "active" : ""} ${t.busy ? "busy" : ""} ${t.needsPermission ? "needs-permission" : ""} ${t.unseen ? "has-unseen" : ""}`}
+                className={`session-tab ${t.id === activeSessionId ? "active" : ""} ${t.id === sideSessionId ? "is-side" : ""} ${t.busy ? "busy" : ""} ${t.needsPermission ? "needs-permission" : ""} ${t.unseen ? "has-unseen" : ""}`}
                 role="tab"
                 aria-selected={t.id === activeSessionId}
                 onContextMenu={(e) => {
@@ -1215,6 +1247,27 @@ export default function App() {
             >
               +
             </button>
+            {splitOk && tabs.length >= 2 && (
+              <button
+                type="button"
+                className={`session-tab-split ${sideSessionId ? "on" : ""}`}
+                title={
+                  sideSessionId
+                    ? "Close side pane (⌘\\)"
+                    : "Open another tab beside (⌘\\)"
+                }
+                onClick={() => {
+                  if (sideSessionId) {
+                    setSideSessionId(null);
+                    return;
+                  }
+                  const other = tabs.find((t) => t.id !== activeSessionId);
+                  if (other) void openBeside(other.id);
+                }}
+              >
+                ⧉
+              </button>
+            )}
           </div>
         )}
         {activeIsBuild && activeSessionId && (
@@ -1237,107 +1290,91 @@ export default function App() {
             </button>
           </div>
         )}
-        <div className="transcript">
-          {transcript.length === 0 && (
-            <div className="empty-agent">
-              <h1>GrokPtah</h1>
-              <div className="version-line">
-                Grok Build as a desktop agent · bridge{" "}
-                {product.bridgeVersion}
+
+        <div
+          className={`pane-row ${
+            splitOk && sideSessionId ? "has-side" : "single"
+          }`}
+        >
+          {activeTab ? (
+            <SessionPane
+              tab={activeTab}
+              focused
+              kindLabel={
+                sessions.find((s) => s.id === activeTab.id)?.kind ??
+                workspaceMode
+              }
+              bridgeVersion={product.bridgeVersion}
+              emptyHint={
+                workspaceMode === "build"
+                  ? "Set a working directory, then send a prompt."
+                  : "Message Grok when this pane is focused."
+              }
+              onFocus={() => setActiveSessionId(activeTab.id)}
+            />
+          ) : (
+            <div className="transcript session-pane-transcript">
+              <div className="empty-agent">
+                <h1>GrokPtah</h1>
+                <div className="version-line">
+                  bridge {product.bridgeVersion}
+                </div>
+                <ul>
+                  <li>
+                    New build / chat from the sidebar, or open an existing
+                    session
+                  </li>
+                  <li>
+                    {splitOk
+                      ? "Wide layout: right-click → Open beside for split view"
+                      : "Widen the window (≥1440px) for side-by-side sessions"}
+                  </li>
+                </ul>
               </div>
-              <ul>
-                <li>
-                  Auth: reuses <code>~/.grok/auth.json</code> from{" "}
-                  <code>grok login</code> (or paste an API key)
-                </li>
-                <li>
-                  {workspaceMode === "build"
-                    ? "Set a working directory (cwd bar or right-click session), then type a prompt"
-                    : "Type a prompt below to start chatting"}
-                </li>
-                <li>
-                  Multi-session: open several tabs and run builds in
-                  parallel (like Claude Code)
-                </li>
-                <li>
-                  Slash: <code>/help</code> <code>/plan</code>{" "}
-                  <code>/yolo</code> · tools: <code>list files</code>,{" "}
-                  <code>run …</code>
-                </li>
-              </ul>
             </div>
           )}
-          {groupTranscript(transcript).map((row) => {
-            if (row.type === "debug") {
+          {splitOk &&
+            sideSessionId &&
+            (() => {
+              const sideTab = tabs.find((t) => t.id === sideSessionId);
+              if (!sideTab) return null;
               return (
-                <DebugTrace
-                  key={row.key}
-                  lines={row.lines}
-                  live={busy && row.live}
+                <SessionPane
+                  tab={sideTab}
+                  focused={false}
+                  kindLabel={
+                    sessions.find((s) => s.id === sideTab.id)?.kind ?? "build"
+                  }
+                  showClose
+                  onClosePane={() => setSideSessionId(null)}
+                  onFocus={() => {
+                    // Swap: side becomes primary, old primary becomes side
+                    const prev = activeSessionId;
+                    setActiveSessionId(sideTab.id);
+                    if (prev && prev !== sideTab.id) setSideSessionId(prev);
+                  }}
                 />
               );
-            }
-            const { item, index: i } = row;
-            return (
-              <div key={i} className={`bubble ${item.kind}`}>
-                {item.kind === "tool" && (
-                  <>
-                    <strong>
-                      {item.title} · {item.status}
-                    </strong>
-                    {item.output && (
-                      <details className="tool-output-details">
-                        <summary>Output</summary>
-                        <pre>{item.output}</pre>
-                      </details>
-                    )}
-                  </>
-                )}
-                {item.kind === "plan" && (
-                  <>
-                    <strong>Plan ({item.status})</strong>
-                    <ol>
-                      {item.steps.map((s, j) => (
-                        <li key={j}>{s}</li>
-                      ))}
-                    </ol>
-                    {activeSessionId && item.status === "proposed" && (
-                      <div className="modal-actions">
-                        <button
-                          type="button"
-                          className="primary"
-                          onClick={() => void api.acceptPlan(activeSessionId)}
-                        >
-                          Accept
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void api.rejectPlan(activeSessionId)}
-                        >
-                          Reject
-                        </button>
-                      </div>
-                    )}
-                  </>
-                )}
-                {(item.kind === "assistant" || item.kind === "thought") && (
-                  <StreamingText text={item.text} streaming={item.streaming} />
-                )}
-                {(item.kind === "user" || item.kind === "error") && item.text}
-              </div>
-            );
-          })}
-          <div ref={bottomRef} />
+            })()}
         </div>
+
+        {(layoutDensity === "wide" || layoutDensity === "ultrawide") &&
+          tabs.length > 0 && (
+            <FleetStrip
+              tabs={tabs}
+              activeSessionId={activeSessionId}
+              sideSessionId={sideSessionId}
+              canSplit={splitOk}
+              onFocus={(id) => setActiveSessionId(id)}
+              onOpenBeside={(id) => void openBeside(id)}
+            />
+          )}
 
         {showTerm && (
           <div className="terminal-slot">
             <TerminalPane toolShell={toolShell} />
           </div>
         )}
-
-        {/* Always-on strip: live server work vs idle/done */}
-        <ActivityIndicator activity={activity} busy={busy} />
 
         <div className="composer-wrap">
           {slashOpen && slashHits.length > 0 && (

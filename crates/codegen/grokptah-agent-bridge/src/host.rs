@@ -1481,9 +1481,9 @@ impl AgentHostHandle {
                     true,
                 )
             };
-            // Persist + return the reply. Do **not** also emit agent_message
-            // for the full body: the UI shows the invoke result, and stacked
-            // event listeners were concatenating the same string N times.
+            // One message event for live UI; invoke return is the finalize
+            // source of truth (SessionPane strips streamed assistants).
+            emit_message(&event_tx, session_id, &reply);
             push_assistant(self, session_id, &reply);
             return Ok(reply);
         }
@@ -1693,7 +1693,7 @@ impl AgentHostHandle {
                 true,
             )
         };
-        // Disk + invoke return only (same dual-path bug as chat).
+        emit_message(&event_tx, session_id, &reply);
         push_assistant(self, session_id, &reply);
         Ok(reply)
     }
