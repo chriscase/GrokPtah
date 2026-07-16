@@ -77,11 +77,19 @@ button:disabled {
   cursor: not-allowed;
 }
 
-/* Layout: agent workstation — fill viewport; only inner regions scroll */
+/* Layout: agent workstation — fill viewport; only inner regions scroll.
+ *
+ * Named areas pin sidebar / main / tools so collapsing a rail (display:none)
+ * does not re-auto-place the other columns into the wrong tracks.
+ */
 .app-shell {
   display: grid;
   grid-template-columns: minmax(180px, 220px) minmax(0, 1fr) minmax(200px, 280px);
   grid-template-rows: 40px minmax(0, 1fr) 24px;
+  grid-template-areas:
+    "title title title"
+    "side main tools"
+    "status status status";
   height: 100%;
   max-height: 100%;
   min-height: 0;
@@ -92,13 +100,24 @@ button:disabled {
   grid-template-columns: 0 minmax(0, 1fr) minmax(200px, 280px);
 }
 .app-shell.sidebar-collapsed .sidebar {
-  display: none;
+  /* Keep the grid area; hide content so main stays in the center track */
+  visibility: hidden;
+  pointer-events: none;
+  overflow: hidden;
+  padding: 0;
+  border: none;
+  min-width: 0;
 }
 .app-shell.rightbar-collapsed {
   grid-template-columns: minmax(180px, 220px) minmax(0, 1fr) 0;
 }
 .app-shell.rightbar-collapsed .rightbar {
-  display: none;
+  visibility: hidden;
+  pointer-events: none;
+  overflow: hidden;
+  padding: 0;
+  border: none;
+  min-width: 0;
 }
 .app-shell.sidebar-collapsed.rightbar-collapsed {
   grid-template-columns: 0 minmax(0, 1fr) 0;
@@ -258,8 +277,12 @@ button:disabled {
   .app-shell {
     grid-template-columns: minmax(150px, 180px) minmax(0, 1fr) 0;
   }
-  .rightbar {
-    display: none;
+  .app-shell .rightbar {
+    visibility: hidden;
+    pointer-events: none;
+    overflow: hidden;
+    padding: 0;
+    border: none;
   }
   .app-shell.sidebar-collapsed {
     grid-template-columns: 0 minmax(0, 1fr) 0;
@@ -267,7 +290,7 @@ button:disabled {
 }
 
 .titlebar {
-  grid-column: 1 / -1;
+  grid-area: title;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -321,16 +344,19 @@ button:disabled {
   overflow: hidden;
   padding: 0.55rem;
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
 }
 
 .sidebar {
+  grid-area: side;
   border-right: 1px solid var(--border-soft);
   overflow-y: auto;
 }
 
 .rightbar {
+  grid-area: tools;
   border-left: 1px solid var(--border-soft);
   overflow-y: auto;
 }
@@ -342,6 +368,7 @@ button:disabled {
  * so "Ready / No active turn" ballooned into the middle of the viewport.
  */
 .main {
+  grid-area: main;
   position: relative;
   display: flex;
   flex-direction: column;
@@ -2421,7 +2448,7 @@ button:disabled {
 }
 
 .status-bar {
-  grid-column: 1 / -1;
+  grid-area: status;
   display: flex;
   align-items: center;
   justify-content: space-between;
