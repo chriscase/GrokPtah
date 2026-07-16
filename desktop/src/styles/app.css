@@ -149,9 +149,181 @@ button:disabled {
 
 .main {
   display: grid;
-  grid-template-rows: 1fr auto auto;
+  grid-template-rows: auto 1fr auto auto;
   min-width: 0;
   background: var(--bg);
+}
+
+/* ── Multi-session tabs (Claude Code–style concurrent workspaces) ── */
+.session-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0.3rem 0.45rem 0;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-panel);
+  overflow-x: auto;
+  min-height: 34px;
+}
+
+.session-tab {
+  display: flex;
+  align-items: center;
+  max-width: 200px;
+  min-width: 72px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  padding: 0;
+  margin: 0;
+}
+
+.session-tab.active {
+  background: var(--bg);
+  border-color: var(--border-soft);
+  border-bottom-color: var(--bg);
+  margin-bottom: -1px;
+}
+
+.session-tab.busy .session-tab-label {
+  color: var(--accent);
+}
+
+.session-tab-label {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  padding: 0.4rem 0.35rem 0.4rem 0.55rem;
+  font-size: 12px;
+  text-align: left;
+}
+
+.session-tab-label:hover {
+  background: transparent;
+  border-color: transparent;
+}
+
+.session-tab-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tab-close {
+  background: transparent;
+  border: none;
+  padding: 0.2rem 0.45rem;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 4px;
+}
+
+.session-tab-close:hover {
+  color: var(--danger);
+  background: rgba(240, 113, 120, 0.12);
+  border-color: transparent;
+}
+
+.session-tab-new {
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 0.2rem 0.55rem;
+  margin: 0.2rem 0.2rem 0.2rem 0.15rem;
+  color: var(--muted);
+  font-size: 14px;
+  align-self: center;
+}
+
+.session-tab-new:hover {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+
+.busy-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: busy-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes busy-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.session-item.busy {
+  border-color: rgba(240, 180, 41, 0.35);
+}
+
+.session-item-title {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.session-hint {
+  margin: 0 0 0.5rem;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.muted-chip {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 0.15rem 0.45rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+}
+
+/* Gemini-style stream reveal */
+.stream-text {
+  display: inline;
+}
+
+.stream-token {
+  display: inline;
+}
+
+.stream-token-fresh {
+  animation: stream-fade-in 0.45s ease-out both;
+}
+
+@keyframes stream-fade-in {
+  from {
+    opacity: 0;
+    filter: blur(3px);
+    text-shadow: 0 0 8px rgba(232, 234, 237, 0.35);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0);
+    text-shadow: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stream-token-fresh {
+    animation: none;
+  }
+  .busy-dot {
+    animation: none;
+    opacity: 1;
+  }
 }
 
 .section-title {

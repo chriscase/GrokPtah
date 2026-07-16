@@ -9,24 +9,13 @@ import {
   type ModelInfo,
   type PermissionRequest,
   type SessionSummary,
+  type SessionTab,
   type SessionUpdate,
+  type TranscriptItem,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
+import { StreamingText } from "./components/StreamingText";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
-
-type TranscriptItem =
-  | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string }
-  | { kind: "thought"; text: string }
-  | {
-      kind: "tool";
-      callId: string;
-      title: string;
-      status: string;
-      output?: string;
-    }
-  | { kind: "plan"; steps: string[]; status: string }
-  | { kind: "error"; text: string };
 
 type RightTab =
   | "files"
@@ -38,19 +27,20 @@ type RightTab =
   | "tasks"
   | "rules";
 
+function emptyTab(id: string, title = "New session"): SessionTab {
+  return { id, title, transcript: [], busy: false, plan: null };
+}
+
 export default function App() {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [auth, setAuth] = useState<AuthState>({ signed_in: false });
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  /** Open concurrent workspaces (tabs). Multiple can be busy at once. */
+  const [tabs, setTabs] = useState<SessionTab[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [transcript, setTranscript] = useState<TranscriptItem[]>([]);
   const [composer, setComposer] = useState("");
-  const [busy, setBusy] = useState(false);
   const [permission, setPermission] = useState<PermissionRequest | null>(null);
-  const [plan, setPlan] = useState<{ steps: string[]; status: string } | null>(
-    null,
-  );
   const [rightTab, setRightTab] = useState<RightTab>("files");
   const [files, setFiles] = useState<string[]>([]);
   const [fuzzy, setFuzzy] = useState("");
@@ -77,6 +67,78 @@ export default function App() {
   const [apiKeyInput, setApiKeyInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  const activeTab = useMemo(
+    () => tabs.find((t) => t.id === activeSessionId) ?? null,
+    [tabs, activeSessionId],
+  );
+  const transcript = activeTab?.transcript ?? [];
+  const busy = activeTab?.busy ?? false;
+  const plan = activeTab?.plan ?? null;
+  const anyBusy = tabs.some((t) => t.busy);
+
+  const patchTab = useCallback(
+    (id: string, patch: (tab: SessionTab) => SessionTab) => {
+      setTabs((prev) =>
+        prev.map((t) => (t.id === id ? patch(t) : t)),
+      );
+    },
+    [],
+  );
+
+  const openTab = useCallback(
+    async (summary: SessionSummary, hydrate = true) => {
+      setActiveSessionId(summary.id);
+      setTabs((prev) => {
+        if (prev.some((t) => t.id === summary.id)) {
+          return prev.map((t) =>
+            t.id === summary.id ? { ...t, title: summary.title } : t,
+          );
+        }
+        return [
+          ...prev,
+          emptyTab(summary.id, summary.title || "New session"),
+        ];
+      });
+      if (!hydrate) return;
+      try {
+        const entries = await api.sessionTranscript(summary.id);
+        setTabs((prev) =>
+          prev.map((t) => {
+            if (t.id !== summary.id) return t;
+            // Keep live stream if this tab already has more than disk.
+            if (t.transcript.length > entries.length) return t;
+            return {
+              ...t,
+              title: summary.title,
+              transcript: entries.map((e) =>
+                e.role === "user"
+                  ? ({ kind: "user" as const, text: e.text })
+                  : ({ kind: "assistant" as const, text: e.text }),
+              ),
+            };
+          }),
+        );
+      } catch {
+        /* offline / empty */
+      }
+    },
+    [],
+  );
+
+  const closeTab = useCallback(
+    (id: string) => {
+      setTabs((prev) => {
+        const next = prev.filter((t) => t.id !== id);
+        setActiveSessionId((cur) => {
+          if (cur !== id) return cur;
+          return next[next.length - 1]?.id ?? null;
+        });
+        return next;
+      });
+    },
+    [],
+  );
+
   const refreshChrome = useCallback(async () => {
     try {
       const [st, au, md, sess, info] = await Promise.all([
@@ -91,6 +153,13 @@ export default function App() {
       setModels(md);
       setSessions(sess);
       setProduct(info);
+      // Keep tab titles in sync with session list
+      setTabs((prev) =>
+        prev.map((t) => {
+          const s = sess.find((x) => x.id === t.id);
+          return s ? { ...t, title: s.title } : t;
+        }),
+      );
     } catch (e) {
       console.warn("refresh failed (browser-only?)", e);
     }
@@ -107,7 +176,7 @@ export default function App() {
         setShowTerm(true);
         setToolShell({ callId: u.call_id, command: u.command });
       }
-      applyUpdate(u, setTranscript, setPermission, setPlan, setBusy);
+      applyUpdate(u, setTabs, setPermission);
     }).then((fn) => {
       unlisten = fn;
     });
@@ -116,7 +185,7 @@ export default function App() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [transcript]);
+  }, [transcript, activeSessionId]);
 
   const slashOpen = composer.startsWith("/") && !composer.includes(" ");
   const slashHits = useMemo(
@@ -128,9 +197,9 @@ export default function App() {
   );
 
   async function ensureSession(): Promise<string> {
-    if (sessionId) return sessionId;
+    if (activeSessionId) return activeSessionId;
     const s = await api.sessionNew();
-    setSessionId(s.id);
+    await openTab(s, false);
     setSessions(await api.sessionList());
     return s.id;
   }
@@ -151,47 +220,104 @@ export default function App() {
     const prompt = (text ?? composer).trim();
     if (!prompt) return;
     setComposer("");
-    setTranscript((t) => [...t, { kind: "user", text: prompt }]);
-    setBusy(true);
+    let id: string;
     try {
-      const id = await ensureSession();
+      id = await ensureSession();
+    } catch (e) {
+      console.warn(e);
+      return;
+    }
+    patchTab(id, (t) => ({
+      ...t,
+      busy: true,
+      title:
+        t.title === "New session"
+          ? prompt.slice(0, 48)
+          : t.title,
+      transcript: [...t.transcript, { kind: "user", text: prompt }],
+    }));
+    try {
       if (prompt === "/compact") {
         await api.sessionCompact(id);
-        setTranscript((t) => [
+        patchTab(id, (t) => ({
           ...t,
-          { kind: "assistant", text: "Conversation compacted." },
-        ]);
+          busy: false,
+          transcript: [
+            ...t.transcript,
+            { kind: "assistant", text: "Conversation compacted." },
+          ],
+        }));
         return;
       }
       const reply = await api.sessionPrompt(id, prompt);
       // Always surface the final reply (events may have streamed already).
       if (reply?.trim()) {
-        setTranscript((t) => {
-          const last = t[t.length - 1];
-          if (last?.kind === "assistant" && last.text.includes(reply.slice(0, 40))) {
-            return t;
+        patchTab(id, (t) => {
+          const last = t.transcript[t.transcript.length - 1];
+          if (
+            last?.kind === "assistant" &&
+            last.text.includes(reply.slice(0, 40))
+          ) {
+            return {
+              ...t,
+              busy: false,
+              transcript: t.transcript.map((item, i) =>
+                i === t.transcript.length - 1 && item.kind === "assistant"
+                  ? { ...item, streaming: false }
+                  : item,
+              ),
+            };
           }
-          // If streaming already built the same text, skip duplicate.
-          const already = t.some(
+          const already = t.transcript.some(
             (item) =>
               item.kind === "assistant" &&
-              (item.text === reply || reply.startsWith(item.text.slice(0, 80))),
+              (item.text === reply ||
+                reply.startsWith(item.text.slice(0, 80))),
           );
-          if (already) return t;
-          return [...t, { kind: "assistant", text: reply }];
+          if (already) {
+            return {
+              ...t,
+              busy: false,
+              transcript: t.transcript.map((item) =>
+                item.kind === "assistant" || item.kind === "thought"
+                  ? { ...item, streaming: false }
+                  : item,
+              ),
+            };
+          }
+          return {
+            ...t,
+            busy: false,
+            transcript: [
+              ...t.transcript,
+              { kind: "assistant", text: reply },
+            ],
+          };
         });
+      } else {
+        patchTab(id, (t) => ({
+          ...t,
+          busy: false,
+          transcript: t.transcript.map((item) =>
+            item.kind === "assistant" || item.kind === "thought"
+              ? { ...item, streaming: false }
+              : item,
+          ),
+        }));
       }
       setSessions(await api.sessionList());
       setSubagents(await api.subagentsList());
       setBgTasks(await api.backgroundTasks());
       await refreshChrome();
     } catch (e) {
-      setTranscript((t) => [
+      patchTab(id, (t) => ({
         ...t,
-        { kind: "error", text: String(e) },
-      ]);
-    } finally {
-      setBusy(false);
+        busy: false,
+        transcript: [
+          ...t.transcript,
+          { kind: "error", text: String(e) },
+        ],
+      }));
     }
   }
 
@@ -324,38 +450,55 @@ export default function App() {
           style={{ width: "100%", marginBottom: 8 }}
           onClick={async () => {
             const s = await api.sessionNew();
-            setSessionId(s.id);
-            setTranscript([]);
-            setPlan(null);
+            await openTab(s, false);
             setSessions(await api.sessionList());
           }}
         >
           New session
         </button>
-        {sessions.map((s) => (
-          <button
-            key={s.id}
-            type="button"
-            className={`session-item ${s.id === sessionId ? "active" : ""}`}
-            onClick={async () => {
-              await api.sessionLoad(s.id);
-              setSessionId(s.id);
-            }}
-          >
-            <div>{s.title}</div>
-            <div style={{ color: "var(--muted)", fontSize: 11 }}>
-              {s.message_count} msgs
-            </div>
-          </button>
-        ))}
+        <p className="session-hint">
+          Open several tabs and run builds in parallel — switch anytime.
+        </p>
+        {sessions.map((s) => {
+          const open = tabs.some((t) => t.id === s.id);
+          const running = tabs.find((t) => t.id === s.id)?.busy;
+          return (
+            <button
+              key={s.id}
+              type="button"
+              className={`session-item ${s.id === activeSessionId ? "active" : ""} ${running ? "busy" : ""}`}
+              onClick={async () => {
+                await api.sessionLoad(s.id);
+                await openTab(s, !open);
+              }}
+            >
+              <div className="session-item-title">
+                {running && <span className="busy-dot" title="Running" />}
+                {s.title}
+              </div>
+              <div style={{ color: "var(--muted)", fontSize: 11 }}>
+                {s.message_count} msgs{open ? " · open" : ""}
+              </div>
+            </button>
+          );
+        })}
         <div className="section-title">Session actions</div>
         <button
           type="button"
-          disabled={!sessionId}
+          disabled={!activeSessionId}
           onClick={async () => {
-            if (!sessionId) return;
-            const f = await api.sessionFork(sessionId);
-            setSessionId(f.id);
+            if (!activeSessionId) return;
+            const f = await api.sessionFork(activeSessionId);
+            await openTab(f, false);
+            // Copy transcript into forked tab from source if still open
+            const src = tabs.find((t) => t.id === activeSessionId);
+            if (src) {
+              patchTab(f.id, (t) => ({
+                ...t,
+                transcript: [...src.transcript],
+                title: f.title,
+              }));
+            }
             setSessions(await api.sessionList());
           }}
         >
@@ -363,21 +506,32 @@ export default function App() {
         </button>
         <button
           type="button"
-          disabled={!sessionId}
+          disabled={!activeSessionId}
           onClick={async () => {
-            if (!sessionId) return;
-            await api.sessionRewind(sessionId, 1);
+            if (!activeSessionId) return;
+            await api.sessionRewind(activeSessionId, 1);
             setSessions(await api.sessionList());
+            await openTab(
+              sessions.find((s) => s.id === activeSessionId) ?? {
+                id: activeSessionId,
+                title: activeTab?.title ?? "Session",
+                cwd: "",
+                created_at: "",
+                updated_at: "",
+                message_count: 0,
+              },
+              true,
+            );
           }}
         >
           Rewind
         </button>
         <button
           type="button"
-          disabled={!sessionId}
+          disabled={!activeSessionId}
           onClick={async () => {
-            if (!sessionId) return;
-            await api.sessionCompact(sessionId);
+            if (!activeSessionId) return;
+            await api.sessionCompact(activeSessionId);
           }}
         >
           Compact
@@ -388,6 +542,51 @@ export default function App() {
       </aside>
 
       <main className="main">
+        {tabs.length > 0 && (
+          <div className="session-tabs" role="tablist" aria-label="Open sessions">
+            {tabs.map((t) => (
+              <div
+                key={t.id}
+                className={`session-tab ${t.id === activeSessionId ? "active" : ""} ${t.busy ? "busy" : ""}`}
+                role="tab"
+                aria-selected={t.id === activeSessionId}
+              >
+                <button
+                  type="button"
+                  className="session-tab-label"
+                  onClick={() => setActiveSessionId(t.id)}
+                  title={t.title}
+                >
+                  {t.busy && <span className="busy-dot" />}
+                  <span className="session-tab-text">{t.title}</span>
+                </button>
+                <button
+                  type="button"
+                  className="session-tab-close"
+                  aria-label={`Close ${t.title}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    closeTab(t.id);
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              className="session-tab-new"
+              title="New session tab"
+              onClick={async () => {
+                const s = await api.sessionNew();
+                await openTab(s, false);
+                setSessions(await api.sessionList());
+              }}
+            >
+              +
+            </button>
+          </div>
+        )}
         <div className="transcript">
           {transcript.length === 0 && (
             <div className="empty-agent">
@@ -405,13 +604,13 @@ export default function App() {
                   Open a project folder, then type a prompt below
                 </li>
                 <li>
+                  Multi-session: open several tabs and run builds in
+                  parallel (like Claude Code)
+                </li>
+                <li>
                   Slash: <code>/help</code> <code>/plan</code>{" "}
                   <code>/yolo</code> · tools: <code>list files</code>,{" "}
                   <code>run …</code>
-                </li>
-                <li>
-                  Console TUI:{" "}
-                  <code>cargo run -p xai-grok-pager-bin</code>
                 </li>
               </ul>
             </div>
@@ -434,18 +633,18 @@ export default function App() {
                       <li key={j}>{s}</li>
                     ))}
                   </ol>
-                  {sessionId && item.status === "proposed" && (
+                  {activeSessionId && item.status === "proposed" && (
                     <div className="modal-actions">
                       <button
                         type="button"
                         className="primary"
-                        onClick={() => void api.acceptPlan(sessionId)}
+                        onClick={() => void api.acceptPlan(activeSessionId)}
                       >
                         Accept
                       </button>
                       <button
                         type="button"
-                        onClick={() => void api.rejectPlan(sessionId)}
+                        onClick={() => void api.rejectPlan(activeSessionId)}
                       >
                         Reject
                       </button>
@@ -453,7 +652,10 @@ export default function App() {
                   )}
                 </>
               )}
-              {item.kind !== "tool" && item.kind !== "plan" && item.text}
+              {(item.kind === "assistant" || item.kind === "thought") && (
+                <StreamingText text={item.text} streaming={item.streaming} />
+              )}
+              {(item.kind === "user" || item.kind === "error") && item.text}
             </div>
           ))}
           <div ref={bottomRef} />
@@ -522,21 +724,33 @@ export default function App() {
               <button
                 type="button"
                 className="danger"
-                onClick={() => void api.sessionCancel()}
+                onClick={() =>
+                  void api.sessionCancel(activeSessionId)
+                }
               >
                 Stop
               </button>
+            )}
+            {anyBusy && !busy && (
+              <span className="muted-chip" title="Other session tabs are still running">
+                {tabs.filter((t) => t.busy).length} other tab
+                {tabs.filter((t) => t.busy).length === 1 ? "" : "s"} running
+              </span>
             )}
           </div>
           <div className="composer-row">
             <textarea
               value={composer}
-              placeholder="Message GrokPtah… (Enter send, Shift+Enter newline)"
+              placeholder={
+                busy
+                  ? "This session is running… switch tabs to start another"
+                  : "Message GrokPtah… (Enter send, Shift+Enter newline)"
+              }
               onChange={(e) => setComposer(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
-                  void sendPrompt();
+                  if (!busy) void sendPrompt();
                 }
               }}
             />
@@ -926,77 +1140,159 @@ export default function App() {
   );
 }
 
+function sessionIdOf(u: SessionUpdate): string | null {
+  if ("session_id" in u && typeof u.session_id === "string") {
+    return u.session_id;
+  }
+  return null;
+}
+
+function ensureTab(tabs: SessionTab[], id: string): SessionTab[] {
+  if (tabs.some((t) => t.id === id)) return tabs;
+  return [...tabs, emptyTab(id)];
+}
+
+function mapTranscript(
+  tab: SessionTab,
+  map: (items: TranscriptItem[]) => TranscriptItem[],
+  extra?: Partial<SessionTab>,
+): SessionTab {
+  return { ...tab, ...extra, transcript: map(tab.transcript) };
+}
+
 function applyUpdate(
   u: SessionUpdate,
-  setTranscript: React.Dispatch<React.SetStateAction<TranscriptItem[]>>,
+  setTabs: React.Dispatch<React.SetStateAction<SessionTab[]>>,
   setPermission: React.Dispatch<React.SetStateAction<PermissionRequest | null>>,
-  setPlan: React.Dispatch<
-    React.SetStateAction<{ steps: string[]; status: string } | null>
-  >,
-  setBusy: React.Dispatch<React.SetStateAction<boolean>>,
 ) {
+  const sid = sessionIdOf(u);
+  if (!sid && u.type !== "permission_required") return;
+
+  const withTab = (
+    id: string,
+    fn: (tab: SessionTab) => SessionTab,
+  ) => {
+    setTabs((prev) => {
+      const base = ensureTab(prev, id);
+      return base.map((t) => (t.id === id ? fn(t) : t));
+    });
+  };
+
   switch (u.type) {
     case "agent_message_chunk":
-      setTranscript((t) => {
-        const last = t[t.length - 1];
-        if (last?.kind === "assistant") {
-          const copy = t.slice(0, -1);
-          copy.push({ kind: "assistant", text: last.text + u.text });
-          return copy;
-        }
-        return [...t, { kind: "assistant", text: u.text }];
-      });
+      withTab(sid!, (tab) =>
+        mapTranscript(
+          tab,
+          (t) => {
+            const last = t[t.length - 1];
+            if (last?.kind === "assistant") {
+              const copy = t.slice(0, -1);
+              copy.push({
+                kind: "assistant",
+                text: last.text + u.text,
+                streaming: true,
+              });
+              return copy;
+            }
+            return [
+              ...t,
+              { kind: "assistant", text: u.text, streaming: true },
+            ];
+          },
+          { busy: true },
+        ),
+      );
       break;
     case "agent_thought_chunk":
-      setTranscript((t) => {
-        const last = t[t.length - 1];
-        if (last?.kind === "thought") {
-          const copy = t.slice(0, -1);
-          copy.push({ kind: "thought", text: last.text + u.text });
-          return copy;
-        }
-        return [...t, { kind: "thought", text: u.text }];
-      });
+      withTab(sid!, (tab) =>
+        mapTranscript(
+          tab,
+          (t) => {
+            const last = t[t.length - 1];
+            if (last?.kind === "thought") {
+              const copy = t.slice(0, -1);
+              copy.push({
+                kind: "thought",
+                text: last.text + u.text,
+                streaming: true,
+              });
+              return copy;
+            }
+            return [
+              ...t,
+              { kind: "thought", text: u.text, streaming: true },
+            ];
+          },
+          { busy: true },
+        ),
+      );
       break;
     case "tool_call":
-      setTranscript((t) => [
-        ...t,
-        {
-          kind: "tool",
-          callId: u.call_id,
-          title: u.title,
-          status: u.status,
-        },
-      ]);
+      withTab(sid!, (tab) =>
+        mapTranscript(
+          tab,
+          (t) => [
+            ...t,
+            {
+              kind: "tool",
+              callId: u.call_id,
+              title: u.title,
+              status: u.status,
+            },
+          ],
+          { busy: true },
+        ),
+      );
       break;
     case "tool_call_update":
-      setTranscript((t) =>
-        t.map((item) =>
-          item.kind === "tool" && item.callId === u.call_id
-            ? {
-                ...item,
-                status: u.status,
-                output: u.output ?? item.output,
-              }
-            : item,
+      withTab(sid!, (tab) =>
+        mapTranscript(tab, (t) =>
+          t.map((item) =>
+            item.kind === "tool" && item.callId === u.call_id
+              ? {
+                  ...item,
+                  status: u.status,
+                  output: u.output ?? item.output,
+                }
+              : item,
+          ),
         ),
       );
       break;
     case "plan":
-      setPlan({ steps: u.steps, status: u.status });
-      setTranscript((t) => [
-        ...t,
-        { kind: "plan", steps: u.steps, status: u.status },
-      ]);
+      withTab(sid!, (tab) =>
+        mapTranscript(
+          tab,
+          (t) => [
+            ...t,
+            { kind: "plan", steps: u.steps, status: u.status },
+          ],
+          { plan: { steps: u.steps, status: u.status } },
+        ),
+      );
       break;
     case "permission_required":
       setPermission(u.request);
       break;
     case "turn_complete":
-      setBusy(false);
+      withTab(sid!, (tab) => ({
+        ...tab,
+        busy: false,
+        transcript: tab.transcript.map((item) =>
+          item.kind === "assistant" || item.kind === "thought"
+            ? { ...item, streaming: false }
+            : item,
+        ),
+      }));
       break;
     case "error":
-      setTranscript((t) => [...t, { kind: "error", text: u.message }]);
+      withTab(sid!, (tab) =>
+        mapTranscript(
+          tab,
+          (t) => [...t, { kind: "error", text: u.message }],
+          { busy: false },
+        ),
+      );
       break;
     default:
       break;

@@ -242,7 +242,7 @@ async fn cancel_kills_real_shell_child_not_only_sleep_stub() {
         }
     }
 
-    host.cancel_turn().expect("cancel");
+    host.cancel_turn(None).expect("cancel");
     let _ = prompt.await;
 
     let mut cancelled = false;

@@ -1,7 +1,7 @@
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo,
-    PermissionDecision, PluginInfo, SessionSummary, SkillInfo, SubagentInfo, BRIDGE_VERSION,
-    PRODUCT_NAME,
+    PermissionDecision, PluginInfo, SessionSummary, SkillInfo, SubagentInfo, TranscriptEntry,
+    BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -81,8 +81,24 @@ pub async fn session_prompt(
 }
 
 #[tauri::command]
-pub fn session_cancel(state: State<'_, AppState>) -> Result<(), String> {
-    state.host.cancel_turn().map_err(map_err)
+pub fn session_cancel(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let id = match session_id {
+        Some(s) if !s.is_empty() => Some(Uuid::parse_str(&s).map_err(map_err)?),
+        _ => None,
+    };
+    state.host.cancel_turn(id).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_transcript(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<TranscriptEntry>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state.host.session_transcript(id).map_err(map_err)
 }
 
 #[tauri::command]

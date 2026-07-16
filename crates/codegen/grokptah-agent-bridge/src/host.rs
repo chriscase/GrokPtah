@@ -77,7 +77,9 @@ struct Inner {
     subagents: Vec<SubagentInfo>,
     background_tasks: Vec<BackgroundTask>,
     pending_permissions: HashMap<Uuid, PendingPermission>,
-    turn_cancel: Option<CancellationToken>,
+    /// Per-session turn cancellation so multiple sessions can run concurrently
+    /// (Claude Code–style parallel build sessions).
+    turn_cancels: HashMap<Uuid, CancellationToken>,
     event_tx: mpsc::UnboundedSender<SessionUpdate>,
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
@@ -126,7 +128,7 @@ impl AgentHost {
             subagents: Vec::new(),
             background_tasks: Vec::new(),
             pending_permissions: HashMap::new(),
-            turn_cancel: None,
+            turn_cancels: HashMap::new(),
             event_tx,
             edited_files: Vec::new(),
             live_shell: Arc::new(tokio::sync::Mutex::new(None)),
@@ -165,7 +167,7 @@ impl AgentHostHandle {
 
     pub fn stop(&self) -> Result<()> {
         let mut g = self.inner.lock();
-        if let Some(c) = g.turn_cancel.take() {
+        for (_, c) in g.turn_cancels.drain() {
             c.cancel();
         }
         g.running = false;
@@ -213,6 +215,21 @@ impl AgentHostHandle {
         let summary = s.summary();
         g.active_session = Some(id);
         Ok(summary)
+    }
+
+    /// Full transcript for hydrating a session tab without replaying events.
+    pub fn session_transcript(&self, id: Uuid) -> Result<Vec<TranscriptEntry>> {
+        let g = self.inner.lock();
+        let s = g
+            .sessions
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        Ok(s.transcript.clone())
+    }
+
+    /// Whether a session currently has an in-flight turn.
+    pub fn session_busy(&self, id: Uuid) -> bool {
+        self.inner.lock().turn_cancels.contains_key(&id)
     }
 
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
@@ -738,13 +755,26 @@ impl AgentHostHandle {
         Ok(())
     }
 
-    pub fn cancel_turn(&self) -> Result<()> {
+    /// Cancel the in-flight turn for `session_id`, or every active turn when
+    /// `session_id` is `None` (shutdown / global stop).
+    pub fn cancel_turn(&self, session_id: Option<Uuid>) -> Result<()> {
         let live_shell = {
             let g = self.inner.lock();
-            if let Some(c) = &g.turn_cancel {
-                c.cancel();
-            } else {
-                bail!("no active turn");
+            match session_id {
+                Some(id) => {
+                    let Some(c) = g.turn_cancels.get(&id) else {
+                        bail!("no active turn for session {id}");
+                    };
+                    c.cancel();
+                }
+                None => {
+                    if g.turn_cancels.is_empty() {
+                        bail!("no active turn");
+                    }
+                    for c in g.turn_cancels.values() {
+                        c.cancel();
+                    }
+                }
             }
             g.live_shell.clone()
         };
@@ -771,17 +801,25 @@ impl AgentHostHandle {
 
     /// Run a turn. Returns the final assistant text so the UI always has a
     /// reply even if event delivery is delayed.
+    ///
+    /// Multiple sessions may run turns concurrently; each keeps its own
+    /// cancellation token keyed by `session_id`.
     pub async fn session_prompt(&self, session_id: Uuid, prompt: String) -> Result<String> {
         let (cwd, model, effort, plan_mode, cancel, event_tx) = {
             let mut g = self.inner.lock();
             if !g.running {
                 bail!("agent not started");
             }
+            // One in-flight turn per session (re-prompt while busy is an error).
+            if g.turn_cancels.contains_key(&session_id) {
+                bail!("session already has an active turn");
+            }
             // Keep session model in sync with host selection
             let model = g.model.clone();
             let effort = g.effort;
             let cancel = CancellationToken::new();
-            g.turn_cancel = Some(cancel.clone());
+            g.turn_cancels.insert(session_id, cancel.clone());
+            g.active_session = Some(session_id);
             let event_tx = g.event_tx.clone();
             let s = g
                 .sessions
@@ -822,7 +860,7 @@ impl AgentHostHandle {
 
         {
             let mut g = self.inner.lock();
-            g.turn_cancel = None;
+            g.turn_cancels.remove(&session_id);
         }
 
         let cancelled = cancel.is_cancelled();

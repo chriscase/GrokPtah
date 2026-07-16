@@ -15,7 +15,7 @@ mod types;
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig};
 pub use permission::{PermissionDecision, PermissionRequest};
-pub use session::SessionSummary;
+pub use session::{SessionSummary, TranscriptEntry};
 pub use types::{
     AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo, PluginInfo, SkillInfo,
     SubagentInfo,

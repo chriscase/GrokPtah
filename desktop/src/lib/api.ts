@@ -17,7 +17,15 @@ export const api = {
   sessionList: () => invoke<SessionSummary[]>("session_list"),
   sessionPrompt: (sessionId: string, prompt: string) =>
     invoke<string>("session_prompt", { sessionId, prompt }),
-  sessionCancel: () => invoke<void>("session_cancel"),
+  /** Cancel one session's turn, or all active turns when sessionId omitted. */
+  sessionCancel: (sessionId?: string | null) =>
+    invoke<void>("session_cancel", {
+      sessionId: sessionId ?? null,
+    }),
+  sessionTranscript: (sessionId: string) =>
+    invoke<{ role: string; text: string }[]>("session_transcript", {
+      sessionId,
+    }),
   sessionFork: (sourceId: string) =>
     invoke<SessionSummary>("session_fork", { sourceId }),
   sessionRewind: (sessionId: string, keepMessages: number) =>

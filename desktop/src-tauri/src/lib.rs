@@ -44,6 +44,7 @@ pub fn run() {
             commands::session_list,
             commands::session_prompt,
             commands::session_cancel,
+            commands::session_transcript,
             commands::session_fork,
             commands::session_rewind,
             commands::session_compact,

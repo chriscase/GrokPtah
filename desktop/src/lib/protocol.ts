@@ -99,6 +99,29 @@ export interface SessionSummary {
   forked_from?: string | null;
 }
 
+/** Client-side open workspace (Claude Code–style concurrent session tab). */
+export interface SessionTab {
+  id: string;
+  title: string;
+  transcript: TranscriptItem[];
+  busy: boolean;
+  plan: { steps: string[]; status: string } | null;
+}
+
+export type TranscriptItem =
+  | { kind: "user"; text: string }
+  | { kind: "assistant"; text: string; streaming?: boolean }
+  | { kind: "thought"; text: string; streaming?: boolean }
+  | {
+      kind: "tool";
+      callId: string;
+      title: string;
+      status: string;
+      output?: string;
+    }
+  | { kind: "plan"; steps: string[]; status: string }
+  | { kind: "error"; text: string };
+
 export interface ModelInfo {
   id: string;
   display_name: string;
