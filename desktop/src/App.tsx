@@ -193,6 +193,8 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [composer, setComposer] = useState("");
+  /** Taller composer for detailed prompts (power users). */
+  const [composerExpanded, setComposerExpanded] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
   const [permission, setPermission] = useState<PermissionRequest | null>(null);
   const [rightTab, setRightTab] = useState<RightTab>("files");
@@ -215,7 +217,10 @@ export default function App() {
     bridgeVersion: "?",
     autoUpdateEnabled: false,
   });
+  /** Terminal panel expanded (collapsed strip by default — space efficient). */
   const [showTerm, setShowTerm] = useState(false);
+  /** Thin bar when a tool shell is live but panel is collapsed. */
+  const [termPeek, setTermPeek] = useState(false);
   const [toolShell, setToolShell] = useState<ToolShellAttach | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -470,8 +475,13 @@ export default function App() {
   useEffect(() => {
     return subscribeSessionUpdates((u) => {
       if (u.type === "shell_session_started") {
-        setShowTerm(true);
+        // Attach tool shell but keep the panel collapsed unless already open.
         setToolShell({ callId: u.call_id, command: u.command });
+        setTermPeek(true);
+      }
+      if (u.type === "shell_session_ended") {
+        // Keep peek until user dismisses or opens term
+        setTermPeek(true);
       }
       if (u.type === "file_edit") {
         // Live agent diffs in the git pane (no manual refresh).
@@ -1386,8 +1396,61 @@ export default function App() {
             />
           )}
 
+        {/* Tool shell: compact peek by default; expand only when user wants it */}
+        {!showTerm && (termPeek || toolShell) && (
+          <div className="terminal-peek">
+            <button
+              type="button"
+              className="terminal-peek-main"
+              title="Expand tool shell"
+              onClick={() => {
+                setShowTerm(true);
+                setTermPeek(false);
+              }}
+            >
+              <span className="terminal-peek-label">Shell</span>
+              <span className="terminal-peek-cmd">
+                {toolShell?.command
+                  ? toolShell.command.length > 72
+                    ? `${toolShell.command.slice(0, 72)}…`
+                    : toolShell.command
+                  : "Agent terminal available"}
+              </span>
+              <span className="terminal-peek-action">Expand</span>
+            </button>
+            <button
+              type="button"
+              className="terminal-peek-dismiss"
+              title="Dismiss shell bar"
+              onClick={() => {
+                setTermPeek(false);
+                setToolShell(null);
+              }}
+            >
+              ×
+            </button>
+          </div>
+        )}
         {showTerm && (
-          <div className="terminal-slot">
+          <div className="terminal-slot is-expanded">
+            <div className="terminal-slot-bar">
+              <span className="terminal-slot-title">
+                {toolShell?.command
+                  ? `Tool shell · ${toolShell.command.slice(0, 48)}${toolShell.command.length > 48 ? "…" : ""}`
+                  : "Terminal"}
+              </span>
+              <button
+                type="button"
+                className="terminal-slot-collapse"
+                title="Collapse terminal"
+                onClick={() => {
+                  setShowTerm(false);
+                  setTermPeek(Boolean(toolShell));
+                }}
+              >
+                Collapse
+              </button>
+            </div>
             <TerminalPane toolShell={toolShell} />
           </div>
         )}
@@ -1408,17 +1471,19 @@ export default function App() {
               ))}
             </div>
           )}
-          <div className={`composer-shell ${busy ? "is-busy" : ""}`}>
+          <div
+            className={`composer-shell ${busy ? "is-busy" : ""} ${composerExpanded ? "is-expanded" : ""}`}
+          >
             <textarea
               className="composer-input"
               value={composer}
-              rows={2}
+              rows={composerExpanded ? 10 : 2}
               placeholder={
                 busy
                   ? "This session is running… switch tabs to start another"
                   : workspaceMode === "chat"
-                    ? "Message Grok…"
-                    : "Message the coding agent…"
+                    ? "Message Grok… (Shift+Enter for newline)"
+                    : "Message the coding agent… (Shift+Enter for newline)"
               }
               onChange={(e) => setComposer(e.target.value)}
               onKeyDown={(e) => {
@@ -1502,10 +1567,33 @@ export default function App() {
                 <button
                   type="button"
                   className={`composer-chip ${showTerm ? "on" : ""}`}
-                  title={showTerm ? "Hide terminal" : "Show terminal"}
-                  onClick={() => setShowTerm((v) => !v)}
+                  title={
+                    showTerm
+                      ? "Collapse terminal"
+                      : "Show terminal (collapsed by default during tool shells)"
+                  }
+                  onClick={() => {
+                    setShowTerm((v) => {
+                      const next = !v;
+                      if (next) setTermPeek(false);
+                      else if (toolShell) setTermPeek(true);
+                      return next;
+                    });
+                  }}
                 >
                   Term
+                </button>
+                <button
+                  type="button"
+                  className={`composer-chip ${composerExpanded ? "on" : ""}`}
+                  title={
+                    composerExpanded
+                      ? "Compact composer"
+                      : "Expand composer for longer prompts"
+                  }
+                  onClick={() => setComposerExpanded((v) => !v)}
+                >
+                  {composerExpanded ? "Compact" : "Expand"}
                 </button>
                 {anyBusy && !busy && (
                   <span
@@ -1531,7 +1619,11 @@ export default function App() {
                   type="button"
                   className="composer-send"
                   disabled={busy || !composer.trim()}
-                  title={busy ? "Session busy" : "Send (Enter)"}
+                  title={
+                    busy
+                      ? "Session busy"
+                      : "Send (Enter) · newline with Shift+Enter"
+                  }
                   onClick={() => void sendPrompt()}
                 >
                   <svg

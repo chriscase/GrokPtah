@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type { SessionTab, TranscriptItem } from "../lib/protocol";
 import {
   expandDebugLines,
@@ -6,13 +6,26 @@ import {
 } from "../lib/debugTrace";
 import { ActivityIndicator } from "./ActivityIndicator";
 import { DebugTrace } from "./DebugTrace";
+import { MarkdownBody } from "./MarkdownBody";
 import { StreamingText } from "./StreamingText";
+import { ToolCallCard, ToolHistoryGroup } from "./ToolCallCard";
 import { api } from "../lib/api";
+
+type ToolItem = Extract<TranscriptItem, { kind: "tool" }>;
 
 type RenderRow =
   | { type: "item"; item: TranscriptItem; index: number }
-  | { type: "debug"; key: string; lines: string[]; live: boolean };
+  | { type: "debug"; key: string; lines: string[]; live: boolean }
+  | {
+      type: "tool_batch";
+      key: string;
+      tools: { item: ToolItem; index: number }[];
+    };
 
+/**
+ * Group consecutive tool calls into batches so older ones collapse together,
+ * and fold host debug thoughts into chips.
+ */
 function groupTranscript(items: TranscriptItem[]): RenderRow[] {
   const out: RenderRow[] = [];
   let i = 0;
@@ -32,6 +45,22 @@ function groupTranscript(items: TranscriptItem[]): RenderRow[] {
         i += 1;
       }
       out.push({ type: "debug", key: `dbg-${start}`, lines, live });
+      continue;
+    }
+    if (item.kind === "tool") {
+      const tools: { item: ToolItem; index: number }[] = [];
+      while (i < items.length && items[i].kind === "tool") {
+        tools.push({
+          item: items[i] as ToolItem,
+          index: i,
+        });
+        i += 1;
+      }
+      out.push({
+        type: "tool_batch",
+        key: `tools-${tools[0]?.index ?? 0}`,
+        tools,
+      });
       continue;
     }
     out.push({ type: "item", item, index: i });
@@ -69,6 +98,7 @@ export function SessionPane({
   const bottomRef = useRef<HTMLDivElement>(null);
   const busy = tab.busy;
   const transcript = tab.transcript;
+  const rows = useMemo(() => groupTranscript(transcript), [transcript]);
 
   useEffect(() => {
     if (focused) {
@@ -129,7 +159,7 @@ export function SessionPane({
             </p>
           </div>
         )}
-        {groupTranscript(transcript).map((row) => {
+        {rows.map((row) => {
           if (row.type === "debug") {
             return (
               <DebugTrace
@@ -139,22 +169,17 @@ export function SessionPane({
               />
             );
           }
+          if (row.type === "tool_batch") {
+            return (
+              <div key={row.key} className="tool-batch">
+                <ToolHistoryGroup tools={row.tools} keepRecent={4} />
+              </div>
+            );
+          }
           const { item, index: i } = row;
           return (
             <div key={i} className={`bubble ${item.kind}`}>
-              {item.kind === "tool" && (
-                <>
-                  <strong>
-                    {item.title} · {item.status}
-                  </strong>
-                  {item.output && (
-                    <details className="tool-output-details">
-                      <summary>Output</summary>
-                      <pre>{item.output}</pre>
-                    </details>
-                  )}
-                </>
-              )}
+              {item.kind === "tool" && <ToolCallCard item={item} />}
               {item.kind === "plan" && (
                 <>
                   <strong>Plan ({item.status})</strong>
@@ -169,7 +194,6 @@ export function SessionPane({
                         type="button"
                         className="primary"
                         onClick={() => {
-                          // Accept starts plan→execute turn (streams via session events).
                           void api.acceptPlan(tab.id).catch((e) => {
                             console.warn("acceptPlan failed", e);
                           });
@@ -187,10 +211,21 @@ export function SessionPane({
                   )}
                 </>
               )}
-              {(item.kind === "assistant" || item.kind === "thought") && (
+              {item.kind === "assistant" &&
+                (item.streaming ? (
+                  <StreamingText text={item.text} streaming />
+                ) : (
+                  <MarkdownBody text={item.text} />
+                ))}
+              {item.kind === "thought" && (
                 <StreamingText text={item.text} streaming={item.streaming} />
               )}
-              {(item.kind === "user" || item.kind === "error") && item.text}
+              {item.kind === "user" && (
+                <div className="user-text">{item.text}</div>
+              )}
+              {item.kind === "error" && (
+                <div className="error-text">{item.text}</div>
+              )}
             </div>
           );
         })}
