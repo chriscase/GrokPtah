@@ -6,7 +6,7 @@ type Props = {
   title?: string;
 };
 
-/** GrokPtah product mark — never reuse NexaDeck or other product art. */
+/** GrokPtah mark (coding-agent glyph). */
 export function BrandMark({ size = 22, className, title = "GrokPtah" }: Props) {
   return (
     <img
