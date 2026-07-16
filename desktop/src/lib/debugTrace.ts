@@ -23,6 +23,7 @@ export function isDebugLine(line: string): boolean {
   if (/^tool `[a-z0-9_./-]+`/.test(l)) return true;
   if (l.includes("tools on") && l.includes("rounds")) return true;
   if (l.includes("sandbox=") && l.includes("effort=")) return true;
+  if (l.includes("offline agent")) return true;
   // Single-line host crumbs that are not natural-language reasoning
   if (/^[a-z_]+=\S+/.test(l) && l.length < 200) return true;
   return false;

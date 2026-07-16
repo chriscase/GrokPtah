@@ -90,7 +90,7 @@ async fn start_stop_and_status() {
 }
 
 #[tokio::test]
-async fn session_lifecycle_prompt_streams_message_and_thought() {
+async fn session_lifecycle_prompt_streams_message() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.txt"), "hello grokptah").unwrap();
@@ -107,11 +107,12 @@ async fn session_lifecycle_prompt_streams_message_and_thought() {
 
     let events = drain_until_turn_complete(&mut rx).await;
 
+    // Host no longer dumps kind=/round status as thought chunks in the stream.
     assert!(
-        events
+        !events
             .iter()
             .any(|e| matches!(e, SessionUpdate::AgentThoughtChunk { .. })),
-        "expected thought chunks, got {events:?}"
+        "status crumbs must not appear as thoughts, got {events:?}"
     );
     assert!(
         events

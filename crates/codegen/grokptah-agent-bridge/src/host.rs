@@ -1627,7 +1627,6 @@ impl AgentHostHandle {
                 .await;
         }
         let msg = format!("(offline agent) done: {}", prompt.chars().take(80).collect::<String>());
-        emit_thought(event_tx, session_id, "offline agent path");
         emit_message(event_tx, session_id, &msg);
         push_assistant(self, session_id, &msg);
         Ok(msg)
