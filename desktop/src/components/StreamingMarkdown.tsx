@@ -1,14 +1,15 @@
 import { MarkdownBody } from "./MarkdownBody";
 import { StreamingText } from "./StreamingText";
 import { splitStreamingMarkdown } from "../lib/streamMarkdown";
+import { useMaterializingText } from "../lib/useMaterializingText";
 
 /**
- * Progressive markdown while the model streams:
- * - **stable** prefix → full GFM render (headings, lists, tables, fences…)
- * - **tail** → Gemini-style beam-in tokens until that chunk stabilizes
+ * Progressive markdown + Gemini-style materialization.
  *
- * When `streaming` is false, renders the finished document as pure markdown
- * (with a brief settle class for polish).
+ * 1. Large SSE chunks are **paced word-by-word** (`useMaterializingText`)
+ * 2. Older content → full GFM (`stable`)
+ * 3. Live tip (~100–280 chars) → beamed word spans (`tail`)
+ * 4. On finish → full markdown with settle flash
  */
 export function StreamingMarkdown({
   text,
@@ -17,9 +18,12 @@ export function StreamingMarkdown({
   text: string;
   streaming?: boolean;
 }) {
+  const live = !!streaming;
+  const { visible, pending } = useMaterializingText(text, live);
+
   if (!text) return null;
 
-  if (!streaming) {
+  if (!live) {
     return (
       <div className="stream-md stream-md-settled">
         <MarkdownBody text={text} />
@@ -27,10 +31,13 @@ export function StreamingMarkdown({
     );
   }
 
-  const { stable, tail } = splitStreamingMarkdown(text);
+  const { stable, tail } = splitStreamingMarkdown(visible);
+  const catchingUp = pending > 0;
 
   return (
-    <div className="stream-md is-streaming">
+    <div
+      className={`stream-md is-streaming ${catchingUp ? "is-catching-up" : ""}`}
+    >
       {stable ? (
         <div className="stream-md-stable">
           <MarkdownBody text={stable} />
@@ -41,11 +48,9 @@ export function StreamingMarkdown({
           <StreamingText text={tail} streaming />
         </div>
       ) : (
-        streaming && (
-          <span className="stream-text is-streaming">
-            <span className="stream-caret" aria-hidden />
-          </span>
-        )
+        <span className="stream-text is-streaming">
+          <span className="stream-caret" aria-hidden />
+        </span>
       )}
     </div>
   );

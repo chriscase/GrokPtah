@@ -88,9 +88,48 @@ button:disabled {
   overflow: hidden;
 }
 
+.app-shell.sidebar-collapsed {
+  grid-template-columns: 0 minmax(0, 1fr) minmax(200px, 280px);
+}
+.app-shell.sidebar-collapsed .sidebar {
+  display: none;
+}
+.app-shell.rightbar-collapsed {
+  grid-template-columns: minmax(180px, 220px) minmax(0, 1fr) 0;
+}
+.app-shell.rightbar-collapsed .rightbar {
+  display: none;
+}
+.app-shell.sidebar-collapsed.rightbar-collapsed {
+  grid-template-columns: 0 minmax(0, 1fr) 0;
+}
+
+.chrome-toggle {
+  font-size: 11px;
+  padding: 0.2rem 0.45rem;
+  color: var(--muted);
+  border-style: dashed;
+}
+
+.chrome-toggle:hover {
+  color: var(--text);
+}
+
+.chrome-toggle.is-on {
+  color: var(--accent);
+  border-color: rgba(240, 180, 41, 0.4);
+  border-style: solid;
+}
+
 @media (max-width: 1100px) {
   .app-shell {
     grid-template-columns: minmax(160px, 200px) minmax(0, 1fr) minmax(180px, 240px);
+  }
+  .app-shell.sidebar-collapsed {
+    grid-template-columns: 0 minmax(0, 1fr) minmax(180px, 240px);
+  }
+  .app-shell.rightbar-collapsed {
+    grid-template-columns: minmax(160px, 200px) minmax(0, 1fr) 0;
   }
 }
 
@@ -100,6 +139,9 @@ button:disabled {
   }
   .rightbar {
     display: none;
+  }
+  .app-shell.sidebar-collapsed {
+    grid-template-columns: 0 minmax(0, 1fr) 0;
   }
 }
 
@@ -3139,21 +3181,42 @@ button:disabled {
   border-color: var(--border);
 }
 
-/* ── Split session panes (Phase 14) ── */
+/* ── Multi-zone docks (Phase 14.1) ── */
 .main > .pane-row {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
+  flex-direction: row;
   gap: 0;
   overflow: hidden;
 }
 
-.pane-row.single {
-  flex-direction: column;
+.pane-row.has-zones .dock-slot {
+  border-right: 1px solid var(--border-soft);
+  /* Equal share of stage — uses full ultrawide width */
+  flex: 1 1 0;
+  min-width: 0;
+}
+.pane-row.has-zones .dock-slot:last-child {
+  border-right: none;
 }
 
-.pane-row.has-side {
-  flex-direction: row;
+.dock-slot {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 0;
+  background: var(--bg);
+}
+
+.dock-slot.is-focused-dock {
+  background: linear-gradient(
+    180deg,
+    rgba(240, 180, 41, 0.06),
+    transparent 48px
+  );
+  box-shadow: inset 0 2px 0 0 rgba(240, 180, 41, 0.55);
 }
 
 .session-pane {
@@ -3161,25 +3224,84 @@ button:disabled {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  flex: 1 1 50%;
-  background: var(--bg);
+  flex: 1 1 auto;
+  background: transparent;
   border: 1px solid transparent;
 }
 
-.pane-row.has-side .session-pane {
-  border-right: 1px solid var(--border-soft);
+.session-pane-zone {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.15rem;
+  height: 1.15rem;
+  padding: 0 0.2rem;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-soft);
+  flex-shrink: 0;
 }
 
-.pane-row.has-side .session-pane:last-child {
-  border-right: none;
+.session-pane-zone.is-focused {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: transparent;
 }
 
-.session-pane.is-focused {
-  background: linear-gradient(
-    180deg,
-    rgba(240, 180, 41, 0.04),
-    transparent 48px
-  );
+/* Compact chrome when many zones share the stage */
+.pane-row.zones-4 .session-pane-header,
+.pane-row.zones-5 .session-pane-header,
+.pane-row.zones-6 .session-pane-header {
+  padding: 0.2rem 0.35rem;
+  min-height: 26px;
+}
+
+.pane-row.zones-5 .kind-chip,
+.pane-row.zones-6 .kind-chip {
+  display: none;
+}
+
+.pane-row.zones-4 .session-pane-name,
+.pane-row.zones-5 .session-pane-name,
+.pane-row.zones-6 .session-pane-name {
+  font-size: 11px;
+}
+
+.composer-target {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.85rem 0;
+  font-size: 11.5px;
+  color: var(--muted);
+  min-width: 0;
+}
+
+.composer-target-label {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.composer-target-title {
+  color: var(--text);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.composer-target-zone {
+  margin-left: auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.75;
+  flex-shrink: 0;
 }
 
 .session-pane-header {
@@ -3265,7 +3387,8 @@ button:disabled {
   line-height: 1.45;
 }
 
-.session-tab.is-side {
+.session-tab.is-side,
+.session-tab.is-docked {
   border-color: rgba(240, 180, 41, 0.35);
 }
 
@@ -3293,110 +3416,232 @@ button:disabled {
   cursor: not-allowed;
 }
 
-/* ── Fleet strip ── */
+/* ── Live attention rail — full-width session switcher ── */
 .fleet-strip {
   display: flex;
   align-items: stretch;
-  gap: 0.45rem;
-  padding: 0.3rem 0.55rem;
+  gap: 0.5rem;
+  padding: 0.35rem 0.65rem;
   border-top: 1px solid var(--border-soft);
-  background: rgba(0, 0, 0, 0.22);
+  background: linear-gradient(
+    180deg,
+    rgba(0, 0, 0, 0.28),
+    rgba(0, 0, 0, 0.18)
+  );
   flex: 0 0 auto;
   min-height: 0;
   overflow: hidden;
 }
 
+.fleet-strip-hide {
+  flex-shrink: 0;
+  width: 28px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.fleet-strip-hide:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+
 .fleet-strip-label {
   align-self: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1rem;
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.1em;
   color: var(--muted);
   flex-shrink: 0;
-  padding: 0 0.2rem;
+  padding: 0 0.25rem;
+  min-width: 2.4rem;
 }
 
+.fleet-strip-count {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  color: var(--text);
+  text-transform: none;
+}
+
+/* Cards grow to fill unused horizontal space */
 .fleet-cards {
   display: flex;
-  gap: 0.3rem;
+  gap: 0.35rem;
   overflow-x: auto;
   min-width: 0;
-  flex: 1;
+  flex: 1 1 auto;
   padding-bottom: 1px;
+  scrollbar-width: thin;
 }
 
 .fleet-card {
+  position: relative;
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: 0.1rem;
-  min-width: 7.5rem;
-  max-width: 11rem;
-  padding: 0.3rem 0.45rem;
+  align-items: stretch;
+  gap: 0.15rem;
+  /* Grow equally across the rail — use the ultrawide */
+  flex: 1 1 0;
+  min-width: 7rem;
+  max-width: none;
+  padding: 0.35rem 0.55rem 0.35rem 0.65rem;
   border-radius: 8px;
   border: 1px solid var(--border-soft);
   background: var(--bg-elevated);
   text-align: left;
-  flex-shrink: 0;
+  cursor: pointer;
+  transition:
+    border-color 0.12s ease,
+    background 0.12s ease,
+    transform 0.08s ease;
 }
 
 .fleet-card:hover {
   border-color: var(--border);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.fleet-card:active {
+  transform: scale(0.985);
 }
 
 .fleet-card.primary {
-  border-color: rgba(240, 180, 41, 0.45);
+  border-color: rgba(240, 180, 41, 0.5);
   background: var(--accent-bg);
 }
 
-.fleet-card.side {
-  border-style: dashed;
-  border-color: rgba(240, 180, 41, 0.35);
+.fleet-card.in-zone:not(.primary) {
+  border-color: rgba(240, 180, 41, 0.28);
 }
 
-.fleet-card.busy .fleet-card-status {
+/* Left status rail for instant scan */
+.fleet-card-rail {
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+  background: transparent;
+}
+
+.fleet-card.status-busy .fleet-card-rail {
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(240, 180, 41, 0.45);
+}
+
+.fleet-card.status-permission .fleet-card-rail {
+  background: #c084fc;
+  box-shadow: 0 0 8px rgba(192, 132, 252, 0.5);
+}
+
+.fleet-card.status-unseen .fleet-card-rail {
+  background: #60a5fa;
+}
+
+.fleet-card.status-busy .fleet-card-status {
   color: var(--accent);
 }
 
-.fleet-card.permission {
-  border-color: rgba(192, 132, 252, 0.55);
+.fleet-card.status-permission {
+  border-color: rgba(192, 132, 252, 0.45);
 }
 
-.fleet-card.permission .fleet-card-status {
+.fleet-card.status-permission .fleet-card-status {
   color: #c084fc;
+}
+
+.fleet-card-top {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 0;
+  width: 100%;
 }
 
 .fleet-card-status {
   font-size: 10px;
   line-height: 1;
   color: var(--muted);
+  flex-shrink: 0;
+  width: 0.7rem;
+  text-align: center;
 }
 
 .fleet-card-title {
-  font-size: 11.5px;
-  font-weight: 500;
+  font-size: 12px;
+  font-weight: 560;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  width: 100%;
+  min-width: 0;
+  flex: 1 1 auto;
+  color: var(--text);
+}
+
+.fleet-card-zone {
+  flex-shrink: 0;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+  color: var(--accent);
+  background: rgba(240, 180, 41, 0.12);
+  border: 1px solid rgba(240, 180, 41, 0.28);
+}
+
+.fleet-card-zone.is-ghost {
+  color: var(--muted);
+  background: transparent;
+  border-color: transparent;
+  opacity: 0.45;
 }
 
 .fleet-card-phase {
-  font-size: 10px;
+  font-size: 10.5px;
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   width: 100%;
+  padding-left: 1rem;
 }
 
-.main.density-ultrawide .app-shell,
-.main.density-wide {
-  /* density class is on main; shell columns stay; extra space is for panes */
+.fleet-card.status-busy .fleet-card-phase {
+  color: rgba(240, 180, 41, 0.9);
 }
 
-/* Fleet strip only on wide+; match SPLIT_MIN_WIDTH (1180) in layout.ts */
-@media (max-width: 1179px) {
+.fleet-card.status-permission .fleet-card-phase {
+  color: #d8b4fe;
+  font-weight: 560;
+}
+
+/* Wide stage: taller touch targets, more readable phase line */
+.main.density-wide .fleet-card,
+.main.density-ultrawide .fleet-card {
+  min-width: 9rem;
+  padding: 0.4rem 0.65rem 0.4rem 0.75rem;
+}
+
+.main.density-ultrawide .fleet-card-title {
+  font-size: 12.5px;
+}
+
+.main.density-ultrawide .fleet-card-phase {
+  font-size: 11px;
+}
+
+/* Live stays available; hide only on very narrow windows */
+@media (max-width: 700px) {
   .fleet-strip {
     display: none;
   }

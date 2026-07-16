@@ -3,49 +3,85 @@ import type { SessionTab } from "../lib/protocol";
 export type FleetStripProps = {
   tabs: SessionTab[];
   activeSessionId: string | null;
-  sideSessionId: string | null;
+  /** Session ids currently docked as stage columns */
+  zoneIds: string[];
+  canSplit: boolean;
   onFocus: (id: string) => void;
   onOpenBeside: (id: string) => void;
-  canSplit: boolean;
+  onHide?: () => void;
 };
 
+function phaseLabel(t: SessionTab): string {
+  if (t.needsPermission) return "needs you";
+  if (t.busy) {
+    const bits = [
+      t.agentRound != null ? `r${t.agentRound}` : null,
+      t.lastTool || t.activity.detail || t.activity.label || "working",
+    ].filter(Boolean);
+    return bits.join(" · ");
+  }
+  if (t.unseen) return "unseen";
+  return "idle";
+}
+
 /**
- * Ultrawide glance rail: live / attention sessions at a glance.
+ * Live attention rail — full-width switcher for open sessions.
+ * Cards grow to fill horizontal space on ultrawide; click focuses,
+ * Alt-click / double-click docks into a zone.
  */
 export function FleetStrip({
   tabs,
   activeSessionId,
-  sideSessionId,
+  zoneIds,
+  canSplit,
   onFocus,
   onOpenBeside,
-  canSplit,
+  onHide,
 }: FleetStripProps) {
   if (tabs.length === 0) return null;
 
   const ranked = [...tabs].sort((a, b) => {
+    // Focused first for stable “where am I”, then attention score
+    if (a.id === activeSessionId) return -1;
+    if (b.id === activeSessionId) return 1;
     const score = (t: SessionTab) =>
       (t.needsPermission ? 100 : 0) +
       (t.busy ? 50 : 0) +
-      (t.unseen ? 20 : 0);
+      (t.unseen ? 20 : 0) +
+      (zoneIds.includes(t.id) ? 5 : 0);
     return score(b) - score(a);
   });
 
   return (
-    <div className="fleet-strip" role="region" aria-label="Session fleet">
-      <div className="fleet-strip-label">Fleet</div>
-      <div className="fleet-cards">
+    <div className="fleet-strip" role="region" aria-label="Live sessions">
+      <div
+        className="fleet-strip-label"
+        title="Open sessions — click to focus, Alt-click to dock"
+      >
+        Live
+        <span className="fleet-strip-count">{tabs.length}</span>
+      </div>
+      <div className="fleet-cards" style={{ ["--fleet-n" as string]: ranked.length }}>
         {ranked.map((t) => {
           const isPrimary = t.id === activeSessionId;
-          const isSide = t.id === sideSessionId;
+          const zoneIndex = zoneIds.indexOf(t.id);
+          const inZone = zoneIndex >= 0;
+          const status = t.needsPermission
+            ? "permission"
+            : t.busy
+              ? "busy"
+              : t.unseen
+                ? "unseen"
+                : "idle";
           return (
             <button
               key={t.id}
               type="button"
-              className={`fleet-card ${t.busy ? "busy" : ""} ${t.needsPermission ? "permission" : ""} ${isPrimary ? "primary" : ""} ${isSide ? "side" : ""}`}
+              className={`fleet-card status-${status} ${isPrimary ? "primary" : ""} ${inZone ? "in-zone" : ""}`}
               title={
                 canSplit
-                  ? `${t.title}\nClick: focus · Alt-click: open beside`
-                  : t.title
+                  ? `${t.title}\nClick: focus · Alt-click / double-click: dock beside`
+                  : `${t.title}\nClick: focus`
               }
               onClick={(e) => {
                 if (e.altKey && canSplit) {
@@ -54,38 +90,48 @@ export function FleetStrip({
                   onFocus(t.id);
                 }
               }}
-              onDoubleClick={() => {
+              onDoubleClick={(e) => {
+                e.preventDefault();
                 if (canSplit) onOpenBeside(t.id);
               }}
             >
-              <span className="fleet-card-status">
-                {t.needsPermission
-                  ? "!"
-                  : t.busy
-                    ? "●"
-                    : t.unseen
-                      ? "○"
-                      : "·"}
+              <span className="fleet-card-rail" aria-hidden />
+              <span className="fleet-card-top">
+                <span className="fleet-card-status" aria-hidden>
+                  {t.needsPermission
+                    ? "!"
+                    : t.busy
+                      ? "●"
+                      : t.unseen
+                        ? "○"
+                        : "·"}
+                </span>
+                <span className="fleet-card-title">{t.title}</span>
+                {inZone ? (
+                  <span className="fleet-card-zone" title={`Zone ${zoneIndex + 1}`}>
+                    Z{zoneIndex + 1}
+                  </span>
+                ) : canSplit ? (
+                  <span className="fleet-card-zone is-ghost" title="Not docked">
+                    —
+                  </span>
+                ) : null}
               </span>
-              <span className="fleet-card-title">{t.title}</span>
-              <span className="fleet-card-phase">
-                {t.needsPermission
-                  ? "needs you"
-                  : t.busy
-                    ? [
-                        t.agentRound != null ? `r${t.agentRound}` : null,
-                        t.lastTool || t.activity.detail || t.activity.label,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")
-                    : t.unseen
-                      ? "unseen"
-                      : "idle"}
-              </span>
+              <span className="fleet-card-phase">{phaseLabel(t)}</span>
             </button>
           );
         })}
       </div>
+      {onHide && (
+        <button
+          type="button"
+          className="fleet-strip-hide"
+          title="Hide Live rail (⌘⇧L)"
+          onClick={onHide}
+        >
+          ×
+        </button>
+      )}
     </div>
   );
 }

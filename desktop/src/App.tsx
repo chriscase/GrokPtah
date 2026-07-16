@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./lib/api";
 import {
   normalizeSessionUpdate,
@@ -24,9 +24,10 @@ import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import {
-  canSplitSessions,
+  clampDocks,
   SPLIT_MIN_WIDTH,
   useLayoutDensity,
+  useMaxDocks,
 } from "./lib/layout";
 import {
   collapseRepeatedText,
@@ -239,11 +240,42 @@ export default function App() {
   const [workspaceRestored, setWorkspaceRestored] = useState(false);
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
-  /** Secondary session column on wide layouts (Phase 14 split view). */
-  const [sideSessionId, setSideSessionId] = useState<string | null>(null);
+  /**
+   * Ordered dock slots (session ids visible as columns). Phase 14.1 multi-zone.
+   * Empty or single-element = classic single-pane; up to maxDocks columns.
+   */
+  const [docks, setDocks] = useState<string[]>([]);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [rightbarCollapsed, setRightbarCollapsed] = useState(false);
+  const [liveHidden, setLiveHidden] = useState(false);
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const layoutDensity = useLayoutDensity();
-  const splitOk = canSplitSessions(layoutDensity);
+  const maxDocks = useMaxDocks(stageRef, layoutDensity);
+  const splitOk = maxDocks >= 2;
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
+
+  // Keep docks valid: unique, open tabs only, within capacity, include focus
+  useEffect(() => {
+    setDocks((prev) => {
+      const open = new Set(tabs.map((t) => t.id));
+      let next = prev.filter((id) => open.has(id));
+      if (activeSessionId && open.has(activeSessionId) && !next.includes(activeSessionId)) {
+        next = [activeSessionId, ...next];
+      }
+      if (next.length === 0 && activeSessionId && open.has(activeSessionId)) {
+        next = [activeSessionId];
+      }
+      next = clampDocks(next, Math.max(1, maxDocks), activeSessionId);
+      // Avoid useless re-renders
+      if (
+        next.length === prev.length &&
+        next.every((id, i) => id === prev[i])
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, [tabs, activeSessionId, maxDocks]);
 
   // Keep event router aware of focus for unseen badges.
   activeSessionIdForEvents = activeSessionId;
@@ -321,7 +353,7 @@ export default function App() {
   );
 
   const closeTab = useCallback((id: string) => {
-    setSideSessionId((side) => (side === id ? null : side));
+    setDocks((d) => d.filter((x) => x !== id));
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id);
       setActiveSessionId((cur) => {
@@ -329,6 +361,13 @@ export default function App() {
         return next[next.length - 1]?.id ?? null;
       });
       return next;
+    });
+  }, []);
+
+  const undockSession = useCallback((id: string) => {
+    setDocks((d) => {
+      if (d.length <= 1) return d;
+      return d.filter((x) => x !== id);
     });
   }, []);
 
@@ -625,48 +664,90 @@ export default function App() {
   );
 
   /**
-   * Open a session in the side pane (Phase 14 split).
-   * - `sessionId` omitted / same as primary → use another open tab, or create one
-   * - Requires wide layout (`splitOk`); no-op when too narrow
+   * Dock a session into the next free column (or create one).
+   * When already at capacity with multiple docks, peels the rightmost
+   * unfocused dock (toggle-down). When at max with one request to grow,
+   * replaces the rightmost unfocused dock.
    */
   const openBeside = useCallback(
     async (sessionId?: string) => {
-      if (!splitOk) return;
+      if (maxDocks < 2) return;
       const primary = activeSessionId;
 
-      // Toggle / pick another open tab when no specific target
-      if (!sessionId || sessionId === primary) {
-        const other = tabs.find((t) => t.id !== primary);
-        if (other) {
-          setSideSessionId(other.id);
-          return;
-        }
-        // Only one tab (or none): create a fresh session for the side pane
-        const s = await createSession(workspaceMode);
-        if (!s) return;
-        if (primary) setActiveSessionId(primary);
-        setSideSessionId(s.id);
+      // Toggle peel: multi-dock + no specific target → remove rightmost unfocused
+      if (!sessionId && docks.length > 1) {
+        setDocks((d) => {
+          if (d.length <= 1) return d;
+          const peel =
+            [...d].reverse().find((id) => id !== primary) ?? d[d.length - 1];
+          return d.filter((id) => id !== peel);
+        });
         return;
       }
 
-      let summary = sessions.find((s) => s.id === sessionId);
-      if (!summary) {
-        try {
-          summary = await api.sessionLoad(sessionId);
-        } catch {
-          return;
+      let targetId = sessionId;
+      if (!targetId || targetId === primary) {
+        const other = tabs.find(
+          (t) => t.id !== primary && !docks.includes(t.id),
+        );
+        if (other) {
+          targetId = other.id;
+        } else if (!targetId || targetId === primary) {
+          const undocked = tabs.find((t) => t.id !== primary);
+          if (undocked && !docks.includes(undocked.id)) {
+            targetId = undocked.id;
+          } else {
+            const s = await createSession(workspaceMode);
+            if (!s) return;
+            if (primary) setActiveSessionId(primary);
+            targetId = s.id;
+          }
         }
       }
-      const keepFocus = primary;
-      const already = tabs.some((t) => t.id === sessionId);
-      await openTab(summary, !already);
-      // openTab focuses the opened session — restore primary focus.
-      if (keepFocus) setActiveSessionId(keepFocus);
-      setSideSessionId(sessionId);
+
+      if (!targetId) return;
+
+      // Ensure tab open
+      if (!tabs.some((t) => t.id === targetId)) {
+        let summary = sessions.find((s) => s.id === targetId);
+        if (!summary) {
+          try {
+            summary = await api.sessionLoad(targetId);
+          } catch {
+            return;
+          }
+        }
+        const keepFocus = primary;
+        await openTab(summary, true);
+        if (keepFocus) setActiveSessionId(keepFocus);
+      }
+
+      setDocks((d) => {
+        let next = d.filter((id) => id !== targetId);
+        if (primary && !next.includes(primary)) {
+          next = [primary, ...next];
+        }
+        if (next.includes(targetId!)) return clampDocks(next, maxDocks, primary);
+        if (next.length < maxDocks) {
+          next = [...next, targetId!];
+        } else {
+          // Replace rightmost unfocused
+          const replaceAt = (() => {
+            for (let i = next.length - 1; i >= 0; i--) {
+              if (next[i] !== primary) return i;
+            }
+            return next.length - 1;
+          })();
+          next = next.slice();
+          next[replaceAt] = targetId!;
+        }
+        return clampDocks(next, maxDocks, primary);
+      });
     },
     [
-      splitOk,
+      maxDocks,
       activeSessionId,
+      docks,
       tabs,
       sessions,
       openTab,
@@ -675,26 +756,65 @@ export default function App() {
     ],
   );
 
-  // Drop side pane when the window is too narrow for split.
-  useEffect(() => {
-    if (!splitOk) setSideSessionId(null);
-  }, [splitOk]);
-
-  // ⌘\ / Ctrl+\ — toggle side pane (creates a second session if needed).
+  // Keyboard: multi-zone + chrome
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey) || e.key !== "\\") return;
-      e.preventDefault();
-      if (!splitOk) return;
-      if (sideSessionId) {
-        setSideSessionId(null);
+      const meta = e.metaKey || e.ctrlKey;
+      if (!meta) return;
+
+      // ⌘B left chrome, ⌘⌥B right chrome, ⌘⇧L Live
+      if (e.key === "b" || e.key === "B") {
+        if (e.altKey) {
+          e.preventDefault();
+          setRightbarCollapsed((v) => !v);
+          return;
+        }
+        if (!e.shiftKey) {
+          e.preventDefault();
+          setSidebarCollapsed((v) => !v);
+          return;
+        }
+      }
+      if (e.shiftKey && (e.key === "l" || e.key === "L")) {
+        e.preventDefault();
+        setLiveHidden((v) => !v);
         return;
       }
-      void openBeside();
+
+      // ⌘1–⌘6 focus dock by zone index
+      if (e.key >= "1" && e.key <= "6" && !e.altKey && !e.shiftKey) {
+        const idx = Number(e.key) - 1;
+        if (docks[idx]) {
+          e.preventDefault();
+          setActiveSessionId(docks[idx]);
+        }
+        return;
+      }
+
+      // ⌘⌥← / ⌘⌥→ cycle docks
+      if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        if (docks.length < 2 || !activeSessionId) return;
+        e.preventDefault();
+        const i = docks.indexOf(activeSessionId);
+        if (i < 0) return;
+        const next =
+          e.key === "ArrowLeft"
+            ? docks[(i - 1 + docks.length) % docks.length]
+            : docks[(i + 1) % docks.length];
+        setActiveSessionId(next);
+        return;
+      }
+
+      // ⌘\ toggle multi-dock
+      if (e.key === "\\") {
+        e.preventDefault();
+        if (maxDocks < 2) return;
+        void openBeside();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [splitOk, sideSessionId, openBeside]);
+  }, [docks, activeSessionId, maxDocks, openBeside]);
 
   async function ensureSession(): Promise<string> {
     // Prefer the active tab only when its kind matches Builds/Chats mode.
@@ -1037,7 +1157,9 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div
+      className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${rightbarCollapsed ? "rightbar-collapsed" : ""}`}
+    >
       <header className="titlebar">
         <div className="brand">
           <BrandMark size={20} className="brand-mark-img" />
@@ -1052,6 +1174,42 @@ export default function App() {
               ? shortPath(status.project_cwd, 36)
               : "no project open"}
           </span>
+          <button
+            type="button"
+            className="chrome-toggle"
+            title={
+              sidebarCollapsed
+                ? "Show sessions sidebar (⌘B)"
+                : "Hide sessions sidebar (⌘B)"
+            }
+            onClick={() => setSidebarCollapsed((v) => !v)}
+          >
+            {sidebarCollapsed ? "Sessions" : "◂ Sessions"}
+          </button>
+          <button
+            type="button"
+            className="chrome-toggle"
+            title={
+              rightbarCollapsed
+                ? "Show tools panel (⌘⌥B)"
+                : "Hide tools panel (⌘⌥B)"
+            }
+            onClick={() => setRightbarCollapsed((v) => !v)}
+          >
+            {rightbarCollapsed ? "Tools" : "Tools ▸"}
+          </button>
+          <button
+            type="button"
+            className={`chrome-toggle ${liveHidden ? "" : "is-on"}`}
+            title={
+              liveHidden
+                ? "Show Live session rail (⌘⇧L)"
+                : "Hide Live session rail (⌘⇧L)"
+            }
+            onClick={() => setLiveHidden((v) => !v)}
+          >
+            Live
+          </button>
           <button type="button" onClick={() => void openProject()}>
             Open folder
           </button>
@@ -1173,9 +1331,7 @@ export default function App() {
             ? "Grok chats — separate from coding builds."
             : "Coding builds with tools."}
           <span className="session-hint-ctx">
-            {splitOk
-              ? " Split: ⧉ in the tab bar, right-click → Open beside, or ⌘\\."
-              : ` Split needs window ≥${SPLIT_MIN_WIDTH}px (then ⧉ or ⌘\\).`}
+            {` Zones ${docks.length}/${maxDocks}: ⧉/⌘\\ · Live rail switch · ⌘1–${Math.min(6, maxDocks)} focus · ⌘B rails.`}
           </span>
         </p>
         <div className="session-list">
@@ -1256,7 +1412,7 @@ export default function App() {
 
       <main
         className={`main density-${layoutDensity} ${
-          splitOk && sideSessionId ? "is-split" : ""
+          docks.length > 1 ? "is-split" : ""
         }`}
       >
         {tabs.length > 0 && (
@@ -1264,7 +1420,12 @@ export default function App() {
             {tabs.map((t) => (
               <div
                 key={t.id}
-                className={`session-tab ${t.id === activeSessionId ? "active" : ""} ${t.id === sideSessionId ? "is-side" : ""} ${t.busy ? "busy" : ""} ${t.needsPermission ? "needs-permission" : ""} ${t.unseen ? "has-unseen" : ""}`}
+                className={`session-tab ${t.id === activeSessionId ? "active" : ""} ${docks.includes(t.id) ? "is-docked" : ""} ${t.busy ? "busy" : ""} ${t.needsPermission ? "needs-permission" : ""} ${t.unseen ? "has-unseen" : ""}`}
+                draggable
+                onDragStart={(e) => {
+                  e.dataTransfer.setData("text/session-id", t.id);
+                  e.dataTransfer.effectAllowed = "move";
+                }}
                 role="tab"
                 aria-selected={t.id === activeSessionId}
                 onContextMenu={(e) => {
@@ -1314,21 +1475,17 @@ export default function App() {
             {tabs.length >= 1 && (
               <button
                 type="button"
-                className={`session-tab-split ${sideSessionId ? "on" : ""} ${!splitOk ? "is-disabled" : ""}`}
+                className={`session-tab-split ${docks.length > 1 ? "on" : ""} ${!splitOk ? "is-disabled" : ""}`}
                 disabled={!splitOk}
                 title={
                   !splitOk
-                    ? `Widen the window to at least ${SPLIT_MIN_WIDTH}px to split sessions`
-                    : sideSessionId
-                      ? "Close side pane (⌘\\)"
-                      : "Split view — open another session beside (⌘\\)"
+                    ? `Need more stage width for multi-dock (collapse rails with ⌘B / ⌘⌥B, or widen ≥${SPLIT_MIN_WIDTH}px)`
+                    : docks.length > 1
+                      ? `Add dock or peel last unfocused (⌘\\) · capacity ${docks.length}/${maxDocks}`
+                      : `Open another session in a new column (⌘\\) · up to ${maxDocks} docks`
                 }
                 onClick={() => {
                   if (!splitOk) return;
-                  if (sideSessionId) {
-                    setSideSessionId(null);
-                    return;
-                  }
                   void openBeside();
                 }}
               >
@@ -1359,27 +1516,12 @@ export default function App() {
         )}
 
         <div
-          className={`pane-row ${
-            splitOk && sideSessionId ? "has-side" : "single"
+          ref={stageRef}
+          className={`pane-row zones-${Math.max(1, docks.length)} ${
+            docks.length > 1 ? "has-zones" : "single"
           }`}
         >
-          {activeTab ? (
-            <SessionPane
-              tab={activeTab}
-              focused
-              kindLabel={
-                sessions.find((s) => s.id === activeTab.id)?.kind ??
-                workspaceMode
-              }
-              bridgeVersion={product.bridgeVersion}
-              emptyHint={
-                workspaceMode === "build"
-                  ? "Set a working directory, then send a prompt."
-                  : "Message Grok when this pane is focused."
-              }
-              onFocus={() => setActiveSessionId(activeTab.id)}
-            />
-          ) : (
+          {docks.length === 0 ? (
             <div className="transcript session-pane-transcript">
               <div className="empty-agent">
                 <h1>GrokPtah</h1>
@@ -1392,48 +1534,81 @@ export default function App() {
                     session
                   </li>
                   <li>
-                    {splitOk
-                      ? "Click ⧉ in the tab bar or press ⌘\\ for side-by-side sessions"
-                      : `Widen the window (≥${SPLIT_MIN_WIDTH}px), then ⧉ or ⌘\\ for split`}
+                    Up to 6 zones on ultrawide: ⧉ or ⌘\\ · collapse rails (⌘B) ·
+                    Live rail to switch
                   </li>
                 </ul>
               </div>
             </div>
-          )}
-          {splitOk &&
-            sideSessionId &&
-            (() => {
-              const sideTab = tabs.find((t) => t.id === sideSessionId);
-              if (!sideTab) return null;
+          ) : (
+            docks.map((dockId, zoneIndex) => {
+              const dockTab = tabs.find((t) => t.id === dockId);
+              if (!dockTab) return null;
+              const isFocused = dockId === activeSessionId;
               return (
-                <SessionPane
-                  tab={sideTab}
-                  focused={false}
-                  kindLabel={
-                    sessions.find((s) => s.id === sideTab.id)?.kind ?? "build"
-                  }
-                  showClose
-                  onClosePane={() => setSideSessionId(null)}
-                  onFocus={() => {
-                    // Swap: side becomes primary, old primary becomes side
-                    const prev = activeSessionId;
-                    setActiveSessionId(sideTab.id);
-                    if (prev && prev !== sideTab.id) setSideSessionId(prev);
+                <div
+                  key={dockId}
+                  className={`dock-slot ${isFocused ? "is-focused-dock" : ""}`}
+                  data-zone={zoneIndex + 1}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
                   }}
-                />
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const sid = e.dataTransfer.getData("text/session-id");
+                    if (!sid || sid === dockId) return;
+                    setDocks((d) => {
+                      const next = d.slice();
+                      const from = next.indexOf(sid);
+                      const to = next.indexOf(dockId);
+                      if (to < 0) return d;
+                      if (from >= 0) {
+                        // swap
+                        next[from] = dockId;
+                        next[to] = sid;
+                      } else {
+                        next[to] = sid;
+                      }
+                      return clampDocks(next, maxDocks, activeSessionId);
+                    });
+                    setActiveSessionId(sid);
+                  }}
+                >
+                  <SessionPane
+                    tab={dockTab}
+                    focused={isFocused}
+                    zoneIndex={zoneIndex + 1}
+                    zoneCount={docks.length}
+                    kindLabel={
+                      sessions.find((s) => s.id === dockTab.id)?.kind ??
+                      workspaceMode
+                    }
+                    bridgeVersion={product.bridgeVersion}
+                    emptyHint={
+                      workspaceMode === "build"
+                        ? "Set a working directory, then send a prompt."
+                        : "Message Grok when this pane is focused."
+                    }
+                    showClose={docks.length > 1}
+                    onClosePane={() => undockSession(dockId)}
+                    onFocus={() => setActiveSessionId(dockId)}
+                  />
+                </div>
               );
-            })()}
+            })
+          )}
         </div>
 
-        {(layoutDensity === "wide" || layoutDensity === "ultrawide") &&
-          tabs.length > 0 && (
+        {!liveHidden && tabs.length > 0 && (
             <FleetStrip
               tabs={tabs}
               activeSessionId={activeSessionId}
-              sideSessionId={sideSessionId}
+              zoneIds={docks}
               canSplit={splitOk}
               onFocus={(id) => setActiveSessionId(id)}
               onOpenBeside={(id) => void openBeside(id)}
+              onHide={() => setLiveHidden(true)}
             />
           )}
 
@@ -1515,13 +1690,28 @@ export default function App() {
           <div
             className={`composer-shell ${busy ? "is-busy" : ""} ${composerExpanded ? "is-expanded" : ""}`}
           >
+            {activeTab && (
+              <div className="composer-target" title="Composer sends to this session">
+                <span className="composer-target-label">→</span>
+                <span className={`kind-chip ${activeSummary?.kind ?? workspaceMode}`}>
+                  {activeSummary?.kind ?? workspaceMode}
+                </span>
+                <span className="composer-target-title">{activeTab.title}</span>
+                {docks.length > 1 && (
+                  <span className="composer-target-zone">
+                    zone{" "}
+                    {Math.max(1, docks.indexOf(activeTab.id) + 1)}
+                  </span>
+                )}
+              </div>
+            )}
             <textarea
               className="composer-input"
               value={composer}
               rows={composerExpanded ? 10 : 2}
               placeholder={
                 busy
-                  ? "This session is running… switch tabs to start another"
+                  ? "Focused session is running… click another zone to message it"
                   : workspaceMode === "chat"
                     ? "Message Grok… (Shift+Enter for newline)"
                     : "Message the coding agent… (Shift+Enter for newline)"

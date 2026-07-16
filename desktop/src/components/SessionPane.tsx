@@ -72,6 +72,9 @@ export function groupTranscript(items: TranscriptItem[]): RenderRow[] {
 export type SessionPaneProps = {
   tab: SessionTab;
   focused: boolean;
+  /** 1-based zone index when multi-dock; omit for single-pane. */
+  zoneIndex?: number;
+  zoneCount?: number;
   kindLabel?: string;
   emptyHint?: string;
   bridgeVersion?: string;
@@ -88,6 +91,8 @@ export type SessionPaneProps = {
 export function SessionPane({
   tab,
   focused,
+  zoneIndex,
+  zoneCount = 1,
   kindLabel,
   emptyHint,
   bridgeVersion,
@@ -99,6 +104,7 @@ export function SessionPane({
   const busy = tab.busy;
   const transcript = tab.transcript;
   const rows = useMemo(() => groupTranscript(transcript), [transcript]);
+  const multi = (zoneCount ?? 1) > 1;
 
   useEffect(() => {
     if (focused) {
@@ -108,12 +114,21 @@ export function SessionPane({
 
   return (
     <section
-      className={`session-pane ${focused ? "is-focused" : ""} ${busy ? "is-busy" : ""}`}
+      className={`session-pane ${focused ? "is-focused" : ""} ${busy ? "is-busy" : ""} ${multi ? "is-multi" : ""}`}
       onMouseDown={onFocus}
       data-session-id={tab.id}
+      data-zone={zoneIndex}
     >
       <header className="session-pane-header">
         <div className="session-pane-title">
+          {multi && zoneIndex != null && (
+            <span
+              className={`session-pane-zone ${focused ? "is-focused" : ""}`}
+              title={`Zone ${zoneIndex} · ⌘${zoneIndex}`}
+            >
+              {zoneIndex}
+            </span>
+          )}
           {tab.needsPermission ? (
             <span className="attn-dot permission" title="Needs response" />
           ) : tab.busy ? (
@@ -129,13 +144,15 @@ export function SessionPane({
           </span>
         </div>
         <div className="session-pane-actions">
-          {focused && <span className="session-pane-focus-tag">focused</span>}
+          {focused && multi && (
+            <span className="session-pane-focus-tag">focus</span>
+          )}
           {showClose && onClosePane && (
             <button
               type="button"
               className="session-pane-close"
-              title="Close side pane"
-              aria-label="Close side pane"
+              title="Undock zone (session stays in tabs)"
+              aria-label="Undock zone"
               onClick={(e) => {
                 e.stopPropagation();
                 onClosePane();

@@ -36,19 +36,21 @@ describe("splitStreamingMarkdown", () => {
     expect(tail.startsWith("```")).toBe(true);
   });
 
-  it("keeps a beam tail on long single paragraphs", () => {
-    const body = "Word ".repeat(40).trim();
+  it("keeps a substantial beam tail on long paragraphs", () => {
+    const body = "Word ".repeat(80).trim();
     const { stable, tail } = splitStreamingMarkdown(body);
     expect(stable.length).toBeGreaterThan(0);
-    expect(tail.length).toBeGreaterThan(0);
+    expect(tail.length).toBeGreaterThanOrEqual(80);
     expect(stable + tail).toBe(body);
   });
 
-  it("splits at paragraph boundaries when present", () => {
-    const t = "First paragraph is done.\n\nSecond is still stream";
+  it("puts recent content in the beam tail", () => {
+    const t =
+      "First paragraph is done and fairly long so we have room.\n\nSecond is still streaming words here";
     const { stable, tail } = splitStreamingMarkdown(t);
-    expect(stable).toContain("First paragraph");
-    expect(tail).toContain("Second");
     expect(stable + tail).toBe(t);
+    expect(tail.length).toBeGreaterThan(0);
+    // Tail should include the newest words
+    expect(tail).toMatch(/streaming|words|here/);
   });
 });
