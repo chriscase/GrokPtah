@@ -214,5 +214,5 @@ export const SLASH_COMMANDS = [
   { cmd: "/plan", desc: "Enter plan mode" },
   { cmd: "/yolo", desc: "Always approve tools" },
   { cmd: "/explore", desc: "Spawn explore subagent" },
-  { cmd: "/compact", desc: "Compact conversation (use UI too)" },
+  { cmd: "/compact", desc: "Shrink server context (keeps full local history)" },
 ] as const;

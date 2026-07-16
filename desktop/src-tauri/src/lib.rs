@@ -51,6 +51,8 @@ pub fn run() {
             commands::session_delete,
             commands::session_archive,
             commands::session_set_folder,
+            commands::session_set_cwd,
+            commands::pick_session_folder,
             commands::session_set_tags,
             commands::session_list_folders,
             commands::session_list_tags,

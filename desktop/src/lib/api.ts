@@ -53,6 +53,11 @@ export const api = {
     invoke<SessionSummary>("session_archive", { sessionId, archived }),
   sessionSetFolder: (sessionId: string, folder: string | null) =>
     invoke<SessionSummary>("session_set_folder", { sessionId, folder }),
+  sessionSetCwd: (sessionId: string, path: string) =>
+    invoke<SessionSummary>("session_set_cwd", { sessionId, path }),
+  /** Folder picker that sets cwd on one session (build project root). */
+  pickSessionFolder: (sessionId: string) =>
+    invoke<SessionSummary | null>("pick_session_folder", { sessionId }),
   sessionSetTags: (sessionId: string, tags: string[]) =>
     invoke<SessionSummary>("session_set_tags", { sessionId, tags }),
   sessionListFolders: (includeArchived = false) =>

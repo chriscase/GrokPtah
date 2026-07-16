@@ -248,9 +248,13 @@ impl AgentHostHandle {
             }
             Err(e) => eprintln!("[grokptah] transcript append failed: {e:#}"),
         }
+        // Always refresh meta (compact cursor, title, counts) even when no new lines.
+        if let Err(e) = session_store::save_session_meta(&session) {
+            eprintln!("[grokptah] meta persist failed: {e:#}");
+        }
     }
 
-    /// Full transcript rewrite (rewind / compact).
+    /// Full transcript rewrite (rewind / fork only — never used by compact).
     pub fn persist_session_rewrite(&self, id: Uuid) {
         let session = {
             let g = self.inner.lock();
@@ -411,6 +415,22 @@ impl AgentHostHandle {
 
     pub fn session_load(&self, id: Uuid) -> Result<SessionSummary> {
         self.ensure_transcript_loaded(id)?;
+        // Build sessions pin their own project root — promote it so files/git
+        // panels track the session you just opened.
+        let (kind, cwd) = {
+            let g = self.inner.lock();
+            let s = g
+                .sessions
+                .get(&id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            (s.kind, s.cwd.clone())
+        };
+        if kind == SessionKind::Build && cwd.is_dir() {
+            let current = self.inner.lock().project_cwd.clone();
+            if current.as_ref() != Some(&cwd) {
+                let _ = self.set_project_cwd(&cwd);
+            }
+        }
         let summary = {
             let mut g = self.inner.lock();
             let s = g
@@ -582,6 +602,39 @@ impl AgentHostHandle {
         Ok(summary)
     }
 
+    /// Set the working directory for a session (tools + shell run here).
+    ///
+    /// For build sessions this is the project root. When the session is active,
+    /// also updates the host project cwd so the files/git panels match.
+    pub fn session_set_cwd(&self, id: Uuid, path: impl AsRef<Path>) -> Result<SessionSummary> {
+        let p = path.as_ref().to_path_buf();
+        if !p.is_dir() {
+            bail!("not a directory: {}", p.display());
+        }
+        let summary = {
+            let mut g = self.inner.lock();
+            let s = g
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            s.cwd = p.clone();
+            s.updated_at = Utc::now();
+            s.summary()
+        };
+        self.persist_session_meta_only(id);
+
+        // Keep host workspace + discovery in sync when this is the focused session
+        // or when no project is open yet.
+        let should_sync = {
+            let g = self.inner.lock();
+            g.active_session == Some(id) || g.project_cwd.is_none()
+        };
+        if should_sync {
+            let _ = self.set_project_cwd(&p);
+        }
+        Ok(summary)
+    }
+
     pub fn session_set_tags(&self, id: Uuid, tags: Vec<String>) -> Result<SessionSummary> {
         let mut clean: Vec<String> = tags
             .into_iter()
@@ -667,6 +720,9 @@ impl AgentHostHandle {
             s.forked_from = Some(source);
             s.plan_mode = src.plan_mode;
             s.plan_steps = src.plan_steps.clone();
+            s.compacted_summary = src.compacted_summary.clone();
+            s.api_context_start = src.api_context_start;
+            s.kind = src.kind;
             let summary = s.summary();
             g.active_session = Some(s.id);
             if !g.open_tab_ids.contains(&s.id) {
@@ -699,31 +755,52 @@ impl AgentHostHandle {
         Ok(summary)
     }
 
+    /// Shrink the *server-facing* context window only.
+    ///
+    /// Local `transcript.jsonl` is never truncated or rewritten: every message
+    /// stays on disk for search, UI, and perpetual history. Compact advances
+    /// [`Session::api_context_start`] and stores an extractive summary of the
+    /// portion that leaves the API window in [`Session::compacted_summary`].
     pub fn compact_session(&self, id: Uuid) -> Result<SessionSummary> {
         self.ensure_transcript_loaded(id)?;
+        /// How many recent transcript entries stay in the wire context window.
+        const KEEP_RECENT: usize = 6;
         let summary = {
             let mut g = self.inner.lock();
             let s = g
                 .sessions
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
-            if s.transcript.len() > 2 {
-                let keep = 2;
-                let drop_n = s.transcript.len() - keep;
-                s.transcript = s.transcript.split_off(drop_n);
-                s.transcript.insert(
-                    0,
-                    TranscriptEntry {
+            let len = s.transcript.len();
+            if len > KEEP_RECENT {
+                let new_start = len - KEEP_RECENT;
+                // Only advance the window (re-compact moves the cut forward).
+                let old_start = s.api_context_start.min(len);
+                if new_start > old_start {
+                    let leaving = &s.transcript[old_start..new_start];
+                    let piece = build_compact_summary(leaving);
+                    s.compacted_summary = Some(match s.compacted_summary.take() {
+                        Some(prev) if !prev.is_empty() => format!("{prev}\n\n{piece}"),
+                        _ => piece,
+                    });
+                    s.api_context_start = new_start;
+                    let total = len;
+                    let in_window = len - new_start;
+                    // Additive local notice only — never deletes prior entries.
+                    s.transcript.push(TranscriptEntry {
                         role: "system".into(),
-                        text: format!("[compacted {drop_n} prior messages]"),
-                    },
-                );
-                s.compacted_summary = Some(format!("compacted {drop_n}"));
+                        text: format!(
+                            "[context compacted for server: {in_window} recent messages stay in the API window; full local history retained ({total} messages before this notice)]"
+                        ),
+                    });
+                }
             }
             s.updated_at = Utc::now();
             s.summary()
         };
-        self.persist_session_rewrite(id);
+        // Append-only notice (if any) + meta (api_context_start / summary).
+        // Never rewrite_transcript — that would destroy local history.
+        self.persist_session(id);
         Ok(summary)
     }
 
@@ -1358,6 +1435,17 @@ impl AgentHostHandle {
                     return Ok(text.into());
                 }
             }
+            let (wire_messages, compacted_summary) = {
+                let g = self.inner.lock();
+                let s = g
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(|| anyhow!("unknown session"))?;
+                (
+                    api_context_messages(s),
+                    s.compacted_summary.clone(),
+                )
+            };
             let (reply, is_err) = if let Some(creds) = crate::auth_store::resolve_wire_credentials()
             {
                 emit_thought(
@@ -1365,7 +1453,16 @@ impl AgentHostHandle {
                     session_id,
                     &format!("chat API as {}…", creds.method),
                 );
-                match call_xai_chat(&creds, model, prompt, cwd, SessionKind::Chat).await {
+                match call_xai_chat(
+                    &creds,
+                    model,
+                    &wire_messages,
+                    compacted_summary.as_deref(),
+                    cwd,
+                    SessionKind::Chat,
+                )
+                .await
+                {
                     Ok(text) => (text, false),
                     Err(e) => (
                         format!(
@@ -1548,13 +1645,33 @@ impl AgentHostHandle {
         }
 
         // Live model when Grok Build session / API key is available.
+        let (wire_messages, compacted_summary) = {
+            let g = self.inner.lock();
+            let s = g
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            (
+                api_context_messages(s),
+                s.compacted_summary.clone(),
+            )
+        };
         let (reply, is_error) = if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
             emit_thought(
                 &event_tx,
                 session_id,
                 &format!("calling chat API as {}…", creds.method),
             );
-            match call_xai_chat(&creds, model, prompt, cwd, SessionKind::Build).await {
+            match call_xai_chat(
+                &creds,
+                model,
+                &wire_messages,
+                compacted_summary.as_deref(),
+                cwd,
+                SessionKind::Build,
+            )
+            .await
+            {
                 Ok(text) => (text, false),
                 Err(e) => (
                     format!(
@@ -1930,10 +2047,46 @@ fn extract_write(prompt: &str) -> Option<(String, String)> {
     None
 }
 
+/// Build the extractive summary for transcript entries that leave the API window.
+fn build_compact_summary(entries: &[TranscriptEntry]) -> String {
+    let mut out = String::from(
+        "Summary of earlier conversation (full text is retained locally only):\n",
+    );
+    for (i, e) in entries.iter().enumerate() {
+        let clip: String = e.text.chars().take(400).collect();
+        let more = if e.text.chars().count() > 400 { "…" } else { "" };
+        out.push_str(&format!("\n[{}] {}: {}{}\n", i + 1, e.role, clip, more));
+    }
+    const MAX: usize = 12_000;
+    if out.len() > MAX {
+        out.truncate(MAX);
+        out.push('…');
+    }
+    out
+}
+
+/// Messages to send to the model: only the API context window (post-compact),
+/// excluding local system notices. Never includes the truncated local prefix.
+fn api_context_messages(session: &Session) -> Vec<(String, String)> {
+    let start = session.api_context_start.min(session.transcript.len());
+    session.transcript[start..]
+        .iter()
+        .filter(|e| e.role == "user" || e.role == "assistant")
+        .filter(|e| !e.text.starts_with("[context compacted for server:"))
+        .map(|e| (e.role.clone(), e.text.clone()))
+        .collect()
+}
+
+/// Call the chat completions API.
+///
+/// `history` is already windowed (post-`api_context_start`); last entry is
+/// typically the current user prompt. `compacted_summary` is the extractive
+/// stand-in for local-only prefix that left the context window.
 async fn call_xai_chat(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
-    prompt: &str,
+    history: &[(String, String)],
+    compacted_summary: Option<&str>,
     cwd: &Path,
     kind: SessionKind,
 ) -> Result<String> {
@@ -1981,15 +2134,45 @@ async fn call_xai_chat(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| anyhow!(e))?;
+
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    messages.push(serde_json::json!({
+        "role": "system",
+        "content": system
+    }));
+    if let Some(summary) = compacted_summary.filter(|s| !s.is_empty()) {
+        // Carry condensed prior context on the wire without re-sending full local log.
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": format!(
+                "The conversation was compacted for context limits. \
+                 Full history is retained only on the user's machine.\n\n{summary}"
+            )
+        }));
+    }
+    if history.is_empty() {
+        // Fallback: should not happen once the user turn is on the transcript.
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": "(empty)"
+        }));
+    } else {
+        for (role, content) in history {
+            let role = match role.as_str() {
+                "assistant" => "assistant",
+                "system" => "system",
+                _ => "user",
+            };
+            messages.push(serde_json::json!({
+                "role": role,
+                "content": content
+            }));
+        }
+    }
+
     let body = serde_json::json!({
         "model": model_id,
-        "messages": [
-            {
-                "role": "system",
-                "content": system
-            },
-            { "role": "user", "content": prompt }
-        ],
+        "messages": messages,
         "stream": false
     });
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));

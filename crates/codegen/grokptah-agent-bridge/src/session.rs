@@ -72,9 +72,16 @@ pub struct Session {
     pub plan_mode: bool,
     #[serde(default)]
     pub plan_steps: Vec<String>,
-    /// Compact drops early transcript into a summary blob.
+    /// Server-facing summary of transcript *before* [`api_context_start`].
+    /// Local `transcript` is never truncated by compact — this only shrinks
+    /// what is re-sent to the model on the next turn.
     #[serde(default)]
     pub compacted_summary: Option<String>,
+    /// Index into `transcript` where the API context window begins.
+    /// Entries `[0..api_context_start)` stay on disk forever for search/UI
+    /// but are omitted from wire history (replaced by `compacted_summary`).
+    #[serde(default)]
+    pub api_context_start: usize,
     /// Virtual folder (UI org only — not a filesystem path).
     #[serde(default)]
     pub folder: Option<String>,
@@ -122,6 +129,7 @@ impl Session {
             plan_mode: false,
             plan_steps: Vec::new(),
             compacted_summary: None,
+            api_context_start: 0,
             folder: None,
             tags: Vec::new(),
             archived: false,

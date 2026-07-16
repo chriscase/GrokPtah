@@ -90,6 +90,10 @@ pub struct SessionMeta {
     pub plan_steps: Vec<String>,
     #[serde(default)]
     pub compacted_summary: Option<String>,
+    /// Index into transcript.jsonl where the API context window begins.
+    /// Compact advances this; local lines before it are never deleted.
+    #[serde(default)]
+    pub api_context_start: usize,
     /// Number of lines in transcript.jsonl (authoritative for list badges).
     #[serde(default)]
     pub message_count: usize,
@@ -182,7 +186,8 @@ pub fn append_transcript(session: &Session, from_index: usize) -> Result<usize> 
     Ok(n)
 }
 
-/// Full rewrite of transcript.jsonl (rewind / compact).
+/// Full rewrite of transcript.jsonl (rewind / fork only — never compact).
+/// Compact must not call this: local history is append-only forever.
 pub fn rewrite_transcript(session: &Session) -> Result<()> {
     let dir = session_dir(session.id);
     fs::create_dir_all(&dir)?;
@@ -312,6 +317,7 @@ impl SessionMeta {
             plan_mode: s.plan_mode,
             plan_steps: s.plan_steps.clone(),
             compacted_summary: s.compacted_summary.clone(),
+            api_context_start: s.api_context_start,
             message_count: s.transcript.len().max(s.persisted_len),
             folder: s.folder.clone(),
             tags: s.tags.clone(),
@@ -335,6 +341,7 @@ impl SessionMeta {
             plan_mode: self.plan_mode,
             plan_steps: self.plan_steps,
             compacted_summary: self.compacted_summary,
+            api_context_start: self.api_context_start,
             folder: self.folder,
             tags: self.tags,
             archived: self.archived,

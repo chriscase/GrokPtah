@@ -345,8 +345,67 @@ async fn fork_rewind_compact_sessions() {
     let _ = drain_until_turn_complete(&mut rx).await;
     host.session_prompt(forked.id, "msg3".into()).await.unwrap();
     let _ = drain_until_turn_complete(&mut rx).await;
+    let before = host.session_transcript(forked.id).unwrap();
+    let before_len = before.len();
+    assert!(
+        before_len > 0,
+        "need history before compact, got {before_len}"
+    );
     let compacted = host.compact_session(forked.id).unwrap();
-    assert!(compacted.message_count < 10);
+    let after = host.session_transcript(forked.id).unwrap();
+    // Compact must never delete local content — only shrink the server window.
+    assert!(
+        after.len() >= before_len,
+        "local transcript must be retained (before={before_len}, after={})",
+        after.len()
+    );
+    assert!(
+        compacted.message_count >= before_len,
+        "message_count must reflect full local history"
+    );
+    // Every pre-compact line still present (prefix equality).
+    for (i, e) in before.iter().enumerate() {
+        assert_eq!(
+            after[i].role, e.role,
+            "role mismatch at index {i} after compact"
+        );
+        assert_eq!(
+            after[i].text, e.text,
+            "text lost at index {i} after compact"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_set_cwd_updates_session_and_host_project() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir_a.path()).unwrap();
+    let s = host.session_new().unwrap();
+    assert_eq!(
+        std::path::Path::new(&s.cwd),
+        dir_a.path(),
+        "new session inherits host project cwd"
+    );
+
+    let updated = host.session_set_cwd(s.id, dir_b.path()).unwrap();
+    assert_eq!(std::path::Path::new(&updated.cwd), dir_b.path());
+
+    // Active session: host project should follow.
+    let status = host.status();
+    assert_eq!(
+        status.project_cwd.as_deref().map(std::path::Path::new),
+        Some(dir_b.path())
+    );
+
+    // Reload preserves per-session cwd.
+    let loaded = host.session_load(s.id).unwrap();
+    assert_eq!(std::path::Path::new(&loaded.cwd), dir_b.path());
 }
 
 #[tokio::test]

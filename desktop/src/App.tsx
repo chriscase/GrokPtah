@@ -15,6 +15,10 @@ import {
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
 import { ActivityIndicator } from "./components/ActivityIndicator";
+import {
+  ContextMenu,
+  type ContextMenuState,
+} from "./components/ContextMenu";
 import { SearchPanel } from "./components/SearchPanel";
 import { SessionBrowser } from "./components/SessionBrowser";
 import { StreamingText } from "./components/StreamingText";
@@ -87,6 +91,21 @@ function withActivity(
 /** Ref used by applyUpdate so background tabs can be marked unseen. */
 let activeSessionIdForEvents: string | null = null;
 
+/** Shorten a filesystem path for chrome (prefer last two segments). */
+function shortPath(path: string | null | undefined, max = 42): string {
+  if (!path) return "Set working directory…";
+  let p = path;
+  // Collapse home when it matches a typical macOS/Linux home prefix.
+  const homeMatch = p.match(/^(\/Users\/[^/]+|\/home\/[^/]+)/);
+  if (homeMatch) {
+    p = `~${p.slice(homeMatch[1].length)}`;
+  }
+  if (p.length <= max) return p;
+  const parts = p.split(/[/\\]/).filter(Boolean);
+  if (parts.length <= 2) return p;
+  return `…/${parts.slice(-2).join("/")}`;
+}
+
 export default function App() {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [auth, setAuth] = useState<AuthState>({ signed_in: false });
@@ -96,6 +115,7 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [composer, setComposer] = useState("");
+  const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
   const [permission, setPermission] = useState<PermissionRequest | null>(null);
   const [rightTab, setRightTab] = useState<RightTab>("files");
   const [files, setFiles] = useState<string[]>([]);
@@ -152,6 +172,12 @@ export default function App() {
   const plan = activeTab?.plan ?? null;
   const anyBusy = tabs.some((t) => t.busy);
   const activity = activeTab?.activity ?? idleActivity();
+  const activeSummary = useMemo(
+    () => sessions.find((s) => s.id === activeSessionId) ?? null,
+    [sessions, activeSessionId],
+  );
+  const activeIsBuild =
+    (activeSummary?.kind ?? workspaceMode) === "build";
 
   const patchTab = useCallback(
     (id: string, patch: (tab: SessionTab) => SessionTab) => {
@@ -408,16 +434,27 @@ export default function App() {
 
   async function ensureSession(): Promise<string> {
     if (activeSessionId) return activeSessionId;
-    const s = await api.sessionNew();
-    await openTab(s, false);
-    setSessions(await api.sessionList());
+    const s = await createSession(workspaceMode);
+    if (!s) throw new Error("session creation cancelled");
     return s.id;
   }
 
   async function openProject() {
     const path = await api.pickProjectFolder();
     if (path) {
+      // Also pin the folder on the active build so tools use it.
+      if (
+        activeSessionId &&
+        (activeSummary?.kind ?? workspaceMode) === "build"
+      ) {
+        try {
+          await api.sessionSetCwd(activeSessionId, path);
+        } catch {
+          /* host cwd still set by pick */
+        }
+      }
       await refreshChrome();
+      await refreshSessions();
       try {
         setFiles(await api.fileTree());
       } catch {
@@ -425,6 +462,209 @@ export default function App() {
       }
     }
   }
+
+  const setWorkingDirectory = useCallback(
+    async (sessionId: string) => {
+      try {
+        const updated = await api.pickSessionFolder(sessionId);
+        if (!updated) return;
+        await refreshSessions();
+        await refreshChrome();
+        try {
+          setFiles(await api.fileTree());
+        } catch {
+          /* no project / empty */
+        }
+      } catch (e) {
+        console.warn("set working directory failed", e);
+      }
+    },
+    [refreshSessions, refreshChrome],
+  );
+
+  const createSession = useCallback(
+    async (kind: WorkspaceMode) => {
+      // Builds need a project root; offer the folder picker if none is set yet.
+      if (kind === "build" && !status?.project_cwd) {
+        const path = await api.pickProjectFolder();
+        if (!path) return null;
+        await refreshChrome();
+      }
+      const s = await api.sessionNewKind(kind);
+      await openTab(s, false);
+      await refreshSessions();
+      if (kind === "build") {
+        try {
+          setFiles(await api.fileTree());
+        } catch {
+          /* empty */
+        }
+      }
+      return s;
+    },
+    [status?.project_cwd, openTab, refreshSessions, refreshChrome],
+  );
+
+  const openSessionContextMenu = useCallback(
+    (sessionId: string, x: number, y: number) => {
+      const current = sessions.find((s) => s.id === sessionId);
+      const isBuild =
+        (current?.kind ?? workspaceMode) === "build";
+      setCtxMenu({
+        x,
+        y,
+        items: [
+          {
+            type: "item",
+            id: "rename",
+            label: "Rename…",
+            onClick: () => {
+              void (async () => {
+                const next = window.prompt(
+                  "Rename session",
+                  current?.title ?? "",
+                );
+                if (next == null || !next.trim()) return;
+                const updated = await api.sessionRename(
+                  sessionId,
+                  next.trim(),
+                );
+                patchTab(sessionId, (t) => ({ ...t, title: updated.title }));
+                setSessions(await api.sessionListByKind(workspaceMode, false));
+              })();
+            },
+          },
+          ...(isBuild
+            ? ([
+                {
+                  type: "item" as const,
+                  id: "cwd",
+                  label: "Set working directory…",
+                  onClick: () => {
+                    void setWorkingDirectory(sessionId);
+                  },
+                },
+              ] as const)
+            : []),
+          {
+            type: "item",
+            id: "fork",
+            label: "Fork",
+            onClick: () => {
+              void (async () => {
+                const f = await api.sessionFork(sessionId);
+                await openTab(f, false);
+                const src = tabs.find((t) => t.id === sessionId);
+                if (src) {
+                  patchTab(f.id, (t) => ({
+                    ...t,
+                    transcript: [...src.transcript],
+                    title: f.title,
+                  }));
+                }
+                setSessions(
+                  await api.sessionListByKind(workspaceMode, false),
+                );
+              })();
+            },
+          },
+          {
+            type: "item",
+            id: "rewind",
+            label: "Rewind last message",
+            onClick: () => {
+              void (async () => {
+                await api.sessionRewind(sessionId, 1);
+                const list = await api.sessionListByKind(
+                  workspaceMode,
+                  false,
+                );
+                setSessions(list);
+                const summary = list.find((s) => s.id === sessionId);
+                if (summary) await openTab(summary, true);
+              })();
+            },
+          },
+          {
+            type: "item",
+            id: "compact",
+            label: "Compact server context",
+            onClick: () => {
+              void (async () => {
+                await api.sessionCompact(sessionId);
+                try {
+                  const entries = await api.sessionTranscript(sessionId);
+                  patchTab(sessionId, (t) => ({
+                    ...t,
+                    transcript: entries.map((e) =>
+                      e.role === "user"
+                        ? ({ kind: "user" as const, text: e.text })
+                        : ({ kind: "assistant" as const, text: e.text }),
+                    ),
+                  }));
+                } catch {
+                  /* keep local view */
+                }
+              })();
+            },
+          },
+          { type: "separator" },
+          {
+            type: "item",
+            id: "archive",
+            label: "Archive",
+            onClick: () => {
+              void (async () => {
+                await api.sessionArchive(sessionId, true);
+                closeTab(sessionId);
+                setSessions(
+                  await api.sessionListByKind(workspaceMode, false),
+                );
+              })();
+            },
+          },
+          {
+            type: "item",
+            id: "delete",
+            label: "Delete permanently…",
+            danger: true,
+            onClick: () => {
+              void (async () => {
+                if (
+                  !window.confirm(
+                    "Delete this session permanently? Transcript is removed from disk.",
+                  )
+                ) {
+                  return;
+                }
+                await api.sessionDelete(sessionId);
+                closeTab(sessionId);
+                setSessions(
+                  await api.sessionListByKind(workspaceMode, false),
+                );
+              })();
+            },
+          },
+          { type: "separator" },
+          {
+            type: "item",
+            id: "browse",
+            label: "Browse all sessions…",
+            onClick: () => setSessionBrowserOpen(true),
+          },
+        ],
+      });
+    },
+    [
+      sessions,
+      tabs,
+      workspaceMode,
+      openTab,
+      closeTab,
+      patchTab,
+      setWorkingDirectory,
+    ],
+  );
 
   async function sendPrompt(text?: string) {
     const prompt = (text ?? composer).trim();
@@ -450,15 +690,37 @@ export default function App() {
     try {
       if (prompt === "/compact") {
         await api.sessionCompact(id);
-        patchTab(id, (t) => ({
-          ...t,
-          busy: false,
-          activity: doneActivity(false),
-          transcript: [
-            ...t.transcript,
-            { kind: "assistant", text: "Conversation compacted." },
-          ],
-        }));
+        // Compact only shrinks the server context window — rehydrate full
+        // local history so nothing appears deleted in the UI.
+        try {
+          const entries = await api.sessionTranscript(id);
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: doneActivity(false),
+            transcript: entries.map((e) =>
+              e.role === "user"
+                ? ({ kind: "user" as const, text: e.text })
+                : ({
+                    kind: "assistant" as const,
+                    text: e.text,
+                  }),
+            ),
+          }));
+        } catch {
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: doneActivity(false),
+            transcript: [
+              ...t.transcript,
+              {
+                kind: "assistant",
+                text: "Context compacted for the server. Full local history is retained.",
+              },
+            ],
+          }));
+        }
         return;
       }
       const reply = await api.sessionPrompt(id, prompt);
@@ -686,11 +948,7 @@ export default function App() {
           type="button"
           className="primary"
           style={{ width: "100%", marginBottom: 6 }}
-          onClick={async () => {
-            const s = await api.sessionNewKind(workspaceMode);
-            await openTab(s, false);
-            await refreshSessions();
-          }}
+          onClick={() => void createSession(workspaceMode)}
         >
           {workspaceMode === "chat" ? "New chat" : "New build"}
         </button>
@@ -712,156 +970,82 @@ export default function App() {
           {workspaceMode === "chat"
             ? "Regular Grok conversations — separate from coding builds."
             : "Coding-agent builds with tools. Switch to Chats for plain Grok."}
+          <span className="session-hint-ctx"> Right-click a session for actions.</span>
         </p>
-        {sessions.map((s) => {
-          const open = tabs.some((t) => t.id === s.id);
-          const tabMeta = tabs.find((t) => t.id === s.id);
-          const running = tabMeta?.busy;
-          return (
-            <button
-              key={s.id}
-              type="button"
-              className={`session-item ${s.id === activeSessionId ? "active" : ""} ${running ? "busy" : ""} ${tabMeta?.needsPermission ? "needs-permission" : ""} ${tabMeta?.unseen ? "has-unseen" : ""}`}
-              onClick={async () => {
-                await api.sessionLoad(s.id);
-                await openTab(s, !open);
-              }}
-              onDoubleClick={() => setSessionBrowserOpen(true)}
-            >
-              <div className="session-item-title">
-                {tabMeta?.needsPermission ? (
-                  <span
-                    className="attn-dot permission"
-                    title="Needs your response"
-                  />
-                ) : running ? (
-                  <span className="busy-dot" title="Running" />
-                ) : tabMeta?.unseen ? (
-                  <span className="attn-dot unseen" title="Unseen activity" />
-                ) : null}
-                <span className={`kind-chip ${s.kind ?? workspaceMode}`}>
-                  {s.kind ?? workspaceMode}
-                </span>
-                {s.title}
+        <div className="session-list">
+          {sessions.map((s) => {
+            const open = tabs.some((t) => t.id === s.id);
+            const tabMeta = tabs.find((t) => t.id === s.id);
+            const running = tabMeta?.busy;
+            return (
+              <div
+                key={s.id}
+                className={`session-item ${s.id === activeSessionId ? "active" : ""} ${running ? "busy" : ""} ${tabMeta?.needsPermission ? "needs-permission" : ""} ${tabMeta?.unseen ? "has-unseen" : ""}`}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  openSessionContextMenu(s.id, e.clientX, e.clientY);
+                }}
+              >
+                <button
+                  type="button"
+                  className="session-item-main"
+                  onClick={async () => {
+                    await api.sessionLoad(s.id);
+                    await openTab(s, !open);
+                  }}
+                  onDoubleClick={() => setSessionBrowserOpen(true)}
+                >
+                  <div className="session-item-title">
+                    {tabMeta?.needsPermission ? (
+                      <span
+                        className="attn-dot permission"
+                        title="Needs your response"
+                      />
+                    ) : running ? (
+                      <span className="busy-dot" title="Running" />
+                    ) : tabMeta?.unseen ? (
+                      <span
+                        className="attn-dot unseen"
+                        title="Unseen activity"
+                      />
+                    ) : null}
+                    <span className={`kind-chip ${s.kind ?? workspaceMode}`}>
+                      {s.kind ?? workspaceMode}
+                    </span>
+                    <span className="session-item-name">{s.title}</span>
+                  </div>
+                  <div className="session-item-sub">
+                    {s.message_count} msgs{open ? " · open" : ""}
+                    {(s.kind ?? workspaceMode) === "build" && s.cwd
+                      ? ` · ${shortPath(s.cwd, 28)}`
+                      : ""}
+                  </div>
+                  {(s.folder || (s.tags?.length ?? 0) > 0) && (
+                    <div className="session-side-meta">
+                      {s.folder && <span>▣ {s.folder}</span>}
+                      {(s.tags ?? []).slice(0, 3).map((t) => (
+                        <span key={t}>#{t}</span>
+                      ))}
+                    </div>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  className="session-item-more"
+                  aria-label={`Actions for ${s.title}`}
+                  title="Session actions"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const r = e.currentTarget.getBoundingClientRect();
+                    openSessionContextMenu(s.id, r.right, r.bottom + 2);
+                  }}
+                >
+                  ···
+                </button>
               </div>
-              <div style={{ color: "var(--muted)", fontSize: 11 }}>
-                {s.message_count} msgs{open ? " · open" : ""}
-              </div>
-              {(s.folder || (s.tags?.length ?? 0) > 0) && (
-                <div className="session-side-meta">
-                  {s.folder && <span>▣ {s.folder}</span>}
-                  {(s.tags ?? []).slice(0, 3).map((t) => (
-                    <span key={t}>#{t}</span>
-                  ))}
-                </div>
-              )}
-            </button>
-          );
-        })}
-        <div className="section-title">Session actions</div>
-        <button
-          type="button"
-          disabled={!activeSessionId}
-          onClick={async () => {
-            if (!activeSessionId) return;
-            const current = sessions.find((s) => s.id === activeSessionId);
-            const next = window.prompt("Rename session", current?.title ?? "");
-            if (next == null || !next.trim()) return;
-            const updated = await api.sessionRename(activeSessionId, next.trim());
-            patchTab(activeSessionId, (t) => ({ ...t, title: updated.title }));
-            setSessions(await api.sessionList());
-          }}
-        >
-          Rename
-        </button>
-        <button
-          type="button"
-          disabled={!activeSessionId}
-          onClick={async () => {
-            if (!activeSessionId) return;
-            await api.sessionArchive(activeSessionId, true);
-            closeTab(activeSessionId);
-            setSessions(await api.sessionList());
-          }}
-        >
-          Archive
-        </button>
-        <button
-          type="button"
-          className="danger"
-          disabled={!activeSessionId}
-          onClick={async () => {
-            if (!activeSessionId) return;
-            if (
-              !window.confirm(
-                "Delete this session permanently? Transcript is removed from disk.",
-              )
-            ) {
-              return;
-            }
-            await api.sessionDelete(activeSessionId);
-            closeTab(activeSessionId);
-            setSessions(await api.sessionList());
-          }}
-        >
-          Delete
-        </button>
-        <button
-          type="button"
-          disabled={!activeSessionId}
-          onClick={async () => {
-            if (!activeSessionId) return;
-            const f = await api.sessionFork(activeSessionId);
-            await openTab(f, false);
-            // Copy transcript into forked tab from source if still open
-            const src = tabs.find((t) => t.id === activeSessionId);
-            if (src) {
-              patchTab(f.id, (t) => ({
-                ...t,
-                transcript: [...src.transcript],
-                title: f.title,
-              }));
-            }
-            setSessions(await api.sessionList());
-          }}
-        >
-          Fork
-        </button>
-        <button
-          type="button"
-          disabled={!activeSessionId}
-          onClick={async () => {
-            if (!activeSessionId) return;
-            await api.sessionRewind(activeSessionId, 1);
-            setSessions(await api.sessionList());
-            await openTab(
-              sessions.find((s) => s.id === activeSessionId) ?? {
-                id: activeSessionId,
-                title: activeTab?.title ?? "Session",
-                cwd: "",
-                created_at: "",
-                updated_at: "",
-                message_count: 0,
-              },
-              true,
             );
-          }}
-        >
-          Rewind
-        </button>
-        <button
-          type="button"
-          disabled={!activeSessionId}
-          onClick={async () => {
-            if (!activeSessionId) return;
-            await api.sessionCompact(activeSessionId);
-          }}
-        >
-          Compact
-        </button>
-        <button type="button" onClick={() => setShowTerm((v) => !v)}>
-          {showTerm ? "Hide terminal" : "Show terminal"}
-        </button>
+          })}
+        </div>
       </aside>
 
       <main className="main">
@@ -873,6 +1057,10 @@ export default function App() {
                 className={`session-tab ${t.id === activeSessionId ? "active" : ""} ${t.busy ? "busy" : ""} ${t.needsPermission ? "needs-permission" : ""} ${t.unseen ? "has-unseen" : ""}`}
                 role="tab"
                 aria-selected={t.id === activeSessionId}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  openSessionContextMenu(t.id, e.clientX, e.clientY);
+                }}
               >
                 <button
                   type="button"
@@ -909,13 +1097,29 @@ export default function App() {
               type="button"
               className="session-tab-new"
               title={`New ${workspaceMode} tab`}
-              onClick={async () => {
-                const s = await api.sessionNewKind(workspaceMode);
-                await openTab(s, false);
-                await refreshSessions();
-              }}
+              onClick={() => void createSession(workspaceMode)}
             >
               +
+            </button>
+          </div>
+        )}
+        {activeIsBuild && activeSessionId && (
+          <div className="session-cwd-bar">
+            <button
+              type="button"
+              className="session-cwd-btn"
+              title={
+                activeSummary?.cwd
+                  ? `${activeSummary.cwd}\nClick to change working directory`
+                  : "Choose a working directory for this build"
+              }
+              onClick={() => void setWorkingDirectory(activeSessionId)}
+            >
+              <span className="session-cwd-label">cwd</span>
+              <span className="session-cwd-path">
+                {shortPath(activeSummary?.cwd)}
+              </span>
+              <span className="session-cwd-change">Change</span>
             </button>
           </div>
         )}
@@ -933,7 +1137,9 @@ export default function App() {
                   <code>grok login</code> (or paste an API key)
                 </li>
                 <li>
-                  Open a project folder, then type a prompt below
+                  {workspaceMode === "build"
+                    ? "Set a working directory (cwd bar or right-click session), then type a prompt"
+                    : "Type a prompt below to start chatting"}
                 </li>
                 <li>
                   Multi-session: open several tabs and run builds in
@@ -1012,86 +1218,23 @@ export default function App() {
                   className="slash-item"
                   onClick={() => setComposer(c.cmd + " ")}
                 >
-                  <strong>{c.cmd}</strong> — {c.desc}
+                  <strong>{c.cmd}</strong>
+                  <span className="slash-desc">{c.desc}</span>
                 </button>
               ))}
             </div>
           )}
-          <div className="composer-meta">
-            <select
-              value={
-                // Prefer host selection; fall back to first catalog entry
-                // (Grok Build default / latest), not a hard-coded grok-3.
-                models.some((m) => m.id === status?.model)
-                  ? (status?.model ?? models[0]?.id ?? "grok-build")
-                  : (models[0]?.id ?? status?.model ?? "grok-build")
-              }
-              onChange={async (e) => {
-                await api.setModel(e.target.value);
-                await refreshChrome();
-              }}
-            >
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.display_name}
-                </option>
-              ))}
-            </select>
-            <select
-              value={String(status?.effort ?? "medium")}
-              onChange={async (e) => {
-                await api.setEffort(e.target.value);
-                await refreshChrome();
-              }}
-            >
-              {["none", "minimal", "low", "medium", "high", "xhigh", "max"].map(
-                (e) => (
-                  <option key={e} value={e}>
-                    effort: {e}
-                  </option>
-                ),
-              )}
-            </select>
-            <label>
-              <input
-                type="checkbox"
-                checked={!!status?.always_approve}
-                onChange={async (e) => {
-                  await api.setAlwaysApprove(e.target.checked);
-                  await refreshChrome();
-                }}
-              />{" "}
-              <span className={status?.always_approve ? "yolo-on" : ""}>
-                Always approve
-              </span>
-            </label>
-            {busy && (
-              <button
-                type="button"
-                className="danger"
-                onClick={() =>
-                  void api.sessionCancel(activeSessionId)
-                }
-              >
-                Stop
-              </button>
-            )}
-            {anyBusy && !busy && (
-              <span className="muted-chip" title="Other session tabs are still running">
-                {tabs.filter((t) => t.busy).length} other tab
-                {tabs.filter((t) => t.busy).length === 1 ? "" : "s"} running
-              </span>
-            )}
-          </div>
-          <div className="composer-row">
+          <div className={`composer-shell ${busy ? "is-busy" : ""}`}>
             <textarea
+              className="composer-input"
               value={composer}
+              rows={2}
               placeholder={
                 busy
                   ? "This session is running… switch tabs to start another"
                   : workspaceMode === "chat"
-                    ? "Message Grok… (Enter send, Shift+Enter newline)"
-                    : "Message the coding agent… (Enter send, Shift+Enter newline)"
+                    ? "Message Grok…"
+                    : "Message the coding agent…"
               }
               onChange={(e) => setComposer(e.target.value)}
               onKeyDown={(e) => {
@@ -1101,14 +1244,116 @@ export default function App() {
                 }
               }}
             />
-            <button
-              type="button"
-              className="primary"
-              disabled={busy}
-              onClick={() => void sendPrompt()}
-            >
-              Send
-            </button>
+            <div className="composer-toolbar">
+              <div className="composer-toolbar-left">
+                <label className="composer-pill" title="Model">
+                  <span className="composer-pill-label">Model</span>
+                  <select
+                    value={
+                      models.some((m) => m.id === status?.model)
+                        ? (status?.model ?? models[0]?.id ?? "grok-build")
+                        : (models[0]?.id ?? status?.model ?? "grok-build")
+                    }
+                    onChange={async (e) => {
+                      await api.setModel(e.target.value);
+                      await refreshChrome();
+                    }}
+                  >
+                    {models.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.display_name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="composer-pill" title="Reasoning effort">
+                  <span className="composer-pill-label">Effort</span>
+                  <select
+                    value={String(status?.effort ?? "medium")}
+                    onChange={async (e) => {
+                      await api.setEffort(e.target.value);
+                      await refreshChrome();
+                    }}
+                  >
+                    {[
+                      "none",
+                      "minimal",
+                      "low",
+                      "medium",
+                      "high",
+                      "xhigh",
+                      "max",
+                    ].map((e) => (
+                      <option key={e} value={e}>
+                        {e}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  className={`composer-chip ${status?.always_approve ? "on" : ""}`}
+                  title="Always approve tool calls (yolo)"
+                  onClick={async () => {
+                    await api.setAlwaysApprove(!status?.always_approve);
+                    await refreshChrome();
+                  }}
+                >
+                  Auto
+                </button>
+                <button
+                  type="button"
+                  className={`composer-chip ${showTerm ? "on" : ""}`}
+                  title={showTerm ? "Hide terminal" : "Show terminal"}
+                  onClick={() => setShowTerm((v) => !v)}
+                >
+                  Term
+                </button>
+                {anyBusy && !busy && (
+                  <span
+                    className="composer-hint"
+                    title="Other session tabs are still running"
+                  >
+                    {tabs.filter((t) => t.busy).length} other running
+                  </span>
+                )}
+              </div>
+              <div className="composer-toolbar-right">
+                {busy && (
+                  <button
+                    type="button"
+                    className="composer-stop"
+                    title="Stop this session"
+                    onClick={() => void api.sessionCancel(activeSessionId)}
+                  >
+                    Stop
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="composer-send"
+                  disabled={busy || !composer.trim()}
+                  title={busy ? "Session busy" : "Send (Enter)"}
+                  onClick={() => void sendPrompt()}
+                >
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 16 16"
+                    fill="none"
+                    aria-hidden
+                  >
+                    <path
+                      d="M8 13V3M8 3L3.5 7.5M8 3l4.5 4.5"
+                      stroke="currentColor"
+                      strokeWidth="1.75"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       </main>
@@ -1506,6 +1751,8 @@ export default function App() {
           </div>
         </div>
       )}
+
+      <ContextMenu menu={ctxMenu} onClose={() => setCtxMenu(null)} />
 
       <SessionBrowser
         open={sessionBrowserOpen}

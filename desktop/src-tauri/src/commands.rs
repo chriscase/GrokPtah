@@ -168,6 +168,40 @@ pub fn session_set_folder(
 }
 
 #[tauri::command]
+pub fn session_set_cwd(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<SessionSummary, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state.host.session_set_cwd(id, path).map_err(map_err)
+}
+
+/// Folder picker scoped to one session (does not require a global project first).
+#[tauri::command]
+pub async fn pick_session_folder(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<SessionSummary>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let path = app
+        .dialog()
+        .file()
+        .set_title("Set working directory for this build")
+        .blocking_pick_folder();
+    match path {
+        Some(p) => {
+            let path_buf = p.into_path().map_err(map_err)?;
+            let s = path_buf.to_string_lossy().into_owned();
+            let summary = state.host.session_set_cwd(id, &s).map_err(map_err)?;
+            Ok(Some(summary))
+        }
+        None => Ok(None),
+    }
+}
+
+#[tauri::command]
 pub fn session_set_tags(
     state: State<'_, AppState>,
     session_id: String,
