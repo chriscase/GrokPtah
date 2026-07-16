@@ -134,6 +134,9 @@ export interface WorkspaceUiState {
   sessions: SessionSummary[];
 }
 
+/** Attention badge for tabs/sidebar when this session isn't focused. */
+export type AttentionKind = "none" | "unseen" | "permission";
+
 /** Client-side open workspace (Claude Code–style concurrent session tab). */
 export interface SessionTab {
   id: string;
@@ -143,6 +146,10 @@ export interface SessionTab {
   plan: { steps: string[]; status: string } | null;
   /** Live turn indicator (server activity vs idle/done). */
   activity: ActivityState;
+  /** Unread activity while the user was on another tab. */
+  unseen: boolean;
+  /** Distinct “needs your button” state (permission / plan accept). */
+  needsPermission: boolean;
 }
 
 export type TranscriptItem =

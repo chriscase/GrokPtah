@@ -51,6 +51,8 @@ function emptyTab(id: string, title = "New session"): SessionTab {
     busy: false,
     plan: null,
     activity: idleActivity(),
+    unseen: false,
+    needsPermission: false,
   };
 }
 
@@ -59,6 +61,11 @@ function withActivity(
   patch: Partial<ActivityState> & Pick<ActivityState, "phase" | "label">,
 ): SessionTab {
   const at = Date.now();
+  const background =
+    activeSessionIdForEvents != null && tab.id !== activeSessionIdForEvents;
+  const permission = patch.phase === "permission";
+  const cleared =
+    patch.phase === "done" || patch.phase === "idle" || patch.phase === "error";
   return {
     ...tab,
     activity: {
@@ -67,8 +74,18 @@ function withActivity(
       lastEventAt: at,
       live: patch.live ?? tab.activity.live,
     },
+    // Background tabs light up when anything arrives for them.
+    unseen: background && (patch.live || permission) ? true : tab.unseen,
+    needsPermission: permission
+      ? true
+      : cleared
+        ? false
+        : tab.needsPermission,
   };
 }
+
+/** Ref used by applyUpdate so background tabs can be marked unseen. */
+let activeSessionIdForEvents: string | null = null;
 
 export default function App() {
   const [status, setStatus] = useState<AgentStatus | null>(null);
@@ -111,10 +128,25 @@ export default function App() {
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // Keep event router aware of focus for unseen badges.
+  activeSessionIdForEvents = activeSessionId;
+
   const activeTab = useMemo(
     () => tabs.find((t) => t.id === activeSessionId) ?? null,
     [tabs, activeSessionId],
   );
+
+  // Focusing a tab clears its unseen badge.
+  useEffect(() => {
+    if (!activeSessionId) return;
+    setTabs((prev) =>
+      prev.map((t) =>
+        t.id === activeSessionId
+          ? { ...t, unseen: false, needsPermission: t.activity.phase === "permission" }
+          : t,
+      ),
+    );
+  }, [activeSessionId]);
   const transcript = activeTab?.transcript ?? [];
   const busy = activeTab?.busy ?? false;
   const plan = activeTab?.plan ?? null;
@@ -629,7 +661,12 @@ export default function App() {
 
       <aside className="sidebar">
         <div className="section-title">Workspace</div>
-        <div className="workspace-mode" role="tablist" aria-label="Workspace mode">
+        <div
+          className="workspace-mode"
+          data-mode={workspaceMode}
+          role="tablist"
+          aria-label="Workspace mode"
+        >
           <button
             type="button"
             className={workspaceMode === "build" ? "active" : ""}
@@ -678,12 +715,13 @@ export default function App() {
         </p>
         {sessions.map((s) => {
           const open = tabs.some((t) => t.id === s.id);
-          const running = tabs.find((t) => t.id === s.id)?.busy;
+          const tabMeta = tabs.find((t) => t.id === s.id);
+          const running = tabMeta?.busy;
           return (
             <button
               key={s.id}
               type="button"
-              className={`session-item ${s.id === activeSessionId ? "active" : ""} ${running ? "busy" : ""}`}
+              className={`session-item ${s.id === activeSessionId ? "active" : ""} ${running ? "busy" : ""} ${tabMeta?.needsPermission ? "needs-permission" : ""} ${tabMeta?.unseen ? "has-unseen" : ""}`}
               onClick={async () => {
                 await api.sessionLoad(s.id);
                 await openTab(s, !open);
@@ -691,7 +729,16 @@ export default function App() {
               onDoubleClick={() => setSessionBrowserOpen(true)}
             >
               <div className="session-item-title">
-                {running && <span className="busy-dot" title="Running" />}
+                {tabMeta?.needsPermission ? (
+                  <span
+                    className="attn-dot permission"
+                    title="Needs your response"
+                  />
+                ) : running ? (
+                  <span className="busy-dot" title="Running" />
+                ) : tabMeta?.unseen ? (
+                  <span className="attn-dot unseen" title="Unseen activity" />
+                ) : null}
                 <span className={`kind-chip ${s.kind ?? workspaceMode}`}>
                   {s.kind ?? workspaceMode}
                 </span>
@@ -823,7 +870,7 @@ export default function App() {
             {tabs.map((t) => (
               <div
                 key={t.id}
-                className={`session-tab ${t.id === activeSessionId ? "active" : ""} ${t.busy ? "busy" : ""}`}
+                className={`session-tab ${t.id === activeSessionId ? "active" : ""} ${t.busy ? "busy" : ""} ${t.needsPermission ? "needs-permission" : ""} ${t.unseen ? "has-unseen" : ""}`}
                 role="tab"
                 aria-selected={t.id === activeSessionId}
               >
@@ -833,7 +880,16 @@ export default function App() {
                   onClick={() => setActiveSessionId(t.id)}
                   title={t.title}
                 >
-                  {t.busy && <span className="busy-dot" />}
+                  {t.needsPermission ? (
+                    <span
+                      className="attn-dot permission"
+                      title="Needs your response"
+                    />
+                  ) : t.busy ? (
+                    <span className="busy-dot" title="Working" />
+                  ) : t.unseen ? (
+                    <span className="attn-dot unseen" title="Unseen activity" />
+                  ) : null}
                   <span className="session-tab-text">{t.title}</span>
                 </button>
                 <button
@@ -852,11 +908,11 @@ export default function App() {
             <button
               type="button"
               className="session-tab-new"
-              title="New session tab"
+              title={`New ${workspaceMode} tab`}
               onClick={async () => {
-                const s = await api.sessionNew();
+                const s = await api.sessionNewKind(workspaceMode);
                 await openTab(s, false);
-                setSessions(await api.sessionList());
+                await refreshSessions();
               }}
             >
               +
@@ -934,18 +990,16 @@ export default function App() {
               {(item.kind === "user" || item.kind === "error") && item.text}
             </div>
           ))}
-          {/* Live waiting indicator while the active tab is mid-turn */}
-          {(busy || activity.phase === "done" || activity.phase === "error") && (
-            <div className="activity-in-transcript">
-              <ActivityIndicator activity={activity} busy={busy} />
-            </div>
-          )}
           <div ref={bottomRef} />
         </div>
 
-        {showTerm && <TerminalPane toolShell={toolShell} />}
+        {showTerm && (
+          <div className="terminal-slot">
+            <TerminalPane toolShell={toolShell} />
+          </div>
+        )}
 
-        {/* Always-on strip above composer so idle vs live is never ambiguous */}
+        {/* Always-on strip: live server work vs idle/done */}
         <ActivityIndicator activity={activity} busy={busy} />
 
         <div className="composer-wrap">
@@ -1361,12 +1415,20 @@ export default function App() {
 
       {permission && (
         <div className="modal-backdrop">
-          <div className="modal">
-            <h3>Permission required</h3>
+          <div className="modal permission-modal">
+            <h3>Needs your response</h3>
             <p>{permission.summary}</p>
-            <pre style={{ fontSize: 12, color: "var(--muted)" }}>
-              {JSON.stringify(permission.detail, null, 2)}
-            </pre>
+            <p style={{ fontSize: 12, color: "var(--muted)", marginTop: 0 }}>
+              Tool: <code>{permission.tool_name}</code>
+            </p>
+            <details style={{ marginBottom: "0.75rem" }}>
+              <summary style={{ cursor: "pointer", color: "var(--muted)", fontSize: 12 }}>
+                Technical details
+              </summary>
+              <pre style={{ fontSize: 11, color: "var(--muted)", maxHeight: 160, overflow: "auto" }}>
+                {JSON.stringify(permission.detail, null, 2)}
+              </pre>
+            </details>
             <div className="modal-actions">
               <button
                 type="button"
@@ -1374,6 +1436,20 @@ export default function App() {
                 onClick={async () => {
                   await api.permissionRespond(permission.id, "deny");
                   setPermission(null);
+                  if (activeSessionId) {
+                    patchTab(activeSessionId, (t) => ({
+                      ...t,
+                      needsPermission: false,
+                      activity: {
+                        ...t.activity,
+                        phase: "tool",
+                        label: "Working",
+                        detail: "Permission denied",
+                        live: true,
+                        lastEventAt: Date.now(),
+                      },
+                    }));
+                  }
                 }}
               >
                 Deny
@@ -1383,6 +1459,20 @@ export default function App() {
                 onClick={async () => {
                   await api.permissionRespond(permission.id, "always_allow");
                   setPermission(null);
+                  if (activeSessionId) {
+                    patchTab(activeSessionId, (t) => ({
+                      ...t,
+                      needsPermission: false,
+                      activity: {
+                        ...t.activity,
+                        phase: "tool",
+                        label: "Working",
+                        detail: "Continuing…",
+                        live: true,
+                        lastEventAt: Date.now(),
+                      },
+                    }));
+                  }
                   await refreshChrome();
                 }}
               >
@@ -1394,6 +1484,20 @@ export default function App() {
                 onClick={async () => {
                   await api.permissionRespond(permission.id, "allow");
                   setPermission(null);
+                  if (activeSessionId) {
+                    patchTab(activeSessionId, (t) => ({
+                      ...t,
+                      needsPermission: false,
+                      activity: {
+                        ...t.activity,
+                        phase: "tool",
+                        label: "Working",
+                        detail: "Continuing…",
+                        live: true,
+                        lastEventAt: Date.now(),
+                      },
+                    }));
+                  }
                 }}
               >
                 Allow
@@ -1642,7 +1746,7 @@ function applyUpdate(
       if (sid) {
         withTab(sid, (tab) =>
           withActivity(
-            { ...tab, busy: true },
+            { ...tab, busy: true, needsPermission: true, unseen: true },
             { ...phaseFromPermission(), live: true },
           ),
         );
