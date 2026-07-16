@@ -32,6 +32,13 @@ Covered by unit + lifecycle tests offline:
 
 Live (manual): Build mode should stream assistant tokens mid-step; Stop cancels HTTP within ~1s; enabled stdio MCP tools appear as `mcp__server__tool`.
 
+## Phase 15 P2 (plan / hooks / slash / sandbox / explore)
+
+- Plan propose → **Accept & execute** runs plan as context (offline plan steps always)
+- PreToolUse deny hooks (`hooks.json`)
+- Slash: `/model` `/effort` `/clear` `/context` `/mcp` `/skills` `/sandbox` `/explore` `/compact`
+- Sandbox `read-only` blocks writes; `/explore` emits `SubagentSpawned`
+
 ## Full harness (TODO)
 
 Automate fixture tasks vs CLI in CI once #78/#79 stabilize. Track progress on #93.

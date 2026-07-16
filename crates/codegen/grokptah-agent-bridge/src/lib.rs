@@ -6,6 +6,7 @@
 mod auth_store;
 mod discover;
 mod events;
+mod hooks;
 mod host;
 mod local_tools;
 mod mcp_runtime;

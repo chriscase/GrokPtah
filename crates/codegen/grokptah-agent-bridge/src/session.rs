@@ -72,6 +72,12 @@ pub struct Session {
     pub plan_mode: bool,
     #[serde(default)]
     pub plan_steps: Vec<String>,
+    /// proposed | accepted | executing | done | rejected | ""
+    #[serde(default)]
+    pub plan_status: String,
+    /// Original user goal that the plan addresses.
+    #[serde(default)]
+    pub plan_goal: Option<String>,
     /// Server-facing summary of transcript *before* [`api_context_start`].
     /// Local `transcript` is never truncated by compact — this only shrinks
     /// what is re-sent to the model on the next turn.
@@ -128,6 +134,8 @@ impl Session {
             effort,
             plan_mode: false,
             plan_steps: Vec::new(),
+            plan_status: String::new(),
+            plan_goal: None,
             compacted_summary: None,
             api_context_start: 0,
             folder: None,

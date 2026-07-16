@@ -141,7 +141,7 @@ export const api = {
   setPlanMode: (sessionId: string, enabled: boolean) =>
     invoke<void>("set_plan_mode", { sessionId, enabled }),
   acceptPlan: (sessionId: string) =>
-    invoke<void>("accept_plan", { sessionId }),
+    invoke<string>("accept_plan", { sessionId }),
   rejectPlan: (sessionId: string) =>
     invoke<void>("reject_plan", { sessionId }),
   productInfo: () =>

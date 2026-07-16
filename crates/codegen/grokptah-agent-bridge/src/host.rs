@@ -720,6 +720,8 @@ impl AgentHostHandle {
             s.forked_from = Some(source);
             s.plan_mode = src.plan_mode;
             s.plan_steps = src.plan_steps.clone();
+            s.plan_status = src.plan_status.clone();
+            s.plan_goal = src.plan_goal.clone();
             s.compacted_summary = src.compacted_summary.clone();
             s.api_context_start = src.api_context_start;
             s.kind = src.kind;
@@ -820,7 +822,7 @@ impl AgentHostHandle {
     }
 
     pub fn set_sandbox(&self, profile: String) {
-        self.inner.lock().sandbox_profile = profile;
+        self.inner.lock().sandbox_profile = normalize_sandbox_profile(&profile).to_string();
         self.persist_chrome();
     }
 
@@ -1201,25 +1203,77 @@ impl AgentHostHandle {
             .get_mut(&session_id)
             .ok_or_else(|| anyhow!("unknown session"))?;
         s.plan_mode = enabled;
+        if enabled && s.plan_status.is_empty() {
+            s.plan_status = "proposed".into();
+        }
         Ok(())
     }
 
-    pub fn accept_plan(&self, session_id: Uuid) -> Result<()> {
-        let mut g = self.inner.lock();
-        let s = g
-            .sessions
-            .get_mut(&session_id)
-            .ok_or_else(|| anyhow!("unknown session"))?;
-        s.plan_mode = false;
-        let steps = s.plan_steps.clone();
-        let tx = g.event_tx.clone();
-        drop(g);
-        let _ = tx.send(SessionUpdate::Plan {
-            session_id,
-            steps,
-            status: "accepted".into(),
-        });
-        Ok(())
+    /// Accept the proposed plan and immediately start an execution turn that
+    /// follows those steps (plan → execute pipeline).
+    pub async fn accept_plan(&self, session_id: Uuid) -> Result<String> {
+        let (steps, goal) = {
+            let mut g = self.inner.lock();
+            let s = g
+                .sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            if s.plan_steps.is_empty() {
+                bail!("no plan to accept");
+            }
+            s.plan_mode = false;
+            s.plan_status = "accepted".into();
+            let steps = s.plan_steps.clone();
+            let goal = s
+                .plan_goal
+                .clone()
+                .unwrap_or_else(|| "complete the proposed plan".into());
+            let tx = g.event_tx.clone();
+            drop(g);
+            let _ = tx.send(SessionUpdate::Plan {
+                session_id,
+                steps: steps.clone(),
+                status: "accepted".into(),
+            });
+            (steps, goal)
+        };
+
+        let mut numbered = String::new();
+        for (i, step) in steps.iter().enumerate() {
+            numbered.push_str(&format!("{}. {}\n", i + 1, step));
+        }
+        let exec_prompt = format!(
+            "Execute this accepted plan step by step using tools. \
+             Do not re-plan unless blocked. When finished, summarize what you did.\n\n\
+             Goal: {goal}\n\nPlan:\n{numbered}"
+        );
+
+        {
+            let mut g = self.inner.lock();
+            if let Some(s) = g.sessions.get_mut(&session_id) {
+                s.plan_status = "executing".into();
+            }
+        }
+        let reply = self.session_prompt(session_id, exec_prompt).await?;
+        {
+            let mut g = self.inner.lock();
+            if let Some(s) = g.sessions.get_mut(&session_id) {
+                s.plan_status = "done".into();
+            }
+            let tx = g.event_tx.clone();
+            let steps = g
+                .sessions
+                .get(&session_id)
+                .map(|s| s.plan_steps.clone())
+                .unwrap_or_default();
+            drop(g);
+            let _ = tx.send(SessionUpdate::Plan {
+                session_id,
+                steps,
+                status: "done".into(),
+            });
+        }
+        Ok(reply)
     }
 
     pub fn reject_plan(&self, session_id: Uuid) -> Result<()> {
@@ -1230,6 +1284,8 @@ impl AgentHostHandle {
             .ok_or_else(|| anyhow!("unknown session"))?;
         s.plan_mode = false;
         s.plan_steps.clear();
+        s.plan_status = "rejected".into();
+        s.plan_goal = None;
         let tx = g.event_tx.clone();
         drop(g);
         let _ = tx.send(SessionUpdate::Plan {
@@ -1459,38 +1515,73 @@ impl AgentHostHandle {
             return Ok(reply);
         }
 
+        // Plan mode: propose structured steps (model-backed when online).
         if plan_mode || lower.starts_with("/plan") || lower.contains("make a plan") {
-            let steps = vec![
-                "Explore the relevant files".into(),
-                "Draft implementation approach".into(),
-                "Apply changes with permissions".into(),
-                "Verify with tests".into(),
-            ];
+            let goal = prompt
+                .strip_prefix('/')
+                .and_then(|r| r.strip_prefix("plan"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(prompt)
+                .trim()
+                .to_string();
+            let goal = if goal.eq_ignore_ascii_case("plan")
+                || goal.to_lowercase().starts_with("make a plan")
+            {
+                goal
+            } else {
+                goal
+            };
+
+            let steps = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
+                offline_plan_steps(&goal)
+            } else if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
+                match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
+                    Ok(s) if !s.is_empty() => s,
+                    Ok(_) => offline_plan_steps(&goal),
+                    Err(e) => {
+                        let mut s = offline_plan_steps(&goal);
+                        s.insert(0, format!("(model plan fallback: {e})"));
+                        s
+                    }
+                }
+            } else {
+                offline_plan_steps(&goal)
+            };
+
             {
                 let mut g = self.inner.lock();
                 if let Some(s) = g.sessions.get_mut(&session_id) {
                     s.plan_mode = true;
                     s.plan_steps = steps.clone();
+                    s.plan_status = "proposed".into();
+                    s.plan_goal = Some(goal.clone());
                 }
             }
             let _ = event_tx.send(SessionUpdate::Plan {
                 session_id,
-                steps,
+                steps: steps.clone(),
                 status: "proposed".into(),
             });
-            let msg = "Plan proposed. Accept or reject from the plan panel.";
-            emit_message(&event_tx, session_id, msg);
-            push_assistant(self, session_id, msg);
-            return Ok(msg.into());
+            let mut msg = String::from("Plan proposed. Accept or reject from the plan panel.\n\n");
+            for (i, step) in steps.iter().enumerate() {
+                msg.push_str(&format!("{}. {}\n", i + 1, step));
+            }
+            emit_message(&event_tx, session_id, &msg);
+            push_assistant(self, session_id, &msg);
+            return Ok(msg);
         }
 
         if let Some(rest) = prompt.strip_prefix('/') {
-            let cmd = rest.split_whitespace().next().unwrap_or("");
+            let mut parts = rest.split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+            let args: Vec<&str> = parts.collect();
             match cmd {
                 "help" => {
-                    let text =
-                        "Commands: /help /compact /plan /yolo. Build mode uses a multi-step tool loop \
-                         (list_dir, read_file, grep, write_file, run_terminal_cmd) until the task is done.";
+                    let text = "Commands: /help /compact /plan [goal] /yolo /model [id] \
+                         /effort [none|low|medium|high|max] /clear /context /mcp /skills \
+                         /sandbox [read-only|workspace-write|full] /explore [query].\n\
+                         Build mode: multi-step tool loop + optional plan accept→execute.";
                     emit_message(&event_tx, session_id, text);
                     push_assistant(self, session_id, text);
                     return Ok(text.into());
@@ -1501,6 +1592,156 @@ impl AgentHostHandle {
                     emit_message(&event_tx, session_id, text);
                     push_assistant(self, session_id, text);
                     return Ok(text.into());
+                }
+                "compact" => {
+                    let _ = self.compact_session(session_id)?;
+                    let text = "Context compacted for the server. Full local history retained.";
+                    emit_message(&event_tx, session_id, text);
+                    push_assistant(self, session_id, text);
+                    return Ok(text.into());
+                }
+                "model" => {
+                    if let Some(id) = args.first() {
+                        self.set_model((*id).to_string());
+                        let text = format!("Model set to `{id}`.");
+                        emit_message(&event_tx, session_id, &text);
+                        push_assistant(self, session_id, &text);
+                        return Ok(text);
+                    }
+                    let cur = self.inner.lock().model.clone();
+                    let text = format!("Current model: `{cur}`. Usage: /model <id>");
+                    emit_message(&event_tx, session_id, &text);
+                    push_assistant(self, session_id, &text);
+                    return Ok(text);
+                }
+                "effort" => {
+                    if let Some(raw) = args.first() {
+                        let e = parse_effort_arg(raw);
+                        self.set_effort(e);
+                        let text = format!("Effort set to `{}`.", e.as_str());
+                        emit_message(&event_tx, session_id, &text);
+                        push_assistant(self, session_id, &text);
+                        return Ok(text);
+                    }
+                    let cur = self.inner.lock().effort;
+                    let text = format!(
+                        "Current effort: `{}`. Usage: /effort none|low|medium|high|max",
+                        cur.as_str()
+                    );
+                    emit_message(&event_tx, session_id, &text);
+                    push_assistant(self, session_id, &text);
+                    return Ok(text);
+                }
+                "clear" => {
+                    {
+                        let mut g = self.inner.lock();
+                        if let Some(s) = g.sessions.get_mut(&session_id) {
+                            s.transcript.clear();
+                            s.api_context_start = 0;
+                            s.compacted_summary = None;
+                            s.persisted_len = 0;
+                            s.plan_mode = false;
+                            s.plan_steps.clear();
+                            s.plan_status.clear();
+                            s.plan_goal = None;
+                            s.updated_at = Utc::now();
+                        }
+                    }
+                    self.persist_session_rewrite(session_id);
+                    let text = "Session cleared (local transcript reset).";
+                    emit_message(&event_tx, session_id, text);
+                    push_assistant(self, session_id, text);
+                    return Ok(text.into());
+                }
+                "context" | "cost" => {
+                    let text = {
+                        let g = self.inner.lock();
+                        let s = g
+                            .sessions
+                            .get(&session_id)
+                            .ok_or_else(|| anyhow!("unknown session"))?;
+                        let total = s.transcript.len().max(s.persisted_len);
+                        let window = total.saturating_sub(s.api_context_start);
+                        format!(
+                            "Context: {total} local messages · API window starts at index {} \
+                             ({window} messages on wire) · model `{}` · effort `{}` · \
+                             sandbox `{}` · compact summary: {} chars",
+                            s.api_context_start,
+                            g.model,
+                            g.effort.as_str(),
+                            g.sandbox_profile,
+                            s.compacted_summary.as_ref().map(|c| c.len()).unwrap_or(0)
+                        )
+                    };
+                    emit_message(&event_tx, session_id, &text);
+                    push_assistant(self, session_id, &text);
+                    return Ok(text);
+                }
+                "mcp" => {
+                    let lines = self.mcp_doctor();
+                    let servers = self.mcp_list();
+                    let mut text = String::from("MCP servers:\n");
+                    for s in &servers {
+                        text.push_str(&format!(
+                            "- {} [{}] enabled={} status={}\n",
+                            s.name, s.transport, s.enabled, s.status
+                        ));
+                    }
+                    if servers.is_empty() {
+                        text.push_str("(none configured)\n");
+                    }
+                    text.push_str("\nDoctor:\n");
+                    text.push_str(&lines.join("\n"));
+                    emit_message(&event_tx, session_id, &text);
+                    push_assistant(self, session_id, &text);
+                    return Ok(text);
+                }
+                "skills" => {
+                    let skills = self.skills();
+                    let mut text = String::from("Skills:\n");
+                    for s in &skills {
+                        text.push_str(&format!("- **{}**: {}\n", s.name, s.description));
+                    }
+                    if skills.is_empty() {
+                        text.push_str("(none discovered)\n");
+                    }
+                    emit_message(&event_tx, session_id, &text);
+                    push_assistant(self, session_id, &text);
+                    return Ok(text);
+                }
+                "sandbox" => {
+                    if let Some(p) = args.first() {
+                        let norm = normalize_sandbox_profile(p);
+                        self.set_sandbox(norm.to_string());
+                        let text = format!("Sandbox profile set to `{norm}`.");
+                        emit_message(&event_tx, session_id, &text);
+                        push_assistant(self, session_id, &text);
+                        return Ok(text);
+                    }
+                    let cur = self.inner.lock().sandbox_profile.clone();
+                    let text = format!(
+                        "Sandbox: `{cur}`.\n\
+                         Profiles: `read-only` (no writes/mutators), \
+                         `workspace-write` (edits under project root only), \
+                         `full` (no agent sandbox gates).\n\
+                         Usage: /sandbox <profile>"
+                    );
+                    emit_message(&event_tx, session_id, &text);
+                    push_assistant(self, session_id, &text);
+                    return Ok(text);
+                }
+                "explore" => {
+                    let query = if args.is_empty() {
+                        "summarize project layout".to_string()
+                    } else {
+                        args.join(" ")
+                    };
+                    let summary = self
+                        .run_explore_subagent(session_id, cwd, &query, &cancel, &event_tx)
+                        .await?;
+                    emit_message(&event_tx, session_id, &summary);
+                    push_assistant(self, session_id, &summary);
+                    return Ok(summary);
                 }
                 _ => {}
             }
@@ -1597,30 +1838,38 @@ impl AgentHostHandle {
                 let path = path.trim().to_string();
                 let content = content.trim().to_string();
                 let path_rec = path.clone();
-                let _ = self
-                    .run_tool_for_output(
-                        session_id,
-                        "write_file",
-                        &serde_json::json!({ "path": path, "content": content }),
-                        || {
-                            let cwd = cwd.to_path_buf();
-                            let path = path.clone();
-                            let content = content.clone();
-                            async move {
-                                local_tools::tool_write_file(&cwd, &path, &content).await
-                            }
-                        },
-                        cancel,
-                        event_tx,
-                    )
-                    .await;
-                self.emit_file_edit(
-                    session_id,
-                    cwd,
-                    &path_rec,
-                    &format!("Wrote {path_rec}"),
-                    event_tx,
-                );
+                if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
+                    let msg = "ERROR: sandbox is read-only; write_file denied";
+                    emit_message(event_tx, session_id, msg);
+                    // still finish turn below
+                } else {
+                    let out = self
+                        .run_tool_for_output(
+                            session_id,
+                            "write_file",
+                            &serde_json::json!({ "path": path, "content": content }),
+                            || {
+                                let cwd = cwd.to_path_buf();
+                                let path = path.clone();
+                                let content = content.clone();
+                                async move {
+                                    local_tools::tool_write_file(&cwd, &path, &content).await
+                                }
+                            },
+                            cancel,
+                            event_tx,
+                        )
+                        .await;
+                    if out.as_ref().is_ok_and(|s| !s.starts_with("DENIED")) {
+                        self.emit_file_edit(
+                            session_id,
+                            cwd,
+                            &path_rec,
+                            &format!("Wrote {path_rec}"),
+                            event_tx,
+                        );
+                    }
+                }
             }
         }
         if let Some(cmd) = prompt
@@ -1653,7 +1902,27 @@ impl AgentHostHandle {
         event_tx: &mpsc::UnboundedSender<SessionUpdate>,
     ) -> Result<String> {
         const MAX_ROUNDS: usize = 24;
-        let mut messages = build_agent_messages(history, compacted_summary, cwd);
+        let active_plan = {
+            let g = self.inner.lock();
+            g.sessions.get(&session_id).and_then(|s| {
+                if matches!(s.plan_status.as_str(), "accepted" | "executing" | "done")
+                    && !s.plan_steps.is_empty()
+                {
+                    Some((
+                        s.plan_goal
+                            .clone()
+                            .unwrap_or_else(|| "execute plan".into()),
+                        s.plan_steps.clone(),
+                    ))
+                } else {
+                    None
+                }
+            })
+        };
+        let plan_ref = active_plan
+            .as_ref()
+            .map(|(g, steps)| (g.as_str(), steps.as_slice()));
+        let mut messages = build_agent_messages(history, compacted_summary, cwd, plan_ref);
 
         // Best-effort MCP discovery (skipped when offline env set for tests).
         let mcp_specs = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some()
@@ -2087,11 +2356,148 @@ impl AgentHostHandle {
                     }
                 }
             }
+            "spawn_explore" => {
+                let query = args
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("explore the codebase")
+                    .to_string();
+                self.run_explore_subagent(session_id, cwd, &query, cancel, event_tx)
+                    .await
+            }
             other => Ok(format!(
                 "Unknown tool `{other}`. Available: list_dir, read_file, grep, write_file, \
-                 run_terminal_cmd, glob_files, apply_patch, and mcp__* tools"
+                 run_terminal_cmd, glob_files, apply_patch, spawn_explore, and mcp__* tools"
             )),
         }
+    }
+
+    /// Read-only explore subagent: gather layout/search hits and return a summary.
+    async fn run_explore_subagent(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        query: &str,
+        cancel: &CancellationToken,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) -> Result<String> {
+        let sub_id = Uuid::new_v4().to_string();
+        {
+            let mut g = self.inner.lock();
+            g.subagents.push(SubagentInfo {
+                id: sub_id.clone(),
+                kind: "explore".into(),
+                title: query.chars().take(48).collect(),
+                status: "running".into(),
+            });
+        }
+        let _ = event_tx.send(SessionUpdate::SubagentSpawned {
+            session_id,
+            subagent_id: sub_id.clone(),
+            kind: "explore".into(),
+            title: query.chars().take(64).collect(),
+        });
+
+        if cancel.is_cancelled() {
+            self.finish_subagent(&sub_id, "cancelled", event_tx, session_id, None);
+            return Ok("(explore cancelled)".into());
+        }
+
+        // Deterministic explore: list + glob + optional grep (read-only tools).
+        let listing = local_tools::tool_list_dir(cwd, ".")
+            .await
+            .map(|t| t.output)
+            .unwrap_or_else(|e| format!("list_dir error: {e}"));
+        let globs = crate::project_context::glob_files(cwd, "*.{rs,ts,tsx,js,py,md,toml,json}", 40);
+        let mut parts = vec![
+            format!("## Explore: {query}"),
+            "### Project root listing".into(),
+            listing.chars().take(4_000).collect(),
+            "### Sample files".into(),
+            if globs.is_empty() {
+                "(no matches)".into()
+            } else {
+                globs.join("\n")
+            },
+        ];
+
+        // Keyword grep from query tokens
+        let tokens: Vec<&str> = query
+            .split_whitespace()
+            .filter(|t| {
+                if t.len() <= 2 {
+                    return false;
+                }
+                let l = t.to_ascii_lowercase();
+                !matches!(l.as_str(), "the" | "and" | "for" | "with" | "this")
+            })
+            .take(3)
+            .collect();
+        for tok in tokens {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if let Ok(tr) = local_tools::tool_grep(cwd, tok, ".").await {
+                parts.push(format!("### grep `{tok}`\n{}", tr.output.chars().take(2_000).collect::<String>()));
+            }
+        }
+
+        // Online: optional short model summary of findings
+        let mut summary = parts.join("\n\n");
+        if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none() {
+            if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
+                let model = self.inner.lock().model.clone();
+                let ask = format!(
+                    "You are a read-only explore agent. Summarize findings for the parent agent.\n\
+                     Query: {query}\n\nFindings:\n{}",
+                    summary.chars().take(8_000).collect::<String>()
+                );
+                if let Ok(text) = call_xai_chat(
+                    &creds,
+                    &model,
+                    &[("user".into(), ask)],
+                    None,
+                    cwd,
+                    SessionKind::Build,
+                )
+                .await
+                {
+                    summary = format!("{summary}\n\n### Explorer summary\n{text}");
+                }
+            }
+        }
+
+        let clipped: String = summary.chars().take(20_000).collect();
+        self.finish_subagent(
+            &sub_id,
+            "completed",
+            event_tx,
+            session_id,
+            Some(clipped.chars().take(200).collect()),
+        );
+        Ok(clipped)
+    }
+
+    fn finish_subagent(
+        &self,
+        sub_id: &str,
+        status: &str,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        session_id: Uuid,
+        detail: Option<String>,
+    ) {
+        {
+            let mut g = self.inner.lock();
+            if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
+                s.status = status.into();
+            }
+        }
+        let _ = event_tx.send(SessionUpdate::SubagentUpdate {
+            session_id,
+            subagent_id: sub_id.to_string(),
+            status: status.into(),
+            detail,
+        });
     }
 
     async fn run_mcp_tool(
@@ -2220,8 +2626,42 @@ impl AgentHostHandle {
         if cancel.is_cancelled() {
             return Ok("(cancelled)".into());
         }
+
+        // Sandbox: deny writes in read-only for shared tool path.
+        if matches!(tool_name, "write_file" | "apply_patch")
+            && sandbox_is_readonly(&self.inner.lock().sandbox_profile)
+        {
+            return Ok(format!(
+                "ERROR: sandbox is read-only; {tool_name} denied"
+            ));
+        }
+
+        // PreToolUse hooks can deny before permission UI / execution.
+        let project = self.inner.lock().project_cwd.clone();
+        if let Some(msg) =
+            crate::hooks::pre_tool_use_deny(project.as_deref(), tool_name, input)
+        {
+            let call_id = Uuid::new_v4().to_string();
+            let _ = event_tx.send(SessionUpdate::ToolCall {
+                session_id,
+                call_id: call_id.clone(),
+                title: tool_name.into(),
+                kind: tool_kind(tool_name),
+                status: ToolCallStatus::Denied,
+                input: input.clone(),
+            });
+            let out = format!("DENIED by hook: {msg}");
+            let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
+                session_id,
+                call_id,
+                status: ToolCallStatus::Denied,
+                output: Some(out.clone()),
+            });
+            return Ok(out);
+        }
+
         let call_id = Uuid::new_v4().to_string();
-        let needs_perm = matches!(tool_name, "run_terminal_cmd" | "write_file");
+        let needs_perm = matches!(tool_name, "run_terminal_cmd" | "write_file" | "apply_patch");
         let always = {
             let g = self.inner.lock();
             g.always_approve
@@ -2280,20 +2720,34 @@ impl AgentHostHandle {
         match f().await {
             Ok(tr) => {
                 let out = tr.output.clone();
+                let status = if tr.cancelled {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
+                let status_s = if tr.cancelled { "failed" } else { "completed" };
+                let _ = crate::hooks::post_tool_use_note(
+                    project.as_deref(),
+                    tool_name,
+                    status_s,
+                    &out,
+                );
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
                     call_id,
-                    status: if tr.cancelled {
-                        ToolCallStatus::Failed
-                    } else {
-                        ToolCallStatus::Completed
-                    },
+                    status,
                     output: Some(out.clone()),
                 });
                 Ok(out)
             }
             Err(e) => {
                 let msg = e.to_string();
+                let _ = crate::hooks::post_tool_use_note(
+                    project.as_deref(),
+                    tool_name,
+                    "failed",
+                    &msg,
+                );
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
                     call_id,
@@ -2846,6 +3300,23 @@ fn coding_agent_tools(mcp: &[crate::mcp_runtime::McpToolSpec]) -> (serde_json::V
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "spawn_explore",
+                "description": "Spawn a read-only explore subagent to survey the codebase (list/grep/glob) and return a summary.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "What to explore or look for"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
     ];
 
     let mut index = McpToolIndex::new();
@@ -2875,30 +3346,147 @@ fn coding_agent_tools(mcp: &[crate::mcp_runtime::McpToolSpec]) -> (serde_json::V
     (serde_json::Value::Array(tools), index)
 }
 
+fn normalize_sandbox_profile(profile: &str) -> &'static str {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "read-only" | "readonly" | "read_only" | "ro" => "read-only",
+        "full" | "danger-full-access" | "danger_full_access" | "none" | "off" => "full",
+        "workspace-write" | "workspace" | "workspace_write" | "ws" | "" => "workspace-write",
+        _ => "workspace-write",
+    }
+}
+
 fn sandbox_is_readonly(profile: &str) -> bool {
-    matches!(
-        profile.trim().to_ascii_lowercase().as_str(),
-        "read-only" | "readonly" | "read_only"
-    )
+    normalize_sandbox_profile(profile) == "read-only"
+}
+
+fn sandbox_is_full(profile: &str) -> bool {
+    normalize_sandbox_profile(profile) == "full"
 }
 
 fn sandbox_blocks_shell(profile: &str, command: &str) -> bool {
-    if !sandbox_is_readonly(profile) {
+    if sandbox_is_full(profile) {
         return false;
     }
     let c = command.to_ascii_lowercase();
-    // Allow pure read-ish commands; block obvious mutators.
-    let mutators = [
-        "rm ", "rm\t", "mv ", "cp ", ">", ">>", "sed -i", "tee ", "npm i", "npm install",
-        "cargo install", "git commit", "git push", "mkdir ", "touch ", "chmod ", "chown ",
-    ];
+    // Read-only: block mutators. Workspace-write: block only clearly destructive / escape-y.
+    let mutators = if sandbox_is_readonly(profile) {
+        &[
+            "rm ", "rm\t", "mv ", "cp ", ">", ">>", "sed -i", "tee ", "npm i", "npm install",
+            "cargo install", "git commit", "git push", "mkdir ", "touch ", "chmod ", "chown ",
+            "curl ", "wget ", "ssh ",
+        ][..]
+    } else {
+        // workspace-write: still block escaping the tree via absolute rm and network exfil helpers
+        &[
+            "rm -rf /", "rm -rf ~", "curl | sh", "wget | sh", "mkfs", ":(){",
+        ][..]
+    };
     mutators.iter().any(|m| c.contains(m))
+}
+
+fn offline_plan_steps(goal: &str) -> Vec<String> {
+    let g = goal.trim();
+    let mut steps = vec![
+        format!("Clarify goal: {}", g.chars().take(120).collect::<String>()),
+        "Explore relevant files (list_dir / glob / read_file)".into(),
+        "Draft concrete file-level changes".into(),
+        "Apply edits with apply_patch or write_file".into(),
+        "Verify with run_terminal_cmd (tests/build) when applicable".into(),
+    ];
+    let lower = g.to_ascii_lowercase();
+    if lower.contains("test") {
+        steps.push("Add or update tests for the change".into());
+    }
+    if lower.contains("refactor") {
+        steps.insert(2, "Identify seams and keep behavior unchanged".into());
+    }
+    steps
+}
+
+fn parse_effort_arg(raw: &str) -> EffortLevel {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" => EffortLevel::None,
+        "minimal" | "min" => EffortLevel::Minimal,
+        "low" => EffortLevel::Low,
+        "medium" | "med" | "default" => EffortLevel::Medium,
+        "high" => EffortLevel::High,
+        "xhigh" | "x-high" | "extra" => EffortLevel::Xhigh,
+        "max" | "maximum" => EffortLevel::Max,
+        _ => EffortLevel::Medium,
+    }
+}
+
+/// Ask the model for a short numbered plan (no tools).
+async fn propose_plan_with_model(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    cwd: &Path,
+    goal: &str,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>> {
+    if cancel.is_cancelled() {
+        bail!("cancelled");
+    }
+    let prompt = format!(
+        "Propose a concise implementation plan for this coding goal. \
+         Return ONLY a numbered list of 3-8 concrete steps (no preamble).\n\nGoal: {goal}\nProject: {}",
+        cwd.display()
+    );
+    let text = call_xai_chat(
+        creds,
+        model,
+        &[("user".into(), prompt)],
+        None,
+        cwd,
+        SessionKind::Build,
+    )
+    .await?;
+    let steps = parse_numbered_plan(&text);
+    if steps.is_empty() {
+        bail!("model returned no parseable plan steps");
+    }
+    Ok(steps)
+}
+
+fn parse_numbered_plan(text: &str) -> Vec<String> {
+    let mut steps = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // "1. step" / "1) step" / "- step"
+        let body = if let Some(rest) = t.strip_prefix('-') {
+            rest.trim()
+        } else if let Some(pos) = t.find(['.', ')']) {
+            let (num, rest) = t.split_at(pos);
+            if num.chars().all(|c| c.is_ascii_digit()) {
+                rest[1..].trim()
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+        if !body.is_empty() {
+            steps.push(body.to_string());
+        }
+    }
+    if steps.is_empty() {
+        // Fallback: non-empty lines as steps
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(8) {
+            steps.push(line.to_string());
+        }
+    }
+    steps.truncate(10);
+    steps
 }
 
 fn build_agent_messages(
     history: &[(String, String)],
     compacted_summary: Option<&str>,
     cwd: &Path,
+    active_plan: Option<(&str, &[String])>,
 ) -> Vec<serde_json::Value> {
     let (instructions, loaded) = crate::project_context::load_project_instructions(cwd);
     let skills = crate::project_context::load_skills_context(Some(cwd));
@@ -2913,12 +3501,13 @@ fn build_agent_messages(
          Use tools to explore and change the codebase. Do not invent file contents — read, list, or glob first.\n\
          Prefer apply_patch for targeted edits; use write_file for new files or full rewrites.\n\
          Run tests/builds with run_terminal_cmd when useful.\n\
+         Use spawn_explore for broad codebase surveys.\n\
          MCP tools (if any) are named mcp__<server>__<tool> — use them when they match the task.\n\
          When the task is done, respond with a clear final summary and no more tool calls.\n\
          Be concise in narration; put substantial content into tool arguments.{instr_note}",
         cwd.display()
     );
-    let mut messages = Vec::with_capacity(history.len() + 6);
+    let mut messages = Vec::with_capacity(history.len() + 8);
     messages.push(serde_json::json!({
         "role": "system",
         "content": system
@@ -2934,6 +3523,19 @@ fn build_agent_messages(
             "role": "system",
             "content": skills
         }));
+    }
+    if let Some((goal, steps)) = active_plan {
+        if !steps.is_empty() {
+            let mut plan = format!("Accepted plan to execute (goal: {goal}):\n");
+            for (i, s) in steps.iter().enumerate() {
+                plan.push_str(&format!("{}. {}\n", i + 1, s));
+            }
+            plan.push_str("Follow these steps; do not invent a new plan unless blocked.");
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": plan
+            }));
+        }
     }
     if let Some(summary) = compacted_summary.filter(|s| !s.is_empty()) {
         messages.push(serde_json::json!({

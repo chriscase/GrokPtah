@@ -38,5 +38,10 @@ describe("SLASH_COMMANDS", () => {
     expect(cmds).toContain("/help");
     expect(cmds).toContain("/plan");
     expect(cmds).toContain("/yolo");
+    expect(cmds).toContain("/model");
+    expect(cmds).toContain("/effort");
+    expect(cmds).toContain("/explore");
+    expect(cmds).toContain("/sandbox");
+    expect(cmds).toContain("/context");
   });
 });

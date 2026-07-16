@@ -543,9 +543,12 @@ pub fn set_plan_mode(
 }
 
 #[tauri::command]
-pub fn accept_plan(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+pub async fn accept_plan(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<String, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    state.host.accept_plan(id).map_err(map_err)
+    state.host.accept_plan(id).await.map_err(map_err)
 }
 
 #[tauri::command]

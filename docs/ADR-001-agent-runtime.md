@@ -40,3 +40,6 @@ Upstream still has a full stack (`xai-grok-shell`, `xai-grok-tools`, `xai-grok-m
 - P1: SSE token streaming during model steps, skill body inject, cancel mid-HTTP,
   basic stdio MCP tool advertise/dispatch (`mcp__server__tool`), live `FileEdit`
   events into the git/diff pane.
+- P2: real plan propose/accept→execute, PreToolUse hooks, agent-critical slash
+  commands, sandbox profiles (read-only / workspace-write / full), explore
+  subagent (`/explore` + `spawn_explore`).

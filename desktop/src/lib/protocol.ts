@@ -218,8 +218,15 @@ export function normalizeSessionUpdate(raw: unknown): SessionUpdate | null {
 
 export const SLASH_COMMANDS = [
   { cmd: "/help", desc: "Show commands" },
-  { cmd: "/plan", desc: "Enter plan mode" },
+  { cmd: "/plan", desc: "Propose a plan (accept starts execution)" },
   { cmd: "/yolo", desc: "Always approve tools" },
   { cmd: "/explore", desc: "Spawn explore subagent" },
   { cmd: "/compact", desc: "Shrink server context (keeps full local history)" },
+  { cmd: "/model", desc: "Show or set model id" },
+  { cmd: "/effort", desc: "Show or set effort level" },
+  { cmd: "/clear", desc: "Clear session transcript" },
+  { cmd: "/context", desc: "Context / compact window stats" },
+  { cmd: "/mcp", desc: "List MCP servers + doctor" },
+  { cmd: "/skills", desc: "List discovered skills" },
+  { cmd: "/sandbox", desc: "Show or set sandbox profile" },
 ] as const;

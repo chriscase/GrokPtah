@@ -89,6 +89,10 @@ pub struct SessionMeta {
     #[serde(default)]
     pub plan_steps: Vec<String>,
     #[serde(default)]
+    pub plan_status: String,
+    #[serde(default)]
+    pub plan_goal: Option<String>,
+    #[serde(default)]
     pub compacted_summary: Option<String>,
     /// Index into transcript.jsonl where the API context window begins.
     /// Compact advances this; local lines before it are never deleted.
@@ -316,6 +320,8 @@ impl SessionMeta {
             effort: s.effort,
             plan_mode: s.plan_mode,
             plan_steps: s.plan_steps.clone(),
+            plan_status: s.plan_status.clone(),
+            plan_goal: s.plan_goal.clone(),
             compacted_summary: s.compacted_summary.clone(),
             api_context_start: s.api_context_start,
             message_count: s.transcript.len().max(s.persisted_len),
@@ -340,6 +346,8 @@ impl SessionMeta {
             effort: self.effort,
             plan_mode: self.plan_mode,
             plan_steps: self.plan_steps,
+            plan_status: self.plan_status,
+            plan_goal: self.plan_goal,
             compacted_summary: self.compacted_summary,
             api_context_start: self.api_context_start,
             folder: self.folder,

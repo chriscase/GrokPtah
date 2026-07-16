@@ -549,7 +549,10 @@ async fn write_tool_records_edit_and_plugins_install_to_disk() {
 async fn plan_mode_emits_plan_update() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig::default());
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -565,7 +568,159 @@ async fn plan_mode_emits_plan_update() {
             ..
         } if status == "proposed"
     )));
-    host.accept_plan(s.id).unwrap();
+    // Accept starts an execution turn (offline agent).
+    let reply = host.accept_plan(s.id).await.unwrap();
+    assert!(!reply.is_empty());
+    let events2 = drain_until_turn_complete(&mut rx).await;
+    assert!(
+        events2.iter().any(|e| matches!(
+            e,
+            SessionUpdate::Plan { status, .. } if status == "accepted" || status == "done" || status == "executing"
+        )) || events2
+            .iter()
+            .any(|e| matches!(e, SessionUpdate::TurnComplete { .. })),
+        "expected plan execution events, got {events2:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_context_and_model_work_offline() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig::default());
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let s = host.session_new().unwrap();
+
+    let r = host.session_prompt(s.id, "/model".into()).await.unwrap();
+    assert!(r.to_lowercase().contains("model"), "{r}");
+    let _ = drain_until_turn_complete(&mut rx).await;
+
+    let r = host
+        .session_prompt(s.id, "/effort high".into())
+        .await
+        .unwrap();
+    assert!(r.contains("high"), "{r}");
+    let _ = drain_until_turn_complete(&mut rx).await;
+
+    let r = host.session_prompt(s.id, "/context".into()).await.unwrap();
+    assert!(r.contains("Context:"), "{r}");
+    let _ = drain_until_turn_complete(&mut rx).await;
+
+    let r = host
+        .session_prompt(s.id, "/sandbox read-only".into())
+        .await
+        .unwrap();
+    assert!(r.contains("read-only"), "{r}");
+    assert_eq!(host.status().sandbox_profile, "read-only");
+    let _ = drain_until_turn_complete(&mut rx).await;
+}
+
+#[tokio::test]
+async fn hook_denies_write_file() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".grokptah")).unwrap();
+    std::fs::write(
+        dir.path().join(".grokptah/hooks.json"),
+        r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "write_file", "deny": true, "message": "fixture forbids writes" }
+    ],
+    "PostToolUse": []
+  }
+}"#,
+    )
+    .unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let s = host.session_new().unwrap();
+    let reply = host
+        .session_prompt(s.id, "write blocked.txt: should fail".into())
+        .await
+        .unwrap();
+    let events = drain_until_turn_complete(&mut rx).await;
+    let denied = events.iter().any(|e| {
+        matches!(
+            e,
+            SessionUpdate::ToolCall {
+                status: grokptah_agent_bridge::ToolCallStatus::Denied,
+                title,
+                ..
+            } if title == "write_file"
+        )
+    });
+    assert!(
+        denied || reply.contains("DENIED") || !dir.path().join("blocked.txt").exists(),
+        "hook should deny write; reply={reply} events={events:?}"
+    );
+    assert!(
+        !dir.path().join("blocked.txt").exists(),
+        "file must not be written when hook denies"
+    );
+}
+
+#[tokio::test]
+async fn explore_slash_spawns_subagent() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "hello explore").unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let s = host.session_new().unwrap();
+    let reply = host
+        .session_prompt(s.id, "/explore README layout".into())
+        .await
+        .unwrap();
+    let events = drain_until_turn_complete(&mut rx).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SessionUpdate::SubagentSpawned { kind, .. } if kind == "explore")),
+        "expected SubagentSpawned, got {events:?}"
+    );
+    assert!(
+        reply.contains("Explore") || reply.contains("README") || reply.contains("listing"),
+        "explore summary: {reply}"
+    );
+    assert!(!host.subagents().is_empty());
+}
+
+#[tokio::test]
+async fn sandbox_readonly_blocks_write() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    host.set_sandbox("read-only".into());
+    let s = host.session_new().unwrap();
+    let _ = host
+        .session_prompt(s.id, "write no.txt: nope".into())
+        .await
+        .unwrap();
+    let _ = drain_until_turn_complete(&mut rx).await;
+    assert_eq!(host.status().sandbox_profile, "read-only");
+    assert!(
+        !dir.path().join("no.txt").exists(),
+        "read-only sandbox must block offline write"
+    );
 }
 
 /// Regression: tests must not leave sessions in the real user home.

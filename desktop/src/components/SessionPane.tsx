@@ -168,9 +168,14 @@ export function SessionPane({
                       <button
                         type="button"
                         className="primary"
-                        onClick={() => void api.acceptPlan(tab.id)}
+                        onClick={() => {
+                          // Accept starts plan→execute turn (streams via session events).
+                          void api.acceptPlan(tab.id).catch((e) => {
+                            console.warn("acceptPlan failed", e);
+                          });
+                        }}
                       >
-                        Accept
+                        Accept & execute
                       </button>
                       <button
                         type="button"
