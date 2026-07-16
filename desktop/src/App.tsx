@@ -334,10 +334,19 @@ export default function App() {
     }
   }, []);
 
+  // Chrome refresh on mount only (not tied to the event listener).
   useEffect(() => {
     void refreshChrome();
+  }, [refreshChrome]);
+
+  // Single session://update subscription for the app lifetime.
+  // IMPORTANT: do not depend on changing callbacks — the previous pattern
+  // re-registered listeners before the async unlisten resolved, so each
+  // event was delivered N times (duplicated thoughts / errors in the UI).
+  useEffect(() => {
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
-    listen("session://update", (event) => {
+    void listen("session://update", (event) => {
       const u = normalizeSessionUpdate(event.payload);
       if (!u) return;
       // Attach terminal to the *existing* tool shell stream — never re-exec.
@@ -347,10 +356,17 @@ export default function App() {
       }
       applyUpdate(u, setTabs, setPermission);
     }).then((fn) => {
+      if (cancelled) {
+        fn();
+        return;
+      }
       unlisten = fn;
     });
-    return () => unlisten?.();
-  }, [refreshChrome]);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   // Restore sessions + open tabs from disk (desktop-app durability).
   useEffect(() => {
@@ -366,13 +382,29 @@ export default function App() {
         if (cancelled) return;
         setSessions(ws.sessions);
         const byId = new Map(ws.sessions.map((s) => [s.id, s]));
-        // Prefer last open tabs; else most recent sessions with history.
+        // Drop tabs for sessions that no longer exist on disk (test garbage, deletes).
         let tabIds = (ws.open_tab_ids ?? []).filter((id) => byId.has(id));
         if (tabIds.length === 0) {
           tabIds = ws.sessions
             .filter((s) => s.message_count > 0)
             .slice(0, 8)
             .map((s) => s.id);
+        }
+        // Persist the prune so a deleted/missing session doesn't keep reappearing.
+        if (
+          tabIds.length !== (ws.open_tab_ids ?? []).length ||
+          (ws.active_session && !byId.has(ws.active_session))
+        ) {
+          try {
+            await api.setOpenTabs(
+              tabIds,
+              ws.active_session && byId.has(ws.active_session)
+                ? ws.active_session
+                : (tabIds[0] ?? null),
+            );
+          } catch {
+            /* ignore */
+          }
         }
         for (const id of tabIds) {
           const summary = byId.get(id);
@@ -387,6 +419,10 @@ export default function App() {
           null;
         if (active) {
           setActiveSessionId(active);
+          const activeSummary = byId.get(active);
+          if (activeSummary?.kind === "chat" || activeSummary?.kind === "build") {
+            setWorkspaceMode(activeSummary.kind);
+          }
           try {
             await api.sessionLoad(active);
           } catch {
@@ -431,13 +467,6 @@ export default function App() {
       ),
     [composer],
   );
-
-  async function ensureSession(): Promise<string> {
-    if (activeSessionId) return activeSessionId;
-    const s = await createSession(workspaceMode);
-    if (!s) throw new Error("session creation cancelled");
-    return s.id;
-  }
 
   async function openProject() {
     const path = await api.pickProjectFolder();
@@ -504,6 +533,43 @@ export default function App() {
     },
     [status?.project_cwd, openTab, refreshSessions, refreshChrome],
   );
+
+  async function ensureSession(): Promise<string> {
+    // Prefer the active tab only when its kind matches Builds/Chats mode.
+    // Otherwise a build tab left open would answer "chat" prompts as kind=build.
+    if (activeSessionId) {
+      const fromList = sessions.find((s) => s.id === activeSessionId);
+      let kind = fromList?.kind;
+      if (!kind) {
+        try {
+          const loaded = await api.sessionLoad(activeSessionId);
+          kind = loaded.kind;
+        } catch {
+          // Missing/deleted session (e.g. cleaned test garbage) — create fresh.
+          kind = undefined;
+        }
+      }
+      if (kind === workspaceMode) {
+        return activeSessionId;
+      }
+    }
+    // Reuse any already-open tab of the right kind.
+    const openMatch = tabs
+      .map((t) => sessions.find((s) => s.id === t.id))
+      .find((s) => s && (s.kind ?? "build") === workspaceMode);
+    if (openMatch) {
+      setActiveSessionId(openMatch.id);
+      try {
+        await api.sessionLoad(openMatch.id);
+      } catch {
+        /* ignore */
+      }
+      return openMatch.id;
+    }
+    const s = await createSession(workspaceMode);
+    if (!s) throw new Error("session creation cancelled");
+    return s.id;
+  }
 
   const openSessionContextMenu = useCallback(
     (sessionId: string, x: number, y: number) => {
@@ -724,31 +790,19 @@ export default function App() {
         return;
       }
       const reply = await api.sessionPrompt(id, prompt);
-      // Always surface the final reply (events may have streamed already).
+      // Surface the final reply only if events did not already stream it.
+      // Errors are emitted as a single assistant bubble via the event path;
+      // never append a second copy (dedup must tolerate multi-listener ghosts).
       if (reply?.trim()) {
+        const head = reply.slice(0, 48).trim();
         patchTab(id, (t) => {
-          const last = t.transcript[t.transcript.length - 1];
-          if (
-            last?.kind === "assistant" &&
-            last.text.includes(reply.slice(0, 40))
-          ) {
-            return {
-              ...t,
-              busy: false,
-              activity: doneActivity(false),
-              transcript: t.transcript.map((item, i) =>
-                i === t.transcript.length - 1 && item.kind === "assistant"
-                  ? { ...item, streaming: false }
-                  : item,
-              ),
-            };
-          }
-          const already = t.transcript.some(
-            (item) =>
-              item.kind === "assistant" &&
-              (item.text === reply ||
-                reply.startsWith(item.text.slice(0, 80))),
-          );
+          const already = t.transcript.some((item) => {
+            if (item.kind !== "assistant" && item.kind !== "error") return false;
+            if (item.text === reply) return true;
+            if (head && item.text.includes(head)) return true;
+            if (item.text && reply.includes(item.text.slice(0, 48))) return true;
+            return false;
+          });
           if (already) {
             return {
               ...t,
@@ -932,14 +986,39 @@ export default function App() {
           <button
             type="button"
             className={workspaceMode === "build" ? "active" : ""}
-            onClick={() => setWorkspaceMode("build")}
+            onClick={() => {
+              setWorkspaceMode("build");
+              // Don't keep answering in a chat tab while Builds is selected.
+              const buildTab = tabs.find((t) => {
+                const s = sessions.find((x) => x.id === t.id);
+                return (s?.kind ?? "build") === "build";
+              });
+              if (buildTab) setActiveSessionId(buildTab.id);
+              else if (
+                activeSummary &&
+                (activeSummary.kind ?? "build") !== "build"
+              ) {
+                setActiveSessionId(null);
+              }
+            }}
           >
             Builds
           </button>
           <button
             type="button"
             className={workspaceMode === "chat" ? "active" : ""}
-            onClick={() => setWorkspaceMode("chat")}
+            onClick={() => {
+              setWorkspaceMode("chat");
+              const chatTab = tabs.find((t) => {
+                const s = sessions.find((x) => x.id === t.id);
+                return s?.kind === "chat";
+              });
+              if (chatTab) setActiveSessionId(chatTab.id);
+              else if (activeSummary?.kind !== "chat") {
+                // Force ensureSession to create a chat on next send.
+                setActiveSessionId(null);
+              }
+            }}
           >
             Chats
           </button>
@@ -1894,11 +1973,18 @@ function applyUpdate(
           tab,
           (t) => {
             const last = t[t.length - 1];
+            // Host thoughts are whole lines (status crumbs), not token streams.
+            // Append on a new line when the last bubble is already a thought so
+            // we never glue "kind=build…" into itself across deliveries.
             if (last?.kind === "thought") {
+              // Exact duplicate of a multi-listener race — drop it.
+              if (last.text === u.text || last.text.endsWith(u.text)) {
+                return t;
+              }
               const copy = t.slice(0, -1);
               copy.push({
                 kind: "thought",
-                text: last.text + u.text,
+                text: `${last.text}\n${u.text}`,
                 streaming: true,
               });
               return copy;

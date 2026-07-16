@@ -2132,6 +2132,11 @@ async fn call_xai_chat(
     };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .user_agent(format!(
+            "grok/{} (GrokPtah)",
+            crate::auth_store::client_version_header()
+        ))
         .build()
         .map_err(|e| anyhow!(e))?;
 
@@ -2185,20 +2190,32 @@ async fn call_xai_chat(
         req.json(&body)
     };
 
-    let mut resp = send_once(&creds)
-        .send()
-        .await
-        .map_err(|e| anyhow!("request error: {e}"))?;
+    let mut resp = send_once(&creds).send().await.map_err(|e| {
+        // Surface classify-able transport failures (DNS, TLS, timeout) so the
+        // UI is not a vague "error sending request".
+        let kind = if e.is_timeout() {
+            "timeout"
+        } else if e.is_connect() {
+            "connect"
+        } else if e.is_request() {
+            "request"
+        } else {
+            "network"
+        };
+        anyhow!(
+            "request error ({kind}) for {url}: {e}. \
+             Check network, VPN, and that cli-chat-proxy is reachable."
+        )
+    })?;
 
     // One retry after OIDC refresh on 401 (expired access token is common).
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
-                resp = send_once(&creds)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("request error after refresh: {e}"))?;
+                resp = send_once(&creds).send().await.map_err(|e| {
+                    anyhow!("request error after refresh for {url}: {e}")
+                })?;
             }
             Err(e) => {
                 let text = resp.text().await.unwrap_or_default();
