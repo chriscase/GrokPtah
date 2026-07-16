@@ -172,10 +172,15 @@ button:disabled {
   overflow-y: auto;
 }
 
+/*
+ * Main column is flex (not a fixed N-row grid). Tabs / cwd / terminal are
+ * optional; a grid with `1fr` on row 2 assigned the flexible space to whichever
+ * child landed second (often the activity strip when no tabs, or the cwd bar),
+ * so "Ready / No active turn" ballooned into the middle of the viewport.
+ */
 .main {
-  display: grid;
-  /* tabs | transcript | terminal? | activity | composer */
-  grid-template-rows: auto minmax(0, 1fr) auto auto auto;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -183,11 +188,25 @@ button:disabled {
   background: var(--bg);
 }
 
+.main > .session-tabs,
+.main > .session-cwd-bar,
+.main > .terminal-slot,
+.main > .activity-strip,
+.main > .composer-wrap {
+  flex: 0 0 auto;
+}
+
+.main > .transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 .terminal-slot {
   min-height: 120px;
   max-height: 28vh;
   overflow: hidden;
   border-top: 1px solid var(--border-soft);
+  flex-shrink: 0;
 }
 
 /* ── Per-session working directory (build sessions) ── */
@@ -1132,7 +1151,8 @@ button:disabled {
 
 .transcript {
   overflow: auto;
-  min-height: 0; /* critical for grid child scroll */
+  min-height: 0; /* critical so flex sibling can scroll */
+  flex: 1 1 auto;
   padding: 0.85rem 1rem;
   display: flex;
   flex-direction: column;
