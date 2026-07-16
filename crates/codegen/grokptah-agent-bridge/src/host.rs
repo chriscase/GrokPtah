@@ -1481,10 +1481,9 @@ impl AgentHostHandle {
                     true,
                 )
             };
-            // Single emit (not typewriter chunks): UI also receives the same
-            // text via the invoke return value, and chunked streaming raced
-            // into duplicate assistant bubbles.
-            emit_message(&event_tx, session_id, &reply);
+            // Persist + return the reply. Do **not** also emit agent_message
+            // for the full body: the UI shows the invoke result, and stacked
+            // event listeners were concatenating the same string N times.
             push_assistant(self, session_id, &reply);
             return Ok(reply);
         }
@@ -1694,9 +1693,7 @@ impl AgentHostHandle {
                 true,
             )
         };
-        // Single emit + disk append. UI finalizes the turn and dedupes against
-        // the invoke return value (chunked streaming caused double bubbles).
-        emit_message(&event_tx, session_id, &reply);
+        // Disk + invoke return only (same dual-path bug as chat).
         push_assistant(self, session_id, &reply);
         Ok(reply)
     }

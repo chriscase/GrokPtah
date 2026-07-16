@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { api } from "./lib/api";
 import {
   normalizeSessionUpdate,
@@ -29,6 +28,11 @@ import {
   expandDebugLines,
   isDebugThought,
 } from "./lib/debugTrace";
+import {
+  collapseRepeatedText,
+  mergeAssistantChunk,
+  subscribeSessionUpdates,
+} from "./lib/sessionEvents";
 import {
   doneActivity,
   errorActivity,
@@ -120,25 +124,28 @@ function finalizeTurnTranscript(
   const tail =
     lastUser >= 0 ? transcript.slice(lastUser + 1) : [...transcript];
 
-  const collapsed: TranscriptItem[] = collapseAdjacentDuplicateAssistants(
+  // Strip any assistant bubbles from this turn's tail (they may be N× glued
+  // copies from multi-listener events). The invoke return is the single
+  // source of truth for the final assistant text.
+  const nonAssistant: TranscriptItem[] = collapseAdjacentDuplicateAssistants(
     tail,
-  ).map((item) => {
-    if (item.kind === "assistant") {
-      return { kind: "assistant", text: item.text, streaming: false };
-    }
-    if (item.kind === "thought") {
-      return { kind: "thought", text: item.text, streaming: false };
-    }
-    return item;
-  });
+  )
+    .filter((item) => item.kind !== "assistant")
+    .map((item) =>
+      item.kind === "thought"
+        ? { kind: "thought" as const, text: item.text, streaming: false }
+        : item,
+    );
 
-  const hasAssistant = collapsed.some((i) => i.kind === "assistant");
-  const trimmed = reply?.trim() ?? "";
-  if (!hasAssistant && trimmed) {
-    collapsed.push({ kind: "assistant", text: trimmed, streaming: false });
+  const trimmed = reply?.trim() ? collapseRepeatedText(reply.trim()) : "";
+  if (trimmed) {
+    return [
+      ...head,
+      ...nonAssistant,
+      { kind: "assistant", text: trimmed, streaming: false },
+    ];
   }
-
-  return [...head, ...collapsed];
+  return [...head, ...nonAssistant];
 }
 
 /** Merge consecutive assistant bubbles that are the same (or prefix/suffix). */
@@ -446,33 +453,16 @@ export default function App() {
     void refreshChrome();
   }, [refreshChrome]);
 
-  // Single session://update subscription for the app lifetime.
-  // IMPORTANT: do not depend on changing callbacks — the previous pattern
-  // re-registered listeners before the async unlisten resolved, so each
-  // event was delivered N times (duplicated thoughts / errors in the UI).
+  // Page-lifetime singleton bus (survives StrictMode + Vite HMR). Raw
+  // listen() per mount stacked handlers and glued the same reply N times.
   useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    void listen("session://update", (event) => {
-      const u = normalizeSessionUpdate(event.payload);
-      if (!u) return;
-      // Attach terminal to the *existing* tool shell stream — never re-exec.
+    return subscribeSessionUpdates((u) => {
       if (u.type === "shell_session_started") {
         setShowTerm(true);
         setToolShell({ callId: u.call_id, command: u.command });
       }
       applyUpdate(u, setTabs, setPermission);
-    }).then((fn) => {
-      if (cancelled) {
-        fn();
-        return;
-      }
-      unlisten = fn;
     });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
   }, []);
 
   // Restore sessions + open tabs from disk (desktop-app durability).
@@ -1967,17 +1957,23 @@ function applyUpdate(
           (t) => {
             const last = t[t.length - 1];
             if (last?.kind === "assistant") {
+              const merged = mergeAssistantChunk(last.text, u.text);
+              if (merged === "skip") return t;
               const copy = t.slice(0, -1);
               copy.push({
                 kind: "assistant",
-                text: last.text + u.text,
+                text: merged,
                 streaming: true,
               });
               return copy;
             }
             return [
               ...t,
-              { kind: "assistant", text: u.text, streaming: true },
+              {
+                kind: "assistant",
+                text: collapseRepeatedText(u.text),
+                streaming: true,
+              },
             ];
           },
           { busy: true },
