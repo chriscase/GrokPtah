@@ -93,6 +93,14 @@ pub struct SessionMeta {
     /// Number of lines in transcript.jsonl (authoritative for list badges).
     #[serde(default)]
     pub message_count: usize,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 // ── Paths ───────────────────────────────────────────────────────────────────
@@ -231,7 +239,7 @@ pub fn delete_session(id: Uuid) -> Result<()> {
 }
 
 /// Soft GC: drop empty "New session" shells older than `max_age` and cap
-/// total session dirs (oldest by updated_at first). Never deletes open tabs.
+/// **active** (non-archived) session dirs. Never deletes open tabs or archived.
 pub fn garbage_collect(
     open_ids: &[Uuid],
     max_sessions: usize,
@@ -245,9 +253,9 @@ pub fn garbage_collect(
     let now = Utc::now();
     let mut removed = 0usize;
 
-    // 1) Empty new sessions older than threshold
+    // 1) Empty new sessions older than threshold (never archived)
     for m in &metas {
-        if open.contains(&m.id) {
+        if open.contains(&m.id) || m.archived {
             continue;
         }
         if m.message_count == 0
@@ -259,13 +267,13 @@ pub fn garbage_collect(
         }
     }
 
-    // 2) Cap total count
+    // 2) Cap active (non-archived) count
     metas = list_session_metas()?;
-    if metas.len() > max_sessions {
-        // oldest first
-        metas.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
-        let overflow = metas.len() - max_sessions;
-        for m in metas.into_iter().take(overflow) {
+    let mut active: Vec<_> = metas.into_iter().filter(|m| !m.archived).collect();
+    if active.len() > max_sessions {
+        active.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        let overflow = active.len() - max_sessions;
+        for m in active.into_iter().take(overflow) {
             if open.contains(&m.id) {
                 continue;
             }
@@ -303,6 +311,10 @@ impl SessionMeta {
             plan_steps: s.plan_steps.clone(),
             compacted_summary: s.compacted_summary.clone(),
             message_count: s.transcript.len().max(s.persisted_len),
+            folder: s.folder.clone(),
+            tags: s.tags.clone(),
+            archived: s.archived,
+            archived_at: s.archived_at,
         }
     }
 
@@ -320,6 +332,10 @@ impl SessionMeta {
             plan_mode: self.plan_mode,
             plan_steps: self.plan_steps,
             compacted_summary: self.compacted_summary,
+            folder: self.folder,
+            tags: self.tags,
+            archived: self.archived,
+            archived_at: self.archived_at,
             transcript_loaded: false,
             // Until load_transcript, treat disk as authoritative length.
             persisted_len: self.message_count,

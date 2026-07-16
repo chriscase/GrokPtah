@@ -71,6 +71,81 @@ pub fn session_list(state: State<'_, AppState>) -> Vec<SessionSummary> {
 }
 
 #[tauri::command]
+pub fn session_list_archived(state: State<'_, AppState>) -> Vec<SessionSummary> {
+    state.host.list_sessions_filtered(true)
+}
+
+#[tauri::command]
+pub fn session_list_all(state: State<'_, AppState>) -> Vec<SessionSummary> {
+    state.host.list_all_sessions()
+}
+
+#[tauri::command]
+pub fn session_rename(
+    state: State<'_, AppState>,
+    session_id: String,
+    title: String,
+) -> Result<SessionSummary, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state.host.session_rename(id, title).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_delete(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state.host.session_delete(id).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_archive(
+    state: State<'_, AppState>,
+    session_id: String,
+    archived: bool,
+) -> Result<SessionSummary, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .session_archive(id, archived)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_set_folder(
+    state: State<'_, AppState>,
+    session_id: String,
+    folder: Option<String>,
+) -> Result<SessionSummary, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .session_set_folder(id, folder)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_set_tags(
+    state: State<'_, AppState>,
+    session_id: String,
+    tags: Vec<String>,
+) -> Result<SessionSummary, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state.host.session_set_tags(id, tags).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_list_folders(
+    state: State<'_, AppState>,
+    include_archived: bool,
+) -> Vec<String> {
+    state.host.list_folders(include_archived)
+}
+
+#[tauri::command]
+pub fn session_list_tags(state: State<'_, AppState>, include_archived: bool) -> Vec<String> {
+    state.host.list_tags(include_archived)
+}
+
+#[tauri::command]
 pub fn workspace_state(state: State<'_, AppState>) -> WorkspaceUiState {
     state.host.workspace_ui_state()
 }

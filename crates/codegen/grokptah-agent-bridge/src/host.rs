@@ -277,7 +277,13 @@ impl AgentHostHandle {
     /// UI restore: sessions list + which tabs were open.
     pub fn workspace_ui_state(&self) -> WorkspaceUiState {
         let g = self.inner.lock();
-        let mut sessions: Vec<_> = g.sessions.values().map(|s| s.summary()).collect();
+        // Active (non-archived) only for default restore list.
+        let mut sessions: Vec<_> = g
+            .sessions
+            .values()
+            .filter(|s| !s.archived)
+            .map(|s| s.summary())
+            .collect();
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         WorkspaceUiState {
             project_cwd: g.project_cwd.as_ref().map(|p| p.display().to_string()),
@@ -429,10 +435,186 @@ impl AgentHostHandle {
     }
 
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
+        self.list_sessions_filtered(false)
+    }
+
+    /// When `archived_only` is true, return only archived; otherwise only active.
+    pub fn list_sessions_filtered(&self, archived_only: bool) -> Vec<SessionSummary> {
+        let g = self.inner.lock();
+        let mut v: Vec<_> = g
+            .sessions
+            .values()
+            .filter(|s| s.archived == archived_only)
+            .map(|s| s.summary())
+            .collect();
+        v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        v
+    }
+
+    pub fn list_all_sessions(&self) -> Vec<SessionSummary> {
         let g = self.inner.lock();
         let mut v: Vec<_> = g.sessions.values().map(|s| s.summary()).collect();
         v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         v
+    }
+
+    pub fn session_rename(&self, id: Uuid, title: String) -> Result<SessionSummary> {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            bail!("title must not be empty");
+        }
+        let summary = {
+            let mut g = self.inner.lock();
+            let s = g
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            s.title = title;
+            s.updated_at = Utc::now();
+            s.summary()
+        };
+        self.persist_session_meta_only(id);
+        Ok(summary)
+    }
+
+    pub fn session_delete(&self, id: Uuid) -> Result<()> {
+        {
+            let mut g = self.inner.lock();
+            if !g.sessions.contains_key(&id) {
+                bail!("unknown session");
+            }
+            if g.turn_cancels.contains_key(&id) {
+                bail!("cannot delete a session with an active turn — stop it first");
+            }
+            g.sessions.remove(&id);
+            g.open_tab_ids.retain(|t| *t != id);
+            if g.active_session == Some(id) {
+                g.active_session = g.open_tab_ids.first().copied();
+            }
+        }
+        session_store::delete_session(id)?;
+        self.persist_chrome();
+        Ok(())
+    }
+
+    pub fn session_archive(&self, id: Uuid, archived: bool) -> Result<SessionSummary> {
+        let summary = {
+            let mut g = self.inner.lock();
+            {
+                let s = g
+                    .sessions
+                    .get_mut(&id)
+                    .ok_or_else(|| anyhow!("unknown session"))?;
+                s.archived = archived;
+                s.archived_at = if archived { Some(Utc::now()) } else { None };
+                s.updated_at = Utc::now();
+            }
+            // Closing archived sessions out of the tab strip
+            if archived {
+                g.open_tab_ids.retain(|t| *t != id);
+                if g.active_session == Some(id) {
+                    g.active_session = g.open_tab_ids.first().copied();
+                }
+            }
+            g.sessions
+                .get(&id)
+                .ok_or_else(|| anyhow!("unknown session"))?
+                .summary()
+        };
+        self.persist_session_meta_only(id);
+        self.persist_chrome();
+        Ok(summary)
+    }
+
+    pub fn session_set_folder(&self, id: Uuid, folder: Option<String>) -> Result<SessionSummary> {
+        let folder = folder.and_then(|f| {
+            let t = f.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+        let summary = {
+            let mut g = self.inner.lock();
+            let s = g
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            s.folder = folder;
+            s.updated_at = Utc::now();
+            s.summary()
+        };
+        self.persist_session_meta_only(id);
+        Ok(summary)
+    }
+
+    pub fn session_set_tags(&self, id: Uuid, tags: Vec<String>) -> Result<SessionSummary> {
+        let mut clean: Vec<String> = tags
+            .into_iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        clean.sort();
+        clean.dedup();
+        let summary = {
+            let mut g = self.inner.lock();
+            let s = g
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            s.tags = clean;
+            s.updated_at = Utc::now();
+            s.summary()
+        };
+        self.persist_session_meta_only(id);
+        Ok(summary)
+    }
+
+    /// Unique folder names from non-archived sessions (plus any archived if requested).
+    pub fn list_folders(&self, include_archived: bool) -> Vec<String> {
+        let g = self.inner.lock();
+        let mut set = std::collections::BTreeSet::new();
+        for s in g.sessions.values() {
+            if !include_archived && s.archived {
+                continue;
+            }
+            if let Some(f) = &s.folder {
+                if !f.is_empty() {
+                    set.insert(f.clone());
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    pub fn list_tags(&self, include_archived: bool) -> Vec<String> {
+        let g = self.inner.lock();
+        let mut set = std::collections::BTreeSet::new();
+        for s in g.sessions.values() {
+            if !include_archived && s.archived {
+                continue;
+            }
+            for t in &s.tags {
+                if !t.is_empty() {
+                    set.insert(t.clone());
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    fn persist_session_meta_only(&self, id: Uuid) {
+        let session = {
+            let g = self.inner.lock();
+            match g.sessions.get(&id) {
+                Some(s) => s.clone(),
+                None => return,
+            }
+        };
+        if let Err(e) = session_store::save_session_meta(&session) {
+            eprintln!("[grokptah] meta persist failed: {e:#}");
+        }
     }
 
     pub fn fork_session(&self, source: Uuid) -> Result<SessionSummary> {

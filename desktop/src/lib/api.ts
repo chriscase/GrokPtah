@@ -16,6 +16,22 @@ export const api = {
   sessionNew: () => invoke<SessionSummary>("session_new"),
   sessionLoad: (id: string) => invoke<SessionSummary>("session_load", { id }),
   sessionList: () => invoke<SessionSummary[]>("session_list"),
+  sessionListArchived: () => invoke<SessionSummary[]>("session_list_archived"),
+  sessionListAll: () => invoke<SessionSummary[]>("session_list_all"),
+  sessionRename: (sessionId: string, title: string) =>
+    invoke<SessionSummary>("session_rename", { sessionId, title }),
+  sessionDelete: (sessionId: string) =>
+    invoke<void>("session_delete", { sessionId }),
+  sessionArchive: (sessionId: string, archived: boolean) =>
+    invoke<SessionSummary>("session_archive", { sessionId, archived }),
+  sessionSetFolder: (sessionId: string, folder: string | null) =>
+    invoke<SessionSummary>("session_set_folder", { sessionId, folder }),
+  sessionSetTags: (sessionId: string, tags: string[]) =>
+    invoke<SessionSummary>("session_set_tags", { sessionId, tags }),
+  sessionListFolders: (includeArchived = false) =>
+    invoke<string[]>("session_list_folders", { includeArchived }),
+  sessionListTags: (includeArchived = false) =>
+    invoke<string[]>("session_list_tags", { includeArchived }),
   /** Full workspace restore (sessions + open tabs + project). */
   workspaceState: () => invoke<WorkspaceUiState>("workspace_state"),
   setOpenTabs: (tabIds: string[], activeId?: string | null) =>

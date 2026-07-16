@@ -11,6 +11,14 @@ pub struct SessionSummary {
     pub updated_at: DateTime<Utc>,
     pub message_count: usize,
     pub forked_from: Option<Uuid>,
+    /// Virtual folder label (e.g. "NexaDeck", "experiments"). None = Inbox.
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub archived: bool,
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +46,15 @@ pub struct Session {
     /// Compact drops early transcript into a summary blob.
     #[serde(default)]
     pub compacted_summary: Option<String>,
+    /// Virtual folder (UI org only — not a filesystem path).
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub archived_at: Option<DateTime<Utc>>,
     /// True once `transcript.jsonl` has been read into `transcript`.
     #[serde(skip)]
     pub transcript_loaded: bool,
@@ -62,6 +79,10 @@ impl Session {
             plan_mode: false,
             plan_steps: Vec::new(),
             compacted_summary: None,
+            folder: None,
+            tags: Vec::new(),
+            archived: false,
+            archived_at: None,
             transcript_loaded: true,
             persisted_len: 0,
         }
@@ -82,6 +103,10 @@ impl Session {
             updated_at: self.updated_at,
             message_count,
             forked_from: self.forked_from,
+            folder: self.folder.clone(),
+            tags: self.tags.clone(),
+            archived: self.archived,
+            archived_at: self.archived_at,
         }
     }
 }

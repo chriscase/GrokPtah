@@ -14,6 +14,7 @@ import {
   type TranscriptItem,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
+import { SessionBrowser } from "./components/SessionBrowser";
 import { StreamingText } from "./components/StreamingText";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 
@@ -67,6 +68,7 @@ export default function App() {
   const [apiKeyInput, setApiKeyInput] = useState("");
   /** False until we finish reopening tabs from ~/.grokptah/workspace.json. */
   const [workspaceRestored, setWorkspaceRestored] = useState(false);
+  const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const activeTab = useMemo(
@@ -140,6 +142,64 @@ export default function App() {
     },
     [],
   );
+
+  const refreshSessions = useCallback(async () => {
+    try {
+      setSessions(await api.sessionList());
+    } catch {
+      /* bridge down */
+    }
+  }, []);
+
+  /** Open from browser or sidebar; drop from tabs if deleted. */
+  const handleSessionBrowserOpen = useCallback(
+    async (s: SessionSummary) => {
+      if (s.archived) {
+        // Unarchive when opening so it re-enters the active list.
+        try {
+          s = await api.sessionArchive(s.id, false);
+        } catch {
+          /* keep trying load */
+        }
+      }
+      await api.sessionLoad(s.id);
+      await openTab(s, true);
+      setSessionBrowserOpen(false);
+      await refreshSessions();
+    },
+    [openTab, refreshSessions],
+  );
+
+  const handleSessionBrowserChanged = useCallback(async () => {
+    await refreshSessions();
+    // Drop tabs for deleted / archived sessions
+    try {
+      const live = await api.sessionListAll();
+      const liveIds = new Set(live.map((s) => s.id));
+      const archivedIds = new Set(
+        live.filter((s) => s.archived).map((s) => s.id),
+      );
+      setTabs((prev) =>
+        prev.filter((t) => liveIds.has(t.id) && !archivedIds.has(t.id)),
+      );
+      setActiveSessionId((cur) => {
+        if (!cur) return cur;
+        if (!liveIds.has(cur) || archivedIds.has(cur)) {
+          return null;
+        }
+        return cur;
+      });
+      // Refresh tab titles after rename
+      setTabs((prev) =>
+        prev.map((t) => {
+          const s = live.find((x) => x.id === t.id);
+          return s ? { ...t, title: s.title } : t;
+        }),
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [refreshSessions]);
 
   const refreshChrome = useCallback(async () => {
     try {
@@ -516,7 +576,7 @@ export default function App() {
         <button
           type="button"
           className="primary"
-          style={{ width: "100%", marginBottom: 8 }}
+          style={{ width: "100%", marginBottom: 6 }}
           onClick={async () => {
             const s = await api.sessionNew();
             await openTab(s, false);
@@ -525,8 +585,15 @@ export default function App() {
         >
           New session
         </button>
+        <button
+          type="button"
+          style={{ width: "100%", marginBottom: 8 }}
+          onClick={() => setSessionBrowserOpen(true)}
+        >
+          Browse all…
+        </button>
         <p className="session-hint">
-          Open several tabs and run builds in parallel — switch anytime.
+          Parallel tabs · rename/archive/folders in the full session browser.
         </p>
         {sessions.map((s) => {
           const open = tabs.some((t) => t.id === s.id);
@@ -540,6 +607,7 @@ export default function App() {
                 await api.sessionLoad(s.id);
                 await openTab(s, !open);
               }}
+              onDoubleClick={() => setSessionBrowserOpen(true)}
             >
               <div className="session-item-title">
                 {running && <span className="busy-dot" title="Running" />}
@@ -548,10 +616,65 @@ export default function App() {
               <div style={{ color: "var(--muted)", fontSize: 11 }}>
                 {s.message_count} msgs{open ? " · open" : ""}
               </div>
+              {(s.folder || (s.tags?.length ?? 0) > 0) && (
+                <div className="session-side-meta">
+                  {s.folder && <span>▣ {s.folder}</span>}
+                  {(s.tags ?? []).slice(0, 3).map((t) => (
+                    <span key={t}>#{t}</span>
+                  ))}
+                </div>
+              )}
             </button>
           );
         })}
         <div className="section-title">Session actions</div>
+        <button
+          type="button"
+          disabled={!activeSessionId}
+          onClick={async () => {
+            if (!activeSessionId) return;
+            const current = sessions.find((s) => s.id === activeSessionId);
+            const next = window.prompt("Rename session", current?.title ?? "");
+            if (next == null || !next.trim()) return;
+            const updated = await api.sessionRename(activeSessionId, next.trim());
+            patchTab(activeSessionId, (t) => ({ ...t, title: updated.title }));
+            setSessions(await api.sessionList());
+          }}
+        >
+          Rename
+        </button>
+        <button
+          type="button"
+          disabled={!activeSessionId}
+          onClick={async () => {
+            if (!activeSessionId) return;
+            await api.sessionArchive(activeSessionId, true);
+            closeTab(activeSessionId);
+            setSessions(await api.sessionList());
+          }}
+        >
+          Archive
+        </button>
+        <button
+          type="button"
+          className="danger"
+          disabled={!activeSessionId}
+          onClick={async () => {
+            if (!activeSessionId) return;
+            if (
+              !window.confirm(
+                "Delete this session permanently? Transcript is removed from disk.",
+              )
+            ) {
+              return;
+            }
+            await api.sessionDelete(activeSessionId);
+            closeTab(activeSessionId);
+            setSessions(await api.sessionList());
+          }}
+        >
+          Delete
+        </button>
         <button
           type="button"
           disabled={!activeSessionId}
@@ -1178,6 +1301,14 @@ export default function App() {
           </div>
         </div>
       )}
+
+      <SessionBrowser
+        open={sessionBrowserOpen}
+        activeSessionId={activeSessionId}
+        onClose={() => setSessionBrowserOpen(false)}
+        onOpen={(s) => void handleSessionBrowserOpen(s)}
+        onChanged={() => void handleSessionBrowserChanged()}
+      />
 
       {aboutOpen && (
         <div className="modal-backdrop" onClick={() => setAboutOpen(false)}>

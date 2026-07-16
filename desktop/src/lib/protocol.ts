@@ -97,6 +97,10 @@ export interface SessionSummary {
   updated_at: string;
   message_count: number;
   forked_from?: string | null;
+  folder?: string | null;
+  tags?: string[];
+  archived?: boolean;
+  archived_at?: string | null;
 }
 
 /** Restored from `~/.grokptah/workspace.json` on app launch. */
