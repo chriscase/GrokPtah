@@ -38,6 +38,12 @@ pub struct Session {
     /// Compact drops early transcript into a summary blob.
     #[serde(default)]
     pub compacted_summary: Option<String>,
+    /// True once `transcript.jsonl` has been read into `transcript`.
+    #[serde(skip)]
+    pub transcript_loaded: bool,
+    /// How many prefix entries are already durable on disk (append cursor).
+    #[serde(skip)]
+    pub persisted_len: usize,
 }
 
 impl Session {
@@ -56,17 +62,25 @@ impl Session {
             plan_mode: false,
             plan_steps: Vec::new(),
             compacted_summary: None,
+            transcript_loaded: true,
+            persisted_len: 0,
         }
     }
 
     pub fn summary(&self) -> SessionSummary {
+        // Prefer in-memory length when loaded; else disk cursor from meta load.
+        let message_count = if self.transcript_loaded {
+            self.transcript.len()
+        } else {
+            self.persisted_len
+        };
         SessionSummary {
             id: self.id,
             title: self.title.clone(),
             cwd: self.cwd.display().to_string(),
             created_at: self.created_at,
             updated_at: self.updated_at,
-            message_count: self.transcript.len(),
+            message_count,
             forked_from: self.forked_from,
         }
     }

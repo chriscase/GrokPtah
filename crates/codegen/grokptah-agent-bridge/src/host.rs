@@ -16,7 +16,7 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::local_tools;
 use crate::permission::{PermissionDecision, PermissionRequest};
 use crate::session::{Session, SessionSummary, TranscriptEntry};
-use crate::session_store::{self, WorkspaceSnapshot};
+use crate::session_store::{self, WorkspaceChrome};
 use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo, PluginInfo, SkillInfo,
     SubagentInfo,
@@ -117,22 +117,33 @@ impl AgentHost {
     pub fn create(config: HostConfig) -> AgentHostHandle {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let auth = crate::auth_store::load_auth_state();
-        let snap = session_store::load().unwrap_or_default();
-        let project_cwd = session_store::cwd_still_valid(snap.project_cwd.as_deref());
+        let (chrome, mut sessions) = session_store::load_workspace().unwrap_or_else(|e| {
+            eprintln!("[grokptah] workspace load failed: {e:#}");
+            (WorkspaceChrome::default(), HashMap::new())
+        });
+        let project_cwd = session_store::cwd_still_valid(chrome.project_cwd.as_deref());
         let mcp_servers = crate::discover::load_mcp_servers(project_cwd.as_deref());
         let plugins = crate::discover::discover_plugins();
         let skills = crate::discover::discover_skills(project_cwd.as_deref());
-        let sessions = session_store::sessions_map(&snap);
         // Prefer persisted model; fall back to HostConfig / catalog default.
-        let model = if !snap.model.is_empty() {
-            snap.model.clone()
+        let model = if !chrome.model.is_empty() {
+            chrome.model.clone()
         } else {
             config.default_model.clone()
         };
-        let mut open_tab_ids = snap.open_tab_ids.clone();
+        let mut open_tab_ids = chrome.open_tab_ids.clone();
         // Drop tab ids that no longer exist.
         open_tab_ids.retain(|id| sessions.contains_key(id));
-        let active_session = snap
+        // Soft GC empty shells / hard cap (never delete open tabs), then reload map.
+        if let Ok(n) = session_store::garbage_collect(&open_tab_ids, 80, 24 * 7) {
+            if n > 0 {
+                if let Ok(reloaded) = session_store::load_all_metas() {
+                    sessions = reloaded;
+                    open_tab_ids.retain(|id| sessions.contains_key(id));
+                }
+            }
+        }
+        let active_session = chrome
             .active_session
             .filter(|id| sessions.contains_key(id))
             .or_else(|| open_tab_ids.first().copied())
@@ -143,20 +154,20 @@ impl AgentHost {
             sessions,
             active_session,
             open_tab_ids,
-            always_approve: snap.always_approve || config.always_approve,
+            always_approve: chrome.always_approve || config.always_approve,
             always_allowed_tools: HashSet::new(),
             model,
-            effort: snap.effort,
+            effort: chrome.effort,
             auth,
-            sandbox_profile: if snap.sandbox_profile.is_empty() {
+            sandbox_profile: if chrome.sandbox_profile.is_empty() {
                 "workspace-write".into()
             } else {
-                snap.sandbox_profile
+                chrome.sandbox_profile
             },
-            appearance: if snap.appearance.is_empty() {
+            appearance: if chrome.appearance.is_empty() {
                 "dark".into()
             } else {
-                snap.appearance
+                chrome.appearance
             },
             permission_mode: "default".into(),
             allow_rules: Vec::new(),
@@ -184,12 +195,12 @@ impl AgentHostHandle {
         self.event_rx_factory.lock().take()
     }
 
-    /// Snapshot host state to `~/.grokptah/workspace.json`.
-    pub fn persist(&self) {
-        let snap = {
+    /// Persist tiny workspace chrome (tabs / project / model) only.
+    pub fn persist_chrome(&self) {
+        let chrome = {
             let g = self.inner.lock();
-            WorkspaceSnapshot {
-                version: 1,
+            WorkspaceChrome {
+                version: 2,
                 project_cwd: g
                     .project_cwd
                     .as_ref()
@@ -201,12 +212,66 @@ impl AgentHostHandle {
                 sandbox_profile: g.sandbox_profile.clone(),
                 appearance: g.appearance.clone(),
                 always_approve: g.always_approve,
-                sessions: g.sessions.values().cloned().collect(),
             }
         };
-        if let Err(e) = session_store::save(&snap) {
-            eprintln!("[grokptah] workspace persist failed: {e:#}");
+        if let Err(e) = session_store::save_chrome(&chrome) {
+            eprintln!("[grokptah] chrome persist failed: {e:#}");
         }
+    }
+
+    /// Append new transcript lines + refresh meta for one session.
+    pub fn persist_session(&self, id: Uuid) {
+        let mut session = {
+            let g = self.inner.lock();
+            match g.sessions.get(&id) {
+                Some(s) => s.clone(),
+                None => return,
+            }
+        };
+        // Ensure we only append what isn't on disk yet.
+        if !session.transcript_loaded {
+            // Still push meta (title/count) without loading body.
+            if let Err(e) = session_store::save_session_meta(&session) {
+                eprintln!("[grokptah] meta persist failed: {e:#}");
+            }
+            return;
+        }
+        let from = session.persisted_len;
+        match session_store::append_transcript(&session, from) {
+            Ok(n) => {
+                session.persisted_len += n;
+                let mut g = self.inner.lock();
+                if let Some(s) = g.sessions.get_mut(&id) {
+                    s.persisted_len = session.persisted_len;
+                }
+            }
+            Err(e) => eprintln!("[grokptah] transcript append failed: {e:#}"),
+        }
+    }
+
+    /// Full transcript rewrite (rewind / compact).
+    pub fn persist_session_rewrite(&self, id: Uuid) {
+        let session = {
+            let g = self.inner.lock();
+            match g.sessions.get(&id) {
+                Some(s) => s.clone(),
+                None => return,
+            }
+        };
+        if let Err(e) = session_store::rewrite_transcript(&session) {
+            eprintln!("[grokptah] transcript rewrite failed: {e:#}");
+            return;
+        }
+        let mut g = self.inner.lock();
+        if let Some(s) = g.sessions.get_mut(&id) {
+            s.persisted_len = s.transcript.len();
+            s.transcript_loaded = true;
+        }
+    }
+
+    /// Back-compat alias used by older call sites — chrome only.
+    pub fn persist(&self) {
+        self.persist_chrome();
     }
 
     /// UI restore: sessions list + which tabs were open.
@@ -238,7 +303,21 @@ impl AgentHostHandle {
                 }
             }
         }
-        self.persist();
+        self.persist_chrome();
+    }
+
+    /// Ensure transcript is in memory (lazy load from JSONL).
+    pub fn ensure_transcript_loaded(&self, id: Uuid) -> Result<()> {
+        let mut g = self.inner.lock();
+        let s = g
+            .sessions
+            .get_mut(&id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        if s.transcript_loaded {
+            return Ok(());
+        }
+        session_store::load_transcript(s)?;
+        Ok(())
     }
 
     pub fn status(&self) -> AgentStatus {
@@ -283,7 +362,7 @@ impl AgentHostHandle {
             g.mcp_servers = mcp;
             g.skills = skills;
         }
-        self.persist();
+        self.persist_chrome();
         Ok(p.display().to_string())
     }
 
@@ -308,11 +387,14 @@ impl AgentHostHandle {
             g.sessions.insert(s.id, s);
             summary
         };
-        self.persist();
+        // Empty shell: meta + empty transcript file.
+        self.persist_session_rewrite(summary.id);
+        self.persist_chrome();
         Ok(summary)
     }
 
     pub fn session_load(&self, id: Uuid) -> Result<SessionSummary> {
+        self.ensure_transcript_loaded(id)?;
         let summary = {
             let mut g = self.inner.lock();
             let s = g
@@ -326,12 +408,13 @@ impl AgentHostHandle {
             }
             summary
         };
-        self.persist();
+        self.persist_chrome();
         Ok(summary)
     }
 
-    /// Full transcript for hydrating a session tab without replaying events.
+    /// Full transcript for hydrating a session tab (loads JSONL on demand).
     pub fn session_transcript(&self, id: Uuid) -> Result<Vec<TranscriptEntry>> {
+        self.ensure_transcript_loaded(id)?;
         let g = self.inner.lock();
         let s = g
             .sessions
@@ -353,6 +436,7 @@ impl AgentHostHandle {
     }
 
     pub fn fork_session(&self, source: Uuid) -> Result<SessionSummary> {
+        self.ensure_transcript_loaded(source)?;
         let summary = {
             let mut g = self.inner.lock();
             let src = g
@@ -362,6 +446,8 @@ impl AgentHostHandle {
                 .clone();
             let mut s = Session::new(src.cwd.clone(), src.model.clone(), src.effort);
             s.transcript = src.transcript.clone();
+            s.transcript_loaded = true;
+            s.persisted_len = 0;
             s.title = format!("{} (fork)", src.title);
             s.forked_from = Some(source);
             s.plan_mode = src.plan_mode;
@@ -374,11 +460,14 @@ impl AgentHostHandle {
             g.sessions.insert(s.id, s);
             summary
         };
-        self.persist();
+        // Forked body is a full new log.
+        self.persist_session_rewrite(summary.id);
+        self.persist_chrome();
         Ok(summary)
     }
 
     pub fn rewind_session(&self, id: Uuid, keep_messages: usize) -> Result<SessionSummary> {
+        self.ensure_transcript_loaded(id)?;
         let summary = {
             let mut g = self.inner.lock();
             let s = g
@@ -391,11 +480,12 @@ impl AgentHostHandle {
             s.updated_at = Utc::now();
             s.summary()
         };
-        self.persist();
+        self.persist_session_rewrite(id);
         Ok(summary)
     }
 
     pub fn compact_session(&self, id: Uuid) -> Result<SessionSummary> {
+        self.ensure_transcript_loaded(id)?;
         let summary = {
             let mut g = self.inner.lock();
             let s = g
@@ -418,33 +508,33 @@ impl AgentHostHandle {
             s.updated_at = Utc::now();
             s.summary()
         };
-        self.persist();
+        self.persist_session_rewrite(id);
         Ok(summary)
     }
 
     pub fn set_model(&self, model: String) {
         self.inner.lock().model = model;
-        self.persist();
+        self.persist_chrome();
     }
 
     pub fn set_effort(&self, effort: EffortLevel) {
         self.inner.lock().effort = effort;
-        self.persist();
+        self.persist_chrome();
     }
 
     pub fn set_always_approve(&self, v: bool) {
         self.inner.lock().always_approve = v;
-        self.persist();
+        self.persist_chrome();
     }
 
     pub fn set_sandbox(&self, profile: String) {
         self.inner.lock().sandbox_profile = profile;
-        self.persist();
+        self.persist_chrome();
     }
 
     pub fn set_appearance(&self, appearance: String) {
         self.inner.lock().appearance = appearance;
-        self.persist();
+        self.persist_chrome();
     }
 
     pub fn set_permission_mode(&self, mode: String) {
@@ -921,6 +1011,7 @@ impl AgentHostHandle {
     /// Multiple sessions may run turns concurrently; each keeps its own
     /// cancellation token keyed by `session_id`.
     pub async fn session_prompt(&self, session_id: Uuid, prompt: String) -> Result<String> {
+        self.ensure_transcript_loaded(session_id)?;
         let (cwd, model, effort, plan_mode, cancel, event_tx) = {
             let mut g = self.inner.lock();
             if !g.running {
@@ -960,6 +1051,8 @@ impl AgentHostHandle {
                 event_tx,
             )
         };
+        // Durably append the user turn before the long model call.
+        self.persist_session(session_id);
 
         let result = self
             .run_turn(
@@ -978,9 +1071,9 @@ impl AgentHostHandle {
             let mut g = self.inner.lock();
             g.turn_cancels.remove(&session_id);
         }
-        // Persist after every turn (user prompt already in transcript; assistant
-        // text is pushed during run_turn via push_assistant).
-        self.persist();
+        // Append assistant turn(s) written by push_assistant.
+        self.persist_session(session_id);
+        self.persist_chrome();
 
         let cancelled = cancel.is_cancelled();
         match result {
@@ -1458,19 +1551,16 @@ impl AgentHostHandle {
 }
 
 fn push_assistant(host: &AgentHostHandle, session_id: Uuid, text: &str) {
-    {
-        let mut g = host.inner.lock();
-        if let Some(s) = g.sessions.get_mut(&session_id) {
-            s.transcript.push(TranscriptEntry {
-                role: "assistant".into(),
-                text: text.into(),
-            });
-            s.updated_at = Utc::now();
-        }
+    let mut g = host.inner.lock();
+    if let Some(s) = g.sessions.get_mut(&session_id) {
+        s.transcript.push(TranscriptEntry {
+            role: "assistant".into(),
+            text: text.into(),
+        });
+        s.updated_at = Utc::now();
     }
-    // Debounced by turn-end persist; still write on each assistant push so a
-    // crash mid-turn keeps partial progress when the reply was long.
-    host.persist();
+    // Disk flush is append-only at turn end (session_prompt) so large replies
+    // don't rewrite multi-MB files mid-stream.
 }
 
 fn emit_message(tx: &mpsc::UnboundedSender<SessionUpdate>, session_id: Uuid, text: &str) {
