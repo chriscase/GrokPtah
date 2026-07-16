@@ -22,6 +22,7 @@ import {
 import { DebugTrace } from "./components/DebugTrace";
 import { SearchPanel } from "./components/SearchPanel";
 import { SessionBrowser } from "./components/SessionBrowser";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { StreamingText } from "./components/StreamingText";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import {
@@ -48,7 +49,6 @@ type RightTab =
   | "mcp"
   | "plugins"
   | "skills"
-  | "settings"
   | "tasks"
   | "rules";
 
@@ -167,7 +167,7 @@ export default function App() {
   const [skills, setSkills] = useState<any[]>([]);
   const [subagents, setSubagents] = useState<any[]>([]);
   const [bgTasks, setBgTasks] = useState<any[]>([]);
-  const [settings, setSettings] = useState<Record<string, unknown>>({});
+  const [hooksPreview, setHooksPreview] = useState<string | null>(null);
   const [rules, setRules] = useState<string[]>([]);
   const [product, setProduct] = useState({
     name: "GrokPtah",
@@ -177,7 +177,7 @@ export default function App() {
   const [showTerm, setShowTerm] = useState(false);
   const [toolShell, setToolShell] = useState<ToolShellAttach | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
-  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   /** False until we finish reopening tabs from ~/.grokptah/workspace.json. */
   const [workspaceRestored, setWorkspaceRestored] = useState(false);
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
@@ -906,7 +906,6 @@ export default function App() {
       }
       if (tab === "plugins") setPlugins(await api.pluginsList());
       if (tab === "skills") setSkills(await api.skillsList());
-      if (tab === "settings") setSettings(await api.settingsSnapshot());
       if (tab === "tasks") {
         setSubagents(await api.subagentsList());
         setBgTasks(await api.backgroundTasks());
@@ -942,72 +941,47 @@ export default function App() {
         </div>
         <div className="title-actions">
           <span className="path-chip" title={status?.project_cwd ?? ""}>
-            {status?.project_cwd ?? "no project open"}
+            {status?.project_cwd
+              ? shortPath(status.project_cwd, 36)
+              : "no project open"}
           </span>
           <button type="button" onClick={() => void openProject()}>
             Open folder
           </button>
-          <span
-            className="path-chip"
+          <button
+            type="button"
+            className={`auth-chip ${auth.signed_in ? "on" : ""}`}
             title={
               auth.signed_in
-                ? `${auth.display_name} (${auth.method})`
-                : "Not signed in — uses ~/.grok/auth.json from `grok login`, or API key"
+                ? `${auth.display_name} (${auth.method}) — open Settings`
+                : "Not signed in — open Settings to authenticate"
             }
+            onClick={() => setSettingsOpen(true)}
           >
-            {auth.signed_in
-              ? `auth: ${auth.method}`
-              : "auth: none"}
-          </span>
-          {auth.signed_in ? (
-            <button
-              type="button"
-              onClick={async () => setAuth(await api.signOut())}
-            >
-              Clear API key
-            </button>
-          ) : (
-            <>
-              <button
-                type="button"
-                onClick={async () => {
-                  await api.authOpenLogin();
-                }}
-              >
-                console.x.ai
-              </button>
-              <input
-                type="password"
-                placeholder="xAI API key (optional)"
-                value={apiKeyInput}
-                onChange={(e) => setApiKeyInput(e.target.value)}
-                style={{
-                  width: 150,
-                  background: "var(--bg-input)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 6,
-                  padding: "0.25rem 0.4rem",
-                  fontFamily: "var(--font)",
-                  fontSize: 11,
-                }}
+            {auth.signed_in ? auth.method : "auth: none"}
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            title="Settings"
+            aria-label="Open settings"
+            onClick={() => setSettingsOpen(true)}
+          >
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden>
+              <path
+                d="M6.5 2.5h3l.4 1.6a4.5 4.5 0 0 1 1.1.6l1.6-.5.9 1.5-1.2 1.1c.1.3.1.7.1 1s0 .7-.1 1l1.2 1.1-.9 1.5-1.6-.5a4.5 4.5 0 0 1-1.1.6L9.5 13.5h-3l-.4-1.6a4.5 4.5 0 0 1-1.1-.6l-1.6.5-.9-1.5 1.2-1.1A4 4 0 0 1 3.6 8c0-.3 0-.7.1-1L2.5 5.9l.9-1.5 1.6.5c.3-.3.7-.5 1.1-.6L6.5 2.5Z"
+                stroke="currentColor"
+                strokeWidth="1.2"
+                strokeLinejoin="round"
               />
-              <button
-                type="button"
-                className="primary"
-                onClick={async () => {
-                  if (!apiKeyInput.trim()) return;
-                  setAuth(
-                    await api.authSetApiKey(apiKeyInput.trim(), "API key"),
-                  );
-                  setApiKeyInput("");
-                }}
-              >
-                Save key
-              </button>
-            </>
-          )}
-          <button type="button" onClick={() => setAboutOpen(true)}>
-            About
+              <circle
+                cx="8"
+                cy="8"
+                r="1.75"
+                stroke="currentColor"
+                strokeWidth="1.2"
+              />
+            </svg>
           </button>
         </div>
       </header>
@@ -1379,7 +1353,10 @@ export default function App() {
             />
             <div className="composer-toolbar">
               <div className="composer-toolbar-left">
-                <label className="composer-pill" title="Model">
+                <label
+                  className="composer-pill"
+                  title="Model (default from Settings)"
+                >
                   <span className="composer-pill-label">Model</span>
                   <select
                     value={
@@ -1399,7 +1376,10 @@ export default function App() {
                     ))}
                   </select>
                 </label>
-                <label className="composer-pill" title="Reasoning effort">
+                <label
+                  className="composer-pill"
+                  title="Effort (default from Settings)"
+                >
                   <span className="composer-pill-label">Effort</span>
                   <select
                     value={String(status?.effort ?? "medium")}
@@ -1426,13 +1406,21 @@ export default function App() {
                 <button
                   type="button"
                   className={`composer-chip ${status?.always_approve ? "on" : ""}`}
-                  title="Always approve tool calls (yolo)"
+                  title="Always approve tools (also in Settings)"
                   onClick={async () => {
                     await api.setAlwaysApprove(!status?.always_approve);
                     await refreshChrome();
                   }}
                 >
                   Auto
+                </button>
+                <button
+                  type="button"
+                  className="composer-chip quiet"
+                  title="Open settings"
+                  onClick={() => setSettingsOpen(true)}
+                >
+                  ⚙
                 </button>
                 <button
                   type="button"
@@ -1500,7 +1488,6 @@ export default function App() {
               "mcp",
               "plugins",
               "skills",
-              "settings",
               "tasks",
               "rules",
             ] as RightTab[]
@@ -1639,77 +1626,16 @@ export default function App() {
             ))}
             <div className="panel-block">
               <strong>Hooks config</strong>
-              <pre>
-                {/* loaded on demand */}
-                {String((settings as any)._hooks || "Open settings refresh or click Load hooks")}
-              </pre>
+              <pre>{hooksPreview ?? "Click Load hooks"}</pre>
               <button
                 type="button"
                 onClick={async () => {
-                  const h = await api.hooksConfig();
-                  setSettings((s) => ({ ...s, _hooks: h }));
+                  setHooksPreview(await api.hooksConfig());
                 }}
               >
                 Load hooks
               </button>
             </div>
-          </>
-        )}
-
-        {rightTab === "settings" && (
-          <>
-            <div className="panel-block">
-              <pre>{JSON.stringify(settings, null, 2)}</pre>
-            </div>
-            <label>
-              Sandbox{" "}
-              <select
-                onChange={async (e) => {
-                  await api.setSandbox(e.target.value);
-                  setSettings(await api.settingsSnapshot());
-                }}
-              >
-                <option value="workspace-write">workspace-write</option>
-                <option value="read-only">read-only</option>
-                <option value="danger-full-access">danger-full-access</option>
-              </select>
-            </label>
-            <label>
-              Appearance{" "}
-              <select
-                onChange={async (e) => {
-                  await api.setAppearance(e.target.value);
-                  setSettings(await api.settingsSnapshot());
-                }}
-              >
-                <option value="dark">dark</option>
-                <option value="light">light</option>
-              </select>
-            </label>
-            <label>
-              Permission mode{" "}
-              <select
-                onChange={async (e) => {
-                  await api.setPermissionMode(e.target.value);
-                  setSettings(await api.settingsSnapshot());
-                }}
-              >
-                <option value="default">default</option>
-                <option value="bypassPermissions">bypassPermissions</option>
-              </select>
-            </label>
-            <button
-              type="button"
-              onClick={async () => {
-                await api.setAllowDenyRules(["Shell(*)"], ["WebFetch(*)"]);
-                setSettings(await api.settingsSnapshot());
-              }}
-            >
-              Apply sample allow/deny rules
-            </button>
-            {settings.autoUpdateEnabled === false && (
-              <p className="warn-pill">Upstream CLI auto-update disabled</p>
-            )}
           </>
         )}
 
@@ -1886,6 +1812,15 @@ export default function App() {
       )}
 
       <ContextMenu menu={ctxMenu} onClose={() => setCtxMenu(null)} />
+
+      <SettingsPanel
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        models={models}
+        auth={auth}
+        onAuthChange={setAuth}
+        onChromeChange={() => void refreshChrome()}
+      />
 
       <SessionBrowser
         open={sessionBrowserOpen}
