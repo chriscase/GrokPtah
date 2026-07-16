@@ -116,18 +116,24 @@ function finalizeTurnTranscript(
   const tail =
     lastUser >= 0 ? transcript.slice(lastUser + 1) : [...transcript];
 
-  // Strip any assistant bubbles from this turn's tail (they may be N× glued
-  // copies from multi-listener events). The invoke return is the single
-  // source of truth for the final assistant text.
+  // Keep tools / plans / thoughts / errors — only collapse duplicate assistants.
+  // Tool cards must survive turn finalize or the transcript looks "empty" of work.
   const nonAssistant: TranscriptItem[] = collapseAdjacentDuplicateAssistants(
     tail,
   )
     .filter((item) => item.kind !== "assistant")
-    .map((item) =>
-      item.kind === "thought"
-        ? { kind: "thought" as const, text: item.text, streaming: false }
-        : item,
-    );
+    .map((item) => {
+      if (item.kind === "thought") {
+        return { kind: "thought" as const, text: item.text, streaming: false };
+      }
+      if (item.kind === "tool") {
+        return {
+          ...item,
+          status: typeof item.status === "string" ? item.status : "completed",
+        };
+      }
+      return item;
+    });
 
   const trimmed = reply?.trim() ? collapseRepeatedText(reply.trim()) : "";
   if (trimmed) {

@@ -26,7 +26,7 @@ type RenderRow =
  * Group consecutive tool calls into batches so older ones collapse together,
  * and fold host debug thoughts into chips.
  */
-function groupTranscript(items: TranscriptItem[]): RenderRow[] {
+export function groupTranscript(items: TranscriptItem[]): RenderRow[] {
   const out: RenderRow[] = [];
   let i = 0;
   while (i < items.length) {
@@ -171,8 +171,16 @@ export function SessionPane({
           }
           if (row.type === "tool_batch") {
             return (
-              <div key={row.key} className="tool-batch">
-                <ToolHistoryGroup tools={row.tools} keepRecent={4} />
+              <div
+                key={row.key}
+                className="tool-batch"
+                data-testid="tool-batch"
+                data-tool-count={row.tools.length}
+              >
+                <div className="tool-batch-label">
+                  Tools · {row.tools.length}
+                </div>
+                <ToolHistoryGroup tools={row.tools} keepRecent={8} />
               </div>
             );
           }

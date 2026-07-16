@@ -1,7 +1,16 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { TranscriptItem } from "../lib/protocol";
 
 type ToolItem = Extract<TranscriptItem, { kind: "tool" }>;
+
+function statusLabel(status: unknown): string {
+  if (typeof status === "string" && status.trim()) return status;
+  if (status && typeof status === "object") {
+    const keys = Object.keys(status as object);
+    if (keys.length) return keys[0];
+  }
+  return "unknown";
+}
 
 function statusGlyph(status: string): string {
   switch (status) {
@@ -13,13 +22,13 @@ function statusGlyph(status: string): string {
       return "⊘";
     case "running":
     case "pending":
-      return "·";
+      return "●";
     default:
       return "·";
   }
 }
 
-function shortOutput(output?: string, max = 96): string {
+function shortOutput(output?: string, max = 100): string {
   if (!output) return "";
   const one = output.replace(/\s+/g, " ").trim();
   if (one.length <= max) return one;
@@ -27,8 +36,8 @@ function shortOutput(output?: string, max = 96): string {
 }
 
 /**
- * Compact one-line tool call; output expanded only on demand.
- * Running tools stay slightly open for live feedback.
+ * Compact tool call row. Uses <details> so it stays visible even if custom
+ * button styles fight the chrome, and so output is expandable for power users.
  */
 export function ToolCallCard({
   item,
@@ -37,48 +46,51 @@ export function ToolCallCard({
   item: ToolItem;
   defaultOpen?: boolean;
 }) {
-  const live = item.status === "running" || item.status === "pending";
+  const status = statusLabel(item.status);
+  const live = status === "running" || status === "pending";
   const [open, setOpen] = useState(Boolean(defaultOpen) || live);
   const preview = shortOutput(item.output);
+  const title = item.title?.trim() || "tool";
+
+  // When a tool finishes and gains output, keep collapsed unless user opened it;
+  // when it starts running, auto-open briefly for live feedback.
+  useEffect(() => {
+    if (live) setOpen(true);
+  }, [live]);
 
   return (
-    <div
-      className={`tool-card status-${item.status} ${open ? "is-open" : ""} ${live ? "is-live" : ""}`}
+    <details
+      className={`tool-card status-${status} ${live ? "is-live" : ""}`}
+      open={open}
+      onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
     >
-      <button
-        type="button"
-        className="tool-card-header"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-      >
+      <summary className="tool-card-header">
         <span className="tool-card-glyph" aria-hidden>
-          {statusGlyph(item.status)}
+          {statusGlyph(status)}
         </span>
-        <span className="tool-card-title">{item.title}</span>
-        <span className="tool-card-status">{item.status}</span>
-        {!open && preview && (
+        <span className="tool-card-title">{title}</span>
+        <span className="tool-card-status">{status}</span>
+        {!open && preview ? (
           <span className="tool-card-preview" title={item.output}>
             {preview}
           </span>
-        )}
-        <span className="tool-card-chevron" aria-hidden>
-          {open ? "▾" : "▸"}
-        </span>
-      </button>
-      {open && item.output && (
+        ) : null}
+      </summary>
+      {item.output ? (
         <pre className="tool-card-output">{item.output}</pre>
-      )}
-      {open && !item.output && live && (
+      ) : live ? (
         <div className="tool-card-waiting">Running…</div>
+      ) : (
+        <div className="tool-card-waiting">(no output)</div>
       )}
-    </div>
+    </details>
   );
 }
 
 /** Collapse older tool calls into a single expandable group. */
 export function ToolHistoryGroup({
   tools,
-  keepRecent = 4,
+  keepRecent = 6,
 }: {
   tools: { item: ToolItem; index: number }[];
   keepRecent?: number;
@@ -94,34 +106,33 @@ export function ToolHistoryGroup({
       : tools;
 
   return (
-    <>
+    <div className="tool-history-group">
       {older.length > 0 && (
-        <div className="tool-history-group">
-          <button
-            type="button"
-            className="tool-history-toggle"
-            onClick={() => setShowOlder((v) => !v)}
-            aria-expanded={showOlder}
-          >
-            {showOlder ? "Hide" : "Show"} {older.length} earlier tool
-            {older.length === 1 ? "" : "s"}
-          </button>
-          {showOlder &&
-            older.map(({ item, index }) => (
-              <ToolCallCard key={`tool-old-${index}`} item={item} />
-            ))}
-        </div>
+        <button
+          type="button"
+          className="tool-history-toggle"
+          onClick={() => setShowOlder((v) => !v)}
+          aria-expanded={showOlder}
+        >
+          {showOlder ? "Hide" : "Show"} {older.length} earlier tool
+          {older.length === 1 ? "" : "s"}
+        </button>
       )}
+      {showOlder &&
+        older.map(({ item, index }) => (
+          <ToolCallCard key={`tool-old-${item.callId || index}`} item={item} />
+        ))}
       {recent.map(({ item, index }, i) => (
         <ToolCallCard
-          key={`tool-r-${index}`}
+          key={`tool-r-${item.callId || index}`}
           item={item}
           defaultOpen={
             i === recent.length - 1 &&
-            (item.status === "running" || item.status === "pending")
+            (statusLabel(item.status) === "running" ||
+              statusLabel(item.status) === "pending")
           }
         />
       ))}
-    </>
+    </div>
   );
 }
