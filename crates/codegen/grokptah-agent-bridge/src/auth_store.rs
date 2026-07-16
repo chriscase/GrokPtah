@@ -31,15 +31,69 @@ const ACCOUNT_DISPLAY: &str = "display-name";
 pub const XAI_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
 pub const XAI_AUTHENTICATE_RESPONSE: &str = "authenticate-response";
 /// Proxy version gate (`HTTP 426` if missing/too old). Must be ≥ 0.1.202.
-/// Identify as GrokPtah while reporting a current CLI-compatible version.
+///
+/// **Important:** do not put `grokptah-…` in parentheses. The proxy’s parser
+/// treats the parenthetical as the version — `0.2.101 (grokptah-0.1.0)` is
+/// read as `0.1.0` and rejected. Use a clean CLI-compatible version only.
 pub fn client_version_header() -> String {
     if let Ok(v) = std::env::var("GROK_VERSION") {
-        if !v.trim().is_empty() {
-            return v;
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
         }
     }
-    // Floor matches a recent stable CLI line; suffix tags desktop builds.
-    format!("0.2.101 (grokptah-{})", env!("CARGO_PKG_VERSION"))
+    if let Some(v) = detect_installed_grok_version() {
+        return v;
+    }
+    // Known-good floor that passes cli-chat-proxy (matches current stable CLI).
+    "0.2.101".to_string()
+}
+
+#[cfg(test)]
+mod version_header_tests {
+    use super::client_version_header;
+
+    #[test]
+    fn client_version_has_no_grokptah_parenthetical() {
+        let v = client_version_header();
+        assert!(
+            !v.to_lowercase().contains("grokptah"),
+            "proxy mis-parses grokptah-… in parentheses as the version: got {v:?}"
+        );
+        assert!(
+            v.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "version must start with a digit: {v:?}"
+        );
+    }
+}
+
+/// Parse `grok --version` → e.g. `0.2.101 (5bc4b5dfadcf)` when available.
+fn detect_installed_grok_version() -> Option<String> {
+    let output = std::process::Command::new("grok")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Examples: "grok 0.2.101 (5bc4b5dfadcf) [stable]" or "0.2.101"
+    let line = text.lines().next()?.trim();
+    let rest = line
+        .strip_prefix("grok ")
+        .or_else(|| line.strip_prefix("Grok "))
+        .unwrap_or(line)
+        .trim();
+    // Drop channel suffix " [stable]"
+    let rest = rest.split(" [").next()?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    // Sanity: must start with a digit
+    if !rest.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    Some(rest.to_string())
 }
 
 #[derive(Debug, Clone)]
