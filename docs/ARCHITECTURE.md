@@ -11,6 +11,7 @@ that keeps the upstream CLI/TUI and adds a **desktop client** on Tauri 2 + React
 | UI | React + Vite, dark desktop chrome (GrokPtah branding only) |
 | Scope | TUI **capability** parity (not pixel-perfect ratatui) |
 | CLI | `xai-grok-pager-bin` remains independently buildable |
+| Build agent runtime | **Hybrid thin loop** deepened in-bridge; path to embed upstream — see [`ADR-001-agent-runtime.md`](./ADR-001-agent-runtime.md) |
 
 ## Layer diagram
 
@@ -50,8 +51,10 @@ The bridge:
 - Completes permission requests from the UI
 - Supports cancel, fork, rewind, compact, sessions list
 - Runs **local tools** (read/list/grep, shell, write with permission) in-process
-- When an xAI API key is present (OS keychain via `auth_set_api_key` or `XAI_API_KEY`), calls the live chat completions API for the final reply
-- Discovers MCP servers from `~/.grokptah/mcp.json` / project `.mcp.json`, skills under `~/.grokptah/skills` and project skill dirs, plugins under `~/.grokptah/plugins` + local catalog
+- **Build sessions** run a multi-round **tool-calling agent loop** (list/read/grep/glob/write/apply_patch/shell) with permissions; **Chat sessions** are single-shot completions
+- Injects project instructions (`AGENTS.md`, etc.) into Build context; sends effort on the wire
+- When OIDC/`~/.grok/auth.json` or an xAI API key is present, calls cli-chat-proxy / API for model steps
+- Discovers MCP servers from `~/.grokptah/mcp.json` / project `.mcp.json`, skills under `~/.grokptah/skills` and project skill dirs, plugins under `~/.grokptah/plugins` + local catalog (MCP **dispatch** into the loop is Phase 15)
 - Background tasks run real async work (directory walk) via `tokio::spawn`
 - Integrated terminal PTYs forward stdout to the UI (`pty://output`) with multi-tab backlog replay
 

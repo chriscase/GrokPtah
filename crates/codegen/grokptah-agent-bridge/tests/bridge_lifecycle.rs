@@ -29,17 +29,18 @@ struct IsolatedHome {
 impl IsolatedHome {
     fn install() -> Self {
         let lock = home_serial().lock().unwrap_or_else(|e| e.into_inner());
-        let prev = {
-            // Capture current override so we can restore (usually None).
-            // Reading via env is fine; override API only exposes set.
-            None
-        };
+        let prev = None;
         let tmp = tempfile::tempdir().expect("isolated home tempdir");
         let home = tmp.path().join(".grokptah");
         std::fs::create_dir_all(home.join("sessions")).expect("sessions dir");
         std::fs::create_dir_all(home.join("plugins")).ok();
         std::fs::create_dir_all(home.join("skills")).ok();
         set_grokptah_home_override(Some(home));
+        // Prevent live API / tool-loop network calls during unit tests.
+        // SAFETY: tests serialize on home_serial mutex.
+        unsafe {
+            std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+        }
         Self {
             _tmp: tmp,
             _lock: lock,
@@ -51,6 +52,9 @@ impl IsolatedHome {
 impl Drop for IsolatedHome {
     fn drop(&mut self) {
         set_grokptah_home_override(self.prev.take());
+        unsafe {
+            std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+        }
     }
 }
 

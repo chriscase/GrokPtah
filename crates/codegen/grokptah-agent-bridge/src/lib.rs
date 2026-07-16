@@ -10,6 +10,7 @@ mod host;
 mod local_tools;
 mod models_catalog;
 mod permission;
+mod project_context;
 mod search_engine;
 mod session;
 mod session_store;
