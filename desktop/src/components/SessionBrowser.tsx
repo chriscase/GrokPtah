@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
 import type { SessionSummary } from "../lib/protocol";
+import { StyledSelect } from "./StyledSelect";
 
 export type SessionBrowserProps = {
   open: boolean;
@@ -282,49 +283,47 @@ export function SessionBrowser({
             </button>
           ))}
         </div>
-        <select
+        <StyledSelect
+          aria-label="Chat vs build"
+          className="sb-select"
           value={kindFilter}
-          onChange={(e) => {
-            setKindFilter(e.target.value as KindFilter);
+          options={[
+            { value: "all", label: "All kinds" },
+            { value: "chat", label: "Chats" },
+            { value: "build", label: "Builds" },
+          ]}
+          onChange={(v) => {
+            setKindFilter(v as KindFilter);
             setSelected(new Set());
           }}
-          title="Chat vs build"
-        >
-          <option value="all">All kinds</option>
-          <option value="chat">Chats</option>
-          <option value="build">Builds</option>
-        </select>
+        />
         <input
           className="sb-search"
           placeholder="Search title, path, folder, tags…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
-        <select
+        <StyledSelect
+          aria-label="Filter by folder"
+          className="sb-select"
           value={folderFilter}
-          onChange={(e) => setFolderFilter(e.target.value)}
-          title="Filter by folder"
-        >
-          <option value="">All folders</option>
-          <option value="__inbox__">Inbox (no folder)</option>
-          {folders.map((f) => (
-            <option key={f} value={f}>
-              {f}
-            </option>
-          ))}
-        </select>
-        <select
+          options={[
+            { value: "", label: "All folders" },
+            { value: "__inbox__", label: "Inbox (no folder)" },
+            ...folders.map((f) => ({ value: f, label: f })),
+          ]}
+          onChange={(v) => setFolderFilter(v)}
+        />
+        <StyledSelect
+          aria-label="Filter by tag"
+          className="sb-select"
           value={tagFilter}
-          onChange={(e) => setTagFilter(e.target.value)}
-          title="Filter by tag"
-        >
-          <option value="">All tags</option>
-          {allTags.map((t) => (
-            <option key={t} value={t}>
-              #{t}
-            </option>
-          ))}
-        </select>
+          options={[
+            { value: "", label: "All tags" },
+            ...allTags.map((t) => ({ value: t, label: `#${t}` })),
+          ]}
+          onChange={(v) => setTagFilter(v)}
+        />
       </div>
 
       <div className="sb-bulk">
@@ -349,24 +348,21 @@ export function SessionBrowser({
         >
           Delete selected
         </button>
-        <select
+        <StyledSelect
+          aria-label="Move selected to folder"
+          className="sb-select"
           disabled={!selected.size || busy}
-          defaultValue=""
-          onChange={(e) => {
-            const v = e.target.value;
+          value=""
+          options={[
+            { value: "", label: "Move selected to folder…" },
+            { value: "__clear__", label: "Inbox (clear folder)" },
+            ...folders.map((f) => ({ value: f, label: f })),
+          ]}
+          onChange={(v) => {
             if (!v) return;
             void bulkFolder(v === "__clear__" ? null : v);
-            e.target.value = "";
           }}
-        >
-          <option value="">Move selected to folder…</option>
-          <option value="__clear__">Inbox (clear folder)</option>
-          {folders.map((f) => (
-            <option key={f} value={f}>
-              {f}
-            </option>
-          ))}
-        </select>
+        />
         {selected.size > 0 && (
           <span className="sb-sel-count">{selected.size} selected</span>
         )}

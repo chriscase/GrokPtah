@@ -24,6 +24,7 @@ import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
+import { StyledSelect } from "./components/StyledSelect";
 import {
   dequeuePermission,
   enqueuePermission,
@@ -234,6 +235,9 @@ export default function App() {
   const [gitStatus, setGitStatus] = useState("");
   const [gitDiff, setGitDiff] = useState("");
   const [worktrees, setWorktrees] = useState("");
+  const [wtPath, setWtPath] = useState("../wt-feature");
+  const [wtBranch, setWtBranch] = useState("");
+  const [wtBusy, setWtBusy] = useState(false);
   const [mcp, setMcp] = useState<any[]>([]);
   const [mcpDoctor, setMcpDoctor] = useState<string[]>([]);
   /** Project-local .mcp.json trust prompt (malicious-repo RCE gate). */
@@ -2034,37 +2038,36 @@ export default function App() {
                   title="Model (default from Settings)"
                 >
                   <span className="composer-pill-label">Model</span>
-                  <select
+                  <StyledSelect
+                    aria-label="Model"
+                    className="composer-select"
                     value={
                       models.some((m) => m.id === status?.model)
                         ? (status?.model ?? models[0]?.id ?? "grok-build")
                         : (models[0]?.id ?? status?.model ?? "grok-build")
                     }
-                    onChange={async (e) => {
-                      await api.setModel(e.target.value);
-                      await refreshChrome();
+                    options={models.map((m) => ({
+                      value: m.id,
+                      label: m.display_name,
+                    }))}
+                    onChange={(v) => {
+                      void (async () => {
+                        await api.setModel(v);
+                        await refreshChrome();
+                      })();
                     }}
-                  >
-                    {models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.display_name}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </label>
                 <label
                   className="composer-pill"
                   title="Effort (default from Settings)"
                 >
                   <span className="composer-pill-label">Effort</span>
-                  <select
+                  <StyledSelect
+                    aria-label="Effort"
+                    className="composer-select"
                     value={String(status?.effort ?? "medium")}
-                    onChange={async (e) => {
-                      await api.setEffort(e.target.value);
-                      await refreshChrome();
-                    }}
-                  >
-                    {[
+                    options={[
                       "none",
                       "minimal",
                       "low",
@@ -2072,12 +2075,14 @@ export default function App() {
                       "high",
                       "xhigh",
                       "max",
-                    ].map((e) => (
-                      <option key={e} value={e}>
-                        {e}
-                      </option>
-                    ))}
-                  </select>
+                    ].map((e) => ({ value: e, label: e }))}
+                    onChange={(v) => {
+                      void (async () => {
+                        await api.setEffort(v);
+                        await refreshChrome();
+                      })();
+                    }}
+                  />
                 </label>
                 <button
                   type="button"
@@ -2316,6 +2321,101 @@ export default function App() {
             <div className="panel-block">
               <strong>Worktrees</strong>
               <pre>{worktrees || "(none)"}</pre>
+              <div className="worktree-create">
+                <input
+                  placeholder="Path (e.g. ../wt-feature)"
+                  value={wtPath}
+                  onChange={(e) => setWtPath(e.target.value)}
+                  disabled={wtBusy}
+                />
+                <input
+                  placeholder="New branch (optional)"
+                  value={wtBranch}
+                  onChange={(e) => setWtBranch(e.target.value)}
+                  disabled={wtBusy}
+                />
+                <div className="worktree-create-actions">
+                  <button
+                    type="button"
+                    disabled={wtBusy || !wtPath.trim()}
+                    onClick={() => {
+                      void (async () => {
+                        setWtBusy(true);
+                        try {
+                          const msg = await api.createWorktree(
+                            wtPath.trim(),
+                            wtBranch.trim() || null,
+                          );
+                          setWorktrees(await api.listWorktrees());
+                          setGitDiff(msg);
+                        } catch (e) {
+                          setGitDiff(String(e));
+                        } finally {
+                          setWtBusy(false);
+                        }
+                      })();
+                    }}
+                  >
+                    Create worktree
+                  </button>
+                  <button
+                    type="button"
+                    disabled={wtBusy || !wtPath.trim()}
+                    title="Switch project cwd to this worktree path"
+                    onClick={() => {
+                      void (async () => {
+                        setWtBusy(true);
+                        try {
+                          const root = status?.project_cwd;
+                          const abs = wtPath.trim().startsWith("/")
+                            ? wtPath.trim()
+                            : root
+                              ? `${root.replace(/\/$/, "")}/${wtPath.trim()}`
+                              : wtPath.trim();
+                          await api.setProjectCwd(abs);
+                          await refreshChrome();
+                          setWorktrees(await api.listWorktrees());
+                          setGitDiff(`Opened worktree as project: ${abs}`);
+                        } catch (e) {
+                          setGitDiff(String(e));
+                        } finally {
+                          setWtBusy(false);
+                        }
+                      })();
+                    }}
+                  >
+                    Open as project
+                  </button>
+                  <button
+                    type="button"
+                    className="danger"
+                    disabled={wtBusy || !wtPath.trim()}
+                    onClick={() => {
+                      void (async () => {
+                        if (
+                          !window.confirm(
+                            `Remove worktree at ${wtPath.trim()}? Branch is kept.`,
+                          )
+                        ) {
+                          return;
+                        }
+                        setWtBusy(true);
+                        try {
+                          const msg = await api.removeWorktree(wtPath.trim());
+                          setWorktrees(await api.listWorktrees());
+                          setGitDiff(msg || "Worktree removed");
+                        } catch (e) {
+                          setGitDiff(String(e));
+                        } finally {
+                          setWtBusy(false);
+                        }
+                      })();
+                    }}
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
             </div>
             <button type="button" onClick={() => void api.gitStageAll()}>
               Stage all

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import type { AuthState, ModelInfo } from "../lib/protocol";
+import { StyledSelect } from "./StyledSelect";
 
 export type SettingsPanelProps = {
   open: boolean;
@@ -165,22 +166,17 @@ export function SettingsPanel({
 
                 <label className="settings-field">
                   <span className="settings-field-label">Default model</span>
-                  <select
+                  <StyledSelect
                     disabled={busy}
                     value={modelValue}
-                    onChange={(e) =>
-                      void apply(
-                        () => api.setModel(e.target.value),
-                        "Default model saved",
-                      )
+                    options={models.map((m) => ({
+                      value: m.id,
+                      label: m.display_name,
+                    }))}
+                    onChange={(v) =>
+                      void apply(() => api.setModel(v), "Default model saved")
                     }
-                  >
-                    {models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.display_name}
-                      </option>
-                    ))}
-                  </select>
+                  />
                   <span className="settings-hint">
                     Wire id: <code>{modelValue}</code>
                   </span>
@@ -188,22 +184,14 @@ export function SettingsPanel({
 
                 <label className="settings-field">
                   <span className="settings-field-label">Default effort</span>
-                  <select
+                  <StyledSelect
                     disabled={busy}
                     value={String(snap.effort ?? "medium")}
-                    onChange={(e) =>
-                      void apply(
-                        () => api.setEffort(e.target.value),
-                        "Default effort saved",
-                      )
+                    options={EFFORTS.map((e) => ({ value: e, label: e }))}
+                    onChange={(v) =>
+                      void apply(() => api.setEffort(v), "Default effort saved")
                     }
-                  >
-                    {EFFORTS.map((e) => (
-                      <option key={e} value={e}>
-                        {e}
-                      </option>
-                    ))}
-                  </select>
+                  />
                   <span className="settings-hint">
                     Reasoning budget preference for agent turns.
                   </span>
@@ -226,7 +214,7 @@ export function SettingsPanel({
                   <span className="settings-field-label">
                     Tool permission mode
                   </span>
-                  <select
+                  <StyledSelect
                     disabled={busy}
                     value={
                       snap.alwaysApprove ||
@@ -234,20 +222,22 @@ export function SettingsPanel({
                         ? "bypassPermissions"
                         : "default"
                     }
-                    onChange={(e) =>
+                    options={[
+                      { value: "default", label: "Prompt for each tool" },
+                      {
+                        value: "bypassPermissions",
+                        label: "Always approve (bypass / YOLO)",
+                      },
+                    ]}
+                    onChange={(v) =>
                       void apply(
-                        () => api.setPermissionMode(e.target.value),
-                        e.target.value === "bypassPermissions"
+                        () => api.setPermissionMode(v),
+                        v === "bypassPermissions"
                           ? "Tools: auto-approve (bypass)"
                           : "Tools: prompt each call",
                       )
                     }
-                  >
-                    <option value="default">Prompt for each tool</option>
-                    <option value="bypassPermissions">
-                      Always approve (bypass / YOLO)
-                    </option>
-                  </select>
+                  />
                   <span className="settings-hint">
                     Effective:{" "}
                     {snap.alwaysApprove ||
@@ -263,26 +253,30 @@ export function SettingsPanel({
                   <span className="settings-field-label">
                     Tool safety profile
                   </span>
-                  <select
+                  <StyledSelect
                     disabled={busy}
                     value={String(snap.sandboxProfile ?? "workspace-write")}
-                    onChange={(e) =>
+                    options={[
+                      {
+                        value: "workspace-write",
+                        label: "workspace-write (agent soft gates)",
+                      },
+                      {
+                        value: "read-only",
+                        label: "read-only (block write tools / mutators)",
+                      },
+                      {
+                        value: "danger-full-access",
+                        label: "unrestricted (no agent-side gates)",
+                      },
+                    ]}
+                    onChange={(v) =>
                       void apply(
-                        () => api.setSandbox(e.target.value),
+                        () => api.setSandbox(v),
                         "Tool safety profile saved",
                       )
                     }
-                  >
-                    <option value="workspace-write">
-                      workspace-write (agent soft gates)
-                    </option>
-                    <option value="read-only">
-                      read-only (block write tools / mutators)
-                    </option>
-                    <option value="danger-full-access">
-                      unrestricted (no agent-side gates)
-                    </option>
-                  </select>
+                  />
                   <span className="settings-hint">
                     Not an OS sandbox. These are substring/tool-level soft
                     rails inside the agent bridge — trivially bypassable by a
@@ -336,19 +330,20 @@ export function SettingsPanel({
                 <h2>Appearance</h2>
                 <label className="settings-field">
                   <span className="settings-field-label">Theme</span>
-                  <select
+                  <StyledSelect
                     disabled={busy}
                     value={String(snap.appearance ?? "dark")}
-                    onChange={(e) =>
+                    options={[
+                      { value: "dark", label: "Dark" },
+                      { value: "light", label: "Light" },
+                    ]}
+                    onChange={(v) =>
                       void apply(async () => {
-                        await api.setAppearance(e.target.value);
-                        document.documentElement.dataset.theme = e.target.value;
+                        await api.setAppearance(v);
+                        document.documentElement.dataset.theme = v;
                       }, "Appearance saved")
                     }
-                  >
-                    <option value="dark">Dark</option>
-                    <option value="light">Light</option>
-                  </select>
+                  />
                   <span className="settings-hint">
                     Applies immediately via design tokens on{" "}
                     <code>data-theme</code>. Terminal canvas stays dark for

@@ -81,6 +81,8 @@ pub fn run() {
             commands::git_stage_all,
             commands::git_commit,
             commands::list_worktrees,
+            commands::create_worktree,
+            commands::remove_worktree,
             commands::agent_edit_diffs,
             commands::last_edited_path,
             commands::export_transcript,

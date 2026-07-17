@@ -129,6 +129,10 @@ export const api = {
   gitStageAll: () => invoke<string>("git_stage_all"),
   gitCommit: (message: string) => invoke<string>("git_commit", { message }),
   listWorktrees: () => invoke<string>("list_worktrees"),
+  createWorktree: (path: string, branch?: string | null) =>
+    invoke<string>("create_worktree", { path, branch: branch ?? null }),
+  removeWorktree: (path: string) =>
+    invoke<string>("remove_worktree", { path }),
   mcpList: () => invoke<unknown[]>("mcp_list"),
   mcpProjectTrust: () =>
     invoke<{

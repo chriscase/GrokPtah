@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import type { SearchHit } from "../lib/protocol";
+import { StyledSelect } from "./StyledSelect";
 
 export type SearchPanelProps = {
   open: boolean;
@@ -97,27 +98,30 @@ export function SearchPanel({
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
-        <select
+        <StyledSelect
+          aria-label="Ranking mode"
+          className="sp-select"
           value={mode}
-          onChange={(e) =>
-            setMode(e.target.value as "hybrid" | "keyword" | "semantic")
+          options={[
+            { value: "hybrid", label: "Hybrid" },
+            { value: "keyword", label: "Keyword" },
+            { value: "semantic", label: "Semantic" },
+          ]}
+          onChange={(v) =>
+            setMode(v as "hybrid" | "keyword" | "semantic")
           }
-          title="Ranking mode"
-        >
-          <option value="hybrid">Hybrid</option>
-          <option value="keyword">Keyword</option>
-          <option value="semantic">Semantic</option>
-        </select>
-        <select
+        />
+        <StyledSelect
+          aria-label="Session kind"
+          className="sp-select"
           value={kind}
-          onChange={(e) =>
-            setKind(e.target.value as "all" | "chat" | "build")
-          }
-        >
-          <option value="all">All kinds</option>
-          <option value="chat">Chats only</option>
-          <option value="build">Builds only</option>
-        </select>
+          options={[
+            { value: "all", label: "All kinds" },
+            { value: "chat", label: "Chats only" },
+            { value: "build", label: "Builds only" },
+          ]}
+          onChange={(v) => setKind(v as "all" | "chat" | "build")}
+        />
         <label className="sp-check">
           <input
             type="checkbox"

@@ -482,6 +482,29 @@ pub async fn list_worktrees(state: State<'_, AppState>) -> Result<String, String
 }
 
 #[tauri::command]
+pub async fn create_worktree(
+    state: State<'_, AppState>,
+    path: String,
+    branch: Option<String>,
+) -> Result<String, String> {
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.create_worktree(&path, branch.as_deref())
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn remove_worktree(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<String, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.remove_worktree(&path).map_err(map_err)).await
+}
+
+#[tauri::command]
 pub fn mcp_list(state: State<'_, AppState>) -> Vec<McpServerInfo> {
     state.host.mcp_list()
 }

@@ -1480,6 +1480,83 @@ impl AgentHostHandle {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// Create a git worktree under the open project (#43).
+    /// `path` is relative to the project root (or absolute). `branch` is optional
+    /// (new branch `-b` when provided; otherwise checkout default HEAD).
+    pub fn create_worktree(&self, path: &str, branch: Option<&str>) -> Result<String> {
+        let cwd = {
+            let g = self.inner.lock();
+            g.project_cwd
+                .clone()
+                .ok_or_else(|| anyhow!("no project open"))?
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            bail!("worktree path is required");
+        }
+        let target = if std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            cwd.join(path)
+        };
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("worktree").arg("add").current_dir(&cwd);
+        if let Some(b) = branch.map(str::trim).filter(|b| !b.is_empty()) {
+            cmd.arg("-b").arg(b);
+        }
+        cmd.arg(&target);
+        let out = cmd.output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            bail!(
+                "git worktree add failed: {}",
+                if stderr.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    stderr.trim()
+                }
+            );
+        }
+        Ok(format!(
+            "Created worktree at {}\n{}{}",
+            target.display(),
+            stdout,
+            stderr
+        ))
+    }
+
+    /// Remove a worktree path (does not delete the branch).
+    pub fn remove_worktree(&self, path: &str) -> Result<String> {
+        let cwd = {
+            let g = self.inner.lock();
+            g.project_cwd
+                .clone()
+                .ok_or_else(|| anyhow!("no project open"))?
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            bail!("worktree path is required");
+        }
+        let out = std::process::Command::new("git")
+            .args(["worktree", "remove", "--force", path])
+            .current_dir(&cwd)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            bail!(
+                "git worktree remove failed: {}",
+                if stderr.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    stderr.trim()
+                }
+            );
+        }
+        Ok(format!("{}{}", stdout, stderr))
+    }
+
     pub fn project_rules(&self) -> Result<Vec<String>> {
         let cwd = {
             let g = self.inner.lock();

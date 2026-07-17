@@ -3967,3 +3967,138 @@ button:disabled {
 .session-pane {
   position: relative;
 }
+
+/* ── StyledSelect (#126) — no native OS <select> chrome ── */
+.styled-select {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+  vertical-align: middle;
+}
+
+.styled-select-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  max-width: 100%;
+  min-height: 1.85rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.styled-select-trigger:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  background: var(--hover);
+}
+
+.styled-select-trigger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.styled-select-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.styled-select-chevron {
+  flex-shrink: 0;
+  color: var(--accent);
+  font-size: 10px;
+  opacity: 0.9;
+}
+
+.styled-select-menu {
+  position: absolute;
+  z-index: 12000;
+  top: calc(100% + 3px);
+  left: 0;
+  min-width: 100%;
+  max-width: min(320px, 90vw);
+  max-height: 240px;
+  overflow: auto;
+  margin: 0;
+  padding: 0.25rem;
+  list-style: none;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--ctx-menu-bg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+}
+
+.styled-select-option {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  padding: 0.35rem 0.5rem;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.styled-select-option:hover:not(:disabled) {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.styled-select-option.is-selected {
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.composer-pill .styled-select-trigger {
+  border: none;
+  background: transparent;
+  padding: 0.1rem 0.15rem;
+  min-height: 0;
+}
+
+.composer-pill .styled-select-menu {
+  min-width: 160px;
+}
+
+.settings-field .styled-select {
+  display: block;
+  width: 100%;
+  max-width: 420px;
+}
+
+.settings-field .styled-select-trigger {
+  width: 100%;
+  justify-content: space-between;
+}
+
+.worktree-create {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0.4rem 0 0.6rem;
+}
+
+.worktree-create input {
+  width: 100%;
+  padding: 0.3rem 0.45rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+}
+
+.worktree-create-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
