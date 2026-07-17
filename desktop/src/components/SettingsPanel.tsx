@@ -454,7 +454,7 @@ function AppearanceSection({
 }: {
   busy: boolean;
   theme: string;
-  apply: (fn: () => Promise<unknown> | unknown, msg: string) => void | Promise<void>;
+  apply: <T,>(fn: () => Promise<T>, msg: string) => Promise<void>;
 }) {
   const [chrome, setChrome] = useState<AppearanceChrome>(() =>
     loadAppearanceChrome(),
