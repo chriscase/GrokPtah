@@ -80,6 +80,15 @@ pub struct SubagentInfo {
     pub kind: String,
     pub title: String,
     pub status: String,
+    /// Owning parent Build session (for cancel-one / history filter) (#152).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Completion summary or last progress line (#152).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Last tool name the child used (live panel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

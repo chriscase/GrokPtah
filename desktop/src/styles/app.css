@@ -4361,3 +4361,19 @@ html[data-accent="violet"] {
   color: var(--muted);
   font-family: var(--font-mono);
 }
+.subagent-card-summary {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 0.25rem;
+  line-height: 1.35;
+}
+.subagent-card-tool {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--tool, #c3a6ff);
+  margin-top: 0.15rem;
+}
+.subagent-card .danger {
+  margin-top: 0.35rem;
+  font-size: 11px;
+}

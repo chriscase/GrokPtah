@@ -99,6 +99,7 @@ pub fn run() {
             commands::skills_list,
             commands::hooks_config,
             commands::subagents_list,
+            commands::cancel_subagent,
             commands::background_tasks,
             commands::cancel_background_task,
             commands::schedule_background_task,

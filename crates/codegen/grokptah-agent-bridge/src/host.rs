@@ -94,6 +94,8 @@ struct Inner {
     plugins: Vec<PluginInfo>,
     skills: Vec<SkillInfo>,
     subagents: Vec<SubagentInfo>,
+    /// Per-subagent cancel tokens (#151/#152) — cancel one child without killing siblings.
+    subagent_cancels: HashMap<String, CancellationToken>,
     background_tasks: Vec<BackgroundTask>,
     /// Cancel tokens for in-flight background tasks (#52).
     background_cancels: HashMap<String, CancellationToken>,
@@ -212,6 +214,7 @@ impl AgentHost {
             plugins,
             skills,
             subagents: Vec::new(),
+            subagent_cancels: HashMap::new(),
             background_tasks: Vec::new(),
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
@@ -486,6 +489,8 @@ impl AgentHostHandle {
             }
             summary
         };
+        // #152: restore historical subagent summary when reopening a session.
+        self.load_session_subagents(id);
         self.persist_chrome();
         Ok(summary)
     }
@@ -1374,6 +1379,98 @@ impl AgentHostHandle {
         self.inner.lock().subagents.clone()
     }
 
+    /// Public spawn entry for tools, Tauri, and tests (#151).
+    ///
+    /// Starts the child on a background task and returns immediately so multiple
+    /// children overlap. When a parent turn is active, child cancel is linked to
+    /// that turn's token.
+    pub async fn spawn_subagent_public(
+        &self,
+        session_id: Uuid,
+        kind: &str,
+        prompt: &str,
+    ) -> Result<String> {
+        let cwd = {
+            let g = self.inner.lock();
+            g.sessions
+                .get(&session_id)
+                .map(|s| s.cwd.clone())
+                .or_else(|| g.project_cwd.clone())
+                .ok_or_else(|| anyhow!("no project/session cwd"))?
+        };
+        let parent_cancel = {
+            let g = self.inner.lock();
+            g.turn_cancels
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(CancellationToken::new)
+        };
+        let event_tx = self.inner.lock().event_tx.clone();
+        self.spawn_gp_subagent_parallel(
+            session_id,
+            &cwd,
+            prompt,
+            kind,
+            &parent_cancel,
+            &event_tx,
+        )
+    }
+
+    /// Test helper: register a parent turn cancel token for `session_id`.
+    pub fn begin_turn_for_test(&self, session_id: Uuid) {
+        let mut g = self.inner.lock();
+        g.turn_cancels.entry(session_id).or_default();
+    }
+
+    /// Cancel a single subagent without cancelling the parent turn or siblings (#152).
+    pub fn cancel_subagent(&self, id: &str) -> Result<()> {
+        let mut g = self.inner.lock();
+        if let Some(token) = g.subagent_cancels.remove(id) {
+            token.cancel();
+        } else {
+            // Still mark status if present.
+        }
+        let s = g
+            .subagents
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| anyhow!("unknown subagent {id}"))?;
+        if s.status == "running" {
+            s.status = "cancelled".into();
+            s.summary = Some("cancelled by user".into());
+        }
+        let session_id = s
+            .session_id
+            .as_ref()
+            .and_then(|x| Uuid::parse_str(x).ok());
+        let snap = g.subagents.clone();
+        drop(g);
+        if let Some(sid) = session_id {
+            let _ = session_store::save_session_subagents(sid, &snap);
+            let tx = self.inner.lock().event_tx.clone();
+            let _ = tx.send(SessionUpdate::SubagentUpdate {
+                session_id: sid,
+                subagent_id: id.to_string(),
+                status: "cancelled".into(),
+                detail: Some("cancelled by user".into()),
+            });
+        }
+        Ok(())
+    }
+
+    /// Load durable subagent history for a session into the live list (#152).
+    pub fn load_session_subagents(&self, session_id: Uuid) {
+        let hist = session_store::load_session_subagents(session_id);
+        if hist.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock();
+        // Drop stale rows for this session; keep other sessions' live rows.
+        g.subagents
+            .retain(|s| s.session_id.as_deref() != Some(&session_id.to_string()));
+        g.subagents.extend(hist);
+    }
+
     pub fn background_tasks(&self) -> Vec<BackgroundTask> {
         self.inner.lock().background_tasks.clone()
     }
@@ -1965,13 +2062,30 @@ impl AgentHostHandle {
     /// `session_id` is `None` (shutdown / global stop).
     pub fn cancel_turn(&self, session_id: Option<Uuid>) -> Result<()> {
         let (live_shells, kill_ids) = {
-            let g = self.inner.lock();
+            let mut g = self.inner.lock();
             match session_id {
                 Some(id) => {
                     let Some(c) = g.turn_cancels.get(&id) else {
                         bail!("no active turn for session {id}");
                     };
                     c.cancel();
+                    // #151: cancel all outstanding children for this parent session.
+                    let sid = id.to_string();
+                    let child_ids: Vec<String> = g
+                        .subagents
+                        .iter()
+                        .filter(|s| s.session_id.as_deref() == Some(sid.as_str()) && s.status == "running")
+                        .map(|s| s.id.clone())
+                        .collect();
+                    for cid in &child_ids {
+                        if let Some(tok) = g.subagent_cancels.remove(cid) {
+                            tok.cancel();
+                        }
+                        if let Some(s) = g.subagents.iter_mut().find(|s| s.id == *cid) {
+                            s.status = "cancelled".into();
+                            s.summary = Some("parent turn cancelled".into());
+                        }
+                    }
                     (g.live_shells.clone(), vec![id])
                 }
                 None => {
@@ -1980,6 +2094,16 @@ impl AgentHostHandle {
                     }
                     for c in g.turn_cancels.values() {
                         c.cancel();
+                    }
+                    for tok in g.subagent_cancels.values() {
+                        tok.cancel();
+                    }
+                    g.subagent_cancels.clear();
+                    for s in g.subagents.iter_mut() {
+                        if s.status == "running" {
+                            s.status = "cancelled".into();
+                            s.summary = Some("parent turn cancelled".into());
+                        }
                     }
                     let ids: Vec<Uuid> = g.turn_cancels.keys().copied().collect();
                     (g.live_shells.clone(), ids)
@@ -3268,8 +3392,8 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .unwrap_or("general-purpose")
                     .to_string();
-                self.run_gp_subagent(session_id, cwd, &prompt, &kind, cancel, event_tx)
-                    .await
+                // Fire-and-forget: returns immediately so multiple children run in parallel (#151).
+                self.spawn_gp_subagent_parallel(session_id, cwd, &prompt, &kind, cancel, event_tx)
             }
             "todo_write" => {
                 let (items, merge) =
@@ -3441,6 +3565,9 @@ impl AgentHostHandle {
                 kind: "explore".into(),
                 title: query.chars().take(48).collect(),
                 status: "running".into(),
+                session_id: Some(session_id.to_string()),
+                summary: None,
+                last_tool: None,
             });
         }
         let _ = event_tx.send(SessionUpdate::SubagentSpawned {
@@ -3533,15 +3660,15 @@ impl AgentHostHandle {
         Ok(clipped)
     }
 
-    /// General-purpose / plan subagent (#151): can use write/shell tools under
-    /// the same permission gate as the parent; cancelled when parent cancel fires.
-    async fn run_gp_subagent(
+    /// Spawn a GP/plan child on a background task and return immediately (#151).
+    /// Multiple spawns therefore overlap (true parallelism via JoinHandle tasks).
+    fn spawn_gp_subagent_parallel(
         &self,
         session_id: Uuid,
         cwd: &Path,
         prompt: &str,
         kind: &str,
-        cancel: &CancellationToken,
+        parent_cancel: &CancellationToken,
         event_tx: &mpsc::UnboundedSender<SessionUpdate>,
     ) -> Result<String> {
         let kind = if kind == "plan" {
@@ -3550,6 +3677,8 @@ impl AgentHostHandle {
             "general-purpose"
         };
         let sub_id = Uuid::new_v4().to_string();
+        // Child is cancelled if parent is cancelled *or* cancel_subagent is called.
+        let child_cancel = parent_cancel.child_token();
         {
             let mut g = self.inner.lock();
             g.subagents.push(SubagentInfo {
@@ -3557,7 +3686,12 @@ impl AgentHostHandle {
                 kind: kind.into(),
                 title: prompt.chars().take(48).collect(),
                 status: "running".into(),
+                session_id: Some(session_id.to_string()),
+                summary: None,
+                last_tool: None,
             });
+            g.subagent_cancels
+                .insert(sub_id.clone(), child_cancel.clone());
         }
         let _ = event_tx.send(SessionUpdate::SubagentSpawned {
             session_id,
@@ -3565,64 +3699,123 @@ impl AgentHostHandle {
             kind: kind.into(),
             title: prompt.chars().take(64).collect(),
         });
-
-        if cancel.is_cancelled() {
-            self.finish_subagent(&sub_id, "cancelled", event_tx, session_id, None);
-            return Ok("(subagent cancelled)".into());
+        // Persist "running" row so reopen can show in-flight / history (#152).
+        {
+            let snap = self.inner.lock().subagents.clone();
+            let _ = session_store::save_session_subagents(session_id, &snap);
         }
 
-        // Offline deterministic GP: list + optional write when prompt contains "write ".
+        let host = self.clone();
+        let event_tx = event_tx.clone();
+        let cwd = cwd.to_path_buf();
+        let prompt = prompt.to_string();
+        let kind_owned = kind.to_string();
+        let sub_id_task = sub_id.clone();
+        tokio::spawn(async move {
+            host.run_gp_subagent_body(
+                session_id,
+                &cwd,
+                &prompt,
+                &kind_owned,
+                &sub_id_task,
+                child_cancel,
+                event_tx,
+            )
+            .await;
+        });
+
+        Ok(format!(
+            "Spawned {kind} subagent `{sub_id}` (running in parallel — parent is not blocked)."
+        ))
+    }
+
+    /// Body of a GP child (runs on a JoinHandle task).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_gp_subagent_body(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        prompt: &str,
+        kind: &str,
+        sub_id: &str,
+        cancel: CancellationToken,
+        event_tx: mpsc::UnboundedSender<SessionUpdate>,
+    ) {
+        if cancel.is_cancelled() {
+            self.finish_subagent(sub_id, "cancelled", &event_tx, session_id, None);
+            return;
+        }
+
+        // Offline deterministic GP: optional sleep for parallel tests + write.
         if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
             let mut parts = vec![format!("## GP subagent ({kind}): {prompt}")];
-            if let Ok(tr) = local_tools::tool_list_dir(cwd, ".").await {
-                parts.push(format!("### listing\n{}", tr.output.chars().take(2_000).collect::<String>()));
+            // Parallel test hook: "sleep_ms:N ..." delays without blocking parent.
+            if let Some(rest) = prompt.strip_prefix("sleep_ms:") {
+                let ms: u64 = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(50);
+                let sleep = tokio::time::sleep(std::time::Duration::from_millis(ms));
+                tokio::pin!(sleep);
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        self.finish_subagent(sub_id, "cancelled", &event_tx, session_id, None);
+                        return;
+                    }
+                    _ = &mut sleep => {}
+                }
+                parts.push(format!("### slept {ms}ms"));
             }
-            if let Some(rest) = prompt.strip_prefix("write ") {
+            if let Ok(tr) = local_tools::tool_list_dir(cwd, ".").await {
+                parts.push(format!(
+                    "### listing\n{}",
+                    tr.output.chars().take(2_000).collect::<String>()
+                ));
+            }
+            if let Some(rest) = prompt
+                .find("write ")
+                .map(|i| &prompt[i + "write ".len()..])
+            {
                 if let Some((path, content)) = rest.split_once(':') {
                     self.snapshot_edit_original(cwd, path.trim());
                     if let Ok(tr) =
                         local_tools::tool_write_file(cwd, path.trim(), content.trim()).await
                     {
                         parts.push(format!("### write\n{}", tr.output));
-                        self.emit_file_edit(
-                            session_id,
-                            cwd,
-                            path.trim(),
-                            &tr.output,
-                            event_tx,
-                        );
+                        {
+                            let mut g = self.inner.lock();
+                            if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
+                                s.last_tool = Some("write_file".into());
+                            }
+                        }
+                        self.emit_file_edit(session_id, cwd, path.trim(), &tr.output, &event_tx);
                     }
                 }
             }
             if cancel.is_cancelled() {
-                self.finish_subagent(&sub_id, "cancelled", event_tx, session_id, None);
-                return Ok("(subagent cancelled)".into());
+                self.finish_subagent(sub_id, "cancelled", &event_tx, session_id, None);
+                return;
             }
             let summary = parts.join("\n\n");
             let clipped: String = summary.chars().take(12_000).collect();
             self.finish_subagent(
-                &sub_id,
+                sub_id,
                 "completed",
-                event_tx,
+                &event_tx,
                 session_id,
-                Some(clipped.chars().take(200).collect()),
+                Some(clipped.chars().take(400).collect()),
             );
-            return Ok(clipped);
+            return;
         }
 
-        // Online: short multi-tool agent loop (capped rounds) under parent cancel.
+        // Online: short multi-tool agent loop under child cancel.
         let creds = match crate::auth_store::resolve_wire_credentials() {
             Some(c) => c,
             None => {
-                let msg = "GP subagent: no credentials (use offline mode or sign in)";
-                self.finish_subagent(
-                    &sub_id,
-                    "failed",
-                    event_tx,
-                    session_id,
-                    Some(msg.into()),
-                );
-                return Ok(msg.into());
+                let msg = "GP subagent: no credentials";
+                self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(msg.into()));
+                return;
             }
         };
         let model = self.inner.lock().model.clone();
@@ -3639,10 +3832,10 @@ impl AgentHostHandle {
             serde_json::json!({ "role": "user", "content": prompt }),
         ];
         let mut last = String::new();
-        for round in 1..=6u32 {
+        for _round in 1..=6u32 {
             if cancel.is_cancelled() {
-                self.finish_subagent(&sub_id, "cancelled", event_tx, session_id, None);
-                return Ok("(subagent cancelled)".into());
+                self.finish_subagent(sub_id, "cancelled", &event_tx, session_id, None);
+                return;
             }
             let step = call_xai_agent_step(
                 &creds,
@@ -3650,7 +3843,7 @@ impl AgentHostHandle {
                 effort,
                 &messages,
                 &tools,
-                cancel,
+                &cancel,
                 |_d| {},
                 |_t| {},
             )
@@ -3685,18 +3878,22 @@ impl AgentHostHandle {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        // No nested spawn_* (avoids recursive async futures).
+                        {
+                            let mut g = self.inner.lock();
+                            if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
+                                s.last_tool = Some(tc.name.clone());
+                            }
+                        }
                         let out = if tc.name.starts_with("spawn_") {
                             format!("DENIED: nested {} not allowed inside subagent", tc.name)
                         } else {
-                            // Box::pin breaks recursive async type via dispatch→spawn_gp.
                             Box::pin(self.dispatch_agent_tool(
                                 session_id,
                                 cwd,
                                 &tc.name,
                                 &tc.arguments,
-                                cancel,
-                                event_tx,
+                                &cancel,
+                                &event_tx,
                                 &mcp_index,
                             ))
                             .await
@@ -3715,21 +3912,19 @@ impl AgentHostHandle {
                     break;
                 }
             }
-            let _ = round;
         }
         let clipped: String = last.chars().take(12_000).collect();
         self.finish_subagent(
-            &sub_id,
+            sub_id,
             if cancel.is_cancelled() {
                 "cancelled"
             } else {
                 "completed"
             },
-            event_tx,
+            &event_tx,
             session_id,
-            Some(clipped.chars().take(200).collect()),
+            Some(clipped.chars().take(400).collect()),
         );
-        Ok(clipped)
     }
 
     fn finish_subagent(
@@ -3740,12 +3935,18 @@ impl AgentHostHandle {
         session_id: Uuid,
         detail: Option<String>,
     ) {
-        {
+        let snap = {
             let mut g = self.inner.lock();
+            g.subagent_cancels.remove(sub_id);
             if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
                 s.status = status.into();
+                if let Some(ref d) = detail {
+                    s.summary = Some(d.clone());
+                }
             }
-        }
+            g.subagents.clone()
+        };
+        let _ = session_store::save_session_subagents(session_id, &snap);
         let _ = event_tx.send(SessionUpdate::SubagentUpdate {
             session_id,
             subagent_id: sub_id.to_string(),

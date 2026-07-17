@@ -135,6 +135,43 @@ fn transcript_path(id: Uuid) -> PathBuf {
     session_dir(id).join("transcript.jsonl")
 }
 
+fn subagents_path(id: Uuid) -> PathBuf {
+    session_dir(id).join("subagents.json")
+}
+
+/// Persist subagent history for a session (reopen / historical summary) (#152).
+pub fn save_session_subagents(
+    id: Uuid,
+    list: &[crate::types::SubagentInfo],
+) -> Result<()> {
+    ensure_home();
+    let _ = fs::create_dir_all(session_dir(id));
+    // Keep only rows for this session (and rows without session_id for safety).
+    let filtered: Vec<_> = list
+        .iter()
+        .filter(|s| {
+            s.session_id
+                .as_deref()
+                .map(|sid| sid == id.to_string())
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    let path = subagents_path(id);
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(&filtered)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+pub fn load_session_subagents(id: Uuid) -> Vec<crate::types::SubagentInfo> {
+    let path = subagents_path(id);
+    let Ok(bytes) = fs::read(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Load chrome + session shells (transcripts empty until [`load_transcript`]).

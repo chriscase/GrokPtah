@@ -32,6 +32,19 @@ describe("background tasks panel (#52)", () => {
   });
 });
 
+describe("multi-agent panel (#152)", () => {
+  it("shows cancel-one-child and subagent summary fields", () => {
+    const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
+    expect(app).toMatch(/Cancel child/);
+    expect(app).toMatch(/cancelSubagent/);
+    expect(app).toMatch(/subagent-card/);
+    expect(app).toMatch(/subagent_spawned|subagent_update/);
+    // Reopen hydrates history into the panel
+    expect(app).toMatch(/setSubagents\(await api\.subagentsList\(\)\)/);
+  });
+});
+
+
 describe("terminal design system (#129)", () => {
   it("uses design tokens and Tab N labels, not raw green PTY banners", () => {
     const term = readFileSync(

@@ -399,6 +399,8 @@ export default function App() {
               }
             : st,
         );
+        // #152: show historical subagent summary after reopen (host loads from disk).
+        setSubagents(await api.subagentsList());
       } catch {
         /* offline / empty */
       }
@@ -590,6 +592,9 @@ export default function App() {
       }
       if (u.type === "background_task") {
         void api.backgroundTasks().then(setBgTasks).catch(() => {});
+      }
+      if (u.type === "subagent_spawned" || u.type === "subagent_update") {
+        void api.subagentsList().then(setSubagents).catch(() => {});
       }
       if (u.type === "file_edit") {
         // Live agent diffs in the git pane (no manual refresh).
@@ -2769,7 +2774,14 @@ export default function App() {
               </div>
             )}
             <div className="subagent-grid">
-              {subagents.map((a) => (
+              {subagents
+                .filter(
+                  (a) =>
+                    !activeSessionId ||
+                    !a.session_id ||
+                    a.session_id === activeSessionId,
+                )
+                .map((a) => (
                 <div
                   key={a.id}
                   className={`subagent-card is-${String(a.status).toLowerCase().replace(/\s+/g, "-")}`}
@@ -2780,6 +2792,31 @@ export default function App() {
                     {a.title || a.id.slice(0, 8)}
                   </div>
                   <div className="subagent-card-status">{a.status}</div>
+                  {a.summary && (
+                    <div className="subagent-card-summary" title={a.summary}>
+                      {String(a.summary).slice(0, 160)}
+                      {String(a.summary).length > 160 ? "…" : ""}
+                    </div>
+                  )}
+                  {a.last_tool && (
+                    <div className="subagent-card-tool">tool: {a.last_tool}</div>
+                  )}
+                  {String(a.status) === "running" && (
+                    <button
+                      type="button"
+                      className="danger"
+                      data-testid="subagent-cancel"
+                      title="Cancel this child only"
+                      onClick={() => {
+                        void (async () => {
+                          await api.cancelSubagent(a.id);
+                          setSubagents(await api.subagentsList());
+                        })();
+                      }}
+                    >
+                      Cancel child
+                    </button>
+                  )}
                 </div>
               ))}
             </div>

@@ -163,6 +163,7 @@ export const api = {
   skillsList: () => invoke<unknown[]>("skills_list"),
   hooksConfig: () => invoke<string>("hooks_config"),
   subagentsList: () => invoke<unknown[]>("subagents_list"),
+  cancelSubagent: (id: string) => invoke<void>("cancel_subagent", { id }),
   backgroundTasks: () => invoke<unknown[]>("background_tasks"),
   cancelBackgroundTask: (id: string) =>
     invoke<void>("cancel_background_task", { id }),

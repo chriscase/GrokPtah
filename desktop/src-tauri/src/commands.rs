@@ -572,6 +572,11 @@ pub fn hooks_config(state: State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
+pub fn cancel_subagent(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.host.cancel_subagent(&id).map_err(map_err)
+}
+
+#[tauri::command]
 pub fn subagents_list(state: State<'_, AppState>) -> Vec<SubagentInfo> {
     state.host.subagents()
 }
