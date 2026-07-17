@@ -300,11 +300,13 @@ pub fn session_rewind(
     state: State<'_, AppState>,
     session_id: String,
     keep_messages: usize,
+    mode: Option<String>,
 ) -> Result<SessionSummary, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let mode = mode.unwrap_or_else(|| "conversation".into());
     state
         .host
-        .rewind_session(id, keep_messages)
+        .rewind_session(id, keep_messages, &mode)
         .map_err(map_err)
 }
 

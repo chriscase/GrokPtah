@@ -437,7 +437,7 @@ async fn fork_rewind_compact_sessions() {
         .unwrap();
     let _ = drain_until_turn_complete(&mut rx).await;
 
-    let after_rewind = host.rewind_session(forked.id, 1).unwrap();
+    let after_rewind = host.rewind_session(forked.id, 1, "conversation").unwrap();
     assert!(after_rewind.message_count <= 2);
 
     host.session_prompt(forked.id, "msg2".into()).await.unwrap();

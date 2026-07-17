@@ -104,6 +104,8 @@ struct Inner {
     event_tx: mpsc::UnboundedSender<SessionUpdate>,
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
+    /// Path → original file bytes/text before first agent edit this process (#146).
+    edit_snapshots: HashMap<String, String>,
     /// Live tool shell child — killed by [`AgentHostHandle::cancel_turn`].
     live_shells: local_tools::LiveShellMap,
 }
@@ -216,6 +218,7 @@ impl AgentHost {
             turn_cancels: HashMap::new(),
             event_tx,
             edited_files: Vec::new(),
+            edit_snapshots: HashMap::new(),
             live_shells: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
         AgentHostHandle {
@@ -782,22 +785,80 @@ impl AgentHostHandle {
         Ok(summary)
     }
 
-    pub fn rewind_session(&self, id: Uuid, keep_messages: usize) -> Result<SessionSummary> {
+    /// Rewind conversation and/or restore files (#146).
+    ///
+    /// `mode`: `conversation` | `files` | `all` (default `conversation`).
+    pub fn rewind_session(
+        &self,
+        id: Uuid,
+        keep_messages: usize,
+        mode: &str,
+    ) -> Result<SessionSummary> {
         self.ensure_transcript_loaded(id)?;
+        let mode = mode.trim().to_ascii_lowercase();
+        let do_files = mode == "files" || mode == "all" || mode == "filesonly";
+        let do_conv = mode != "files" && mode != "filesonly";
+
+        if do_files {
+            self.restore_edit_snapshots()?;
+        }
+
         let summary = {
             let mut g = self.inner.lock();
             let s = g
                 .sessions
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
-            if keep_messages < s.transcript.len() {
+            if do_conv && keep_messages < s.transcript.len() {
                 s.transcript.truncate(keep_messages);
             }
             s.updated_at = Utc::now();
             s.summary()
         };
-        self.persist_session_rewrite(id);
+        if do_conv {
+            self.persist_session_rewrite(id);
+        }
         Ok(summary)
+    }
+
+    /// Snapshot original contents the first time a path is edited (for FilesOnly rewind).
+    pub fn snapshot_edit_original(&self, cwd: &Path, rel_path: &str) {
+        let abs = cwd.join(rel_path);
+        let key = abs.to_string_lossy().into_owned();
+        let mut g = self.inner.lock();
+        if g.edit_snapshots.contains_key(&key) {
+            return;
+        }
+        let original = std::fs::read_to_string(&abs).unwrap_or_default();
+        g.edit_snapshots.insert(key, original);
+    }
+
+    fn restore_edit_snapshots(&self) -> Result<()> {
+        let snaps: Vec<(String, String)> = {
+            let g = self.inner.lock();
+            g.edit_snapshots
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        for (path, content) in &snaps {
+            let p = Path::new(path);
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if content.is_empty() && !p.exists() {
+                continue;
+            }
+            if content.is_empty() {
+                let _ = std::fs::remove_file(p);
+            } else {
+                std::fs::write(p, content)?;
+            }
+        }
+        let mut g = self.inner.lock();
+        g.edit_snapshots.clear();
+        g.edited_files.clear();
+        Ok(())
     }
 
     /// Shrink the *server-facing* context window only (sync extractive path).
@@ -2979,6 +3040,8 @@ impl AgentHostHandle {
                     .ok_or_else(|| anyhow!("write_file requires content"))?
                     .to_string();
                 let path_record = path.clone();
+                // #146: snapshot original *before* write so FilesOnly rewind can restore.
+                self.snapshot_edit_original(cwd, &path_record);
                 let out = self
                     .run_tool_for_output(
                         session_id,
@@ -3124,6 +3187,18 @@ impl AgentHostHandle {
                     status: ToolCallStatus::Running,
                     input,
                 });
+                // Best-effort path hints from patch text for pre-edit snapshots (#146).
+                for line in patch.lines() {
+                    if let Some(p) = line
+                        .strip_prefix("*** Update File: ")
+                        .or_else(|| line.strip_prefix("*** Add File: "))
+                    {
+                        let path = p.trim();
+                        if !path.is_empty() {
+                            self.snapshot_edit_original(cwd, path);
+                        }
+                    }
+                }
                 match crate::project_context::apply_patch(cwd, &patch) {
                     Ok(report) => {
                         // Record + live-diff every path in the report

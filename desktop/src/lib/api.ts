@@ -91,8 +91,13 @@ export const api = {
     >("session_transcript", { sessionId }),
   sessionFork: (sourceId: string) =>
     invoke<SessionSummary>("session_fork", { sourceId }),
-  sessionRewind: (sessionId: string, keepMessages: number) =>
+  sessionRewind: (
+    sessionId: string,
+    keepMessages: number,
+    mode?: "conversation" | "files" | "all" | string,
+  ) =>
     invoke<SessionSummary>("session_rewind", {
+      mode: mode ?? "conversation",
       sessionId,
       keepMessages,
     }),

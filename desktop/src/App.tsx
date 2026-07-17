@@ -1084,18 +1084,48 @@ export default function App() {
           },
           {
             type: "item",
-            id: "rewind",
-            label: "Rewind last message",
+            id: "rewind-conv",
+            label: "Rewind chat only",
             onClick: () => {
               void (async () => {
-                await api.sessionRewind(sessionId, 1);
-                const list = await api.sessionListByKind(
-                  workspaceMode,
-                  false,
-                );
+                const tab = tabs.find((t) => t.id === sessionId);
+                const keep = Math.max(0, (tab?.transcript.length ?? 1) - 1);
+                await api.sessionRewind(sessionId, keep, "conversation");
+                const list = await api.sessionListByKind(workspaceMode, false);
                 setSessions(list);
                 const summary = list.find((s) => s.id === sessionId);
                 if (summary) await openTab(summary, true);
+              })();
+            },
+          },
+          {
+            type: "item",
+            id: "rewind-files",
+            label: "Rewind files only (agent edits)",
+            onClick: () => {
+              void (async () => {
+                const tab = tabs.find((t) => t.id === sessionId);
+                const keep = tab?.transcript.length ?? 0;
+                await api.sessionRewind(sessionId, keep, "files");
+                setGitDiff("(files restored from pre-edit snapshots)");
+                setRightTab("git");
+              })();
+            },
+          },
+          {
+            type: "item",
+            id: "rewind-all",
+            label: "Rewind chat + files",
+            onClick: () => {
+              void (async () => {
+                const tab = tabs.find((t) => t.id === sessionId);
+                const keep = Math.max(0, (tab?.transcript.length ?? 1) - 1);
+                await api.sessionRewind(sessionId, keep, "all");
+                const list = await api.sessionListByKind(workspaceMode, false);
+                setSessions(list);
+                const summary = list.find((s) => s.id === sessionId);
+                if (summary) await openTab(summary, true);
+                setGitDiff("(chat + files rewound)");
               })();
             },
           },
