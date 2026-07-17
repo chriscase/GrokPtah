@@ -10,7 +10,7 @@ export type SearchPanelProps = {
 };
 
 /**
- * Hybrid search across Grok chats + build sessions (keyword + semantic TF-IDF).
+ * Hybrid search across Grok chats + build sessions.
  */
 export function SearchPanel({
   open,
@@ -75,7 +75,7 @@ export function SearchPanel({
         <div>
           <h2>Search</h2>
           <span className="sp-sub">
-            Keyword · semantic (TF–IDF) · hybrid — chats & builds
+            Search chats and coding builds
           </span>
         </div>
         <button type="button" onClick={onClose}>
@@ -136,8 +136,7 @@ export function SearchPanel({
       <div className="sp-results">
         {!searched && !busy && (
           <div className="sp-empty">
-            Search across Grok chats and coding build sessions. Hybrid mode
-            blends exact keyword matches with semantic TF–IDF similarity.
+            Search across Grok chats and coding build sessions.
           </div>
         )}
         {searched && hits.length === 0 && !busy && (
@@ -154,14 +153,6 @@ export function SearchPanel({
                 <div className="sp-hit-top">
                   <span className={`sp-kind ${h.kind}`}>{h.kind}</span>
                   <strong>{h.title}</strong>
-                  <span className="sp-score" title="hybrid / keyword / semantic">
-                    {h.score.toFixed(2)}
-                    <span className="sp-score-detail">
-                      {" "}
-                      · kw {h.keyword_score.toFixed(2)} · sem{" "}
-                      {h.semantic_score.toFixed(2)}
-                    </span>
-                  </span>
                 </div>
                 <div className="sp-snippet">{h.snippet}</div>
                 <div className="sp-hit-meta">

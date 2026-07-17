@@ -19,8 +19,12 @@
   --tool: #c3a6ff;
   --user-bg: #1a1d26;
   --radius: 6px;
-  --font: "SF Mono", "JetBrains Mono", "IBM Plex Mono", ui-monospace, Menlo, monospace;
-  --font-ui: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  /* Body / prose — proportional so code pops against it (#125) */
+  --font: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+  --font-ui: var(--font);
+  /* Code, tools, terminal, ids — mono only */
+  --font-mono: "SF Mono", "JetBrains Mono", "IBM Plex Mono", ui-monospace, Menlo,
+    Consolas, monospace;
 }
 
 * {
@@ -526,7 +530,7 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--font-mono, ui-monospace, Menlo, monospace);
+  font-family: var(--font-mono);
   color: var(--muted);
 }
 
@@ -899,9 +903,10 @@ button:disabled {
   margin-bottom: 0.35em;
 }
 
-/* Word-level beam spans */
+/* Word-level beam spans — inherit proportional prose font */
 .stream-text {
   display: inline;
+  font-family: var(--font);
 }
 
 .stream-text.is-streaming {
@@ -1632,12 +1637,14 @@ button:disabled {
 
 .bubble.user .user-text {
   white-space: pre-wrap;
+  font-family: var(--font);
 }
 
 .bubble.assistant {
-  /* Markdown owns whitespace */
+  /* Markdown owns whitespace — proportional prose */
   white-space: normal;
   padding: 0.65rem 0.85rem;
+  font-family: var(--font);
 }
 
 .bubble.thought {
@@ -1664,8 +1671,9 @@ button:disabled {
 
 /* ── Markdown assistant body ── */
 .md-body {
-  font-size: 13px;
-  line-height: 1.55;
+  font-family: var(--font);
+  font-size: 13.5px;
+  line-height: 1.6;
   color: var(--text);
 }
 
@@ -1749,7 +1757,7 @@ button:disabled {
 
 .md-body .md-code-inline,
 .md-body code:not(pre code) {
-  font-family: var(--font-mono, ui-monospace, Menlo, monospace);
+  font-family: var(--font-mono);
   font-size: 0.9em;
   padding: 0.1em 0.35em;
   border-radius: 4px;
@@ -1895,7 +1903,7 @@ button:disabled {
   flex-shrink: 0;
   font-weight: 600;
   color: var(--text);
-  font-family: var(--font-mono, ui-monospace, Menlo, monospace);
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 

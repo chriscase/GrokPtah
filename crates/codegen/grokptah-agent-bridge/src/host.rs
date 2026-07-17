@@ -128,6 +128,8 @@ impl Drop for TurnBusyGuard {
 pub struct AgentHostHandle {
     inner: Arc<Mutex<Inner>>,
     event_rx_factory: Arc<Mutex<Option<mpsc::UnboundedReceiver<SessionUpdate>>>>,
+    /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
+    _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
 }
 
 pub struct AgentHost;
@@ -135,6 +137,14 @@ pub struct AgentHost;
 impl AgentHost {
     /// Create a new host. Events are pulled via [`AgentHostHandle::take_event_receiver`] once.
     pub fn create(config: HostConfig) -> AgentHostHandle {
+        // Single-instance guard before any GC or writes that could race another process.
+        let instance_lock = match crate::instance_lock::InstanceLock::try_acquire() {
+            Ok(l) => Some(Arc::new(l)),
+            Err(e) => {
+                eprintln!("[grokptah] {e:#}");
+                None
+            }
+        };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let auth = crate::auth_store::load_auth_state();
         let (chrome, mut sessions) = session_store::load_workspace().unwrap_or_else(|e| {
@@ -154,12 +164,14 @@ impl AgentHost {
         let mut open_tab_ids = chrome.open_tab_ids.clone();
         // Drop tab ids that no longer exist.
         open_tab_ids.retain(|id| sessions.contains_key(id));
-        // Soft GC empty shells / hard cap (never delete open tabs), then reload map.
-        if let Ok(n) = session_store::garbage_collect(&open_tab_ids, 80, 24 * 7) {
-            if n > 0 {
-                if let Ok(reloaded) = session_store::load_all_metas() {
-                    sessions = reloaded;
-                    open_tab_ids.retain(|id| sessions.contains_key(id));
+        // Soft GC only when we own the instance lock (never GC another process's sessions).
+        if instance_lock.is_some() {
+            if let Ok(n) = session_store::garbage_collect(&open_tab_ids, 80, 24 * 7) {
+                if n > 0 {
+                    if let Ok(reloaded) = session_store::load_all_metas() {
+                        sessions = reloaded;
+                        open_tab_ids.retain(|id| sessions.contains_key(id));
+                    }
                 }
             }
         }
@@ -206,6 +218,7 @@ impl AgentHost {
         AgentHostHandle {
             inner: Arc::new(Mutex::new(inner)),
             event_rx_factory: Arc::new(Mutex::new(Some(event_rx))),
+            _instance_lock: instance_lock,
         }
     }
 }
@@ -366,6 +379,13 @@ impl AgentHostHandle {
     }
 
     pub fn start(&self) -> Result<()> {
+        if self._instance_lock.is_none() {
+            bail!(
+                "another GrokPtah instance is already using {}. \
+                 Quit the other window before starting a second one.",
+                crate::discover::grokptah_home().display()
+            );
+        }
         self.inner.lock().running = true;
         Ok(())
     }

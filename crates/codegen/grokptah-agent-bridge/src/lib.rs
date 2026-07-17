@@ -8,6 +8,7 @@ mod discover;
 mod events;
 mod hooks;
 mod host;
+mod instance_lock;
 mod local_tools;
 mod mcp_runtime;
 mod memory;
@@ -26,8 +27,8 @@ pub use textutil::{truncate_at_char_boundary, truncate_with_marker};
 pub use memory::{inject_context as memory_inject_context, list_facts as memory_list_facts, remember as memory_remember};
 
 pub use discover::{
-    grokptah_home, is_project_mcp_trusted, project_has_local_mcp_servers, set_grokptah_home_override,
-    set_project_mcp_trusted,
+    grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
+    set_grokptah_home_override, set_project_mcp_trusted,
 };
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;

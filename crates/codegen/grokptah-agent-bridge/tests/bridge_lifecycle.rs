@@ -3,33 +3,23 @@
 //! All tests install an isolated GrokPtah home so they never pollute the
 //! developer's real `~/.grokptah` session list.
 
-use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use grokptah_agent_bridge::{
-    desktop_auto_update_enabled, set_grokptah_home_override, AgentHost, HostConfig,
-    PermissionDecision, SessionUpdate,
+    desktop_auto_update_enabled, home_override_serial, set_grokptah_home_override, AgentHost,
+    HostConfig, PermissionDecision, SessionUpdate,
 };
 use tokio::time::timeout;
-
-/// Serialize tests that mutate the process-wide home override.
-fn home_serial() -> &'static Mutex<()> {
-    static L: OnceLock<Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| Mutex::new(()))
-}
 
 /// RAII: point `grokptah_home()` at a temp dir for the duration of a test.
 struct IsolatedHome {
     _tmp: tempfile::TempDir,
-    _lock: MutexGuard<'static, ()>,
-    prev: Option<PathBuf>,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl IsolatedHome {
     fn install() -> Self {
-        let lock = home_serial().lock().unwrap_or_else(|e| e.into_inner());
-        let prev = None;
+        let lock = home_override_serial();
         let tmp = tempfile::tempdir().expect("isolated home tempdir");
         let home = tmp.path().join(".grokptah");
         std::fs::create_dir_all(home.join("sessions")).expect("sessions dir");
@@ -37,21 +27,20 @@ impl IsolatedHome {
         std::fs::create_dir_all(home.join("skills")).ok();
         set_grokptah_home_override(Some(home));
         // Prevent live API / tool-loop network calls during unit tests.
-        // SAFETY: tests serialize on home_serial mutex.
+        // SAFETY: tests serialize on home_override_serial mutex.
         unsafe {
             std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
         }
         Self {
             _tmp: tmp,
             _lock: lock,
-            prev,
         }
     }
 }
 
 impl Drop for IsolatedHome {
     fn drop(&mut self) {
-        set_grokptah_home_override(self.prev.take());
+        set_grokptah_home_override(None);
         unsafe {
             std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
         }

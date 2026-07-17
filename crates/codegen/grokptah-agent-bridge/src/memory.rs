@@ -148,10 +148,11 @@ pub fn inject_context(cwd: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discover::set_grokptah_home_override;
+    use crate::discover::{home_override_serial, set_grokptah_home_override};
 
     #[test]
     fn remember_and_recall_across_load() {
+        let _serial = home_override_serial();
         let home = tempfile::tempdir().unwrap();
         set_grokptah_home_override(Some(home.path().to_path_buf()));
         let proj = tempfile::tempdir().unwrap();

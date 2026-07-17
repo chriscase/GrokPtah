@@ -4,27 +4,21 @@
 //! Full live CLI comparison is manual (see docs/PARITY_EVALS.md).
 
 use std::fs;
-use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, AgentHost, HostConfig, SessionUpdate,
+    home_override_serial, set_grokptah_home_override, AgentHost, HostConfig, SessionUpdate,
 };
 use tokio::time::timeout;
 
-fn home_serial() -> &'static Mutex<()> {
-    static L: OnceLock<Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| Mutex::new(()))
-}
-
 struct IsolatedHome {
     _tmp: tempfile::TempDir,
-    _lock: MutexGuard<'static, ()>,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl IsolatedHome {
     fn install() -> Self {
-        let lock = home_serial().lock().unwrap_or_else(|e| e.into_inner());
+        let lock = home_override_serial();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join(".grokptah");
         fs::create_dir_all(home.join("sessions")).unwrap();

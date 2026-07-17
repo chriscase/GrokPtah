@@ -166,6 +166,10 @@ pub fn save_session_meta(session: &Session) -> Result<()> {
 
 /// Append transcript entries that are not yet on disk (`from_index..`).
 /// Returns how many lines were written.
+///
+/// Each entry is serialized to a complete line string first, then written as a
+/// single `write_all` so a crash cannot leave a half-encoded JSON object
+/// mid-line (#118).
 pub fn append_transcript(session: &Session, from_index: usize) -> Result<usize> {
     if from_index >= session.transcript.len() {
         return Ok(0);
@@ -179,12 +183,19 @@ pub fn append_transcript(session: &Session, from_index: usize) -> Result<usize> 
         .open(&path)
         .with_context(|| format!("open append {}", path.display()))?;
     let mut n = 0;
+    let mut batch = String::new();
     for entry in session.transcript.iter().skip(from_index) {
-        serde_json::to_writer(&mut f, entry)?;
-        f.write_all(b"\n")?;
+        let line = serde_json::to_string(entry)
+            .with_context(|| "serialize transcript entry")?;
+        batch.push_str(&line);
+        batch.push('\n');
         n += 1;
     }
+    f.write_all(batch.as_bytes())
+        .with_context(|| format!("write append {}", path.display()))?;
     f.flush()?;
+    // Durability on turn boundary (best-effort on platforms without full fsync).
+    let _ = f.sync_all();
     // Keep meta.message_count in sync
     save_session_meta(session)?;
     Ok(n)
@@ -199,18 +210,36 @@ pub fn rewrite_transcript(session: &Session) -> Result<()> {
     let tmp = path.with_extension("jsonl.tmp");
     {
         let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let mut batch = String::new();
         for entry in &session.transcript {
-            serde_json::to_writer(&mut f, entry)?;
-            f.write_all(b"\n")?;
+            let line = serde_json::to_string(entry)?;
+            batch.push_str(&line);
+            batch.push('\n');
         }
+        f.write_all(batch.as_bytes())?;
         f.flush()?;
+        let _ = f.sync_all();
+    }
+    // Sync parent dir so the rename is durable.
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = File::open(parent) {
+            let _ = dirf.sync_all();
+        }
     }
     fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+    }
     save_session_meta(session)?;
     Ok(())
 }
 
 /// Load full transcript into a session shell. No-op if already loaded.
+///
+/// A torn **trailing** line (crash mid-append) is skipped with a log rather
+/// than making the whole session unopenable (#118).
 pub fn load_transcript(session: &mut Session) -> Result<()> {
     if session.transcript_loaded {
         return Ok(());
@@ -225,14 +254,34 @@ pub fn load_transcript(session: &mut Session) -> Result<()> {
     let f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
     let reader = BufReader::new(f);
     let mut entries = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
     for (i, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("read line {} of {}", i + 1, path.display()))?;
         if line.trim().is_empty() {
             continue;
         }
-        let entry: TranscriptEntry = serde_json::from_str(&line)
-            .with_context(|| format!("parse line {} of {}", i + 1, path.display()))?;
-        entries.push(entry);
+        lines.push(line);
+    }
+    let last = lines.len().saturating_sub(1);
+    for (i, line) in lines.iter().enumerate() {
+        match serde_json::from_str::<TranscriptEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                if i == last {
+                    eprintln!(
+                        "[grokptah] skip torn trailing transcript line in {}: {e}",
+                        path.display()
+                    );
+                } else {
+                    // Mid-file corruption is rarer; still skip rather than brick the session.
+                    eprintln!(
+                        "[grokptah] skip corrupt transcript line {} in {}: {e}",
+                        i + 1,
+                        path.display()
+                    );
+                }
+            }
+        }
     }
     session.transcript = entries;
     session.transcript_loaded = true;
@@ -421,8 +470,24 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     let raw = serde_json::to_string_pretty(value)?;
-    fs::write(&tmp, raw).with_context(|| format!("write {}", tmp.display()))?;
+    {
+        let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(raw.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.flush()?;
+        let _ = f.sync_all();
+    }
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+    }
     fs::rename(&tmp, path).with_context(|| format!("rename {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -538,4 +603,64 @@ fn migrate_v1_if_needed() -> Result<()> {
         bak.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discover::{home_override_serial, set_grokptah_home_override};
+    use crate::session::Session;
+    use std::io::Write;
+
+    #[test]
+    fn load_skips_torn_trailing_jsonl_line() {
+        let _g = home_override_serial();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".grokptah");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        set_grokptah_home_override(Some(home.clone()));
+
+        let id = Uuid::new_v4();
+        let dir = home.join("sessions").join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let tpath = dir.join("transcript.jsonl");
+        {
+            let mut f = std::fs::File::create(&tpath).unwrap();
+            let good = serde_json::to_string(&TranscriptEntry::user("hello")).unwrap();
+            writeln!(f, "{good}").unwrap();
+            write!(f, "{{\"role\":\"assistant\",\"text\":\"torn").unwrap();
+            f.flush().unwrap();
+        }
+
+        let mut session = Session::new(tmp.path().to_path_buf(), "m".into(), EffortLevel::Medium);
+        session.id = id;
+        session.transcript_loaded = false;
+        load_transcript(&mut session).expect("load must succeed");
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].role, "user");
+        assert_eq!(session.transcript[0].text, "hello");
+
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn append_writes_complete_reloadable_lines() {
+        let _g = home_override_serial();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".grokptah");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        set_grokptah_home_override(Some(home));
+
+        let mut session = Session::new(tmp.path().to_path_buf(), "m".into(), EffortLevel::Medium);
+        session.transcript.push(TranscriptEntry::user("a"));
+        session.transcript.push(TranscriptEntry::assistant("b"));
+        session.persisted_len = 0;
+        append_transcript(&session, 0).unwrap();
+        session.transcript.clear();
+        session.transcript_loaded = false;
+        load_transcript(&mut session).unwrap();
+        assert_eq!(session.transcript.len(), 2);
+
+        set_grokptah_home_override(None);
+    }
 }

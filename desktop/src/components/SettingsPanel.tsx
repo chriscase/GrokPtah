@@ -314,22 +314,6 @@ export function SettingsPanel({
                       disabled={busy}
                       onClick={() =>
                         void apply(
-                          () =>
-                            api.setAllowDenyRules(
-                              ["Shell(*)"],
-                              ["WebFetch(*)"],
-                            ),
-                          "Sample rules applied (enforced)",
-                        )
-                      }
-                    >
-                      Apply sample rules
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() =>
-                        void apply(
                           () => api.setAllowDenyRules([], []),
                           "Rules cleared",
                         )

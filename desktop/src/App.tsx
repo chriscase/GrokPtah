@@ -1467,9 +1467,6 @@ export default function App() {
           {workspaceMode === "chat"
             ? "Grok chats — separate from coding builds."
             : "Coding builds with tools."}
-          <span className="session-hint-ctx">
-            {` Zones ${docks.length}/${maxDocks}: ⧉/⌘\\ · Live rail switch · ⌘1–${Math.min(6, maxDocks)} focus · ⌘B rails.`}
-          </span>
         </p>
         <div className="session-list">
           {sessions.map((s) => {
@@ -2153,9 +2150,13 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => void api.gitCommit("chore: GrokPtah commit")}
+              onClick={() => {
+                const msg = window.prompt("Commit message", "");
+                if (msg == null || !msg.trim()) return;
+                void api.gitCommit(msg.trim());
+              }}
             >
-              Commit
+              Commit…
             </button>
           </>
         )}
@@ -2206,16 +2207,6 @@ export default function App() {
               <strong>Doctor</strong>
               <pre>{mcpDoctor.join("\n")}</pre>
             </div>
-            <button
-              type="button"
-              onClick={async () => {
-                await api.mcpAddStdio("echo-tool", "echo", ["mcp-ok"]);
-                setMcp(await api.mcpList());
-                setMcpDoctor(await api.mcpDoctor());
-              }}
-            >
-              Add sample stdio MCP
-            </button>
           </>
         )}
 

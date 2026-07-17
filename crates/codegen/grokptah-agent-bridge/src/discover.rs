@@ -18,6 +18,17 @@ fn home_override() -> &'static Mutex<Option<PathBuf>> {
     O.get_or_init(|| Mutex::new(None))
 }
 
+/// Serialize all tests that mutate the process-wide home override.
+///
+/// Unit tests that call [`set_grokptah_home_override`] must hold this guard
+/// for the duration of the test (including drop of any InstanceLock).
+pub fn home_override_serial() -> std::sync::MutexGuard<'static, ()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Set or clear the data-dir override.
 ///
 /// Callers that run concurrent tests must serialize access (see test helpers).
