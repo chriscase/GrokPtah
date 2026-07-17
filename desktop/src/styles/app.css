@@ -1,6 +1,7 @@
 /* GrokPtah — coding-agent chrome (Grok Build desktop), not a consumer app splash */
 
-:root {
+:root,
+[data-theme="dark"] {
   color-scheme: dark;
   --bg: #0b0c0e;
   --bg-panel: #12141a;
@@ -18,6 +19,18 @@
   --thought: #9aa5b5;
   --tool: #c3a6ff;
   --user-bg: #1a1d26;
+  --surface-deep: #050608;
+  --surface-chrome: #12151c;
+  --surface-chip: #151820;
+  --hover: #1e222c;
+  --status-bar-bg: #08090c;
+  --ctx-menu-bg: #14171e;
+  --rail-mid: #1a1e28;
+  --rail-edge: #14171f;
+  --overlay-scrim: rgba(0, 0, 0, 0.65);
+  --overlay-soft: rgba(0, 0, 0, 0.2);
+  --overlay-faint: rgba(255, 255, 255, 0.05);
+  --overlay-mid: rgba(255, 255, 255, 0.06);
   --radius: 6px;
   /* Body / prose — proportional so code pops against it (#125) */
   --font: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
@@ -25,6 +38,39 @@
   /* Code, tools, terminal, ids — mono only */
   --font-mono: "SF Mono", "JetBrains Mono", "IBM Plex Mono", ui-monospace, Menlo,
     Consolas, monospace;
+}
+
+/* Full light token set (#133) — selecting Light must recolor all chrome. */
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f5f7;
+  --bg-panel: #ffffff;
+  --bg-elevated: #eef0f4;
+  --bg-input: #ffffff;
+  --border: #d0d5de;
+  --border-soft: #e2e5ec;
+  --text: #1a1d24;
+  --muted: #5c6573;
+  --accent: #b8860b;
+  --accent-dim: #8a6508;
+  --accent-bg: rgba(184, 134, 11, 0.12);
+  --danger: #c23b44;
+  --ok: #2f8f57;
+  --thought: #5a6575;
+  --tool: #6b4db8;
+  --user-bg: #e8ebf2;
+  --surface-deep: #e6e8ee;
+  --surface-chrome: #f0f2f6;
+  --surface-chip: #e8ebf1;
+  --hover: #e2e5ec;
+  --status-bar-bg: #e8ebf1;
+  --ctx-menu-bg: #ffffff;
+  --rail-mid: #e8ebf1;
+  --rail-edge: #dde1e9;
+  --overlay-scrim: rgba(0, 0, 0, 0.35);
+  --overlay-soft: rgba(0, 0, 0, 0.06);
+  --overlay-faint: rgba(0, 0, 0, 0.04);
+  --overlay-mid: rgba(0, 0, 0, 0.05);
 }
 
 * {
@@ -62,7 +108,7 @@ button {
 
 button:hover {
   border-color: var(--accent-dim);
-  background: #1e222c;
+  background: var(--hover);
 }
 
 button.primary {
@@ -118,7 +164,7 @@ button:disabled {
   border: 1px solid var(--border-soft);
   border-radius: 7px;
   overflow: hidden;
-  background: rgba(0, 0, 0, 0.2);
+  background: var(--overlay-soft);
 }
 
 .chrome-toggle {
@@ -141,7 +187,7 @@ button:disabled {
 
 .chrome-toggle:hover {
   color: var(--text);
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--overlay-faint);
 }
 
 .chrome-toggle.is-on {
@@ -186,7 +232,7 @@ button:disabled {
   justify-content: center;
   border-radius: 5px;
   border: 1px solid var(--border-soft);
-  background: rgba(0, 0, 0, 0.2);
+  background: var(--overlay-soft);
   color: var(--muted);
   font-size: 12px;
   line-height: 1;
@@ -230,24 +276,24 @@ button:disabled {
   border-radius: 0;
   background: linear-gradient(
     180deg,
-    #1a1e28 0%,
-    #14171f 45%,
-    #10131a 100%
+    var(--rail-mid) 0%,
+    var(--rail-edge) 45%,
+    var(--surface-deep) 100%
   );
   color: var(--thought);
   cursor: pointer;
-  box-shadow: inset 0 0 0 1px #2c3340;
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 
 .rail-expand:hover {
   background: linear-gradient(
     180deg,
-    #232834 0%,
-    #1a1e28 50%,
-    #14171f 100%
+    var(--hover) 0%,
+    var(--rail-mid) 50%,
+    var(--rail-edge) 100%
   );
   color: var(--text);
-  box-shadow: inset 0 0 0 1px #3d4658;
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 
 .rail-expand-chevron {
@@ -442,7 +488,7 @@ button:disabled {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  background: #050608;
+  background: var(--surface-deep);
 }
 
 .terminal-slot.is-expanded {
@@ -502,7 +548,7 @@ button:disabled {
   align-items: stretch;
   flex: 0 0 auto;
   border-top: 1px solid var(--border-soft);
-  background: rgba(5, 8, 7, 0.92);
+  background: var(--surface-deep);
   min-height: 30px;
   max-height: 34px;
 }
@@ -564,7 +610,7 @@ button:disabled {
 
 .terminal-peek-dismiss:hover {
   color: var(--text);
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--overlay-faint);
 }
 
 /* ── Per-session working directory (build sessions) ── */
@@ -573,7 +619,7 @@ button:disabled {
   align-items: center;
   padding: 0.25rem 0.65rem;
   border-bottom: 1px solid var(--border-soft);
-  background: rgba(0, 0, 0, 0.2);
+  background: var(--overlay-soft);
   min-height: 0;
   flex-shrink: 0;
 }
@@ -762,7 +808,7 @@ button:disabled {
 }
 
 .session-item:hover {
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--overlay-faint);
   border-color: var(--border-soft);
 }
 
@@ -839,7 +885,7 @@ button:disabled {
 }
 
 .session-item-more:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--overlay-mid);
   color: var(--text);
   border-color: transparent;
 }
@@ -1840,7 +1886,7 @@ button:disabled {
 }
 
 .md-body tr:nth-child(even) td {
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--overlay-faint);
 }
 
 /* ── Compact tool cards (must stay obvious in the transcript) ── */
@@ -1907,7 +1953,7 @@ button:disabled {
 }
 
 .tool-card-header:hover {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--overlay-faint);
 }
 
 .tool-card-glyph {
@@ -2034,7 +2080,7 @@ button:disabled {
   padding: 0 0.55rem 0 0.4rem;
   border-radius: 999px;
   border: 1px solid var(--border-soft);
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--overlay-faint);
   color: var(--muted);
   font-size: 11px;
   font-family: var(--font-ui);
@@ -2076,7 +2122,7 @@ button:disabled {
   height: 1.15rem;
   padding: 0 0.3rem;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--overlay-mid);
   font-size: 10px;
   font-family: var(--font);
   line-height: 1.15rem;
@@ -2098,7 +2144,7 @@ button:disabled {
   margin-top: 0.35rem;
   border: 1px solid var(--border);
   border-radius: 10px;
-  background: #12151c;
+  background: var(--surface-chrome);
   box-shadow:
     0 0 0 1px rgba(0, 0, 0, 0.25),
     0 12px 28px rgba(0, 0, 0, 0.4);
@@ -2285,7 +2331,7 @@ button:disabled {
 
 .composer-pill:hover {
   border-color: var(--border);
-  background: #151820;
+  background: var(--surface-chip);
 }
 
 .composer-pill-label {
@@ -2337,7 +2383,7 @@ button:disabled {
 .composer-chip:hover {
   color: var(--text);
   border-color: var(--border);
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--overlay-faint);
 }
 
 .composer-chip.on {
@@ -2408,7 +2454,7 @@ button:disabled {
   padding: 0.3rem;
   border-radius: 10px;
   border: 1px solid var(--border);
-  background: #14171e;
+  background: var(--ctx-menu-bg);
   box-shadow:
     0 0 0 1px rgba(0, 0, 0, 0.35),
     0 16px 40px rgba(0, 0, 0, 0.55);
@@ -2532,7 +2578,7 @@ button:disabled {
   font-size: 11px;
   color: var(--muted);
   border-top: 1px solid var(--border-soft);
-  background: #08090c;
+  background: var(--status-bar-bg);
 }
 
 .status-live {
@@ -2887,7 +2933,7 @@ button:disabled {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.65);
+  background: var(--overlay-scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2947,7 +2993,7 @@ button:disabled {
   min-height: 100px;
   max-height: 18vh;
   border-top: none;
-  background: #050608;
+  background: var(--surface-deep);
   padding: 0.2rem;
 }
 
@@ -3048,7 +3094,7 @@ button:disabled {
   position: fixed;
   inset: 0;
   z-index: 80;
-  background: rgba(0, 0, 0, 0.62);
+  background: var(--overlay-scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3061,7 +3107,7 @@ button:disabled {
   height: min(560px, 90vh);
   display: flex;
   flex-direction: column;
-  background: #12151c;
+  background: var(--surface-chrome);
   border: 1px solid var(--border);
   border-radius: 14px;
   box-shadow:
@@ -3076,7 +3122,7 @@ button:disabled {
   justify-content: space-between;
   padding: 0.75rem 0.9rem;
   border-bottom: 1px solid var(--border-soft);
-  background: rgba(0, 0, 0, 0.2);
+  background: var(--overlay-soft);
 }
 
 .settings-title {
@@ -3105,7 +3151,7 @@ button:disabled {
 }
 
 .settings-close:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--overlay-mid);
   color: var(--text);
   border-color: transparent;
 }
@@ -3139,7 +3185,7 @@ button:disabled {
 
 .settings-nav-item:hover {
   color: var(--text);
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--overlay-faint);
   border-color: transparent;
 }
 
@@ -3224,7 +3270,7 @@ button:disabled {
   padding: 0.65rem 0.75rem;
   border: 1px solid var(--border-soft);
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--overlay-faint);
 }
 
 .settings-toggle-row .settings-field-label {
@@ -3296,7 +3342,7 @@ button:disabled {
   border-radius: 10px;
   padding: 0.75rem;
   margin-bottom: 1rem;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--overlay-faint);
 }
 
 .settings-auth-status {
@@ -3465,7 +3511,7 @@ button:disabled {
   font-weight: 700;
   letter-spacing: 0.02em;
   color: var(--muted);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--overlay-mid);
   border: 1px solid var(--border-soft);
   flex-shrink: 0;
 }
@@ -3669,7 +3715,7 @@ button:disabled {
 
 .fleet-strip-hide:hover {
   color: var(--text);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--overlay-mid);
 }
 
 .fleet-strip-label {
@@ -3730,7 +3776,7 @@ button:disabled {
 
 .fleet-card:hover {
   border-color: var(--border);
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--overlay-faint);
 }
 
 .fleet-card.primary {

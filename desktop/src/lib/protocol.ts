@@ -247,4 +247,6 @@ export const SLASH_COMMANDS = [
   { cmd: "/mcp", desc: "List MCP servers + doctor" },
   { cmd: "/skills", desc: "List discovered skills" },
   { cmd: "/sandbox", desc: "Show or set tool safety profile (not an OS sandbox)" },
+  { cmd: "/resume", desc: "Open session browser to resume history" },
+  { cmd: "/continue", desc: "Continue the most recently updated other session" },
 ] as const;

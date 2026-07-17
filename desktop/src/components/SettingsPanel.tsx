@@ -350,7 +350,9 @@ export function SettingsPanel({
                     <option value="light">Light</option>
                   </select>
                   <span className="settings-hint">
-                    Light theme is stored; full light tokens ship over time.
+                    Applies immediately via design tokens on{" "}
+                    <code>data-theme</code>. Terminal canvas stays dark for
+                    contrast with shell output.
                   </span>
                 </label>
               </section>

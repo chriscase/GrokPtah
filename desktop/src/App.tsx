@@ -362,18 +362,29 @@ export default function App() {
       });
       if (!hydrate) return;
       try {
-        const entries = await api.sessionTranscript(summary.id);
+        // Resume: promote backend active session + cwd, then hydrate transcript (#38).
+        const loaded = await api.sessionLoad(summary.id);
+        const entries = await api.sessionTranscript(loaded.id);
         setTabs((prev) =>
           prev.map((t) => {
-            if (t.id !== summary.id) return t;
+            if (t.id !== loaded.id) return t;
             // Keep live stream if this tab already has more than disk.
-            if (t.transcript.length > entries.length) return t;
+            if (t.busy && t.transcript.length > entries.length) return t;
             return {
               ...t,
-              title: summary.title,
+              title: loaded.title || summary.title,
               transcript: entriesToTranscriptItems(entries),
             };
           }),
+        );
+        setStatus((st) =>
+          st
+            ? {
+                ...st,
+                active_session: loaded.id,
+                project_cwd: loaded.cwd || st.project_cwd,
+              }
+            : st,
         );
       } catch {
         /* offline / empty */
@@ -527,6 +538,9 @@ export default function App() {
       setModels(md);
       setSessions(sess);
       setProduct(info);
+      // Apply persisted appearance so Light is real after reload (#133).
+      document.documentElement.dataset.theme =
+        st.appearance === "light" ? "light" : "dark";
       // Keep tab titles in sync with session list
       setTabs((prev) =>
         prev.map((t) => {
@@ -1006,17 +1020,39 @@ export default function App() {
             : []),
           {
             type: "item",
+            id: "resume",
+            label: "Resume (load history)",
+            onClick: () => {
+              void (async () => {
+                try {
+                  const s = await api.sessionLoad(sessionId);
+                  await openTab(s, true);
+                  setSessions(
+                    await api.sessionListByKind(workspaceMode, false),
+                  );
+                } catch (e) {
+                  console.warn(e);
+                }
+              })();
+            },
+          },
+          {
+            type: "item",
             id: "fork",
             label: "Fork",
             onClick: () => {
               void (async () => {
                 const f = await api.sessionFork(sessionId);
-                await openTab(f, false);
+                // Fork: open new id with history copy from source tab + disk.
+                await openTab(f, true);
                 const src = tabs.find((t) => t.id === sessionId);
-                if (src) {
+                if (src && src.transcript.length > 0) {
                   patchTab(f.id, (t) => ({
                     ...t,
-                    transcript: [...src.transcript],
+                    transcript:
+                      t.transcript.length >= src.transcript.length
+                        ? t.transcript
+                        : [...src.transcript],
                     title: f.title,
                   }));
                 }
@@ -1192,6 +1228,76 @@ export default function App() {
                 text: "Context compacted for the server. Full local history is retained.",
               },
             ],
+          }));
+        }
+        return;
+      }
+      // /resume → session browser; /continue → most recently updated other session (#38).
+      if (prompt === "/resume") {
+        patchTab(id, (t) => ({
+          ...t,
+          busy: false,
+          activity: idleActivity(),
+          transcript: t.transcript.filter(
+            (x) => !(x.kind === "user" && x.text === prompt),
+          ),
+        }));
+        setSessionBrowserOpen(true);
+        return;
+      }
+      if (prompt === "/continue") {
+        try {
+          const list = await api.sessionListByKind(workspaceMode, false);
+          const sorted = [...list].sort(
+            (a, b) =>
+              new Date(b.updated_at).getTime() -
+              new Date(a.updated_at).getTime(),
+          );
+          const target = sorted.find((s) => s.id !== id) ?? null;
+          if (!target) {
+            patchTab(id, (t) => ({
+              ...t,
+              busy: false,
+              activity: idleActivity(),
+              transcript: [
+                ...t.transcript.filter(
+                  (x) => !(x.kind === "user" && x.text === prompt),
+                ),
+                {
+                  kind: "assistant",
+                  text: "No other session to continue. Use /resume to browse history, or Fork from the tab menu.",
+                },
+              ],
+            }));
+            return;
+          }
+          // Drop the slash echo from the previous tab.
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: idleActivity(),
+            transcript: t.transcript.filter(
+              (x) => !(x.kind === "user" && x.text === prompt),
+            ),
+          }));
+          await openTab(target, true);
+          patchTab(target.id, (t) => ({
+            ...t,
+            busy: false,
+            activity: idleActivity(),
+            transcript: [
+              ...t.transcript,
+              {
+                kind: "assistant",
+                text: `Continued “${target.title || target.id.slice(0, 8)}”. Send a prompt to keep going.`,
+              },
+            ],
+          }));
+        } catch (e) {
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: errorActivity(String(e)),
           }));
         }
         return;
