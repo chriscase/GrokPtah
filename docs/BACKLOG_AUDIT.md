@@ -45,7 +45,7 @@
 
 | Issue | Proof |
 |-------|--------|
-| **#122** | `memo()` on SessionPane, MarkdownBody, ToolCallCard, FleetStrip; MD_COMPONENTS hoisted; `openTabIdsKey` persist; `npm test` `memoIsolation.test.ts` |
+| **#122** | `memo()` + **stable** `onFocusSession`/`onClosePane` id handlers (not per-dock lambdas); SessionPane, MarkdownBody, ToolCallCard, FleetStrip; MD_COMPONENTS hoisted; `openTabIdsKey` persist; `npm test` `memoIsolation.test.ts` |
 | **#123** | Stick hysteresis + **Jump to latest ↓** button in SessionPane; structural test |
 
 ## Still open (do not mass-close)
