@@ -20,6 +20,10 @@ export type SettingsPanelProps = {
   onAuthChange: (a: AuthState) => void;
   /** After host chrome changes (model/effort/etc). */
   onChromeChange: () => void;
+  /**
+   * #132: `dock` = full-height side pane (default); `modal` = centered overlay.
+   */
+  placement?: "dock" | "modal";
 };
 
 type SettingsSnap = {
@@ -55,6 +59,7 @@ export function SettingsPanel({
   auth,
   onAuthChange,
   onChromeChange,
+  placement = "dock",
 }: SettingsPanelProps) {
   const [snap, setSnap] = useState<SettingsSnap>({});
   const [apiKeyInput, setApiKeyInput] = useState("");
@@ -112,14 +117,14 @@ export function SettingsPanel({
 
   return (
     <div
-      className="settings-backdrop"
-      onClick={onClose}
+      className={`settings-backdrop ${placement === "dock" ? "is-dock" : "is-modal"}`}
+      onClick={placement === "modal" ? onClose : undefined}
       role="presentation"
     >
       <div
-        className="settings-panel"
+        className={`settings-panel ${placement === "dock" ? "is-docked" : ""}`}
         role="dialog"
-        aria-modal="true"
+        aria-modal={placement === "modal"}
         aria-label="Settings"
         onClick={(e) => e.stopPropagation()}
       >
@@ -129,6 +134,9 @@ export function SettingsPanel({
               <SettingsGlyph />
             </span>
             Settings
+            {placement === "dock" && (
+              <span className="settings-dock-badge">pane</span>
+            )}
           </div>
           <button
             type="button"
