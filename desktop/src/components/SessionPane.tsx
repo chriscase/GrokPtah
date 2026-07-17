@@ -80,8 +80,12 @@ export type SessionPaneProps = {
   kindLabel?: string;
   emptyHint?: string;
   bridgeVersion?: string;
-  onFocus: () => void;
-  onClosePane?: () => void;
+  /**
+   * Must be a **stable** callback (useCallback). Pane calls it with `tab.id`
+   * so the parent never wraps per-dock lambdas that defeat React.memo (#122).
+   */
+  onFocusSession: (sessionId: string) => void;
+  onClosePane?: (sessionId: string) => void;
   /** Show close control for secondary pane only. */
   showClose?: boolean;
 };
@@ -91,7 +95,8 @@ export type SessionPaneProps = {
  * Composer stays shared in the parent and targets the focused pane.
  *
  * Memoized (#122): when only another dock's tab object changes, this pane
- * keeps the same `tab` reference and skips re-render.
+ * keeps the same `tab` reference and skips re-render — **if** parent passes
+ * stable `onFocusSession` / `onClosePane` by reference (not `() => …(dockId)`).
  */
 export const SessionPane = memo(function SessionPane({
   tab,
@@ -101,7 +106,7 @@ export const SessionPane = memo(function SessionPane({
   kindLabel,
   emptyHint,
   bridgeVersion,
-  onFocus,
+  onFocusSession,
   onClosePane,
   showClose,
 }: SessionPaneProps) {
@@ -132,7 +137,7 @@ export const SessionPane = memo(function SessionPane({
   return (
     <section
       className={`session-pane ${focused ? "is-focused" : ""} ${busy ? "is-busy" : ""} ${multi ? "is-multi" : ""}`}
-      onMouseDown={onFocus}
+      onMouseDown={() => onFocusSession(tab.id)}
       data-session-id={tab.id}
       data-zone={zoneIndex}
     >
@@ -172,7 +177,7 @@ export const SessionPane = memo(function SessionPane({
               aria-label="Undock zone"
               onClick={(e) => {
                 e.stopPropagation();
-                onClosePane();
+                onClosePane(tab.id);
               }}
             >
               ×

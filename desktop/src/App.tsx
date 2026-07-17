@@ -1735,8 +1735,8 @@ export default function App() {
                         : "Message Grok when this pane is focused."
                     }
                     showClose={docks.length > 1}
-                    onClosePane={() => undockSession(dockId)}
-                    onFocus={() => focusSession(dockId)}
+                    onClosePane={undockSession}
+                    onFocusSession={focusSession}
                   />
                 </div>
               );
