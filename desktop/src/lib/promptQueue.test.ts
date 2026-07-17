@@ -15,6 +15,9 @@ describe("prompt queue / interject (#147)", () => {
     // Send stays enabled while busy so users can queue
     expect(app).toMatch(/disabled=\{!composer\.trim\(\)\}/);
     expect(app).not.toMatch(/disabled=\{busy \|\| !composer\.trim\(\)\}/);
+    // Enter must queue while busy (not no-op)
+    expect(app).toMatch(/Enter queues/);
+    expect(app).not.toMatch(/if \(!busy\) void sendPrompt\(\)/);
   });
 });
 
@@ -23,8 +26,9 @@ describe("background tasks panel (#52)", () => {
     const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
     expect(app).toMatch(/Schedule scan/);
     expect(app).toMatch(/Schedule shell/);
-    expect(app).toMatch(/Adopt/);
+    expect(app).toMatch(/Open session/);
     expect(app).toMatch(/Background \/ scheduled/);
+    expect(app).toMatch(/background_task/);
   });
 });
 

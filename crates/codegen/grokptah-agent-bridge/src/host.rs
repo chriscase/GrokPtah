@@ -1318,6 +1318,21 @@ impl AgentHostHandle {
     }
 
     pub fn cancel_background_task(&self, id: &str) -> Result<()> {
+        // Agent tool shells: cancel the owning turn (kills live_shells) (#52).
+        let session_for_shell = {
+            let g = self.inner.lock();
+            g.background_tasks
+                .iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.session_id.clone())
+        };
+        if id.starts_with("shell-") {
+            if let Some(sid) = session_for_shell.as_deref() {
+                if let Ok(uuid) = Uuid::parse_str(sid) {
+                    let _ = self.cancel_turn(Some(uuid));
+                }
+            }
+        }
         let mut g = self.inner.lock();
         if let Some(token) = g.background_cancels.remove(id) {
             token.cancel();
@@ -1503,19 +1518,40 @@ impl AgentHostHandle {
             session_id: session_id.map(|u| u.to_string()),
             detail: Some("agent tool shell".into()),
         };
-        let mut g = self.inner.lock();
-        // Replace prior entry for same call id.
-        g.background_tasks.retain(|x| x.id != t.id);
-        g.background_tasks.push(t);
+        let event_tx = {
+            let mut g = self.inner.lock();
+            // Replace prior entry for same call id.
+            g.background_tasks.retain(|x| x.id != t.id);
+            g.background_tasks.push(t.clone());
+            g.event_tx.clone()
+        };
+        let _ = event_tx.send(SessionUpdate::BackgroundTask {
+            session_id,
+            task_id: t.id.clone(),
+            title: t.title.clone(),
+            status: t.status.clone(),
+        });
     }
 
     pub fn complete_shell_background_task(&self, call_id: &str, status: &str) {
         let id = format!("shell-{call_id}");
-        let mut g = self.inner.lock();
-        if let Some(task) = g.background_tasks.iter_mut().find(|t| t.id == id) {
-            task.status = status.into();
-            task.detail = Some(status.into());
-        }
+        let (event_tx, title) = {
+            let mut g = self.inner.lock();
+            let title = if let Some(task) = g.background_tasks.iter_mut().find(|t| t.id == id) {
+                task.status = status.into();
+                task.detail = Some(status.into());
+                task.title.clone()
+            } else {
+                return;
+            };
+            (g.event_tx.clone(), title)
+        };
+        let _ = event_tx.send(SessionUpdate::BackgroundTask {
+            session_id: None,
+            task_id: id,
+            title,
+            status: status.into(),
+        });
     }
 
     pub fn fuzzy_open(&self, query: &str) -> Result<Vec<String>> {

@@ -574,10 +574,16 @@ export default function App() {
         // Attach tool shell but keep the panel collapsed unless already open.
         setToolShell({ callId: u.call_id, command: u.command });
         setTermPeek(true);
+        // #52: agent shells appear in Tasks without waiting for turn end.
+        void api.backgroundTasks().then(setBgTasks).catch(() => {});
       }
       if (u.type === "shell_session_ended") {
         // Keep peek until user dismisses or opens term
         setTermPeek(true);
+        void api.backgroundTasks().then(setBgTasks).catch(() => {});
+      }
+      if (u.type === "background_task") {
+        void api.backgroundTasks().then(setBgTasks).catch(() => {});
       }
       if (u.type === "file_edit") {
         // Live agent diffs in the git pane (no manual refresh).
@@ -2078,7 +2084,7 @@ export default function App() {
               rows={composerExpanded ? 10 : 2}
               placeholder={
                 busy
-                  ? "Focused session is running… draft saved when you switch sessions"
+                  ? "Turn running — Enter queues · Interject sends now"
                   : workspaceMode === "chat"
                     ? "Message Grok… (drafts keep per session · Shift+Enter newline)"
                     : "Message the coding agent… (drafts keep per session · Shift+Enter newline)"
@@ -2087,7 +2093,8 @@ export default function App() {
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
-                  if (!busy) void sendPrompt();
+                  // #147: Enter queues while busy (same as Send); Shift+Enter newline.
+                  void sendPrompt();
                 }
               }}
             />
@@ -2645,19 +2652,30 @@ export default function App() {
                   {t.session_id && (
                     <button
                       type="button"
-                      title="Focus the owning session"
+                      title="Focus owning session and show tool shell if live"
                       onClick={() => {
                         void (async () => {
                           try {
                             const s = await api.sessionLoad(String(t.session_id));
                             await openTab(s, true);
+                            // Surface shell work outside the transcript.
+                            setRightTab("tasks");
+                            if (t.kind === "shell" || String(t.id).startsWith("shell-")) {
+                              setShowTerm(true);
+                              setTermEverOpened(true);
+                              setTermPeek(false);
+                              setToolShell({
+                                callId: String(t.id).replace(/^shell-/, ""),
+                                command: String(t.title),
+                              });
+                            }
                           } catch (e) {
                             console.warn(e);
                           }
                         })();
                       }}
                     >
-                      Adopt
+                      Open session
                     </button>
                   )}
                 </div>
