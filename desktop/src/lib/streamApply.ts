@@ -2,13 +2,18 @@
  * Pure helpers for progressive assistant stream application.
  *
  * Host may send:
- *  - cumulative full text (chunk starts with existing)
- *  - true deltas (append)
- *  - accidental full re-deliveries (multi-listener) → skip
+ *  - cumulative full text (chunk starts with existing and is longer) → replace
+ *  - true deltas (append), including N identical lines in a row
+ *  - optional monotonic `seq` to drop stale redeliveries
  *
- * Never use length-only tail slicing for "what changed" when replacing
- * the committed bubble text — the bubble stores the full string; UI beam
- * components compute the visual delta themselves.
+ * Intentionally does **not**:
+ *  - length-only tail slicing (see streamVisualDelta)
+ *  - endsWith / startsWith "rewind" skips that drop the 3rd+ identical line
+ *    when existing is "line\\nline\\n" and chunk is "line\\n" (#121)
+ *  - length>=80 exact-equality skip that drops long repeated code lines
+ *
+ * Multi-listener full redelivery is handled by the session update bus
+ * singleton; we prefer correct repeated-line append over heuristic skip.
  */
 
 export type StreamApplyResult =
@@ -40,25 +45,17 @@ export function applyAssistantStreamChunk(
     return { kind: "replace", text: chunk };
   }
 
-  // Cumulative snapshot (server/proxy re-sent a longer full buffer).
+  // Cumulative snapshot (server/proxy re-sent a longer full buffer that
+  // already contains everything we have).
   if (chunk.startsWith(existing) && chunk.length > existing.length) {
     return { kind: "replace", text: chunk };
   }
 
-  // Exact equality: long payload → treat as multi-listener full re-dump (skip).
-  // Short payload may be a second identical code line (append) — #121.
-  if (chunk === existing) {
-    if (chunk.length >= 80) return { kind: "skip" };
-    return { kind: "append", text: existing + chunk };
-  }
-
-  // Shorter rewind of a cumulative buffer we already have — ignore.
-  // (Do NOT use endsWith(chunk): that drops legitimate repeated lines.)
-  if (existing.startsWith(chunk) && existing.length > chunk.length) {
-    return { kind: "skip" };
-  }
-
-  // True delta: append (including repeated identical lines).
+  // Everything else is a delta: append.
+  // Includes:
+  //  - chunk === existing (2nd identical unit when bubble is just that unit)
+  //  - existing.startsWith(chunk) (3rd+ identical line when bubble is N copies)
+  //  - normal extensions that are not strict prefixes of the buffer
   return { kind: "append", text: existing + chunk };
 }
 

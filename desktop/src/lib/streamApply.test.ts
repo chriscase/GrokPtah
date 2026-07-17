@@ -16,20 +16,43 @@ describe("applyAssistantStreamChunk", () => {
     expect(nextAssistantText("Hello", "Hello world")).toBe("Hello world");
   });
 
-  it("skips long exact redelivery; appends short repeated line", () => {
-    const long = "x".repeat(100);
-    expect(nextAssistantText(long, long)).toBe("skip");
-    // short equal is legitimate second line, not multi-listener dump
+  it("appends when chunk equals existing (2nd identical unit)", () => {
     expect(nextAssistantText("Hi", "Hi")).toBe("HiHi");
+    const long = "x".repeat(100);
+    // Long equal is still a legitimate second copy of a line, not skip
+    expect(nextAssistantText(long, long)).toBe(long + long);
   });
 
-  it("does not drop legitimate repeated lines (no content-collapse)", () => {
-    // Two identical code lines arriving as deltas must both remain.
+  it("does not drop 2+ identical short code lines", () => {
     const line = "  return 1;\n";
     let t = "";
     t = nextAssistantText(t, line) as string;
     t = nextAssistantText(t, line) as string;
     expect(t).toBe(line + line);
+  });
+
+  it("does not drop 3+ identical short code lines (startsWith rewind trap)", () => {
+    // After two lines, existing.startsWith(chunk) is true — old logic skipped.
+    const line = "  return 1;\n";
+    let t = "";
+    for (let i = 0; i < 5; i++) {
+      const next = nextAssistantText(t, line);
+      expect(next).not.toBe("skip");
+      t = next as string;
+    }
+    expect(t).toBe(line.repeat(5));
+  });
+
+  it("does not drop long repeated code lines (no length>=80 skip)", () => {
+    // ≥80 chars so this would have hit the old exact-equality length heuristic
+    const line = `  const value = ${"x".repeat(90)};\n`;
+    expect(line.length).toBeGreaterThanOrEqual(80);
+    let t = "";
+    t = nextAssistantText(t, line) as string;
+    t = nextAssistantText(t, line) as string;
+    t = nextAssistantText(t, line) as string;
+    expect(t).toBe(line + line + line);
+    expect(t.split("\n").filter(Boolean)).toHaveLength(3);
   });
 
   it("seq drops stale chunks", () => {
@@ -54,7 +77,6 @@ describe("streamVisualDelta", () => {
   });
 
   it("resets when text is not a pure extension (length-only would garble)", () => {
-    // Same length replacement would break slice(prevLen) beams.
     const d = streamVisualDelta("abcXX", "abcYY");
     expect(d.reset).toBe(true);
     expect(d.added).toBe("abcYY");
