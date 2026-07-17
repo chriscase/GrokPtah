@@ -1634,13 +1634,14 @@ button:disabled {
   overflow: auto;
   min-height: 0; /* critical so flex sibling can scroll */
   flex: 1 1 auto;
-  padding: 0.85rem 1rem;
+  padding: 0.55rem 0.85rem;
   display: flex;
   flex-direction: column;
-  gap: 0.55rem;
+  /* #128: tighter inter-message density (~35% less gap) to match markdown pane */
+  gap: 0.35rem;
   font-family: var(--font);
   font-size: 12.5px;
-  line-height: 1.5;
+  line-height: 1.45;
 }
 
 /* Grok Build–style empty state: prompt, not product splash */
@@ -1680,7 +1681,7 @@ button:disabled {
   max-width: 52rem;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
-  padding: 0.55rem 0.7rem;
+  padding: 0.4rem 0.6rem;
   background: var(--bg-elevated);
   word-break: break-word;
 }
@@ -1690,7 +1691,7 @@ button:disabled {
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  margin: 0 0 0.35rem;
+  margin: 0 0 0.22rem;
   opacity: 0.85;
 }
 
@@ -1714,7 +1715,7 @@ button:disabled {
 .bubble.assistant {
   /* Markdown owns whitespace — proportional prose */
   white-space: normal;
-  padding: 0.65rem 0.85rem;
+  padding: 0.45rem 0.7rem;
   font-family: var(--font);
   background: var(--bg-elevated);
   border-left: 3px solid color-mix(in srgb, var(--ok, #7fd99a) 70%, var(--border));

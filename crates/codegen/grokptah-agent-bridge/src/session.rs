@@ -101,6 +101,18 @@ impl TranscriptEntry {
         }
     }
 
+    /// Model reasoning / chain-of-thought (hydrated as thought bubbles on reload).
+    pub fn thought(text: impl Into<String>) -> Self {
+        Self {
+            role: "thought".into(),
+            text: text.into(),
+            tool_call_id: None,
+            tool_title: None,
+            tool_status: None,
+            tool_output: None,
+        }
+    }
+
     pub fn tool(
         call_id: impl Into<String>,
         title: impl Into<String>,

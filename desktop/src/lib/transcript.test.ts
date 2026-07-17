@@ -38,4 +38,17 @@ describe("entriesToTranscriptItems", () => {
     ]);
     expect(items[0].kind).toBe("tool");
   });
+
+  it("hydrates thought role so reasoning survives reload (#149)", () => {
+    const items = entriesToTranscriptItems([
+      { role: "user", text: "why?" },
+      { role: "thought", text: "consider the options…" },
+      { role: "assistant", text: "because" },
+    ]);
+    expect(items[1]).toEqual({
+      kind: "thought",
+      text: "consider the options…",
+    });
+  });
 });
+

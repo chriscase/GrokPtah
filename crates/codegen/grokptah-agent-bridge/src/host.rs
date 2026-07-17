@@ -2547,6 +2547,9 @@ impl AgentHostHandle {
                 |delta| {
                     emit_message(event_tx, session_id, delta);
                 },
+                |thought| {
+                    emit_thought(event_tx, session_id, thought);
+                },
             )
             .await
             {
@@ -2558,23 +2561,45 @@ impl AgentHostHandle {
             };
 
             match step {
-                AgentStep::Final { text, streamed } => {
+                AgentStep::Final {
+                    text,
+                    streamed,
+                    reasoning,
+                } => {
+                    if let Some(r) = reasoning.as_deref() {
+                        push_thought(self, session_id, r);
+                    }
                     let text = if text.trim().is_empty() {
-                        "(agent finished with empty reply)".into()
+                        if reasoning.as_ref().is_some_and(|r| !r.trim().is_empty()) {
+                            // Reasoning-only turn already shown as thought; keep a thin marker.
+                            String::new()
+                        } else {
+                            "(agent finished with empty reply)".into()
+                        }
                     } else {
                         text
                     };
-                    if !streamed {
-                        emit_message(event_tx, session_id, &text);
+                    if !text.is_empty() {
+                        if !streamed {
+                            emit_message(event_tx, session_id, &text);
+                        }
+                        push_assistant(self, session_id, &text);
                     }
-                    push_assistant(self, session_id, &text);
-                    return Ok(text);
+                    return Ok(if text.is_empty() {
+                        reasoning.unwrap_or_else(|| "(thought only)".into())
+                    } else {
+                        text
+                    });
                 }
                 AgentStep::ToolCalls {
                     content,
                     tool_calls,
                     streamed,
+                    reasoning,
                 } => {
+                    if let Some(r) = reasoning.as_deref() {
+                        push_thought(self, session_id, r);
+                    }
                     if !streamed {
                         if let Some(c) = content.as_ref().filter(|s| !s.trim().is_empty()) {
                             emit_message(event_tx, session_id, c);
@@ -4000,6 +4025,19 @@ fn push_assistant(host: &AgentHostHandle, session_id: Uuid, text: &str) {
     // don't rewrite multi-MB files mid-stream.
 }
 
+/// Persist model reasoning so thought bubbles survive reload (#149).
+fn push_thought(host: &AgentHostHandle, session_id: Uuid, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let mut g = host.inner.lock();
+    if let Some(s) = g.sessions.get_mut(&session_id) {
+        s.transcript.push(TranscriptEntry::thought(text));
+        s.updated_at = Utc::now();
+    }
+}
+
 /// Record a tool call on the durable transcript (so UI reload / post-turn
 /// hydrate still shows tools — not only ephemeral session://update events).
 fn push_tool(
@@ -4071,6 +4109,9 @@ fn surface_rate_limit_or_error(
 
 #[allow(dead_code)] // reserved if we re-enable quiet diagnostics
 fn emit_thought(tx: &mpsc::UnboundedSender<SessionUpdate>, session_id: Uuid, text: &str) {
+    if text.is_empty() {
+        return;
+    }
     let _ = tx.send(SessionUpdate::AgentThoughtChunk {
         session_id,
         text: text.into(),
@@ -4133,11 +4174,14 @@ enum AgentStep {
         text: String,
         /// True when tokens were already emitted as AgentMessageChunk.
         streamed: bool,
+        /// Model reasoning_content (also streamed as AgentThoughtChunk).
+        reasoning: Option<String>,
     },
     ToolCalls {
         content: Option<String>,
         tool_calls: Vec<AgentToolCall>,
         streamed: bool,
+        reasoning: Option<String>,
     },
 }
 
@@ -4655,9 +4699,11 @@ fn resolve_api_base(creds: &crate::auth_store::WireCredentials, model: &str) -> 
     (base, model_id)
 }
 
-/// Stream one chat/completions step (tools + tokens). Emits content deltas via `on_delta`.
+/// Stream one chat/completions step (tools + tokens).
+/// Content → `on_delta`; reasoning_content → `on_thought` (#149).
 /// Cancel aborts the HTTP body read within ~one chunk.
-async fn call_xai_agent_step<F>(
+#[allow(clippy::too_many_arguments)]
+async fn call_xai_agent_step<F, G>(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
     effort: EffortLevel,
@@ -4665,9 +4711,11 @@ async fn call_xai_agent_step<F>(
     tools: &serde_json::Value,
     cancel: &CancellationToken,
     mut on_delta: F,
+    mut on_thought: G,
 ) -> Result<AgentStep>
 where
     F: FnMut(&str),
+    G: FnMut(&str),
 {
     use futures::StreamExt;
 
@@ -4791,6 +4839,7 @@ where
                 &v["choices"][0]["message"],
                 false,
                 &mut on_delta,
+                &mut on_thought,
             );
         }
 
@@ -4860,6 +4909,7 @@ where
                 if let Some(r) = delta["reasoning_content"].as_str() {
                     if !r.is_empty() {
                         reasoning.push_str(r);
+                        on_thought(r);
                     }
                 }
                 if let Some(arr) = delta["tool_calls"].as_array() {
@@ -4907,6 +4957,12 @@ where
             });
         }
 
+        let reasoning_opt = if reasoning.trim().is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        };
+
         if !tool_calls.is_empty() {
             let content_opt = if content.trim().is_empty() {
                 None
@@ -4917,6 +4973,7 @@ where
                 content: content_opt,
                 tool_calls,
                 streamed: streamed_any,
+                reasoning: reasoning_opt,
             });
         }
 
@@ -4924,15 +4981,15 @@ where
             return Ok(AgentStep::Final {
                 text: content,
                 streamed: streamed_any,
+                reasoning: reasoning_opt,
             });
         }
-        if !reasoning.trim().is_empty() {
-            if !streamed_any {
-                on_delta(&reasoning);
-            }
+        if let Some(r) = reasoning_opt {
+            // Reasoning-only: already streamed via on_thought; no assistant text.
             return Ok(AgentStep::Final {
-                text: reasoning,
+                text: String::new(),
                 streamed: true,
+                reasoning: Some(r),
             });
         }
         last_err = Some("empty stream response".into());
@@ -4948,13 +5005,15 @@ where
     );
 }
 
-fn parse_agent_step_from_message<F>(
+fn parse_agent_step_from_message<F, G>(
     msg: &serde_json::Value,
     streamed: bool,
     on_delta: &mut F,
+    on_thought: &mut G,
 ) -> Result<AgentStep>
 where
     F: FnMut(&str),
+    G: FnMut(&str),
 {
     if let Some(arr) = msg["tool_calls"].as_array() {
         if !arr.is_empty() {
@@ -4983,14 +5042,30 @@ where
                         on_delta(c);
                     }
                 }
+                let reasoning = msg["reasoning_content"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        on_thought(s);
+                        s.to_string()
+                    });
                 return Ok(AgentStep::ToolCalls {
                     content,
                     tool_calls,
                     streamed: streamed || has_content,
+                    reasoning,
                 });
             }
         }
     }
+
+    let reasoning = msg["reasoning_content"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            on_thought(s);
+            s.to_string()
+        });
 
     if let Some(content) = msg["content"].as_str() {
         if !content.is_empty() {
@@ -5000,19 +5075,16 @@ where
             return Ok(AgentStep::Final {
                 text: content.to_string(),
                 streamed: true,
+                reasoning,
             });
         }
     }
-    if let Some(r) = msg["reasoning_content"].as_str() {
-        if !r.is_empty() {
-            if !streamed {
-                on_delta(r);
-            }
-            return Ok(AgentStep::Final {
-                text: r.to_string(),
-                streamed: true,
-            });
-        }
+    if let Some(r) = reasoning {
+        return Ok(AgentStep::Final {
+            text: String::new(),
+            streamed: true,
+            reasoning: Some(r),
+        });
     }
     bail!("empty agent response: {msg}");
 }
