@@ -4318,3 +4318,46 @@ html[data-accent="violet"] {
   border-radius: 4px;
   padding: 0.05rem 0.3rem;
 }
+
+/* #152 multi-agent cards */
+.subagent-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+.subagent-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.45rem 0.55rem;
+  background: var(--bg-elevated);
+  border-left: 3px solid var(--tool, #c3a6ff);
+}
+.subagent-card.is-running {
+  border-left-color: var(--accent);
+}
+.subagent-card.is-completed {
+  border-left-color: var(--ok, #7fd99a);
+}
+.subagent-card.is-cancelled,
+.subagent-card.is-failed {
+  border-left-color: var(--danger);
+}
+.subagent-card-kind {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.subagent-card-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0.15rem 0;
+}
+.subagent-card-status {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}

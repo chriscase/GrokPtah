@@ -2758,12 +2758,31 @@ export default function App() {
 
         {rightTab === "tasks" && (
           <>
-            <div className="section-title">Subagents</div>
-            {subagents.map((a) => (
-              <div key={a.id} className="panel-block">
-                {a.kind}: {a.title} — {a.status}
+            <div className="section-title">Multi-agent</div>
+            <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 0.5rem" }}>
+              Parallel children (explore / general-purpose / plan) — not a flat
+              status dump (#152).
+            </p>
+            {subagents.length === 0 && (
+              <div className="panel-block" style={{ color: "var(--muted)" }}>
+                (no subagents this session)
               </div>
-            ))}
+            )}
+            <div className="subagent-grid">
+              {subagents.map((a) => (
+                <div
+                  key={a.id}
+                  className={`subagent-card is-${String(a.status).toLowerCase().replace(/\s+/g, "-")}`}
+                  data-testid="subagent-card"
+                >
+                  <div className="subagent-card-kind">{a.kind || "agent"}</div>
+                  <div className="subagent-card-title">
+                    {a.title || a.id.slice(0, 8)}
+                  </div>
+                  <div className="subagent-card-status">{a.status}</div>
+                </div>
+              ))}
+            </div>
             <div className="section-title">Background / scheduled</div>
             <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 0.5rem" }}>
               Long-running work outside the transcript (#52). Shell tool runs

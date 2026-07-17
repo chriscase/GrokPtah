@@ -3255,6 +3255,22 @@ impl AgentHostHandle {
                 self.run_explore_subagent(session_id, cwd, &query, cancel, event_tx)
                     .await
             }
+            "spawn_general_purpose" | "spawn_subagent" => {
+                let prompt = args
+                    .get("prompt")
+                    .or_else(|| args.get("query"))
+                    .or_else(|| args.get("description"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("complete the delegated task")
+                    .to_string();
+                let kind = args
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("general-purpose")
+                    .to_string();
+                self.run_gp_subagent(session_id, cwd, &prompt, &kind, cancel, event_tx)
+                    .await
+            }
             "todo_write" => {
                 let (items, merge) =
                     crate::todo_list::TodoList::from_tool_args(&args).map_err(|e| anyhow!(e))?;
@@ -3402,8 +3418,8 @@ impl AgentHostHandle {
             }
             other => Ok(format!(
                 "Unknown tool `{other}`. Available: list_dir, read_file, grep, write_file, \
-                 run_terminal_cmd, glob_files, apply_patch, spawn_explore, todo_write, \
-                 memory_write, memory_read, web_fetch, and mcp__* tools"
+                 run_terminal_cmd, glob_files, apply_patch, spawn_explore, spawn_general_purpose, \
+                 todo_write, memory_write, memory_read, web_fetch, and mcp__* tools"
             )),
         }
     }
@@ -3510,6 +3526,205 @@ impl AgentHostHandle {
         self.finish_subagent(
             &sub_id,
             "completed",
+            event_tx,
+            session_id,
+            Some(clipped.chars().take(200).collect()),
+        );
+        Ok(clipped)
+    }
+
+    /// General-purpose / plan subagent (#151): can use write/shell tools under
+    /// the same permission gate as the parent; cancelled when parent cancel fires.
+    async fn run_gp_subagent(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        prompt: &str,
+        kind: &str,
+        cancel: &CancellationToken,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) -> Result<String> {
+        let kind = if kind == "plan" {
+            "plan"
+        } else {
+            "general-purpose"
+        };
+        let sub_id = Uuid::new_v4().to_string();
+        {
+            let mut g = self.inner.lock();
+            g.subagents.push(SubagentInfo {
+                id: sub_id.clone(),
+                kind: kind.into(),
+                title: prompt.chars().take(48).collect(),
+                status: "running".into(),
+            });
+        }
+        let _ = event_tx.send(SessionUpdate::SubagentSpawned {
+            session_id,
+            subagent_id: sub_id.clone(),
+            kind: kind.into(),
+            title: prompt.chars().take(64).collect(),
+        });
+
+        if cancel.is_cancelled() {
+            self.finish_subagent(&sub_id, "cancelled", event_tx, session_id, None);
+            return Ok("(subagent cancelled)".into());
+        }
+
+        // Offline deterministic GP: list + optional write when prompt contains "write ".
+        if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
+            let mut parts = vec![format!("## GP subagent ({kind}): {prompt}")];
+            if let Ok(tr) = local_tools::tool_list_dir(cwd, ".").await {
+                parts.push(format!("### listing\n{}", tr.output.chars().take(2_000).collect::<String>()));
+            }
+            if let Some(rest) = prompt.strip_prefix("write ") {
+                if let Some((path, content)) = rest.split_once(':') {
+                    self.snapshot_edit_original(cwd, path.trim());
+                    if let Ok(tr) =
+                        local_tools::tool_write_file(cwd, path.trim(), content.trim()).await
+                    {
+                        parts.push(format!("### write\n{}", tr.output));
+                        self.emit_file_edit(
+                            session_id,
+                            cwd,
+                            path.trim(),
+                            &tr.output,
+                            event_tx,
+                        );
+                    }
+                }
+            }
+            if cancel.is_cancelled() {
+                self.finish_subagent(&sub_id, "cancelled", event_tx, session_id, None);
+                return Ok("(subagent cancelled)".into());
+            }
+            let summary = parts.join("\n\n");
+            let clipped: String = summary.chars().take(12_000).collect();
+            self.finish_subagent(
+                &sub_id,
+                "completed",
+                event_tx,
+                session_id,
+                Some(clipped.chars().take(200).collect()),
+            );
+            return Ok(clipped);
+        }
+
+        // Online: short multi-tool agent loop (capped rounds) under parent cancel.
+        let creds = match crate::auth_store::resolve_wire_credentials() {
+            Some(c) => c,
+            None => {
+                let msg = "GP subagent: no credentials (use offline mode or sign in)";
+                self.finish_subagent(
+                    &sub_id,
+                    "failed",
+                    event_tx,
+                    session_id,
+                    Some(msg.into()),
+                );
+                return Ok(msg.into());
+            }
+        };
+        let model = self.inner.lock().model.clone();
+        let effort = self.inner.lock().effort;
+        let (tools, mcp_index) = coding_agent_tools(&[]);
+        let mut messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": format!(
+                    "You are a {kind} subagent for GrokPtah. Complete the task with tools. \
+                     Return a concise summary for the parent when done."
+                )
+            }),
+            serde_json::json!({ "role": "user", "content": prompt }),
+        ];
+        let mut last = String::new();
+        for round in 1..=6u32 {
+            if cancel.is_cancelled() {
+                self.finish_subagent(&sub_id, "cancelled", event_tx, session_id, None);
+                return Ok("(subagent cancelled)".into());
+            }
+            let step = call_xai_agent_step(
+                &creds,
+                &model,
+                effort,
+                &messages,
+                &tools,
+                cancel,
+                |_d| {},
+                |_t| {},
+            )
+            .await;
+            match step {
+                Ok(AgentStep::Final { text, reasoning, .. }) => {
+                    if let Some(r) = reasoning {
+                        push_thought(self, session_id, &r);
+                    }
+                    last = text;
+                    break;
+                }
+                Ok(AgentStep::ToolCalls {
+                    content,
+                    tool_calls,
+                    reasoning,
+                    ..
+                }) => {
+                    if let Some(r) = reasoning {
+                        push_thought(self, session_id, &r);
+                    }
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": tool_calls.iter().map(|tc| serde_json::json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": { "name": tc.name, "arguments": tc.arguments }
+                        })).collect::<Vec<_>>(),
+                    }));
+                    for tc in tool_calls {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        // No nested spawn_* (avoids recursive async futures).
+                        let out = if tc.name.starts_with("spawn_") {
+                            format!("DENIED: nested {} not allowed inside subagent", tc.name)
+                        } else {
+                            // Box::pin breaks recursive async type via dispatch→spawn_gp.
+                            Box::pin(self.dispatch_agent_tool(
+                                session_id,
+                                cwd,
+                                &tc.name,
+                                &tc.arguments,
+                                cancel,
+                                event_tx,
+                                &mcp_index,
+                            ))
+                            .await
+                            .unwrap_or_else(|e| format!("ERROR: {e}"))
+                        };
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": out.chars().take(8_000).collect::<String>(),
+                        }));
+                        last = out;
+                    }
+                }
+                Err(e) => {
+                    last = format!("GP subagent error: {e}");
+                    break;
+                }
+            }
+            let _ = round;
+        }
+        let clipped: String = last.chars().take(12_000).collect();
+        self.finish_subagent(
+            &sub_id,
+            if cancel.is_cancelled() {
+                "cancelled"
+            } else {
+                "completed"
+            },
             event_tx,
             session_id,
             Some(clipped.chars().take(200).collect()),
@@ -4387,7 +4602,9 @@ fn tool_kind(name: &str) -> ToolCallKind {
         "write_file" | "apply_patch" => ToolCallKind::Edit,
         "grep" | "glob_files" => ToolCallKind::Search,
         "run_terminal_cmd" | "web_fetch" => ToolCallKind::Execute,
-        "todo_write" | "spawn_explore" => ToolCallKind::Think,
+        "todo_write" | "spawn_explore" | "spawn_general_purpose" | "spawn_subagent" => {
+            ToolCallKind::Think
+        }
         "memory_write" => ToolCallKind::Other,
         n if n.starts_with("mcp__") => ToolCallKind::Other,
         _ => ToolCallKind::Other,
@@ -4561,6 +4778,24 @@ fn coding_agent_tools(
                         }
                     },
                     "required": ["patch"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "spawn_general_purpose",
+                "description": "Spawn a general-purpose (or plan) subagent that can use write/shell tools under the same permission gate. Use for parallel delegated work.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": { "type": "string", "description": "Task for the child agent" },
+                        "kind": {
+                            "type": "string",
+                            "description": "general-purpose (default) or plan"
+                        }
+                    },
+                    "required": ["prompt"]
                 }
             }
         }),

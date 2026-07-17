@@ -19,7 +19,7 @@ Status as of Phase 15 remainder. Bridge implements a **thin** tool loop (ADR-001
 | notebook | — | **gap** | Not planned in bridge |
 | browser / computer use | — | **gap** | Out of scope for thin loop |
 | image_gen | — | **gap** | Desktop may use separate Imagine path |
-| subagent general-purpose | — | **partial** | Explore only; full GP spawn tracked in #151 (GUI #152) |
+| subagent general-purpose | `spawn_general_purpose` | **shipped** | GP/plan children under parent cancel; explore still `spawn_explore` |
 | semantic search | — | **gap** | Grep + glob only |
 | git specialized tools | shell | **via shell** | Use `run_terminal_cmd` |
 

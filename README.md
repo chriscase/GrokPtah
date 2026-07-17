@@ -59,6 +59,19 @@ This is **not** an official xAI product. It is a personal/community fork for des
 
 Capability parity with the TUI is the target; the UI is desktop-native, not a pixel clone of the terminal theme.
 
+### Parity eval harness (#93)
+
+Offline smoke fixtures for the Build agent (no network) live in the bridge crate:
+
+```sh
+cd crates/codegen/grokptah-agent-bridge
+cargo test --test parity_eval -- --test-threads=1
+# Full suite (lib + lifecycle + parity):
+cargo test -- --test-threads=1
+```
+
+See [`docs/PARITY_EVALS.md`](docs/PARITY_EVALS.md) for fixture table, CI gating notes, and how to run a live CLI comparison when online.
+
 ---
 
 ## Quick start
