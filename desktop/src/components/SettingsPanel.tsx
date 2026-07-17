@@ -2,6 +2,15 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import type { AuthState, ModelInfo } from "../lib/protocol";
 import { StyledSelect } from "./StyledSelect";
+import {
+  applyAppearanceChrome,
+  loadAppearanceChrome,
+  saveAppearanceChrome,
+  type AppearanceChrome,
+  type AccentId,
+  type DensityId,
+  type TypeScaleId,
+} from "../lib/appearance";
 
 export type SettingsPanelProps = {
   open: boolean;
@@ -326,31 +335,11 @@ export function SettingsPanel({
             )}
 
             {section === "appearance" && (
-              <section className="settings-section">
-                <h2>Appearance</h2>
-                <label className="settings-field">
-                  <span className="settings-field-label">Theme</span>
-                  <StyledSelect
-                    disabled={busy}
-                    value={String(snap.appearance ?? "dark")}
-                    options={[
-                      { value: "dark", label: "Dark" },
-                      { value: "light", label: "Light" },
-                    ]}
-                    onChange={(v) =>
-                      void apply(async () => {
-                        await api.setAppearance(v);
-                        document.documentElement.dataset.theme = v;
-                      }, "Appearance saved")
-                    }
-                  />
-                  <span className="settings-hint">
-                    Applies immediately via design tokens on{" "}
-                    <code>data-theme</code>. Terminal canvas stays dark for
-                    contrast with shell output.
-                  </span>
-                </label>
-              </section>
+              <AppearanceSection
+                busy={busy}
+                theme={String(snap.appearance ?? "dark")}
+                apply={apply}
+              />
             )}
 
             {section === "auth" && (
@@ -454,6 +443,101 @@ export function SettingsPanel({
         </div>
       </div>
     </div>
+  );
+}
+
+/** #134 — theme + accent/density/type-scale with live preview. */
+function AppearanceSection({
+  busy,
+  theme,
+  apply,
+}: {
+  busy: boolean;
+  theme: string;
+  apply: (fn: () => Promise<unknown> | unknown, msg: string) => void | Promise<void>;
+}) {
+  const [chrome, setChrome] = useState<AppearanceChrome>(() =>
+    loadAppearanceChrome(),
+  );
+
+  useEffect(() => {
+    applyAppearanceChrome(chrome);
+  }, [chrome]);
+
+  function patchChrome(partial: Partial<AppearanceChrome>) {
+    const next = { ...chrome, ...partial };
+    setChrome(next);
+    saveAppearanceChrome(next);
+  }
+
+  return (
+    <section className="settings-section">
+      <h2>Appearance</h2>
+      <label className="settings-field">
+        <span className="settings-field-label">Theme</span>
+        <StyledSelect
+          disabled={busy}
+          value={theme}
+          options={[
+            { value: "dark", label: "Dark" },
+            { value: "light", label: "Light" },
+          ]}
+          onChange={(v) =>
+            void apply(async () => {
+              await api.setAppearance(v);
+              document.documentElement.dataset.theme = v;
+            }, "Theme saved")
+          }
+        />
+      </label>
+      <label className="settings-field">
+        <span className="settings-field-label">Accent</span>
+        <StyledSelect
+          disabled={busy}
+          value={chrome.accent}
+          options={[
+            { value: "amber", label: "Amber (default)" },
+            { value: "teal", label: "Teal" },
+            { value: "violet", label: "Violet" },
+          ]}
+          onChange={(v) => patchChrome({ accent: v as AccentId })}
+        />
+      </label>
+      <label className="settings-field">
+        <span className="settings-field-label">Density</span>
+        <StyledSelect
+          disabled={busy}
+          value={chrome.density}
+          options={[
+            { value: "compact", label: "Compact" },
+            { value: "comfortable", label: "Comfortable" },
+            { value: "spacious", label: "Spacious" },
+          ]}
+          onChange={(v) => patchChrome({ density: v as DensityId })}
+        />
+      </label>
+      <label className="settings-field">
+        <span className="settings-field-label">Type scale</span>
+        <StyledSelect
+          disabled={busy}
+          value={chrome.typeScale}
+          options={[
+            { value: "sm", label: "Small" },
+            { value: "md", label: "Medium" },
+            { value: "lg", label: "Large" },
+          ]}
+          onChange={(v) => patchChrome({ typeScale: v as TypeScaleId })}
+        />
+      </label>
+      <div className="appearance-preview" data-testid="appearance-preview">
+        <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 6 }}>
+          Live preview
+        </div>
+        <div className="appearance-preview-bubble">
+          Accent · density · type — updates as you change controls
+        </div>
+      </div>
+    </section>
   );
 }
 

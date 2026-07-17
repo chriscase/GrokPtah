@@ -25,6 +25,11 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
 import { StyledSelect } from "./components/StyledSelect";
+import { LaunchSplash } from "./components/LaunchSplash";
+import {
+  applyAppearanceChrome,
+  loadAppearanceChrome,
+} from "./lib/appearance";
 import {
   dequeuePermission,
   enqueuePermission,
@@ -563,6 +568,7 @@ export default function App() {
 
   // Chrome refresh on mount only (not tied to the event listener).
   useEffect(() => {
+    applyAppearanceChrome(loadAppearanceChrome());
     void refreshChrome();
   }, [refreshChrome]);
 
@@ -1283,6 +1289,114 @@ export default function App() {
         }
         return;
       }
+      // #148: fork / rename / export / cd
+      if (prompt === "/fork" || prompt.startsWith("/fork ")) {
+        try {
+          const f = await api.sessionFork(id);
+          await openTab(f, true);
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: idleActivity(),
+            transcript: t.transcript.filter(
+              (x) => !(x.kind === "user" && x.text === prompt),
+            ),
+          }));
+          await refreshSessions();
+        } catch (e) {
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: errorActivity(String(e)),
+          }));
+        }
+        return;
+      }
+      if (prompt.startsWith("/rename ")) {
+        const title = prompt.slice("/rename ".length).trim();
+        try {
+          if (!title) throw new Error("Usage: /rename <title>");
+          await api.sessionRename(id, title);
+          patchTab(id, (t) => ({
+            ...t,
+            title,
+            busy: false,
+            activity: idleActivity(),
+            transcript: [
+              ...t.transcript.filter(
+                (x) => !(x.kind === "user" && x.text === prompt),
+              ),
+              { kind: "assistant", text: `Renamed session to “${title}”.` },
+            ],
+          }));
+          await refreshSessions();
+        } catch (e) {
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: errorActivity(String(e)),
+          }));
+        }
+        return;
+      }
+      if (prompt === "/export" || prompt.startsWith("/export ")) {
+        try {
+          const text = await api.exportTranscript(id);
+          await navigator.clipboard.writeText(text);
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: idleActivity(),
+            transcript: [
+              ...t.transcript.filter(
+                (x) => !(x.kind === "user" && x.text === prompt),
+              ),
+              {
+                kind: "assistant",
+                text: `Exported transcript (${text.length} chars) to clipboard.`,
+              },
+            ],
+          }));
+        } catch (e) {
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: errorActivity(String(e)),
+          }));
+        }
+        return;
+      }
+      if (prompt.startsWith("/cd ") || prompt === "/cd") {
+        const path = prompt === "/cd" ? "" : prompt.slice("/cd ".length).trim();
+        try {
+          if (!path) throw new Error("Usage: /cd <path>");
+          await api.setProjectCwd(path);
+          try {
+            await api.sessionSetCwd(id, path);
+          } catch {
+            /* session cwd optional */
+          }
+          await refreshChrome();
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: idleActivity(),
+            transcript: [
+              ...t.transcript.filter(
+                (x) => !(x.kind === "user" && x.text === prompt),
+              ),
+              { kind: "assistant", text: `Working directory → ${path}` },
+            ],
+          }));
+        } catch (e) {
+          patchTab(id, (t) => ({
+            ...t,
+            busy: false,
+            activity: errorActivity(String(e)),
+          }));
+        }
+        return;
+      }
       // /resume → session browser; /continue → most recently updated other session (#38).
       if (prompt === "/resume") {
         patchTab(id, (t) => ({
@@ -1455,10 +1569,13 @@ export default function App() {
     }
   }
 
+  const splashReady = workspaceRestored && status !== null;
+
   return (
     <div
       className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${rightbarCollapsed ? "rightbar-collapsed" : ""}`}
     >
+      <LaunchSplash ready={splashReady} />
       <header className="titlebar">
         <div className="brand">
           <BrandMark size={20} className="brand-mark-img" />

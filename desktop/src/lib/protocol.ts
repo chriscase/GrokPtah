@@ -249,4 +249,8 @@ export const SLASH_COMMANDS = [
   { cmd: "/sandbox", desc: "Show or set tool safety profile (not an OS sandbox)" },
   { cmd: "/resume", desc: "Open session browser to resume history" },
   { cmd: "/continue", desc: "Continue the most recently updated other session" },
+  { cmd: "/fork", desc: "Fork the focused session (new id + history copy)" },
+  { cmd: "/rename", desc: "Rename the focused session: /rename <title>" },
+  { cmd: "/export", desc: "Export focused session transcript to clipboard" },
+  { cmd: "/cd", desc: "Set project/session working directory: /cd <path>" },
 ] as const;

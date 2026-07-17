@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="GrokPtah Djed">
+  <!-- Djed pillar of stability + amber caret (Ptah craftsman + Grok beam) -->
+  <rect width="64" height="64" rx="12" fill="#0b0d11"/>
+  <rect x="1.5" y="1.5" width="61" height="61" rx="10.5" fill="none" stroke="#2a2e38" stroke-width="1.5"/>
+  <!-- Djed bars (code lines) -->
+  <rect class="djed-bar" x="18" y="14" width="28" height="5" rx="1.5" fill="#f0b429" opacity="0.35"/>
+  <rect class="djed-bar" x="18" y="22" width="28" height="5" rx="1.5" fill="#f0b429" opacity="0.55"/>
+  <rect class="djed-bar" x="18" y="30" width="28" height="5" rx="1.5" fill="#f0b429" opacity="0.75"/>
+  <rect class="djed-bar" x="18" y="38" width="28" height="5" rx="1.5" fill="#f0b429" opacity="0.9"/>
+  <!-- Pillar stem -->
+  <rect x="28" y="43" width="8" height="10" rx="1" fill="#f0b429"/>
+  <!-- Caret beam tip -->
+  <path d="M24 12 L32 4 L40 12 Z" fill="#f0b429"/>
+</svg>
