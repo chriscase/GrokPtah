@@ -1124,3 +1124,27 @@ async fn concurrent_sessions_shells_do_not_kill_each_other() {
     // A was cancelled or finished — either way B was not wedged by A's cancel
     let _ = a_reply;
 }
+
+#[test]
+fn permission_mode_and_always_approve_stay_coherent() {
+    let _iso = IsolatedHome::install();
+    let host = AgentHost::create(HostConfig::default());
+    host.start().unwrap();
+
+    host.set_always_approve(true);
+    let snap: serde_json::Value = host.settings_snapshot();
+    assert_eq!(snap["alwaysApprove"], true);
+    assert_eq!(snap["permissionMode"], "bypassPermissions");
+    assert_eq!(snap["effectiveToolPrompting"], "bypass");
+
+    host.set_permission_mode("default".into());
+    let snap = host.settings_snapshot();
+    assert_eq!(snap["alwaysApprove"], false);
+    assert_eq!(snap["permissionMode"], "default");
+    assert_eq!(snap["effectiveToolPrompting"], "prompt");
+
+    host.set_permission_mode("bypassPermissions".into());
+    let snap = host.settings_snapshot();
+    assert_eq!(snap["alwaysApprove"], true);
+    assert_eq!(snap["permissionMode"], "bypassPermissions");
+}

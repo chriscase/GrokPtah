@@ -1070,8 +1070,19 @@ impl AgentHostHandle {
         self.persist_chrome();
     }
 
+    /// Single source of truth for global tool prompting (#113).
+    ///
+    /// `true`  → always_approve + permission_mode=bypassPermissions  
+    /// `false` → prompt mode
     pub fn set_always_approve(&self, v: bool) {
-        self.inner.lock().always_approve = v;
+        let mut g = self.inner.lock();
+        g.always_approve = v;
+        g.permission_mode = if v {
+            "bypassPermissions".into()
+        } else {
+            "default".into()
+        };
+        drop(g);
         self.persist_chrome();
     }
 
@@ -1085,8 +1096,18 @@ impl AgentHostHandle {
         self.persist_chrome();
     }
 
+    /// Keep permission_mode and always_approve as one coherent control (#113).
     pub fn set_permission_mode(&self, mode: String) {
-        self.inner.lock().permission_mode = mode;
+        let mut g = self.inner.lock();
+        let bypass = mode == "bypassPermissions" || mode == "bypass" || mode == "yolo";
+        g.permission_mode = if bypass {
+            "bypassPermissions".into()
+        } else {
+            "default".into()
+        };
+        g.always_approve = bypass;
+        drop(g);
+        self.persist_chrome();
     }
 
     pub fn set_allow_deny_rules(&self, allow: Vec<String>, deny: Vec<String>) {
@@ -1483,6 +1504,17 @@ impl AgentHostHandle {
     }
 
     pub fn settings_snapshot(&self) -> serde_json::Value {
+        // Reconcile legacy dual-control drift so UI never shows conflicting state (#113).
+        {
+            let mut g = self.inner.lock();
+            let bypass = g.always_approve || g.permission_mode == "bypassPermissions";
+            g.always_approve = bypass;
+            g.permission_mode = if bypass {
+                "bypassPermissions".into()
+            } else {
+                "default".into()
+            };
+        }
         let g = self.inner.lock();
         serde_json::json!({
             "model": g.model,
@@ -1490,7 +1522,9 @@ impl AgentHostHandle {
             "alwaysApprove": g.always_approve,
             "sandboxProfile": g.sandbox_profile,
             "appearance": g.appearance,
+            // Single effective mode for UI (mirrors alwaysApprove).
             "permissionMode": g.permission_mode,
+            "effectiveToolPrompting": if g.always_approve { "bypass" } else { "prompt" },
             "allowRules": g.allow_rules,
             "denyRules": g.deny_rules,
             "autoUpdateEnabled": crate::desktop_auto_update_enabled(),

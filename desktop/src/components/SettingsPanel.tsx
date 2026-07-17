@@ -209,33 +209,6 @@ export function SettingsPanel({
                   </span>
                 </label>
 
-                <label className="settings-field settings-toggle-row">
-                  <div>
-                    <span className="settings-field-label">
-                      Always approve tools
-                    </span>
-                    <span className="settings-hint">
-                      YOLO mode — skip permission prompts for tool calls.
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={!!snap.alwaysApprove}
-                    className={`settings-switch ${snap.alwaysApprove ? "on" : ""}`}
-                    disabled={busy}
-                    onClick={() =>
-                      void apply(
-                        () => api.setAlwaysApprove(!snap.alwaysApprove),
-                        snap.alwaysApprove
-                          ? "Always-approve off"
-                          : "Always-approve on",
-                      )
-                    }
-                  >
-                    <span className="settings-switch-knob" />
-                  </button>
-                </label>
               </section>
             )}
 
@@ -243,26 +216,46 @@ export function SettingsPanel({
               <section className="settings-section">
                 <h2>Permissions & sandbox</h2>
                 <p className="settings-lead">
-                  How tools run and what they may touch on disk.
+                  How tools run and what they may touch on disk. Tool prompting
+                  is a <strong>single</strong> control (also the composer Auto
+                  chip) — no second YOLO toggle that can disagree.
                 </p>
 
                 <label className="settings-field">
-                  <span className="settings-field-label">Permission mode</span>
+                  <span className="settings-field-label">
+                    Tool permission mode
+                  </span>
                   <select
                     disabled={busy}
-                    value={String(snap.permissionMode ?? "default")}
+                    value={
+                      snap.alwaysApprove ||
+                      snap.permissionMode === "bypassPermissions"
+                        ? "bypassPermissions"
+                        : "default"
+                    }
                     onChange={(e) =>
                       void apply(
                         () => api.setPermissionMode(e.target.value),
-                        "Permission mode saved",
+                        e.target.value === "bypassPermissions"
+                          ? "Tools: auto-approve (bypass)"
+                          : "Tools: prompt each call",
                       )
                     }
                   >
-                    <option value="default">default (prompt)</option>
+                    <option value="default">Prompt for each tool</option>
                     <option value="bypassPermissions">
-                      bypassPermissions
+                      Always approve (bypass / YOLO)
                     </option>
                   </select>
+                  <span className="settings-hint">
+                    Effective:{" "}
+                    {snap.alwaysApprove ||
+                    snap.permissionMode === "bypassPermissions"
+                      ? "bypass — no tool prompts"
+                      : "prompt — ask before shell/write/MCP"}
+                    . Per-tool “Always allow” from the permission modal is
+                    separate and only scopes that tool.
+                  </span>
                 </label>
 
                 <label className="settings-field">
