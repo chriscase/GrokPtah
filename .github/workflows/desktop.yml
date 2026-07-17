@@ -33,8 +33,11 @@ jobs:
         run: |
           npm run typecheck
           npm test
-      - name: Cargo check + bridge tests
+      - name: Cargo check (desktop)
         working-directory: desktop/src-tauri
-        run: |
-          cargo check
-          cargo test -p grokptah-agent-bridge
+        run: cargo check
+      - name: Bridge integration tests
+        # Bridge is its own Cargo workspace root (path dep of desktop).
+        # `cargo test -p` from src-tauri fails: package is not a workspace member.
+        working-directory: crates/codegen/grokptah-agent-bridge
+        run: cargo test

@@ -19,8 +19,8 @@ use crate::search_engine::{self, SearchHit, SearchQuery};
 use crate::session::{Session, SessionKind, SessionSummary, TranscriptEntry};
 use crate::session_store::{self, WorkspaceChrome};
 use crate::types::{
-    AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo, PluginInfo, SkillInfo,
-    SubagentInfo,
+    AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
+    SkillInfo, SubagentInfo,
 };
 
 /// UI restore payload: open tabs + active session + project (sessions live in list).
@@ -68,6 +68,8 @@ pub struct AgentStatus {
 }
 
 struct PendingPermission {
+    /// Tool that requested this permission (for scoped AlwaysAllow).
+    tool_name: String,
     tx: oneshot::Sender<PermissionDecision>,
 }
 
@@ -1091,6 +1093,37 @@ impl AgentHostHandle {
         list
     }
 
+    /// Project-local MCP trust status for the open project (or defaults).
+    pub fn mcp_project_trust(&self) -> McpProjectTrust {
+        let project = self.inner.lock().project_cwd.clone();
+        match project {
+            Some(p) => McpProjectTrust {
+                project: Some(p.display().to_string()),
+                has_local_mcp: crate::discover::project_has_local_mcp_servers(&p),
+                trusted: crate::discover::is_project_mcp_trusted(&p),
+                decided: crate::discover::project_mcp_trust_decided(&p),
+            },
+            None => McpProjectTrust {
+                project: None,
+                has_local_mcp: false,
+                trusted: false,
+                decided: false,
+            },
+        }
+    }
+
+    pub fn mcp_set_project_trust(&self, trusted: bool) -> Result<McpProjectTrust> {
+        let project = self
+            .inner
+            .lock()
+            .project_cwd
+            .clone()
+            .ok_or_else(|| anyhow!("no project open"))?;
+        crate::discover::set_project_mcp_trusted(&project, trusted)
+            .map_err(|e| anyhow!(e))?;
+        Ok(self.mcp_project_trust())
+    }
+
     pub fn mcp_set_enabled(&self, name: &str, enabled: bool) -> Result<McpServerInfo> {
         let project = self.inner.lock().project_cwd.clone();
         if !crate::discover::save_mcp_server_enabled(project.as_deref(), name, enabled) {
@@ -1502,8 +1535,11 @@ impl AgentHostHandle {
             .pending_permissions
             .remove(&request_id)
             .ok_or_else(|| anyhow!("no pending permission {request_id}"))?;
+        // AlwaysAllow is per-tool only. Global YOLO remains Settings/`set_always_approve`.
         if decision == PermissionDecision::AlwaysAllow {
-            g.always_approve = true;
+            if !pending.tool_name.is_empty() {
+                g.always_allowed_tools.insert(pending.tool_name);
+            }
         }
         let _ = pending.tx.send(decision);
         Ok(())
@@ -2652,7 +2688,7 @@ impl AgentHostHandle {
                     {
                         let mut g = self.inner.lock();
                         g.pending_permissions
-                            .insert(req.id, PendingPermission { tx });
+                            .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
                     }
                     let _ = event_tx.send(SessionUpdate::PermissionRequired {
                         session_id,
@@ -3045,7 +3081,6 @@ impl AgentHostHandle {
             let g = self.inner.lock();
             g.always_approve
                 || g.always_allowed_tools.contains(wire_name)
-                || g.always_allowed_tools.contains("mcp")
                 || g.permission_mode == "bypassPermissions"
         };
         let call_id = Uuid::new_v4().to_string();
@@ -3061,7 +3096,7 @@ impl AgentHostHandle {
             {
                 let mut g = self.inner.lock();
                 g.pending_permissions
-                    .insert(req.id, PendingPermission { tx });
+                    .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
             }
             let _ = event_tx.send(SessionUpdate::PermissionRequired {
                 session_id,
@@ -3085,7 +3120,6 @@ impl AgentHostHandle {
             if decision == PermissionDecision::AlwaysAllow {
                 let mut g = self.inner.lock();
                 g.always_allowed_tools.insert(wire_name.into());
-                g.always_allowed_tools.insert("mcp".into());
             }
         }
         let _ = event_tx.send(SessionUpdate::ToolCall {
@@ -3208,7 +3242,7 @@ impl AgentHostHandle {
             {
                 let mut g = self.inner.lock();
                 g.pending_permissions
-                    .insert(req.id, PendingPermission { tx });
+                    .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
             }
             let _ = event_tx.send(SessionUpdate::PermissionRequired {
                 session_id,
@@ -3341,7 +3375,7 @@ impl AgentHostHandle {
             {
                 let mut g = self.inner.lock();
                 g.pending_permissions
-                    .insert(req.id, PendingPermission { tx });
+                    .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
             }
             let _ = event_tx.send(SessionUpdate::PermissionRequired {
                 session_id,
@@ -3512,7 +3546,7 @@ impl AgentHostHandle {
             {
                 let mut g = self.inner.lock();
                 g.pending_permissions
-                    .insert(req.id, PendingPermission { tx });
+                    .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
             }
             let _ = event_tx.send(SessionUpdate::PermissionRequired {
                 session_id,
@@ -3646,7 +3680,7 @@ impl AgentHostHandle {
             {
                 let mut g = self.inner.lock();
                 g.pending_permissions
-                    .insert(req.id, PendingPermission { tx });
+                    .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
             }
             let _ = event_tx.send(SessionUpdate::PermissionRequired {
                 session_id,

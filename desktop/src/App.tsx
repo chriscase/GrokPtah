@@ -225,6 +225,13 @@ export default function App() {
   const [worktrees, setWorktrees] = useState("");
   const [mcp, setMcp] = useState<any[]>([]);
   const [mcpDoctor, setMcpDoctor] = useState<string[]>([]);
+  /** Project-local .mcp.json trust prompt (malicious-repo RCE gate). */
+  const [mcpTrustPrompt, setMcpTrustPrompt] = useState<{
+    project: string | null;
+    has_local_mcp: boolean;
+    trusted: boolean;
+    decided: boolean;
+  } | null>(null);
   const [plugins, setPlugins] = useState<any[]>([]);
   const [skills, setSkills] = useState<any[]>([]);
   const [subagents, setSubagents] = useState<any[]>([]);
@@ -609,6 +616,7 @@ export default function App() {
         if (ws.project_cwd) {
           // status refresh will surface path; host already loaded it
           await refreshChrome();
+          if (!cancelled) await maybePromptMcpTrust();
         }
       } catch (e) {
         console.warn("workspace restore failed", e);
@@ -641,6 +649,20 @@ export default function App() {
     [composer],
   );
 
+  async function maybePromptMcpTrust() {
+    try {
+      const trust = await api.mcpProjectTrust();
+      // Prompt only when local config exists and user has never answered.
+      if (trust.has_local_mcp && !trust.decided) {
+        setMcpTrustPrompt(trust);
+      } else {
+        setMcpTrustPrompt(null);
+      }
+    } catch {
+      setMcpTrustPrompt(null);
+    }
+  }
+
   async function openProject() {
     const path = await api.pickProjectFolder();
     if (path) {
@@ -662,6 +684,7 @@ export default function App() {
       } catch {
         /* empty */
       }
+      await maybePromptMcpTrust();
     }
   }
 
@@ -691,6 +714,7 @@ export default function App() {
         const path = await api.pickProjectFolder();
         if (!path) return null;
         await refreshChrome();
+        await maybePromptMcpTrust();
       }
       const s = await api.sessionNewKind(kind);
       await openTab(s, false);
@@ -2136,6 +2160,30 @@ export default function App() {
 
         {rightTab === "mcp" && (
           <>
+            <div className="panel-block">
+              <strong>Project MCP trust</strong>
+              <p style={{ fontSize: 12, color: "var(--muted)", margin: "0.35rem 0" }}>
+                Repo-local <code>.mcp.json</code> only runs after you trust this
+                project. User-global servers under <code>~/.grokptah</code> are
+                unaffected.
+              </p>
+              <button
+                type="button"
+                onClick={async () => {
+                  const t = await api.mcpProjectTrust();
+                  if (t.has_local_mcp && !t.trusted) {
+                    await api.mcpSetProjectTrust(true);
+                  } else if (t.trusted) {
+                    await api.mcpSetProjectTrust(false);
+                  } else {
+                    setMcpTrustPrompt(t);
+                  }
+                  setMcpDoctor(await api.mcpDoctor());
+                }}
+              >
+                Toggle project trust
+              </button>
+            </div>
             {mcp.map((s) => (
               <div key={s.name} className="panel-block">
                 <strong>{s.name}</strong> [{s.transport}] {s.status}
@@ -2289,6 +2337,56 @@ export default function App() {
         </span>
       </footer>
 
+      {mcpTrustPrompt && (
+        <div className="modal-backdrop">
+          <div className="modal permission-modal">
+            <h3>Trust project MCP servers?</h3>
+            <p>
+              This project declares MCP servers in a local config (e.g.{" "}
+              <code>.mcp.json</code>). Starting them runs commands from that
+              repo — only trust projects you control.
+            </p>
+            {mcpTrustPrompt.project && (
+              <p style={{ fontSize: 12, color: "var(--muted)", marginTop: 0 }}>
+                Project: <code>{mcpTrustPrompt.project}</code>
+              </p>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                onClick={() => setMcpTrustPrompt(null)}
+              >
+                Not now
+              </button>
+              <button
+                type="button"
+                className="danger"
+                onClick={async () => {
+                  await api.mcpSetProjectTrust(false);
+                  setMcpTrustPrompt(null);
+                }}
+              >
+                Never for this project
+              </button>
+              <button
+                type="button"
+                className="primary"
+                onClick={async () => {
+                  await api.mcpSetProjectTrust(true);
+                  setMcpTrustPrompt(null);
+                  if (rightTab === "mcp") {
+                    setMcp(await api.mcpList());
+                    setMcpDoctor(await api.mcpDoctor());
+                  }
+                }}
+              >
+                Trust & allow MCP
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {permission && (
         <div className="modal-backdrop">
           <div className="modal permission-modal">
@@ -2352,7 +2450,7 @@ export default function App() {
                   await refreshChrome();
                 }}
               >
-                Always
+                Always allow {permission.tool_name}
               </button>
               <button
                 type="button"

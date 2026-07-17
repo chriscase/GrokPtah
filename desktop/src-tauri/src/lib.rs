@@ -87,6 +87,8 @@ pub fn run() {
             commands::memory_list,
             commands::memory_remember,
             commands::mcp_list,
+            commands::mcp_project_trust,
+            commands::mcp_set_project_trust,
             commands::mcp_set_enabled,
             commands::mcp_doctor,
             commands::mcp_add_stdio,

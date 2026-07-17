@@ -760,3 +760,138 @@ async fn isolated_home_does_not_touch_user_sessions_dir() {
         "creating sessions under IsolatedHome must not add dirs under ~/.grokptah/sessions"
     );
 }
+
+#[tokio::test]
+async fn always_allow_scopes_to_tool_not_global() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: false,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    // First: shell prompt → AlwaysAllow for run_terminal_cmd only
+    let host2 = host.clone();
+    let prompt1 = tokio::spawn(async move {
+        host2
+            .session_prompt(session.id, "run echo scoped-always".into())
+            .await
+    });
+
+    let mut req_id = None;
+    let mut tool_name = String::new();
+    loop {
+        let ev = timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("timeout waiting for permission")
+            .expect("channel closed");
+        if let SessionUpdate::PermissionRequired { request, .. } = &ev {
+            req_id = Some(request.id);
+            tool_name = request.tool_name.clone();
+            break;
+        }
+    }
+    assert_eq!(tool_name, "run_terminal_cmd");
+    host.permission_respond(req_id.unwrap(), PermissionDecision::AlwaysAllow)
+        .unwrap();
+    prompt1.await.unwrap().unwrap();
+    // Drain turn complete
+    loop {
+        match timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(ev)) if matches!(ev, SessionUpdate::TurnComplete { .. }) => break,
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+
+    // Global YOLO must remain off
+    assert!(
+        !host.status().always_approve,
+        "AlwaysAllow must not flip global always_approve"
+    );
+
+    // Second: write_file still requires permission (not covered by shell always-allow)
+    let host3 = host.clone();
+    let prompt2 = tokio::spawn(async move {
+        host3
+            .session_prompt(session.id, "write scoped.txt: should still prompt".into())
+            .await
+    });
+
+    let mut saw_write_perm = false;
+    let mut write_req = None;
+    loop {
+        let ev = timeout(Duration::from_secs(8), rx.recv())
+            .await
+            .expect("timeout waiting for write permission")
+            .expect("channel closed");
+        if let SessionUpdate::PermissionRequired { request, .. } = &ev {
+            assert_eq!(request.tool_name, "write_file");
+            saw_write_perm = true;
+            write_req = Some(request.id);
+            break;
+        }
+        if matches!(ev, SessionUpdate::TurnComplete { .. }) {
+            break;
+        }
+    }
+    assert!(
+        saw_write_perm,
+        "write_file must still prompt after shell AlwaysAllow"
+    );
+    host.permission_respond(write_req.unwrap(), PermissionDecision::Deny)
+        .unwrap();
+    let _ = prompt2.await;
+}
+
+#[tokio::test]
+async fn project_local_mcp_does_not_spawn_until_trusted() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("mcp_spawned.marker");
+    let marker_s = marker.display().to_string();
+    // Hostile project config: spawn touches a marker file immediately.
+    let cfg = serde_json::json!({
+        "servers": [{
+            "name": "evil",
+            "transport": "stdio",
+            "command": "sh",
+            "args": ["-c", format!("touch '{marker_s}'; sleep 60")],
+            "enabled": true
+        }]
+    });
+    std::fs::write(
+        dir.path().join(".mcp.json"),
+        serde_json::to_string_pretty(&cfg).unwrap(),
+    )
+    .unwrap();
+
+    // Untrusted: listing tools must not start the process.
+    let tools = grokptah_agent_bridge::list_mcp_tools(Some(dir.path())).await;
+    // Give a moment in case something races.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !marker.exists(),
+        "untrusted project .mcp.json must not spawn stdio servers"
+    );
+    assert!(tools.is_empty(), "no MCP tools when untrusted, got {tools:?}");
+
+    // Trust then list again — process may fail handshake but must start (marker).
+    grokptah_agent_bridge::set_project_mcp_trusted(dir.path(), true).unwrap();
+    let _ = grokptah_agent_bridge::list_mcp_tools(Some(dir.path())).await;
+    // Wait for shell to touch marker
+    for _ in 0..50 {
+        if marker.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        marker.exists(),
+        "trusted project should spawn MCP command (marker missing)"
+    );
+}

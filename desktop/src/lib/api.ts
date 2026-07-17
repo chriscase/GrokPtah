@@ -130,6 +130,20 @@ export const api = {
   gitCommit: (message: string) => invoke<string>("git_commit", { message }),
   listWorktrees: () => invoke<string>("list_worktrees"),
   mcpList: () => invoke<unknown[]>("mcp_list"),
+  mcpProjectTrust: () =>
+    invoke<{
+      project: string | null;
+      has_local_mcp: boolean;
+      trusted: boolean;
+      decided: boolean;
+    }>("mcp_project_trust"),
+  mcpSetProjectTrust: (trusted: boolean) =>
+    invoke<{
+      project: string | null;
+      has_local_mcp: boolean;
+      trusted: boolean;
+      decided: boolean;
+    }>("mcp_set_project_trust", { trusted }),
   mcpSetEnabled: (name: string, enabled: boolean) =>
     invoke("mcp_set_enabled", { name, enabled }),
   mcpDoctor: () => invoke<string[]>("mcp_doctor"),

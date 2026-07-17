@@ -88,8 +88,19 @@ pub async fn call_mcp_tool(
 }
 
 fn load_enabled_stdio_servers(project: Option<&std::path::Path>) -> Vec<McpServerConfig> {
+    use crate::discover::{is_project_local_mcp_config, is_project_mcp_trusted};
+
+    let project_trusted = project
+        .map(is_project_mcp_trusted)
+        .unwrap_or(false);
+
     let mut out = Vec::new();
     for path in mcp_config_paths(project) {
+        // CRITICAL: never spawn from repo-local .mcp.json unless the project
+        // root was explicitly trusted. User-global ~/.grokptah/mcp.json is OK.
+        if is_project_local_mcp_config(&path) && !project_trusted {
+            continue;
+        }
         if let Ok(raw) = std::fs::read_to_string(&path) {
             if let Ok(cfg) = serde_json::from_str::<McpConfigFile>(&raw) {
                 for s in cfg.servers {

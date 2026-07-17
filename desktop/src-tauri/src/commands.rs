@@ -471,6 +471,19 @@ pub fn mcp_list(state: State<'_, AppState>) -> Vec<McpServerInfo> {
 }
 
 #[tauri::command]
+pub fn mcp_project_trust(state: State<'_, AppState>) -> grokptah_agent_bridge::McpProjectTrust {
+    state.host.mcp_project_trust()
+}
+
+#[tauri::command]
+pub fn mcp_set_project_trust(
+    state: State<'_, AppState>,
+    trusted: bool,
+) -> Result<grokptah_agent_bridge::McpProjectTrust, String> {
+    state.host.mcp_set_project_trust(trusted).map_err(map_err)
+}
+
+#[tauri::command]
 pub fn mcp_set_enabled(
     state: State<'_, AppState>,
     name: String,

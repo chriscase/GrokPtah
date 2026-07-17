@@ -22,7 +22,12 @@ mod types;
 
 pub use memory::{inject_context as memory_inject_context, list_facts as memory_list_facts, remember as memory_remember};
 
-pub use discover::{grokptah_home, set_grokptah_home_override};
+pub use discover::{
+    grokptah_home, is_project_mcp_trusted, project_has_local_mcp_servers, set_grokptah_home_override,
+    set_project_mcp_trusted,
+};
+/// List MCP tools for the project (spawns stdio servers when allowed).
+pub use mcp_runtime::list_mcp_tools;
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{
     is_rate_limit_error, AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState,
@@ -31,8 +36,8 @@ pub use permission::{PermissionDecision, PermissionRequest};
 pub use search_engine::{SearchHit, SearchQuery};
 pub use session::{SessionKind, SessionSummary, TranscriptEntry};
 pub use types::{
-    AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo, PluginInfo, SkillInfo,
-    SubagentInfo,
+    AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
+    SkillInfo, SubagentInfo,
 };
 
 /// Crate version string for about / diagnostics.

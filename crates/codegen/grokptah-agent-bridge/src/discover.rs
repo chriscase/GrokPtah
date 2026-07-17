@@ -96,6 +96,108 @@ pub fn mcp_config_paths(project: Option<&Path>) -> Vec<PathBuf> {
     v
 }
 
+/// Config paths that ship with a project (not user-global `~/.grokptah/mcp.json`).
+pub fn project_mcp_config_paths(project: &Path) -> Vec<PathBuf> {
+    vec![
+        project.join(".mcp.json"),
+        project.join(".grokptah").join("mcp.json"),
+    ]
+}
+
+/// True if `path` is a project-local MCP config (not under GrokPtah home).
+pub fn is_project_local_mcp_config(path: &Path) -> bool {
+    let home = grokptah_home();
+    !path.starts_with(&home)
+}
+
+/// Whether this project root is trusted to run stdio MCP servers declared
+/// in repo-local configs (`.mcp.json` / `.grokptah/mcp.json`).
+pub fn is_project_mcp_trusted(project: &Path) -> bool {
+    let Ok(canon) = project.canonicalize() else {
+        return false;
+    };
+    let key = canon.to_string_lossy().into_owned();
+    load_mcp_trust_map()
+        .get(&key)
+        .copied()
+        .unwrap_or(false)
+}
+
+/// True if the user has already answered the trust prompt (yes or no).
+pub fn project_mcp_trust_decided(project: &Path) -> bool {
+    let Ok(canon) = project.canonicalize() else {
+        return false;
+    };
+    let key = canon.to_string_lossy().into_owned();
+    load_mcp_trust_map().contains_key(&key)
+}
+
+/// Persist per-project MCP trust (canonical path → trusted/denied).
+pub fn set_project_mcp_trusted(project: &Path, trusted: bool) -> Result<(), String> {
+    ensure_home();
+    let canon = project
+        .canonicalize()
+        .map_err(|e| format!("canonicalize project for MCP trust: {e}"))?;
+    let key = canon.to_string_lossy().into_owned();
+    let mut map = load_mcp_trust_map();
+    map.insert(key, trusted);
+    save_mcp_trust_map(&map)
+}
+
+/// True if any project-local MCP config file exists and declares servers.
+pub fn project_has_local_mcp_servers(project: &Path) -> bool {
+    for path in project_mcp_config_paths(project) {
+        if !path.exists() {
+            continue;
+        }
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(cfg) = serde_json::from_str::<McpConfigFile>(&raw) {
+                if !cfg.servers.is_empty() {
+                    return true;
+                }
+            } else if let Ok(list) = serde_json::from_str::<Vec<McpServerConfig>>(&raw) {
+                if !list.is_empty() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct McpTrustFile {
+    /// Canonical project roots that may run project-declared stdio MCP servers.
+    #[serde(default)]
+    projects: std::collections::HashMap<String, bool>,
+}
+
+fn mcp_trust_path() -> PathBuf {
+    grokptah_home().join("mcp_trust.json")
+}
+
+fn load_mcp_trust_map() -> std::collections::HashMap<String, bool> {
+    let path = mcp_trust_path();
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return std::collections::HashMap::new();
+    };
+    serde_json::from_str::<McpTrustFile>(&raw)
+        .map(|f| f.projects)
+        .unwrap_or_default()
+}
+
+fn save_mcp_trust_map(map: &std::collections::HashMap<String, bool>) -> Result<(), String> {
+    ensure_home();
+    let file = McpTrustFile {
+        projects: map.clone(),
+    };
+    fs::write(
+        mcp_trust_path(),
+        serde_json::to_string_pretty(&file).unwrap_or_else(|_| "{}".into()),
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub fn load_mcp_servers(project: Option<&Path>) -> Vec<McpServerInfo> {
     ensure_home();
     for path in mcp_config_paths(project) {
@@ -203,6 +305,19 @@ pub fn mcp_doctor_lines(project: Option<&Path>) -> Vec<String> {
             path.display(),
             if path.exists() { "found" } else { "missing" }
         ));
+    }
+    if let Some(p) = project {
+        let has_local = project_has_local_mcp_servers(p);
+        let trusted = is_project_mcp_trusted(p);
+        lines.push(format!(
+            "project MCP trust: trusted={trusted} has_local_config={has_local}"
+        ));
+        if has_local && !trusted {
+            lines.push(
+                "WARNING: project-local MCP servers will NOT spawn until this project is trusted"
+                    .into(),
+            );
+        }
     }
     for s in load_mcp_servers(project) {
         let probe = if s.transport == "stdio" {

@@ -49,6 +49,16 @@ pub struct McpServerInfo {
     pub status: String,
 }
 
+/// Whether the open project may spawn repo-local MCP stdio servers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpProjectTrust {
+    pub project: Option<String>,
+    pub has_local_mcp: bool,
+    pub trusted: bool,
+    /// User already answered yes/no (skip re-prompt until settings change).
+    pub decided: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub id: String,
