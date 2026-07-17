@@ -55,7 +55,7 @@ This is **not** an official xAI product. It is a personal/community fork for des
 - **Terminal** — interactive multi-tab PTY; tool shells attach to the **live** tool process stream  
 - **Extensibility** — MCP config under `~/.grokptah` / project `.mcp.json`; plugins & skills on disk; hooks config  
 - **Auth** — store an xAI API key in the OS keychain (or `XAI_API_KEY`); open console for keys  
-- **Settings** — model, effort, sandbox profile, appearance, permission mode  
+- **Settings** — model, effort, tool safety profile (soft agent gates, not OS sandbox), appearance, permission mode  
 
 Capability parity with the TUI is the target; the UI is desktop-native, not a pixel clone of the terminal theme.
 

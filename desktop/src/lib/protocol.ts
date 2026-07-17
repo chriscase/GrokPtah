@@ -246,5 +246,5 @@ export const SLASH_COMMANDS = [
   { cmd: "/context", desc: "Context / compact window stats" },
   { cmd: "/mcp", desc: "List MCP servers + doctor" },
   { cmd: "/skills", desc: "List discovered skills" },
-  { cmd: "/sandbox", desc: "Show or set sandbox profile" },
+  { cmd: "/sandbox", desc: "Show or set tool safety profile (not an OS sandbox)" },
 ] as const;

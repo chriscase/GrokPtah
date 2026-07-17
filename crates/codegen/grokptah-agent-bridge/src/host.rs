@@ -1917,7 +1917,8 @@ impl AgentHostHandle {
                 "help" => {
                     let text = "Commands: /help /compact /plan [goal] /yolo /model [id] \
                          /effort [none|low|medium|high|max] /clear /context /mcp /skills \
-                         /sandbox [read-only|workspace-write|full] /explore [query].\n\
+                         /sandbox [read-only|workspace-write|full] (tool safety profile — \
+                         not an OS sandbox) /explore [query].\n\
                          Build mode: multi-step tool loop + optional plan accept→execute.";
                     emit_message(&event_tx, session_id, text);
                     push_assistant(self, session_id, text);
@@ -2064,21 +2065,28 @@ impl AgentHostHandle {
                     return Ok(text);
                 }
                 "sandbox" => {
+                    // Slash alias kept for muscle memory; labeled as tool-safety
+                    // profile — not an OS sandbox (#114).
                     if let Some(p) = args.first() {
                         let norm = normalize_sandbox_profile(p);
                         self.set_sandbox(norm.to_string());
-                        let text = format!("Sandbox profile set to `{norm}`.");
+                        let text = format!(
+                            "Tool safety profile set to `{norm}` \
+                             (agent soft gates only — not an OS sandbox)."
+                        );
                         emit_message(&event_tx, session_id, &text);
                         push_assistant(self, session_id, &text);
                         return Ok(text);
                     }
                     let cur = self.inner.lock().sandbox_profile.clone();
                     let text = format!(
-                        "Sandbox: `{cur}`.\n\
-                         Profiles: `read-only` (no writes/mutators), \
-                         `workspace-write` (edits under project root only), \
-                         `full` (no agent sandbox gates).\n\
-                         Usage: /sandbox <profile>"
+                        "Tool safety profile: `{cur}`.\n\
+                         These are agent-side soft gates (substring denylists / \
+                         tool write checks) — **not** an OS sandbox or isolation boundary.\n\
+                         Profiles: `read-only` (block write tools + mutator substrings), \
+                         `workspace-write` (edits allowed; block only crude escape patterns), \
+                         `full` (no agent-side gates).\n\
+                         Usage: /sandbox <profile>  (alias kept for compatibility)"
                     );
                     emit_message(&event_tx, session_id, &text);
                     push_assistant(self, session_id, &text);
@@ -2217,7 +2225,7 @@ impl AgentHostHandle {
                 let content = content.trim().to_string();
                 let path_rec = path.clone();
                 if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
-                    let msg = "ERROR: sandbox is read-only; write_file denied";
+                    let msg = "ERROR: tool safety profile is read-only; write_file denied";
                     emit_message(event_tx, session_id, msg);
                     // still finish turn below
                 } else {
@@ -2676,7 +2684,9 @@ impl AgentHostHandle {
             }
             "write_file" => {
                 if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
-                    return Ok("ERROR: sandbox is read-only; write_file denied".into());
+                    return Ok(
+                        "ERROR: tool safety profile is read-only; write_file denied".into(),
+                    );
                 }
                 let path = args
                     .get("path")
@@ -2717,7 +2727,8 @@ impl AgentHostHandle {
                     .to_string();
                 if sandbox_blocks_shell(&self.inner.lock().sandbox_profile, &command) {
                     return Ok(format!(
-                        "ERROR: sandbox profile forbids this shell command: {command}"
+                        "ERROR: tool safety profile forbids this shell command \
+                         (soft denylist, not an OS sandbox): {command}"
                     ));
                 }
                 self.run_shell_tool_for_output(session_id, cwd, &command, cancel, event_tx)
@@ -2764,7 +2775,9 @@ impl AgentHostHandle {
             }
             "apply_patch" => {
                 if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
-                    return Ok("ERROR: sandbox is read-only; apply_patch denied".into());
+                    return Ok(
+                        "ERROR: tool safety profile is read-only; apply_patch denied".into(),
+                    );
                 }
                 let patch = args
                     .get("patch")
@@ -3015,7 +3028,9 @@ impl AgentHostHandle {
                     .ok_or_else(|| anyhow!("web_fetch requires url"))?
                     .to_string();
                 if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
-                    return Ok("ERROR: sandbox is read-only; web_fetch denied".into());
+                    return Ok(
+                        "ERROR: tool safety profile is read-only; web_fetch denied".into(),
+                    );
                 }
                 self.run_tool_for_output(
                     session_id,
@@ -3299,11 +3314,13 @@ impl AgentHostHandle {
             return Ok("(cancelled)".into());
         }
 
-        // Sandbox: deny writes in read-only for shared tool path.
+        // Tool safety profile: deny writes in read-only for shared tool path.
         if matches!(tool_name, "write_file" | "apply_patch")
             && sandbox_is_readonly(&self.inner.lock().sandbox_profile)
         {
-            return Ok(format!("ERROR: sandbox is read-only; {tool_name} denied"));
+            return Ok(format!(
+                "ERROR: tool safety profile is read-only; {tool_name} denied"
+            ));
         }
 
         // PreToolUse hooks can deny before permission UI / execution.
@@ -4294,12 +4311,15 @@ fn sandbox_is_full(profile: &str) -> bool {
     normalize_sandbox_profile(profile) == "full"
 }
 
+/// Soft substring denylist for shell commands under a tool-safety profile.
+/// **Not** an OS sandbox — patterns are trivially bypassable (#114).
 fn sandbox_blocks_shell(profile: &str, command: &str) -> bool {
     if sandbox_is_full(profile) {
         return false;
     }
     let c = command.to_ascii_lowercase();
     // Read-only: block mutators. Workspace-write: block only clearly destructive / escape-y.
+    // These are honesty-labeled soft rails, not isolation.
     let mutators = if sandbox_is_readonly(profile) {
         &[
             "rm ",

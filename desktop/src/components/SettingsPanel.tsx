@@ -35,7 +35,7 @@ const EFFORTS = [
 ] as const;
 
 /**
- * Full-screen settings: defaults (model, effort, permissions, sandbox,
+ * Full-screen settings: defaults (model, effort, permissions, tool safety,
  * appearance) + auth. Keeps chrome out of the titlebar/composer clutter.
  */
 export function SettingsPanel({
@@ -214,11 +214,12 @@ export function SettingsPanel({
 
             {section === "permissions" && (
               <section className="settings-section">
-                <h2>Permissions & sandbox</h2>
+                <h2>Permissions & tool safety</h2>
                 <p className="settings-lead">
                   How tools run and what they may touch on disk. Tool prompting
                   is a <strong>single</strong> control (also the composer Auto
-                  chip) — no second YOLO toggle that can disagree.
+                  chip) — no second YOLO toggle that can disagree. Soft
+                  agent-side gates only — not an OS sandbox.
                 </p>
 
                 <label className="settings-field">
@@ -259,23 +260,34 @@ export function SettingsPanel({
                 </label>
 
                 <label className="settings-field">
-                  <span className="settings-field-label">Sandbox profile</span>
+                  <span className="settings-field-label">
+                    Tool safety profile
+                  </span>
                   <select
                     disabled={busy}
                     value={String(snap.sandboxProfile ?? "workspace-write")}
                     onChange={(e) =>
                       void apply(
                         () => api.setSandbox(e.target.value),
-                        "Sandbox saved",
+                        "Tool safety profile saved",
                       )
                     }
                   >
-                    <option value="workspace-write">workspace-write</option>
-                    <option value="read-only">read-only</option>
+                    <option value="workspace-write">
+                      workspace-write (agent soft gates)
+                    </option>
+                    <option value="read-only">
+                      read-only (block write tools / mutators)
+                    </option>
                     <option value="danger-full-access">
-                      danger-full-access
+                      unrestricted (no agent-side gates)
                     </option>
                   </select>
+                  <span className="settings-hint">
+                    Not an OS sandbox. These are substring/tool-level soft
+                    rails inside the agent bridge — trivially bypassable by a
+                    determined command. Do not treat this as isolation.
+                  </span>
                 </label>
 
                 <div className="settings-field">

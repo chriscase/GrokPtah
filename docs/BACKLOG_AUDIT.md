@@ -55,17 +55,18 @@
 | **#136** | `termEverOpened` + CSS `.is-collapsed`; no kill-on-unmount; reattach/list+backlog |
 | **#137** | Listed FS/git/session cmds `async` + `spawn_blocking` via `run_blocking` |
 | **#138** | Cap backlog, seq+watermark, UTF-8 split buffer, `pty://exit`; FE queue during apply |
+| **#141** | PermissionModal + queue; RTL tests: non-focused session + concurrent; App patches owning session |
+| **#114** | Honesty relabel: tool safety profile (not OS sandbox); ERROR/help/settings/docs aligned |
+| **#106** | Epic closed — all PTY children done |
 
 ## Still open (do not mass-close)
 
 - Multi-agent: **#151**, **#152**
 - Product honesty: **#52**, **#43**, **#38**, **#93**
 - TUI parity: **#146–#149**
-- CI residual: **#141**
 - UX polish: **#126**, **#128–#129**, **#132–#134**, **#150**
 - Architecture: **#144**, **#145**
-- Permissions residual: **#114**
-- Epic children residual under #106 if any remaining shell items
+- Epic #101 residual only if other children remain (all security children done after #114)
 
 ## Anti-patterns avoided
 

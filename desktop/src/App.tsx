@@ -23,6 +23,12 @@ import { SessionBrowser } from "./components/SessionBrowser";
 import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
+import { PermissionModal } from "./components/PermissionModal";
+import {
+  dequeuePermission,
+  enqueuePermission,
+  headPermission,
+} from "./lib/permissionQueue";
 import {
   clampDocks,
   SPLIT_MIN_WIDTH,
@@ -216,7 +222,11 @@ export default function App() {
   /** Taller composer for detailed prompts (power users). */
   const [composerExpanded, setComposerExpanded] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
-  const [permission, setPermission] = useState<PermissionRequest | null>(null);
+  /** FIFO of tool permission prompts — concurrent requests must not clobber (#141). */
+  const [permissionQueue, setPermissionQueue] = useState<PermissionRequest[]>(
+    [],
+  );
+  const permission = headPermission(permissionQueue);
   const [rightTab, setRightTab] = useState<RightTab>("files");
   const [files, setFiles] = useState<string[]>([]);
   const [fuzzy, setFuzzy] = useState("");
@@ -563,7 +573,7 @@ export default function App() {
           return `${prev.trimEnd()}\n${block}`;
         });
       }
-      applyUpdate(u, setTabs, setPermission);
+      applyUpdate(u, setTabs, setPermissionQueue);
     });
   }, []);
 
@@ -2377,8 +2387,8 @@ export default function App() {
               ? `○ Idle here · ${tabs.filter((t) => t.busy).length} other tab(s) active`
               : "○ Idle · ready"}
           {" · "}
-          {status?.running ? "agent up" : "agent stopped"} ·{" "}
-          {status?.sandbox_profile}
+          {status?.running ? "agent up" : "agent stopped"} · safety{" "}
+          {status?.sandbox_profile ?? "—"}
         </span>
         <span>
           auto-update: {product.autoUpdateEnabled ? "on" : "off"} · bridge{" "}
@@ -2437,97 +2447,34 @@ export default function App() {
       )}
 
       {permission && (
-        <div className="modal-backdrop">
-          <div className="modal permission-modal">
-            <h3>Needs your response</h3>
-            <p>{permission.summary}</p>
-            <p style={{ fontSize: 12, color: "var(--muted)", marginTop: 0 }}>
-              Tool: <code>{permission.tool_name}</code>
-            </p>
-            <details style={{ marginBottom: "0.75rem" }}>
-              <summary style={{ cursor: "pointer", color: "var(--muted)", fontSize: 12 }}>
-                Technical details
-              </summary>
-              <pre style={{ fontSize: 11, color: "var(--muted)", maxHeight: 160, overflow: "auto" }}>
-                {JSON.stringify(permission.detail, null, 2)}
-              </pre>
-            </details>
-            <div className="modal-actions">
-              <button
-                type="button"
-                className="danger"
-                onClick={async () => {
-                  await api.permissionRespond(permission.id, "deny");
-                  setPermission(null);
-                  if (activeSessionId) {
-                    patchTab(activeSessionId, (t) => ({
-                      ...t,
-                      needsPermission: false,
-                      activity: {
-                        ...t.activity,
-                        phase: "tool",
-                        label: "Working",
-                        detail: "Permission denied",
-                        live: true,
-                        lastEventAt: Date.now(),
-                      },
-                    }));
-                  }
-                }}
-              >
-                Deny
-              </button>
-              <button
-                type="button"
-                onClick={async () => {
-                  await api.permissionRespond(permission.id, "always_allow");
-                  setPermission(null);
-                  if (activeSessionId) {
-                    patchTab(activeSessionId, (t) => ({
-                      ...t,
-                      needsPermission: false,
-                      activity: {
-                        ...t.activity,
-                        phase: "tool",
-                        label: "Working",
-                        detail: "Continuing…",
-                        live: true,
-                        lastEventAt: Date.now(),
-                      },
-                    }));
-                  }
-                  await refreshChrome();
-                }}
-              >
-                Always allow {permission.tool_name}
-              </button>
-              <button
-                type="button"
-                className="primary"
-                onClick={async () => {
-                  await api.permissionRespond(permission.id, "allow");
-                  setPermission(null);
-                  if (activeSessionId) {
-                    patchTab(activeSessionId, (t) => ({
-                      ...t,
-                      needsPermission: false,
-                      activity: {
-                        ...t.activity,
-                        phase: "tool",
-                        label: "Working",
-                        detail: "Continuing…",
-                        live: true,
-                        lastEventAt: Date.now(),
-                      },
-                    }));
-                  }
-                }}
-              >
-                Allow
-              </button>
-            </div>
-          </div>
-        </div>
+        <PermissionModal
+          request={permission}
+          queuedBehind={Math.max(0, permissionQueue.length - 1)}
+          fallbackSessionId={activeSessionId}
+          onRespond={async (requestId, decision, sessionId) => {
+            await api.permissionRespond(requestId, decision);
+            setPermissionQueue((q) => dequeuePermission(q, requestId));
+            // Patch the *owning* session, not whichever tab is focused (#141).
+            if (sessionId) {
+              patchTab(sessionId, (t) => ({
+                ...t,
+                needsPermission: false,
+                activity: {
+                  ...t.activity,
+                  phase: "tool",
+                  label: "Working",
+                  detail:
+                    decision === "deny" ? "Permission denied" : "Continuing…",
+                  live: true,
+                  lastEventAt: Date.now(),
+                },
+              }));
+            }
+            if (decision === "always_allow") {
+              await refreshChrome();
+            }
+          }}
+        />
       )}
 
       <ContextMenu menu={ctxMenu} onClose={() => setCtxMenu(null)} />
@@ -2629,7 +2576,9 @@ function mapTranscript(
 function applyUpdate(
   u: SessionUpdate,
   setTabs: React.Dispatch<React.SetStateAction<SessionTab[]>>,
-  setPermission: React.Dispatch<React.SetStateAction<PermissionRequest | null>>,
+  setPermissionQueue: React.Dispatch<
+    React.SetStateAction<PermissionRequest[]>
+  >,
 ) {
   const sid = sessionIdOf(u);
   if (!sid && u.type !== "permission_required") return;
@@ -2792,7 +2741,8 @@ function applyUpdate(
       );
       break;
     case "permission_required":
-      setPermission(u.request);
+      // Enqueue — concurrent requests must not overwrite the modal (#141).
+      setPermissionQueue((q) => enqueuePermission(q, u.request));
       if (sid) {
         withTab(sid, (tab) =>
           withActivity(

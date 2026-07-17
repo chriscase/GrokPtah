@@ -7,7 +7,7 @@ Status as of Phase 15 remainder. Bridge implements a **thin** tool loop (ADR-001
 | list_dir / LS | `list_dir` | **shipped** | Relative to project cwd |
 | read_file / Read | `read_file` | **shipped** | Size-capped |
 | grep / Grep | `grep` | **shipped** | Regex under path |
-| write / Write | `write_file` | **shipped** | Permission + sandbox |
+| write / Write | `write_file` | **shipped** | Permission + tool safety profile (soft gates) |
 | shell / Bash | `run_terminal_cmd` | **shipped** | Streamed; cancel kills child |
 | glob / Glob | `glob_files` | **shipped** | Simple globs |
 | apply_patch / Edit | `apply_patch` | **shipped** | Multi-hunk Update File + JSON search/replace |
