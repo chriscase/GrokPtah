@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SessionTab, TranscriptItem } from "../lib/protocol";
 import {
   expandDebugLines,
@@ -89,8 +89,11 @@ export type SessionPaneProps = {
 /**
  * One session column: header, transcript, activity.
  * Composer stays shared in the parent and targets the focused pane.
+ *
+ * Memoized (#122): when only another dock's tab object changes, this pane
+ * keeps the same `tab` reference and skips re-render.
  */
-export function SessionPane({
+export const SessionPane = memo(function SessionPane({
   tab,
   focused,
   zoneIndex,
@@ -106,10 +109,18 @@ export function SessionPane({
   const scrollRef = useRef<HTMLDivElement>(null);
   /** User is near bottom — only then auto-scroll on new transcript rows. */
   const stickRef = useRef(true);
+  /** Drive re-render for jump-to-latest button when stick flips (#123). */
+  const [showJump, setShowJump] = useState(false);
   const busy = tab.busy;
   const transcript = tab.transcript;
   const rows = useMemo(() => groupTranscript(transcript), [transcript]);
   const multi = (zoneCount ?? 1) > 1;
+
+  const jumpToLatest = useCallback(() => {
+    stickRef.current = true;
+    setShowJump(false);
+    bottomRef.current?.scrollIntoView({ behavior: "auto" });
+  }, []);
 
   useEffect(() => {
     if (!focused) return;
@@ -182,8 +193,10 @@ export function SessionPane({
           // (hysteresis vs threshold) so tiny layout shifts don't kill follow.
           if (distance > 120) {
             stickRef.current = false;
+            setShowJump(true);
           } else if (shouldStickToBottom(distance, 48)) {
             stickRef.current = true;
+            setShowJump(false);
           }
         }}
       >
@@ -281,7 +294,18 @@ export function SessionPane({
         <div ref={bottomRef} />
       </div>
 
+      {showJump && (
+        <button
+          type="button"
+          className="jump-to-latest"
+          onClick={jumpToLatest}
+          title="Return to the live end of the transcript"
+        >
+          Jump to latest ↓
+        </button>
+      )}
+
       <ActivityIndicator activity={tab.activity} busy={busy} />
     </section>
   );
-}
+});

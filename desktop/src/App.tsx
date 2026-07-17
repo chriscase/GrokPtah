@@ -422,6 +422,15 @@ export default function App() {
     });
   }, []);
 
+  const focusSession = useCallback((id: string) => {
+    setActiveSessionId(id);
+  }, []);
+
+  const hideLiveRail = useCallback(() => {
+    setLiveHidden(true);
+  }, []);
+
+
   const refreshSessions = useCallback(async () => {
     try {
       setSessions(await api.sessionListByKind(workspaceMode, false));
@@ -1727,7 +1736,7 @@ export default function App() {
                     }
                     showClose={docks.length > 1}
                     onClosePane={() => undockSession(dockId)}
-                    onFocus={() => setActiveSessionId(dockId)}
+                    onFocus={() => focusSession(dockId)}
                   />
                 </div>
               );
@@ -1741,9 +1750,9 @@ export default function App() {
               activeSessionId={activeSessionId}
               zoneIds={docks}
               canSplit={splitOk}
-              onFocus={(id) => setActiveSessionId(id)}
-              onOpenBeside={(id) => void openBeside(id)}
-              onHide={() => setLiveHidden(true)}
+              onFocus={focusSession}
+              onOpenBeside={openBeside}
+              onHide={hideLiveRail}
             />
           )}
 

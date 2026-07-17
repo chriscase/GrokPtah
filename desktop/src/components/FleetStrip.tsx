@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { SessionTab } from "../lib/protocol";
 
 export type FleetStripProps = {
@@ -29,7 +30,7 @@ function phaseLabel(t: SessionTab): string {
  * Order matches the tab strip (stable; never reorders on focus click).
  * Cards size to the title, not the full ultrawide width.
  */
-export function FleetStrip({
+export const FleetStrip = memo(function FleetStrip({
   tabs,
   activeSessionId,
   zoneIds,
@@ -122,4 +123,4 @@ export function FleetStrip({
       )}
     </div>
   );
-}
+});

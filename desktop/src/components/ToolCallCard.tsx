@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { TranscriptItem } from "../lib/protocol";
 
 type ToolItem = Extract<TranscriptItem, { kind: "tool" }>;
@@ -41,7 +41,8 @@ function shortOutput(output?: string, max = 88): string {
  * Only auto-expands while status is running/pending. On complete/fail it
  * collapses again unless the user has manually toggled this card.
  */
-export function ToolCallCard({ item }: { item: ToolItem }) {
+/** Memoized so settled tool cards skip re-render when other panes stream (#122). */
+export const ToolCallCard = memo(function ToolCallCard({ item }: { item: ToolItem }) {
   const status = statusLabel(item.status);
   const live = status === "running" || status === "pending";
   /** null = follow automatic open rules; boolean = user override */
@@ -89,7 +90,7 @@ export function ToolCallCard({ item }: { item: ToolItem }) {
       )}
     </details>
   );
-}
+});
 
 /**
  * Show recent tools as compact rows; older ones stay behind a toggle.

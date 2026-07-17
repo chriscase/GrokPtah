@@ -1,4 +1,5 @@
-import ReactMarkdown from "react-markdown";
+import { memo } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 /**
@@ -22,63 +23,60 @@ export function normalizeMarkdownTables(text: string): string {
         // After separator, before next data row: `|---| | Data |`
         .replace(/(\|[\t \-:|]+\|)\s+\|/g, "$1\n|")
         // Glued data rows: `| a | b | | c | d |` → newline between rows.
-        // Require the RHS to contain another pipe (full row), so a true
-        // empty mid-row cell `| a | | b |` (single next cell) is preserved
-        // only when it doesn't look like multi-cell continuation…
-        // Prefer: split when ≥2 pipes appear after the join (multi-cell row).
         .replace(/\|\s+\|(?=[^|\n]*\|[^|\n]*\|)/g, "|\n|");
     })
     .join("");
 }
 
+/** Stable markdown component map — recreated each render breaks React.memo. */
+const MD_COMPONENTS: Components = {
+  a: ({ href, children }) => (
+    <a href={href} target="_blank" rel="noreferrer noopener">
+      {children}
+    </a>
+  ),
+  table: ({ children }) => (
+    <div className="md-table-wrap">
+      <table>{children}</table>
+    </div>
+  ),
+  th: ({ children, style }) => (
+    <th style={style} scope="col">
+      {children}
+    </th>
+  ),
+  td: ({ children, style }) => <td style={style}>{children}</td>,
+  pre: ({ children }) => <pre className="md-pre">{children}</pre>,
+  code: ({ className, children, ...props }) => {
+    const inline = !className;
+    if (inline) {
+      return (
+        <code className="md-code-inline" {...props}>
+          {children}
+        </code>
+      );
+    }
+    return (
+      <code className={className} {...props}>
+        {children}
+      </code>
+    );
+  },
+};
+
 /**
  * Render assistant (and similar) text as markdown — not raw source.
  * Streaming callers should pass plain text until the turn settles.
+ * Memoized so settled bubbles skip re-parse during unrelated stream chunks (#122).
  */
-export function MarkdownBody({ text }: { text: string }) {
+export const MarkdownBody = memo(function MarkdownBody({ text }: { text: string }) {
   if (!text) return null;
   const source = normalizeMarkdownTables(text);
   return (
     <div className="md-body">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ href, children }) => (
-            <a href={href} target="_blank" rel="noreferrer noopener">
-              {children}
-            </a>
-          ),
-          table: ({ children }) => (
-            <div className="md-table-wrap">
-              <table>{children}</table>
-            </div>
-          ),
-          th: ({ children, style }) => (
-            <th style={style} scope="col">
-              {children}
-            </th>
-          ),
-          td: ({ children, style }) => <td style={style}>{children}</td>,
-          pre: ({ children }) => <pre className="md-pre">{children}</pre>,
-          code: ({ className, children, ...props }) => {
-            const inline = !className;
-            if (inline) {
-              return (
-                <code className="md-code-inline" {...props}>
-                  {children}
-                </code>
-              );
-            }
-            return (
-              <code className={className} {...props}>
-                {children}
-              </code>
-            );
-          },
-        }}
-      >
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
         {source}
       </ReactMarkdown>
     </div>
   );
-}
+});

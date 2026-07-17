@@ -3866,3 +3866,27 @@ button:disabled {
   overflow: auto;
   color: var(--muted, #9aa0a6);
 }
+
+/* Jump to latest when user scrolled up mid-stream (#123) */
+.jump-to-latest {
+  position: absolute;
+  bottom: 3.25rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  padding: 0.35rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid var(--accent-dim);
+  background: var(--bg-elevated);
+  color: var(--accent);
+  font-size: 12px;
+  font-family: var(--font-ui);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+}
+.jump-to-latest:hover {
+  background: var(--accent-bg);
+}
+.session-pane {
+  position: relative;
+}
