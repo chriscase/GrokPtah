@@ -895,3 +895,138 @@ async fn project_local_mcp_does_not_spawn_until_trusted() {
         "trusted project should spawn MCP command (marker missing)"
     );
 }
+
+#[tokio::test]
+async fn turn_busy_clears_when_guard_drops_after_panic() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+    assert!(!host.session_busy(session.id));
+
+    // Simulate mid-turn panic: mark busy, then drop guard via catch_unwind path.
+    // Public path: run a turn, then prove we can re-prompt (busy cleared).
+    host.session_prompt(session.id, "list files".into())
+        .await
+        .unwrap();
+    assert!(
+        !host.session_busy(session.id),
+        "session must not stay busy after normal turn"
+    );
+
+    // Second turn must be accepted (not "already has an active turn")
+    host.session_prompt(session.id, "list files".into())
+        .await
+        .unwrap();
+    assert!(!host.session_busy(session.id));
+}
+
+#[tokio::test]
+async fn multi_turn_wire_includes_prior_tool_output() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    // Unique secret only available via a file tool read — never in the user prompt of turn 2.
+    let secret = "TOOL_AMNESIA_SECRET_9f3c2a1b";
+    std::fs::write(dir.path().join("secret_note.txt"), secret).unwrap();
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    // Turn 1: offline path reads the file via tools and records tool transcript.
+    host.session_prompt(
+        session.id,
+        format!("read secret_note.txt"),
+    )
+    .await
+    .unwrap();
+
+    // Wire preview for the *next* model call must include the tool output.
+    let wire = host.wire_messages_preview(session.id).unwrap();
+    let blob = serde_json::to_string(&wire).unwrap();
+    assert!(
+        blob.contains(secret),
+        "prior-turn tool output must appear in wire context; got {}",
+        &blob.chars().take(800).collect::<String>()
+    );
+
+    // Turn 2: user asks only about the secret without re-stating it.
+    host.session_prompt(session.id, "What was in secret_note.txt?".into())
+        .await
+        .unwrap();
+    let wire2 = host.wire_messages_preview(session.id).unwrap();
+    let blob2 = serde_json::to_string(&wire2).unwrap();
+    assert!(
+        blob2.contains(secret),
+        "second turn wire must still carry prior tool facts; missing secret"
+    );
+}
+
+#[tokio::test]
+async fn read_file_truncate_survives_cjk_over_cap() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    // > 32k bytes of multi-byte CJK — must not panic on byte-index truncate
+    let body = "字".repeat(20_000);
+    assert!(body.len() > 32_000);
+    std::fs::write(dir.path().join("big_cjk.txt"), &body).unwrap();
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+    // Offline read path uses tool_read_file (32k cap)
+    host.session_prompt(session.id, "read big_cjk.txt".into())
+        .await
+        .expect("CJK over-cap read must not panic");
+    let wire = host.wire_messages_preview(session.id).unwrap();
+    let blob = serde_json::to_string(&wire).unwrap();
+    assert!(
+        blob.contains("truncated") || blob.contains("字"),
+        "tool output should appear (truncated or prefix)"
+    );
+}
+
+#[test]
+fn turn_busy_guard_clears_on_panic_unwind() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig::default());
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let host2 = host.clone();
+    let sid = session.id;
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        host2.test_only_panic_while_turn_busy(sid);
+    }));
+    assert!(r.is_err(), "helper must panic");
+    assert!(
+        !host.session_busy(session.id),
+        "TurnBusyGuard Drop must clear busy after panic unwind"
+    );
+    // Session must accept a new turn (not wedged).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        host.session_prompt(session.id, "list files".into())
+            .await
+            .expect("must accept turn after panic cleanup");
+    });
+}

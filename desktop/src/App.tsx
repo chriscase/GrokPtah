@@ -631,14 +631,16 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist tab strip whenever it changes (after initial restore).
+  // Persist tab *ids* only (not per-token transcript rewrites).
+  // Depending on full `tabs` re-wrote workspace.json on every stream chunk.
+  const openTabIdsKey = tabs.map((t) => t.id).join(",");
   useEffect(() => {
     if (!workspaceRestored) return;
     void api.setOpenTabs(
-      tabs.map((t) => t.id),
+      openTabIdsKey ? openTabIdsKey.split(",") : [],
       activeSessionId,
     );
-  }, [tabs, activeSessionId, workspaceRestored]);
+  }, [openTabIdsKey, activeSessionId, workspaceRestored]);
 
   const slashOpen = composer.startsWith("/") && !composer.includes(" ");
   const slashHits = useMemo(
@@ -2617,7 +2619,10 @@ function applyUpdate(
               ...t,
               {
                 kind: "assistant",
-                text: collapseRepeatedText(u.text),
+                // Do not collapseRepeatedText here — it can drop legitimate
+                // repeated code lines mid-stream. Multi-listener dups are
+                // handled by mergeAssistantChunk / the session bus singleton.
+                text: u.text,
                 streaming: true,
               },
             ];

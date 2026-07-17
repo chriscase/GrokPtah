@@ -17,8 +17,11 @@ mod project_context;
 mod search_engine;
 mod session;
 mod session_store;
+mod textutil;
 mod todo_list;
 mod types;
+
+pub use textutil::{truncate_at_char_boundary, truncate_with_marker};
 
 pub use memory::{inject_context as memory_inject_context, list_facts as memory_list_facts, remember as memory_remember};
 

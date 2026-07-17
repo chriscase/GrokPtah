@@ -36,7 +36,7 @@ pub fn load_project_instructions(cwd: &Path) -> (String, Vec<String>) {
         if let Some((chunk, _)) = read_capped(&path, MAX_FILE_CHARS) {
             let room = MAX_TOTAL_CHARS.saturating_sub(total);
             let text = if chunk.len() > room {
-                format!("{}…", &chunk[..room])
+                crate::textutil::truncate_with_marker(&chunk, room, "…")
             } else {
                 chunk
             };
@@ -82,7 +82,7 @@ pub fn load_project_instructions(cwd: &Path) -> (String, Vec<String>) {
                     break;
                 }
                 let text = if chunk.len() > room {
-                    format!("{}…", &chunk[..room])
+                    crate::textutil::truncate_with_marker(&chunk, room, "…")
                 } else {
                     chunk
                 };
@@ -112,7 +112,7 @@ fn read_capped(path: &Path, max: usize) -> Option<(String, usize)> {
         return None;
     }
     let text = if raw.len() > max {
-        format!("{}\n… (truncated)", &raw[..max])
+        crate::textutil::truncate_with_marker(&raw, max, "\n… (truncated)")
     } else {
         raw
     };
@@ -398,7 +398,7 @@ pub fn load_skills_context(project: Option<&Path>) -> String {
             break;
         }
         let text = if body.len() > cap {
-            format!("{}…\n(truncated)", &body[..cap])
+            crate::textutil::truncate_with_marker(body, cap, "…\n(truncated)")
         } else {
             body.to_string()
         };

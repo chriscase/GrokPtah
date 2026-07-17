@@ -70,7 +70,7 @@ pub async fn tool_read_file(cwd: &Path, path: &str) -> Result<ToolResult> {
         .await
         .with_context(|| format!("read {}", full.display()))?;
     let truncated = if text.len() > 32_000 {
-        format!("{}\n… (truncated)", &text[..32_000])
+        crate::textutil::truncate_with_marker(&text, 32_000, "\n… (truncated)")
     } else {
         text
     };
@@ -262,10 +262,17 @@ where
             msg = chunk_rx.recv() => {
                 match msg {
                     Some(s) => {
+                        if collected.len() >= 32_000 {
+                            // Already at cap — stop ingesting (avoid thrash truncate).
+                            continue;
+                        }
                         collected.push_str(&s);
                         if collected.len() > 32_000 {
-                            collected.truncate(32_000);
-                            collected.push_str("\n… (truncated)");
+                            let head = crate::textutil::truncate_at_char_boundary(
+                                &collected,
+                                32_000,
+                            );
+                            collected = format!("{head}\n… (truncated)");
                         } else {
                             on_chunk(s);
                         }

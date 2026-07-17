@@ -12,6 +12,7 @@ import {
   normalizeSessionUpdate,
   type SessionUpdate,
 } from "./protocol";
+import { nextAssistantText } from "./streamApply";
 
 export type SessionUpdateHandler = (u: SessionUpdate) => void;
 
@@ -99,33 +100,13 @@ export function collapseRepeatedText(text: string): string {
 /**
  * Merge a new agent message chunk into the last assistant bubble without
  * duplicating a full re-delivery of the same content.
+ *
+ * Implementation lives in `streamApply` (content/seq based — not
+ * length-only, and does not collapse legitimate repeated code lines).
  */
 export function mergeAssistantChunk(
   existing: string,
   chunk: string,
 ): string | "skip" {
-  if (!chunk) return "skip";
-  if (!existing) return chunk;
-
-  // Exact re-delivery of the same full message (multi-listener).
-  if (chunk === existing) return "skip";
-  // Chunk already fully contained as a trailing suffix.
-  if (existing.endsWith(chunk)) return "skip";
-  // Full message re-sent while we already have it (or more).
-  if (chunk.startsWith(existing) && chunk.length >= existing.length) {
-    return chunk; // replace with longer complete form
-  }
-  // Existing is already N copies of chunk
-  if (existing.length % chunk.length === 0) {
-    const times = existing.length / chunk.length;
-    if (times >= 1 && times <= 12 && chunk.repeat(times) === existing) {
-      return "skip";
-    }
-  }
-  // Appending would create an exact double
-  if (existing + chunk === chunk + chunk || existing + chunk === existing + existing) {
-    return existing.startsWith(chunk) ? existing : chunk;
-  }
-
-  return existing + chunk;
+  return nextAssistantText(existing, chunk);
 }

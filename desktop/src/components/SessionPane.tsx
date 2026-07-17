@@ -4,6 +4,7 @@ import {
   expandDebugLines,
   isDebugThought,
 } from "../lib/debugTrace";
+import { shouldStickToBottom } from "../lib/streamApply";
 import { ActivityIndicator } from "./ActivityIndicator";
 import { DebugTrace } from "./DebugTrace";
 import { StreamingMarkdown } from "./StreamingMarkdown";
@@ -101,15 +102,19 @@ export function SessionPane({
   showClose,
 }: SessionPaneProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  /** User is near bottom — only then auto-scroll on new transcript rows. */
+  const stickRef = useRef(true);
   const busy = tab.busy;
   const transcript = tab.transcript;
   const rows = useMemo(() => groupTranscript(transcript), [transcript]);
   const multi = (zoneCount ?? 1) > 1;
 
   useEffect(() => {
-    if (focused) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
+    if (!focused) return;
+    if (!stickRef.current) return;
+    // Instant scroll — smooth + onScroll races can mark stick=false mid-animation.
+    bottomRef.current?.scrollIntoView({ behavior: "auto" });
   }, [transcript, focused, tab.id]);
 
   return (
@@ -164,7 +169,23 @@ export function SessionPane({
         </div>
       </header>
 
-      <div className="transcript session-pane-transcript">
+      <div
+        className="transcript session-pane-transcript"
+        ref={scrollRef}
+        onScroll={() => {
+          const el = scrollRef.current;
+          if (!el) return;
+          const distance =
+            el.scrollHeight - el.scrollTop - el.clientHeight;
+          // Only clear stick when the user is clearly away from the bottom
+          // (hysteresis vs threshold) so tiny layout shifts don't kill follow.
+          if (distance > 120) {
+            stickRef.current = false;
+          } else if (shouldStickToBottom(distance, 48)) {
+            stickRef.current = true;
+          }
+        }}
+      >
         {transcript.length === 0 && (
           <div className="empty-agent pane-empty">
             <h1>{tab.title || "Session"}</h1>
