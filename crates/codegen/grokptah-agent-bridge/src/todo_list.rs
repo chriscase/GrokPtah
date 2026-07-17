@@ -81,10 +81,7 @@ impl TodoList {
 
     /// Parse from tool JSON: array of {id?, content, status?} or {todos: [...], merge?: bool}
     pub fn from_tool_args(v: &serde_json::Value) -> anyhow::Result<(Vec<TodoItem>, bool)> {
-        let merge = v
-            .get("merge")
-            .and_then(|m| m.as_bool())
-            .unwrap_or(true);
+        let merge = v.get("merge").and_then(|m| m.as_bool()).unwrap_or(true);
         let arr = if let Some(a) = v.get("todos").and_then(|t| t.as_array()) {
             a.clone()
         } else if let Some(a) = v.as_array() {

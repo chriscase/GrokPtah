@@ -55,7 +55,11 @@ pub fn load_project_instructions(cwd: &Path) -> (String, Vec<String>) {
         if !dir.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&dir).max_depth(2).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&dir)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if total >= MAX_TOTAL_CHARS {
                 break;
             }
@@ -167,11 +171,10 @@ fn glob_match(pattern: &str, path: &str) -> bool {
         // Convert **/*.ext → suffix match on segments
         if let Some(rest) = pattern.strip_prefix("**/") {
             return path_matches_simple(rest, path)
-                || path
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|name| path_matches_simple(rest.trim_start_matches("*/"), name)
-                        || path_matches_simple(rest, name));
+                || path.rsplit('/').next().is_some_and(|name| {
+                    path_matches_simple(rest.trim_start_matches("*/"), name)
+                        || path_matches_simple(rest, name)
+                });
         }
     }
     // Also allow bare *.rs matching any depth basename
@@ -450,7 +453,9 @@ mod tests {
         fs::write(dir.path().join("c.txt"), "c").unwrap();
         let hits = glob_files(dir.path(), "*.rs", 50);
         assert!(hits.iter().any(|h| h.ends_with("a.rs")));
-        assert!(hits.iter().any(|h| h.ends_with("src/b.rs") || h == "src/b.rs"));
+        assert!(hits
+            .iter()
+            .any(|h| h.ends_with("src/b.rs") || h == "src/b.rs"));
         assert!(!hits.iter().any(|h| h.ends_with("c.txt")));
     }
 

@@ -82,17 +82,18 @@ pub async fn call_mcp_tool(
         .into_iter()
         .find(|s| s.name == server || sanitize_ident(&s.name) == server)
         .ok_or_else(|| anyhow!("unknown or disabled MCP server `{server}`"))?;
-    timeout(Duration::from_secs(30), call_tool_on_server(&s, tool, arguments))
-        .await
-        .map_err(|_| anyhow!("mcp call timed out"))?
+    timeout(
+        Duration::from_secs(30),
+        call_tool_on_server(&s, tool, arguments),
+    )
+    .await
+    .map_err(|_| anyhow!("mcp call timed out"))?
 }
 
 fn load_enabled_stdio_servers(project: Option<&std::path::Path>) -> Vec<McpServerConfig> {
     use crate::discover::{is_project_local_mcp_config, is_project_mcp_trusted};
 
-    let project_trusted = project
-        .map(is_project_mcp_trusted)
-        .unwrap_or(false);
+    let project_trusted = project.map(is_project_mcp_trusted).unwrap_or(false);
 
     let mut out = Vec::new();
     for path in mcp_config_paths(project) {

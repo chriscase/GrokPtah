@@ -24,18 +24,21 @@ mod types;
 
 pub use textutil::{truncate_at_char_boundary, truncate_with_marker};
 
-pub use memory::{inject_context as memory_inject_context, list_facts as memory_list_facts, remember as memory_remember};
+pub use memory::{
+    inject_context as memory_inject_context, list_facts as memory_list_facts,
+    remember as memory_remember,
+};
 
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
     set_grokptah_home_override, set_project_mcp_trusted,
 };
-/// List MCP tools for the project (spawns stdio servers when allowed).
-pub use mcp_runtime::list_mcp_tools;
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{
     is_rate_limit_error, AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState,
 };
+/// List MCP tools for the project (spawns stdio servers when allowed).
+pub use mcp_runtime::list_mcp_tools;
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use search_engine::{SearchHit, SearchQuery};
 pub use session::{SessionKind, SessionSummary, TranscriptEntry};

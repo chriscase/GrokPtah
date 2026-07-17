@@ -12,6 +12,7 @@ import { StreamingMarkdown } from "./StreamingMarkdown";
 import { StreamingText } from "./StreamingText";
 import { ToolCallCard, ToolHistoryGroup } from "./ToolCallCard";
 import { api } from "../lib/api";
+import { displaySessionTitle } from "../lib/sessionTitle";
 
 type ToolItem = Extract<TranscriptItem, { kind: "tool" }>;
 
@@ -88,6 +89,10 @@ export type SessionPaneProps = {
   onClosePane?: (sessionId: string) => void;
   /** Show close control for secondary pane only. */
   showClose?: boolean;
+  /** Working directory for title disambiguation (#130). */
+  cwd?: string | null;
+  /** Peer sessions for collision detection in multi-dock chrome. */
+  titlePeers?: { id: string; title: string; cwd?: string | null }[];
 };
 
 /**
@@ -109,7 +114,13 @@ export const SessionPane = memo(function SessionPane({
   onFocusSession,
   onClosePane,
   showClose,
+  cwd,
+  titlePeers = [],
 }: SessionPaneProps) {
+  const displayTitle = displaySessionTitle(
+    { id: tab.id, title: tab.title, cwd },
+    titlePeers,
+  );
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   /** User is near bottom — only then auto-scroll on new transcript rows. */
@@ -162,7 +173,7 @@ export const SessionPane = memo(function SessionPane({
             <span className={`kind-chip ${kindLabel}`}>{kindLabel}</span>
           )}
           <span className="session-pane-name" title={tab.title}>
-            {tab.title}
+            {displayTitle}
           </span>
         </div>
         <div className="session-pane-actions">
@@ -207,7 +218,7 @@ export const SessionPane = memo(function SessionPane({
       >
         {transcript.length === 0 && (
           <div className="empty-agent pane-empty">
-            <h1>{tab.title || "Session"}</h1>
+            <h1>{displayTitle || "Session"}</h1>
             {bridgeVersion && (
               <div className="version-line">bridge {bridgeVersion}</div>
             )}
@@ -245,6 +256,11 @@ export const SessionPane = memo(function SessionPane({
           return (
             <ErrorBoundary key={i} label={`bubble ${item.kind}`}>
               <div className={`bubble ${item.kind}`}>
+                {(item.kind === "user" || item.kind === "assistant") && (
+                  <div className="bubble-role" aria-hidden>
+                    {item.kind === "user" ? "You" : "Grok"}
+                  </div>
+                )}
                 {item.kind === "tool" && <ToolCallCard item={item} />}
                 {item.kind === "plan" && (
                   <>

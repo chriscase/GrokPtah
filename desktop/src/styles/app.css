@@ -1628,11 +1628,25 @@ button:disabled {
   word-break: break-word;
 }
 
+.bubble-role {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin: 0 0 0.35rem;
+  opacity: 0.85;
+}
+
 .bubble.user {
   align-self: flex-end;
-  background: var(--user-bg);
-  border-color: var(--border);
+  background: color-mix(in srgb, var(--accent) 14%, var(--user-bg));
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-left: 3px solid var(--accent);
   white-space: pre-wrap;
+}
+
+.bubble.user .bubble-role {
+  color: var(--accent);
 }
 
 .bubble.user .user-text {
@@ -1645,6 +1659,12 @@ button:disabled {
   white-space: normal;
   padding: 0.65rem 0.85rem;
   font-family: var(--font);
+  background: var(--bg-elevated);
+  border-left: 3px solid color-mix(in srgb, var(--ok, #7fd99a) 70%, var(--border));
+}
+
+.bubble.assistant .bubble-role {
+  color: var(--ok, #7fd99a);
 }
 
 .bubble.thought {

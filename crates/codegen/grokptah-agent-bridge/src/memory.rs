@@ -38,9 +38,7 @@ fn memory_dir() -> PathBuf {
 }
 
 pub fn project_key(cwd: &Path) -> String {
-    let canon = cwd
-        .canonicalize()
-        .unwrap_or_else(|_| cwd.to_path_buf());
+    let canon = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let s = canon.display().to_string();
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);

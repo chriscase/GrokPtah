@@ -11,6 +11,29 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
+/// Soft cap for PTY output replay buffers (~256 KiB).
+pub const PTY_BACKLOG_CAP: usize = 256 * 1024;
+
+/// Append `chunk` to a backlog ring, dropping from the front when over cap.
+///
+/// Pure helper so unit tests can exercise drain boundaries without a live PTY (#142).
+pub fn append_backlog_capped(backlog: &mut Vec<u8>, chunk: &[u8], cap: usize) {
+    if chunk.is_empty() {
+        return;
+    }
+    if chunk.len() >= cap {
+        // Keep only the tail of an oversized chunk.
+        backlog.clear();
+        backlog.extend_from_slice(&chunk[chunk.len() - cap..]);
+        return;
+    }
+    backlog.extend_from_slice(chunk);
+    if backlog.len() > cap {
+        let drop = backlog.len() - cap;
+        backlog.drain(..drop);
+    }
+}
+
 struct PtySession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -84,12 +107,11 @@ impl PtyHub {
                                 if s.killed {
                                     break;
                                 }
-                                s.backlog.extend_from_slice(&chunk);
-                                // Cap backlog ~256 KiB
-                                if s.backlog.len() > 256 * 1024 {
-                                    let drop = s.backlog.len() - 256 * 1024;
-                                    s.backlog.drain(..drop);
-                                }
+                                append_backlog_capped(
+                                    &mut s.backlog,
+                                    &chunk,
+                                    PTY_BACKLOG_CAP,
+                                );
                             } else {
                                 break;
                             }
@@ -157,7 +179,11 @@ impl PtyHub {
                                 if s.killed {
                                     break;
                                 }
-                                s.backlog.extend_from_slice(&chunk);
+                                append_backlog_capped(
+                                    &mut s.backlog,
+                                    &chunk,
+                                    PTY_BACKLOG_CAP,
+                                );
                             } else {
                                 break;
                             }
@@ -225,4 +251,35 @@ impl PtyHub {
 
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backlog_cap_drops_from_front() {
+        let mut b = Vec::new();
+        append_backlog_capped(&mut b, b"hello ", 10);
+        append_backlog_capped(&mut b, b"world!!", 10);
+        // "hello world!!" is 13 bytes → keep last 10
+        assert_eq!(b.len(), 10);
+        assert_eq!(std::str::from_utf8(&b).unwrap(), "lo world!!");
+    }
+
+    #[test]
+    fn backlog_oversized_chunk_keeps_tail() {
+        let mut b = vec![b'x'; 5];
+        append_backlog_capped(&mut b, &[b'y'; 20], 8);
+        assert_eq!(b.len(), 8);
+        assert!(b.iter().all(|&c| c == b'y'));
+    }
+
+    #[test]
+    fn backlog_under_cap_preserves_all() {
+        let mut b = Vec::new();
+        append_backlog_capped(&mut b, b"abc", 100);
+        append_backlog_capped(&mut b, b"def", 100);
+        assert_eq!(b, b"abcdef");
+    }
 }

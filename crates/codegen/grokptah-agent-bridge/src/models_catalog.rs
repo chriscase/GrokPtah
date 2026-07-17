@@ -197,11 +197,7 @@ fn read_models_cache() -> Option<Vec<CatalogModel>> {
             .or_else(|| entry.info.model.clone())
             .unwrap_or(key);
         let wire = entry.info.model.clone().unwrap_or_else(|| id.clone());
-        let display = entry
-            .info
-            .name
-            .clone()
-            .unwrap_or_else(|| id.clone());
+        let display = entry.info.name.clone().unwrap_or_else(|| id.clone());
         out.push(CatalogModel {
             info: ModelInfo {
                 id: id.clone(),

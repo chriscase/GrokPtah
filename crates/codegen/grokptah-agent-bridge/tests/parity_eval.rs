@@ -3,6 +3,8 @@
 //! Runs fixture tasks against the shipped AgentHost offline path.
 //! Full live CLI comparison is manual (see docs/PARITY_EVALS.md).
 
+#![allow(clippy::while_let_loop)]
+
 use std::fs;
 use std::time::Duration;
 
@@ -46,7 +48,7 @@ impl Drop for IsolatedHome {
 async fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>) {
     loop {
         match timeout(Duration::from_secs(5), rx.recv()).await {
-            Ok(Some(ev)) if matches!(ev, SessionUpdate::TurnComplete { .. }) => break,
+            Ok(Some(SessionUpdate::TurnComplete { .. })) => break,
             Ok(Some(_)) => {}
             _ => break,
         }
@@ -66,7 +68,11 @@ fn fixture_repo() -> tempfile::TempDir {
         "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
     )
     .unwrap();
-    fs::write(dir.path().join("README.md"), "# Fixture\n\nsearch-me-token\n").unwrap();
+    fs::write(
+        dir.path().join("README.md"),
+        "# Fixture\n\nsearch-me-token\n",
+    )
+    .unwrap();
     dir
 }
 
@@ -206,7 +212,11 @@ async fn compact_never_shrinks_local_transcript() {
     }
     let (len_before, start_before, summary_before) = host.compact_stats(s.id).unwrap();
     assert!(start_before == 0 || summary_before.is_none() || summary_before.as_ref().is_some());
-    let before_lines = host.export_transcript(s.id).unwrap().matches("## [").count();
+    let before_lines = host
+        .export_transcript(s.id)
+        .unwrap()
+        .matches("## [")
+        .count();
 
     host.session_prompt(s.id, "/compact".into()).await.unwrap();
     drain(&mut rx).await;
@@ -221,11 +231,12 @@ async fn compact_never_shrinks_local_transcript() {
         "api_context_start must advance after compact ({start_before} → {start_after})"
     );
     let summary = summary_after.expect("compacted_summary must be set");
-    assert!(
-        !summary.is_empty(),
-        "compacted_summary must be non-empty"
-    );
-    let after_lines = host.export_transcript(s.id).unwrap().matches("## [").count();
+    assert!(!summary.is_empty(), "compacted_summary must be non-empty");
+    let after_lines = host
+        .export_transcript(s.id)
+        .unwrap()
+        .matches("## [")
+        .count();
     assert!(after_lines >= before_lines);
 
     // Follow-on offline turn: wire preview must include compacted_summary (same
@@ -361,8 +372,7 @@ async fn rate_limited_surfaces_user_visible_event() {
             ..
         } => {
             assert!(
-                message.to_ascii_lowercase().contains("rate limited")
-                    || message.contains("429"),
+                message.to_ascii_lowercase().contains("rate limited") || message.contains("429"),
                 "{message}"
             );
             assert!(retry_after_ms.is_some());

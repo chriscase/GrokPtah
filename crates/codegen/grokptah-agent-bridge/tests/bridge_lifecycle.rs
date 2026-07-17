@@ -3,6 +3,8 @@
 //! All tests install an isolated GrokPtah home so they never pollute the
 //! developer's real `~/.grokptah` session list.
 
+#![allow(clippy::while_let_loop)] // event-drain loops are clearer as loop+match
+
 use std::time::Duration;
 
 use grokptah_agent_bridge::{
@@ -119,9 +121,13 @@ async fn session_lifecycle_prompt_streams_message() {
         )),
         "expected list_dir tool for 'list files'"
     );
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, SessionUpdate::TurnComplete { cancelled: false, .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        SessionUpdate::TurnComplete {
+            cancelled: false,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -177,20 +183,18 @@ async fn permission_request_round_trip_allow() {
     // never drop ToolCall / ShellSessionStarted that fire between permission
     // grant and prompt join (prior flakes: Elapsed while re-draining).
     let mut events = Vec::new();
-    let mut req_id = None;
-    loop {
+    let id = loop {
         let ev = timeout(Duration::from_secs(8), rx.recv())
             .await
             .expect("timeout waiting for permission")
             .expect("channel closed");
         if let SessionUpdate::PermissionRequired { request, .. } = &ev {
-            req_id = Some(request.id);
+            let id = request.id;
             events.push(ev);
-            break;
+            break id;
         }
         events.push(ev);
-    }
-    let id = req_id.expect("permission id");
+    };
     host.permission_respond(id, PermissionDecision::Allow)
         .unwrap();
 
@@ -230,7 +234,10 @@ async fn permission_request_round_trip_allow() {
         .iter()
         .any(|e| matches!(e, SessionUpdate::TurnComplete { .. }));
 
-    assert!(saw_tool, "shell tool should run after allow, got {events:?}");
+    assert!(
+        saw_tool,
+        "shell tool should run after allow, got {events:?}"
+    );
     assert!(
         saw_shell_started,
         "must emit ShellSessionStarted for live attach, got {events:?}"
@@ -318,11 +325,8 @@ async fn cancel_kills_real_shell_child_not_only_sleep_stub() {
 
     let cmd = format!("sleep 30; echo done > '{}'", marker.display());
     let host2 = host.clone();
-    let prompt = tokio::spawn(async move {
-        host2
-            .session_prompt(session.id, format!("run {cmd}"))
-            .await
-    });
+    let prompt =
+        tokio::spawn(async move { host2.session_prompt(session.id, format!("run {cmd}")).await });
 
     // Wait until live shell session started (real child spawned)
     loop {
@@ -346,14 +350,10 @@ async fn cancel_kills_real_shell_child_not_only_sleep_stub() {
     let mut shell_cancelled = false;
     while let Ok(Some(ev)) = timeout(Duration::from_secs(5), rx.recv()).await {
         match &ev {
-            SessionUpdate::ShellSessionEnded {
-                cancelled: c, ..
-            } => {
+            SessionUpdate::ShellSessionEnded { cancelled: c, .. } => {
                 shell_cancelled = *c;
             }
-            SessionUpdate::TurnComplete {
-                cancelled: c, ..
-            } => {
+            SessionUpdate::TurnComplete { cancelled: c, .. } => {
                 cancelled = *c;
                 break;
             }
@@ -715,16 +715,9 @@ async fn sandbox_readonly_blocks_write() {
 /// Regression: tests must not leave sessions in the real user home.
 #[tokio::test]
 async fn isolated_home_does_not_touch_user_sessions_dir() {
-    let user_sessions = dirs::home_dir()
-        .unwrap()
-        .join(".grokptah")
-        .join("sessions");
+    let user_sessions = dirs::home_dir().unwrap().join(".grokptah").join("sessions");
     let before: Vec<_> = std::fs::read_dir(&user_sessions)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.file_name())
-                .collect()
-        })
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
         .unwrap_or_default();
 
     {
@@ -738,11 +731,7 @@ async fn isolated_home_does_not_touch_user_sessions_dir() {
     }
 
     let after: Vec<_> = std::fs::read_dir(&user_sessions)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.file_name())
-                .collect()
-        })
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
         .unwrap_or_default();
     assert_eq!(
         before, after,
@@ -771,27 +760,23 @@ async fn always_allow_scopes_to_tool_not_global() {
             .await
     });
 
-    let mut req_id = None;
-    let mut tool_name = String::new();
-    loop {
+    let (req_id, tool_name) = loop {
         let ev = timeout(Duration::from_secs(8), rx.recv())
             .await
             .expect("timeout waiting for permission")
             .expect("channel closed");
-        if let SessionUpdate::PermissionRequired { request, .. } = &ev {
-            req_id = Some(request.id);
-            tool_name = request.tool_name.clone();
-            break;
+        if let SessionUpdate::PermissionRequired { request, .. } = ev {
+            break (request.id, request.tool_name);
         }
-    }
+    };
     assert_eq!(tool_name, "run_terminal_cmd");
-    host.permission_respond(req_id.unwrap(), PermissionDecision::AlwaysAllow)
+    host.permission_respond(req_id, PermissionDecision::AlwaysAllow)
         .unwrap();
     prompt1.await.unwrap().unwrap();
     // Drain turn complete
     loop {
         match timeout(Duration::from_secs(5), rx.recv()).await {
-            Ok(Some(ev)) if matches!(ev, SessionUpdate::TurnComplete { .. }) => break,
+            Ok(Some(SessionUpdate::TurnComplete { .. })) => break,
             Ok(Some(_)) => continue,
             _ => break,
         }
@@ -867,7 +852,10 @@ async fn project_local_mcp_does_not_spawn_until_trusted() {
         !marker.exists(),
         "untrusted project .mcp.json must not spawn stdio servers"
     );
-    assert!(tools.is_empty(), "no MCP tools when untrusted, got {tools:?}");
+    assert!(
+        tools.is_empty(),
+        "no MCP tools when untrusted, got {tools:?}"
+    );
 
     // Trust then list again — process may fail handshake but must start (marker).
     grokptah_agent_bridge::set_project_mcp_trusted(dir.path(), true).unwrap();
@@ -932,12 +920,9 @@ async fn multi_turn_wire_includes_prior_tool_output() {
     let session = host.session_new().unwrap();
 
     // Turn 1: offline path reads the file via tools and records tool transcript.
-    host.session_prompt(
-        session.id,
-        format!("read secret_note.txt"),
-    )
-    .await
-    .unwrap();
+    host.session_prompt(session.id, "read secret_note.txt".into())
+        .await
+        .unwrap();
 
     // Wire preview for the *next* model call must include the tool output.
     let wire = host.wire_messages_preview(session.id).unwrap();
@@ -1043,22 +1028,16 @@ async fn deny_rule_blocks_shell_without_prompt() {
     let mut saw_denied = false;
     loop {
         match timeout(Duration::from_secs(2), rx.recv()).await {
-            Ok(Some(ev)) => {
-                match &ev {
-                    SessionUpdate::PermissionRequired { .. } => saw_perm = true,
-                    SessionUpdate::ToolCall {
-                        title,
-                        status,
-                        ..
-                    } if title == "run_terminal_cmd" => {
-                        if matches!(status, grokptah_agent_bridge::ToolCallStatus::Denied) {
-                            saw_denied = true;
-                        }
+            Ok(Some(ev)) => match &ev {
+                SessionUpdate::PermissionRequired { .. } => saw_perm = true,
+                SessionUpdate::ToolCall { title, status, .. } if title == "run_terminal_cmd" => {
+                    if matches!(status, grokptah_agent_bridge::ToolCallStatus::Denied) {
+                        saw_denied = true;
                     }
-                    SessionUpdate::TurnComplete { .. } => break,
-                    _ => {}
                 }
-            }
+                SessionUpdate::TurnComplete { .. } => break,
+                _ => {}
+            },
             _ => break,
         }
     }
@@ -1122,11 +1101,7 @@ async fn concurrent_sessions_shells_do_not_kill_each_other() {
 
     let host_a = host.clone();
     let host_b = host.clone();
-    let ta = tokio::spawn(async move {
-        host_a
-            .session_prompt(a.id, "run sleep 3".into())
-            .await
-    });
+    let ta = tokio::spawn(async move { host_a.session_prompt(a.id, "run sleep 3".into()).await });
     // Stagger so both shells are live
     tokio::time::sleep(Duration::from_millis(150)).await;
     let tb = tokio::spawn(async move {

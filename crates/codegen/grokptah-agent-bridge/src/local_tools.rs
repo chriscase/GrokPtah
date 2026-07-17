@@ -52,9 +52,9 @@ pub fn resolve_under_cwd(cwd: &Path, rel: &str) -> Result<PathBuf> {
     } else {
         cwd.join(rel)
     };
-    let canon_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let canon_cwd = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     if p.exists() {
-        let c = p.canonicalize().context("canonicalize path")?;
+        let c = dunce::canonicalize(&p).context("canonicalize path")?;
         if !c.starts_with(&canon_cwd) {
             anyhow::bail!("path escapes project root: {}", c.display());
         }
@@ -287,9 +287,8 @@ where
                         // both pipes closed — wait for child
                         let mut map = live_shells.lock().await;
                         if let Some(mut child) = map.remove(&session_id) {
-                            match child.wait().await {
-                                Ok(status) => exit_code = status.code(),
-                                Err(_) => {}
+                            if let Ok(status) = child.wait().await {
+                                exit_code = status.code();
                             }
                         }
                         break;

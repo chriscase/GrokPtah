@@ -124,19 +124,16 @@ pub fn is_project_local_mcp_config(path: &Path) -> bool {
 /// Whether this project root is trusted to run stdio MCP servers declared
 /// in repo-local configs (`.mcp.json` / `.grokptah/mcp.json`).
 pub fn is_project_mcp_trusted(project: &Path) -> bool {
-    let Ok(canon) = project.canonicalize() else {
+    let Ok(canon) = dunce::canonicalize(project) else {
         return false;
     };
     let key = canon.to_string_lossy().into_owned();
-    load_mcp_trust_map()
-        .get(&key)
-        .copied()
-        .unwrap_or(false)
+    load_mcp_trust_map().get(&key).copied().unwrap_or(false)
 }
 
 /// True if the user has already answered the trust prompt (yes or no).
 pub fn project_mcp_trust_decided(project: &Path) -> bool {
-    let Ok(canon) = project.canonicalize() else {
+    let Ok(canon) = dunce::canonicalize(project) else {
         return false;
     };
     let key = canon.to_string_lossy().into_owned();
@@ -146,8 +143,7 @@ pub fn project_mcp_trust_decided(project: &Path) -> bool {
 /// Persist per-project MCP trust (canonical path → trusted/denied).
 pub fn set_project_mcp_trusted(project: &Path, trusted: bool) -> Result<(), String> {
     ensure_home();
-    let canon = project
-        .canonicalize()
+    let canon = dunce::canonicalize(project)
         .map_err(|e| format!("canonicalize project for MCP trust: {e}"))?;
     let key = canon.to_string_lossy().into_owned();
     let mut map = load_mcp_trust_map();
@@ -255,7 +251,10 @@ pub fn load_mcp_servers(project: Option<&Path>) -> Vec<McpServerInfo> {
                 name: "filesystem".into(),
                 transport: "stdio".into(),
                 command: Some("npx".into()),
-                args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+                args: vec![
+                    "-y".into(),
+                    "@modelcontextprotocol/server-filesystem".into(),
+                ],
                 url: None,
                 enabled: false,
             }],
@@ -365,7 +364,11 @@ pub fn discover_skills(project: Option<&Path>) -> Vec<SkillInfo> {
         if !dir.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&dir).max_depth(3).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&dir)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
@@ -376,7 +379,11 @@ pub fn discover_skills(project: Option<&Path>) -> Vec<SkillInfo> {
                 .unwrap_or_else(|| "skill".into());
             let desc = fs::read_to_string(path)
                 .ok()
-                .and_then(|t| t.lines().find(|l| !l.trim().is_empty()).map(|l| l.to_string()))
+                .and_then(|t| {
+                    t.lines()
+                        .find(|l| !l.trim().is_empty())
+                        .map(|l| l.to_string())
+                })
                 .unwrap_or_default();
             out.push(SkillInfo {
                 id: path.display().to_string(),

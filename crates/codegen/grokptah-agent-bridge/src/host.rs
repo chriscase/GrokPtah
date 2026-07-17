@@ -234,10 +234,7 @@ impl AgentHostHandle {
             let g = self.inner.lock();
             WorkspaceChrome {
                 version: 2,
-                project_cwd: g
-                    .project_cwd
-                    .as_ref()
-                    .map(|p| p.display().to_string()),
+                project_cwd: g.project_cwd.as_ref().map(|p| p.display().to_string()),
                 active_session: g.active_session,
                 open_tab_ids: g.open_tab_ids.clone(),
                 model: g.model.clone(),
@@ -537,7 +534,11 @@ impl AgentHostHandle {
         v
     }
 
-    pub fn list_sessions_by_kind(&self, kind: SessionKind, include_archived: bool) -> Vec<SessionSummary> {
+    pub fn list_sessions_by_kind(
+        &self,
+        kind: SessionKind,
+        include_archived: bool,
+    ) -> Vec<SessionSummary> {
         let g = self.inner.lock();
         let mut v: Vec<_> = g
             .sessions
@@ -991,9 +992,7 @@ impl AgentHostHandle {
             && !s.plan_steps.is_empty()
         {
             Some((
-                s.plan_goal
-                    .as_deref()
-                    .unwrap_or("execute plan"),
+                s.plan_goal.as_deref().unwrap_or("execute plan"),
                 s.plan_steps.as_slice(),
             ))
         } else {
@@ -1030,11 +1029,7 @@ impl AgentHostHandle {
     /// Surface a rate-limit (or other) agent failure the same way a live turn
     /// does — emits [`SessionUpdate::RateLimited`] when appropriate plus a
     /// user-visible error chunk. Public for offline resilience tests.
-    pub fn surface_agent_failure(
-        &self,
-        session_id: Uuid,
-        err: &str,
-    ) -> Result<()> {
+    pub fn surface_agent_failure(&self, session_id: Uuid, err: &str) -> Result<()> {
         let event_tx = self.inner.lock().event_tx.clone();
         surface_rate_limit_or_error(&event_tx, session_id, err);
         Ok(())
@@ -1113,7 +1108,6 @@ impl AgentHostHandle {
         )
     }
 
-
     pub fn models(&self) -> Vec<ModelInfo> {
         // Live catalog from Grok Build's models_cache.json + builtins (grok-build, …).
         crate::models_catalog::load_catalog()
@@ -1141,8 +1135,8 @@ impl AgentHostHandle {
     }
 
     pub fn set_api_key(&self, api_key: String, display_name: String) -> Result<AuthState> {
-        let state = crate::auth_store::store_api_key(&api_key, &display_name)
-            .map_err(|e| anyhow!(e))?;
+        let state =
+            crate::auth_store::store_api_key(&api_key, &display_name).map_err(|e| anyhow!(e))?;
         self.inner.lock().auth = state.clone();
         Ok(state)
     }
@@ -1190,8 +1184,7 @@ impl AgentHostHandle {
             .project_cwd
             .clone()
             .ok_or_else(|| anyhow!("no project open"))?;
-        crate::discover::set_project_mcp_trusted(&project, trusted)
-            .map_err(|e| anyhow!(e))?;
+        crate::discover::set_project_mcp_trusted(&project, trusted).map_err(|e| anyhow!(e))?;
         Ok(self.mcp_project_trust())
     }
 
@@ -1202,7 +1195,11 @@ impl AgentHostHandle {
             let mut g = self.inner.lock();
             if let Some(s) = g.mcp_servers.iter_mut().find(|s| s.name == name) {
                 s.enabled = enabled;
-                s.status = if enabled { "configured".into() } else { "disabled".into() };
+                s.status = if enabled {
+                    "configured".into()
+                } else {
+                    "disabled".into()
+                };
                 return Ok(s.clone());
             }
             bail!("unknown MCP server");
@@ -1607,10 +1604,8 @@ impl AgentHostHandle {
             .remove(&request_id)
             .ok_or_else(|| anyhow!("no pending permission {request_id}"))?;
         // AlwaysAllow is per-tool only. Global YOLO remains Settings/`set_always_approve`.
-        if decision == PermissionDecision::AlwaysAllow {
-            if !pending.tool_name.is_empty() {
-                g.always_allowed_tools.insert(pending.tool_name);
-            }
+        if decision == PermissionDecision::AlwaysAllow && !pending.tool_name.is_empty() {
+            g.always_allowed_tools.insert(pending.tool_name);
         }
         let _ = pending.tx.send(decision);
         Ok(())
@@ -1766,6 +1761,7 @@ impl AgentHostHandle {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         &self,
         session_id: Uuid,
@@ -1801,10 +1797,7 @@ impl AgentHostHandle {
                     .sessions
                     .get(&session_id)
                     .ok_or_else(|| anyhow!("unknown session"))?;
-                (
-                    api_context_messages(s),
-                    s.compacted_summary.clone(),
-                )
+                (api_context_messages(s), s.compacted_summary.clone())
             };
             let reply = if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
                 match call_xai_chat(
@@ -1843,14 +1836,6 @@ impl AgentHostHandle {
                 .unwrap_or(prompt)
                 .trim()
                 .to_string();
-            let goal = if goal.eq_ignore_ascii_case("plan")
-                || goal.to_lowercase().starts_with("make a plan")
-            {
-                goal
-            } else {
-                goal
-            };
-
             let steps = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
                 offline_plan_steps(&goal)
             } else if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
@@ -2146,6 +2131,7 @@ impl AgentHostHandle {
     }
 
     /// Deterministic Build turn for offline tests (no network).
+    #[allow(clippy::too_many_arguments)]
     async fn run_offline_build_turn(
         &self,
         session_id: Uuid,
@@ -2343,6 +2329,7 @@ impl AgentHostHandle {
 
     /// Multi-round tool loop: model proposes tools → we run them → feed results
     /// back until a final text answer or max rounds.
+    #[allow(clippy::too_many_arguments)]
     async fn run_coding_agent_loop(
         &self,
         session_id: Uuid,
@@ -2381,9 +2368,7 @@ impl AgentHostHandle {
                     && !s.plan_steps.is_empty()
                 {
                     Some((
-                        s.plan_goal
-                            .clone()
-                            .unwrap_or_else(|| "execute plan".into()),
+                        s.plan_goal.clone().unwrap_or_else(|| "execute plan".into()),
                         s.plan_steps.clone(),
                     ))
                 } else {
@@ -2391,17 +2376,16 @@ impl AgentHostHandle {
                 }
             });
             let summary = s.and_then(|s| s.compacted_summary.clone());
-            (plan, summary.or_else(|| compacted_summary.map(|s| s.to_string())))
+            (
+                plan,
+                summary.or_else(|| compacted_summary.map(|s| s.to_string())),
+            )
         };
         let plan_ref = active_plan
             .as_ref()
             .map(|(g, steps)| (g.as_str(), steps.as_slice()));
-        let mut messages = build_agent_messages(
-            history,
-            compacted_summary.as_deref(),
-            cwd,
-            plan_ref,
-        );
+        let mut messages =
+            build_agent_messages(history, compacted_summary.as_deref(), cwd, plan_ref);
 
         // Best-effort MCP discovery (skipped when offline env set for tests).
         let mcp_specs = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some()
@@ -2568,6 +2552,7 @@ impl AgentHostHandle {
     }
 
     /// Run one model-requested tool with permissions + UI events.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_agent_tool(
         &self,
         session_id: Uuid,
@@ -2584,16 +2569,7 @@ impl AgentHostHandle {
         // Namespaced MCP tools
         if let Some((server, tool)) = mcp_index.get(name) {
             return self
-                .run_mcp_tool(
-                    session_id,
-                    cwd,
-                    server,
-                    tool,
-                    name,
-                    &args,
-                    cancel,
-                    event_tx,
-                )
+                .run_mcp_tool(session_id, cwd, server, tool, name, &args, cancel, event_tx)
                 .await;
         }
 
@@ -2688,9 +2664,7 @@ impl AgentHostHandle {
                             let cwd = cwd.to_path_buf();
                             let path = path.clone();
                             let content = content.clone();
-                            async move {
-                                local_tools::tool_write_file(&cwd, &path, &content).await
-                            }
+                            async move { local_tools::tool_write_file(&cwd, &path, &content).await }
                         },
                         cancel,
                         event_tx,
@@ -2712,14 +2686,8 @@ impl AgentHostHandle {
                         "ERROR: sandbox profile forbids this shell command: {command}"
                     ));
                 }
-                self.run_shell_tool_for_output(
-                    session_id,
-                    cwd,
-                    &command,
-                    cancel,
-                    event_tx,
-                )
-                .await
+                self.run_shell_tool_for_output(session_id, cwd, &command, cancel, event_tx)
+                    .await
             }
             "glob_files" => {
                 let pattern = args
@@ -2727,10 +2695,7 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("glob_files requires pattern"))?
                     .to_string();
-                let limit = args
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(80) as usize;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
                 let hits = crate::project_context::glob_files(cwd, &pattern, limit);
                 let out = if hits.is_empty() {
                     "(no matches)".into()
@@ -2792,8 +2757,13 @@ impl AgentHostHandle {
                     let (tx, rx) = oneshot::channel();
                     {
                         let mut g = self.inner.lock();
-                        g.pending_permissions
-                            .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
+                        g.pending_permissions.insert(
+                            req.id,
+                            PendingPermission {
+                                tool_name: req.tool_name.clone(),
+                                tx,
+                            },
+                        );
                     }
                     let _ = event_tx.send(SessionUpdate::PermissionRequired {
                         session_id,
@@ -2834,13 +2804,7 @@ impl AgentHostHandle {
                             if let Some(p) = line.strip_prefix("updated ") {
                                 let path = p.split(' ').next().unwrap_or("");
                                 if !path.is_empty() {
-                                    self.emit_file_edit(
-                                        session_id,
-                                        cwd,
-                                        path,
-                                        line,
-                                        event_tx,
-                                    );
+                                    self.emit_file_edit(session_id, cwd, path, line, event_tx);
                                 }
                             }
                         }
@@ -2890,8 +2854,8 @@ impl AgentHostHandle {
                     .await
             }
             "todo_write" => {
-                let (items, merge) = crate::todo_list::TodoList::from_tool_args(&args)
-                    .map_err(|e| anyhow!(e))?;
+                let (items, merge) =
+                    crate::todo_list::TodoList::from_tool_args(&args).map_err(|e| anyhow!(e))?;
                 let rendered = {
                     let mut g = self.inner.lock();
                     let s = g
@@ -3106,7 +3070,10 @@ impl AgentHostHandle {
                 break;
             }
             if let Ok(tr) = local_tools::tool_grep(cwd, tok, ".").await {
-                parts.push(format!("### grep `{tok}`\n{}", tr.output.chars().take(2_000).collect::<String>()));
+                parts.push(format!(
+                    "### grep `{tok}`\n{}",
+                    tr.output.chars().take(2_000).collect::<String>()
+                ));
             }
         }
 
@@ -3168,6 +3135,7 @@ impl AgentHostHandle {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_mcp_tool(
         &self,
         session_id: Uuid,
@@ -3199,8 +3167,13 @@ impl AgentHostHandle {
             let (tx, rx) = oneshot::channel();
             {
                 let mut g = self.inner.lock();
-                g.pending_permissions
-                    .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
+                g.pending_permissions.insert(
+                    req.id,
+                    PendingPermission {
+                        tool_name: req.tool_name.clone(),
+                        tx,
+                    },
+                );
             }
             let _ = event_tx.send(SessionUpdate::PermissionRequired {
                 session_id,
@@ -3296,16 +3269,12 @@ impl AgentHostHandle {
         if matches!(tool_name, "write_file" | "apply_patch")
             && sandbox_is_readonly(&self.inner.lock().sandbox_profile)
         {
-            return Ok(format!(
-                "ERROR: sandbox is read-only; {tool_name} denied"
-            ));
+            return Ok(format!("ERROR: sandbox is read-only; {tool_name} denied"));
         }
 
         // PreToolUse hooks can deny before permission UI / execution.
         let project = self.inner.lock().project_cwd.clone();
-        if let Some(msg) =
-            crate::hooks::pre_tool_use_deny(project.as_deref(), tool_name, input)
-        {
+        if let Some(msg) = crate::hooks::pre_tool_use_deny(project.as_deref(), tool_name, input) {
             let call_id = Uuid::new_v4().to_string();
             let _ = event_tx.send(SessionUpdate::ToolCall {
                 session_id,
@@ -3344,8 +3313,13 @@ impl AgentHostHandle {
             let (tx, rx) = oneshot::channel();
             {
                 let mut g = self.inner.lock();
-                g.pending_permissions
-                    .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
+                g.pending_permissions.insert(
+                    req.id,
+                    PendingPermission {
+                        tool_name: req.tool_name.clone(),
+                        tx,
+                    },
+                );
             }
             let _ = event_tx.send(SessionUpdate::PermissionRequired {
                 session_id,
@@ -3398,12 +3372,8 @@ impl AgentHostHandle {
                     ToolCallStatus::Completed
                 };
                 let status_s = if tr.cancelled { "failed" } else { "completed" };
-                let _ = crate::hooks::post_tool_use_note(
-                    project.as_deref(),
-                    tool_name,
-                    status_s,
-                    &out,
-                );
+                let _ =
+                    crate::hooks::post_tool_use_note(project.as_deref(), tool_name, status_s, &out);
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
                     call_id: call_id.clone(),
@@ -3422,12 +3392,8 @@ impl AgentHostHandle {
             }
             Err(e) => {
                 let msg = e.to_string();
-                let _ = crate::hooks::post_tool_use_note(
-                    project.as_deref(),
-                    tool_name,
-                    "failed",
-                    &msg,
-                );
+                let _ =
+                    crate::hooks::post_tool_use_note(project.as_deref(), tool_name, "failed", &msg);
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
                     call_id: call_id.clone(),
@@ -3493,8 +3459,13 @@ impl AgentHostHandle {
             let (tx, rx) = oneshot::channel();
             {
                 let mut g = self.inner.lock();
-                g.pending_permissions
-                    .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
+                g.pending_permissions.insert(
+                    req.id,
+                    PendingPermission {
+                        tool_name: req.tool_name.clone(),
+                        tx,
+                    },
+                );
             }
             let _ = event_tx.send(SessionUpdate::PermissionRequired {
                 session_id,
@@ -3666,14 +3637,19 @@ impl AgentHostHandle {
                 id: Uuid::new_v4(),
                 session_id,
                 tool_name: "run_terminal_cmd".into(),
-                summary: format!("Allow tool `run_terminal_cmd`?"),
+                summary: "Allow tool `run_terminal_cmd`?".to_string(),
                 detail: serde_json::json!({ "tool": "run_terminal_cmd", "command": command }),
             };
             let (tx, rx) = oneshot::channel();
             {
                 let mut g = self.inner.lock();
-                g.pending_permissions
-                    .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
+                g.pending_permissions.insert(
+                    req.id,
+                    PendingPermission {
+                        tool_name: req.tool_name.clone(),
+                        tx,
+                    },
+                );
             }
             let _ = event_tx.send(SessionUpdate::PermissionRequired {
                 session_id,
@@ -3814,8 +3790,13 @@ impl AgentHostHandle {
             let (tx, rx) = oneshot::channel();
             {
                 let mut g = self.inner.lock();
-                g.pending_permissions
-                    .insert(req.id, PendingPermission { tool_name: req.tool_name.clone(), tx });
+                g.pending_permissions.insert(
+                    req.id,
+                    PendingPermission {
+                        tool_name: req.tool_name.clone(),
+                        tx,
+                    },
+                );
             }
             let _ = event_tx.send(SessionUpdate::PermissionRequired {
                 session_id,
@@ -4035,7 +4016,9 @@ enum AgentStep {
 /// Map of OpenAI function name → (real server name, real tool name).
 type McpToolIndex = std::collections::HashMap<String, (String, String)>;
 
-fn coding_agent_tools(mcp: &[crate::mcp_runtime::McpToolSpec]) -> (serde_json::Value, McpToolIndex) {
+fn coding_agent_tools(
+    mcp: &[crate::mcp_runtime::McpToolSpec],
+) -> (serde_json::Value, McpToolIndex) {
     let mut tools = vec![
         serde_json::json!({
             "type": "function",
@@ -4285,14 +4268,36 @@ fn sandbox_blocks_shell(profile: &str, command: &str) -> bool {
     // Read-only: block mutators. Workspace-write: block only clearly destructive / escape-y.
     let mutators = if sandbox_is_readonly(profile) {
         &[
-            "rm ", "rm\t", "mv ", "cp ", ">", ">>", "sed -i", "tee ", "npm i", "npm install",
-            "cargo install", "git commit", "git push", "mkdir ", "touch ", "chmod ", "chown ",
-            "curl ", "wget ", "ssh ",
+            "rm ",
+            "rm\t",
+            "mv ",
+            "cp ",
+            ">",
+            ">>",
+            "sed -i",
+            "tee ",
+            "npm i",
+            "npm install",
+            "cargo install",
+            "git commit",
+            "git push",
+            "mkdir ",
+            "touch ",
+            "chmod ",
+            "chown ",
+            "curl ",
+            "wget ",
+            "ssh ",
         ][..]
     } else {
         // workspace-write: still block escaping the tree via absolute rm and network exfil helpers
         &[
-            "rm -rf /", "rm -rf ~", "curl | sh", "wget | sh", "mkfs", ":(){",
+            "rm -rf /",
+            "rm -rf ~",
+            "curl | sh",
+            "wget | sh",
+            "mkfs",
+            ":(){",
         ][..]
     };
     mutators.iter().any(|m| c.contains(m))
@@ -4388,7 +4393,12 @@ fn parse_numbered_plan(text: &str) -> Vec<String> {
     }
     if steps.is_empty() {
         // Fallback: non-empty lines as steps
-        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(8) {
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(8)
+        {
             steps.push(line.to_string());
         }
     }
@@ -4407,7 +4417,10 @@ fn build_agent_messages(
     let instr_note = if loaded.is_empty() {
         String::new()
     } else {
-        format!("\nLoaded project instruction files: {}.\n", loaded.join(", "))
+        format!(
+            "\nLoaded project instruction files: {}.\n",
+            loaded.join(", ")
+        )
     };
     let system = format!(
         "You are GrokPtah, a desktop coding agent (Grok Build–style).\n\
@@ -4488,10 +4501,7 @@ fn build_agent_messages(
     messages
 }
 
-fn resolve_api_base(
-    creds: &crate::auth_store::WireCredentials,
-    model: &str,
-) -> (String, String) {
+fn resolve_api_base(creds: &crate::auth_store::WireCredentials, model: &str) -> (String, String) {
     let entry = crate::models_catalog::lookup(model);
     let model_id = entry
         .as_ref()
@@ -4615,15 +4625,12 @@ where
             let text = resp.text().await.unwrap_or_default();
             let clipped: String = text.chars().take(400).collect();
             last_err = Some(if status.as_u16() == 429 {
-                format!(
-                    "HTTP 429 rate limited (will retry): {clipped}"
-                )
+                format!("HTTP 429 rate limited (will retry): {clipped}")
             } else {
                 format!("HTTP {status}: {clipped}")
             });
             if attempt < 3 {
-                tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << attempt)))
-                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << attempt))).await;
                 continue;
             }
             bail!("{}", last_err.unwrap());
@@ -4649,7 +4656,11 @@ where
         // Non-stream JSON body (fallback path)
         if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
             let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
-            return parse_agent_step_from_message(&v["choices"][0]["message"], false, &mut on_delta);
+            return parse_agent_step_from_message(
+                &v["choices"][0]["message"],
+                false,
+                &mut on_delta,
+            );
         }
 
         // SSE stream path — cancel kills the body read promptly.
@@ -4723,13 +4734,9 @@ where
                 if let Some(arr) = delta["tool_calls"].as_array() {
                     for tc in arr {
                         let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                        let entry = tc_map.entry(idx).or_insert_with(|| {
-                            (
-                                String::new(),
-                                String::new(),
-                                String::new(),
-                            )
-                        });
+                        let entry = tc_map
+                            .entry(idx)
+                            .or_insert_with(|| (String::new(), String::new(), String::new()));
                         if let Some(id) = tc["id"].as_str() {
                             if !id.is_empty() {
                                 entry.0 = id.to_string();
@@ -4881,12 +4888,15 @@ where
 
 /// Build the extractive summary for transcript entries that leave the API window.
 fn build_compact_summary(entries: &[TranscriptEntry]) -> String {
-    let mut out = String::from(
-        "Summary of earlier conversation (full text is retained locally only):\n",
-    );
+    let mut out =
+        String::from("Summary of earlier conversation (full text is retained locally only):\n");
     for (i, e) in entries.iter().enumerate() {
         let clip: String = e.text.chars().take(400).collect();
-        let more = if e.text.chars().count() > 400 { "…" } else { "" };
+        let more = if e.text.chars().count() > 400 {
+            "…"
+        } else {
+            ""
+        };
         out.push_str(&format!("\n[{}] {}: {}{}\n", i + 1, e.role, clip, more));
         // Include clipped tool outputs so compact does not reintroduce tool amnesia.
         if e.role == "tool" {
@@ -4933,9 +4943,7 @@ fn api_context_messages(session: &Session) -> Vec<(String, String)> {
                 // prefer full output when present (capped for wire size).
                 // Hard prefix marks untrusted tool residue (not user intent).
                 let content = if body.is_empty() {
-                    format!(
-                        "TOOL_RESULT (untrusted, prior turn): `{title}` · {status}"
-                    )
+                    format!("TOOL_RESULT (untrusted, prior turn): `{title}` · {status}")
                 } else {
                     let clipped = crate::textutil::truncate_with_marker(
                         body,
@@ -4998,12 +5006,10 @@ async fn call_xai_chat(
         "https://api.x.ai/v1".into()
     };
     let system = match kind {
-        SessionKind::Chat => {
-            "You are Grok, a helpful, witty AI assistant in GrokPtah. \
+        SessionKind::Chat => "You are Grok, a helpful, witty AI assistant in GrokPtah. \
              This is a regular conversation — not a coding-agent build session. \
              Answer clearly; use markdown when useful. Do not invent local file edits."
-                .to_string()
-        }
+            .to_string(),
         SessionKind::Build => format!(
             "You are GrokPtah, a desktop coding agent built on Grok Build. \
              Working directory: {}. Be helpful and concise. Prefer concrete code changes.",
@@ -5063,9 +5069,7 @@ async fn call_xai_chat(
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
     let send_once = |c: &crate::auth_store::WireCredentials| {
-        let req = client
-            .post(&url)
-            .header("Content-Type", "application/json");
+        let req = client.post(&url).header("Content-Type", "application/json");
         let req = crate::auth_store::apply_auth_headers(req, c, &base);
         req.json(&body)
     };
@@ -5093,9 +5097,10 @@ async fn call_xai_chat(
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
-                resp = send_once(&creds).send().await.map_err(|e| {
-                    anyhow!("request error after refresh for {url}: {e}")
-                })?;
+                resp = send_once(&creds)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("request error after refresh for {url}: {e}"))?;
             }
             Err(e) => {
                 let text = resp.text().await.unwrap_or_default();
@@ -5140,4 +5145,3 @@ async fn call_xai_chat(
     }
     bail!("empty model response: {v}");
 }
-

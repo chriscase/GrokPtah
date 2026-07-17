@@ -26,8 +26,11 @@ fn fixture_repo_layout_for_manual_parity() {
         "Always add a trailing newline to files you write.\n",
     )
     .unwrap();
-    fs::write(dir.path().join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b }\n")
-        .unwrap();
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
     fs::write(
         dir.path().join("src/main.rs"),
         "fn main() { println!(\"{}\", src_lib_add()); }\nfn src_lib_add() -> i32 { 0 }\n",

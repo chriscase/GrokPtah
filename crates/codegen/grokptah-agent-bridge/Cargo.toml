@@ -30,6 +30,7 @@ bytes = "1"
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 open = "5"
 fs2 = "0.4"
+dunce = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "test-util"] }

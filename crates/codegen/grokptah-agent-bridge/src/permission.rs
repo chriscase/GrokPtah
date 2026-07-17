@@ -59,9 +59,7 @@ pub fn rule_matches(rule: &str, tool_name: &str) -> bool {
     }
     // Known family aliases used in the Settings sample + docs.
     let families: &[&str] = match base {
-        "shell" | "bash" | "run_terminal_cmd" | "terminal" => {
-            &["run_terminal_cmd"]
-        }
+        "shell" | "bash" | "run_terminal_cmd" | "terminal" => &["run_terminal_cmd"],
         "webfetch" | "web_fetch" | "fetch" => &["web_fetch"],
         "write" | "write_file" | "edit" => &["write_file", "apply_patch"],
         "apply_patch" | "patch" => &["apply_patch"],

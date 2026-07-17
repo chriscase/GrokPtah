@@ -25,6 +25,7 @@ impl InstanceLock {
         let path = grokptah_home().join(".instance.lock");
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&path)

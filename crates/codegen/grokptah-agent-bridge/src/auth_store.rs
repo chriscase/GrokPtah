@@ -215,10 +215,8 @@ fn load_grok_build_session() -> Option<WireCredentials> {
             .and_then(|v| v.as_str())
             .unwrap_or("oidc");
         // User sessions always need the CLI token-auth header on cli-chat-proxy.
-        let oidc = mode == "oidc"
-            || mode.contains("oidc")
-            || mode == "user"
-            || mode == "user_token";
+        let oidc =
+            mode == "oidc" || mode.contains("oidc") || mode == "user" || mode == "user_token";
         let expires_at = cred
             .get("expires_at")
             .and_then(|v| v.as_str())
@@ -331,7 +329,9 @@ async fn refresh_oidc(creds: &WireCredentials) -> Result<WireCredentials, String
 
     // Re-read disk — another process may have refreshed already.
     if let Some(disk) = load_grok_build_session() {
-        if disk.expires_at.is_some_and(|exp| exp > Utc::now() + ChronoDuration::minutes(5))
+        if disk
+            .expires_at
+            .is_some_and(|exp| exp > Utc::now() + ChronoDuration::minutes(5))
             && disk.bearer != creds.bearer
         {
             return Ok(disk);
@@ -347,10 +347,7 @@ async fn refresh_oidc_inner(creds: &WireCredentials) -> Result<WireCredentials, 
         .refresh_token
         .as_deref()
         .ok_or_else(|| "no refresh_token in auth.json — run `grok login`".to_string())?;
-    let issuer = creds
-        .oidc_issuer
-        .as_deref()
-        .unwrap_or("https://auth.x.ai");
+    let issuer = creds.oidc_issuer.as_deref().unwrap_or("https://auth.x.ai");
     let client_id = creds
         .oidc_client_id
         .as_deref()
@@ -457,13 +454,13 @@ fn write_refreshed_auth(
     if let Some(rt) = refresh_token {
         entry.insert("refresh_token".into(), Value::String(rt.into()));
     }
-    entry.insert(
-        "expires_at".into(),
-        Value::String(expires_at.to_rfc3339()),
-    );
+    entry.insert("expires_at".into(), Value::String(expires_at.to_rfc3339()));
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     Ok(())
 }

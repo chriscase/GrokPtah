@@ -27,17 +27,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.92.0"
+          components: rustfmt, clippy
       - name: Install frontend deps
-        run: npm install
+        run: npm ci
       - name: Typecheck + unit tests
         run: |
           npm run typecheck
           npm test
-      - name: Cargo check (desktop)
+      - name: Cargo check + unit tests (desktop)
         working-directory: desktop/src-tauri
-        run: cargo check
-      - name: Bridge integration tests
+        run: |
+          cargo check
+          cargo test
+      - name: Bridge fmt + clippy + tests
         # Bridge is its own Cargo workspace root (path dep of desktop).
-        # `cargo test -p` from src-tauri fails: package is not a workspace member.
         working-directory: crates/codegen/grokptah-agent-bridge
-        run: cargo test
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test

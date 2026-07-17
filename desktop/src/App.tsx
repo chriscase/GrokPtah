@@ -34,6 +34,7 @@ import {
   mergeAssistantChunk,
   subscribeSessionUpdates,
 } from "./lib/sessionEvents";
+import { displaySessionTitle } from "./lib/sessionTitle";
 import { entriesToTranscriptItems } from "./lib/transcript";
 import {
   doneActivity,
@@ -1517,7 +1518,9 @@ export default function App() {
                     <span className={`kind-chip ${s.kind ?? workspaceMode}`}>
                       {s.kind ?? workspaceMode}
                     </span>
-                    <span className="session-item-name">{s.title}</span>
+                    <span className="session-item-name" title={s.title}>
+                      {displaySessionTitle(s, sessions)}
+                    </span>
                   </div>
                   <div className="session-item-sub">
                     {s.message_count} msgs{open ? " · open" : ""}
@@ -1593,7 +1596,26 @@ export default function App() {
                   ) : t.unseen ? (
                     <span className="attn-dot unseen" title="Unseen activity" />
                   ) : null}
-                  <span className="session-tab-text">{t.title}</span>
+                  <span
+                    className="session-tab-text"
+                    title={t.title}
+                  >
+                    {displaySessionTitle(
+                      {
+                        id: t.id,
+                        title: t.title,
+                        cwd: sessions.find((s) => s.id === t.id)?.cwd,
+                      },
+                      [
+                        ...sessions,
+                        ...tabs.map((x) => ({
+                          id: x.id,
+                          title: x.title,
+                          cwd: sessions.find((s) => s.id === x.id)?.cwd,
+                        })),
+                      ],
+                    )}
+                  </span>
                 </button>
                 <button
                   type="button"
@@ -1737,6 +1759,15 @@ export default function App() {
                     showClose={docks.length > 1}
                     onClosePane={undockSession}
                     onFocusSession={focusSession}
+                    cwd={sessions.find((s) => s.id === dockTab.id)?.cwd}
+                    titlePeers={[
+                      ...sessions,
+                      ...tabs.map((x) => ({
+                        id: x.id,
+                        title: x.title,
+                        cwd: sessions.find((s) => s.id === x.id)?.cwd,
+                      })),
+                    ]}
                   />
                 </div>
               );

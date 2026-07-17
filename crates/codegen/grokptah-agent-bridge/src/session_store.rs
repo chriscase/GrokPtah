@@ -185,8 +185,7 @@ pub fn append_transcript(session: &Session, from_index: usize) -> Result<usize> 
     let mut n = 0;
     let mut batch = String::new();
     for entry in session.transcript.iter().skip(from_index) {
-        let line = serde_json::to_string(entry)
-            .with_context(|| "serialize transcript entry")?;
+        let line = serde_json::to_string(entry).with_context(|| "serialize transcript entry")?;
         batch.push_str(&line);
         batch.push('\n');
         n += 1;

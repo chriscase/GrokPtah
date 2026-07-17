@@ -22,10 +22,10 @@ use crate::session::{SessionKind, TranscriptEntry};
 use crate::session_store::{self, SessionMeta};
 
 const STOP: &[&str] = &[
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "is", "it",
-    "this", "that", "with", "as", "by", "from", "be", "are", "was", "were", "been", "have",
-    "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might",
-    "not", "no", "yes", "you", "your", "i", "me", "my", "we", "our", "they", "them", "their",
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "is", "it", "this",
+    "that", "with", "as", "by", "from", "be", "are", "was", "were", "been", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should", "may", "might", "not", "no", "yes",
+    "you", "your", "i", "me", "my", "we", "our", "they", "them", "their",
 ];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,7 +221,7 @@ pub fn search(q: &SearchQuery) -> anyhow::Result<Vec<SearchHit>> {
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    hits.truncate(q.limit.max(1).min(200));
+    hits.truncate(q.limit.clamp(1, 200));
     Ok(hits)
 }
 
