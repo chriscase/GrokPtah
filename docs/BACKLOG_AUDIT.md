@@ -45,6 +45,10 @@
 
 | Issue | Proof |
 |-------|--------|
+| **#140** | npm ci + fmt/clippy -D warnings + src-tauri tests (`881e4a8`) |
+| **#127** | You/Grok role labels + borders |
+| **#142** | pty backlog tests + session_store unit tests in CI |
+| **#130** | displaySessionTitle + pane wiring |
 | **#122** | `memo()` + **stable** `onFocusSession`/`onClosePane` id handlers (not per-dock lambdas); SessionPane, MarkdownBody, ToolCallCard, FleetStrip; MD_COMPONENTS hoisted; `openTabIdsKey` persist; `npm test` `memoIsolation.test.ts` |
 | **#123** | Stick hysteresis + **Jump to latest ↓** button in SessionPane; structural test |
 
@@ -54,8 +58,8 @@
 - Product honesty: **#52**, **#43**, **#38**, **#93**
 - TUI parity: **#146–#149**
 - PTY: **#135–#138**
-- CI residual: **#140–#142**
-- UX polish: **#126–#130**, **#132–#134**, **#150**
+- CI residual: **#141**
+- UX polish: **#126**, **#128–#129**, **#132–#134**, **#150**
 - Architecture: **#144**, **#145**
 - Permissions residual: **#113**, **#114**
 
