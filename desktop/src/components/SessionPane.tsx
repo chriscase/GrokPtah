@@ -7,6 +7,7 @@ import {
 import { shouldStickToBottom } from "../lib/streamApply";
 import { ActivityIndicator } from "./ActivityIndicator";
 import { DebugTrace } from "./DebugTrace";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { StreamingMarkdown } from "./StreamingMarkdown";
 import { StreamingText } from "./StreamingText";
 import { ToolCallCard, ToolHistoryGroup } from "./ToolCallCard";
@@ -224,55 +225,57 @@ export function SessionPane({
           }
           const { item, index: i } = row;
           return (
-            <div key={i} className={`bubble ${item.kind}`}>
-              {item.kind === "tool" && <ToolCallCard item={item} />}
-              {item.kind === "plan" && (
-                <>
-                  <strong>Plan ({item.status})</strong>
-                  <ol>
-                    {item.steps.map((s, j) => (
-                      <li key={j}>{s}</li>
-                    ))}
-                  </ol>
-                  {focused && item.status === "proposed" && (
-                    <div className="modal-actions">
-                      <button
-                        type="button"
-                        className="primary"
-                        onClick={() => {
-                          void api.acceptPlan(tab.id).catch((e) => {
-                            console.warn("acceptPlan failed", e);
-                          });
-                        }}
-                      >
-                        Accept & execute
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void api.rejectPlan(tab.id)}
-                      >
-                        Reject
-                      </button>
-                    </div>
-                  )}
-                </>
-              )}
-              {item.kind === "assistant" && (
-                <StreamingMarkdown
-                  text={item.text}
-                  streaming={!!item.streaming}
-                />
-              )}
-              {item.kind === "thought" && (
-                <StreamingText text={item.text} streaming={item.streaming} />
-              )}
-              {item.kind === "user" && (
-                <div className="user-text">{item.text}</div>
-              )}
-              {item.kind === "error" && (
-                <div className="error-text">{item.text}</div>
-              )}
-            </div>
+            <ErrorBoundary key={i} label={`bubble ${item.kind}`}>
+              <div className={`bubble ${item.kind}`}>
+                {item.kind === "tool" && <ToolCallCard item={item} />}
+                {item.kind === "plan" && (
+                  <>
+                    <strong>Plan ({item.status})</strong>
+                    <ol>
+                      {item.steps.map((s, j) => (
+                        <li key={j}>{s}</li>
+                      ))}
+                    </ol>
+                    {focused && item.status === "proposed" && (
+                      <div className="modal-actions">
+                        <button
+                          type="button"
+                          className="primary"
+                          onClick={() => {
+                            void api.acceptPlan(tab.id).catch((e) => {
+                              console.warn("acceptPlan failed", e);
+                            });
+                          }}
+                        >
+                          Accept & execute
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void api.rejectPlan(tab.id)}
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    )}
+                  </>
+                )}
+                {item.kind === "assistant" && (
+                  <StreamingMarkdown
+                    text={item.text}
+                    streaming={!!item.streaming}
+                  />
+                )}
+                {item.kind === "thought" && (
+                  <StreamingText text={item.text} streaming={item.streaming} />
+                )}
+                {item.kind === "user" && (
+                  <div className="user-text">{item.text}</div>
+                )}
+                {item.kind === "error" && (
+                  <div className="error-text">{item.text}</div>
+                )}
+              </div>
+            </ErrorBoundary>
           );
         })}
         <div ref={bottomRef} />

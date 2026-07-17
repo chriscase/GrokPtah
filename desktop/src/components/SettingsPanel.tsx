@@ -287,6 +287,13 @@ export function SettingsPanel({
 
                 <div className="settings-field">
                   <span className="settings-field-label">Allow / deny rules</span>
+                  <p className="settings-lead" style={{ marginTop: 0 }}>
+                    Enforced at the tool gate: <strong>deny wins</strong>. Allow
+                    skips the prompt for matching tools; deny blocks them.
+                    Patterns: tool name, family alias (
+                    <code>Shell(*)</code>, <code>WebFetch(*)</code>), or{" "}
+                    <code>*</code>.
+                  </p>
                   <div className="settings-rules">
                     <div>
                       <strong>Allow</strong>
@@ -301,22 +308,36 @@ export function SettingsPanel({
                       </pre>
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() =>
-                      void apply(
-                        () =>
-                          api.setAllowDenyRules(
-                            ["Shell(*)"],
-                            ["WebFetch(*)"],
-                          ),
-                        "Sample rules applied",
-                      )
-                    }
-                  >
-                    Apply sample allow/deny rules
-                  </button>
+                  <div className="modal-actions" style={{ marginTop: "0.5rem" }}>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        void apply(
+                          () =>
+                            api.setAllowDenyRules(
+                              ["Shell(*)"],
+                              ["WebFetch(*)"],
+                            ),
+                          "Sample rules applied (enforced)",
+                        )
+                      }
+                    >
+                      Apply sample rules
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        void apply(
+                          () => api.setAllowDenyRules([], []),
+                          "Rules cleared",
+                        )
+                      }
+                    >
+                      Clear rules
+                    </button>
+                  </div>
                 </div>
               </section>
             )}

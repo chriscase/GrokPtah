@@ -3831,3 +3831,30 @@ button:disabled {
     display: none;
   }
 }
+
+/* Error boundary fallback (#124) */
+.error-boundary {
+  margin: 0.75rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid color-mix(in srgb, var(--danger, #e85d5d) 55%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger, #e85d5d) 12%, var(--panel, #141820));
+  color: var(--text, #e8eaed);
+}
+.error-boundary h3 {
+  margin: 0 0 0.35rem;
+  font-size: 0.95rem;
+}
+.error-boundary-msg {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+  color: var(--muted, #9aa0a6);
+}
+.error-boundary-detail {
+  margin: 0 0 0.65rem;
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+  max-height: 8rem;
+  overflow: auto;
+  color: var(--muted, #9aa0a6);
+}

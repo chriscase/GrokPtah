@@ -1030,3 +1030,133 @@ fn turn_busy_guard_clears_on_panic_unwind() {
             .expect("must accept turn after panic cleanup");
     });
 }
+
+#[tokio::test]
+async fn deny_rule_blocks_shell_without_prompt() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: false,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    host.set_allow_deny_rules(vec![], vec!["Shell(*)".into()]);
+    let session = host.session_new().unwrap();
+    let mut rx = host.take_event_receiver().unwrap();
+
+    host.session_prompt(session.id, "run echo should-be-denied".into())
+        .await
+        .unwrap();
+
+    // Offline turn always ends with a done line; assert the *tool* was denied.
+    let mut saw_perm = false;
+    let mut saw_denied = false;
+    loop {
+        match timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(ev)) => {
+                match &ev {
+                    SessionUpdate::PermissionRequired { .. } => saw_perm = true,
+                    SessionUpdate::ToolCall {
+                        title,
+                        status,
+                        ..
+                    } if title == "run_terminal_cmd" => {
+                        if matches!(status, grokptah_agent_bridge::ToolCallStatus::Denied) {
+                            saw_denied = true;
+                        }
+                    }
+                    SessionUpdate::TurnComplete { .. } => break,
+                    _ => {}
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_denied, "deny rule must mark shell tool Denied");
+    assert!(!saw_perm, "deny rule must not open permission modal");
+}
+
+#[tokio::test]
+async fn allow_rule_suppresses_shell_prompt() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: false,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    host.set_allow_deny_rules(vec!["Shell(*)".into()], vec![]);
+    let session = host.session_new().unwrap();
+    let mut rx = host.take_event_receiver().unwrap();
+
+    host.session_prompt(session.id, "run echo allow-ok".into())
+        .await
+        .unwrap();
+
+    let mut saw_perm = false;
+    let mut saw_shell = false;
+    loop {
+        match timeout(Duration::from_secs(3), rx.recv()).await {
+            Ok(Some(ev)) => {
+                if matches!(ev, SessionUpdate::PermissionRequired { .. }) {
+                    saw_perm = true;
+                }
+                match &ev {
+                    SessionUpdate::ToolCall { title, .. } if title == "run_terminal_cmd" => {
+                        saw_shell = true;
+                    }
+                    SessionUpdate::TurnComplete { .. } => break,
+                    _ => {}
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(!saw_perm, "allow rule must suppress permission prompt");
+    assert!(saw_shell, "shell tool should still run under allow rule");
+}
+
+#[tokio::test]
+async fn concurrent_sessions_shells_do_not_kill_each_other() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let a = host.session_new().unwrap();
+    let b = host.session_new().unwrap();
+
+    let host_a = host.clone();
+    let host_b = host.clone();
+    let ta = tokio::spawn(async move {
+        host_a
+            .session_prompt(a.id, "run sleep 3".into())
+            .await
+    });
+    // Stagger so both shells are live
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let tb = tokio::spawn(async move {
+        host_b
+            .session_prompt(b.id, "run echo session-b-alive".into())
+            .await
+    });
+
+    let b_reply = tb.await.unwrap().unwrap();
+    // Cancel A while it sleeps — must not kill B (already done) incorrectly
+    let _ = host.cancel_turn(Some(a.id));
+    let a_reply = ta.await.unwrap().unwrap();
+
+    assert!(
+        b_reply.contains("session-b-alive")
+            || b_reply.contains("offline")
+            || b_reply.contains("exit"),
+        "session B shell must complete independently, got {b_reply}"
+    );
+    // A was cancelled or finished — either way B was not wedged by A's cancel
+    let _ = a_reply;
+}

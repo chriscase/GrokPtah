@@ -177,8 +177,8 @@ pub async fn tool_write_file(cwd: &Path, path: &str, content: &str) -> Result<To
     ))
 }
 
-/// Slot for the live shell child so [`crate::host::AgentHostHandle::cancel_turn`] can kill it.
-pub type LiveShellSlot = Arc<TokioMutex<Option<Child>>>;
+/// Per-session live shell children so concurrent sessions do not kill each other.
+pub type LiveShellMap = Arc<TokioMutex<std::collections::HashMap<uuid::Uuid, Child>>>;
 
 /// Run a shell command with streamed stdout/stderr, cancellable via `cancel`
 /// (kills the child process — works for any command, not only sleep).
@@ -186,7 +186,8 @@ pub async fn tool_shell_streaming<F>(
     cwd: &Path,
     command: &str,
     cancel: CancellationToken,
-    live_shell: LiveShellSlot,
+    session_id: uuid::Uuid,
+    live_shells: LiveShellMap,
     mut on_chunk: F,
 ) -> Result<ToolResult>
 where
@@ -206,8 +207,13 @@ where
     let stderr = child.stderr.take().context("stderr")?;
 
     {
-        let mut slot = live_shell.lock().await;
-        *slot = Some(child);
+        let mut map = live_shells.lock().await;
+        // Replace only this session's previous child (if any).
+        if let Some(mut old) = map.remove(&session_id) {
+            let _ = old.kill().await;
+            let _ = old.wait().await;
+        }
+        map.insert(session_id, child);
     }
 
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -252,8 +258,8 @@ where
         tokio::select! {
             _ = cancel.cancelled() => {
                 cancelled = true;
-                let mut slot = live_shell.lock().await;
-                if let Some(mut child) = slot.take() {
+                let mut map = live_shells.lock().await;
+                if let Some(mut child) = map.remove(&session_id) {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                 }
@@ -279,8 +285,8 @@ where
                     }
                     None => {
                         // both pipes closed — wait for child
-                        let mut slot = live_shell.lock().await;
-                        if let Some(mut child) = slot.take() {
+                        let mut map = live_shells.lock().await;
+                        if let Some(mut child) = map.remove(&session_id) {
                             match child.wait().await {
                                 Ok(status) => exit_code = status.code(),
                                 Err(_) => {}
@@ -299,10 +305,10 @@ where
         on_chunk(s);
     }
 
-    // Ensure slot cleared
+    // Ensure this session's slot cleared
     {
-        let mut slot = live_shell.lock().await;
-        if let Some(mut child) = slot.take() {
+        let mut map = live_shells.lock().await;
+        if let Some(mut child) = map.remove(&session_id) {
             if cancelled {
                 let _ = child.kill().await;
             }

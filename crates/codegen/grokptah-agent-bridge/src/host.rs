@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::local_tools;
-use crate::permission::{PermissionDecision, PermissionRequest};
+use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::search_engine::{self, SearchHit, SearchQuery};
 use crate::session::{Session, SessionKind, SessionSummary, TranscriptEntry};
 use crate::session_store::{self, WorkspaceChrome};
@@ -103,7 +103,7 @@ struct Inner {
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
     /// Live tool shell child — killed by [`AgentHostHandle::cancel_turn`].
-    live_shell: local_tools::LiveShellSlot,
+    live_shells: local_tools::LiveShellMap,
 }
 
 /// Clears `turn_cancels` for a session when dropped — keeps panics from wedging busy.
@@ -201,7 +201,7 @@ impl AgentHost {
             turn_cancels: HashMap::new(),
             event_tx,
             edited_files: Vec::new(),
-            live_shell: Arc::new(tokio::sync::Mutex::new(None)),
+            live_shells: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
         AgentHostHandle {
             inner: Arc::new(Mutex::new(inner)),
@@ -1080,6 +1080,20 @@ impl AgentHostHandle {
         g.deny_rules = deny;
     }
 
+    /// Consult YOLO / always-allowed tools / allow+deny rules for a tool gate.
+    fn tool_gate(&self, tool_name: &str) -> ToolGate {
+        let g = self.inner.lock();
+        evaluate_tool_gate(
+            tool_name,
+            g.always_approve,
+            &g.always_allowed_tools,
+            &g.permission_mode,
+            &g.allow_rules,
+            &g.deny_rules,
+        )
+    }
+
+
     pub fn models(&self) -> Vec<ModelInfo> {
         // Live catalog from Grok Build's models_cache.json + builtins (grok-build, …).
         crate::models_catalog::load_catalog()
@@ -1585,7 +1599,7 @@ impl AgentHostHandle {
     /// Cancel the in-flight turn for `session_id`, or every active turn when
     /// `session_id` is `None` (shutdown / global stop).
     pub fn cancel_turn(&self, session_id: Option<Uuid>) -> Result<()> {
-        let live_shell = {
+        let (live_shells, kill_ids) = {
             let g = self.inner.lock();
             match session_id {
                 Some(id) => {
@@ -1593,6 +1607,7 @@ impl AgentHostHandle {
                         bail!("no active turn for session {id}");
                     };
                     c.cancel();
+                    (g.live_shells.clone(), vec![id])
                 }
                 None => {
                     if g.turn_cancels.is_empty() {
@@ -1601,24 +1616,26 @@ impl AgentHostHandle {
                     for c in g.turn_cancels.values() {
                         c.cancel();
                     }
+                    let ids: Vec<Uuid> = g.turn_cancels.keys().copied().collect();
+                    (g.live_shells.clone(), ids)
                 }
             }
-            g.live_shell.clone()
         };
-        // Kill live shell child immediately (not only cooperative sleep).
+        // Kill only this session's (or all cancelled sessions') shell children.
         let handle = tokio::runtime::Handle::try_current();
         if let Ok(h) = handle {
             h.spawn(async move {
-                let mut slot = live_shell.lock().await;
-                if let Some(mut child) = slot.take() {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                let mut map = live_shells.lock().await;
+                for id in kill_ids {
+                    if let Some(mut child) = map.remove(&id) {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                    }
                 }
             });
-        } else {
-            // Sync fallback: try_lock and kill
-            if let Ok(mut slot) = live_shell.try_lock() {
-                if let Some(mut child) = slot.take() {
+        } else if let Ok(mut map) = live_shells.try_lock() {
+            for id in kill_ids {
+                if let Some(mut child) = map.remove(&id) {
                     let _ = child.start_kill();
                 }
             }
@@ -2738,13 +2755,11 @@ impl AgentHostHandle {
                     .to_string();
                 let input = args.clone();
                 let needs = true;
-                let always = {
-                    let g = self.inner.lock();
-                    g.always_approve
-                        || g.always_allowed_tools.contains("apply_patch")
-                        || g.always_allowed_tools.contains("write_file")
-                        || g.permission_mode == "bypassPermissions"
-                };
+                let gate = self.tool_gate("apply_patch");
+                if gate == ToolGate::AutoDeny {
+                    return Ok("DENIED by deny rule: apply_patch".into());
+                }
+                let always = matches!(gate, ToolGate::AutoAllow);
                 let call_id = Uuid::new_v4().to_string();
                 if needs && !always {
                     let req = PermissionRequest {
@@ -3147,12 +3162,11 @@ impl AgentHostHandle {
         if cancel.is_cancelled() {
             return Ok("(cancelled)".into());
         }
-        let always = {
-            let g = self.inner.lock();
-            g.always_approve
-                || g.always_allowed_tools.contains(wire_name)
-                || g.permission_mode == "bypassPermissions"
-        };
+        let gate = self.tool_gate(wire_name);
+        if gate == ToolGate::AutoDeny {
+            return Ok(format!("DENIED by deny rule: MCP `{wire_name}`"));
+        }
+        let always = matches!(gate, ToolGate::AutoAllow);
         let call_id = Uuid::new_v4().to_string();
         if !always {
             let req = PermissionRequest {
@@ -3293,12 +3307,11 @@ impl AgentHostHandle {
 
         let call_id = Uuid::new_v4().to_string();
         let needs_perm = matches!(tool_name, "run_terminal_cmd" | "write_file" | "apply_patch");
-        let always = {
-            let g = self.inner.lock();
-            g.always_approve
-                || g.always_allowed_tools.contains(tool_name)
-                || g.permission_mode == "bypassPermissions"
-        };
+        let gate = self.tool_gate(tool_name);
+        if gate == ToolGate::AutoDeny {
+            return Ok(format!("DENIED by deny rule: tool `{tool_name}`"));
+        }
+        let always = matches!(gate, ToolGate::AutoAllow);
 
         if needs_perm && !always {
             let req = PermissionRequest {
@@ -3426,12 +3439,28 @@ impl AgentHostHandle {
             return Ok("(cancelled)".into());
         }
         let call_id = Uuid::new_v4().to_string();
-        let always = {
-            let g = self.inner.lock();
-            g.always_approve
-                || g.always_allowed_tools.contains("run_terminal_cmd")
-                || g.permission_mode == "bypassPermissions"
-        };
+        let gate = self.tool_gate("run_terminal_cmd");
+        if gate == ToolGate::AutoDeny {
+            let msg = format!("DENIED by deny rule: shell `{command}`");
+            let _ = event_tx.send(SessionUpdate::ToolCall {
+                session_id,
+                call_id: call_id.clone(),
+                title: "run_terminal_cmd".into(),
+                kind: ToolCallKind::Execute,
+                status: ToolCallStatus::Denied,
+                input: serde_json::json!({ "command": command }),
+            });
+            push_tool(
+                self,
+                session_id,
+                &call_id,
+                "run_terminal_cmd",
+                ToolCallStatus::Denied,
+                Some(msg.clone()),
+            );
+            return Ok(msg);
+        }
+        let always = matches!(gate, ToolGate::AutoAllow);
 
         if !always {
             let req = PermissionRequest {
@@ -3502,14 +3531,15 @@ impl AgentHostHandle {
             command: command.to_string(),
         });
 
-        let live_shell = self.inner.lock().live_shell.clone();
+        let live_shells = self.inner.lock().live_shells.clone();
         let event_tx_chunks = event_tx.clone();
         let call_id_chunks = call_id.clone();
         let result = local_tools::tool_shell_streaming(
             cwd,
             command,
             cancel.clone(),
-            live_shell,
+            session_id,
+            live_shells,
             move |chunk| {
                 let _ = event_tx_chunks.send(SessionUpdate::ShellOutput {
                     session_id,
@@ -3597,12 +3627,19 @@ impl AgentHostHandle {
         }
         let call_id = Uuid::new_v4().to_string();
         let needs_perm = true;
-        let always = {
-            let g = self.inner.lock();
-            g.always_approve
-                || g.always_allowed_tools.contains("run_terminal_cmd")
-                || g.permission_mode == "bypassPermissions"
-        };
+        let gate = self.tool_gate("run_terminal_cmd");
+        if gate == ToolGate::AutoDeny {
+            let _ = event_tx.send(SessionUpdate::ToolCall {
+                session_id,
+                call_id: call_id.clone(),
+                title: "run_terminal_cmd".into(),
+                kind: ToolCallKind::Execute,
+                status: ToolCallStatus::Denied,
+                input: serde_json::json!({ "command": command }),
+            });
+            return Ok(());
+        }
+        let always = matches!(gate, ToolGate::AutoAllow);
 
         if needs_perm && !always {
             let req = PermissionRequest {
@@ -3658,14 +3695,15 @@ impl AgentHostHandle {
             command: command.to_string(),
         });
 
-        let live_shell = self.inner.lock().live_shell.clone();
+        let live_shells = self.inner.lock().live_shells.clone();
         let event_tx_chunks = event_tx.clone();
         let call_id_chunks = call_id.clone();
         let result = local_tools::tool_shell_streaming(
             cwd,
             command,
             cancel.clone(),
-            live_shell,
+            session_id,
+            live_shells,
             move |chunk| {
                 let _ = event_tx_chunks.send(SessionUpdate::ShellOutput {
                     session_id,
@@ -3731,12 +3769,19 @@ impl AgentHostHandle {
         }
         let call_id = Uuid::new_v4().to_string();
         let needs_perm = matches!(tool_name, "run_terminal_cmd" | "write_file");
-        let always = {
-            let g = self.inner.lock();
-            g.always_approve
-                || g.always_allowed_tools.contains(tool_name)
-                || g.permission_mode == "bypassPermissions"
-        };
+        let gate = self.tool_gate(tool_name);
+        if gate == ToolGate::AutoDeny {
+            let _ = event_tx.send(SessionUpdate::ToolCall {
+                session_id,
+                call_id: call_id.clone(),
+                title: tool_name.into(),
+                kind: ToolCallKind::Other,
+                status: ToolCallStatus::Denied,
+                input: serde_json::json!({ "tool": tool_name }),
+            });
+            return Ok(());
+        }
+        let always = matches!(gate, ToolGate::AutoAllow);
 
         if needs_perm && !always {
             let req = PermissionRequest {
