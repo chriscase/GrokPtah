@@ -78,13 +78,21 @@ export function TerminalPane({
 
   useEffect(() => {
     if (!hostRef.current) return;
+    // #129: pull xterm colors from design tokens (amber accent, shared surfaces).
+    const css = getComputedStyle(document.documentElement);
+    const tok = (name: string, fb: string) =>
+      (css.getPropertyValue(name).trim() || fb);
     const term = new Terminal({
       theme: {
-        background: "#050807",
-        foreground: "#e7f2ec",
-        cursor: "#2dd4a8",
+        background: tok("--surface-deep", "#050608"),
+        foreground: tok("--text", "#e8eaed"),
+        cursor: tok("--accent", "#f0b429"),
+        selectionBackground: tok("--accent-bg", "rgba(240,180,41,0.25)"),
       },
-      fontFamily: "IBM Plex Mono, Menlo, monospace",
+      fontFamily: tok(
+        "--font-mono",
+        "SF Mono, JetBrains Mono, IBM Plex Mono, ui-monospace, Menlo, monospace",
+      ),
       fontSize: 12,
       convertEol: true,
     });
@@ -168,7 +176,7 @@ export function TerminalPane({
                 activeIdRef.current = next;
                 term.reset();
                 await applyBacklog(next, term, {
-                  banner: `\x1b[90m[shell exited — switched to ${next.slice(0, 8)}]\x1b[0m`,
+                  banner: `\x1b[90m[shell exited — switched tab]\x1b[0m`,
                 });
               } else {
                 setActiveId(null);
@@ -230,7 +238,8 @@ export function TerminalPane({
           activeIdRef.current = id;
           setMode("pty");
           await applyBacklog(id, term, {
-            banner: `\x1b[32mGrokPtah terminal\x1b[0m — reattached ${id.slice(0, 8)}`,
+            // Amber accent (not green third-family) — raw UUID not primary (#129).
+            banner: `\x1b[33mTerminal\x1b[0m · reattached`,
           });
           await api.ptyResize(id, term.cols, term.rows);
         } else {
@@ -244,9 +253,7 @@ export function TerminalPane({
           setActiveId(id);
           activeIdRef.current = id;
           setMode("pty");
-          term.writeln(
-            `\x1b[32mGrokPtah terminal\x1b[0m — interactive PTY ${id.slice(0, 8)}`,
-          );
+          term.writeln(`\x1b[33mTerminal\x1b[0m · ready`);
         }
         if (disposed) return;
         await refreshTabs();
@@ -300,7 +307,7 @@ export function TerminalPane({
       // Watermark *before* write so flushed live chunks skip dups.
       seqWatermarkRef.current.set(id, bl.upToSeq);
       if (bl.data) term.write(bl.data);
-      else term.writeln(`\x1b[90m[tab ${id.slice(0, 8)}]\x1b[0m`);
+      else term.writeln(`\x1b[90m[tab]\x1b[0m`);
       await api.ptyResize(id, term.cols, term.rows);
     } catch (e) {
       term.writeln(String(e));
@@ -360,16 +367,18 @@ export function TerminalPane({
         }}
       >
         <span style={{ color: "var(--muted)" }}>
-          {mode === "tool" ? "Tool shell (live)" : "Terminal:"}
+          {mode === "tool" ? "Tool shell (live)" : "Terminal"}
         </span>
-        {tabs.map((t) => (
+        {tabs.map((t, i) => (
           <button
             key={t}
             type="button"
             className={t === activeId && mode === "pty" ? "warn-pill" : ""}
+            title={`Session ${t.slice(0, 8)}…`}
             onClick={() => void switchTo(t, true)}
           >
-            {t.slice(0, 8)}
+            {/* #129: short labels — raw PTY UUIDs only in title tooltip */}
+            Tab {i + 1}
           </button>
         ))}
         <button type="button" onClick={() => void newTab()}>

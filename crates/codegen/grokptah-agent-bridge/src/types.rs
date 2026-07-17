@@ -88,4 +88,13 @@ pub struct BackgroundTask {
     pub title: String,
     pub status: String,
     pub scheduled: bool,
+    /// `scan` | `shell` | `agent` — kind of long-running work (#52).
+    #[serde(default)]
+    pub kind: String,
+    /// Optional owning session (for adopt / focus).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Last progress line (visible outside the transcript scroll).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }

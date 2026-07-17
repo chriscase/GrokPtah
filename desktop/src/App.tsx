@@ -222,6 +222,10 @@ export default function App() {
   );
   /** Taller composer for detailed prompts (power users). */
   const [composerExpanded, setComposerExpanded] = useState(false);
+  /** Per-session prompt queue while a turn is running (#147). */
+  const [promptQueues, setPromptQueues] = useState<Record<string, string[]>>(
+    {},
+  );
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
   /** FIFO of tool permission prompts — concurrent requests must not clobber (#141). */
   const [permissionQueue, setPermissionQueue] = useState<PermissionRequest[]>(
@@ -1162,7 +1166,10 @@ export default function App() {
     ],
   );
 
-  async function sendPrompt(text?: string) {
+  async function sendPrompt(
+    text?: string,
+    opts?: { interject?: boolean; fromQueue?: boolean; sessionId?: string },
+  ) {
     const prompt = (text ?? composer).trim();
     if (!prompt) return;
     const fromComposer = text === undefined;
@@ -1179,7 +1186,7 @@ export default function App() {
     }
     let id: string;
     try {
-      id = await ensureSession();
+      id = opts?.sessionId ?? (await ensureSession());
     } catch (e) {
       console.warn(e);
       // Restore draft if session creation failed after we cleared it
@@ -1197,6 +1204,40 @@ export default function App() {
         return next;
       });
     }
+
+    const tabBusy = tabs.find((t) => t.id === id)?.busy;
+    // #147: queue while a turn is running (unless interject = cancel then send).
+    if (tabBusy && !opts?.interject && !opts?.fromQueue) {
+      const nextLen = (promptQueues[id]?.length ?? 0) + 1;
+      setPromptQueues((q) => ({
+        ...q,
+        [id]: [...(q[id] ?? []), prompt],
+      }));
+      patchTab(id, (t) => ({
+        ...t,
+        activity: {
+          ...t.activity,
+          detail: `Queued (${nextLen})`,
+          lastEventAt: Date.now(),
+        },
+        transcript: [
+          ...t.transcript,
+          {
+            kind: "thought" as const,
+            text: `Queued while turn runs: ${prompt.slice(0, 120)}${prompt.length > 120 ? "…" : ""}`,
+          },
+        ],
+      }));
+      return;
+    }
+    if (tabBusy && opts?.interject) {
+      try {
+        await api.sessionCancel(id);
+      } catch {
+        /* best effort */
+      }
+    }
+
     patchTab(id, (t) => ({
       ...t,
       busy: true,
@@ -1338,6 +1379,25 @@ export default function App() {
       setBgTasks(await api.backgroundTasks());
       await refreshChrome();
       await refreshSessions();
+      // #147: drain next queued prompt for this session.
+      let nextQueued: string | undefined;
+      setPromptQueues((q) => {
+        const list = q[id] ?? [];
+        if (!list.length) return q;
+        const [head, ...rest] = list;
+        nextQueued = head;
+        const next = { ...q };
+        if (rest.length) next[id] = rest;
+        else delete next[id];
+        return next;
+      });
+      if (nextQueued) {
+        const drain = nextQueued;
+        // fromQueue bypasses busy re-queue (state may still show busy briefly).
+        setTimeout(() => {
+          void sendPrompt(drain, { fromQueue: true, sessionId: id });
+        }, 0);
+      }
     } catch (e) {
       patchTab(id, (t) => ({
         ...t,
@@ -2158,13 +2218,32 @@ export default function App() {
                     Stop
                   </button>
                 )}
+                {busy && composer.trim() && (
+                  <button
+                    type="button"
+                    className="composer-chip"
+                    title="Cancel current turn and send this prompt now (#147)"
+                    onClick={() => void sendPrompt(undefined, { interject: true })}
+                  >
+                    Interject
+                  </button>
+                )}
+                {activeSessionId &&
+                  (promptQueues[activeSessionId]?.length ?? 0) > 0 && (
+                    <span
+                      className="composer-hint"
+                      title="Prompts waiting for the current turn to finish"
+                    >
+                      Queue {promptQueues[activeSessionId].length}
+                    </span>
+                  )}
                 <button
                   type="button"
                   className="composer-send"
-                  disabled={busy || !composer.trim()}
+                  disabled={!composer.trim()}
                   title={
                     busy
-                      ? "Session busy"
+                      ? "Queue prompt (turn running) · Interject to send now"
                       : "Send (Enter) · newline with Shift+Enter"
                   }
                   onClick={() => void sendPrompt()}
@@ -2532,30 +2611,81 @@ export default function App() {
               </div>
             ))}
             <div className="section-title">Background / scheduled</div>
+            <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 0.5rem" }}>
+              Long-running work outside the transcript (#52). Shell tool runs
+              appear here; schedule a project scan or <code>!cmd</code> shell.
+            </p>
+            {bgTasks.length === 0 && (
+              <div className="panel-block" style={{ color: "var(--muted)" }}>
+                (no background tasks)
+              </div>
+            )}
             {bgTasks.map((t) => (
-              <div key={t.id} className="panel-block">
-                {t.title} — {t.status}
-                {t.status !== "cancelled" && (
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      await api.cancelBackgroundTask(t.id);
-                      setBgTasks(await api.backgroundTasks());
-                    }}
-                  >
-                    Cancel
-                  </button>
-                )}
+              <div key={t.id} className="panel-block bg-task-card">
+                <div style={{ fontWeight: 600 }}>
+                  {t.kind ? `[${t.kind}] ` : ""}
+                  {t.title}
+                </div>
+                <div style={{ fontSize: 11, color: "var(--muted)" }}>
+                  {t.status}
+                  {t.detail && t.detail !== t.status ? ` · ${t.detail}` : ""}
+                </div>
+                <div className="worktree-create-actions" style={{ marginTop: 6 }}>
+                  {String(t.status).startsWith("running") && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await api.cancelBackgroundTask(t.id);
+                        setBgTasks(await api.backgroundTasks());
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                  {t.session_id && (
+                    <button
+                      type="button"
+                      title="Focus the owning session"
+                      onClick={() => {
+                        void (async () => {
+                          try {
+                            const s = await api.sessionLoad(String(t.session_id));
+                            await openTab(s, true);
+                          } catch (e) {
+                            console.warn(e);
+                          }
+                        })();
+                      }}
+                    >
+                      Adopt
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
             <button
               type="button"
               onClick={async () => {
-                await api.scheduleBackgroundTask("Manual schedule");
+                await api.scheduleBackgroundTask("Project file scan");
+                setBgTasks(await api.backgroundTasks());
+                setRightTab("tasks");
+              }}
+            >
+              Schedule scan
+            </button>
+            <button
+              type="button"
+              onClick={async () => {
+                const cmd = window.prompt(
+                  "Shell command for background task (runs in project cwd)",
+                  "sleep 2 && echo done",
+                );
+                if (!cmd?.trim()) return;
+                await api.scheduleBackgroundTask(`!${cmd.trim()}`);
                 setBgTasks(await api.backgroundTasks());
               }}
             >
-              Schedule task
+              Schedule shell…
             </button>
           </>
         )}

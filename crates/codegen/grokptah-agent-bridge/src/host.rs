@@ -95,6 +95,8 @@ struct Inner {
     skills: Vec<SkillInfo>,
     subagents: Vec<SubagentInfo>,
     background_tasks: Vec<BackgroundTask>,
+    /// Cancel tokens for in-flight background tasks (#52).
+    background_cancels: HashMap<String, CancellationToken>,
     pending_permissions: HashMap<Uuid, PendingPermission>,
     /// Per-session turn cancellation so multiple sessions can run concurrently
     /// (Claude Code–style parallel build sessions).
@@ -209,6 +211,7 @@ impl AgentHost {
             skills,
             subagents: Vec::new(),
             background_tasks: Vec::new(),
+            background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
             event_tx,
@@ -1316,64 +1319,203 @@ impl AgentHostHandle {
 
     pub fn cancel_background_task(&self, id: &str) -> Result<()> {
         let mut g = self.inner.lock();
+        if let Some(token) = g.background_cancels.remove(id) {
+            token.cancel();
+        }
         let t = g
             .background_tasks
             .iter_mut()
             .find(|t| t.id == id)
             .ok_or_else(|| anyhow!("unknown task"))?;
         t.status = "cancelled".into();
+        t.detail = Some("cancelled by user".into());
         Ok(())
     }
 
+    /// Schedule long-running work visible outside the transcript (#52).
+    ///
+    /// - Title starting with `!` runs a shell command in the project cwd.
+    /// - Otherwise runs a cancellable project file scan with progress.
     pub fn schedule_background_task(&self, title: String) -> BackgroundTask {
         let id = Uuid::new_v4().to_string();
+        let cancel = CancellationToken::new();
+        let is_shell = title.trim_start().starts_with('!');
         let t = BackgroundTask {
             id: id.clone(),
             title: title.clone(),
             status: "running".into(),
             scheduled: true,
+            kind: if is_shell {
+                "shell".into()
+            } else {
+                "scan".into()
+            },
+            session_id: self
+                .inner
+                .lock()
+                .active_session
+                .map(|u| u.to_string()),
+            detail: Some("starting…".into()),
         };
         {
             let mut g = self.inner.lock();
             g.background_tasks.push(t.clone());
+            g.background_cancels.insert(id.clone(), cancel.clone());
         }
         let host = self.clone();
         let task_id = id.clone();
         let event_tx = self.inner.lock().event_tx.clone();
+        let title_for_task = title.clone();
         tokio::spawn(async move {
-            // Real async work: walk project and count files (or sleep if no project)
-            let cwd = host.inner.lock().project_cwd.clone();
-            let result = if let Some(cwd) = cwd {
-                tokio::task::spawn_blocking(move || {
-                    walkdir::WalkDir::new(cwd)
-                        .max_depth(6)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.file_type().is_file())
-                        .count()
-                })
-                .await
-                .unwrap_or(0)
+            let final_status = if is_shell {
+                let cmd = title_for_task.trim_start().trim_start_matches('!').trim();
+                let cwd = host.inner.lock().project_cwd.clone();
+                let cancel_c = cancel.clone();
+                let cmd_owned = cmd.to_string();
+                let run = async {
+                    let mut command = tokio::process::Command::new("sh");
+                    command.arg("-lc").arg(&cmd_owned);
+                    if let Some(ref c) = cwd {
+                        command.current_dir(c);
+                    }
+                    command.stdout(std::process::Stdio::piped());
+                    command.stderr(std::process::Stdio::piped());
+                    let mut child = command.spawn().map_err(|e| e.to_string())?;
+                    let mut stdout = child.stdout.take();
+                    let mut stderr = child.stderr.take();
+                    tokio::select! {
+                        _ = cancel_c.cancelled() => {
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            Err("cancelled".to_string())
+                        }
+                        status = child.wait() => {
+                            use tokio::io::AsyncReadExt;
+                            let status = status.map_err(|e| e.to_string())?;
+                            let mut body = String::new();
+                            if let Some(ref mut out) = stdout {
+                                let mut buf = Vec::new();
+                                let _ = out.read_to_end(&mut buf).await;
+                                body.push_str(&String::from_utf8_lossy(&buf));
+                            }
+                            if let Some(ref mut err) = stderr {
+                                let mut buf = Vec::new();
+                                let _ = err.read_to_end(&mut buf).await;
+                                body.push_str(&String::from_utf8_lossy(&buf));
+                            }
+                            let clip: String = body.chars().take(400).collect();
+                            if status.success() {
+                                Ok(format!("completed · exit 0 · {clip}"))
+                            } else {
+                                Ok(format!("failed · {clip}"))
+                            }
+                        }
+                    }
+                };
+                match run.await {
+                    Ok(s) => s,
+                    Err(e) => e,
+                }
             } else {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                0
+                // Cancellable project scan (real walk with cancel polling).
+                let cwd = host.inner.lock().project_cwd.clone();
+                if let Some(cwd) = cwd {
+                    let cancel_c = cancel.clone();
+                    let host_p = host.clone();
+                    let task_id_p = task_id.clone();
+                    let title_p = title_for_task.clone();
+                    let event_tx_p = event_tx.clone();
+                    let walk = tokio::task::spawn_blocking(move || {
+                        let mut n = 0usize;
+                        for e in walkdir::WalkDir::new(cwd).max_depth(8).into_iter().flatten() {
+                            if cancel_c.is_cancelled() {
+                                return Err(n);
+                            }
+                            if e.file_type().is_file() {
+                                n += 1;
+                                if n.is_multiple_of(250) {
+                                    let mut g = host_p.inner.lock();
+                                    if let Some(task) =
+                                        g.background_tasks.iter_mut().find(|t| t.id == task_id_p)
+                                    {
+                                        if task.status != "cancelled" {
+                                            task.detail = Some(format!("scanned {n} files…"));
+                                        }
+                                    }
+                                    let _ = event_tx_p.send(SessionUpdate::BackgroundTask {
+                                        session_id: None,
+                                        task_id: task_id_p.clone(),
+                                        title: title_p.clone(),
+                                        status: format!("running ({n} files)"),
+                                    });
+                                }
+                            }
+                        }
+                        Ok(n)
+                    });
+                    match walk.await {
+                        Ok(Ok(n)) => format!("completed ({n} files)"),
+                        Ok(Err(n)) => format!("cancelled after {n} files"),
+                        Err(_) => "failed".into(),
+                    }
+                } else {
+                    tokio::select! {
+                        _ = cancel.cancelled() => "cancelled".to_string(),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(400)) => {
+                            "completed (no project open)".into()
+                        }
+                    }
+                }
             };
             {
                 let mut g = host.inner.lock();
+                g.background_cancels.remove(&task_id);
                 if let Some(task) = g.background_tasks.iter_mut().find(|t| t.id == task_id) {
                     if task.status != "cancelled" {
-                        task.status = format!("completed ({result} files)");
+                        task.status = final_status.clone();
+                        task.detail = Some(final_status.clone());
                     }
                 }
             }
             let _ = event_tx.send(SessionUpdate::BackgroundTask {
                 session_id: None,
                 task_id: task_id.clone(),
-                title,
-                status: format!("completed ({result} files)"),
+                title: title_for_task,
+                status: final_status,
             });
         });
         t
+    }
+
+    /// Register a long-running agent shell as a background task (visible in Tasks panel).
+    pub fn register_shell_background_task(
+        &self,
+        call_id: &str,
+        command: &str,
+        session_id: Option<Uuid>,
+    ) {
+        let t = BackgroundTask {
+            id: format!("shell-{call_id}"),
+            title: command.chars().take(80).collect(),
+            status: "running".into(),
+            scheduled: false,
+            kind: "shell".into(),
+            session_id: session_id.map(|u| u.to_string()),
+            detail: Some("agent tool shell".into()),
+        };
+        let mut g = self.inner.lock();
+        // Replace prior entry for same call id.
+        g.background_tasks.retain(|x| x.id != t.id);
+        g.background_tasks.push(t);
+    }
+
+    pub fn complete_shell_background_task(&self, call_id: &str, status: &str) {
+        let id = format!("shell-{call_id}");
+        let mut g = self.inner.lock();
+        if let Some(task) = g.background_tasks.iter_mut().find(|t| t.id == id) {
+            task.status = status.into();
+            task.detail = Some(status.into());
+        }
     }
 
     pub fn fuzzy_open(&self, query: &str) -> Result<Vec<String>> {
@@ -3674,6 +3816,7 @@ impl AgentHostHandle {
             call_id: call_id.clone(),
             command: command.to_string(),
         });
+        self.register_shell_background_task(&call_id, command, Some(session_id));
 
         let live_shells = self.inner.lock().live_shells.clone();
         let event_tx_chunks = event_tx.clone();
@@ -3703,6 +3846,10 @@ impl AgentHostHandle {
                 } else {
                     ToolCallStatus::Completed
                 };
+                self.complete_shell_background_task(
+                    &call_id,
+                    if cancelled { "cancelled" } else { "completed" },
+                );
                 let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
                     session_id,
                     call_id: call_id.clone(),
@@ -3843,6 +3990,7 @@ impl AgentHostHandle {
             call_id: call_id.clone(),
             command: command.to_string(),
         });
+        self.register_shell_background_task(&call_id, command, Some(session_id));
 
         let live_shells = self.inner.lock().live_shells.clone();
         let event_tx_chunks = event_tx.clone();
@@ -3865,6 +4013,10 @@ impl AgentHostHandle {
 
         match result {
             Ok(tr) => {
+                self.complete_shell_background_task(
+                    &call_id,
+                    if tr.cancelled { "cancelled" } else { "completed" },
+                );
                 let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
                     session_id,
                     call_id: call_id.clone(),
