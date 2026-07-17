@@ -58,15 +58,23 @@
 | **#141** | PermissionModal + queue; RTL tests: non-focused session + concurrent; App patches owning session |
 | **#114** | Honesty relabel: tool safety profile (not OS sandbox); ERROR/help/settings/docs aligned |
 | **#106** | Epic closed — all PTY children done |
+| **#101** | Epic closed — all permission/trust children done |
+| **#107** | Epic closed — CI children done including #141 |
+| **#133** | Real light theme tokens + retokenized chrome |
+| **#38** | Resume/continue/fork: sessionLoad hydrate, menu, `/resume` `/continue` |
+| **#126** | StyledSelect listbox — no native `<select>` in Settings/composer |
+| **#43** | Worktree create/remove/open-as-project |
+| **#149** | Persist `thought` transcript + stream reasoning_content |
+| **#128** | Tighter transcript gap/padding |
 
 ## Still open (do not mass-close)
 
 - Multi-agent: **#151**, **#152**
-- Product honesty: **#52**, **#43**, **#38**, **#93**
-- TUI parity: **#146–#149**
-- UX polish: **#126**, **#128–#129**, **#132–#134**, **#150**
+- Product honesty: **#52**, **#93**
+- TUI parity: **#146–#148**
+- UX polish: **#129**, **#132**, **#134**, **#150**
 - Architecture: **#144**, **#145**
-- Epic #101 residual only if other children remain (all security children done after #114)
+- Epics open while children remain: **#104**, **#105**, **#108**, **#109**
 
 ## Anti-patterns avoided
 
