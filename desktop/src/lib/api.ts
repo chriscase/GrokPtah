@@ -188,5 +188,11 @@ export const api = {
     invoke<void>("pty_resize", { id, cols, rows }),
   ptyKill: (id: string) => invoke<void>("pty_kill", { id }),
   ptyList: () => invoke<string[]>("pty_list"),
-  ptyBacklog: (id: string) => invoke<string>("pty_backlog", { id }),
+  /** Backlog + seq watermark so live events don't double-render after tab switch (#138). */
+  ptyBacklog: (id: string) => invoke<PtyBacklog>("pty_backlog", { id }),
+};
+
+export type PtyBacklog = {
+  data: string;
+  upToSeq: number;
 };

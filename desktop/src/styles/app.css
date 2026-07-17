@@ -449,6 +449,17 @@ button:disabled {
   max-height: 22vh;
 }
 
+/* #136: collapse hides the pane without unmounting TerminalPane / killing the shell. */
+.terminal-slot.is-collapsed {
+  max-height: 0;
+  min-height: 0;
+  border: none;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+  flex: 0 0 0;
+}
+
 .terminal-slot-bar {
   display: flex;
   align-items: center;

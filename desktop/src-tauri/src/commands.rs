@@ -7,10 +7,22 @@ use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
+use crate::pty_host::PtyBacklog;
 use crate::AppState;
 
 fn map_err(e: impl ToString) -> String {
     e.to_string()
+}
+
+/// Run a blocking host/FS/git call off the UI thread (#137).
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("blocking task join: {e}"))?
 }
 
 #[tauri::command]
@@ -82,7 +94,8 @@ pub fn session_list_by_kind(
 }
 
 #[tauri::command]
-pub fn search_sessions(
+#[allow(clippy::too_many_arguments)] // mirrors SearchQuery fields for the IPC boundary
+pub async fn search_sessions(
     state: State<'_, AppState>,
     query: String,
     mode: Option<String>,
@@ -92,6 +105,7 @@ pub fn search_sessions(
     folder: Option<String>,
     tag: Option<String>,
 ) -> Result<Vec<SearchHit>, String> {
+    let host = state.host.clone();
     let q = SearchQuery {
         query,
         mode: mode.unwrap_or_else(|| "hybrid".into()),
@@ -101,13 +115,17 @@ pub fn search_sessions(
         folder,
         tag,
     };
-    state.host.search_sessions(q).map_err(map_err)
+    run_blocking(move || host.search_sessions(q).map_err(map_err)).await
 }
 
 #[tauri::command]
-pub fn session_load(state: State<'_, AppState>, id: String) -> Result<SessionSummary, String> {
+pub async fn session_load(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<SessionSummary, String> {
+    let host = state.host.clone();
     let id = Uuid::parse_str(&id).map_err(map_err)?;
-    state.host.session_load(id).map_err(map_err)
+    run_blocking(move || host.session_load(id).map_err(map_err)).await
 }
 
 #[tauri::command]
@@ -148,10 +166,7 @@ pub fn session_archive(
     archived: bool,
 ) -> Result<SessionSummary, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    state
-        .host
-        .session_archive(id, archived)
-        .map_err(map_err)
+    state.host.session_archive(id, archived).map_err(map_err)
 }
 
 #[tauri::command]
@@ -161,10 +176,7 @@ pub fn session_set_folder(
     folder: Option<String>,
 ) -> Result<SessionSummary, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    state
-        .host
-        .session_set_folder(id, folder)
-        .map_err(map_err)
+    state.host.session_set_folder(id, folder).map_err(map_err)
 }
 
 #[tauri::command]
@@ -212,10 +224,7 @@ pub fn session_set_tags(
 }
 
 #[tauri::command]
-pub fn session_list_folders(
-    state: State<'_, AppState>,
-    include_archived: bool,
-) -> Vec<String> {
+pub fn session_list_folders(state: State<'_, AppState>, include_archived: bool) -> Vec<String> {
     state.host.list_folders(include_archived)
 }
 
@@ -268,16 +277,20 @@ pub fn session_cancel(
 }
 
 #[tauri::command]
-pub fn session_transcript(
+pub async fn session_transcript(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Vec<TranscriptEntry>, String> {
+    let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    state.host.session_transcript(id).map_err(map_err)
+    run_blocking(move || host.session_transcript(id).map_err(map_err)).await
 }
 
 #[tauri::command]
-pub fn session_fork(state: State<'_, AppState>, source_id: String) -> Result<SessionSummary, String> {
+pub fn session_fork(
+    state: State<'_, AppState>,
+    source_id: String,
+) -> Result<SessionSummary, String> {
     let id = Uuid::parse_str(&source_id).map_err(map_err)?;
     state.host.fork_session(id).map_err(map_err)
 }
@@ -302,11 +315,7 @@ pub async fn session_compact(
 ) -> Result<SessionSummary, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     // Prefer model-backed summary when online (same path as slash `/compact`).
-    state
-        .host
-        .compact_session_async(id)
-        .await
-        .map_err(map_err)
+    state.host.compact_session_async(id).await.map_err(map_err)
 }
 
 #[tauri::command]
@@ -389,28 +398,33 @@ pub fn auth_open_login(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn file_tree(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    state.host.file_tree().map_err(map_err)
+pub async fn file_tree(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.file_tree().map_err(map_err)).await
 }
 
 #[tauri::command]
-pub fn fuzzy_open(state: State<'_, AppState>, query: String) -> Result<Vec<String>, String> {
-    state.host.fuzzy_open(&query).map_err(map_err)
+pub async fn fuzzy_open(state: State<'_, AppState>, query: String) -> Result<Vec<String>, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.fuzzy_open(&query).map_err(map_err)).await
 }
 
 #[tauri::command]
-pub fn git_status(state: State<'_, AppState>) -> Result<String, String> {
-    state.host.git_status().map_err(map_err)
+pub async fn git_status(state: State<'_, AppState>) -> Result<String, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.git_status().map_err(map_err)).await
 }
 
 #[tauri::command]
-pub fn git_diff(state: State<'_, AppState>) -> Result<String, String> {
-    state.host.git_diff().map_err(map_err)
+pub async fn git_diff(state: State<'_, AppState>) -> Result<String, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.git_diff().map_err(map_err)).await
 }
 
 #[tauri::command]
-pub fn agent_edit_diffs(state: State<'_, AppState>) -> Result<String, String> {
-    state.host.agent_edit_diffs().map_err(map_err)
+pub async fn agent_edit_diffs(state: State<'_, AppState>) -> Result<String, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.agent_edit_diffs().map_err(map_err)).await
 }
 
 #[tauri::command]
@@ -419,18 +433,17 @@ pub fn last_edited_path(state: State<'_, AppState>) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn export_transcript(
+pub async fn export_transcript(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<String, String> {
+    let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    state.host.export_transcript(id).map_err(map_err)
+    run_blocking(move || host.export_transcript(id).map_err(map_err)).await
 }
 
 #[tauri::command]
-pub fn memory_list(
-    state: State<'_, AppState>,
-) -> Result<Vec<serde_json::Value>, String> {
+pub fn memory_list(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
     let facts = state.host.memory_list().map_err(map_err)?;
     Ok(facts
         .into_iter()
@@ -451,18 +464,21 @@ pub fn memory_remember(state: State<'_, AppState>, text: String) -> Result<Strin
 }
 
 #[tauri::command]
-pub fn git_stage_all(state: State<'_, AppState>) -> Result<String, String> {
-    state.host.git_stage_all().map_err(map_err)
+pub async fn git_stage_all(state: State<'_, AppState>) -> Result<String, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.git_stage_all().map_err(map_err)).await
 }
 
 #[tauri::command]
-pub fn git_commit(state: State<'_, AppState>, message: String) -> Result<String, String> {
-    state.host.git_commit(&message).map_err(map_err)
+pub async fn git_commit(state: State<'_, AppState>, message: String) -> Result<String, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.git_commit(&message).map_err(map_err)).await
 }
 
 #[tauri::command]
-pub fn list_worktrees(state: State<'_, AppState>) -> Result<String, String> {
-    state.host.list_worktrees().map_err(map_err)
+pub async fn list_worktrees(state: State<'_, AppState>) -> Result<String, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.list_worktrees().map_err(map_err)).await
 }
 
 #[tauri::command]
@@ -546,10 +562,7 @@ pub fn cancel_background_task(state: State<'_, AppState>, id: String) -> Result<
 }
 
 #[tauri::command]
-pub fn schedule_background_task(
-    state: State<'_, AppState>,
-    title: String,
-) -> BackgroundTask {
+pub fn schedule_background_task(state: State<'_, AppState>, title: String) -> BackgroundTask {
     state.host.schedule_background_task(title)
 }
 
@@ -574,11 +587,7 @@ pub fn set_permission_mode(state: State<'_, AppState>, mode: String) {
 }
 
 #[tauri::command]
-pub fn set_allow_deny_rules(
-    state: State<'_, AppState>,
-    allow: Vec<String>,
-    deny: Vec<String>,
-) {
+pub fn set_allow_deny_rules(state: State<'_, AppState>, allow: Vec<String>, deny: Vec<String>) {
     state.host.set_allow_deny_rules(allow, deny);
 }
 
@@ -598,10 +607,7 @@ pub fn set_plan_mode(
 }
 
 #[tauri::command]
-pub async fn accept_plan(
-    state: State<'_, AppState>,
-    session_id: String,
-) -> Result<String, String> {
+pub async fn accept_plan(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state.host.accept_plan(id).await.map_err(map_err)
 }
@@ -652,7 +658,7 @@ pub fn pty_list(state: State<'_, AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn pty_backlog(state: State<'_, AppState>, id: String) -> Result<String, String> {
+pub fn pty_backlog(state: State<'_, AppState>, id: String) -> Result<PtyBacklog, String> {
     state.pty.backlog(&id).map_err(map_err)
 }
 

@@ -246,6 +246,11 @@ export default function App() {
   });
   /** Terminal panel expanded (collapsed strip by default — space efficient). */
   const [showTerm, setShowTerm] = useState(false);
+  /**
+   * Once the user opens the terminal, keep TerminalPane mounted across collapse
+   * so the PTY + xterm survive (#136). Hidden with CSS when `showTerm` is false.
+   */
+  const [termEverOpened, setTermEverOpened] = useState(false);
   /** Thin bar when a tool shell is live but panel is collapsed. */
   const [termPeek, setTermPeek] = useState(false);
   const [toolShell, setToolShell] = useState<ToolShellAttach | null>(null);
@@ -1796,6 +1801,7 @@ export default function App() {
               title="Expand tool shell"
               onClick={() => {
                 setShowTerm(true);
+                setTermEverOpened(true);
                 setTermPeek(false);
               }}
             >
@@ -1822,27 +1828,33 @@ export default function App() {
             </button>
           </div>
         )}
-        {showTerm && (
-          <div className="terminal-slot is-expanded">
-            <div className="terminal-slot-bar">
-              <span className="terminal-slot-title">
-                {toolShell?.command
-                  ? `Tool shell · ${toolShell.command.slice(0, 48)}${toolShell.command.length > 48 ? "…" : ""}`
-                  : "Terminal"}
-              </span>
-              <button
-                type="button"
-                className="terminal-slot-collapse"
-                title="Collapse terminal"
-                onClick={() => {
-                  setShowTerm(false);
-                  setTermPeek(Boolean(toolShell));
-                }}
-              >
-                Collapse
-              </button>
-            </div>
-            <TerminalPane toolShell={toolShell} />
+        {/* #136: keep TerminalPane mounted after first open; CSS-hide on collapse. */}
+        {(showTerm || termEverOpened) && (
+          <div
+            className={`terminal-slot ${showTerm ? "is-expanded" : "is-collapsed"}`}
+            aria-hidden={!showTerm}
+          >
+            {showTerm && (
+              <div className="terminal-slot-bar">
+                <span className="terminal-slot-title">
+                  {toolShell?.command
+                    ? `Tool shell · ${toolShell.command.slice(0, 48)}${toolShell.command.length > 48 ? "…" : ""}`
+                    : "Terminal"}
+                </span>
+                <button
+                  type="button"
+                  className="terminal-slot-collapse"
+                  title="Collapse terminal"
+                  onClick={() => {
+                    setShowTerm(false);
+                    setTermPeek(Boolean(toolShell));
+                  }}
+                >
+                  Collapse
+                </button>
+              </div>
+            )}
+            <TerminalPane toolShell={toolShell} visible={showTerm} />
           </div>
         )}
 
@@ -1981,8 +1993,12 @@ export default function App() {
                   onClick={() => {
                     setShowTerm((v) => {
                       const next = !v;
-                      if (next) setTermPeek(false);
-                      else if (toolShell) setTermPeek(true);
+                      if (next) {
+                        setTermEverOpened(true);
+                        setTermPeek(false);
+                      } else if (toolShell) {
+                        setTermPeek(true);
+                      }
                       return next;
                     });
                   }}
