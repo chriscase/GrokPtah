@@ -108,6 +108,7 @@ pub fn run() {
             commands::set_appearance,
             commands::set_permission_mode,
             commands::set_allow_deny_rules,
+            commands::set_gateway_config,
             commands::project_rules,
             commands::set_plan_mode,
             commands::accept_plan,

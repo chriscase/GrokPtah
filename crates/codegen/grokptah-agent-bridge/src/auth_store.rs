@@ -207,6 +207,24 @@ pub fn resolve_wire_credentials() -> Option<WireCredentials> {
             }
         }
     }
+    // Settings UI gateway.json key (#169) when env keys absent.
+    if let Some(key) = crate::gateway_config::file_api_key() {
+        return Some(WireCredentials {
+            bearer: key,
+            oidc_token_auth: false,
+            display_name: "gateway.json".into(),
+            method: "api_key".into(),
+            user_id: None,
+            team_id: None,
+            auth_scope: None,
+            refresh_token: None,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            principal_type: None,
+            principal_id: None,
+            expires_at: None,
+        });
+    }
     // Rotating token helper (#170): command prints a short-lived bearer to stdout.
     if let Ok(cmd) = std::env::var("GROKPTAH_TOKEN_COMMAND") {
         let cmd = cmd.trim();
