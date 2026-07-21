@@ -1406,14 +1406,7 @@ impl AgentHostHandle {
                 .unwrap_or_else(CancellationToken::new)
         };
         let event_tx = self.inner.lock().event_tx.clone();
-        self.spawn_gp_subagent_parallel(
-            session_id,
-            &cwd,
-            prompt,
-            kind,
-            &parent_cancel,
-            &event_tx,
-        )
+        self.spawn_gp_subagent_parallel(session_id, &cwd, prompt, kind, &parent_cancel, &event_tx)
     }
 
     /// Test helper: register a parent turn cancel token for `session_id`.
@@ -1439,10 +1432,7 @@ impl AgentHostHandle {
             s.status = "cancelled".into();
             s.summary = Some("cancelled by user".into());
         }
-        let session_id = s
-            .session_id
-            .as_ref()
-            .and_then(|x| Uuid::parse_str(x).ok());
+        let session_id = s.session_id.as_ref().and_then(|x| Uuid::parse_str(x).ok());
         let snap = g.subagents.clone();
         drop(g);
         if let Some(sid) = session_id {
@@ -1523,11 +1513,7 @@ impl AgentHostHandle {
             } else {
                 "scan".into()
             },
-            session_id: self
-                .inner
-                .lock()
-                .active_session
-                .map(|u| u.to_string()),
+            session_id: self.inner.lock().active_session.map(|u| u.to_string()),
             detail: Some("starting…".into()),
         };
         {
@@ -1600,7 +1586,11 @@ impl AgentHostHandle {
                     let event_tx_p = event_tx.clone();
                     let walk = tokio::task::spawn_blocking(move || {
                         let mut n = 0usize;
-                        for e in walkdir::WalkDir::new(cwd).max_depth(8).into_iter().flatten() {
+                        for e in walkdir::WalkDir::new(cwd)
+                            .max_depth(8)
+                            .into_iter()
+                            .flatten()
+                        {
                             if cancel_c.is_cancelled() {
                                 return Err(n);
                             }
@@ -2074,7 +2064,9 @@ impl AgentHostHandle {
                     let child_ids: Vec<String> = g
                         .subagents
                         .iter()
-                        .filter(|s| s.session_id.as_deref() == Some(sid.as_str()) && s.status == "running")
+                        .filter(|s| {
+                            s.session_id.as_deref() == Some(sid.as_str()) && s.status == "running"
+                        })
                         .map(|s| s.id.clone())
                         .collect();
                     for cid in &child_ids {
@@ -3149,9 +3141,7 @@ impl AgentHostHandle {
             }
             "write_file" => {
                 if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
-                    return Ok(
-                        "ERROR: tool safety profile is read-only; write_file denied".into(),
-                    );
+                    return Ok("ERROR: tool safety profile is read-only; write_file denied".into());
                 }
                 let path = args
                     .get("path")
@@ -3523,9 +3513,7 @@ impl AgentHostHandle {
                     .ok_or_else(|| anyhow!("web_fetch requires url"))?
                     .to_string();
                 if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
-                    return Ok(
-                        "ERROR: tool safety profile is read-only; web_fetch denied".into(),
-                    );
+                    return Ok("ERROR: tool safety profile is read-only; web_fetch denied".into());
                 }
                 self.run_tool_for_output(
                     session_id,
@@ -3773,10 +3761,7 @@ impl AgentHostHandle {
                     tr.output.chars().take(2_000).collect::<String>()
                 ));
             }
-            if let Some(rest) = prompt
-                .find("write ")
-                .map(|i| &prompt[i + "write ".len()..])
-            {
+            if let Some(rest) = prompt.find("write ").map(|i| &prompt[i + "write ".len()..]) {
                 if let Some((path, content)) = rest.split_once(':') {
                     self.snapshot_edit_original(cwd, path.trim());
                     if let Ok(tr) =
@@ -3849,7 +3834,9 @@ impl AgentHostHandle {
             )
             .await;
             match step {
-                Ok(AgentStep::Final { text, reasoning, .. }) => {
+                Ok(AgentStep::Final {
+                    text, reasoning, ..
+                }) => {
                     if let Some(r) = reasoning {
                         push_thought(self, session_id, &r);
                     }
@@ -4542,7 +4529,11 @@ impl AgentHostHandle {
             Ok(tr) => {
                 self.complete_shell_background_task(
                     &call_id,
-                    if tr.cancelled { "cancelled" } else { "completed" },
+                    if tr.cancelled {
+                        "cancelled"
+                    } else {
+                        "completed"
+                    },
                 );
                 let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
                     session_id,
