@@ -7,9 +7,11 @@ mod auth_store;
 mod discover;
 mod events;
 mod exec_risk;
+mod gateway_config;
 mod hooks;
 mod host;
 mod instance_lock;
+mod isolation;
 mod local_tools;
 mod mcp_runtime;
 mod memory;
@@ -27,6 +29,8 @@ mod types;
 mod worktree_gc;
 
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
+pub use gateway_config::{load as load_gateway_config, save as save_gateway_config, GatewayConfig};
+pub use isolation::prepare_isolation_cwd;
 pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};
 pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
 

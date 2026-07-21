@@ -1998,6 +1998,7 @@ impl AgentHostHandle {
             };
         }
         let g = self.inner.lock();
+        let gw = crate::gateway_config::load();
         serde_json::json!({
             "model": g.model,
             "effort": g.effort,
@@ -2010,7 +2011,31 @@ impl AgentHostHandle {
             "allowRules": g.allow_rules,
             "denyRules": g.deny_rules,
             "autoUpdateEnabled": crate::desktop_auto_update_enabled(),
+            // Corporate gateway (#169) — env overrides still win at resolve time.
+            "gatewayProviderId": gw.provider_id,
+            "gatewayBaseUrl": gw.base_url,
+            "gatewayApiKeySet": !gw.api_key.trim().is_empty(),
         })
+    }
+
+    /// Persist OpenAI-compatible gateway settings (#169). Empty strings clear fields.
+    pub fn set_gateway_config(
+        &self,
+        provider_id: String,
+        base_url: String,
+        api_key: Option<String>,
+    ) -> Result<()> {
+        let mut cfg = crate::gateway_config::load();
+        cfg.provider_id = provider_id.trim().to_string();
+        cfg.base_url = base_url.trim().to_string();
+        if let Some(k) = api_key {
+            let t = k.trim();
+            if !t.is_empty() {
+                cfg.api_key = t.to_string();
+            }
+        }
+        crate::gateway_config::save(&cfg).map_err(|e| anyhow!("save gateway.json: {e}"))?;
+        Ok(())
     }
 
     pub fn set_plan_mode(&self, session_id: Uuid, enabled: bool) -> Result<()> {
@@ -3859,31 +3884,31 @@ impl AgentHostHandle {
 
         let host = self.clone();
         let event_tx = event_tx.clone();
-        // #162 optional worktree isolation
+        // #162 optional worktree isolation (never empty-dir fallback)
         let mut cwd = cwd.to_path_buf();
         if std::env::var("GROKPTAH_SUBAGENT_ISOLATION")
             .map(|v| v == "worktree" || v == "1")
             .unwrap_or(false)
         {
-            let wt_root = cwd.join(".grokptah").join("worktrees");
-            let _ = std::fs::create_dir_all(&wt_root);
-            let wt = wt_root.join(format!("sub-{sub_id}"));
-            // Prefer git worktree; fall back to copy-less empty dir for offline.
-            let status = std::process::Command::new("git")
-                .args([
-                    "worktree",
-                    "add",
-                    "--detach",
-                    wt.to_str().unwrap_or("."),
-                    "HEAD",
-                ])
-                .current_dir(&cwd)
-                .status();
-            if status.map(|s| s.success()).unwrap_or(false) {
-                cwd = wt;
-            } else {
-                let _ = std::fs::create_dir_all(&wt);
-                cwd = wt;
+            match crate::isolation::prepare_isolation_cwd(&cwd, &sub_id) {
+                Ok(wt) => cwd = wt,
+                Err(e) => {
+                    // Fail closed: leave parent cwd and record failure on the child row.
+                    let mut g = self.inner.lock();
+                    if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
+                        s.status = "failed".into();
+                        s.summary = Some(format!("isolation failed: {e}"));
+                    }
+                    let _ = event_tx.send(SessionUpdate::SubagentUpdate {
+                        session_id,
+                        subagent_id: sub_id.clone(),
+                        status: "failed".into(),
+                        detail: Some(format!("isolation failed: {e}")),
+                    });
+                    return Ok(format!(
+                        "ERROR: subagent isolation failed (not starting child): {e}"
+                    ));
+                }
             }
         }
         let prompt = prompt.to_string();
@@ -5730,26 +5755,9 @@ fn resolve_api_base(creds: &crate::auth_store::WireCredentials, model: &str) -> 
         .map(|e| e.wire_model.as_str())
         .unwrap_or(model)
         .to_string();
-    // Explicit base overrides (gateway #169). Prefer xAI-specific envs first.
+    // Explicit base overrides (gateway #169): env, then gateway.json, then defaults.
     // OIDC default path is unchanged when none of these are set.
-    let explicit_base = std::env::var("XAI_API_BASE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            std::env::var("GROKPTAH_API_BASE")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        })
-        .or_else(|| {
-            std::env::var("OPENAI_BASE_URL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        })
-        .or_else(|| {
-            std::env::var("OPENAI_API_BASE")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        });
+    let explicit_base = crate::gateway_config::effective_base_url();
     let base = if let Some(env) = explicit_base {
         env
     } else if creds.oidc_token_auth {

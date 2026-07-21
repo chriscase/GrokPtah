@@ -177,6 +177,16 @@ export const api = {
     invoke<void>("set_permission_mode", { mode }),
   setAllowDenyRules: (allow: string[], deny: string[]) =>
     invoke<void>("set_allow_deny_rules", { allow, deny }),
+  setGatewayConfig: (
+    providerId: string,
+    baseUrl: string,
+    apiKey?: string | null,
+  ) =>
+    invoke<void>("set_gateway_config", {
+      providerId,
+      baseUrl,
+      apiKey: apiKey ?? null,
+    }),
   projectRules: () => invoke<string[]>("project_rules"),
   setPlanMode: (sessionId: string, enabled: boolean) =>
     invoke<void>("set_plan_mode", { sessionId, enabled }),

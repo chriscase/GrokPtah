@@ -3,6 +3,7 @@ import {
   sessionIdForPermission,
   type PermissionDecision,
 } from "../lib/permissionQueue";
+import type { DenyHistoryEntry } from "../lib/denyHistory";
 
 export type PermissionModalProps = {
   request: PermissionRequest;
@@ -19,6 +20,8 @@ export type PermissionModalProps = {
   ) => void | Promise<void>;
   /** Optional fallback only if request.session_id is empty. */
   fallbackSessionId?: string | null;
+  /** Recent denials for this project/session (#175). */
+  denyHistory?: DenyHistoryEntry[];
 };
 
 /**
@@ -30,8 +33,17 @@ export function PermissionModal({
   queuedBehind = 0,
   onRespond,
   fallbackSessionId = null,
+  denyHistory = [],
 }: PermissionModalProps) {
   const sessionId = sessionIdForPermission(request, fallbackSessionId);
+  const detail =
+    typeof request.detail === "object" && request.detail !== null
+      ? (request.detail as Record<string, unknown>)
+      : {};
+  const risk =
+    typeof detail.risk === "string" ? detail.risk : undefined;
+  const riskTier =
+    typeof detail.risk_tier === "string" ? detail.risk_tier : undefined;
 
   async function respond(decision: PermissionDecision) {
     await onRespond(request.id, decision, sessionId);
@@ -59,33 +71,28 @@ export function PermissionModal({
           </p>
         )}
         <p data-testid="permission-summary">{request.summary}</p>
-        {typeof request.detail === "object" &&
-          request.detail !== null &&
-          "risk" in (request.detail as Record<string, unknown>) &&
-          (request.detail as { risk?: string; risk_tier?: string }).risk && (
-            <p
-              data-testid="permission-risk"
-              style={{
-                margin: "0 0 0.75rem",
-                padding: "0.5rem 0.65rem",
-                borderRadius: 6,
-                background:
-                  (request.detail as { risk_tier?: string }).risk_tier === "deny"
-                    ? "rgba(220, 50, 50, 0.15)"
-                    : "rgba(220, 160, 40, 0.12)",
-                border: "1px solid var(--border, #333)",
-                fontSize: "0.85rem",
-              }}
-            >
-              <strong>Exec-risk</strong> (
-              {(request.detail as { risk_tier?: string }).risk_tier ?? "ask"}):{" "}
-              {String((request.detail as { risk?: string }).risk)}
-              <span style={{ opacity: 0.75 }}>
-                {" "}
-                — tool safety gate, not an OS sandbox
-              </span>
-            </p>
-          )}
+        {risk && (
+          <p
+            data-testid="permission-risk"
+            style={{
+              margin: "0 0 0.75rem",
+              padding: "0.5rem 0.65rem",
+              borderRadius: 6,
+              background:
+                riskTier === "deny"
+                  ? "rgba(220, 50, 50, 0.15)"
+                  : "rgba(220, 160, 40, 0.12)",
+              border: "1px solid var(--border, #333)",
+              fontSize: "0.85rem",
+            }}
+          >
+            <strong>Exec-risk</strong> ({riskTier ?? "ask"}): {risk}
+            <span style={{ opacity: 0.75 }}>
+              {" "}
+              — tool safety gate, not an OS sandbox
+            </span>
+          </p>
+        )}
         <p style={{ fontSize: 12, color: "var(--muted)", marginTop: 0 }}>
           Tool: <code data-testid="permission-tool">{request.tool_name}</code>
           {sessionId ? (
@@ -98,6 +105,35 @@ export function PermissionModal({
             </>
           ) : null}
         </p>
+        {denyHistory.length > 0 && (
+          <div
+            data-testid="permission-deny-history"
+            style={{
+              marginBottom: "0.75rem",
+              padding: "0.5rem 0.65rem",
+              borderRadius: 6,
+              border: "1px solid var(--border, #333)",
+              fontSize: "0.8rem",
+              maxHeight: 120,
+              overflow: "auto",
+            }}
+          >
+            <strong>Recent denials</strong>
+            <ul style={{ margin: "0.35rem 0 0", paddingLeft: "1.1rem" }}>
+              {denyHistory.slice(0, 8).map((e, i) => (
+                <li
+                  key={`${e.at}-${i}`}
+                  data-testid="permission-deny-history-item"
+                >
+                  <code>{e.tool_name}</code>
+                  {e.risk_tier ? ` [${e.risk_tier}]` : ""}:{" "}
+                  {e.summary.slice(0, 80)}
+                  {e.summary.length > 80 ? "…" : ""}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <details style={{ marginBottom: "0.75rem" }}>
           <summary
             style={{ cursor: "pointer", color: "var(--muted)", fontSize: 12 }}

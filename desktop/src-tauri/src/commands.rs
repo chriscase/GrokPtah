@@ -621,6 +621,20 @@ pub fn set_allow_deny_rules(state: State<'_, AppState>, allow: Vec<String>, deny
     state.host.set_allow_deny_rules(allow, deny);
 }
 
+/// Corporate OpenAI-compatible gateway (#169). Empty api_key leaves existing key.
+#[tauri::command]
+pub fn set_gateway_config(
+    state: State<'_, AppState>,
+    provider_id: String,
+    base_url: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    state
+        .host
+        .set_gateway_config(provider_id, base_url, api_key)
+        .map_err(map_err)
+}
+
 #[tauri::command]
 pub fn project_rules(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     state.host.project_rules().map_err(map_err)

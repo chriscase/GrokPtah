@@ -36,6 +36,9 @@ type SettingsSnap = {
   allowRules?: string[];
   denyRules?: string[];
   autoUpdateEnabled?: boolean;
+  gatewayProviderId?: string;
+  gatewayBaseUrl?: string;
+  gatewayApiKeySet?: boolean;
 };
 
 const EFFORTS = [
@@ -63,6 +66,9 @@ export function SettingsPanel({
 }: SettingsPanelProps) {
   const [snap, setSnap] = useState<SettingsSnap>({});
   const [apiKeyInput, setApiKeyInput] = useState("");
+  const [gatewayProvider, setGatewayProvider] = useState("");
+  const [gatewayBase, setGatewayBase] = useState("");
+  const [gatewayKey, setGatewayKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [section, setSection] = useState<
@@ -73,6 +79,8 @@ export function SettingsPanel({
     try {
       const s = (await api.settingsSnapshot()) as SettingsSnap;
       setSnap(s);
+      setGatewayProvider(String(s.gatewayProviderId ?? ""));
+      setGatewayBase(String(s.gatewayBaseUrl ?? ""));
     } catch (e) {
       setNotice(String(e));
     }
@@ -422,6 +430,81 @@ export function SettingsPanel({
                     </button>
                   </div>
                 </label>
+
+                <div
+                  className="settings-field"
+                  data-testid="settings-gateway"
+                  style={{ marginTop: "1.25rem" }}
+                >
+                  <span className="settings-field-label">
+                    Corporate gateway (OpenAI-compatible) (#169)
+                  </span>
+                  <p className="settings-lead" style={{ marginTop: 0 }}>
+                    Optional base URL + Bearer for locked-down proxies. Does{" "}
+                    <strong>not</strong> replace xAI login when{" "}
+                    <code>XAI_API_KEY</code> or OIDC is present. Env vars
+                    override this file. Stored in{" "}
+                    <code>~/.grokptah/gateway.json</code>.
+                  </p>
+                  <label className="settings-field">
+                    <span className="settings-field-label">
+                      Provider id (optional)
+                    </span>
+                    <input
+                      data-testid="gateway-provider-id"
+                      type="text"
+                      placeholder="corp"
+                      value={gatewayProvider}
+                      onChange={(e) => setGatewayProvider(e.target.value)}
+                    />
+                  </label>
+                  <label className="settings-field">
+                    <span className="settings-field-label">Base URL</span>
+                    <input
+                      data-testid="gateway-base-url"
+                      type="url"
+                      placeholder="https://gateway.example/v1"
+                      value={gatewayBase}
+                      onChange={(e) => setGatewayBase(e.target.value)}
+                    />
+                  </label>
+                  <label className="settings-field">
+                    <span className="settings-field-label">
+                      Gateway API key
+                      {snap.gatewayApiKeySet ? " (saved)" : ""}
+                    </span>
+                    <input
+                      data-testid="gateway-api-key"
+                      type="password"
+                      placeholder={
+                        snap.gatewayApiKeySet ? "•••• (leave blank to keep)" : "sk-…"
+                      }
+                      value={gatewayKey}
+                      onChange={(e) => setGatewayKey(e.target.value)}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <div className="modal-actions" style={{ marginTop: "0.5rem" }}>
+                    <button
+                      type="button"
+                      className="primary"
+                      data-testid="gateway-save"
+                      disabled={busy}
+                      onClick={() =>
+                        void apply(async () => {
+                          await api.setGatewayConfig(
+                            gatewayProvider.trim(),
+                            gatewayBase.trim(),
+                            gatewayKey.trim() || null,
+                          );
+                          setGatewayKey("");
+                        }, "Gateway settings saved")
+                      }
+                    >
+                      Save gateway
+                    </button>
+                  </div>
+                </div>
               </section>
             )}
 

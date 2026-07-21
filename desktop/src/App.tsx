@@ -24,6 +24,11 @@ import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
+import {
+  appendDeny,
+  loadDenyHistory,
+  type DenyHistoryEntry,
+} from "./lib/denyHistory";
 import { StyledSelect } from "./components/StyledSelect";
 import { LaunchSplash } from "./components/LaunchSplash";
 import {
@@ -235,6 +240,10 @@ export default function App() {
   /** FIFO of tool permission prompts — concurrent requests must not clobber (#141). */
   const [permissionQueue, setPermissionQueue] = useState<PermissionRequest[]>(
     [],
+  );
+  /** #175 recent denials for permission modal */
+  const [denyHistory, setDenyHistory] = useState<DenyHistoryEntry[]>(() =>
+    loadDenyHistory(),
   );
   const permission = headPermission(permissionQueue);
   const [rightTab, setRightTab] = useState<RightTab>("files");
@@ -3016,7 +3025,25 @@ export default function App() {
           request={permission}
           queuedBehind={Math.max(0, permissionQueue.length - 1)}
           fallbackSessionId={activeSessionId}
+          denyHistory={denyHistory}
           onRespond={async (requestId, decision, sessionId) => {
+            if (decision === "deny") {
+              const d =
+                typeof permission.detail === "object" &&
+                permission.detail !== null
+                  ? (permission.detail as Record<string, unknown>)
+                  : {};
+              setDenyHistory((h) =>
+                appendDeny(h, {
+                  tool_name: permission.tool_name,
+                  summary: permission.summary,
+                  session_id: sessionId || permission.session_id || "",
+                  risk: typeof d.risk === "string" ? d.risk : undefined,
+                  risk_tier:
+                    typeof d.risk_tier === "string" ? d.risk_tier : undefined,
+                }),
+              );
+            }
             await api.permissionRespond(requestId, decision);
             setPermissionQueue((q) => dequeuePermission(q, requestId));
             // Patch the *owning* session, not whichever tab is focused (#141).
