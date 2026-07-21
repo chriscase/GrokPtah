@@ -15,7 +15,8 @@ RUN_ID="${1:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT="${SCRATCH:-$ROOT/evals/runs/$RUN_ID}"
 mkdir -p "$OUT"
 
-MODEL="${GROKPTAH_MODEL:-grok-build}"
+# Prefer an id the installed CLI accepts (`grok models`). Override with GROKPTAH_MODEL.
+MODEL="${GROKPTAH_MODEL:-grok-4.5}"
 TASKS="$ROOT/evals/tasks.json"
 FIXTURES="$ROOT/evals/fixtures"
 BRIDGE="$ROOT/crates/codegen/grokptah-agent-bridge"

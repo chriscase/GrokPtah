@@ -18,11 +18,11 @@ with both sides run **live** (network + credentials), same model id, YOLO / alwa
 
 ```bash
 export GROKPTAH_LIVE_EVAL=1
-# optional: GROKPTAH_MODEL=grok-build  GROK_BIN=$(which grok)
+export GROKPTAH_MODEL=grok-4.5   # must be in `grok models` for the CLI side
 ./evals/scripts/run_parity.sh
 ```
 
-Outputs under `evals/runs/<timestamp>/`:
+Outputs under `evals/runs/<timestamp>/` or `$SCRATCH`:
 
 | File | Meaning |
 |------|---------|
@@ -46,11 +46,39 @@ Red CI is blocking. Do not merge while Desktop workflow is red.
 
 ## Latest live results
 
-_Populate after each harness run. Do not invent numbers._
+Model: **grok-4.5** (installed CLI did not accept `grok-build` id — see honesty notes).  
+SHA at run: `8191e28` (phase-16/parity).
 
-| Date (UTC) | SHA | Model | Ptah success | CLI success | Ptah ≥ CLI? | Run dir |
-|------------|-----|-------|-------------:|------------:|:-----------:|---------|
-| _pending first live run_ | | | | | | |
+### Run A — 2026-07-21T23:30:10Z
+
+| Metric | GrokPtah | Grok CLI |
+|--------|---------:|---------:|
+| Success count | 3/3 | 3/3 |
+| Success rate | 100% | 100% |
+| Tool errors (sum) | 0 | 0 |
+| Wall ms (sum) | 19829 | 47802 |
+| Permission prompts | 0 | 0 |
+
+**Ptah ≥ CLI:** YES (equal success; equal tool_errors; Ptah faster wall).
+
+| Task | Ptah | CLI | Ptah ms | CLI ms |
+|------|:----:|:---:|--------:|-------:|
+| basic_edit_add_mul | ✓ | ✓ | 7055 | 9289 |
+| search_edit_version | ✓ | ✓ | 7626 | 30482 |
+| basic_edit_readme_token | ✓ | ✓ | 5148 | 8031 |
+
+### Run B — 2026-07-21T23:30:53Z (consistency)
+
+| Metric | GrokPtah | Grok CLI |
+|--------|---------:|---------:|
+| Success count | 3/3 | 3/3 |
+| Success rate | 100% | 100% |
+| Tool errors (sum) | 0 | 0 |
+| Wall ms (sum) | 16562 | 25293 |
+
+**Ptah ≥ CLI:** YES. Per-task pass/fail **identical** to Run A.
+
+Raw logs: goal scratch `eval-run-2/`, `eval-run-3/`.
 
 ## Honesty / deliberate non-parity
 
@@ -59,7 +87,8 @@ _Populate after each harness run. Do not invent numbers._
 | OS sandbox / Landlock | **Non-goal** — exec-risk + soft tool-safety only (#155) |
 | Full `xai-grok-tools` matrix | See `TOOL_MATRIX.md` residual policy (#160) |
 | Workflows engine | Deferred (#176) |
-| Personas depth vs Build | Partial while #164 in progress |
+| Model id `grok-build` on installed CLI | CLI 0.2.103 listed only `grok-4.5`; evals used `grok-4.5` for a fair head-to-head |
+| Fixture set size | Three coding tasks — not the entire Build surface |
 
 ## Related docs
 

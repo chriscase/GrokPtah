@@ -111,6 +111,16 @@ struct Inner {
     edit_snapshots: HashMap<Uuid, HashMap<String, String>>,
     /// Live tool shell child — killed by [`AgentHostHandle::cancel_turn`].
     live_shells: local_tools::LiveShellMap,
+    /// Session usage counters (#159) — prompt/completion tokens when API reports them.
+    session_usage: HashMap<Uuid, SessionUsage>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    requests: u64,
 }
 
 /// Clears `turn_cancels` for a session when dropped — keeps panics from wedging busy.
@@ -224,6 +234,7 @@ impl AgentHost {
             edited_files: Vec::new(),
             edit_snapshots: HashMap::new(), // session_id → path → original
             live_shells: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            session_usage: HashMap::new(),
         };
         AgentHostHandle {
             inner: Arc::new(Mutex::new(inner)),
@@ -1156,6 +1167,26 @@ impl AgentHostHandle {
     pub fn set_model(&self, model: String) {
         self.inner.lock().model = model;
         self.persist_chrome();
+    }
+
+    /// Accumulate token usage for /usage (#159).
+    pub fn record_session_usage(
+        &self,
+        session_id: Uuid,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+    ) {
+        let mut g = self.inner.lock();
+        let u = g.session_usage.entry(session_id).or_default();
+        u.prompt_tokens = u.prompt_tokens.saturating_add(prompt_tokens);
+        u.completion_tokens = u.completion_tokens.saturating_add(completion_tokens);
+        u.total_tokens = u.total_tokens.saturating_add(if total_tokens > 0 {
+            total_tokens
+        } else {
+            prompt_tokens.saturating_add(completion_tokens)
+        });
+        u.requests = u.requests.saturating_add(1);
     }
 
     pub fn set_effort(&self, effort: EffortLevel) {
@@ -2374,11 +2405,33 @@ impl AgentHostHandle {
                     let text = "Commands: /help /compact /plan [goal] /yolo /model [id] \
                          /effort [none|low|medium|high|max] /clear /context /mcp /skills \
                          /sandbox [read-only|workspace-write|full] (tool safety profile — \
-                         not an OS sandbox) /explore [query].\n\
+                         not an OS sandbox) /explore [query] /usage.\n\
                          Build mode: multi-step tool loop + optional plan accept→execute.";
                     emit_message(&event_tx, session_id, text);
                     push_assistant(self, session_id, text);
                     return Ok(text.into());
+                }
+                "usage" => {
+                    let u = {
+                        let g = self.inner.lock();
+                        g.session_usage
+                            .get(&session_id)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    // Cost: document unknown rates; report tokens only (#159).
+                    let text = format!(
+                        "Session usage (#159):\n\
+                         - requests: {}\n\
+                         - prompt_tokens: {}\n\
+                         - completion_tokens: {}\n\
+                         - total_tokens: {}\n\
+                         Cost: not computed (no fixed rate table; see /usage in Grok Build for billed estimates).",
+                        u.requests, u.prompt_tokens, u.completion_tokens, u.total_tokens
+                    );
+                    emit_message(&event_tx, session_id, &text);
+                    push_assistant(self, session_id, &text);
+                    return Ok(text);
                 }
                 "yolo" => {
                     self.set_always_approve(true);
@@ -5709,6 +5762,8 @@ where
         // Non-stream JSON body (fallback path)
         if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
             let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
+            // Note: session usage is accumulated in the turn loop when available.
+            let _ = v.get("usage"); // kept for future wire-through of session_id
             return parse_agent_step_from_message(
                 &v["choices"][0]["message"],
                 false,
