@@ -1858,7 +1858,31 @@ impl AgentHostHandle {
             .args(["worktree", "list"])
             .current_dir(&cwd)
             .output()?;
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+        // #166: dry-run age GC report for managed isolation worktrees
+        let managed = cwd.join(".grokptah").join("worktrees");
+        if managed.is_dir() {
+            let report = crate::worktree_gc::gc_worktrees(
+                &managed,
+                crate::worktree_gc::DEFAULT_MAX_AGE,
+                true,
+            );
+            if report.scanned > 0 {
+                s.push_str(&format!(
+                    "\n# auto-gc dry-run: {} aged under .grokptah/worktrees (set GROKPTAH_WORKTREE_GC=1 to delete)\n",
+                    report.scanned
+                ));
+            }
+            if std::env::var_os("GROKPTAH_WORKTREE_GC").is_some() {
+                let live = crate::worktree_gc::gc_worktrees(
+                    &managed,
+                    crate::worktree_gc::DEFAULT_MAX_AGE,
+                    false,
+                );
+                s.push_str(&format!("# auto-gc removed {} paths\n", live.removed.len()));
+            }
+        }
+        Ok(s)
     }
 
     /// Create a git worktree under the open project (#43).
@@ -3542,6 +3566,69 @@ impl AgentHostHandle {
                 );
                 Ok(out)
             }
+            "kill_task" | "cancel_task" => {
+                let id = args
+                    .get("id")
+                    .or_else(|| args.get("task_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    return Ok("ERROR: kill_task requires id".into());
+                }
+                // Prefer background task cancel; also try subagent cancel (#179).
+                let bg = self.cancel_background_task(&id);
+                let sub = self.cancel_subagent(&id);
+                match (bg, sub) {
+                    (Ok(()), _) => Ok(format!("killed background task {id}")),
+                    (_, Ok(())) => Ok(format!("cancelled subagent {id}")),
+                    (Err(e1), Err(e2)) => {
+                        Ok(format!("ERROR: kill_task {id}: bg={e1}; subagent={e2}"))
+                    }
+                }
+            }
+            "task_output" | "get_task_output" => {
+                let id = args
+                    .get("id")
+                    .or_else(|| args.get("task_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let tasks = self.background_tasks();
+                let subs = self.subagents();
+                if let Some(id) = id {
+                    if let Some(t) = tasks.iter().find(|t| t.id == id) {
+                        return Ok(format!(
+                            "task {} status={} kind={} detail={}",
+                            t.id,
+                            t.status,
+                            t.kind,
+                            t.detail.clone().unwrap_or_default()
+                        ));
+                    }
+                    if let Some(s) = subs.iter().find(|s| s.id == id) {
+                        return Ok(format!(
+                            "subagent {} kind={} status={} summary={}",
+                            s.id,
+                            s.kind,
+                            s.status,
+                            s.summary.clone().unwrap_or_default()
+                        ));
+                    }
+                    return Ok(format!("ERROR: unknown task/subagent id {id}"));
+                }
+                let mut lines = Vec::new();
+                for t in &tasks {
+                    lines.push(format!("task {} [{}] {}", t.id, t.status, t.title));
+                }
+                for s in &subs {
+                    lines.push(format!("subagent {} [{}] {}", s.id, s.status, s.title));
+                }
+                if lines.is_empty() {
+                    Ok("(no background tasks or subagents)".into())
+                } else {
+                    Ok(lines.join("\n"))
+                }
+            }
             "memory_read" => {
                 let query = args
                     .get("query")
@@ -3772,7 +3859,33 @@ impl AgentHostHandle {
 
         let host = self.clone();
         let event_tx = event_tx.clone();
-        let cwd = cwd.to_path_buf();
+        // #162 optional worktree isolation
+        let mut cwd = cwd.to_path_buf();
+        if std::env::var("GROKPTAH_SUBAGENT_ISOLATION")
+            .map(|v| v == "worktree" || v == "1")
+            .unwrap_or(false)
+        {
+            let wt_root = cwd.join(".grokptah").join("worktrees");
+            let _ = std::fs::create_dir_all(&wt_root);
+            let wt = wt_root.join(format!("sub-{sub_id}"));
+            // Prefer git worktree; fall back to copy-less empty dir for offline.
+            let status = std::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "--detach",
+                    wt.to_str().unwrap_or("."),
+                    "HEAD",
+                ])
+                .current_dir(&cwd)
+                .status();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                cwd = wt;
+            } else {
+                let _ = std::fs::create_dir_all(&wt);
+                cwd = wt;
+            }
+        }
         let prompt = prompt.to_string();
         let kind_owned = kind.to_string();
         let sub_id_task = sub_id.clone();
@@ -5276,6 +5389,33 @@ fn coding_agent_tools(
                         "url": { "type": "string" }
                     },
                     "required": ["url"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "kill_task",
+                "description": "Cancel a background task or subagent by id (#179).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Task or subagent id" }
+                    },
+                    "required": ["id"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "task_output",
+                "description": "Get status/detail for a background task or subagent, or list all if id omitted (#179).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Optional task or subagent id" }
+                    }
                 }
             }
         }),

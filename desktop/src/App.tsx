@@ -1534,13 +1534,21 @@ export default function App() {
       setBgTasks(await api.backgroundTasks());
       await refreshChrome();
       await refreshSessions();
-      // #147: drain next queued prompt for this session.
+      // #147 + #157: drain queued prompts; combine consecutive plain follow-ups.
       let nextQueued: string | undefined;
       setPromptQueues((q) => {
         const list = q[id] ?? [];
         if (!list.length) return q;
-        const [head, ...rest] = list;
-        nextQueued = head;
+        // combine_queued_prompts: merge prefix of plain (non-slash) texts
+        let n = 1;
+        for (let i = 1; i < list.length; i++) {
+          const t = list[i]?.trim() ?? "";
+          if (!t || t.startsWith("/") || t.startsWith("!")) break;
+          n++;
+        }
+        const combined = list.slice(0, n).join("\n\n");
+        const rest = list.slice(n);
+        nextQueued = combined;
         const next = { ...q };
         if (rest.length) next[id] = rest;
         else delete next[id];

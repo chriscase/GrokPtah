@@ -24,6 +24,7 @@ mod ssrf;
 mod textutil;
 mod todo_list;
 mod types;
+mod worktree_gc;
 
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
 pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};
@@ -64,3 +65,5 @@ pub const PRODUCT_NAME: &str = "GrokPtah";
 pub fn desktop_auto_update_enabled() -> bool {
     false
 }
+
+pub use worktree_gc::{candidates_older_than, gc_worktrees, GcReport, DEFAULT_MAX_AGE};
