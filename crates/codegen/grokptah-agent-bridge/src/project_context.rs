@@ -355,13 +355,120 @@ fn strip_trailing_nl(s: &str) -> String {
     s.trim_end_matches('\n').trim_end_matches('\r').to_string()
 }
 
-const MAX_SKILLS_CHARS: usize = 10_000;
-const MAX_SKILL_BODY: usize = 2_400;
+/// Soft total budget for *unmatched* skill bodies in the default catalog inject.
+const MAX_SKILLS_CATALOG_CHARS: usize = 12_000;
+/// Matched skills inject full Markdown (Build 0.2.109 parity intent) (#154).
+const MAX_MATCHED_SKILL_BODY: usize = 200_000;
+const MAX_MATCHED_SKILLS: usize = 8;
+const MAX_MATCHED_TOTAL: usize = 400_000;
+
+/// Git status for Build system context: branch + unstaged + untracked (#158).
+/// Capped so huge dirty trees do not explode the prompt.
+pub fn git_status_context(cwd: &Path) -> String {
+    // Confirm this is a git work tree (empty repo still counts).
+    let is_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output();
+    match is_repo {
+        Ok(o) if o.status.success() => {
+            let v = String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .to_ascii_lowercase();
+            if v != "true" {
+                return String::new();
+            }
+        }
+        _ => return String::new(),
+    }
+
+    let mut out = String::from("## Git status (startup)\n");
+    let branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output();
+    if let Ok(o) = branch {
+        if o.status.success() {
+            let b = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !b.is_empty() {
+                out.push_str(&format!("Branch: {b}\n"));
+            }
+        } else {
+            out.push_str("Branch: (unborn)\n");
+        }
+    }
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "-uall"])
+        .current_dir(cwd)
+        .output();
+    let Ok(o) = status else {
+        return out;
+    };
+    if !o.status.success() {
+        return out;
+    }
+    let text = String::from_utf8_lossy(&o.stdout);
+    if text.trim().is_empty() {
+        out.push_str("Working tree clean.\n");
+        return out;
+    }
+    let mut unstaged = Vec::new();
+    let mut untracked = Vec::new();
+    let mut staged = Vec::new();
+    for line in text.lines().take(200) {
+        if line.len() < 3 {
+            continue;
+        }
+        let x = line.as_bytes()[0] as char;
+        let y = line.as_bytes()[1] as char;
+        let path = line[3..].trim();
+        if x == '?' && y == '?' {
+            untracked.push(path.to_string());
+        } else {
+            if x != ' ' && x != '?' {
+                staged.push(format!("{x} {path}"));
+            }
+            if y != ' ' && y != '?' {
+                unstaged.push(format!("{y} {path}"));
+            }
+        }
+    }
+    if !staged.is_empty() {
+        out.push_str("Staged:\n");
+        for p in staged.into_iter().take(80) {
+            out.push_str(&format!("  {p}\n"));
+        }
+    }
+    if !unstaged.is_empty() {
+        out.push_str("Unstaged:\n");
+        for p in unstaged.into_iter().take(80) {
+            out.push_str(&format!("  {p}\n"));
+        }
+    }
+    if !untracked.is_empty() {
+        out.push_str("Untracked:\n");
+        for p in untracked.into_iter().take(80) {
+            out.push_str(&format!("  {p}\n"));
+        }
+    }
+    if out.len() > 6_000 {
+        crate::textutil::truncate_with_marker(&out, 6_000, "\n… (git status truncated)")
+    } else {
+        out
+    }
+}
 
 /// Load discovered skills (catalog + bodies) for Build agent system context.
 ///
 /// `SkillInfo.id` is the filesystem path to the skill markdown.
+/// When `task` is set, skills matching the task get **full** bodies (no 2.4k cap).
+#[allow(dead_code)] // public helper; production path uses `load_skills_context_for_task`
 pub fn load_skills_context(project: Option<&Path>) -> String {
+    load_skills_context_for_task(project, None)
+}
+
+/// Like [`load_skills_context`] but prefers full bodies for skills matching `task` (#154).
+pub fn load_skills_context_for_task(project: Option<&Path>, task: Option<&str>) -> String {
     let skills = crate::discover::discover_skills(project);
     if skills.is_empty() {
         return String::new();
@@ -369,23 +476,34 @@ pub fn load_skills_context(project: Option<&Path>) -> String {
     let mut out = String::from(
         "Skills available for this session (follow a skill body when the user task matches):\n\n",
     );
-    let mut used = out.len();
 
-    // Compact catalog first
+    // Compact catalog always
     for s in &skills {
         let line = format!("- **{}**: {}\n", s.name, s.description);
-        if used + line.len() > MAX_SKILLS_CHARS / 3 {
+        if out.len() + line.len() > MAX_SKILLS_CATALOG_CHARS / 2 {
             break;
         }
         out.push_str(&line);
-        used += line.len();
     }
     out.push('\n');
 
-    // Full bodies (capped) for the first few skills
-    let mut bodies = 0usize;
+    let task_l = task.map(|t| t.to_ascii_lowercase()).unwrap_or_default();
+    let mut matched: Vec<&crate::types::SkillInfo> = Vec::new();
+    let mut rest: Vec<&crate::types::SkillInfo> = Vec::new();
     for s in &skills {
-        if bodies >= 6 || used >= MAX_SKILLS_CHARS {
+        if !task_l.is_empty() && skill_matches_task(s, &task_l) {
+            matched.push(s);
+        } else {
+            rest.push(s);
+        }
+    }
+
+    let mut used_bodies = 0usize;
+    let mut body_count = 0usize;
+
+    // Full bodies for matched skills (#154 — no aggressive 2400-char truncate)
+    for s in matched.into_iter().take(MAX_MATCHED_SKILLS) {
+        if body_count >= MAX_MATCHED_SKILLS || used_bodies >= MAX_MATCHED_TOTAL {
             break;
         }
         let Ok(body) = std::fs::read_to_string(&s.id) else {
@@ -395,22 +513,64 @@ pub fn load_skills_context(project: Option<&Path>) -> String {
         if body.is_empty() {
             continue;
         }
-        let room = MAX_SKILLS_CHARS.saturating_sub(used);
-        let cap = MAX_SKILL_BODY.min(room.saturating_sub(64));
-        if cap < 80 {
-            break;
-        }
-        let text = if body.len() > cap {
-            crate::textutil::truncate_with_marker(body, cap, "…\n(truncated)")
+        let text = if body.len() > MAX_MATCHED_SKILL_BODY {
+            crate::textutil::truncate_with_marker(body, MAX_MATCHED_SKILL_BODY, "…\n(truncated)")
         } else {
             body.to_string()
         };
-        let block = format!("### Skill: {}\n{}\n\n", s.name, text);
+        let block = format!("### Skill: {} (matched — full body)\n{}\n\n", s.name, text);
         out.push_str(&block);
-        used += block.len();
-        bodies += 1;
+        used_bodies += block.len();
+        body_count += 1;
+    }
+
+    // Unmatched: short previews only (catalog already listed names)
+    let preview_budget = MAX_SKILLS_CATALOG_CHARS;
+    let mut preview_used = 0usize;
+    for s in rest.into_iter().take(4) {
+        if preview_used >= preview_budget {
+            break;
+        }
+        let Ok(body) = std::fs::read_to_string(&s.id) else {
+            continue;
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let preview = crate::textutil::truncate_with_marker(
+            body,
+            400,
+            "…\n(preview; open skill file for full text)",
+        );
+        let block = format!("### Skill: {} (preview)\n{}\n\n", s.name, preview);
+        out.push_str(&block);
+        preview_used += block.len();
     }
     out
+}
+
+fn skill_matches_task(skill: &crate::types::SkillInfo, task_lower: &str) -> bool {
+    if task_lower.is_empty() {
+        return false;
+    }
+    let name = skill.name.to_ascii_lowercase();
+    let desc = skill.description.to_ascii_lowercase();
+    if task_lower.contains(&name)
+        || name
+            .split(['-', '_', ' '])
+            .any(|p| p.len() > 2 && task_lower.contains(p))
+    {
+        return true;
+    }
+    // token overlap on description words
+    for w in desc.split_whitespace() {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric());
+        if w.len() >= 5 && task_lower.contains(w) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Best-effort unified diff for a path after an edit (git, else summary).
@@ -522,6 +682,52 @@ LINE THREE
         assert!(
             ctx.contains("edge cases") || ctx.contains("Review") || ctx.contains("review"),
             "skills context: {ctx}"
+        );
+    }
+
+    #[test]
+    fn matched_skill_injects_full_body_over_2400_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = dir.path().join("skills");
+        fs::create_dir_all(&skills).unwrap();
+        let marker = "UNIQUE_SKILL_MARKER_END_OF_BODY";
+        let body = format!("# bigskill\n\n{}\n{marker}\n", "x".repeat(5000));
+        fs::write(skills.join("bigskill.md"), &body).unwrap();
+        // discover looks under project skill dirs (`skills/`, `.grok/skills`, …)
+        let ctx =
+            load_skills_context_for_task(Some(dir.path()), Some("please run bigskill carefully"));
+        assert!(
+            ctx.contains(marker),
+            "expected full body including end marker; ctx len {} tail {:?}",
+            ctx.len(),
+            ctx.chars().rev().take(80).collect::<String>()
+        );
+        assert!(
+            !ctx.contains("(truncated)") || ctx.contains(marker),
+            "matched skill should not lose end of body"
+        );
+    }
+
+    #[test]
+    fn git_status_includes_untracked_when_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(dir.path())
+            .output();
+        fs::write(dir.path().join("orphan.txt"), "hi").unwrap();
+        let ctx = git_status_context(dir.path());
+        assert!(
+            ctx.contains("orphan.txt") || ctx.contains("Untracked") || ctx.contains("Branch"),
+            "git ctx: {ctx}"
         );
     }
 }

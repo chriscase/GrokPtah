@@ -6,6 +6,7 @@
 mod auth_store;
 mod discover;
 mod events;
+mod exec_risk;
 mod hooks;
 mod host;
 mod instance_lock;
@@ -15,12 +16,18 @@ mod memory;
 mod models_catalog;
 mod permission;
 mod project_context;
+mod prompt_combine;
 mod search_engine;
 mod session;
 mod session_store;
+mod ssrf;
 mod textutil;
 mod todo_list;
 mod types;
+
+pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
+pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};
+pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
 
 pub use textutil::{truncate_at_char_boundary, truncate_with_marker};
 

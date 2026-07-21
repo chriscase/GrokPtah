@@ -17,6 +17,7 @@ use crate::types::ModelInfo;
 /// Fallback when cache is missing / unreadable (still prefer Grok Build ids).
 const BUILTIN: &[(&str, &str, bool)] = &[
     ("grok-build", "Grok Build", true),
+    ("grok-4.20-multi-agent", "Grok 4.20 Multi-Agent", true),
     ("grok-4.5", "Grok 4.5", true),
     ("grok-4", "Grok 4", true),
     ("grok-3", "Grok 3", true),
@@ -85,6 +86,7 @@ fn pick_preferred_default(catalog: &[CatalogModel]) -> Option<String> {
     // Explicit preference order for coding agent defaults.
     const PREFER: &[&str] = &[
         "grok-build",
+        "grok-4.20-multi-agent",
         "grok-4.5",
         "grok-4",
         "grok-3",
@@ -219,6 +221,16 @@ mod tests {
     fn builtin_catalog_includes_grok_build() {
         let c = load_catalog();
         assert!(c.iter().any(|m| m.info.id == "grok-build"));
+    }
+
+    #[test]
+    fn builtin_catalog_includes_grok_4_20_multi_agent() {
+        let c = load_catalog();
+        assert!(
+            c.iter().any(|m| m.info.id == "grok-4.20-multi-agent"),
+            "ids: {:?}",
+            c.iter().map(|m| m.info.id.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

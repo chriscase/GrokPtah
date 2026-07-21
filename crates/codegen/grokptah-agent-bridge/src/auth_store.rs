@@ -129,7 +129,14 @@ pub fn auth_json_path() -> PathBuf {
     grok_home().join("auth.json")
 }
 
-/// Best credential for outbound xAI chat API calls.
+/// Best credential for outbound chat API calls.
+///
+/// Order (must not break default xAI path — #169):
+/// 1. `XAI_API_KEY`
+/// 2. Keyring API key
+/// 3. Corporate/OpenAI-compatible: `GROKPTAH_API_KEY` / `OPENAI_API_KEY`
+/// 4. Rotating token command (#170): `GROKPTAH_TOKEN_COMMAND`
+/// 5. Grok Build OIDC session (`~/.grok/auth.json`)
 pub fn resolve_wire_credentials() -> Option<WireCredentials> {
     if let Ok(key) = std::env::var("XAI_API_KEY") {
         if !key.is_empty() {
@@ -175,7 +182,74 @@ pub fn resolve_wire_credentials() -> Option<WireCredentials> {
             }
         }
     }
+    // Corporate / OpenAI-compatible gateway keys (#169) — only when xAI key absent.
+    for (env_name, label) in [
+        ("GROKPTAH_API_KEY", "env:GROKPTAH_API_KEY"),
+        ("OPENAI_API_KEY", "env:OPENAI_API_KEY"),
+    ] {
+        if let Ok(key) = std::env::var(env_name) {
+            if !key.is_empty() {
+                return Some(WireCredentials {
+                    bearer: key,
+                    oidc_token_auth: false,
+                    display_name: label.into(),
+                    method: "api_key".into(),
+                    user_id: None,
+                    team_id: None,
+                    auth_scope: None,
+                    refresh_token: None,
+                    oidc_issuer: None,
+                    oidc_client_id: None,
+                    principal_type: None,
+                    principal_id: None,
+                    expires_at: None,
+                });
+            }
+        }
+    }
+    // Rotating token helper (#170): command prints a short-lived bearer to stdout.
+    if let Ok(cmd) = std::env::var("GROKPTAH_TOKEN_COMMAND") {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            if let Some(tok) = run_token_command(cmd) {
+                return Some(WireCredentials {
+                    bearer: tok,
+                    oidc_token_auth: false,
+                    display_name: "token_command".into(),
+                    method: "token_command".into(),
+                    user_id: None,
+                    team_id: None,
+                    auth_scope: None,
+                    refresh_token: None,
+                    oidc_issuer: None,
+                    oidc_client_id: None,
+                    principal_type: None,
+                    principal_id: None,
+                    expires_at: None,
+                });
+            }
+        }
+    }
     load_grok_build_session()
+}
+
+fn run_token_command(cmd: &str) -> Option<String> {
+    // Shell out once; never log stdout (may be a secret).
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    let tok = s.lines().map(str::trim).find(|l| !l.is_empty())?;
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_string())
+    }
 }
 
 /// Read the active OIDC session from Grok Build's `~/.grok/auth.json`.
