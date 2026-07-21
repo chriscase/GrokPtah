@@ -51,12 +51,8 @@ export function StreamingText({
     if (!added) return;
     prevText.current = text;
 
-    // Finished one-shot (full message at once): no multi-word beam spam
-    if (!streaming && prevText.current === added && segments.length === 0) {
-      setSegments([{ id: idSeq.current++, text: added, fresh: false }]);
-      return;
-    }
-
+    // One-shot full message: still materialize (Gemini-like), slightly faster stagger.
+    // Previously set fresh:false which made complete replies pop in with no beam.
     ingestAdded(added, streaming, false);
   }, [text, streaming]);
 
