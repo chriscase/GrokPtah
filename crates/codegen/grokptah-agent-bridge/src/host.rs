@@ -106,10 +106,21 @@ struct Inner {
     event_tx: mpsc::UnboundedSender<SessionUpdate>,
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
-    /// Path → original file bytes/text before first agent edit this process (#146).
-    edit_snapshots: HashMap<String, String>,
+    /// Per-session path → original content before first agent edit (#146).
+    /// Keyed by session so rewind never restores another session's edits.
+    edit_snapshots: HashMap<Uuid, HashMap<String, String>>,
     /// Live tool shell child — killed by [`AgentHostHandle::cancel_turn`].
     live_shells: local_tools::LiveShellMap,
+    /// Session usage counters (#159) — prompt/completion tokens when API reports them.
+    session_usage: HashMap<Uuid, SessionUsage>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    requests: u64,
 }
 
 /// Clears `turn_cancels` for a session when dropped — keeps panics from wedging busy.
@@ -221,8 +232,9 @@ impl AgentHost {
             turn_cancels: HashMap::new(),
             event_tx,
             edited_files: Vec::new(),
-            edit_snapshots: HashMap::new(),
+            edit_snapshots: HashMap::new(), // session_id → path → original
             live_shells: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            session_usage: HashMap::new(),
         };
         AgentHostHandle {
             inner: Arc::new(Mutex::new(inner)),
@@ -805,7 +817,7 @@ impl AgentHostHandle {
         let do_conv = mode != "files" && mode != "filesonly";
 
         if do_files {
-            self.restore_edit_snapshots()?;
+            self.restore_edit_snapshots_for_session(id)?;
         }
 
         let summary = {
@@ -814,6 +826,8 @@ impl AgentHostHandle {
                 .sessions
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
+            // Honor keep_messages for conversation modes (#146).
+            // FilesOnly leaves transcript untouched.
             if do_conv && keep_messages < s.transcript.len() {
                 s.transcript.truncate(keep_messages);
             }
@@ -826,25 +840,43 @@ impl AgentHostHandle {
         Ok(summary)
     }
 
-    /// Snapshot original contents the first time a path is edited (for FilesOnly rewind).
+    /// Snapshot original contents the first time a path is edited in this session (#146).
     pub fn snapshot_edit_original(&self, cwd: &Path, rel_path: &str) {
         let abs = cwd.join(rel_path);
         let key = abs.to_string_lossy().into_owned();
         let mut g = self.inner.lock();
-        if g.edit_snapshots.contains_key(&key) {
+        let sid = match g.active_session {
+            Some(id) => id,
+            None => return,
+        };
+        let map = g.edit_snapshots.entry(sid).or_default();
+        if map.contains_key(&key) {
             return;
         }
         let original = std::fs::read_to_string(&abs).unwrap_or_default();
-        g.edit_snapshots.insert(key, original);
+        map.insert(key, original);
     }
 
-    fn restore_edit_snapshots(&self) -> Result<()> {
+    /// Snapshot for an explicit session (tool path always knows the session).
+    pub fn snapshot_edit_original_for_session(&self, session_id: Uuid, cwd: &Path, rel_path: &str) {
+        let abs = cwd.join(rel_path);
+        let key = abs.to_string_lossy().into_owned();
+        let mut g = self.inner.lock();
+        let map = g.edit_snapshots.entry(session_id).or_default();
+        if map.contains_key(&key) {
+            return;
+        }
+        let original = std::fs::read_to_string(&abs).unwrap_or_default();
+        map.insert(key, original);
+    }
+
+    fn restore_edit_snapshots_for_session(&self, session_id: Uuid) -> Result<()> {
         let snaps: Vec<(String, String)> = {
             let g = self.inner.lock();
             g.edit_snapshots
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
+                .get(&session_id)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default()
         };
         for (path, content) in &snaps {
             let p = Path::new(path);
@@ -861,8 +893,11 @@ impl AgentHostHandle {
             }
         }
         let mut g = self.inner.lock();
-        g.edit_snapshots.clear();
-        g.edited_files.clear();
+        g.edit_snapshots.remove(&session_id);
+        // Drop edited_files entries that match restored paths (best-effort)
+        let restored: std::collections::HashSet<_> = snaps.iter().map(|(p, _)| p.clone()).collect();
+        g.edited_files
+            .retain(|p| !restored.iter().any(|r| r.ends_with(p) || p.ends_with(r)));
         Ok(())
     }
 
@@ -1132,6 +1167,26 @@ impl AgentHostHandle {
     pub fn set_model(&self, model: String) {
         self.inner.lock().model = model;
         self.persist_chrome();
+    }
+
+    /// Accumulate token usage for /usage (#159).
+    pub fn record_session_usage(
+        &self,
+        session_id: Uuid,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+    ) {
+        let mut g = self.inner.lock();
+        let u = g.session_usage.entry(session_id).or_default();
+        u.prompt_tokens = u.prompt_tokens.saturating_add(prompt_tokens);
+        u.completion_tokens = u.completion_tokens.saturating_add(completion_tokens);
+        u.total_tokens = u.total_tokens.saturating_add(if total_tokens > 0 {
+            total_tokens
+        } else {
+            prompt_tokens.saturating_add(completion_tokens)
+        });
+        u.requests = u.requests.saturating_add(1);
     }
 
     pub fn set_effort(&self, effort: EffortLevel) {
@@ -1406,14 +1461,7 @@ impl AgentHostHandle {
                 .unwrap_or_else(CancellationToken::new)
         };
         let event_tx = self.inner.lock().event_tx.clone();
-        self.spawn_gp_subagent_parallel(
-            session_id,
-            &cwd,
-            prompt,
-            kind,
-            &parent_cancel,
-            &event_tx,
-        )
+        self.spawn_gp_subagent_parallel(session_id, &cwd, prompt, kind, &parent_cancel, &event_tx)
     }
 
     /// Test helper: register a parent turn cancel token for `session_id`.
@@ -1439,10 +1487,7 @@ impl AgentHostHandle {
             s.status = "cancelled".into();
             s.summary = Some("cancelled by user".into());
         }
-        let session_id = s
-            .session_id
-            .as_ref()
-            .and_then(|x| Uuid::parse_str(x).ok());
+        let session_id = s.session_id.as_ref().and_then(|x| Uuid::parse_str(x).ok());
         let snap = g.subagents.clone();
         drop(g);
         if let Some(sid) = session_id {
@@ -1523,11 +1568,7 @@ impl AgentHostHandle {
             } else {
                 "scan".into()
             },
-            session_id: self
-                .inner
-                .lock()
-                .active_session
-                .map(|u| u.to_string()),
+            session_id: self.inner.lock().active_session.map(|u| u.to_string()),
             detail: Some("starting…".into()),
         };
         {
@@ -1600,7 +1641,11 @@ impl AgentHostHandle {
                     let event_tx_p = event_tx.clone();
                     let walk = tokio::task::spawn_blocking(move || {
                         let mut n = 0usize;
-                        for e in walkdir::WalkDir::new(cwd).max_depth(8).into_iter().flatten() {
+                        for e in walkdir::WalkDir::new(cwd)
+                            .max_depth(8)
+                            .into_iter()
+                            .flatten()
+                        {
                             if cancel_c.is_cancelled() {
                                 return Err(n);
                             }
@@ -1813,7 +1858,31 @@ impl AgentHostHandle {
             .args(["worktree", "list"])
             .current_dir(&cwd)
             .output()?;
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+        // #166: dry-run age GC report for managed isolation worktrees
+        let managed = cwd.join(".grokptah").join("worktrees");
+        if managed.is_dir() {
+            let report = crate::worktree_gc::gc_worktrees(
+                &managed,
+                crate::worktree_gc::DEFAULT_MAX_AGE,
+                true,
+            );
+            if report.scanned > 0 {
+                s.push_str(&format!(
+                    "\n# auto-gc dry-run: {} aged under .grokptah/worktrees (set GROKPTAH_WORKTREE_GC=1 to delete)\n",
+                    report.scanned
+                ));
+            }
+            if std::env::var_os("GROKPTAH_WORKTREE_GC").is_some() {
+                let live = crate::worktree_gc::gc_worktrees(
+                    &managed,
+                    crate::worktree_gc::DEFAULT_MAX_AGE,
+                    false,
+                );
+                s.push_str(&format!("# auto-gc removed {} paths\n", live.removed.len()));
+            }
+        }
+        Ok(s)
     }
 
     /// Create a git worktree under the open project (#43).
@@ -2074,7 +2143,9 @@ impl AgentHostHandle {
                     let child_ids: Vec<String> = g
                         .subagents
                         .iter()
-                        .filter(|s| s.session_id.as_deref() == Some(sid.as_str()) && s.status == "running")
+                        .filter(|s| {
+                            s.session_id.as_deref() == Some(sid.as_str()) && s.status == "running"
+                        })
                         .map(|s| s.id.clone())
                         .collect();
                     for cid in &child_ids {
@@ -2358,11 +2429,33 @@ impl AgentHostHandle {
                     let text = "Commands: /help /compact /plan [goal] /yolo /model [id] \
                          /effort [none|low|medium|high|max] /clear /context /mcp /skills \
                          /sandbox [read-only|workspace-write|full] (tool safety profile — \
-                         not an OS sandbox) /explore [query].\n\
+                         not an OS sandbox) /explore [query] /usage.\n\
                          Build mode: multi-step tool loop + optional plan accept→execute.";
                     emit_message(&event_tx, session_id, text);
                     push_assistant(self, session_id, text);
                     return Ok(text.into());
+                }
+                "usage" => {
+                    let u = {
+                        let g = self.inner.lock();
+                        g.session_usage
+                            .get(&session_id)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    // Cost: document unknown rates; report tokens only (#159).
+                    let text = format!(
+                        "Session usage (#159):\n\
+                         - requests: {}\n\
+                         - prompt_tokens: {}\n\
+                         - completion_tokens: {}\n\
+                         - total_tokens: {}\n\
+                         Cost: not computed (no fixed rate table; see /usage in Grok Build for billed estimates).",
+                        u.requests, u.prompt_tokens, u.completion_tokens, u.total_tokens
+                    );
+                    emit_message(&event_tx, session_id, &text);
+                    push_assistant(self, session_id, &text);
+                    return Ok(text);
                 }
                 "yolo" => {
                     self.set_always_approve(true);
@@ -3149,9 +3242,7 @@ impl AgentHostHandle {
             }
             "write_file" => {
                 if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
-                    return Ok(
-                        "ERROR: tool safety profile is read-only; write_file denied".into(),
-                    );
+                    return Ok("ERROR: tool safety profile is read-only; write_file denied".into());
                 }
                 let path = args
                     .get("path")
@@ -3165,7 +3256,7 @@ impl AgentHostHandle {
                     .to_string();
                 let path_record = path.clone();
                 // #146: snapshot original *before* write so FilesOnly rewind can restore.
-                self.snapshot_edit_original(cwd, &path_record);
+                self.snapshot_edit_original_for_session(session_id, cwd, &path_record);
                 let out = self
                     .run_tool_for_output(
                         session_id,
@@ -3319,7 +3410,7 @@ impl AgentHostHandle {
                     {
                         let path = p.trim();
                         if !path.is_empty() {
-                            self.snapshot_edit_original(cwd, path);
+                            self.snapshot_edit_original_for_session(session_id, cwd, path);
                         }
                     }
                 }
@@ -3475,6 +3566,69 @@ impl AgentHostHandle {
                 );
                 Ok(out)
             }
+            "kill_task" | "cancel_task" => {
+                let id = args
+                    .get("id")
+                    .or_else(|| args.get("task_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    return Ok("ERROR: kill_task requires id".into());
+                }
+                // Prefer background task cancel; also try subagent cancel (#179).
+                let bg = self.cancel_background_task(&id);
+                let sub = self.cancel_subagent(&id);
+                match (bg, sub) {
+                    (Ok(()), _) => Ok(format!("killed background task {id}")),
+                    (_, Ok(())) => Ok(format!("cancelled subagent {id}")),
+                    (Err(e1), Err(e2)) => {
+                        Ok(format!("ERROR: kill_task {id}: bg={e1}; subagent={e2}"))
+                    }
+                }
+            }
+            "task_output" | "get_task_output" => {
+                let id = args
+                    .get("id")
+                    .or_else(|| args.get("task_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let tasks = self.background_tasks();
+                let subs = self.subagents();
+                if let Some(id) = id {
+                    if let Some(t) = tasks.iter().find(|t| t.id == id) {
+                        return Ok(format!(
+                            "task {} status={} kind={} detail={}",
+                            t.id,
+                            t.status,
+                            t.kind,
+                            t.detail.clone().unwrap_or_default()
+                        ));
+                    }
+                    if let Some(s) = subs.iter().find(|s| s.id == id) {
+                        return Ok(format!(
+                            "subagent {} kind={} status={} summary={}",
+                            s.id,
+                            s.kind,
+                            s.status,
+                            s.summary.clone().unwrap_or_default()
+                        ));
+                    }
+                    return Ok(format!("ERROR: unknown task/subagent id {id}"));
+                }
+                let mut lines = Vec::new();
+                for t in &tasks {
+                    lines.push(format!("task {} [{}] {}", t.id, t.status, t.title));
+                }
+                for s in &subs {
+                    lines.push(format!("subagent {} [{}] {}", s.id, s.status, s.title));
+                }
+                if lines.is_empty() {
+                    Ok("(no background tasks or subagents)".into())
+                } else {
+                    Ok(lines.join("\n"))
+                }
+            }
             "memory_read" => {
                 let query = args
                     .get("query")
@@ -3523,9 +3677,7 @@ impl AgentHostHandle {
                     .ok_or_else(|| anyhow!("web_fetch requires url"))?
                     .to_string();
                 if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
-                    return Ok(
-                        "ERROR: tool safety profile is read-only; web_fetch denied".into(),
-                    );
+                    return Ok("ERROR: tool safety profile is read-only; web_fetch denied".into());
                 }
                 self.run_tool_for_output(
                     session_id,
@@ -3707,7 +3859,33 @@ impl AgentHostHandle {
 
         let host = self.clone();
         let event_tx = event_tx.clone();
-        let cwd = cwd.to_path_buf();
+        // #162 optional worktree isolation
+        let mut cwd = cwd.to_path_buf();
+        if std::env::var("GROKPTAH_SUBAGENT_ISOLATION")
+            .map(|v| v == "worktree" || v == "1")
+            .unwrap_or(false)
+        {
+            let wt_root = cwd.join(".grokptah").join("worktrees");
+            let _ = std::fs::create_dir_all(&wt_root);
+            let wt = wt_root.join(format!("sub-{sub_id}"));
+            // Prefer git worktree; fall back to copy-less empty dir for offline.
+            let status = std::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "--detach",
+                    wt.to_str().unwrap_or("."),
+                    "HEAD",
+                ])
+                .current_dir(&cwd)
+                .status();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                cwd = wt;
+            } else {
+                let _ = std::fs::create_dir_all(&wt);
+                cwd = wt;
+            }
+        }
         let prompt = prompt.to_string();
         let kind_owned = kind.to_string();
         let sub_id_task = sub_id.clone();
@@ -3773,12 +3951,9 @@ impl AgentHostHandle {
                     tr.output.chars().take(2_000).collect::<String>()
                 ));
             }
-            if let Some(rest) = prompt
-                .find("write ")
-                .map(|i| &prompt[i + "write ".len()..])
-            {
+            if let Some(rest) = prompt.find("write ").map(|i| &prompt[i + "write ".len()..]) {
                 if let Some((path, content)) = rest.split_once(':') {
-                    self.snapshot_edit_original(cwd, path.trim());
+                    self.snapshot_edit_original_for_session(session_id, cwd, path.trim());
                     if let Ok(tr) =
                         local_tools::tool_write_file(cwd, path.trim(), content.trim()).await
                     {
@@ -3832,7 +4007,13 @@ impl AgentHostHandle {
             serde_json::json!({ "role": "user", "content": prompt }),
         ];
         let mut last = String::new();
-        for _round in 1..=6u32 {
+        // #163: deeper child sessions (default 16 rounds; was hard-capped at 6).
+        let max_child_rounds: u32 = std::env::var("GROKPTAH_SUBAGENT_MAX_ROUNDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16)
+            .clamp(4, 48);
+        for _round in 1..=max_child_rounds {
             if cancel.is_cancelled() {
                 self.finish_subagent(sub_id, "cancelled", &event_tx, session_id, None);
                 return;
@@ -3849,7 +4030,9 @@ impl AgentHostHandle {
             )
             .await;
             match step {
-                Ok(AgentStep::Final { text, reasoning, .. }) => {
+                Ok(AgentStep::Final {
+                    text, reasoning, ..
+                }) => {
                     if let Some(r) = reasoning {
                         push_thought(self, session_id, &r);
                     }
@@ -3884,8 +4067,20 @@ impl AgentHostHandle {
                                 s.last_tool = Some(tc.name.clone());
                             }
                         }
+                        // #161 capability modes: plan is non-mutating (explore is separate path).
                         let out = if tc.name.starts_with("spawn_") {
                             format!("DENIED: nested {} not allowed inside subagent", tc.name)
+                        } else if kind == "plan"
+                            && matches!(
+                                tc.name.as_str(),
+                                "write_file" | "apply_patch" | "run_terminal_cmd" | "memory_write"
+                            )
+                        {
+                            format!(
+                                "DENIED by capability mode `plan`: tool `{}` is not allowed. \
+                                 Plan agents may only research (list/read/grep/glob) and produce a plan.",
+                                tc.name
+                            )
                         } else {
                             Box::pin(self.dispatch_agent_tool(
                                 session_id,
@@ -4247,9 +4442,53 @@ impl AgentHostHandle {
             return Ok("(cancelled)".into());
         }
         let call_id = Uuid::new_v4().to_string();
+
+        // #155 exec-risk preflight (not OS sandbox)
+        let risk = crate::exec_risk::assess_shell_risk(command);
+        let (sandbox_profile, yolo) = {
+            let g = self.inner.lock();
+            (g.sandbox_profile.clone(), g.always_approve)
+        };
+        if risk.tier == crate::exec_risk::RiskTier::Deny
+            && crate::exec_risk::should_block_deny_tier(&sandbox_profile, yolo)
+        {
+            let msg = format!(
+                "DENIED by exec-risk: {} (peeled: `{}`). \
+                 This is a tool-safety risk gate, not an OS sandbox. \
+                 Adjust the command or use a full-profile YOLO session if intentional.",
+                risk.reason, risk.peeled
+            );
+            let _ = event_tx.send(SessionUpdate::ToolCall {
+                session_id,
+                call_id: call_id.clone(),
+                title: "run_terminal_cmd".into(),
+                kind: ToolCallKind::Execute,
+                status: ToolCallStatus::Denied,
+                input: serde_json::json!({
+                    "command": command,
+                    "risk": risk.reason,
+                    "risk_tier": "deny",
+                }),
+            });
+            push_tool(
+                self,
+                session_id,
+                &call_id,
+                "run_terminal_cmd",
+                ToolCallStatus::Denied,
+                Some(msg.clone()),
+            );
+            // #156: model-visible deny reason (tool result string)
+            return Ok(msg);
+        }
+
         let gate = self.tool_gate("run_terminal_cmd");
         if gate == ToolGate::AutoDeny {
-            let msg = format!("DENIED by deny rule: shell `{command}`");
+            // #156: feed clear reason to the model
+            let msg = format!(
+                "DENIED by deny rule: shell `{command}` was blocked by permission deny rules. \
+                 Do not retry the same command; choose a safer alternative or ask the user."
+            );
             let _ = event_tx.send(SessionUpdate::ToolCall {
                 session_id,
                 call_id: call_id.clone(),
@@ -4270,13 +4509,30 @@ impl AgentHostHandle {
         }
         let always = matches!(gate, ToolGate::AutoAllow);
 
-        if !always {
+        // Ask-tier risk forces a prompt even under allow-rules (unless YOLO).
+        let force_ask = risk.tier == crate::exec_risk::RiskTier::Ask && !yolo;
+        if !always || force_ask {
+            let risk_note = if risk.tier != crate::exec_risk::RiskTier::Allow {
+                format!(" [risk: {}]", risk.reason)
+            } else {
+                String::new()
+            };
             let req = PermissionRequest {
                 id: Uuid::new_v4(),
                 session_id,
                 tool_name: "run_terminal_cmd".into(),
-                summary: format!("Allow shell: {command}"),
-                detail: serde_json::json!({ "tool": "run_terminal_cmd", "command": command }),
+                summary: format!("Allow shell: {command}{risk_note}"),
+                detail: serde_json::json!({
+                    "tool": "run_terminal_cmd",
+                    "command": command,
+                    "risk": risk.reason,
+                    "risk_tier": match risk.tier {
+                        crate::exec_risk::RiskTier::Allow => "allow",
+                        crate::exec_risk::RiskTier::Ask => "ask",
+                        crate::exec_risk::RiskTier::Deny => "deny",
+                    },
+                    "peeled": risk.peeled,
+                }),
             };
             let (tx, rx) = oneshot::channel();
             {
@@ -4298,13 +4554,18 @@ impl AgentHostHandle {
                 _ = cancel.cancelled() => PermissionDecision::Deny,
             };
             if decision == PermissionDecision::Deny {
+                let msg = format!(
+                    "DENIED: user denied shell `{command}` (reason for model: do not retry; \
+                     pick another approach). risk={}",
+                    risk.reason
+                );
                 let _ = event_tx.send(SessionUpdate::ToolCall {
                     session_id,
                     call_id: call_id.clone(),
                     title: "run_terminal_cmd".into(),
                     kind: ToolCallKind::Execute,
                     status: ToolCallStatus::Denied,
-                    input: serde_json::json!({ "command": command }),
+                    input: serde_json::json!({ "command": command, "risk": risk.reason }),
                 });
                 push_tool(
                     self,
@@ -4312,9 +4573,9 @@ impl AgentHostHandle {
                     &call_id,
                     "run_terminal_cmd",
                     ToolCallStatus::Denied,
-                    Some(format!("DENIED: user denied shell `{command}`")),
+                    Some(msg.clone()),
                 );
-                return Ok(format!("DENIED: user denied shell `{command}`"));
+                return Ok(msg);
             }
             if decision == PermissionDecision::AlwaysAllow {
                 let mut g = self.inner.lock();
@@ -4444,6 +4705,28 @@ impl AgentHostHandle {
             return Ok(());
         }
         let call_id = Uuid::new_v4().to_string();
+        let risk = crate::exec_risk::assess_shell_risk(command);
+        let (sandbox_profile, yolo) = {
+            let g = self.inner.lock();
+            (g.sandbox_profile.clone(), g.always_approve)
+        };
+        if risk.tier == crate::exec_risk::RiskTier::Deny
+            && crate::exec_risk::should_block_deny_tier(&sandbox_profile, yolo)
+        {
+            let _ = event_tx.send(SessionUpdate::ToolCall {
+                session_id,
+                call_id: call_id.clone(),
+                title: "run_terminal_cmd".into(),
+                kind: ToolCallKind::Execute,
+                status: ToolCallStatus::Denied,
+                input: serde_json::json!({
+                    "command": command,
+                    "risk": risk.reason,
+                    "risk_tier": "deny",
+                }),
+            });
+            return Ok(());
+        }
         let needs_perm = true;
         let gate = self.tool_gate("run_terminal_cmd");
         if gate == ToolGate::AutoDeny {
@@ -4458,14 +4741,29 @@ impl AgentHostHandle {
             return Ok(());
         }
         let always = matches!(gate, ToolGate::AutoAllow);
+        let force_ask = risk.tier == crate::exec_risk::RiskTier::Ask && !yolo;
 
-        if needs_perm && !always {
+        if (needs_perm && !always) || force_ask {
+            let risk_note = if risk.tier != crate::exec_risk::RiskTier::Allow {
+                format!(" [risk: {}]", risk.reason)
+            } else {
+                String::new()
+            };
             let req = PermissionRequest {
                 id: Uuid::new_v4(),
                 session_id,
                 tool_name: "run_terminal_cmd".into(),
-                summary: "Allow tool `run_terminal_cmd`?".to_string(),
-                detail: serde_json::json!({ "tool": "run_terminal_cmd", "command": command }),
+                summary: format!("Allow tool `run_terminal_cmd`?{risk_note}"),
+                detail: serde_json::json!({
+                    "tool": "run_terminal_cmd",
+                    "command": command,
+                    "risk": risk.reason,
+                    "risk_tier": match risk.tier {
+                        crate::exec_risk::RiskTier::Allow => "allow",
+                        crate::exec_risk::RiskTier::Ask => "ask",
+                        crate::exec_risk::RiskTier::Deny => "deny",
+                    },
+                }),
             };
             let (tx, rx) = oneshot::channel();
             {
@@ -4542,7 +4840,11 @@ impl AgentHostHandle {
             Ok(tr) => {
                 self.complete_shell_background_task(
                     &call_id,
-                    if tr.cancelled { "cancelled" } else { "completed" },
+                    if tr.cancelled {
+                        "cancelled"
+                    } else {
+                        "completed"
+                    },
                 );
                 let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
                     session_id,
@@ -4813,6 +5115,11 @@ fn tool_kind(name: &str) -> ToolCallKind {
 }
 
 async fn tool_web_fetch(url: &str) -> Result<local_tools::ToolResult> {
+    // #179 SSRF preflight (always, including offline)
+    let ssrf = crate::ssrf::check_url(url);
+    if !ssrf.allow {
+        anyhow::bail!("SSRF blocked: {}", ssrf.reason);
+    }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         anyhow::bail!("url must start with http:// or https://");
     }
@@ -5085,6 +5392,33 @@ fn coding_agent_tools(
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "kill_task",
+                "description": "Cancel a background task or subagent by id (#179).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Task or subagent id" }
+                    },
+                    "required": ["id"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "task_output",
+                "description": "Get status/detail for a background task or subagent, or list all if id omitted (#179).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Optional task or subagent id" }
+                    }
+                }
+            }
+        }),
     ];
 
     let mut index = McpToolIndex::new();
@@ -5287,7 +5621,15 @@ fn build_agent_messages(
     active_plan: Option<(&str, &[String])>,
 ) -> Vec<serde_json::Value> {
     let (instructions, loaded) = crate::project_context::load_project_instructions(cwd);
-    let skills = crate::project_context::load_skills_context(Some(cwd));
+    // #154: match-time full skill bodies using latest user turn
+    let last_user = history
+        .iter()
+        .rev()
+        .find(|(role, _)| role == "user")
+        .map(|(_, t)| t.as_str());
+    let skills = crate::project_context::load_skills_context_for_task(Some(cwd), last_user);
+    // #158: richer startup git context (branch + unstaged + untracked)
+    let git_ctx = crate::project_context::git_status_context(cwd);
     let instr_note = if loaded.is_empty() {
         String::new()
     } else {
@@ -5317,6 +5659,12 @@ fn build_agent_messages(
         messages.push(serde_json::json!({
             "role": "system",
             "content": instructions
+        }));
+    }
+    if !git_ctx.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": git_ctx
         }));
     }
     if !skills.is_empty() {
@@ -5382,7 +5730,27 @@ fn resolve_api_base(creds: &crate::auth_store::WireCredentials, model: &str) -> 
         .map(|e| e.wire_model.as_str())
         .unwrap_or(model)
         .to_string();
-    let base = if let Ok(env) = std::env::var("XAI_API_BASE") {
+    // Explicit base overrides (gateway #169). Prefer xAI-specific envs first.
+    // OIDC default path is unchanged when none of these are set.
+    let explicit_base = std::env::var("XAI_API_BASE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("GROKPTAH_API_BASE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("OPENAI_BASE_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("OPENAI_API_BASE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+    let base = if let Some(env) = explicit_base {
         env
     } else if creds.oidc_token_auth {
         entry
@@ -5534,6 +5902,8 @@ where
         // Non-stream JSON body (fallback path)
         if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
             let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
+            // Note: session usage is accumulated in the turn loop when available.
+            let _ = v.get("usage"); // kept for future wire-through of session_id
             return parse_agent_step_from_message(
                 &v["choices"][0]["message"],
                 false,
@@ -5883,30 +6253,8 @@ async fn call_xai_chat(
     // Prefer a non-expired / refreshed OIDC access token before the first call.
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
 
-    // Use the same catalog Grok Build wrote (wire id + base_url). Do not remap
-    // `grok-build` → `grok-3` — that made the desktop look stuck on old models.
-    let entry = crate::models_catalog::lookup(model);
-    let model_id = entry
-        .as_ref()
-        .map(|e| e.wire_model.as_str())
-        .unwrap_or(model)
-        .to_string();
-    // OIDC / cli session: prefer the proxy base from models_cache (cli-chat-proxy).
-    // API keys: public api.x.ai unless the catalog specifies otherwise or env overrides.
-    // Always force cli-chat-proxy for OIDC user tokens — api.x.ai rejects them.
-    let base = if let Ok(env) = std::env::var("XAI_API_BASE") {
-        env
-    } else if creds.oidc_token_auth {
-        entry
-            .as_ref()
-            .and_then(|e| e.base_url.clone())
-            .filter(|u| u.contains("cli-chat-proxy") || u.contains("x.ai"))
-            .unwrap_or_else(|| "https://cli-chat-proxy.grok.com/v1".into())
-    } else if let Some(u) = entry.as_ref().and_then(|e| e.base_url.clone()) {
-        u
-    } else {
-        "https://api.x.ai/v1".into()
-    };
+    // Shared base resolution (#169 gateway envs + OIDC default path).
+    let (base, model_id) = resolve_api_base(&creds, model);
     let system = match kind {
         SessionKind::Chat => "You are Grok, a helpful, witty AI assistant in GrokPtah. \
              This is a regular conversation — not a coding-agent build session. \

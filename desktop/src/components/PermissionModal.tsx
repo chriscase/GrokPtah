@@ -59,6 +59,33 @@ export function PermissionModal({
           </p>
         )}
         <p data-testid="permission-summary">{request.summary}</p>
+        {typeof request.detail === "object" &&
+          request.detail !== null &&
+          "risk" in (request.detail as Record<string, unknown>) &&
+          (request.detail as { risk?: string; risk_tier?: string }).risk && (
+            <p
+              data-testid="permission-risk"
+              style={{
+                margin: "0 0 0.75rem",
+                padding: "0.5rem 0.65rem",
+                borderRadius: 6,
+                background:
+                  (request.detail as { risk_tier?: string }).risk_tier === "deny"
+                    ? "rgba(220, 50, 50, 0.15)"
+                    : "rgba(220, 160, 40, 0.12)",
+                border: "1px solid var(--border, #333)",
+                fontSize: "0.85rem",
+              }}
+            >
+              <strong>Exec-risk</strong> (
+              {(request.detail as { risk_tier?: string }).risk_tier ?? "ask"}):{" "}
+              {String((request.detail as { risk?: string }).risk)}
+              <span style={{ opacity: 0.75 }}>
+                {" "}
+                — tool safety gate, not an OS sandbox
+              </span>
+            </p>
+          )}
         <p style={{ fontSize: 12, color: "var(--muted)", marginTop: 0 }}>
           Tool: <code data-testid="permission-tool">{request.tool_name}</code>
           {sessionId ? (

@@ -1148,3 +1148,49 @@ fn permission_mode_and_always_approve_stay_coherent() {
     assert_eq!(snap["alwaysApprove"], true);
     assert_eq!(snap["permissionMode"], "bypassPermissions");
 }
+
+/// #146: per-session edit snapshots — rewind B must not restore A's file.
+#[tokio::test]
+async fn rewind_files_isolated_per_session() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = dir.path().join("a.txt");
+    let path_b = dir.path().join("b.txt");
+    std::fs::write(&path_a, "A0").unwrap();
+    std::fs::write(&path_b, "B0").unwrap();
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let sa = host.session_new().unwrap();
+    let sb = host.session_new().unwrap();
+
+    // Snapshot + mutate as if each session edited its file.
+    host.snapshot_edit_original_for_session(sa.id, dir.path(), "a.txt");
+    host.snapshot_edit_original_for_session(sb.id, dir.path(), "b.txt");
+    std::fs::write(&path_a, "A1").unwrap();
+    std::fs::write(&path_b, "B1").unwrap();
+
+    // Rewind only B files → a stays A1, b restores to B0
+    host.rewind_session(sb.id, 0, "files").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path_a).unwrap(),
+        "A1",
+        "session A file must not restore"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path_b).unwrap(),
+        "B0",
+        "session B file restores"
+    );
+
+    // Conversation-only rewind must not touch files
+    std::fs::write(&path_a, "A2").unwrap();
+    host.snapshot_edit_original_for_session(sa.id, dir.path(), "a.txt");
+    std::fs::write(&path_a, "A3").unwrap();
+    host.rewind_session(sa.id, 0, "conversation").unwrap();
+    assert_eq!(std::fs::read_to_string(&path_a).unwrap(), "A3");
+}

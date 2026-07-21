@@ -140,10 +140,7 @@ fn subagents_path(id: Uuid) -> PathBuf {
 }
 
 /// Persist subagent history for a session (reopen / historical summary) (#152).
-pub fn save_session_subagents(
-    id: Uuid,
-    list: &[crate::types::SubagentInfo],
-) -> Result<()> {
+pub fn save_session_subagents(id: Uuid, list: &[crate::types::SubagentInfo]) -> Result<()> {
     ensure_home();
     let _ = fs::create_dir_all(session_dir(id));
     // Keep only rows for this session (and rows without session_id for safety).

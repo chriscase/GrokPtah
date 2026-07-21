@@ -1,0 +1,37 @@
+[
+  {
+    "id": "basic_edit_add_mul",
+    "fixture": "basic_edit",
+    "prompt": "In src/lib.rs, add a public function mul(a: i32, b: i32) -> i32 that multiplies a and b. Do not change add or greet. Save the file.",
+    "success": {
+      "type": "file_contains",
+      "path": "src/lib.rs",
+      "must_contain": ["fn mul", "a * b"],
+      "must_not_remove": ["fn add", "fn greet"]
+    },
+    "max_turns": 12
+  },
+  {
+    "id": "search_edit_version",
+    "fixture": "search_edit",
+    "prompt": "Find where the app prints its version and change the string from \"version 1\" to \"version 2\". Only edit what is needed.",
+    "success": {
+      "type": "file_contains",
+      "path": "src/app.rs",
+      "must_contain": ["version 2"],
+      "must_not_contain": ["version 1"]
+    },
+    "max_turns": 12
+  },
+  {
+    "id": "basic_edit_readme_token",
+    "fixture": "basic_edit",
+    "prompt": "Read README.md. Create a new file FOUND.txt containing only the secret token found in the README (the word after Token:) and a trailing newline.",
+    "success": {
+      "type": "file_contains",
+      "path": "FOUND.txt",
+      "must_contain": ["search-me-token"]
+    },
+    "max_turns": 10
+  }
+]
