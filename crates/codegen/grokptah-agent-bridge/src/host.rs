@@ -3977,7 +3977,13 @@ impl AgentHostHandle {
                 ));
             }
             if let Some(rest) = prompt.find("write ").map(|i| &prompt[i + "write ".len()..]) {
-                if let Some((path, content)) = rest.split_once(':') {
+                // #161: plan capability blocks mutators offline the same as online.
+                if kind == "plan" || kind == "explore" {
+                    parts.push(format!(
+                        "### write DENIED by capability mode `{kind}`: \
+                         write_file is not allowed for plan/explore children"
+                    ));
+                } else if let Some((path, content)) = rest.split_once(':') {
                     self.snapshot_edit_original_for_session(session_id, cwd, path.trim());
                     if let Ok(tr) =
                         local_tools::tool_write_file(cwd, path.trim(), content.trim()).await

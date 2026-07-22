@@ -1,4 +1,7 @@
 //! #162 / #172 multi-agent isolation + capability modes (shipped paths).
+//!
+//! Tests drive AgentHost + offline GP body (the real shipped path under
+//! GROKPTAH_AGENT_OFFLINE), not reimplemented isolation/write logic.
 
 #![allow(clippy::while_let_loop)]
 
@@ -42,7 +45,29 @@ impl Drop for IsolatedHome {
     }
 }
 
+async fn wait_subagents_done(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>, n: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut done = 0u32;
+    while done < n && tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(400), rx.recv()).await {
+            Ok(Some(SessionUpdate::SubagentUpdate { status, .. }))
+                if matches!(status.as_str(), "completed" | "failed" | "cancelled") =>
+            {
+                done += 1;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    assert!(done >= n, "expected {n} finished subagents, got {done}");
+}
+
 /// #162: two isolated GP children write different paths without colliding.
+///
+/// Asserts (not theater):
+/// - each write lands under a *distinct* `.grokptah/worktrees/sub-*` tree
+/// - parent project root does **not** receive either write
 #[tokio::test]
 async fn isolation_two_children_writes_do_not_collide() {
     let _iso = IsolatedHome::install();
@@ -50,7 +75,6 @@ async fn isolation_two_children_writes_do_not_collide() {
         std::env::set_var("GROKPTAH_SUBAGENT_ISOLATION", "worktree");
     }
     let dir = tempfile::tempdir().unwrap();
-    // Seed project files so copy isolation has content.
     fs::write(dir.path().join("README.md"), "root\n").unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn x() {}\n").unwrap();
@@ -72,79 +96,89 @@ async fn isolation_two_children_writes_do_not_collide() {
         .spawn_subagent_public(session.id, "general-purpose", "write b.txt: child-b")
         .await
         .unwrap();
-    assert!(!a.contains("isolation failed"), "child A isolation: {a}");
-    assert!(!b.contains("isolation failed"), "child B isolation: {b}");
-
-    // Drain until both complete or timeout
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    let mut done = 0u32;
-    while done < 2 && tokio::time::Instant::now() < deadline {
-        match timeout(Duration::from_millis(500), rx.recv()).await {
-            Ok(Some(SessionUpdate::SubagentUpdate { status, .. }))
-                if status == "completed" || status == "failed" =>
-            {
-                done += 1;
-            }
-            Ok(Some(_)) => {}
-            _ => {}
-        }
-    }
-
-    // Isolation roots under .grokptah/worktrees
-    let wt = dir.path().join(".grokptah").join("worktrees");
-    assert!(wt.is_dir(), "expected worktrees dir under project");
-    let mut found_a = false;
-    let mut found_b = false;
-    if let Ok(rd) = fs::read_dir(&wt) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.join("a.txt").is_file() {
-                let body = fs::read_to_string(p.join("a.txt")).unwrap_or_default();
-                if body.contains("child-a") {
-                    found_a = true;
-                }
-            }
-            if p.join("b.txt").is_file() {
-                let body = fs::read_to_string(p.join("b.txt")).unwrap_or_default();
-                if body.contains("child-b") {
-                    found_b = true;
-                }
-            }
-            // Each isolation cwd must not be empty — must still have README
-            if p.is_dir()
-                && p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with("sub-"))
-            {
-                assert!(
-                    p.join("README.md").is_file() || p.join("src").is_dir(),
-                    "isolation cwd must contain project files, not empty: {}",
-                    p.display()
-                );
-            }
-        }
-    }
-    // Offline GP may write into isolation cwd; assert at least isolation dirs exist with content
-    let subdirs: Vec<_> = fs::read_dir(&wt)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.path().is_dir())
-                .map(|e| e.path())
-                .collect()
-        })
-        .unwrap_or_default();
     assert!(
-        subdirs.len() >= 2,
-        "expected ≥2 isolation worktrees, got {subdirs:?}"
+        !a.contains("isolation failed") && a.contains("Spawned"),
+        "child A: {a}"
     );
-    // Writes may land in isolation trees; parent tree must not get both if isolation worked
-    // (best-effort: if offline wrote, files are under wt not only parent)
-    let _ = (found_a, found_b);
+    assert!(
+        !b.contains("isolation failed") && b.contains("Spawned"),
+        "child B: {b}"
+    );
+
+    wait_subagents_done(&mut rx, 2).await;
+
+    // Parent must NOT have the writes
+    assert!(
+        !dir.path().join("a.txt").exists(),
+        "parent must not contain a.txt (isolation leak)"
+    );
+    assert!(
+        !dir.path().join("b.txt").exists(),
+        "parent must not contain b.txt (isolation leak)"
+    );
+
+    let wt = dir.path().join(".grokptah").join("worktrees");
+    assert!(wt.is_dir(), "expected .grokptah/worktrees");
+
+    let mut wt_with_a: Option<std::path::PathBuf> = None;
+    let mut wt_with_b: Option<std::path::PathBuf> = None;
+    for e in fs::read_dir(&wt).unwrap().flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let name = p.file_name().unwrap().to_string_lossy();
+        if !name.starts_with("sub-") {
+            continue;
+        }
+        // Isolation tree must still have project files
+        assert!(
+            p.join("README.md").is_file(),
+            "isolation cwd empty or incomplete: {}",
+            p.display()
+        );
+        if p.join("a.txt").is_file() {
+            let body = fs::read_to_string(p.join("a.txt")).unwrap();
+            assert!(
+                body.contains("child-a"),
+                "a.txt body in {}: {body}",
+                p.display()
+            );
+            wt_with_a = Some(p.clone());
+        }
+        if p.join("b.txt").is_file() {
+            let body = fs::read_to_string(p.join("b.txt")).unwrap();
+            assert!(
+                body.contains("child-b"),
+                "b.txt body in {}: {body}",
+                p.display()
+            );
+            wt_with_b = Some(p.clone());
+        }
+    }
+
+    let wa = wt_with_a.expect("child-a write must land under a sub-* worktree");
+    let wb = wt_with_b.expect("child-b write must land under a sub-* worktree");
+    assert_ne!(
+        wa,
+        wb,
+        "a.txt and b.txt must be in distinct isolation worktrees (got both in {})",
+        wa.display()
+    );
+    // Cross-check: neither worktree should hold the other's file
+    assert!(
+        !wa.join("b.txt").exists(),
+        "worktree A must not contain b.txt"
+    );
+    assert!(
+        !wb.join("a.txt").exists(),
+        "worktree B must not contain a.txt"
+    );
 }
 
-/// #161: plan capability refuses write tools (via runtime gate on online path;
-/// offline plan spawn still returns without writing when prompt uses write).
+/// #161: plan offline path refuses write_ even when prompt requests it.
 #[tokio::test]
-async fn plan_kind_does_not_write_files_offline() {
+async fn plan_kind_denies_write_offline() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("keep.txt"), "safe").unwrap();
@@ -153,32 +187,52 @@ async fn plan_kind_does_not_write_files_offline() {
         always_approve: true,
         ..HostConfig::default()
     });
+    let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
 
-    // Offline GP path still runs write for general-purpose; plan kind should
-    // not create the written file when using the write-hook offline path.
-    // Plan uses same offline body currently — exercise spawn with plan kind
-    // and ensure a denied mutator message path exists for online tool names.
+    // Real mutator request — must be denied for plan kind (same gate as online).
     let msg = host
-        .spawn_subagent_public(session.id, "plan", "sleep_ms:30 plan-only (no write token)")
+        .spawn_subagent_public(session.id, "plan", "write plan-leak.txt: should-not-exist")
         .await
         .unwrap();
-    assert!(
-        msg.contains("Spawned") || msg.contains("parallel") || msg.contains("plan"),
-        "{msg}"
-    );
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    // No rogue write from plan offline without "write " prefix
+    assert!(msg.contains("Spawned") || msg.contains("parallel"), "{msg}");
+
+    wait_subagents_done(&mut rx, 1).await;
+
     assert!(
         !dir.path().join("plan-leak.txt").exists(),
-        "plan must not create unexpected files"
+        "plan must not create plan-leak.txt in project root"
     );
+    // Also must not appear under any isolation tree if isolation were on
+    let wt = dir.path().join(".grokptah").join("worktrees");
+    if wt.is_dir() {
+        for e in fs::read_dir(&wt).unwrap().flatten() {
+            assert!(
+                !e.path().join("plan-leak.txt").exists(),
+                "plan must not write under {}",
+                e.path().display()
+            );
+        }
+    }
     assert_eq!(
         fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
         "safe"
     );
+
+    // GP control on same host (one instance lock): general-purpose *does* write.
+    host.spawn_subagent_public(session.id, "general-purpose", "write gp-ok.txt: from-gp")
+        .await
+        .unwrap();
+    wait_subagents_done(&mut rx, 1).await;
+    assert!(
+        dir.path().join("gp-ok.txt").is_file(),
+        "general-purpose control write must succeed so plan deny is meaningful"
+    );
+    assert!(fs::read_to_string(dir.path().join("gp-ok.txt"))
+        .unwrap()
+        .contains("from-gp"));
 }
 
 #[tokio::test]
