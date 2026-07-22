@@ -14,12 +14,27 @@ export type FleetStripProps = {
 
 function phaseLabel(t: SessionTab): string {
   if (t.needsPermission) return "needs you";
+  const fleetBits: string[] = [];
+  if (t.runningSubagents && t.runningSubagents > 0) {
+    fleetBits.push(
+      t.runningSubagents === 1
+        ? "1 subagent"
+        : `${t.runningSubagents} subagents`,
+    );
+  }
+  if (t.totalTokens && t.totalTokens > 0) {
+    fleetBits.push(`${t.totalTokens} tok`);
+  }
   if (t.busy) {
     const bits = [
       t.agentRound != null ? `r${t.agentRound}` : null,
       t.lastTool || t.activity.detail || t.activity.label || "working",
+      ...fleetBits,
     ].filter(Boolean);
     return bits.join(" · ");
+  }
+  if (fleetBits.length) {
+    return fleetBits.join(" · ");
   }
   if (t.unseen) return "unseen";
   return "idle";

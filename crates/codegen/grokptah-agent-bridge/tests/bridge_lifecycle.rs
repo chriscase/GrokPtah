@@ -1194,3 +1194,30 @@ async fn rewind_files_isolated_per_session() {
     host.rewind_session(sa.id, 0, "conversation").unwrap();
     assert_eq!(std::fs::read_to_string(&path_a).unwrap(), "A3");
 }
+
+#[tokio::test]
+async fn session_load_rebinds_missing_cwd() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let s = host.session_new().unwrap();
+    // Poison stored cwd to a deleted path
+    {
+        // session_set_cwd only works for existing dirs — set then drop dir
+        let live = tempfile::tempdir().unwrap();
+        host.session_set_cwd(s.id, live.path()).unwrap();
+        drop(live); // delete
+    }
+    // Project still open at dir — load should rebind
+    let sum = host.session_load(s.id).unwrap();
+    assert!(
+        std::path::Path::new(&sum.cwd).is_dir(),
+        "rebound cwd must exist: {}",
+        sum.cwd
+    );
+}

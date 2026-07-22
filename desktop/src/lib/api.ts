@@ -163,6 +163,18 @@ export const api = {
   skillsList: () => invoke<unknown[]>("skills_list"),
   hooksConfig: () => invoke<string>("hooks_config"),
   subagentsList: () => invoke<unknown[]>("subagents_list"),
+  listAgents: () => invoke<unknown[]>("list_agents"),
+  listPersonas: () => invoke<unknown[]>("list_personas"),
+  fleetObservability: () =>
+    invoke<{
+      running_subagents_total?: number;
+      sessions?: Array<{
+        session_id: string;
+        running_subagents?: number;
+        total_tokens?: number;
+        busy?: boolean;
+      }>;
+    }>("fleet_observability"),
   cancelSubagent: (id: string) => invoke<void>("cancel_subagent", { id }),
   backgroundTasks: () => invoke<unknown[]>("background_tasks"),
   cancelBackgroundTask: (id: string) =>

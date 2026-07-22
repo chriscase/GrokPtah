@@ -577,6 +577,25 @@ pub fn cancel_subagent(state: State<'_, AppState>, id: String) -> Result<(), Str
 }
 
 #[tauri::command]
+pub fn list_agents(
+    state: State<'_, AppState>,
+) -> Vec<grokptah_agent_bridge::AgentDef> {
+    state.host.list_agents()
+}
+
+#[tauri::command]
+pub fn list_personas(
+    state: State<'_, AppState>,
+) -> Vec<grokptah_agent_bridge::PersonaDef> {
+    state.host.list_personas()
+}
+
+#[tauri::command]
+pub fn fleet_observability(state: State<'_, AppState>) -> serde_json::Value {
+    state.host.fleet_observability()
+}
+
+#[tauri::command]
 pub fn subagents_list(state: State<'_, AppState>) -> Vec<SubagentInfo> {
     state.host.subagents()
 }

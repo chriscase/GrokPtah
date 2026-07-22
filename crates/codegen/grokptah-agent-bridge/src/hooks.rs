@@ -22,6 +22,9 @@ struct HooksInner {
     pre_tool_use: Vec<HookEntry>,
     #[serde(default, rename = "PostToolUse")]
     post_tool_use: Vec<HookEntry>,
+    /// Stop hooks run at end of a turn (#168).
+    #[serde(default, rename = "Stop")]
+    stop: Vec<StopHookEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,6 +38,32 @@ struct HookEntry {
     /// Message shown to the agent / UI on deny (or post note).
     #[serde(default)]
     message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StopHookEntry {
+    /// When true, keep the agent running and feed `message` back as feedback.
+    #[serde(default)]
+    continue_turn: bool,
+    /// Alias for continue_turn (Build-ish).
+    #[serde(default)]
+    r#continue: bool,
+    /// Feedback text injected for the model when continuing.
+    #[serde(default)]
+    message: Option<String>,
+    /// When true (default for stop without continue), hard-end is allowed.
+    #[serde(default)]
+    #[allow(dead_code)]
+    deny: bool,
+}
+
+/// Result of Stop hooks at turn end (#168).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopHookResult {
+    /// End the turn normally.
+    End,
+    /// Continue with feedback for the model (another agent step).
+    ContinueWithFeedback(String),
 }
 
 fn parse_hooks(project: Option<&Path>) -> HooksInner {
@@ -113,6 +142,25 @@ pub fn ensure_seed_hooks() {
     let _ = grokptah_home();
 }
 
+/// Evaluate Stop hooks after a turn completes (#168).
+///
+/// First matching continue wins. Hard-end is the default when none continue.
+pub fn evaluate_stop_hooks(project: Option<&Path>) -> StopHookResult {
+    let hooks = parse_hooks(project);
+    for h in &hooks.stop {
+        let cont = h.continue_turn || h.r#continue;
+        if cont {
+            let msg = h
+                .message
+                .clone()
+                .unwrap_or_else(|| "Stop hook requested continue.".into());
+            eprintln!("[grokptah] Stop CONTINUE: {msg}");
+            return StopHookResult::ContinueWithFeedback(msg);
+        }
+    }
+    StopHookResult::End
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +187,29 @@ mod tests {
         assert_eq!(deny.as_deref(), Some("no writes in fixture"));
         let ok = pre_tool_use_deny(Some(dir.path()), "read_file", &serde_json::json!({}));
         assert!(ok.is_none());
+    }
+
+    #[test]
+    fn stop_hook_continue_with_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join(".grokptah");
+        fs::create_dir_all(&cfg).unwrap();
+        fs::write(
+            cfg.join("hooks.json"),
+            r#"{
+  "hooks": {
+    "Stop": [
+      { "continue": true, "message": "check tests again" }
+    ]
+  }
+}"#,
+        )
+        .unwrap();
+        match evaluate_stop_hooks(Some(dir.path())) {
+            StopHookResult::ContinueWithFeedback(m) => {
+                assert!(m.contains("check tests"), "{m}");
+            }
+            StopHookResult::End => panic!("expected continue"),
+        }
     }
 }

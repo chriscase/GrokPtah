@@ -46,3 +46,8 @@ Upstream still has a full stack (`xai-grok-shell`, `xai-grok-tools`, `xai-grok-m
 - Remainder: tool matrix + todo/memory/web_fetch; LLM/extractive compact +
   auto-compact; project memory; parity smoke tests; AgentProgress/RateLimited
   + export transcript / last-edit UI.
+
+## Phase 16 residual architecture (#144 / #145)
+
+- **#145 (2026-07):** `host.rs` split — free functions (tool schemas, wire HTTP, sandbox helpers) live in `host_helpers.rs` (~1.4k LOC). Further module splits (subagent/slash) remain incremental.
+- **#144:** Full `xai-chat-state` / `xai-grok-tools` path-deps still blocked by monorepo packaging (bridge is its own workspace). Prefer lifting pure modules as done for `prompt_combine` / exec-risk / isolation; do not claim full upstream embed.

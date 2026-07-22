@@ -604,6 +604,26 @@ export default function App() {
       }
       if (u.type === "subagent_spawned" || u.type === "subagent_update") {
         void api.subagentsList().then(setSubagents).catch(() => {});
+        // #174 fleet: running subagent counts + usage on strip
+        void api
+          .fleetObservability()
+          .then((fo) => {
+            const byId = new Map(
+              (fo.sessions ?? []).map((s) => [s.session_id, s]),
+            );
+            setTabs((prev) =>
+              prev.map((t) => {
+                const s = byId.get(t.id);
+                if (!s) return t;
+                return {
+                  ...t,
+                  runningSubagents: s.running_subagents ?? 0,
+                  totalTokens: s.total_tokens ?? 0,
+                };
+              }),
+            );
+          })
+          .catch(() => {});
       }
       if (u.type === "file_edit") {
         // Live agent diffs in the git pane (no manual refresh).
