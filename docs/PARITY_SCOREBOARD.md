@@ -46,7 +46,7 @@ export GROKPTAH_MODEL=grok-4.5   # must appear in `grok models`
 
 ## Latest live results (non-trivial suite)
 
-Model: **grok-4.5** · Suite size: **8 tasks** · SHA at doc write: see merge of continuous/parity-real
+Model: **grok-4.5** · Suite size: **8 tasks** · Merge SHA: `e1a1062` (PR #186 / #185)
 
 ### Run A — 2026-07-22T08:48:00Z
 
