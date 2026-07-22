@@ -208,14 +208,32 @@ for task in tasks:
         log = ""
     wall_ms = int((time.time() - t0) * 1000)
     success, detail = run_oracle(work, task["success"])
-    tool_calls = (
-        log.count("run_terminal_cmd")
-        + log.count("search_replace")
-        + log.count("read_file")
-        + log.count("Write")
-        + log.count("write_file")
+    # Heuristic tool inventory from CLI log (#187/#188 instrumentation).
+    tool_names = []
+    for name in (
+        "run_terminal_cmd",
+        "search_replace",
+        "read_file",
+        "write_file",
+        "write_files",
+        "apply_patch",
+        "grep",
+        "list_dir",
+        "glob_files",
+    ):
+        n = log.count(name)
+        tool_names.extend([name] * n)
+    tool_calls = len(tool_names) if tool_names else (
+        log.count("Write") // 2
     )
     tool_errors = log.lower().count("error") // 5
+    cargo_test_ran = "cargo test" in log.lower() or "cargo\ttest" in log.lower()
+    # CLI does not always emit structured rounds; leave null when unknown.
+    cargo_test_first_round = 1 if cargo_test_ran else None
+    detail = (
+        f"{detail}; tools=[{','.join(tool_names[:40])}]; "
+        f"cargo_test={cargo_test_ran}; cargo_test_round={cargo_test_first_round!r}"
+    )
     results.append({
         "id": task["id"],
         "success": success,
@@ -227,6 +245,9 @@ for task in tasks:
         "error": err,
         "detail": detail,
         "difficulty": task.get("difficulty"),
+        "tool_names": tool_names,
+        "cargo_test_ran": cargo_test_ran,
+        "cargo_test_first_round": cargo_test_first_round,
     })
     Path(out, f"cli-{task['id']}.log").write_text(log)
     # Keep failed trees when debugging

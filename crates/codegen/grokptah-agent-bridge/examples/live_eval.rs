@@ -51,6 +51,12 @@ struct TaskResult {
     error: Option<String>,
     detail: String,
     difficulty: Option<String>,
+    /// Ordered tool titles seen during the turn (#187/#188 instrumentation).
+    tool_names: Vec<String>,
+    /// Whether any shell tool looked like cargo test.
+    cargo_test_ran: bool,
+    /// Model round when cargo test was first observed (if any).
+    cargo_test_first_round: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +137,9 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
 
     let host = AgentHost::create(HostConfig {
         always_approve: true,
+        // Align host loop budget with task max_turns so the model sees real scarcity
+        // (CLI --max-turns) instead of the default 24-step ceiling (#187/#188).
+        max_agent_rounds: Some(task.max_turns.max(1)),
         ..HostConfig::default()
     });
     let mut rx = match host.take_event_receiver() {
@@ -159,6 +168,9 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
     let mut permission_prompts = 0u32;
     let mut rounds_est = 0u32;
     let mut err_msg = None;
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut cargo_test_ran = false;
+    let mut cargo_test_first_round: Option<u32> = None;
     let max_turns = task.max_turns.max(1);
     let session_id = session.id;
 
@@ -166,7 +178,16 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
         loop {
             match timeout(Duration::from_secs(300), rx.recv()).await {
                 Ok(Some(SessionUpdate::TurnComplete { .. })) => break,
-                Ok(Some(SessionUpdate::ToolCall { .. })) => tool_calls += 1,
+                Ok(Some(SessionUpdate::ToolCall { title, input, .. })) => {
+                    tool_calls += 1;
+                    tool_names.push(title.clone());
+                    if looks_like_cargo_test(&title, &input) {
+                        cargo_test_ran = true;
+                        if cargo_test_first_round.is_none() {
+                            cargo_test_first_round = Some(rounds_est.max(1));
+                        }
+                    }
+                }
                 Ok(Some(SessionUpdate::ToolCallUpdate { status, .. })) => {
                     if matches!(status, ToolCallStatus::Failed | ToolCallStatus::Denied) {
                         tool_errors += 1;
@@ -175,8 +196,22 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
                 Ok(Some(SessionUpdate::PermissionRequired { .. })) => {
                     permission_prompts += 1;
                 }
-                Ok(Some(SessionUpdate::AgentProgress { round, .. })) => {
+                Ok(Some(SessionUpdate::AgentProgress {
+                    round,
+                    last_tool,
+                    detail,
+                    ..
+                })) => {
                     rounds_est = rounds_est.max(round);
+                    if let Some(t) = last_tool {
+                        if t == "run_terminal_cmd" && detail.to_ascii_lowercase().contains("cargo")
+                        {
+                            cargo_test_ran = true;
+                            if cargo_test_first_round.is_none() {
+                                cargo_test_first_round = Some(round);
+                            }
+                        }
+                    }
                     // Enforce task max_turns (parity with CLI --max-turns).
                     // Round is 1-based model step index emitted at step *start*;
                     // allow rounds 1..=max_turns, cancel only when a step beyond budget begins.
@@ -215,6 +250,12 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
         detail = format!("{detail}; dump={}", dump.display());
         eprintln!("eval fail dump: {}", dump.display());
     }
+    // Append compact instrumentation for scoreboard consumers.
+    detail = format!(
+        "{detail}; tools=[{}]; cargo_test={cargo_test_ran}; cargo_test_round={:?}",
+        tool_names.join(","),
+        cargo_test_first_round
+    );
     TaskResult {
         id: task.id.clone(),
         success: oracle.ok,
@@ -226,7 +267,22 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
         error: err_msg,
         detail,
         difficulty: task.difficulty.clone(),
+        tool_names,
+        cargo_test_ran,
+        cargo_test_first_round,
     }
+}
+
+fn looks_like_cargo_test(title: &str, input: &serde_json::Value) -> bool {
+    if title != "run_terminal_cmd" {
+        return false;
+    }
+    let cmd = input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    cmd.contains("cargo test") || cmd.contains("cargo\ttest")
 }
 
 fn fail_early(task: &Task, t0: Instant, error: String, detail: impl Into<String>) -> TaskResult {
@@ -241,6 +297,9 @@ fn fail_early(task: &Task, t0: Instant, error: String, detail: impl Into<String>
         error: Some(error),
         detail: detail.into(),
         difficulty: task.difficulty.clone(),
+        tool_names: Vec::new(),
+        cargo_test_ran: false,
+        cargo_test_first_round: None,
     }
 }
 

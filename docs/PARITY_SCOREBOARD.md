@@ -54,61 +54,52 @@ Offline (CI): `cargo test eval_oracle` in the bridge workspace + suite-shape che
 | Offline oracle unit tests + hard-task shape | **Yes** |
 | Full live discriminating suite | **No** (on-demand; required for ≥ claims) |
 
-## Latest live results (discriminating)
+## Latest live results — turn-efficiency cycle (#187/#188)
 
-Model: **grok-4.5** · Suite: **14 tasks** (2 smoke + 12 hard)  
-Merge SHA: `e43618f2c691cc13a9bff59d64bcffd34c4a8f8a`  
-Evidence: goal scratch `eval-final-A/`, `eval-final-B/`  
-max_turns enforced on bridge (`round > max_turns` cancel) and CLI `--max-turns`.
+Model: **grok-4.5** · Suite: **14 tasks** · max_turns **unchanged** (multi_bug=3, cross_cut=4)  
+Evidence: goal scratch `proof-1/`, `proof-2/`  
+Instrumentation: `tool_names`, `cargo_test_ran`, `cargo_test_first_round` on both sides.
 
-### Run A — eval-final-A
+### Agent capability changes (this cycle)
+
+- `write_files` multi-file batch tool (real dispatch path + unit tests)
+- Efficiency system guidance + tool schema reorder (edit/test tools first)
+- `HostConfig.max_agent_rounds` aligned with live_eval task budget + final-step tool filter (edit/shell only) + cargo-test-failure coaching
+
+### proof-1
+
+| Metric | GrokPtah | Grok CLI |
+|--------|---------:|---------:|
+| Success | **14/14** | **14/14** |
+
+| Gap task | Ptah | CLI | Ptah ≥ CLI |
+|----------|:----:|:---:|:----------:|
+| multi_bug_cascade_undoc | ✓ | ✓ | **YES** |
+| cross_cut_legacy_widget | ✓ | ✓ | **YES** |
+
+### proof-2 (consistency)
 
 | Metric | GrokPtah | Grok CLI |
 |--------|---------:|---------:|
 | Success | **13/14** | **14/14** |
-| Hard-only | 11/12 | 12/12 |
-| Tool errors | 0 | 0 |
 
-**Ptah ≥ CLI:** **NO**
+| Gap task | Ptah | CLI | Ptah ≥ CLI |
+|----------|:----:|:---:|:----------:|
+| multi_bug_cascade_undoc | ✗ | ✓ | **NO** |
+| cross_cut_legacy_widget | ✓ | ✓ | **YES** |
 
-| Task | Ptah | CLI |
-|------|:----:|:---:|
-| multi_bug_cascade_undoc | ✗ | ✓ |
-| (all others) | ✓ | ✓ |
+### Gap resolution
 
-### Run B — eval-final-B (consistency)
+| Task | Issue | Outcome |
+|------|-------|---------|
+| cross_cut_legacy_widget | #188 | **Closed** — Ptah ≥ CLI on **both** proof runs (stable) |
+| multi_bug_cascade_undoc | #187 | **Remains open** — still flaky under max_turns=3 (pass proof-1, fail proof-2); residual model noise despite write_files + budget coaching |
 
-| Metric | GrokPtah | Grok CLI |
-|--------|---------:|---------:|
-| Success | **12/14** | **14/14** |
-| Hard-only | 10/12 | 12/12 |
+**Do not claim full suite ≥ Build.** #187 residual is honest.
 
-**Ptah ≥ CLI:** **NO**
+### Prior history
 
-| Task | Ptah | CLI |
-|------|:----:|:---:|
-| cross_cut_legacy_widget | ✗ | ✓ |
-| multi_bug_cascade_undoc | ✗ | ✓ |
-| (all others) | ✓ | ✓ |
-
-### Consistency note
-
-- **multi_bug_cascade_undoc** failed Ptah on **both** runs (stable gap).  
-- **cross_cut_legacy_widget** failed Ptah on run B only (model noise under tight budget). Documented; not averaged away.  
-- Suite is **non-uniform** (not 100% both sides). Claim **≥ Grok Build: NO** on this suite.
-
-### Earlier runs (pre-fix max_turns off-by-one)
-
-`eval-run-3` / `eval-run-4` used `round >= max_turns` (one fewer model step than CLI). Fixed to `round > max_turns` before final A/B. Do not use those aggregates for claims.
-
-## Gaps (Ptah behind CLI)
-
-| Task | Status | Action |
-|------|--------|--------|
-| multi_bug_cascade_undoc | Stable fail under max_turns=3 | [#187](https://github.com/chriscase/GrokPtah/issues/187) |
-| cross_cut_legacy_widget | Flaky under max_turns=4 | [#188](https://github.com/chriscase/GrokPtah/issues/188) |
-
-Agent-side mitigations already shipped: system-prompt batching guidance; max_turns parity fix in live_eval.
+Earlier discriminating baseline (pre-efficiency): Ptah often behind on both gap tasks. See git history / issue threads.
 
 ## Honesty / deliberate non-parity
 

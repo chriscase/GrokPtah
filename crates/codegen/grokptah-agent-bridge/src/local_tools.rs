@@ -177,6 +177,39 @@ pub async fn tool_write_file(cwd: &Path, path: &str, content: &str) -> Result<To
     ))
 }
 
+/// Write many files in one tool call (turn-efficient multi-file edits for #187/#188).
+pub async fn tool_write_files(cwd: &Path, files: &[(String, String)]) -> Result<ToolResult> {
+    if files.is_empty() {
+        anyhow::bail!("write_files requires a non-empty files array");
+    }
+    let mut written = Vec::new();
+    let mut total_bytes = 0usize;
+    for (path, content) in files {
+        let full = resolve_under_cwd(cwd, path)?;
+        if let Some(parent) = full.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        tokio::fs::write(&full, content)
+            .await
+            .with_context(|| format!("write {}", full.display()))?;
+        total_bytes += content.len();
+        written.push(path.clone());
+    }
+    Ok(ToolResult::basic(
+        format!("Write {} files", written.len()),
+        ToolCallKind::Edit,
+        serde_json::json!({ "paths": written, "bytes": total_bytes }),
+        format!(
+            "Wrote {} file(s) ({} bytes total): {}",
+            written.len(),
+            total_bytes,
+            written.join(", ")
+        ),
+        true,
+        format!("write_files {}", written.join(",")),
+    ))
+}
+
 /// Per-session live shell children so concurrent sessions do not kill each other.
 pub type LiveShellMap = Arc<TokioMutex<std::collections::HashMap<uuid::Uuid, Child>>>;
 
@@ -391,4 +424,44 @@ pub fn list_tree(cwd: &Path, max: usize) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn write_files_batch_writes_all_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![
+            ("src/a.rs".into(), "pub fn a() {}\n".into()),
+            ("src/b.rs".into(), "pub fn b() {}\n".into()),
+            ("src/c.rs".into(), "pub fn c() {}\n".into()),
+        ];
+        let r = tool_write_files(dir.path(), &files).await.unwrap();
+        assert!(r.output.contains("3 file"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap(),
+            "pub fn a() {}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/b.rs")).unwrap(),
+            "pub fn b() {}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/c.rs")).unwrap(),
+            "pub fn c() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_files_empty_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let res = tool_write_files(dir.path(), &[]).await;
+        assert!(res.is_err());
+        assert!(
+            res.err().unwrap().to_string().contains("non-empty"),
+            "empty files should error"
+        );
+    }
 }
