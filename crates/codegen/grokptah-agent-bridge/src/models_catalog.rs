@@ -85,9 +85,9 @@ fn pick_preferred_default(catalog: &[CatalogModel]) -> Option<String> {
     }
     // Explicit preference order for coding agent defaults.
     const PREFER: &[&str] = &[
+        "grok-4.5",
         "grok-build",
         "grok-4.20-multi-agent",
-        "grok-4.5",
         "grok-4",
         "grok-3",
         "grok-composer-2.5-fast",

@@ -81,3 +81,11 @@
 - No bulk “delivery complete” multi-issue close
 - No closing #90-style stubs as full multi-agent
 - Epics not closed while children open (except #102 where all children done)
+
+## Continuous honesty (2026-07-22)
+
+| Item | Status |
+|------|--------|
+| #145 host god object | **Partial ship + accept-as-is residual**: `host_helpers.rs` extracted; remaining ~5.2k `host.rs` consciously accepted in ADR-001 (not "god object fully eliminated") |
+| #144 xai-* lift | **NOT PLANNED** unless hand-port cost forces it (ADR-001). Closed with residual rationale — do not re-open as COMPLETED full lift |
+| Live parity suite | Expanding beyond 3 smoke fixtures (see evals/tasks.json + PARITY_SCOREBOARD) |

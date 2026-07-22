@@ -55,21 +55,41 @@ tasks_path, fixtures, out, grok_bin, model, root = sys.argv[1:7]
 tasks = json.loads(Path(tasks_path).read_text())
 results = []
 
-def check_success(work: Path, spec: dict) -> bool:
-    if spec.get("type") != "file_contains":
-        return False
-    p = work / spec["path"]
+def check_file(work: Path, path: str, must_contain=None, must_not_contain=None, must_not_remove=None) -> bool:
+    p = work / path
     if not p.is_file():
         return False
     body = p.read_text(errors="replace")
-    for s in spec.get("must_contain", []):
+    for s in must_contain or []:
         if s not in body:
             return False
-    for s in spec.get("must_not_contain", []):
+    for s in must_not_contain or []:
         if s in body:
             return False
-    for s in spec.get("must_not_remove", []):
+    for s in must_not_remove or []:
         if s not in body:
+            return False
+    return True
+
+def check_success(work: Path, spec: dict) -> bool:
+    if spec.get("type") != "file_contains":
+        return False
+    if not check_file(
+        work,
+        spec["path"],
+        spec.get("must_contain"),
+        spec.get("must_not_contain"),
+        spec.get("must_not_remove"),
+    ):
+        return False
+    for extra in spec.get("extra_checks") or []:
+        if not check_file(
+            work,
+            extra["path"],
+            extra.get("must_contain"),
+            extra.get("must_not_contain"),
+            extra.get("must_not_remove"),
+        ):
             return False
     return True
 
