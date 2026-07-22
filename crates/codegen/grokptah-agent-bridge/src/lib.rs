@@ -3,6 +3,7 @@
 //! No child `grok agent stdio` process on the happy path. The host owns
 //! sessions, streams typed updates, and completes permission futures from the UI.
 
+mod agents_personas;
 mod auth_store;
 mod discover;
 mod events;
@@ -10,6 +11,7 @@ mod exec_risk;
 mod gateway_config;
 mod hooks;
 mod host;
+mod host_helpers;
 mod instance_lock;
 mod isolation;
 mod local_tools;
@@ -28,6 +30,9 @@ mod todo_list;
 mod types;
 mod worktree_gc;
 
+pub use agents_personas::{
+    discover_agents, discover_personas, resolve_agent, resolve_persona, AgentDef, PersonaDef,
+};
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
 pub use gateway_config::{load as load_gateway_config, save as save_gateway_config, GatewayConfig};
 pub use isolation::prepare_isolation_cwd;
@@ -46,9 +51,7 @@ pub use discover::{
     set_grokptah_home_override, set_project_mcp_trusted,
 };
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
-pub use host::{
-    is_rate_limit_error, AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState,
-};
+pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
 pub use permission::{PermissionDecision, PermissionRequest};
@@ -71,3 +74,5 @@ pub fn desktop_auto_update_enabled() -> bool {
 }
 
 pub use worktree_gc::{candidates_older_than, gc_worktrees, GcReport, DEFAULT_MAX_AGE};
+
+pub use host_helpers::is_rate_limit_error;

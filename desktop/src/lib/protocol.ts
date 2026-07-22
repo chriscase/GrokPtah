@@ -175,6 +175,10 @@ export interface SessionTab {
   unseen: boolean;
   /** Distinct “needs your button” state (permission / plan accept). */
   needsPermission: boolean;
+  /** #174 fleet: running subagents for this session */
+  runningSubagents?: number;
+  /** #174 fleet: total tokens this session (when known) */
+  totalTokens?: number;
 }
 
 export type TranscriptItem =
