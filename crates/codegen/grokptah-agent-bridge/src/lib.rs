@@ -6,6 +6,7 @@
 mod agents_personas;
 mod auth_store;
 mod discover;
+pub mod eval_oracle;
 mod events;
 mod exec_risk;
 mod gateway_config;

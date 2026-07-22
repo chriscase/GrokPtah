@@ -2,106 +2,343 @@
   {
     "id": "basic_edit_add_mul",
     "fixture": "basic_edit",
+    "difficulty": "smoke",
+    "difficulty_rationale": "Single-file trivial API add; offline/live harness smoke.",
     "prompt": "In src/lib.rs, add a public function mul(a: i32, b: i32) -> i32 that multiplies a and b. Do not change add or greet. Save the file.",
     "success": {
       "type": "file_contains",
       "path": "src/lib.rs",
-      "must_contain": ["fn mul", "a * b"],
-      "must_not_remove": ["fn add", "fn greet"]
-    },
-    "max_turns": 12
-  },
-  {
-    "id": "search_edit_version",
-    "fixture": "search_edit",
-    "prompt": "Find where the app prints its version and change the string from \"version 1\" to \"version 2\". Only edit what is needed.",
-    "success": {
-      "type": "file_contains",
-      "path": "src/app.rs",
-      "must_contain": ["version 2"],
-      "must_not_contain": ["version 1"]
+      "must_contain": [
+        "fn mul",
+        "a * b"
+      ],
+      "must_not_remove": [
+        "fn add",
+        "fn greet"
+      ]
     },
     "max_turns": 12
   },
   {
     "id": "basic_edit_readme_token",
     "fixture": "basic_edit",
+    "difficulty": "smoke",
+    "difficulty_rationale": "Exact artifact check (structured exact_file oracle).",
     "prompt": "Read README.md. Create a new file FOUND.txt containing only the secret token found in the README (the word after Token:) and a trailing newline.",
     "success": {
-      "type": "file_contains",
+      "type": "exact_file",
       "path": "FOUND.txt",
-      "must_contain": ["search-me-token"]
+      "expected": "search-me-token\n"
     },
     "max_turns": 10
   },
   {
-    "id": "multi_file_rename_app",
-    "fixture": "multi_file",
-    "prompt": "Rename the application from LegacyApp to NexaCore across the codebase. Update the constant in config and any call sites so banner/describe still use the name. Do not leave LegacyApp anywhere under src/.",
+    "id": "ambiguous_rank_order",
+    "fixture": "ambiguous_rank",
+    "difficulty": "hard",
+    "difficulty_rationale": "Conflicting PRODUCT vs SPEC docs; only SPEC matches cargo tests (name then age).",
+    "prompt": "Fix rank_people so the project tests pass. Requirements in the repo docs are incomplete or conflicting \u2014 use the most authoritative engineering source and run cargo test.",
     "success": {
-      "type": "file_contains",
-      "path": "src/config.rs",
-      "must_contain": ["NexaCore"],
-      "must_not_contain": ["LegacyApp"],
-      "extra_checks": [
-        {"path": "src/app.rs", "must_not_contain": ["LegacyApp"]},
-        {"path": "src/lib.rs", "must_not_contain": ["LegacyApp"]}
+      "type": "command",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "Cargo.toml",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "timeout_secs": 120
+    },
+    "max_turns": 18
+  },
+  {
+    "id": "cross_cut_legacy_widget",
+    "fixture": "cross_cut_api",
+    "difficulty": "hard",
+    "difficulty_rationale": "Cross-cutting rename LegacyWidget\u2192CoreWidget across many modules + re-exports. Tight max_turns=5 stresses planning efficiency. max_turns=4 stresses multi-file rename completeness.",
+    "prompt": "Rename type LegacyWidget to CoreWidget everywhere in this crate so `cargo test` passes. Update all modules, re-exports, and the compatibility alias in legacy.rs (WidgetCompat should wrap CoreWidget). Do not leave LegacyWidget as a type name.",
+    "success": {
+      "type": "all",
+      "checks": [
+        {
+          "type": "command",
+          "argv": [
+            "cargo",
+            "test",
+            "--manifest-path",
+            "Cargo.toml",
+            "--quiet"
+          ],
+          "exit_code": 0,
+          "timeout_secs": 120
+        },
+        {
+          "type": "command",
+          "argv": [
+            "sh",
+            "-c",
+            "! grep -R --include='*.rs' -n LegacyWidget src"
+          ],
+          "exit_code": 0,
+          "timeout_secs": 30
+        }
       ]
     },
-    "max_turns": 16
+    "max_turns": 4
   },
   {
-    "id": "plan_then_execute_util",
-    "fixture": "plan_exec",
-    "prompt": "First outline a short plan (3 steps max) to change util::double so it multiplies by 2 with `a * 2` instead of `x + x`. Then implement the change in src/util.rs. Keep main.rs unchanged.",
+    "id": "recover_wrong_notes",
+    "fixture": "recover_wrong",
+    "difficulty": "hard",
+    "difficulty_rationale": "Recover after wrong prior attempt: delete bad artifacts + correct NOTES.md.",
+    "prompt": "A previous agent attempt left bad files (NOTES_draft.md with WRONG secret, src/leaked_secret.txt). Read src/protected.txt for the real secret (do not modify protected.txt). Create NOTES.md at the project root containing only that secret and a trailing newline. Delete the wrong artifacts. Run cargo test to verify.",
     "success": {
-      "type": "file_contains",
-      "path": "src/util.rs",
-      "must_contain": ["* 2", "fn double"],
-      "must_not_contain": ["x + x"],
-      "must_not_remove": ["fn double"]
+      "type": "all",
+      "checks": [
+        {
+          "type": "command",
+          "argv": [
+            "cargo",
+            "test",
+            "--manifest-path",
+            "Cargo.toml",
+            "--quiet"
+          ],
+          "exit_code": 0,
+          "timeout_secs": 120
+        },
+        {
+          "type": "exact_file",
+          "path": "NOTES.md",
+          "expected": "secret-value-omega\n"
+        },
+        {
+          "type": "file_absent",
+          "path": "NOTES_draft.md"
+        },
+        {
+          "type": "file_absent",
+          "path": "src/leaked_secret.txt"
+        }
+      ]
+    },
+    "max_turns": 18
+  },
+  {
+    "id": "hist_utf8_truncate",
+    "fixture": "hist_utf8_trunc",
+    "difficulty": "hard",
+    "difficulty_rationale": "Fork bug class: UTF-8 mid-codepoint truncate (9c1426a / #115).",
+    "history_source": "9c1426a / #115",
+    "prompt": "truncate_bytes panics or mis-handles multi-byte UTF-8 when max_bytes lands mid-codepoint. Fix it so cargo test passes (never panic; stay on char boundaries; empty when cap is mid-first-codepoint).",
+    "success": {
+      "type": "command",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "Cargo.toml",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "timeout_secs": 120
     },
     "max_turns": 16
   },
   {
-    "id": "test_and_fix_max",
-    "fixture": "test_fix",
-    "prompt": "The function max_i32 is wrong (it returns the smaller value). Fix src/lib.rs so max_i32 returns the larger of a and b. Optionally run: cargo test --manifest-path Cargo.toml",
+    "id": "hist_always_allow_scope",
+    "fixture": "hist_allow_scope",
+    "difficulty": "hard",
+    "difficulty_rationale": "Fork bug class: AlwaysAllow per-tool not global (39a8fd3 / #110).",
+    "history_source": "39a8fd3 / #110",
+    "prompt": "apply_always_allow incorrectly flips global always_approve. Fix permission scoping so AlwaysAllow only auto-approves the named tool; always_approve stays false unless explicitly set. cargo test must pass.",
     "success": {
-      "type": "file_contains",
-      "path": "src/lib.rs",
-      "must_contain": ["fn max_i32"],
-      "must_not_contain": ["if a < b { a } else { b }"]
+      "type": "command",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "Cargo.toml",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "timeout_secs": 120
     },
     "max_turns": 14
   },
   {
-    "id": "fail_recover_notes",
-    "fixture": "fail_recover",
-    "prompt": "Read src/protected.txt and extract the secret line (secret-value-*). Do NOT modify protected.txt. Create NOTES.md at the project root containing that secret value alone plus a trailing newline.",
+    "id": "hist_jsonl_torn_line",
+    "fixture": "hist_jsonl_torn",
+    "difficulty": "hard",
+    "difficulty_rationale": "Fork bug class: skip torn trailing JSONL (session_store pattern).",
+    "history_source": "session_store torn JSONL",
+    "prompt": "load_jsonl fails when the last line is incomplete JSON. Fix it to skip a torn trailing line and return successfully parsed prior records. cargo test must pass.",
     "success": {
-      "type": "file_contains",
-      "path": "NOTES.md",
-      "must_contain": ["secret-value-alpha"],
-      "extra_checks": [
-        {"path": "src/protected.txt", "must_contain": ["DO NOT OVERWRITE"]}
-      ]
+      "type": "command",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "Cargo.toml",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "timeout_secs": 120
     },
-    "max_turns": 12
+    "max_turns": 14
   },
   {
-    "id": "long_horizon_bug42",
-    "fixture": "long_horizon",
-    "prompt": "1) Read docs/OVERVIEW.md for context. 2) Fix BUG-42 in the emitter so the prefix is OUT: (with colon) not out>. 3) Write REPORT.md summarizing the bug, file changed, and one-line verification. Use tools; do not invent file contents without reading. Remove any remaining out> prefix from the format! string (comments may mention the old bug).",
+    "id": "long_horizon_trap_bug99",
+    "fixture": "long_trap",
+    "difficulty": "hard",
+    "difficulty_rationale": "Shallow-planning trap: README says out>; BUG99.md requires OUT: + REPORT.md. Tight max_turns=5 stresses planning efficiency.",
+    "prompt": "Fix BUG-99 in this project end-to-end. Read the documentation carefully (there are conflicting notes). Implement the correct emit prefix, write REPORT.md as specified by the authoritative bug doc, and ensure cargo test passes.",
     "success": {
-      "type": "file_contains",
-      "path": "src/emitter.rs",
-      "must_contain": ["OUT:"],
-      "must_not_contain": ["format!(\"out>"],
-      "extra_checks": [
-        {"path": "REPORT.md", "must_contain": ["BUG-42"]}
+      "type": "all",
+      "checks": [
+        {
+          "type": "command",
+          "argv": [
+            "cargo",
+            "test",
+            "--manifest-path",
+            "Cargo.toml",
+            "--quiet"
+          ],
+          "exit_code": 0,
+          "timeout_secs": 120
+        },
+        {
+          "type": "file_exists",
+          "path": "REPORT.md"
+        }
       ]
     },
-    "max_turns": 20
+    "max_turns": 3
+  },
+  {
+    "id": "lru_cache_impl",
+    "fixture": "lru_cache",
+    "difficulty": "hard",
+    "difficulty_rationale": "Implement correct LRU from stub; eviction order + update-touch edges trip incomplete solutions. Tight max_turns=5 stresses planning efficiency.",
+    "prompt": "Implement LruCache in src/lib.rs so cargo test passes: fixed capacity, get/put, LRU eviction, and put-update must refresh recency.",
+    "success": {
+      "type": "command",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "Cargo.toml",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "timeout_secs": 120
+    },
+    "max_turns": 3
+  },
+  {
+    "id": "rename_keep_display_label",
+    "fixture": "rename_keep_label",
+    "difficulty": "hard",
+    "difficulty_rationale": "Rename type OldThing\u2192NewThing but PRODUCT_LABEL string must remain exactly OldThing (blind replace fails). Tight max_turns=5 stresses planning efficiency.",
+    "prompt": "Rename the type OldThing to NewThing across the crate so cargo test passes. The user-facing PRODUCT_LABEL string must remain exactly the characters OldThing \u2014 do not rename that telemetry string. Type name OldThing must not remain in src/.",
+    "success": {
+      "type": "all",
+      "checks": [
+        {
+          "type": "command",
+          "argv": [
+            "cargo",
+            "test",
+            "--manifest-path",
+            "Cargo.toml",
+            "--quiet"
+          ],
+          "exit_code": 0,
+          "timeout_secs": 120
+        },
+        {
+          "type": "command",
+          "argv": [
+            "sh",
+            "-c",
+            "! grep -R --include='*.rs' -n 'struct OldThing\\|use crate::OldThing\\|pub use types::OldThing' src"
+          ],
+          "exit_code": 0,
+          "timeout_secs": 30
+        }
+      ]
+    },
+    "max_turns": 3
+  },
+  {
+    "id": "multi_bug_cascade_undoc",
+    "fixture": "multi_bug_cascade",
+    "difficulty": "hard",
+    "difficulty_rationale": "Three independent bugs; docs only mention clamp. Stopping after one fix fails cargo test. Tight max_turns=5 stresses planning efficiency.",
+    "prompt": "Make cargo test pass for this crate. README mentions one known issue; there may be more. Fix everything the tests require.",
+    "success": {
+      "type": "command",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "Cargo.toml",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "timeout_secs": 120
+    },
+    "max_turns": 3
+  },
+  {
+    "id": "adversarial_plan_traps",
+    "fixture": "adversarial_plan",
+    "difficulty": "hard",
+    "difficulty_rationale": "Long-horizon with stacked traps: README+QUICK wrong; only docs/REAL_SPEC.md is authoritative. Tight max_turns=4 stresses planning efficiency.",
+    "prompt": "Complete this project so cargo test passes. Multiple docs disagree \u2014 find the authoritative specification and implement it fully (code + DONE.md).",
+    "success": {
+      "type": "all",
+      "checks": [
+        {
+          "type": "command",
+          "argv": [
+            "cargo",
+            "test",
+            "--manifest-path",
+            "Cargo.toml",
+            "--quiet"
+          ],
+          "exit_code": 0,
+          "timeout_secs": 120
+        },
+        {
+          "type": "file_exists",
+          "path": "DONE.md"
+        }
+      ]
+    },
+    "max_turns": 3
+  },
+  {
+    "id": "interval_schedule_suite",
+    "fixture": "interval_schedule",
+    "difficulty": "hard",
+    "difficulty_rationale": "Three interval algorithms (compatible/unsorted, activity selection, merge touching). Easy stubs fail several cargo tests.",
+    "prompt": "Fix is_compatible, max_non_overlapping, and merge_intervals in src/lib.rs so cargo test passes. Touching endpoints: compatible=true; merge should fuse touching intervals. max_non_overlapping is classic activity selection.",
+    "success": {
+      "type": "command",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "Cargo.toml",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "timeout_secs": 120
+    },
+    "max_turns": 3
   }
 ]
