@@ -5,11 +5,13 @@ on:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "evals/**"
       - ".github/workflows/desktop.yml"
   pull_request:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "evals/**"
 
 jobs:
   desktop:
@@ -46,3 +48,24 @@ jobs:
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
           cargo test
+      - name: Offline parity oracles (no network)
+        # Structured oracle unit tests + fixture selftests; live suite is on-demand.
+        working-directory: crates/codegen/grokptah-agent-bridge
+        run: cargo test eval_oracle -- --nocapture
+      - name: Offline oracle suite shape (repo root)
+        working-directory: .
+        run: |
+          test -f evals/tasks.json
+          test -f evals/oracle_selftest/pass_exact/artifact.txt
+          test -f evals/oracle_selftest/fail_exact/artifact.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          tasks = json.loads(Path("evals/tasks.json").read_text())
+          hard = [t for t in tasks if t.get("difficulty") != "smoke"]
+          assert hard, "need hard discriminating tasks"
+          for t in hard:
+              ty = t["success"]["type"]
+              assert ty in ("command", "all", "exact_file"), (t["id"], ty)
+          print(f"ok: {len(tasks)} tasks, {len(hard)} hard, structured oracles")
+          PY

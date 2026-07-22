@@ -1,4 +1,4 @@
-//! Live headless Build eval runner for GrokPtah bridge (#171).
+//! Live headless Build eval runner for GrokPtah bridge.
 //!
 //! Usage (from bridge crate root):
 //! ```sh
@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use grokptah_agent_bridge::eval_oracle::{self, SuccessSpec};
 use grokptah_agent_bridge::{
     set_grokptah_home_override, AgentHost, HostConfig, SessionUpdate, ToolCallStatus,
 };
@@ -29,36 +30,13 @@ struct Task {
     prompt: String,
     success: SuccessSpec,
     #[serde(default = "default_max_turns")]
-    #[allow(dead_code)]
     max_turns: u32,
+    #[serde(default)]
+    difficulty: Option<String>,
 }
 
 fn default_max_turns() -> u32 {
     12
-}
-
-#[derive(Debug, Deserialize)]
-struct ExtraCheck {
-    path: String,
-    #[serde(default)]
-    must_contain: Vec<String>,
-    #[serde(default)]
-    must_not_contain: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SuccessSpec {
-    #[serde(rename = "type")]
-    kind: String,
-    path: String,
-    #[serde(default)]
-    must_contain: Vec<String>,
-    #[serde(default)]
-    must_not_contain: Vec<String>,
-    #[serde(default)]
-    must_not_remove: Vec<String>,
-    #[serde(default)]
-    extra_checks: Vec<ExtraCheck>,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,6 +50,7 @@ struct TaskResult {
     rounds_est: u32,
     error: Option<String>,
     detail: String,
+    difficulty: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,31 +122,11 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
     let work = match tempfile::tempdir() {
         Ok(d) => d,
         Err(e) => {
-            return TaskResult {
-                id: task.id.clone(),
-                success: false,
-                wall_ms: t0.elapsed().as_millis(),
-                tool_calls: 0,
-                tool_errors: 0,
-                permission_prompts: 0,
-                rounds_est: 0,
-                error: Some(e.to_string()),
-                detail: "tempdir failed".into(),
-            };
+            return fail_early(task, t0, e.to_string(), "tempdir failed");
         }
     };
     if let Err(e) = copy_dir(&fixture_src, work.path()) {
-        return TaskResult {
-            id: task.id.clone(),
-            success: false,
-            wall_ms: t0.elapsed().as_millis(),
-            tool_calls: 0,
-            tool_errors: 0,
-            permission_prompts: 0,
-            rounds_est: 0,
-            error: Some(e.to_string()),
-            detail: "copy fixture failed".into(),
-        };
+        return fail_early(task, t0, e.to_string(), "copy fixture failed");
     }
 
     let host = AgentHost::create(HostConfig {
@@ -177,60 +136,20 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
     let mut rx = match host.take_event_receiver() {
         Some(r) => r,
         None => {
-            return TaskResult {
-                id: task.id.clone(),
-                success: false,
-                wall_ms: t0.elapsed().as_millis(),
-                tool_calls: 0,
-                tool_errors: 0,
-                permission_prompts: 0,
-                rounds_est: 0,
-                error: Some("no event receiver".into()),
-                detail: String::new(),
-            };
+            return fail_early(task, t0, "no event receiver".into(), String::new());
         }
     };
     if let Err(e) = host.start() {
-        return TaskResult {
-            id: task.id.clone(),
-            success: false,
-            wall_ms: t0.elapsed().as_millis(),
-            tool_calls: 0,
-            tool_errors: 0,
-            permission_prompts: 0,
-            rounds_est: 0,
-            error: Some(e.to_string()),
-            detail: "start failed".into(),
-        };
+        return fail_early(task, t0, e.to_string(), "start failed");
     }
     host.set_model(model.to_string());
     if let Err(e) = host.set_project_cwd(work.path()) {
-        return TaskResult {
-            id: task.id.clone(),
-            success: false,
-            wall_ms: t0.elapsed().as_millis(),
-            tool_calls: 0,
-            tool_errors: 0,
-            permission_prompts: 0,
-            rounds_est: 0,
-            error: Some(e.to_string()),
-            detail: "set_project_cwd failed".into(),
-        };
+        return fail_early(task, t0, e.to_string(), "set_project_cwd failed");
     }
     let session = match host.session_new() {
         Ok(s) => s,
         Err(e) => {
-            return TaskResult {
-                id: task.id.clone(),
-                success: false,
-                wall_ms: t0.elapsed().as_millis(),
-                tool_calls: 0,
-                tool_errors: 0,
-                permission_prompts: 0,
-                rounds_est: 0,
-                error: Some(e.to_string()),
-                detail: "session_new failed".into(),
-            };
+            return fail_early(task, t0, e.to_string(), "session_new failed");
         }
     };
 
@@ -240,10 +159,12 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
     let mut permission_prompts = 0u32;
     let mut rounds_est = 0u32;
     let mut err_msg = None;
+    let max_turns = task.max_turns.max(1);
+    let session_id = session.id;
 
     let drain = async {
         loop {
-            match timeout(Duration::from_secs(180), rx.recv()).await {
+            match timeout(Duration::from_secs(300), rx.recv()).await {
                 Ok(Some(SessionUpdate::TurnComplete { .. })) => break,
                 Ok(Some(SessionUpdate::ToolCall { .. })) => tool_calls += 1,
                 Ok(Some(SessionUpdate::ToolCallUpdate { status, .. })) => {
@@ -256,6 +177,14 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
                 }
                 Ok(Some(SessionUpdate::AgentProgress { round, .. })) => {
                     rounds_est = rounds_est.max(round);
+                    // Enforce task max_turns (parity with CLI --max-turns).
+                    // Round is 1-based model step index emitted at step *start*;
+                    // allow rounds 1..=max_turns, cancel only when a step beyond budget begins.
+                    if round > max_turns {
+                        let _ = host.cancel_turn(Some(session_id));
+                        err_msg = Some(format!("max turns reached ({max_turns})"));
+                        break;
+                    }
                 }
                 Ok(Some(SessionUpdate::Error { message, .. })) => {
                     err_msg = Some(message);
@@ -272,27 +201,23 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
 
     let (prompt_res, _) = tokio::join!(prompt_fut, drain);
     if let Err(e) = prompt_res {
-        err_msg = Some(e.to_string());
+        if err_msg.is_none() {
+            err_msg = Some(e.to_string());
+        }
     }
 
-    let success = check_success(work.path(), &task.success);
-    let mut detail = if success {
-        "ok".into()
-    } else {
-        "success predicate failed".into()
-    };
-    // Optional failure dump for debugging (GROKPTAH_EVAL_KEEP_FAIL=1)
-    if !success && std::env::var_os("GROKPTAH_EVAL_KEEP_FAIL").is_some() {
+    let oracle = eval_oracle::evaluate(work.path(), &task.success);
+    let mut detail = oracle.detail.clone();
+    if !oracle.ok && std::env::var_os("GROKPTAH_EVAL_KEEP_FAIL").is_some() {
         let dump = std::env::temp_dir().join(format!("grokptah-eval-fail-{}", task.id));
         let _ = fs::remove_dir_all(&dump);
         let _ = copy_dir(work.path(), &dump);
         detail = format!("{detail}; dump={}", dump.display());
         eprintln!("eval fail dump: {}", dump.display());
     }
-    // Prevent work tempdir drop before we return? TempDir drops at end of scope — dump already copied.
     TaskResult {
         id: task.id.clone(),
-        success,
+        success: oracle.ok,
         wall_ms: t0.elapsed().as_millis(),
         tool_calls,
         tool_errors,
@@ -300,63 +225,23 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
         rounds_est,
         error: err_msg,
         detail,
+        difficulty: task.difficulty.clone(),
     }
 }
 
-fn check_file_predicates(
-    root: &Path,
-    path: &str,
-    must_contain: &[String],
-    must_not_contain: &[String],
-    must_not_remove: &[String],
-) -> bool {
-    let path = root.join(path);
-    let Ok(body) = fs::read_to_string(&path) else {
-        return false;
-    };
-    for s in must_contain {
-        if !body.contains(s) {
-            return false;
-        }
+fn fail_early(task: &Task, t0: Instant, error: String, detail: impl Into<String>) -> TaskResult {
+    TaskResult {
+        id: task.id.clone(),
+        success: false,
+        wall_ms: t0.elapsed().as_millis(),
+        tool_calls: 0,
+        tool_errors: 0,
+        permission_prompts: 0,
+        rounds_est: 0,
+        error: Some(error),
+        detail: detail.into(),
+        difficulty: task.difficulty.clone(),
     }
-    for s in must_not_contain {
-        if body.contains(s) {
-            return false;
-        }
-    }
-    for s in must_not_remove {
-        if !body.contains(s) {
-            return false;
-        }
-    }
-    true
-}
-
-fn check_success(root: &Path, spec: &SuccessSpec) -> bool {
-    if spec.kind != "file_contains" {
-        return false;
-    }
-    if !check_file_predicates(
-        root,
-        &spec.path,
-        &spec.must_contain,
-        &spec.must_not_contain,
-        &spec.must_not_remove,
-    ) {
-        return false;
-    }
-    for extra in &spec.extra_checks {
-        if !check_file_predicates(
-            root,
-            &extra.path,
-            &extra.must_contain,
-            &extra.must_not_contain,
-            &[],
-        ) {
-            return false;
-        }
-    }
-    true
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {

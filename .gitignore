@@ -7,3 +7,9 @@ desktop/node_modules/
 desktop/dist/
 desktop/src-tauri/target/
 crates/codegen/grokptah-agent-bridge/target/
+
+# Eval fixture build outputs
+evals/fixtures/**/target/
+evals/fixtures/**/Cargo.lock
+evals/runs/
+node_modules/

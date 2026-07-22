@@ -9,3 +9,6 @@ path = "src/lib.rs"
 [[test]]
 name = "max_test"
 path = "tests/max_test.rs"
+
+# Independent of monorepo workspace (eval fixture).
+[workspace]

@@ -671,6 +671,12 @@ pub(crate) fn build_agent_messages(
          Working directory: {}.\n\
          Use tools to explore and change the codebase. Do not invent file contents — read, list, or glob first.\n\
          Prefer apply_patch for targeted edits; use write_file for new files or full rewrites.\n\
+         Efficiency: when a change is mechanical (rename, multi-file same edit, several independent bugs),\n\
+         batch independent tool calls in **one** model step instead of one file per round.\n\
+         Prefer `run_terminal_cmd` with a short script (e.g. perl/sed) for cross-file renames when safe,\n\
+         then fix re-exports/`pub use` and compile errors in the same or next step — do not leave\n\
+         half-renamed public APIs.\n\
+         If cargo tests define success, apply fixes then run `cargo test` promptly; do not over-explore.\n\
          Run tests/builds with run_terminal_cmd when useful.\n\
          Use spawn_explore for broad codebase surveys.\n\
          MCP tools (if any) are named mcp__<server>__<tool> — use them when they match the task.\n\
