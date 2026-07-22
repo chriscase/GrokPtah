@@ -15,10 +15,11 @@ use uuid::Uuid;
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     api_context_messages, build_agent_messages, build_compact_summary, call_xai_agent_step,
-    call_xai_chat, coding_agent_tools, emit_message, emit_thought, normalize_sandbox_profile,
-    offline_plan_steps, parse_effort_arg, propose_plan_with_model, push_assistant, push_thought,
-    push_tool, sandbox_blocks_shell, sandbox_is_readonly, surface_rate_limit_or_error, tool_kind,
-    tool_web_fetch, AgentStep, McpToolIndex,
+    call_xai_chat, cargo_test_output_failed, coding_agent_tools, emit_message, emit_thought,
+    filter_tools_edit_and_shell, normalize_sandbox_profile, offline_plan_steps, parse_effort_arg,
+    propose_plan_with_model, push_assistant, push_thought, push_tool, sandbox_blocks_shell,
+    sandbox_is_readonly, surface_rate_limit_or_error, tool_kind, tool_web_fetch, AgentStep,
+    McpToolIndex,
 };
 use crate::local_tools;
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
@@ -46,6 +47,8 @@ pub struct HostConfig {
     pub default_model: String,
     pub default_effort: EffortLevel,
     pub always_approve: bool,
+    /// Cap model steps per user turn (live eval / tight budgets). None = default 24.
+    pub max_agent_rounds: Option<u32>,
 }
 
 impl Default for HostConfig {
@@ -56,6 +59,7 @@ impl Default for HostConfig {
             default_model: crate::models_catalog::resolve_default_model(),
             default_effort: EffortLevel::Medium,
             always_approve: false,
+            max_agent_rounds: None,
         }
     }
 }
@@ -89,6 +93,8 @@ pub(crate) struct Inner {
     open_tab_ids: Vec<Uuid>,
     always_approve: bool,
     always_allowed_tools: HashSet<String>,
+    /// Optional per-turn model-step budget (#187/#188).
+    max_agent_rounds: Option<u32>,
     model: String,
     effort: EffortLevel,
     auth: AuthState,
@@ -212,6 +218,7 @@ impl AgentHost {
             open_tab_ids,
             always_approve: chrome.always_approve || config.always_approve,
             always_allowed_tools: HashSet::new(),
+            max_agent_rounds: config.max_agent_rounds,
             model,
             effort: chrome.effort,
             auth,
@@ -3070,7 +3077,13 @@ impl AgentHostHandle {
         cancel: &CancellationToken,
         event_tx: &mpsc::UnboundedSender<SessionUpdate>,
     ) -> Result<String> {
-        const MAX_ROUNDS: usize = 24;
+        let max_rounds = {
+            let g = self.inner.lock();
+            g.max_agent_rounds
+                .map(|n| n.max(1) as usize)
+                .unwrap_or(24)
+                .min(24)
+        };
         // Auto-compact when wire window is large (non-destructive local history).
         {
             let need = {
@@ -3132,7 +3145,7 @@ impl AgentHostHandle {
         // #168: at most one Stop-hook continue per user turn
         let mut stop_continued = false;
 
-        for round in 1..=MAX_ROUNDS {
+        for round in 1..=max_rounds {
             if cancel.is_cancelled() {
                 let msg = "(cancelled)".to_string();
                 emit_message(event_tx, session_id, &msg);
@@ -3140,12 +3153,31 @@ impl AgentHostHandle {
                 return Ok(msg);
             }
 
+            // Budget-aware coaching when max_agent_rounds is tight (#187/#188).
+            let remaining = max_rounds.saturating_sub(round) + 1;
+            let tools_this_round = if max_rounds <= 8 && remaining == 1 {
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": "BUDGET: FINAL model step. Exploration tools are disabled. Use only write_files / write_file / apply_patch / run_terminal_cmd. Apply all remaining fixes and run cargo test now.",
+                }));
+                // Restrict tool surface on the last step so the model cannot burn the step on list/grep/read.
+                filter_tools_edit_and_shell(&tools)
+            } else {
+                if max_rounds <= 8 && remaining <= 2 {
+                    messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": "BUDGET: only 2 model steps left including this one. Prefer dense multi-tool edits (write_files) + cargo test over list/grep/read.",
+                    }));
+                }
+                tools.clone()
+            };
+
             let _ = event_tx.send(SessionUpdate::AgentProgress {
                 session_id,
                 round: round as u32,
-                max_rounds: MAX_ROUNDS as u32,
+                max_rounds: max_rounds as u32,
                 last_tool: None,
-                detail: format!("Model step {round}/{MAX_ROUNDS}"),
+                detail: format!("Model step {round}/{max_rounds}"),
             });
 
             let step = match call_xai_agent_step(
@@ -3153,7 +3185,7 @@ impl AgentHostHandle {
                 model,
                 effort,
                 &messages,
-                &tools,
+                &tools_this_round,
                 cancel,
                 |delta| {
                     emit_message(event_tx, session_id, delta);
@@ -3268,7 +3300,7 @@ impl AgentHostHandle {
                         let _ = event_tx.send(SessionUpdate::AgentProgress {
                             session_id,
                             round: round as u32,
-                            max_rounds: MAX_ROUNDS as u32,
+                            max_rounds: max_rounds as u32,
                             last_tool: Some(tc.name.clone()),
                             detail: format!("Tool `{}` (round {round})", tc.name),
                         });
@@ -3298,6 +3330,16 @@ impl AgentHostHandle {
                         } else {
                             content
                         };
+                        // After cargo test failures under a tight budget, force edit-next coaching.
+                        if max_rounds <= 8
+                            && tc.name == "run_terminal_cmd"
+                            && cargo_test_output_failed(&content)
+                        {
+                            messages.push(serde_json::json!({
+                                "role": "system",
+                                "content": "cargo test reported failures. Your next step MUST apply code edits for ALL failing tests (prefer write_files or multi-file apply_patch in one step). Do not only re-read docs/README. Then re-run cargo test.",
+                            }));
+                        }
                         messages.push(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": tc.id,
@@ -3309,7 +3351,7 @@ impl AgentHostHandle {
         }
 
         let msg = format!(
-            "Stopped after {MAX_ROUNDS} tool rounds without a final answer. \
+            "Stopped after {max_rounds} tool rounds without a final answer. \
              Ask me to continue, or narrow the task."
         );
         emit_message(event_tx, session_id, &msg);
@@ -3459,6 +3501,54 @@ impl AgentHostHandle {
                     .await;
                 if let Ok(ref report) = out {
                     self.emit_file_edit(session_id, cwd, &path_record, report, event_tx);
+                }
+                out
+            }
+            "write_files" => {
+                if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
+                    return Ok("ERROR: tool safety profile is read-only; write_files denied".into());
+                }
+                let files_val = args
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| anyhow!("write_files requires files array"))?;
+                let mut files: Vec<(String, String)> = Vec::new();
+                for (i, item) in files_val.iter().enumerate() {
+                    let path = item
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("write_files[{i}].path required"))?
+                        .to_string();
+                    let content = item
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("write_files[{i}].content required"))?
+                        .to_string();
+                    self.snapshot_edit_original_for_session(session_id, cwd, &path);
+                    files.push((path, content));
+                }
+                if files.is_empty() {
+                    return Ok("ERROR: write_files files array is empty".into());
+                }
+                let paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
+                let out = self
+                    .run_tool_for_output(
+                        session_id,
+                        "write_files",
+                        &args,
+                        || {
+                            let cwd = cwd.to_path_buf();
+                            let files = files.clone();
+                            async move { local_tools::tool_write_files(&cwd, &files).await }
+                        },
+                        cancel,
+                        event_tx,
+                    )
+                    .await;
+                if let Ok(ref report) = out {
+                    for p in &paths {
+                        self.emit_file_edit(session_id, cwd, p, report, event_tx);
+                    }
                 }
                 out
             }
@@ -3878,7 +3968,7 @@ impl AgentHostHandle {
                 .await
             }
             other => Ok(format!(
-                "Unknown tool `{other}`. Available: list_dir, read_file, grep, write_file, \
+                "Unknown tool `{other}`. Available: list_dir, read_file, grep, write_file, write_files, \
                  run_terminal_cmd, glob_files, apply_patch, spawn_explore, spawn_general_purpose, \
                  todo_write, memory_write, memory_read, web_fetch, and mcp__* tools"
             )),
@@ -4293,7 +4383,11 @@ impl AgentHostHandle {
                         } else if kind == "plan"
                             && matches!(
                                 tc.name.as_str(),
-                                "write_file" | "apply_patch" | "run_terminal_cmd" | "memory_write"
+                                "write_file"
+                                    | "write_files"
+                                    | "apply_patch"
+                                    | "run_terminal_cmd"
+                                    | "memory_write"
                             )
                         {
                             format!(
@@ -4501,7 +4595,7 @@ impl AgentHostHandle {
         }
 
         // Tool safety profile: deny writes in read-only for shared tool path.
-        if matches!(tool_name, "write_file" | "apply_patch")
+        if matches!(tool_name, "write_file" | "write_files" | "apply_patch")
             && sandbox_is_readonly(&self.inner.lock().sandbox_profile)
         {
             return Ok(format!(
@@ -4532,7 +4626,10 @@ impl AgentHostHandle {
         }
 
         let call_id = Uuid::new_v4().to_string();
-        let needs_perm = matches!(tool_name, "run_terminal_cmd" | "write_file" | "apply_patch");
+        let needs_perm = matches!(
+            tool_name,
+            "run_terminal_cmd" | "write_file" | "write_files" | "apply_patch"
+        );
         let gate = self.tool_gate(tool_name);
         if gate == ToolGate::AutoDeny {
             return Ok(format!("DENIED by deny rule: tool `{tool_name}`"));
@@ -5118,7 +5215,7 @@ impl AgentHostHandle {
             return Ok(());
         }
         let call_id = Uuid::new_v4().to_string();
-        let needs_perm = matches!(tool_name, "run_terminal_cmd" | "write_file");
+        let needs_perm = matches!(tool_name, "run_terminal_cmd" | "write_file" | "write_files");
         let gate = self.tool_gate(tool_name);
         if gate == ToolGate::AutoDeny {
             let _ = event_tx.send(SessionUpdate::ToolCall {
@@ -5179,7 +5276,7 @@ impl AgentHostHandle {
 
         let kind = match tool_name {
             "read_file" | "list_dir" => ToolCallKind::Read,
-            "write_file" => ToolCallKind::Edit,
+            "write_file" | "write_files" => ToolCallKind::Edit,
             "grep" => ToolCallKind::Search,
             "run_terminal_cmd" => ToolCallKind::Execute,
             _ => ToolCallKind::Other,

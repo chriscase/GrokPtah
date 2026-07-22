@@ -61,7 +61,9 @@ pub fn rule_matches(rule: &str, tool_name: &str) -> bool {
     let families: &[&str] = match base {
         "shell" | "bash" | "run_terminal_cmd" | "terminal" => &["run_terminal_cmd"],
         "webfetch" | "web_fetch" | "fetch" => &["web_fetch"],
-        "write" | "write_file" | "edit" => &["write_file", "apply_patch"],
+        "write" | "write_file" | "write_files" | "edit" => {
+            &["write_file", "write_files", "apply_patch"]
+        }
         "apply_patch" | "patch" => &["apply_patch"],
         "read" | "read_file" => &["read_file"],
         "mcp" => &["mcp"],

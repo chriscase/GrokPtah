@@ -42,6 +42,9 @@ pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
 
 pub use textutil::{truncate_at_char_boundary, truncate_with_marker};
 
+/// Coding-agent efficiency guidance (system prompt fragment for multi-file / multi-bug turns).
+pub use host_helpers::coding_agent_efficiency_guidance;
+
 pub use memory::{
     inject_context as memory_inject_context, list_facts as memory_list_facts,
     remember as memory_remember,

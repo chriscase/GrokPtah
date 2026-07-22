@@ -130,7 +130,7 @@ pub(crate) fn emit_thought(
 pub(crate) fn tool_kind(name: &str) -> ToolCallKind {
     match name {
         "read_file" | "list_dir" | "memory_read" => ToolCallKind::Read,
-        "write_file" | "apply_patch" => ToolCallKind::Edit,
+        "write_file" | "write_files" | "apply_patch" => ToolCallKind::Edit,
         "grep" | "glob_files" => ToolCallKind::Search,
         "run_terminal_cmd" | "web_fetch" => ToolCallKind::Execute,
         "todo_write" | "spawn_explore" | "spawn_general_purpose" | "spawn_subagent" => {
@@ -140,6 +140,41 @@ pub(crate) fn tool_kind(name: &str) -> ToolCallKind {
         n if n.starts_with("mcp__") => ToolCallKind::Other,
         _ => ToolCallKind::Other,
     }
+}
+
+/// Detect cargo-test failure text in tool output (for budget coaching).
+pub fn cargo_test_output_failed(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    if !lower.contains("test") && !lower.contains("cargo") {
+        // Still check common cargo failure markers without requiring the word cargo
+        // (quiet mode may omit it in tails).
+    }
+    lower.contains("error: test failed")
+        || lower.contains("test result: failed")
+        || lower.contains("failures:")
+        || (lower.contains("failed") && lower.contains("test") && !lower.contains("0 failed"))
+}
+
+/// Efficiency / multi-step guidance shared by the coding-agent system prompt (#187/#188).
+pub fn coding_agent_efficiency_guidance() -> &'static str {
+    "\
+## Turn budget (critical)\n\
+You MAY emit **multiple tool calls in one assistant step** — use that. Prefer 1–3 dense steps over many exploratory steps.\n\
+\n\
+### When the user asks to fix tests / make cargo test pass\n\
+1. FIRST step: run `cargo test` — then in the **same** step apply fixes for **all** failures via `write_files` or multi-file `apply_patch`.\n\
+2. Do **not** spend extra steps re-listing the tree after you know failing tests.\n\
+3. Do **not** stop after fixing only the bug mentioned in README if other tests still fail.\n\
+4. Prefer finishing with `cargo test` when feasible.\n\
+\n\
+### When the user asks for a type/symbol rename across the crate\n\
+1. In **one** step: bulk rename with `run_terminal_cmd` (e.g. find+sed/perl on src/**/*.rs) and/or `write_files` for every changed module including `lib.rs` re-exports.\n\
+2. Same step: ensure public aliases (`pub use`, compat wrappers) compile — never leave half-renamed APIs.\n\
+3. Same or next step only: `cargo test`.\n\
+4. Avoid 3+ rounds of list_dir/grep/read before the first edit.\n\
+\n\
+Prefer `write_files` over serial `write_file` when 2+ files change. Prefer multi-block `apply_patch` for search/replace across files.\n\
+"
 }
 
 pub(crate) async fn tool_web_fetch(url: &str) -> Result<local_tools::ToolResult> {
@@ -204,6 +239,55 @@ pub(crate) enum AgentStep {
 /// Map of OpenAI function name → (real server name, real tool name).
 pub(crate) type McpToolIndex = std::collections::HashMap<String, (String, String)>;
 
+/// On final budget step, only allow edit + shell tools (#187/#188).
+pub(crate) fn filter_tools_edit_and_shell(tools: &serde_json::Value) -> serde_json::Value {
+    let Some(arr) = tools.as_array() else {
+        return tools.clone();
+    };
+    let keep = [
+        "write_files",
+        "write_file",
+        "apply_patch",
+        "run_terminal_cmd",
+    ];
+    let filtered: Vec<serde_json::Value> = arr
+        .iter()
+        .filter(|t| {
+            let name = t
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            keep.contains(&name)
+        })
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        tools.clone()
+    } else {
+        serde_json::Value::Array(filtered)
+    }
+}
+
+fn tool_schema_priority(tool: &serde_json::Value) -> u8 {
+    match tool
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+    {
+        "write_files" => 0,
+        "write_file" => 1,
+        "apply_patch" => 2,
+        "run_terminal_cmd" => 3,
+        "read_file" => 10,
+        "grep" => 11,
+        "glob_files" => 12,
+        "list_dir" => 13,
+        _ => 40,
+    }
+}
+
 pub(crate) fn coding_agent_tools(
     mcp: &[crate::mcp_runtime::McpToolSpec],
 ) -> (serde_json::Value, McpToolIndex) {
@@ -260,7 +344,7 @@ pub(crate) fn coding_agent_tools(
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file with the given content. Prefer complete file contents.",
+                "description": "Create or overwrite one file. For 2+ files prefer write_files in the same step.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -274,8 +358,33 @@ pub(crate) fn coding_agent_tools(
         serde_json::json!({
             "type": "function",
             "function": {
+                "name": "write_files",
+                "description": "Write multiple files in ONE tool call (batch). Use for renames/refactors that touch several paths so you do not burn a model turn per file. files: [{path, content}, ...].",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "files": {
+                            "type": "array",
+                            "description": "Files to write",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": { "type": "string" },
+                                    "content": { "type": "string" }
+                                },
+                                "required": ["path", "content"]
+                            }
+                        }
+                    },
+                    "required": ["files"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
                 "name": "run_terminal_cmd",
-                "description": "Run a shell command in the project working directory (tests, builds, git, etc.).",
+                "description": "Run a shell command (tests, builds, bulk rename via perl/sed). For multi-file mechanical renames prefer one scripted command over many write_file calls. Run cargo test early when tests define success.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -304,13 +413,13 @@ pub(crate) fn coding_agent_tools(
             "type": "function",
             "function": {
                 "name": "apply_patch",
-                "description": "Apply a targeted edit. Prefer this over write_file for large files. Use either JSON {\"path\",\"old_string\",\"new_string\"} or *** Update File: path blocks with <<<<<<< SEARCH / ======= / >>>>>>> REPLACE.",
+                "description": "Apply targeted edit(s). Prefer over write_file for large files. Use JSON {\"path\",\"old_string\",\"new_string\"} OR multiple *** Update File: path blocks with <<<<<<< SEARCH / ======= / >>>>>>> REPLACE in ONE call for multi-file changes.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "patch": {
                             "type": "string",
-                            "description": "Patch payload (JSON search/replace or Update File blocks)"
+                            "description": "Patch payload (JSON search/replace or one/many Update File blocks)"
                         }
                     },
                     "required": ["patch"]
@@ -448,6 +557,9 @@ pub(crate) fn coding_agent_tools(
             }
         }),
     ];
+
+    // Prefer edit/test tools early in the schema list (model bias under tight turn budgets).
+    tools.sort_by_key(tool_schema_priority);
 
     let mut index = McpToolIndex::new();
     for t in mcp {
@@ -666,17 +778,13 @@ pub(crate) fn build_agent_messages(
             loaded.join(", ")
         )
     };
+    let efficiency = coding_agent_efficiency_guidance();
     let system = format!(
         "You are GrokPtah, a desktop coding agent (Grok Build–style).\n\
          Working directory: {}.\n\
          Use tools to explore and change the codebase. Do not invent file contents — read, list, or glob first.\n\
-         Prefer apply_patch for targeted edits; use write_file for new files or full rewrites.\n\
-         Efficiency: when a change is mechanical (rename, multi-file same edit, several independent bugs),\n\
-         batch independent tool calls in **one** model step instead of one file per round.\n\
-         Prefer `run_terminal_cmd` with a short script (e.g. perl/sed) for cross-file renames when safe,\n\
-         then fix re-exports/`pub use` and compile errors in the same or next step — do not leave\n\
-         half-renamed public APIs.\n\
-         If cargo tests define success, apply fixes then run `cargo test` promptly; do not over-explore.\n\
+         Prefer apply_patch for targeted edits; write_files for multi-file rewrites; write_file for a single new/full file.\n\
+         {efficiency}\
          Run tests/builds with run_terminal_cmd when useful.\n\
          Use spawn_explore for broad codebase surveys.\n\
          MCP tools (if any) are named mcp__<server>__<tool> — use them when they match the task.\n\
@@ -1412,4 +1520,94 @@ pub(crate) async fn call_xai_chat(
         }
     }
     bail!("empty model response: {v}");
+}
+
+#[cfg(test)]
+mod efficiency_tests {
+    use super::*;
+
+    #[test]
+    fn efficiency_guidance_covers_multi_bug_and_rename() {
+        let g = coding_agent_efficiency_guidance();
+        assert!(g.contains("write_files"), "multi-file batch path");
+        assert!(g.contains("cargo test"), "cargo-test-first guidance");
+        assert!(g.contains("multiple tool calls"), "multi-tool-per-step");
+        assert!(
+            g.contains("half-renamed") || g.contains("pub use"),
+            "rename completeness"
+        );
+    }
+
+    #[test]
+    fn cargo_test_failure_detector() {
+        assert!(cargo_test_output_failed(
+            "running 2 tests\ntest t ... FAILED\n\nfailures:\n\ntest result: FAILED. 0 passed; 2 failed"
+        ));
+        assert!(cargo_test_output_failed(
+            "error: test failed, to rerun pass"
+        ));
+        assert!(!cargo_test_output_failed(
+            "test result: ok. 2 passed; 0 failed; 0 ignored"
+        ));
+    }
+
+    #[test]
+    fn filter_tools_edit_and_shell_drops_explore() {
+        let (tools, _) = coding_agent_tools(&[]);
+        let f = filter_tools_edit_and_shell(&tools);
+        let names: Vec<&str> = f
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"write_files"));
+        assert!(names.contains(&"run_terminal_cmd"));
+        assert!(!names.contains(&"list_dir"));
+        assert!(!names.contains(&"grep"));
+    }
+
+    #[test]
+    fn coding_agent_tools_include_write_files() {
+        let (tools, _) = coding_agent_tools(&[]);
+        let s = tools.to_string();
+        assert!(
+            s.contains("write_files"),
+            "schema must advertise write_files"
+        );
+        assert!(s.contains("write_file"));
+        assert!(s.contains("apply_patch"));
+        // multi-file batch description
+        assert!(s.contains("multiple files") || s.contains("ONE tool call") || s.contains("batch"));
+        let arr = tools.as_array().unwrap();
+        let names: Vec<&str> = arr
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        let wf = names.iter().position(|n| *n == "write_files").unwrap();
+        let ld = names.iter().position(|n| *n == "list_dir").unwrap();
+        assert!(
+            wf < ld,
+            "write_files should sort before list_dir, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn build_agent_messages_embeds_efficiency_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs =
+            build_agent_messages(&[("user".into(), "fix it".into())], None, dir.path(), None);
+        let system = msgs[0]["content"].as_str().unwrap_or("");
+        assert!(
+            system.contains("write_files") || system.contains("Turn budget"),
+            "system prompt must include efficiency guidance, got: {}",
+            &system[..system.len().min(200)]
+        );
+        assert!(system.contains("cargo test") || system.contains("cargo tests"));
+    }
+
+    #[test]
+    fn tool_kind_write_files_is_edit() {
+        assert!(matches!(tool_kind("write_files"), ToolCallKind::Edit));
+    }
 }
