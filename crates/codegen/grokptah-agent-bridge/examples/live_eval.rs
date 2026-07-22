@@ -38,6 +38,15 @@ fn default_max_turns() -> u32 {
 }
 
 #[derive(Debug, Deserialize)]
+struct ExtraCheck {
+    path: String,
+    #[serde(default)]
+    must_contain: Vec<String>,
+    #[serde(default)]
+    must_not_contain: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SuccessSpec {
     #[serde(rename = "type")]
     kind: String,
@@ -48,6 +57,8 @@ struct SuccessSpec {
     must_not_contain: Vec<String>,
     #[serde(default)]
     must_not_remove: Vec<String>,
+    #[serde(default)]
+    extra_checks: Vec<ExtraCheck>,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,6 +276,20 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
     }
 
     let success = check_success(work.path(), &task.success);
+    let mut detail = if success {
+        "ok".into()
+    } else {
+        "success predicate failed".into()
+    };
+    // Optional failure dump for debugging (GROKPTAH_EVAL_KEEP_FAIL=1)
+    if !success && std::env::var_os("GROKPTAH_EVAL_KEEP_FAIL").is_some() {
+        let dump = std::env::temp_dir().join(format!("grokptah-eval-fail-{}", task.id));
+        let _ = fs::remove_dir_all(&dump);
+        let _ = copy_dir(work.path(), &dump);
+        detail = format!("{detail}; dump={}", dump.display());
+        eprintln!("eval fail dump: {}", dump.display());
+    }
+    // Prevent work tempdir drop before we return? TempDir drops at end of scope — dump already copied.
     TaskResult {
         id: task.id.clone(),
         success,
@@ -274,34 +299,60 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
         permission_prompts,
         rounds_est,
         error: err_msg,
-        detail: if success {
-            "ok".into()
-        } else {
-            "success predicate failed".into()
-        },
+        detail,
     }
+}
+
+fn check_file_predicates(
+    root: &Path,
+    path: &str,
+    must_contain: &[String],
+    must_not_contain: &[String],
+    must_not_remove: &[String],
+) -> bool {
+    let path = root.join(path);
+    let Ok(body) = fs::read_to_string(&path) else {
+        return false;
+    };
+    for s in must_contain {
+        if !body.contains(s) {
+            return false;
+        }
+    }
+    for s in must_not_contain {
+        if body.contains(s) {
+            return false;
+        }
+    }
+    for s in must_not_remove {
+        if !body.contains(s) {
+            return false;
+        }
+    }
+    true
 }
 
 fn check_success(root: &Path, spec: &SuccessSpec) -> bool {
     if spec.kind != "file_contains" {
         return false;
     }
-    let path = root.join(&spec.path);
-    let Ok(body) = fs::read_to_string(&path) else {
+    if !check_file_predicates(
+        root,
+        &spec.path,
+        &spec.must_contain,
+        &spec.must_not_contain,
+        &spec.must_not_remove,
+    ) {
         return false;
-    };
-    for s in &spec.must_contain {
-        if !body.contains(s) {
-            return false;
-        }
     }
-    for s in &spec.must_not_contain {
-        if body.contains(s) {
-            return false;
-        }
-    }
-    for s in &spec.must_not_remove {
-        if !body.contains(s) {
+    for extra in &spec.extra_checks {
+        if !check_file_predicates(
+            root,
+            &extra.path,
+            &extra.must_contain,
+            &extra.must_not_contain,
+            &[],
+        ) {
             return false;
         }
     }

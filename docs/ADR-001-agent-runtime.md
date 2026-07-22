@@ -51,3 +51,16 @@ Upstream still has a full stack (`xai-grok-shell`, `xai-grok-tools`, `xai-grok-m
 
 - **#145 (2026-07):** `host.rs` split — free functions (tool schemas, wire HTTP, sandbox helpers) live in `host_helpers.rs` (~1.4k LOC). Further module splits (subagent/slash) remain incremental.
 - **#144:** Full `xai-chat-state` / `xai-grok-tools` path-deps still blocked by monorepo packaging (bridge is its own workspace). Prefer lifting pure modules as done for `prompt_combine` / exec-risk / isolation; do not claim full upstream embed.
+
+## Host size after Phase 16 helpers (continuous honesty)
+
+As of continuous improvement (2026-07-22):
+
+| File | ~LOC | Role |
+|------|-----:|------|
+| `host.rs` | ~5.2k | Session lifecycle, slash, subagent orchestration, offline turn |
+| `host_helpers.rs` | ~1.4k | Wire HTTP, tool schemas, sandbox helpers, transcript push |
+
+**#145 decision — accept remaining `host.rs` size as-is for now:** further mechanical splits (slash/subagent into files) are optional polish, not required to claim the god-object was addressed. The free-function extraction is the completed boundary. Future splits only when a change set needs them.
+
+**#144 decision — NOT PLANNED unless forced:** full `xai-chat-state` / `xai-grok-tools` path-dep lift remains deferred. Bridge stays an independent workspace. Prefer vendor-and-port pure modules; revisit lift only if hand-port cost becomes unsustainable.

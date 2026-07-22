@@ -33,5 +33,75 @@
       "must_contain": ["search-me-token"]
     },
     "max_turns": 10
+  },
+  {
+    "id": "multi_file_rename_app",
+    "fixture": "multi_file",
+    "prompt": "Rename the application from LegacyApp to NexaCore across the codebase. Update the constant in config and any call sites so banner/describe still use the name. Do not leave LegacyApp anywhere under src/.",
+    "success": {
+      "type": "file_contains",
+      "path": "src/config.rs",
+      "must_contain": ["NexaCore"],
+      "must_not_contain": ["LegacyApp"],
+      "extra_checks": [
+        {"path": "src/app.rs", "must_not_contain": ["LegacyApp"]},
+        {"path": "src/lib.rs", "must_not_contain": ["LegacyApp"]}
+      ]
+    },
+    "max_turns": 16
+  },
+  {
+    "id": "plan_then_execute_util",
+    "fixture": "plan_exec",
+    "prompt": "First outline a short plan (3 steps max) to change util::double so it multiplies by 2 with `a * 2` instead of `x + x`. Then implement the change in src/util.rs. Keep main.rs unchanged.",
+    "success": {
+      "type": "file_contains",
+      "path": "src/util.rs",
+      "must_contain": ["* 2", "fn double"],
+      "must_not_contain": ["x + x"],
+      "must_not_remove": ["fn double"]
+    },
+    "max_turns": 16
+  },
+  {
+    "id": "test_and_fix_max",
+    "fixture": "test_fix",
+    "prompt": "The function max_i32 is wrong (it returns the smaller value). Fix src/lib.rs so max_i32 returns the larger of a and b. Optionally run: cargo test --manifest-path Cargo.toml",
+    "success": {
+      "type": "file_contains",
+      "path": "src/lib.rs",
+      "must_contain": ["fn max_i32"],
+      "must_not_contain": ["if a < b { a } else { b }"]
+    },
+    "max_turns": 14
+  },
+  {
+    "id": "fail_recover_notes",
+    "fixture": "fail_recover",
+    "prompt": "Read src/protected.txt and extract the secret line (secret-value-*). Do NOT modify protected.txt. Create NOTES.md at the project root containing that secret value alone plus a trailing newline.",
+    "success": {
+      "type": "file_contains",
+      "path": "NOTES.md",
+      "must_contain": ["secret-value-alpha"],
+      "extra_checks": [
+        {"path": "src/protected.txt", "must_contain": ["DO NOT OVERWRITE"]}
+      ]
+    },
+    "max_turns": 12
+  },
+  {
+    "id": "long_horizon_bug42",
+    "fixture": "long_horizon",
+    "prompt": "1) Read docs/OVERVIEW.md for context. 2) Fix BUG-42 in the emitter so the prefix is OUT: (with colon) not out>. 3) Write REPORT.md summarizing the bug, file changed, and one-line verification. Use tools; do not invent file contents without reading. Remove any remaining out> prefix from the format! string (comments may mention the old bug).",
+    "success": {
+      "type": "file_contains",
+      "path": "src/emitter.rs",
+      "must_contain": ["OUT:"],
+      "must_not_contain": ["format!(\"out>"],
+      "extra_checks": [
+        {"path": "REPORT.md", "must_contain": ["BUG-42"]}
+      ]
+    },
+    "max_turns": 20
   }
 ]

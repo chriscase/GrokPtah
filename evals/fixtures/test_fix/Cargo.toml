@@ -1,0 +1,11 @@
+[package]
+name = "test_fix_fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "max_test"
+path = "tests/max_test.rs"

@@ -82,6 +82,17 @@ export const FleetStrip = memo(function FleetStrip({
               key={t.id}
               type="button"
               className={`fleet-card status-${status} ${isPrimary ? "primary" : ""} ${inZone ? "in-zone" : ""}`}
+              data-testid="fleet-card"
+              data-session-id={t.id}
+              data-running-subagents={t.runningSubagents ?? 0}
+              data-total-tokens={t.totalTokens ?? 0}
+              aria-pressed={isPrimary}
+              aria-current={isPrimary ? "true" : undefined}
+              aria-label={`${t.title}: ${phaseLabel(t)}${
+                t.runningSubagents
+                  ? `, ${t.runningSubagents} subagent${t.runningSubagents === 1 ? "" : "s"}`
+                  : ""
+              }${t.totalTokens ? `, ${t.totalTokens} tokens` : ""}`}
               title={
                 canSplit
                   ? `${t.title}\nClick: focus · Alt-click / double-click: dock beside`
