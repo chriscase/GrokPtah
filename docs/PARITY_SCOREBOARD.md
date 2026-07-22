@@ -57,6 +57,7 @@ Offline (CI): `cargo test eval_oracle` in the bridge workspace + suite-shape che
 ## Latest live results — turn-efficiency cycle (#187/#188)
 
 Model: **grok-4.5** · Suite: **14 tasks** · max_turns **unchanged** (multi_bug=3, cross_cut=4)  
+Merge SHA (efficiency): `e34b0b0c73543d7ae039501e10344d51e80b93d4`  
 Evidence: goal scratch `proof-1/`, `proof-2/`  
 Instrumentation: `tool_names`, `cargo_test_ran`, `cargo_test_first_round` on both sides.
 
