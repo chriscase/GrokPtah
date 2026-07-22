@@ -57,6 +57,7 @@ Offline (CI): `cargo test eval_oracle` in the bridge workspace + suite-shape che
 ## Latest live results (discriminating)
 
 Model: **grok-4.5** · Suite: **14 tasks** (2 smoke + 12 hard)  
+Merge SHA: `e43618f2c691cc13a9bff59d64bcffd34c4a8f8a`  
 Evidence: goal scratch `eval-final-A/`, `eval-final-B/`  
 max_turns enforced on bridge (`round > max_turns` cancel) and CLI `--max-turns`.
 
