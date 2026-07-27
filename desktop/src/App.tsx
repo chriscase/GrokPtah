@@ -24,6 +24,7 @@ import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
+import { PromptQueueSummary } from "./components/PromptQueuePanel";
 import {
   appendDeny,
   loadDenyHistory,
@@ -64,6 +65,11 @@ import {
   queuedActivity,
   type ActivityState,
 } from "./lib/activity";
+import {
+  createPromptQueueEntry,
+  drainPromptQueuePrefix,
+} from "./lib/promptQueue";
+import { useComposerQueue } from "./lib/useComposerQueue";
 
 type WorkspaceMode = "build" | "chat";
 
@@ -222,20 +228,19 @@ export default function App() {
   const [tabs, setTabs] = useState<SessionTab[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [composer, setComposer] = useState("");
-  /**
-   * Per-session composer drafts — survive focus switches so you can
-   * pre-type prompts for several agents and send when ready.
-   */
-  const [composerDrafts, setComposerDrafts] = useState<Record<string, string>>(
-    {},
-  );
-  /** Taller composer for detailed prompts (power users). */
-  const [composerExpanded, setComposerExpanded] = useState(false);
-  /** Per-session prompt queue while a turn is running (#147). */
-  const [promptQueues, setPromptQueues] = useState<Record<string, string[]>>(
-    {},
-  );
+  const {
+    composer,
+    updateComposer,
+    clearComposerFor,
+    restoreComposer,
+    forgetSession: forgetComposerSession,
+    expanded: composerExpanded,
+    setExpanded: setComposerExpanded,
+    queues: promptQueues,
+    dispatchQueue,
+    queueFor,
+    currentQueueFor,
+  } = useComposerQueue(activeSessionId);
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
   /** FIFO of tool permission prompts — concurrent requests must not clobber (#141). */
   const [permissionQueue, setPermissionQueue] = useState<PermissionRequest[]>(
@@ -419,12 +424,7 @@ export default function App() {
 
   const closeTab = useCallback((id: string) => {
     setDocks((d) => d.filter((x) => x !== id));
-    setComposerDrafts((d) => {
-      if (!(id in d)) return d;
-      const next = { ...d };
-      delete next[id];
-      return next;
-    });
+    forgetComposerSession(id);
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id);
       setActiveSessionId((cur) => {
@@ -433,38 +433,7 @@ export default function App() {
       });
       return next;
     });
-  }, []);
-
-  /** Write composer into the focused session's draft bag. */
-  const updateComposer = useCallback(
-    (text: string) => {
-      setComposer(text);
-      if (activeSessionId) {
-        setComposerDrafts((d) => {
-          if ((d[activeSessionId] ?? "") === text) return d;
-          if (!text) {
-            if (!(activeSessionId in d)) return d;
-            const next = { ...d };
-            delete next[activeSessionId];
-            return next;
-          }
-          return { ...d, [activeSessionId]: text };
-        });
-      }
-    },
-    [activeSessionId],
-  );
-
-  // Restore draft when focus moves between sessions
-  useEffect(() => {
-    if (!activeSessionId) {
-      setComposer("");
-      return;
-    }
-    setComposer(composerDrafts[activeSessionId] ?? "");
-    // Only rehydrate when the target session changes — not on every draft keystroke.
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: load on focus switch only
-  }, [activeSessionId]);
+  }, [forgetComposerSession]);
 
   const undockSession = useCallback((id: string) => {
     setDocks((d) => {
@@ -1250,15 +1219,7 @@ export default function App() {
     if (!prompt) return;
     const fromComposer = text === undefined;
     if (fromComposer) {
-      setComposer("");
-      if (activeSessionId) {
-        setComposerDrafts((d) => {
-          if (!(activeSessionId in d)) return d;
-          const next = { ...d };
-          delete next[activeSessionId];
-          return next;
-        });
-      }
+      clearComposerFor(activeSessionId);
     }
     let id: string;
     try {
@@ -1266,29 +1227,23 @@ export default function App() {
     } catch (e) {
       console.warn(e);
       // Restore draft if session creation failed after we cleared it
-      if (fromComposer) updateComposer(prompt);
+      if (fromComposer) restoreComposer(prompt, activeSessionId);
       return;
     }
     // After ensureSession, focus may have moved to a new id — clear that draft too
     if (fromComposer) {
-      setComposer("");
-      setComposerDrafts((d) => {
-        if (!(id in d) && !(activeSessionId && activeSessionId in d)) return d;
-        const next = { ...d };
-        delete next[id];
-        if (activeSessionId) delete next[activeSessionId];
-        return next;
-      });
+      clearComposerFor(id, activeSessionId);
     }
 
     const tabBusy = tabs.find((t) => t.id === id)?.busy;
     // #147: queue while a turn is running (unless interject = cancel then send).
     if (tabBusy && !opts?.interject && !opts?.fromQueue) {
       const nextLen = (promptQueues[id]?.length ?? 0) + 1;
-      setPromptQueues((q) => ({
-        ...q,
-        [id]: [...(q[id] ?? []), prompt],
-      }));
+      dispatchQueue({
+        type: "add",
+        sessionId: id,
+        entry: createPromptQueueEntry(prompt),
+      });
       patchTab(id, (t) => ({
         ...t,
         activity: {
@@ -1564,30 +1519,16 @@ export default function App() {
       await refreshChrome();
       await refreshSessions();
       // #147 + #157: drain queued prompts; combine consecutive plain follow-ups.
-      let nextQueued: string | undefined;
-      setPromptQueues((q) => {
-        const list = q[id] ?? [];
-        if (!list.length) return q;
-        // combine_queued_prompts: merge prefix of plain (non-slash) texts
-        let n = 1;
-        for (let i = 1; i < list.length; i++) {
-          const t = list[i]?.trim() ?? "";
-          if (!t || t.startsWith("/") || t.startsWith("!")) break;
-          n++;
-        }
-        const combined = list.slice(0, n).join("\n\n");
-        const rest = list.slice(n);
-        nextQueued = combined;
-        const next = { ...q };
-        if (rest.length) next[id] = rest;
-        else delete next[id];
-        return next;
-      });
-      if (nextQueued) {
-        const drain = nextQueued;
+      const drained = drainPromptQueuePrefix(currentQueueFor(id));
+      if (drained) {
+        dispatchQueue({
+          type: "replace",
+          sessionId: id,
+          entries: drained.remaining,
+        });
         // fromQueue bypasses busy re-queue (state may still show busy briefly).
         setTimeout(() => {
-          void sendPrompt(drain, { fromQueue: true, sessionId: id });
+          void sendPrompt(drained.text, { fromQueue: true, sessionId: id });
         }, 0);
       }
     } catch (e) {
@@ -2424,15 +2365,7 @@ export default function App() {
                     Interject
                   </button>
                 )}
-                {activeSessionId &&
-                  (promptQueues[activeSessionId]?.length ?? 0) > 0 && (
-                    <span
-                      className="composer-hint"
-                      title="Prompts waiting for the current turn to finish"
-                    >
-                      Queue {promptQueues[activeSessionId].length}
-                    </span>
-                  )}
+                <PromptQueueSummary entries={queueFor(activeSessionId)} />
                 <button
                   type="button"
                   className="composer-send"
