@@ -236,7 +236,9 @@ fn truncate_redact(s: &str, max: usize) -> String {
     if s.len() <= max {
         s
     } else {
-        format!("{}…[truncated {} bytes]", &s[..max], s.len())
+        // char-boundary safe (CJK / emoji) — never slice mid-codepoint
+        let head = crate::textutil::truncate_at_char_boundary(&s, max);
+        format!("{head}…[truncated {} bytes]", s.len())
     }
 }
 
