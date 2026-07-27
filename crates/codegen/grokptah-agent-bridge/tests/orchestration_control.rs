@@ -225,6 +225,7 @@ fn restart_interrupted_no_auto_resume() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // home_override_serial MutexGuard must span the whole test
 async fn e2e_mcp_client_valid_and_invalid_token() {
     let (home, _lock) = setup_home();
     let ws = tempdir().unwrap();
