@@ -277,15 +277,15 @@ pub async fn tool_shell_streaming<F>(
 where
     F: FnMut(String) + Send,
 {
-    let mut child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("spawn shell")?;
+        .kill_on_drop(true);
+    crate::spawn_env::scrub_tokio_command(&mut cmd);
+    let mut child = cmd.spawn().context("spawn shell")?;
 
     let stdout = child.stdout.take().context("stdout")?;
     let stderr = child.stderr.take().context("stderr")?;

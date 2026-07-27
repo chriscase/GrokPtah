@@ -3,11 +3,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use parking_lot::Mutex;
 
-use super::types::{AuditEntry, IdempotencyReceipt, RunRecord, RunState};
+use super::types::{
+    safe_id_filename, AuditEntry, IdempotencyReceipt, OrchError, OrchErrorCode, RunRecord, RunState,
+};
 
 #[derive(Clone)]
 pub struct OrchStore {
@@ -21,7 +24,6 @@ struct OrchStoreInner {
 
 impl OrchStore {
     /// Open store and convert unfinished runs to `interrupted` (crash recovery).
-    /// Call once per process boot — not when cloning a handle for background work.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
@@ -34,6 +36,8 @@ impl OrchStore {
             }),
         };
         store.mark_unfinished_interrupted()?;
+        // Pending idempotency claims that never completed become conflict-safe:
+        // leave them; claimers will finish or callers will conflict.
         Ok(store)
     }
 
@@ -41,36 +45,33 @@ impl OrchStore {
         &self.inner.root
     }
 
-    fn run_path(&self, run_id: &str) -> PathBuf {
-        self.inner.root.join("runs").join(format!("{run_id}.json"))
+    fn run_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
     }
 
-    fn idemp_path(&self, request_id: &str) -> PathBuf {
-        // request ids may contain path-unfriendly chars
-        let safe: String = request_id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.inner
+    fn idemp_path(&self, request_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(request_id)?;
+        Ok(self
+            .inner
             .root
             .join("idempotency")
-            .join(format!("{safe}.json"))
+            .join(format!("{safe}.json")))
     }
 
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
         let _g = self.inner.lock.lock();
-        let path = self.run_path(&run.run_id);
+        let path = self
+            .run_path(&run.run_id)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         atomic_write_json(&path, run)
     }
 
     pub fn load_run(&self, run_id: &str) -> anyhow::Result<Option<RunRecord>> {
-        let path = self.run_path(run_id);
+        let path = match self.run_path(run_id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
         if !path.is_file() {
             return Ok(None);
         }
@@ -101,16 +102,106 @@ impl OrchStore {
 
     pub fn save_idempotency(&self, receipt: &IdempotencyReceipt) -> anyhow::Result<()> {
         let _g = self.inner.lock.lock();
-        atomic_write_json(&self.idemp_path(&receipt.request_id), receipt)
+        let path = self
+            .idemp_path(&receipt.request_id)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        atomic_write_json(&path, receipt)
     }
 
     pub fn load_idempotency(&self, request_id: &str) -> anyhow::Result<Option<IdempotencyReceipt>> {
-        let path = self.idemp_path(request_id);
+        let path = match self.idemp_path(request_id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
         if !path.is_file() {
             return Ok(None);
         }
         let text = fs::read_to_string(path)?;
         Ok(Some(serde_json::from_str(&text)?))
+    }
+
+    /// Atomically claim a request_id for mutation.
+    /// - Existing complete receipt with same hash → `Replay(response)`
+    /// - Existing complete receipt with different hash → Conflict
+    /// - Existing pending → wait/poll until complete or timeout
+    /// - None → create pending claim (exclusive)
+    pub fn claim_idempotency(
+        &self,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> Result<IdempotencyClaim, OrchError> {
+        let path = self.idemp_path(request_id)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let _g = self.inner.lock.lock();
+            if path.is_file() {
+                let text = fs::read_to_string(&path)
+                    .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+                let prev: IdempotencyReceipt = serde_json::from_str(&text)
+                    .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+                if prev.tool != tool || prev.payload_hash != payload_hash {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "request_id reused with different payload",
+                    ));
+                }
+                if prev.status == "complete" {
+                    return Ok(IdempotencyClaim::Replay(prev.response));
+                }
+                // pending — wait outside lock
+                drop(_g);
+                if std::time::Instant::now() > deadline {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Internal,
+                        "timed out waiting for in-flight idempotent mutation",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            // Exclusive create: write pending atomically via create_new.
+            let pending = IdempotencyReceipt {
+                request_id: request_id.into(),
+                payload_hash: payload_hash.into(),
+                run_id: None,
+                tool: tool.into(),
+                response: serde_json::Value::Null,
+                created_at: Utc::now(),
+                status: "pending".into(),
+            };
+            match write_json_exclusive(&path, &pending) {
+                Ok(()) => return Ok(IdempotencyClaim::Perform),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    drop(_g);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(OrchError::new(OrchErrorCode::Internal, e.to_string()));
+                }
+            }
+        }
+    }
+
+    pub fn complete_idempotency(
+        &self,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+        run_id: Option<String>,
+        response: serde_json::Value,
+    ) -> Result<(), OrchError> {
+        let receipt = IdempotencyReceipt {
+            request_id: request_id.into(),
+            payload_hash: payload_hash.into(),
+            run_id,
+            tool: tool.into(),
+            response,
+            created_at: Utc::now(),
+            status: "complete".into(),
+        };
+        self.save_idempotency(&receipt)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
     pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
@@ -125,7 +216,6 @@ impl OrchStore {
         Ok(())
     }
 
-    /// Unfinished runs become `interrupted` and never auto-resume.
     pub fn mark_unfinished_interrupted(&self) -> anyhow::Result<usize> {
         let mut n = 0;
         for mut run in self.list_runs()? {
@@ -142,6 +232,11 @@ impl OrchStore {
     }
 }
 
+pub enum IdempotencyClaim {
+    Perform,
+    Replay(serde_json::Value),
+}
+
 fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -149,6 +244,20 @@ fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Res
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
     fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(&serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?)?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -179,13 +288,12 @@ mod tests {
             terminal_result: None,
             final_response: None,
             error_code: None,
+            aggregates: Default::default(),
         };
         store.save_run(&run).unwrap();
-        // reopen = crash recovery
         let store2 = OrchStore::open(d.path()).unwrap();
         let loaded = store2.load_run("r1").unwrap().unwrap();
         assert_eq!(loaded.state, RunState::Interrupted);
-        assert!(!matches!(loaded.state, RunState::Running));
     }
 
     #[test]
@@ -208,6 +316,7 @@ mod tests {
             terminal_result: None,
             final_response: None,
             error_code: None,
+            aggregates: Default::default(),
         };
         store.save_run(&run).unwrap();
         let clone = store.clone();
@@ -216,19 +325,27 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_roundtrip() {
+    fn idempotency_claim_exclusive() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        let r = IdempotencyReceipt {
-            request_id: "abc/def".into(),
-            payload_hash: "h".into(),
-            run_id: Some("r".into()),
-            tool: "ptah_submit_task".into(),
-            response: serde_json::json!({"ok": true}),
-            created_at: Utc::now(),
-        };
-        store.save_idempotency(&r).unwrap();
-        let loaded = store.load_idempotency("abc/def").unwrap().unwrap();
-        assert_eq!(loaded.payload_hash, "h");
+        match store.claim_idempotency("t", "req", "h").unwrap() {
+            IdempotencyClaim::Perform => {}
+            _ => panic!("first claim should perform"),
+        }
+        store
+            .complete_idempotency("t", "req", "h", None, serde_json::json!({"ok": true}))
+            .unwrap();
+        match store.claim_idempotency("t", "req", "h").unwrap() {
+            IdempotencyClaim::Replay(v) => assert_eq!(v["ok"], true),
+            _ => panic!("replay"),
+        }
+        assert!(store.claim_idempotency("t", "req", "other").is_err());
+    }
+
+    #[test]
+    fn traversal_id_rejected() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        assert!(store.claim_idempotency("t", "../x", "h").is_err());
     }
 }

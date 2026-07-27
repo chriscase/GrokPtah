@@ -16,6 +16,19 @@ pub enum RunState {
     LimitReached,
 }
 
+impl RunState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed
+                | Self::Failed
+                | Self::Cancelled
+                | Self::Interrupted
+                | Self::LimitReached
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunBounds {
@@ -32,6 +45,206 @@ impl Default for RunBounds {
             max_duration_ms: 15 * 60 * 1000,
         }
     }
+}
+
+impl RunBounds {
+    /// Validate a fully-resolved bounds object (after merge). Rejects zero.
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.max_prompt_bytes == 0 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "max_prompt_bytes must be > 0",
+            ));
+        }
+        if self.max_rounds == 0 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "max_rounds must be > 0",
+            ));
+        }
+        if self.max_duration_ms == 0 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "max_duration_ms must be > 0",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Merge caller bounds under server ceilings. Caller may only narrow.
+/// Missing fields use the ceiling. Zero / overflow rejected.
+pub fn merge_bounds(
+    ceiling: &RunBounds,
+    caller: Option<&serde_json::Value>,
+) -> Result<RunBounds, OrchError> {
+    let Some(v) = caller else {
+        ceiling.validate()?;
+        return Ok(ceiling.clone());
+    };
+    if !v.is_object() {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "bounds must be an object",
+        ));
+    }
+    let obj = v.as_object().unwrap();
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "maxPromptBytes"
+                | "max_prompt_bytes"
+                | "maxRounds"
+                | "max_rounds"
+                | "maxDurationMs"
+                | "max_duration_ms"
+        ) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                format!("unknown bounds field {key}"),
+            ));
+        }
+    }
+    let max_prompt_bytes = read_bound_usize(obj, &["maxPromptBytes", "max_prompt_bytes"])?
+        .unwrap_or(ceiling.max_prompt_bytes);
+    let max_rounds =
+        read_bound_u32(obj, &["maxRounds", "max_rounds"])?.unwrap_or(ceiling.max_rounds);
+    let max_duration_ms = read_bound_u64(obj, &["maxDurationMs", "max_duration_ms"])?
+        .unwrap_or(ceiling.max_duration_ms);
+
+    if max_prompt_bytes > ceiling.max_prompt_bytes {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "max_prompt_bytes exceeds server ceiling",
+        ));
+    }
+    if max_rounds > ceiling.max_rounds {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "max_rounds exceeds server ceiling",
+        ));
+    }
+    if max_duration_ms > ceiling.max_duration_ms {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "max_duration_ms exceeds server ceiling",
+        ));
+    }
+    let merged = RunBounds {
+        max_prompt_bytes,
+        max_rounds,
+        max_duration_ms,
+    };
+    merged.validate()?;
+    Ok(merged)
+}
+
+fn read_bound_usize(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Result<Option<usize>, OrchError> {
+    for k in keys {
+        if let Some(v) = obj.get(*k) {
+            return Ok(Some(positive_usize(v, k)?));
+        }
+    }
+    Ok(None)
+}
+
+fn read_bound_u32(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Result<Option<u32>, OrchError> {
+    for k in keys {
+        if let Some(v) = obj.get(*k) {
+            return Ok(Some(positive_u32(v, k)?));
+        }
+    }
+    Ok(None)
+}
+
+fn read_bound_u64(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Result<Option<u64>, OrchError> {
+    for k in keys {
+        if let Some(v) = obj.get(*k) {
+            return Ok(Some(positive_u64(v, k)?));
+        }
+    }
+    Ok(None)
+}
+
+fn positive_usize(v: &serde_json::Value, key: &str) -> Result<usize, OrchError> {
+    let n = v.as_u64().ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{key} must be a positive integer"),
+        )
+    })?;
+    if n == 0 || n > usize::MAX as u64 {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{key} must be > 0 and within range"),
+        ));
+    }
+    Ok(n as usize)
+}
+
+fn positive_u32(v: &serde_json::Value, key: &str) -> Result<u32, OrchError> {
+    let n = v.as_u64().ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{key} must be a positive integer"),
+        )
+    })?;
+    if n == 0 || n > u32::MAX as u64 {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{key} must be > 0 and within range"),
+        ));
+    }
+    Ok(n as u32)
+}
+
+fn positive_u64(v: &serde_json::Value, key: &str) -> Result<u64, OrchError> {
+    let n = v.as_u64().ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{key} must be a positive integer"),
+        )
+    })?;
+    if n == 0 {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{key} must be > 0"),
+        ));
+    }
+    Ok(n)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RunAggregates {
+    pub changes: Vec<ChangeRecord>,
+    pub tests: Vec<TestObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeRecord {
+    pub path: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestObservation {
+    pub call_id: String,
+    pub command: Option<String>,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub cancelled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +265,9 @@ pub struct RunRecord {
     pub terminal_result: Option<String>,
     pub final_response: Option<String>,
     pub error_code: Option<String>,
+    /// Durable per-run aggregates for journal rollover (#196 residual).
+    #[serde(default)]
+    pub aggregates: RunAggregates,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +279,13 @@ pub struct IdempotencyReceipt {
     pub tool: String,
     pub response: serde_json::Value,
     pub created_at: DateTime<Utc>,
+    /// pending | complete
+    #[serde(default = "default_receipt_status")]
+    pub status: String,
+}
+
+fn default_receipt_status() -> String {
+    "complete".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,13 +396,10 @@ pub fn reject_control_prompt(prompt: &str) -> Result<(), OrchError> {
     Ok(())
 }
 
+/// UTF-8 safe prompt preview (never slice mid-codepoint).
 pub fn prompt_preview(prompt: &str) -> String {
     let p = prompt.trim();
-    if p.len() <= 120 {
-        p.to_string()
-    } else {
-        format!("{}…", &p[..120])
-    }
+    crate::textutil::truncate_at_char_boundary(p, 120).to_string()
 }
 
 pub fn hash_payload(v: &serde_json::Value) -> String {
@@ -189,6 +409,61 @@ pub fn hash_payload(v: &serde_json::Value) -> String {
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+/// Collision-resistant, path-safe filename for request/run ids.
+pub fn safe_id_filename(id: &str) -> Result<String, OrchError> {
+    if id.is_empty() || id.len() > 256 {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "id length out of range",
+        ));
+    }
+    if id.contains("..") || id.contains('/') || id.contains('\\') || id.contains('\0') {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "id contains path separators",
+        ));
+    }
+    // Hash always — avoids sanitized-name collisions and traversal.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    id.hash(&mut h);
+    Ok(format!("{:016x}", h.finish()))
+}
+
+/// Recognized test-runner commands (not mere substring "test").
+pub fn is_recognized_test_command(command: &str) -> bool {
+    let c = command.trim();
+    let lower = c.to_ascii_lowercase();
+    // Token-aware: cargo test, npm test, npx vitest, pytest, go test, etc.
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    // strip env assignments: FOO=bar cargo test
+    let mut i = 0;
+    while i < tokens.len() && tokens[i].contains('=') && !tokens[i].starts_with('-') {
+        i += 1;
+    }
+    let rest = &tokens[i..];
+    if rest.is_empty() {
+        return false;
+    }
+    match rest[0] {
+        "cargo" => rest.get(1) == Some(&"test") || rest.get(1) == Some(&"t"),
+        "npm" | "pnpm" | "yarn" | "bun" => rest.get(1) == Some(&"test"),
+        "npx" => rest
+            .get(1)
+            .map(|t| *t == "vitest" || *t == "jest" || *t == "mocha")
+            .unwrap_or(false),
+        "pytest" | "py.test" => true,
+        "go" => rest.get(1) == Some(&"test"),
+        "python" | "python3" => rest.get(1).map(|t| t.contains("pytest")).unwrap_or(false),
+        "make" => rest.get(1) == Some(&"test"),
+        other => other == "vitest" || other == "jest",
+    }
 }
 
 /// Tools exposed by the control plane (schema snapshot source of truth).
@@ -238,5 +513,51 @@ mod tests {
         for f in FORBIDDEN_TOOLS {
             assert!(!CONTROL_TOOLS.contains(f), "{f} must not be in allowlist");
         }
+    }
+
+    #[test]
+    fn prompt_preview_utf8_safe() {
+        let s = "日".repeat(100);
+        let p = prompt_preview(&s);
+        assert!(!p.is_empty());
+        // must be valid UTF-8 (always true for String) and not panic
+        assert!(p.chars().count() <= 120);
+    }
+
+    #[test]
+    fn bounds_ceiling_reject_escalation() {
+        let ceil = RunBounds::default();
+        let bad = serde_json::json!({"maxRounds": 100});
+        assert!(merge_bounds(&ceil, Some(&bad)).is_err());
+        let zero = serde_json::json!({"maxRounds": 0});
+        assert!(merge_bounds(&ceil, Some(&zero)).is_err());
+        let ok = serde_json::json!({"maxRounds": 2, "maxDurationMs": 1000});
+        let m = merge_bounds(&ceil, Some(&ok)).unwrap();
+        assert_eq!(m.max_rounds, 2);
+        assert_eq!(m.max_duration_ms, 1000);
+    }
+
+    #[test]
+    fn test_command_classification() {
+        assert!(is_recognized_test_command("cargo test"));
+        assert!(is_recognized_test_command(
+            "FOO=1 cargo test -- --nocapture"
+        ));
+        assert!(is_recognized_test_command("npm test"));
+        assert!(is_recognized_test_command("pytest tests/"));
+        assert!(!is_recognized_test_command("echo test"));
+        assert!(!is_recognized_test_command("cat contest.txt"));
+        assert!(!is_recognized_test_command("sleep 1"));
+    }
+
+    #[test]
+    fn safe_id_rejects_traversal() {
+        assert!(safe_id_filename("../etc/passwd").is_err());
+        assert!(safe_id_filename("a/b").is_err());
+        let a = safe_id_filename("req-1").unwrap();
+        let b = safe_id_filename("req_1").unwrap();
+        // different ids → different hashes (almost always; both path-safe)
+        assert!(!a.contains('/'));
+        assert!(!b.contains(".."));
     }
 }

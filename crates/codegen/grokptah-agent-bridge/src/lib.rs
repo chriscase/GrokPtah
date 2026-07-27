@@ -29,6 +29,7 @@ mod prompt_queue;
 mod search_engine;
 mod session;
 mod session_store;
+mod spawn_env;
 mod ssrf;
 mod textutil;
 mod todo_list;
@@ -69,12 +70,14 @@ pub use mcp_control::{discovered_tool_names, start_control_server, ControlServer
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
 pub use orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState,
-    WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    is_recognized_test_command, merge_bounds, prompt_preview, OrchStore, OrchestrationConfig,
+    OrchestrationService, RunBounds, RunRecord, RunState, WorkspaceAllowlist, CONTROL_TOOLS,
+    FORBIDDEN_TOOLS,
 };
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use search_engine::{SearchHit, SearchQuery};
 pub use session::{SessionKind, SessionSummary, TranscriptEntry};
+pub use spawn_env::{scrub_std_command, scrub_tokio_command, CONTROL_SECRET_ENV_KEYS};
 pub use types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
     SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,

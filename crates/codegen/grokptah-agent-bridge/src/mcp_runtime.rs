@@ -196,12 +196,15 @@ impl McpSession {
             .command
             .as_ref()
             .ok_or_else(|| anyhow!("MCP server {} has no command", server.name))?;
-        let mut child = Command::new(cmd)
+        let mut command = Command::new(cmd);
+        command
             .args(&server.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        crate::spawn_env::scrub_tokio_command(&mut command);
+        let mut child = command
             .spawn()
             .with_context(|| format!("spawn MCP {}", server.name))?;
         let stdin = child.stdin.take().context("mcp stdin")?;

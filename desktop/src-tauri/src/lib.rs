@@ -178,10 +178,10 @@ async fn start_embedded_control(
         .unwrap_or(0);
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(list) = std::env::var("GROKPTAH_CONTROL_WORKSPACES") {
-        for part in list.split(':') {
-            let p = part.trim();
-            if !p.is_empty() {
-                roots.push(PathBuf::from(p));
+        // Platform-correct path list (':' on Unix, ';' on Windows).
+        for part in std::env::split_paths(&list) {
+            if !part.as_os_str().is_empty() {
+                roots.push(part);
             }
         }
     }

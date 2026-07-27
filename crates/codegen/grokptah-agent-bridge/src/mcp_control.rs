@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 use crate::orchestration::{
-    OrchError, OrchErrorCode, OrchestrationService, RunBounds, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    OrchError, OrchErrorCode, OrchestrationService, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 
 #[derive(Clone)]
@@ -108,6 +108,14 @@ async fn rpc_handler(
     headers: HeaderMap,
     Json(req): Json<JsonRpcReq>,
 ) -> Response {
+    // Strict JSON-RPC 2.0 version.
+    if !req.jsonrpc.is_empty() && req.jsonrpc != "2.0" {
+        return json_err(
+            req.id,
+            StatusCode::BAD_REQUEST,
+            &OrchError::new(OrchErrorCode::InvalidRequest, "jsonrpc must be \"2.0\""),
+        );
+    }
     // Loopback-only is enforced by bind; reject credentials in query (never used).
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -191,11 +199,10 @@ fn tools_list_result() -> Value {
             json!({
                 "name": name,
                 "description": format!("GrokPtah control plane tool {name}"),
-                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": true },
+                "inputSchema": tool_input_schema(name),
             })
         })
         .collect();
-    // Schema snapshot invariant: no forbidden tools
     for f in FORBIDDEN_TOOLS {
         assert!(
             !CONTROL_TOOLS.contains(f),
@@ -203,6 +210,96 @@ fn tools_list_result() -> Value {
         );
     }
     json!({ "tools": tools })
+}
+
+fn tool_input_schema(name: &str) -> Value {
+    let req_id = json!({"type": "string", "minLength": 1, "maxLength": 256});
+    let session = json!({"type": "string", "format": "uuid"});
+    let workspace = json!({"type": "string", "minLength": 1});
+    let run_id = json!({"type": "string", "minLength": 1, "maxLength": 256});
+    let bounds = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "maxPromptBytes": {"type": "integer", "minimum": 1},
+            "maxRounds": {"type": "integer", "minimum": 1, "maximum": 24},
+            "maxDurationMs": {"type": "integer", "minimum": 1}
+        }
+    });
+    match name {
+        "ptah_list_sessions" | "ptah_get_capacity" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        "ptah_get_run"
+        | "ptah_get_progress"
+        | "ptah_get_changes"
+        | "ptah_get_test_results"
+        | "ptah_get_handoff" => json!({
+            "type": "object",
+            "required": ["run_id"],
+            "additionalProperties": false,
+            "properties": { "run_id": run_id }
+        }),
+        "ptah_get_events" => json!({
+            "type": "object",
+            "required": ["run_id"],
+            "additionalProperties": false,
+            "properties": {
+                "run_id": run_id,
+                "after_seq": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500}
+            }
+        }),
+        "ptah_submit_task" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "prompt"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "prompt": {"type": "string", "minLength": 1},
+                "bounds": bounds
+            }
+        }),
+        "ptah_queue_prompt" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "prompt"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "prompt": {"type": "string", "minLength": 1},
+                "priority": {"type": "boolean"}
+            }
+        }),
+        "ptah_steer" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "text"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "text": {"type": "string", "minLength": 1}
+            }
+        }),
+        "ptah_cancel" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "run_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id
+            }
+        }),
+        _ => json!({"type": "object", "additionalProperties": false}),
+    }
 }
 
 async fn tools_call(
@@ -269,9 +366,7 @@ async fn dispatch_tool(
             let session_id = uuid_arg(args, "session_id")?;
             let workspace = PathBuf::from(str_arg(args, "workspace")?);
             let prompt = str_arg(args, "prompt")?.to_string();
-            let bounds = args
-                .get("bounds")
-                .and_then(|v| serde_json::from_value::<RunBounds>(v.clone()).ok());
+            let bounds = args.get("bounds").cloned();
             orch.submit_task(auth, &request_id, session_id, &workspace, prompt, bounds)
                 .await
         }
@@ -328,7 +423,7 @@ pub fn discovered_tool_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::host::{AgentHost, HostConfig};
-    use crate::orchestration::{OrchStore, OrchestrationConfig, WorkspaceAllowlist};
+    use crate::orchestration::{OrchStore, OrchestrationConfig, RunBounds, WorkspaceAllowlist};
     use crate::set_grokptah_home_override;
     use tempfile::tempdir;
 

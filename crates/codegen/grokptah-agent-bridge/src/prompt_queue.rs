@@ -94,13 +94,25 @@ impl SessionPromptQueue {
         self.queued.iter().cloned().collect()
     }
 
+    #[allow(dead_code)]
     pub fn add(
         &mut self,
         text: impl Into<String>,
         source: impl Into<String>,
         priority: bool,
     ) -> Result<PromptQueueEntry> {
-        let entry = PromptQueueEntry::new(text, source, priority)?;
+        self.add_with_owner(text, source, priority, Some("desktop".into()))
+    }
+
+    pub fn add_with_owner(
+        &mut self,
+        text: impl Into<String>,
+        source: impl Into<String>,
+        priority: bool,
+        owner: Option<String>,
+    ) -> Result<PromptQueueEntry> {
+        let mut entry = PromptQueueEntry::new(text, source, priority)?;
+        entry.owner = owner;
         if priority {
             self.queued.push_front(entry.clone());
         } else {

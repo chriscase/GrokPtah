@@ -8,12 +8,12 @@ use parking_lot::Mutex;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::event_bus::{EventBus, JournalPage};
+use crate::event_bus::{CursorExpiredError, EventBus};
 use crate::host::AgentHostHandle;
 use crate::session::SessionKind;
 
 use super::authz::{require_workspace_match, AuthContext, WorkspaceAllowlist};
-use super::store::OrchStore;
+use super::store::{IdempotencyClaim, OrchStore};
 use super::types::*;
 
 #[derive(Clone)]
@@ -40,8 +40,9 @@ pub struct OrchestrationService {
     bus: EventBus,
     store: OrchStore,
     config: Mutex<OrchestrationConfig>,
-    /// Active run_ids currently executing (capacity).
     active: Arc<Mutex<Vec<String>>>,
+    /// Join handles for in-flight runs (prevents forget + unbounded leaks).
+    join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl OrchestrationService {
@@ -57,6 +58,7 @@ impl OrchestrationService {
             store,
             config: Mutex::new(config),
             active: Arc::new(Mutex::new(Vec::new())),
+            join_handles: Mutex::new(Vec::new()),
         })
     }
 
@@ -78,7 +80,19 @@ impl OrchestrationService {
 
     pub fn auth_header(&self, header: Option<&str>) -> Result<AuthContext, OrchError> {
         let tok = self.config.lock().bearer_token.clone();
-        super::authz::require_bearer(header, &tok)
+        let res = super::authz::require_bearer(header, &tok);
+        if let Err(ref e) = res {
+            self.audit(
+                "auth",
+                None,
+                None,
+                None,
+                "rejected",
+                Some(e.code.as_str()),
+                "auth failed",
+            );
+        }
+        res
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -100,87 +114,30 @@ impl OrchestrationService {
             workspace: workspace.map(str::to_string),
             outcome: outcome.into(),
             error_code: error_code.map(str::to_string),
-            detail: detail.chars().take(500).collect(),
+            detail: crate::textutil::truncate_at_char_boundary(detail, 500).to_string(),
         };
         let _ = self.store.append_audit(&entry);
     }
 
-    fn check_idempotency(
+    fn audit_err(
         &self,
         tool: &str,
-        request_id: &str,
-        payload: &serde_json::Value,
-    ) -> Result<Option<serde_json::Value>, OrchError> {
-        let hash = hash_payload(payload);
-        match self.store.load_idempotency(request_id) {
-            Ok(Some(prev)) => {
-                if prev.payload_hash != hash || prev.tool != tool {
-                    return Err(OrchError::new(
-                        OrchErrorCode::Conflict,
-                        "request_id reused with different payload",
-                    ));
-                }
-                Ok(Some(prev.response))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(OrchError::new(OrchErrorCode::Internal, e.to_string())),
-        }
+        request_id: Option<&str>,
+        session_id: Option<Uuid>,
+        workspace: Option<&str>,
+        e: &OrchError,
+    ) {
+        self.audit(
+            tool,
+            request_id,
+            session_id,
+            workspace,
+            "rejected",
+            Some(e.code.as_str()),
+            &e.message,
+        );
     }
 
-    fn save_idempotency(
-        &self,
-        tool: &str,
-        request_id: &str,
-        payload: &serde_json::Value,
-        run_id: Option<String>,
-        response: serde_json::Value,
-    ) -> Result<(), OrchError> {
-        let receipt = IdempotencyReceipt {
-            request_id: request_id.into(),
-            payload_hash: hash_payload(payload),
-            run_id,
-            tool: tool.into(),
-            response,
-            created_at: Utc::now(),
-        };
-        self.store
-            .save_idempotency(&receipt)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
-    }
-
-    // ── reads ──────────────────────────────────────────────────────────
-
-    pub fn list_sessions(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
-        let sessions = self.host.list_sessions_by_kind(SessionKind::Build, false);
-        let rows: Vec<serde_json::Value> = sessions
-            .into_iter()
-            .map(|s| {
-                json!({
-                    "sessionId": s.id,
-                    "title": s.title,
-                    "kind": "build",
-                    "cwd": s.cwd,
-                    "updatedAt": s.updated_at,
-                    "busy": false,
-                })
-            })
-            .collect();
-        Ok(json!({ "sessions": rows }))
-    }
-
-    pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
-        // Lock order: config → active (never nest the other way).
-        let max = self.config.lock().max_concurrent_runs;
-        let active = self.active.lock().len();
-        Ok(json!({
-            "maxConcurrentRuns": max,
-            "activeRuns": active,
-            "available": max.saturating_sub(active),
-        }))
-    }
-
-    /// Atomically reserve a capacity slot for `run_id`.
-    /// Lock order matches [`get_capacity`]: config (read+release) then active.
     fn try_reserve_capacity(&self, run_id: &str) -> Result<(), OrchError> {
         let max = self.config.lock().max_concurrent_runs;
         let mut active = self.active.lock();
@@ -198,16 +155,91 @@ impl OrchestrationService {
         self.active.lock().retain(|id| id != run_id);
     }
 
-    pub fn get_run(
-        &self,
-        _auth: &AuthContext,
-        run_id: &str,
-    ) -> Result<serde_json::Value, OrchError> {
+    fn reaping_handles(&self) {
+        let mut h = self.join_handles.lock();
+        h.retain(|j| !j.is_finished());
+    }
+
+    /// Load run and verify workspace ownership against allowlist + session.
+    fn load_authorized_run(&self, run_id: &str) -> Result<RunRecord, OrchError> {
+        if safe_id_filename(run_id).is_err() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "malformed run_id",
+            ));
+        }
         let run = self
             .store
             .load_run(run_id)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
+        let allowlist = self.config.lock().allowlist.clone();
+        let ws = PathBuf::from(&run.workspace);
+        if !allowlist.contains(&ws) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "run workspace not authorized",
+            ));
+        }
+        // Session must still match claimed workspace when present.
+        if let Ok(session) = self.host.session_load(run.session_id) {
+            if !session.cwd.is_empty() {
+                let _ = require_workspace_match(&allowlist, Some(Path::new(&session.cwd)), &ws)
+                    .map_err(|_| {
+                        OrchError::new(
+                            OrchErrorCode::ForbiddenScope,
+                            "run session workspace mismatch",
+                        )
+                    })?;
+            }
+        }
+        Ok(run)
+    }
+
+    // ── reads ──────────────────────────────────────────────────────────
+
+    pub fn list_sessions(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+        let allowlist = self.config.lock().allowlist.clone();
+        let sessions = self.host.list_sessions_by_kind(SessionKind::Build, false);
+        let rows: Vec<serde_json::Value> = sessions
+            .into_iter()
+            .filter(|s| {
+                if s.cwd.is_empty() {
+                    return false;
+                }
+                allowlist.contains(Path::new(&s.cwd))
+            })
+            .map(|s| {
+                let busy = self.host.session_busy(s.id);
+                json!({
+                    "sessionId": s.id,
+                    "title": s.title,
+                    "kind": "build",
+                    "cwd": s.cwd,
+                    "updatedAt": s.updated_at,
+                    "busy": busy,
+                })
+            })
+            .collect();
+        Ok(json!({ "sessions": rows }))
+    }
+
+    pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+        let max = self.config.lock().max_concurrent_runs;
+        let active = self.active.lock().len();
+        Ok(json!({
+            "maxConcurrentRuns": max,
+            "activeRuns": active,
+            "available": max.saturating_sub(active),
+        }))
+    }
+
+    pub fn get_run(
+        &self,
+        _auth: &AuthContext,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let run = self.load_authorized_run(run_id)?;
         serde_json::to_value(run)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
@@ -217,11 +249,7 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self
-            .store
-            .load_run(run_id)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
+        let run = self.load_authorized_run(run_id)?;
         let busy = self.host.session_busy(run.session_id);
         Ok(json!({
             "runId": run.run_id,
@@ -241,17 +269,20 @@ impl OrchestrationService {
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
+        // run_id is required — never fall back to the global journal.
+        let rid = run_id.ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "run_id is required for get_events",
+            )
+        })?;
+        let run = self.load_authorized_run(rid)?;
         let mut page = self.bus.read_after(after_seq, limit);
-        if let Some(rid) = run_id {
-            if let Ok(Some(run)) = self.store.load_run(rid) {
-                page.entries.retain(|e| {
-                    let sid = session_id_of(&e.update);
-                    sid == Some(run.session_id)
-                        && run.start_seq.map(|s| e.seq >= s).unwrap_or(true)
-                        && run.end_seq.map(|s| e.seq <= s).unwrap_or(true)
-                });
-            }
-        }
+        page.entries.retain(|e| {
+            session_id_of(&e.update) == Some(run.session_id)
+                && run.start_seq.map(|s| e.seq >= s).unwrap_or(true)
+                && run.end_seq.map(|s| e.seq <= s).unwrap_or(true)
+        });
         if page.cursor_expired {
             return Err(OrchError::new(
                 OrchErrorCode::CursorExpired,
@@ -270,16 +301,21 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self
-            .store
-            .load_run(run_id)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
-        let page = self.scoped_events(&run);
-        let mut paths = Vec::new();
-        for e in page.entries {
-            if let crate::events::SessionUpdate::FileEdit { path, summary, .. } = e.update {
-                paths.push(json!({ "path": path, "summary": summary }));
+        let run = self.load_authorized_run(run_id)?;
+        // Prefer durable aggregates (survive journal rollover).
+        let mut paths: Vec<serde_json::Value> = run
+            .aggregates
+            .changes
+            .iter()
+            .map(|c| json!({ "path": c.path, "summary": c.summary }))
+            .collect();
+        if let Ok(entries) = self.scoped_events_complete(&run) {
+            for e in entries {
+                if let crate::events::SessionUpdate::FileEdit { path, summary, .. } = e.update {
+                    if !paths.iter().any(|p| p["path"] == path) {
+                        paths.push(json!({ "path": path, "summary": summary }));
+                    }
+                }
             }
         }
         Ok(json!({ "runId": run_id, "changes": paths }))
@@ -290,46 +326,57 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self
-            .store
-            .load_run(run_id)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
-        let page = self.scoped_events(&run);
-        let mut observed = Vec::new();
-        for e in page.entries {
-            match e.update {
-                crate::events::SessionUpdate::ShellSessionStarted {
-                    command, call_id, ..
-                } => {
-                    if command.to_ascii_lowercase().contains("test")
-                        || command.contains("cargo test")
-                        || command.contains("npm test")
-                        || command.contains("pytest")
-                    {
-                        observed.push(json!({
-                            "callId": call_id,
-                            "command": command,
-                            "status": "started",
-                        }));
+        let run = self.load_authorized_run(run_id)?;
+        let mut by_id: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        // Seed from durable aggregates.
+        for t in &run.aggregates.tests {
+            by_id.insert(
+                t.call_id.clone(),
+                json!({
+                    "callId": t.call_id,
+                    "command": t.command,
+                    "status": t.status,
+                    "exitCode": t.exit_code,
+                    "cancelled": t.cancelled,
+                }),
+            );
+        }
+        if let Ok(entries) = self.scoped_events_complete(&run) {
+            for e in entries {
+                match e.update {
+                    crate::events::SessionUpdate::ShellSessionStarted {
+                        command, call_id, ..
+                    } => {
+                        if is_recognized_test_command(&command) {
+                            by_id.insert(
+                                call_id.clone(),
+                                json!({
+                                    "callId": call_id,
+                                    "command": command,
+                                    "status": "started",
+                                }),
+                            );
+                        }
                     }
+                    crate::events::SessionUpdate::ShellSessionEnded {
+                        call_id,
+                        exit_code,
+                        cancelled,
+                        ..
+                    } => {
+                        if let Some(prev) = by_id.get_mut(&call_id) {
+                            prev["status"] = json!("ended");
+                            prev["exitCode"] = json!(exit_code);
+                            prev["cancelled"] = json!(cancelled);
+                        }
+                        // Do NOT record non-test shell ends.
+                    }
+                    _ => {}
                 }
-                crate::events::SessionUpdate::ShellSessionEnded {
-                    call_id,
-                    exit_code,
-                    cancelled,
-                    ..
-                } => {
-                    observed.push(json!({
-                        "callId": call_id,
-                        "exitCode": exit_code,
-                        "cancelled": cancelled,
-                        "status": "ended",
-                    }));
-                }
-                _ => {}
             }
         }
+        let observed: Vec<_> = by_id.into_values().collect();
         if observed.is_empty() {
             Ok(json!({
                 "runId": run_id,
@@ -350,11 +397,7 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self
-            .store
-            .load_run(run_id)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
+        let run = self.load_authorized_run(run_id)?;
         Ok(json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
@@ -363,17 +406,43 @@ impl OrchestrationService {
             "terminalResult": run.terminal_result,
             "startSeq": run.start_seq,
             "endSeq": run.end_seq,
+            "changes": run.aggregates.changes,
+            "tests": run.aggregates.tests,
         }))
     }
 
-    fn scoped_events(&self, run: &RunRecord) -> JournalPage {
+    fn scoped_events_complete(
+        &self,
+        run: &RunRecord,
+    ) -> Result<Vec<crate::event_bus::JournalEntry>, OrchError> {
         let after = run.start_seq.map(|s| s.saturating_sub(1)).unwrap_or(0);
-        let mut page = self.bus.read_after(after, 500);
-        page.entries.retain(|e| {
-            session_id_of(&e.update) == Some(run.session_id)
-                && run.end_seq.map(|end| e.seq <= end).unwrap_or(true)
-        });
-        page
+        match self
+            .bus
+            .read_range_all(after, run.end_seq, Some(run.session_id))
+        {
+            Ok(v) => Ok(v),
+            Err(CursorExpiredError) => Err(OrchError::new(
+                OrchErrorCode::CursorExpired,
+                "event cursor expired for run range",
+            )),
+        }
+    }
+
+    fn require_build_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<crate::session::SessionSummary, OrchError> {
+        let session = self
+            .host
+            .session_load(session_id)
+            .map_err(|_| OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"))?;
+        if session.kind != SessionKind::Build {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "only Build sessions are controllable in this slice",
+            ));
+        }
+        Ok(session)
     }
 
     // ── mutations ──────────────────────────────────────────────────────
@@ -385,76 +454,84 @@ impl OrchestrationService {
         session_id: Uuid,
         workspace: &Path,
         prompt: String,
-        bounds: Option<RunBounds>,
+        bounds_json: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
+        let tool = "ptah_submit_task";
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
             "prompt": prompt,
-            "bounds": bounds,
+            "bounds": bounds_json,
         });
-        if let Some(prev) = self.check_idempotency("ptah_submit_task", request_id, &payload)? {
-            return Ok(prev);
+        let phash = hash_payload(&payload);
+
+        match self.store.claim_idempotency(tool, request_id, &phash) {
+            Ok(IdempotencyClaim::Replay(prev)) => return Ok(prev),
+            Ok(IdempotencyClaim::Perform) => {}
+            Err(e) => {
+                self.audit_err(tool, Some(request_id), Some(session_id), None, &e);
+                return Err(e);
+            }
         }
-        reject_control_prompt(&prompt)?;
-        let bounds = bounds.unwrap_or_else(|| self.config.lock().bounds.clone());
-        if prompt.len() > bounds.max_prompt_bytes {
-            self.audit(
-                "ptah_submit_task",
+
+        let finish_err = |svc: &Self, e: OrchError| -> OrchError {
+            svc.audit_err(
+                tool,
                 Some(request_id),
                 Some(session_id),
                 Some(&workspace.display().to_string()),
-                "rejected",
-                Some("invalid_request"),
-                "prompt too large",
+                &e,
             );
-            return Err(OrchError::new(
+            e
+        };
+
+        if let Err(e) = reject_control_prompt(&prompt) {
+            return Err(finish_err(self, e));
+        }
+        let ceiling = self.config.lock().bounds.clone();
+        let bounds = match merge_bounds(&ceiling, bounds_json.as_ref()) {
+            Ok(b) => b,
+            Err(e) => return Err(finish_err(self, e)),
+        };
+        if prompt.len() > bounds.max_prompt_bytes {
+            let e = OrchError::new(
                 OrchErrorCode::InvalidRequest,
                 format!(
                     "prompt exceeds max_prompt_bytes ({})",
                     bounds.max_prompt_bytes
                 ),
-            ));
+            );
+            return Err(finish_err(self, e));
         }
 
-        let session = self
-            .host
-            .session_load(session_id)
-            .map_err(|_| OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"))?;
-        if session.kind != SessionKind::Build {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "only Build sessions are controllable in this slice",
-            ));
-        }
+        let session = match self.require_build_session(session_id) {
+            Ok(s) => s,
+            Err(e) => return Err(finish_err(self, e)),
+        };
         let cwd = if session.cwd.is_empty() {
             None
         } else {
             Some(PathBuf::from(&session.cwd))
         };
         let allowlist = self.config.lock().allowlist.clone();
-        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        let claimed = match require_workspace_match(&allowlist, cwd.as_deref(), workspace) {
+            Ok(c) => c,
+            Err(e) => return Err(finish_err(self, e)),
+        };
 
         if self.host.session_busy(session_id) {
-            self.audit(
-                "ptah_submit_task",
-                Some(request_id),
-                Some(session_id),
-                Some(&claimed.display().to_string()),
-                "rejected",
-                Some("session_busy"),
-                "session busy",
-            );
-            return Err(OrchError::new(
+            let e = OrchError::new(
                 OrchErrorCode::SessionBusy,
                 "session already has an active turn",
-            ));
+            );
+            return Err(finish_err(self, e));
         }
 
-        // Generate id, then reserve capacity (config→active) before durable IO.
         let run_id = Uuid::new_v4().to_string();
-        self.try_reserve_capacity(&run_id)?;
+        if let Err(e) = self.try_reserve_capacity(&run_id) {
+            return Err(finish_err(self, e));
+        }
 
         let start_seq = self.bus.current_seq().saturating_add(1);
         let run = RunRecord {
@@ -473,14 +550,15 @@ impl OrchestrationService {
             terminal_result: None,
             final_response: None,
             error_code: None,
+            aggregates: RunAggregates::default(),
         };
         if let Err(e) = self.store.save_run(&run) {
             self.release_capacity(&run_id);
-            return Err(OrchError::new(OrchErrorCode::Internal, e.to_string()));
+            let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
+            return Err(finish_err(self, e));
         }
 
         let host = self.host.clone();
-        // Clone the in-process store handle — never re-open (open() is crash recovery).
         let store = self.store.clone();
         let bus = self.bus.clone();
         let active_slot = self.active.clone();
@@ -490,18 +568,23 @@ impl OrchestrationService {
         let max_rounds = bounds.max_rounds;
 
         let join = tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_millis(max_ms.max(1)),
-                host.session_prompt_with_max_rounds(
-                    session_id,
-                    prompt_owned,
-                    Some(max_rounds.max(1)),
-                ),
-            )
-            .await;
+            let prompt_fut = host.session_prompt_with_max_rounds(
+                session_id,
+                prompt_owned,
+                Some(max_rounds.max(1)),
+            );
+            let result =
+                tokio::time::timeout(std::time::Duration::from_millis(max_ms.max(1)), prompt_fut)
+                    .await;
+
+            let timed_out = result.is_err();
+            if timed_out {
+                // Cancel turn, kill shells/subagents, and await teardown.
+                let _ = host.cancel_turn_and_await(Some(session_id)).await;
+            }
+
             let end_seq = bus.current_seq();
             if let Ok(Some(mut r)) = store.load_run(&rid) {
-                // Cancel/interrupt from another path wins over late worker completion.
                 if matches!(r.state, RunState::Cancelled | RunState::Interrupted) {
                     r.end_seq = r.end_seq.or(Some(end_seq));
                     r.updated_at = Utc::now();
@@ -511,10 +594,50 @@ impl OrchestrationService {
                 }
                 r.end_seq = Some(end_seq);
                 r.updated_at = Utc::now();
+                // Collect aggregates from events before they roll off.
+                if let Ok(entries) = bus.read_range_all(
+                    r.start_seq.map(|s| s.saturating_sub(1)).unwrap_or(0),
+                    Some(end_seq),
+                    Some(session_id),
+                ) {
+                    for e in entries {
+                        match e.update {
+                            crate::events::SessionUpdate::FileEdit { path, summary, .. } => {
+                                r.aggregates.changes.push(ChangeRecord { path, summary });
+                            }
+                            crate::events::SessionUpdate::ShellSessionStarted {
+                                command,
+                                call_id,
+                                ..
+                            } if is_recognized_test_command(&command) => {
+                                r.aggregates.tests.push(TestObservation {
+                                    call_id,
+                                    command: Some(command),
+                                    status: "started".into(),
+                                    exit_code: None,
+                                    cancelled: None,
+                                });
+                            }
+                            crate::events::SessionUpdate::ShellSessionEnded {
+                                call_id,
+                                exit_code,
+                                cancelled,
+                                ..
+                            } => {
+                                if let Some(t) =
+                                    r.aggregates.tests.iter_mut().find(|t| t.call_id == call_id)
+                                {
+                                    t.status = "ended".into();
+                                    t.exit_code = exit_code;
+                                    t.cancelled = Some(cancelled);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 match result {
                     Ok(Ok(text)) => {
-                        // Coding / offline simulate path surfaces round exhaustion
-                        // via the shared stop message (#196).
                         if crate::host_helpers::is_round_limit_stop_message(&text) {
                             r.state = RunState::LimitReached;
                             r.terminal_result = Some("limit_reached".into());
@@ -523,16 +646,20 @@ impl OrchestrationService {
                             r.state = RunState::Completed;
                             r.terminal_result = Some("completed".into());
                         }
-                        r.final_response = Some(text.chars().take(8_000).collect());
+                        r.final_response = Some(
+                            crate::textutil::truncate_at_char_boundary(&text, 8_000).to_string(),
+                        );
                     }
                     Ok(Err(e)) => {
                         r.state = RunState::Failed;
                         r.terminal_result = Some("failed".into());
                         r.error_code = Some("internal".into());
-                        r.final_response = Some(e.to_string().chars().take(2_000).collect());
+                        r.final_response = Some(
+                            crate::textutil::truncate_at_char_boundary(&e.to_string(), 2_000)
+                                .to_string(),
+                        );
                     }
                     Err(_) => {
-                        let _ = host.cancel_turn(Some(session_id));
                         r.state = RunState::LimitReached;
                         r.terminal_result = Some("limit_reached".into());
                         r.error_code = Some("limit_reached".into());
@@ -542,9 +669,8 @@ impl OrchestrationService {
             }
             active_slot.lock().retain(|id| id != &rid);
         });
-        // Don't await full completion for the RPC response — return running receipt.
-        // Drop join handle intentionally (process-local); tests can poll get_run.
-        std::mem::forget(join);
+        self.reaping_handles();
+        self.join_handles.lock().push(join);
 
         let response = json!({
             "runId": run_id,
@@ -552,15 +678,25 @@ impl OrchestrationService {
             "state": RunState::Running,
             "requestId": request_id,
         });
-        self.save_idempotency(
-            "ptah_submit_task",
+        if let Err(e) = self.store.complete_idempotency(
+            tool,
             request_id,
-            &payload,
-            Some(run_id),
+            &phash,
+            Some(run_id.clone()),
             response.clone(),
-        )?;
+        ) {
+            // Action already started — still surface error; retry should replay if claim remains.
+            self.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&claimed.display().to_string()),
+                &e,
+            );
+            return Err(e);
+        }
         self.audit(
-            "ptah_submit_task",
+            tool,
             Some(request_id),
             Some(session_id),
             Some(&claimed.display().to_string()),
@@ -568,7 +704,6 @@ impl OrchestrationService {
             None,
             "run started",
         );
-        let _ = run;
         Ok(response)
     }
 
@@ -582,45 +717,73 @@ impl OrchestrationService {
         priority: bool,
     ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
+        let tool = "ptah_queue_prompt";
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
             "prompt": prompt,
             "priority": priority,
         });
-        if let Some(prev) = self.check_idempotency("ptah_queue_prompt", request_id, &payload)? {
-            return Ok(prev);
+        let phash = hash_payload(&payload);
+        match self.store.claim_idempotency(tool, request_id, &phash) {
+            Ok(IdempotencyClaim::Replay(prev)) => return Ok(prev),
+            Ok(IdempotencyClaim::Perform) => {}
+            Err(e) => {
+                self.audit_err(tool, Some(request_id), Some(session_id), None, &e);
+                return Err(e);
+            }
         }
-        reject_control_prompt(&prompt)?;
-        let session = self
-            .host
-            .session_load(session_id)
-            .map_err(|_| OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"))?;
+        let fail = |svc: &Self, e: OrchError| {
+            svc.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&workspace.display().to_string()),
+                &e,
+            );
+            e
+        };
+        if let Err(e) = reject_control_prompt(&prompt) {
+            return Err(fail(self, e));
+        }
+        if let Err(e) = self.require_build_session(session_id) {
+            return Err(fail(self, e));
+        }
+        let session = self.host.session_load(session_id).unwrap();
         let cwd = if session.cwd.is_empty() {
             None
         } else {
             Some(PathBuf::from(&session.cwd))
         };
         let allowlist = self.config.lock().allowlist.clone();
-        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
-        let entries = self
-            .host
-            .session_queue_add(session_id, prompt, priority)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        let claimed = match require_workspace_match(&allowlist, cwd.as_deref(), workspace) {
+            Ok(c) => c,
+            Err(e) => return Err(fail(self, e)),
+        };
+        let entries = match self.host.session_queue_add_with_source(
+            session_id,
+            prompt,
+            priority,
+            "control",
+            Some("mcp".into()),
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                return Err(fail(
+                    self,
+                    OrchError::new(OrchErrorCode::Internal, e.to_string()),
+                ));
+            }
+        };
         let response = json!({
             "requestId": request_id,
             "sessionId": session_id,
             "entries": entries,
         });
-        self.save_idempotency(
-            "ptah_queue_prompt",
-            request_id,
-            &payload,
-            None,
-            response.clone(),
-        )?;
+        self.store
+            .complete_idempotency(tool, request_id, &phash, None, response.clone())?;
         self.audit(
-            "ptah_queue_prompt",
+            tool,
             Some(request_id),
             Some(session_id),
             Some(&claimed.display().to_string()),
@@ -640,30 +803,57 @@ impl OrchestrationService {
         text: String,
     ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
+        let tool = "ptah_steer";
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
             "text": text,
         });
-        if let Some(prev) = self.check_idempotency("ptah_steer", request_id, &payload)? {
-            return Ok(prev);
+        let phash = hash_payload(&payload);
+        match self.store.claim_idempotency(tool, request_id, &phash) {
+            Ok(IdempotencyClaim::Replay(prev)) => return Ok(prev),
+            Ok(IdempotencyClaim::Perform) => {}
+            Err(e) => {
+                self.audit_err(tool, Some(request_id), Some(session_id), None, &e);
+                return Err(e);
+            }
         }
-        reject_control_prompt(&text)?;
-        let session = self
-            .host
-            .session_load(session_id)
-            .map_err(|_| OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"))?;
+        let fail = |svc: &Self, e: OrchError| {
+            svc.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&workspace.display().to_string()),
+                &e,
+            );
+            e
+        };
+        if let Err(e) = reject_control_prompt(&text) {
+            return Err(fail(self, e));
+        }
+        if let Err(e) = self.require_build_session(session_id) {
+            return Err(fail(self, e));
+        }
+        let session = self.host.session_load(session_id).unwrap();
         let cwd = if session.cwd.is_empty() {
             None
         } else {
             Some(PathBuf::from(&session.cwd))
         };
         let allowlist = self.config.lock().allowlist.clone();
-        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
-        let receipt = self
-            .host
-            .session_steer(session_id, text)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        let claimed = match require_workspace_match(&allowlist, cwd.as_deref(), workspace) {
+            Ok(c) => c,
+            Err(e) => return Err(fail(self, e)),
+        };
+        let receipt = match self.host.session_steer(session_id, text) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(fail(
+                    self,
+                    OrchError::new(OrchErrorCode::Internal, e.to_string()),
+                ));
+            }
+        };
         let response = json!({
             "requestId": request_id,
             "sessionId": session_id,
@@ -671,9 +861,10 @@ impl OrchestrationService {
             "entry": receipt.entry,
             "entries": receipt.entries,
         });
-        self.save_idempotency("ptah_steer", request_id, &payload, None, response.clone())?;
+        self.store
+            .complete_idempotency(tool, request_id, &phash, None, response.clone())?;
         self.audit(
-            "ptah_steer",
+            tool,
             Some(request_id),
             Some(session_id),
             Some(&claimed.display().to_string()),
@@ -693,58 +884,162 @@ impl OrchestrationService {
         run_id: Option<&str>,
     ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
+        let tool = "ptah_cancel";
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
             "runId": run_id,
         });
-        if let Some(prev) = self.check_idempotency("ptah_cancel", request_id, &payload)? {
-            return Ok(prev);
+        let phash = hash_payload(&payload);
+        match self.store.claim_idempotency(tool, request_id, &phash) {
+            Ok(IdempotencyClaim::Replay(prev)) => return Ok(prev),
+            Ok(IdempotencyClaim::Perform) => {}
+            Err(e) => {
+                self.audit_err(tool, Some(request_id), Some(session_id), None, &e);
+                return Err(e);
+            }
         }
-        let session = self
-            .host
-            .session_load(session_id)
-            .map_err(|_| OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"))?;
+        let fail = |svc: &Self, e: OrchError| {
+            svc.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&workspace.display().to_string()),
+                &e,
+            );
+            e
+        };
+
+        let rid = match run_id {
+            Some(r) if !r.is_empty() => r,
+            _ => {
+                return Err(fail(
+                    self,
+                    OrchError::new(
+                        OrchErrorCode::InvalidRequest,
+                        "run_id is required for cancel",
+                    ),
+                ));
+            }
+        };
+
+        let mut run = match self.store.load_run(rid) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return Err(fail(
+                    self,
+                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"),
+                ));
+            }
+            Err(e) => {
+                return Err(fail(
+                    self,
+                    OrchError::new(OrchErrorCode::Internal, e.to_string()),
+                ));
+            }
+        };
+
+        if run.session_id != session_id {
+            return Err(fail(
+                self,
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "run_id does not belong to session",
+                ),
+            ));
+        }
+        if run.state.is_terminal() {
+            return Err(fail(
+                self,
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    format!("run already terminal ({:?})", run.state),
+                ),
+            ));
+        }
+
+        let session = match self.host.session_load(session_id) {
+            Ok(s) => s,
+            Err(_) => {
+                return Err(fail(
+                    self,
+                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"),
+                ));
+            }
+        };
         let cwd = if session.cwd.is_empty() {
             None
         } else {
             Some(PathBuf::from(&session.cwd))
         };
         let allowlist = self.config.lock().allowlist.clone();
-        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
-        let cancelled = self.host.cancel_turn(Some(session_id)).is_ok();
-        if let Some(rid) = run_id {
-            if let Ok(Some(mut run)) = self.store.load_run(rid) {
-                if run.session_id == session_id {
-                    run.state = RunState::Cancelled;
-                    run.updated_at = Utc::now();
-                    run.end_seq = Some(self.bus.current_seq());
-                    run.terminal_result = Some("cancelled".into());
-                    let _ = self.store.save_run(&run);
-                }
-            }
+        let claimed = match require_workspace_match(&allowlist, cwd.as_deref(), workspace) {
+            Ok(c) => c,
+            Err(e) => return Err(fail(self, e)),
+        };
+        // Workspace must match the run record as well.
+        if claimed.display().to_string() != run.workspace
+            && canonical_cmp(&claimed, Path::new(&run.workspace)).is_err()
+        {
+            return Err(fail(
+                self,
+                OrchError::new(
+                    OrchErrorCode::WorkspaceMismatch,
+                    "workspace does not match run",
+                ),
+            ));
         }
-        self.active.lock().retain(|id| Some(id.as_str()) != run_id);
+
+        // Persist cancelled BEFORE signalling cancel so late workers cannot complete.
+        run.state = RunState::Cancelled;
+        run.updated_at = Utc::now();
+        run.end_seq = Some(self.bus.current_seq());
+        run.terminal_result = Some("cancelled".into());
+        if let Err(e) = self.store.save_run(&run) {
+            return Err(fail(
+                self,
+                OrchError::new(OrchErrorCode::Internal, e.to_string()),
+            ));
+        }
+
+        let cancelled = self.host.cancel_turn(Some(session_id)).is_ok();
+        // Only release this run's capacity.
+        self.release_capacity(rid);
+
         let response = json!({
             "requestId": request_id,
             "sessionId": session_id,
+            "runId": rid,
             "cancelled": cancelled,
+            "state": RunState::Cancelled,
         });
-        self.save_idempotency("ptah_cancel", request_id, &payload, None, response.clone())?;
+        self.store.complete_idempotency(
+            tool,
+            request_id,
+            &phash,
+            Some(rid.into()),
+            response.clone(),
+        )?;
         self.audit(
-            "ptah_cancel",
+            tool,
             Some(request_id),
             Some(session_id),
             Some(&claimed.display().to_string()),
             "accepted",
             None,
-            if cancelled {
-                "cancelled"
-            } else {
-                "no active turn"
-            },
+            "cancelled",
         );
         Ok(response)
+    }
+}
+
+fn canonical_cmp(a: &Path, b: &Path) -> Result<(), ()> {
+    let ca = dunce::canonicalize(a).map_err(|_| ())?;
+    let cb = dunce::canonicalize(b).map_err(|_| ())?;
+    if ca == cb {
+        Ok(())
+    } else {
+        Err(())
     }
 }
 

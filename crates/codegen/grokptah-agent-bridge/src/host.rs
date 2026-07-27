@@ -167,7 +167,17 @@ impl Drop for TurnBusyGuard {
                 .or_default()
                 .defer_pending_steering();
         }
-        self.host.persist_prompt_queue(self.session_id);
+        let _ = self.host.persist_prompt_queue(self.session_id);
+    }
+}
+
+async fn kill_shells(live_shells: local_tools::LiveShellMap, kill_ids: Vec<Uuid>) {
+    let mut map = live_shells.lock().await;
+    for id in kill_ids {
+        if let Some(mut child) = map.remove(&id) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
     }
 }
 
@@ -1740,6 +1750,7 @@ impl AgentHostHandle {
                     }
                     command.stdout(std::process::Stdio::piped());
                     command.stderr(std::process::Stdio::piped());
+                    crate::spawn_env::scrub_tokio_command(&mut command);
                     let mut child = command.spawn().map_err(|e| e.to_string())?;
                     let mut stdout = child.stdout.take();
                     let mut stderr = child.stderr.take();
@@ -2320,16 +2331,34 @@ impl AgentHostHandle {
         text: String,
         priority: bool,
     ) -> Result<Vec<PromptQueueEntry>> {
+        self.session_queue_add_with_source(
+            session_id,
+            text,
+            priority,
+            "composer",
+            Some("desktop".into()),
+        )
+    }
+
+    /// Queue with explicit source/owner metadata (MCP control uses `control` / `mcp`).
+    pub fn session_queue_add_with_source(
+        &self,
+        session_id: Uuid,
+        text: String,
+        priority: bool,
+        source: &str,
+        owner: Option<String>,
+    ) -> Result<Vec<PromptQueueEntry>> {
         let list = {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&session_id) {
                 bail!("unknown session");
             }
             let queue = g.prompt_queues.entry(session_id).or_default();
-            queue.add(text, "composer", priority)?;
+            queue.add_with_owner(text, source, priority, owner)?;
             queue.list()
         };
-        self.persist_prompt_queue(session_id);
+        self.persist_prompt_queue(session_id)?;
         Ok(list)
     }
 
@@ -2349,7 +2378,7 @@ impl AgentHostHandle {
             queue.edit(entry_id, version, text)?;
             queue.list()
         };
-        self.persist_prompt_queue(session_id);
+        let _ = self.persist_prompt_queue(session_id);
         Ok(list)
     }
 
@@ -2367,7 +2396,7 @@ impl AgentHostHandle {
             queue.remove(entry_id)?;
             queue.list()
         };
-        self.persist_prompt_queue(session_id);
+        let _ = self.persist_prompt_queue(session_id);
         Ok(list)
     }
 
@@ -2379,7 +2408,7 @@ impl AgentHostHandle {
             }
             g.prompt_queues.entry(session_id).or_default().clear();
         }
-        self.persist_prompt_queue(session_id);
+        let _ = self.persist_prompt_queue(session_id);
         Ok(Vec::new())
     }
 
@@ -2398,7 +2427,7 @@ impl AgentHostHandle {
             queue.move_to(entry_id, to_index)?;
             queue.list()
         };
-        self.persist_prompt_queue(session_id);
+        let _ = self.persist_prompt_queue(session_id);
         Ok(list)
     }
 
@@ -2420,7 +2449,7 @@ impl AgentHostHandle {
             }
         };
         if result.batch.is_some() {
-            self.persist_prompt_queue(session_id);
+            let _ = self.persist_prompt_queue(session_id);
         }
         Ok(result)
     }
@@ -2439,7 +2468,7 @@ impl AgentHostHandle {
             queue.run_next(entry_id)?;
             g.turn_cancels.contains_key(&session_id)
         };
-        self.persist_prompt_queue(session_id);
+        let _ = self.persist_prompt_queue(session_id);
         let cancelled_active = active && self.cancel_turn(Some(session_id)).is_ok();
         Ok(PromptQueueRunNextResult {
             entries: self.session_queue_list(session_id)?,
@@ -2466,7 +2495,7 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
             queue.steer_queued(entry_id, can_inject)?
         };
-        self.persist_prompt_queue(session_id);
+        let _ = self.persist_prompt_queue(session_id);
         Ok(receipt)
     }
 
@@ -2484,75 +2513,19 @@ impl AgentHostHandle {
                 .or_default()
                 .steer_text(text, can_inject)?
         };
-        self.persist_prompt_queue(session_id);
+        let _ = self.persist_prompt_queue(session_id);
         Ok(receipt)
     }
 
     /// Cancel the in-flight turn for `session_id`, or every active turn when
     /// `session_id` is `None` (shutdown / global stop).
     pub fn cancel_turn(&self, session_id: Option<Uuid>) -> Result<()> {
-        let (live_shells, kill_ids) = {
-            let mut g = self.inner.lock();
-            match session_id {
-                Some(id) => {
-                    let Some(c) = g.turn_cancels.get(&id) else {
-                        bail!("no active turn for session {id}");
-                    };
-                    c.cancel();
-                    // #151: cancel all outstanding children for this parent session.
-                    let sid = id.to_string();
-                    let child_ids: Vec<String> = g
-                        .subagents
-                        .iter()
-                        .filter(|s| {
-                            s.session_id.as_deref() == Some(sid.as_str()) && s.status == "running"
-                        })
-                        .map(|s| s.id.clone())
-                        .collect();
-                    for cid in &child_ids {
-                        if let Some(tok) = g.subagent_cancels.remove(cid) {
-                            tok.cancel();
-                        }
-                        if let Some(s) = g.subagents.iter_mut().find(|s| s.id == *cid) {
-                            s.status = "cancelled".into();
-                            s.summary = Some("parent turn cancelled".into());
-                        }
-                    }
-                    (g.live_shells.clone(), vec![id])
-                }
-                None => {
-                    if g.turn_cancels.is_empty() {
-                        bail!("no active turn");
-                    }
-                    for c in g.turn_cancels.values() {
-                        c.cancel();
-                    }
-                    for tok in g.subagent_cancels.values() {
-                        tok.cancel();
-                    }
-                    g.subagent_cancels.clear();
-                    for s in g.subagents.iter_mut() {
-                        if s.status == "running" {
-                            s.status = "cancelled".into();
-                            s.summary = Some("parent turn cancelled".into());
-                        }
-                    }
-                    let ids: Vec<Uuid> = g.turn_cancels.keys().copied().collect();
-                    (g.live_shells.clone(), ids)
-                }
-            }
-        };
-        // Kill only this session's (or all cancelled sessions') shell children.
+        let (live_shells, kill_ids) = self.cancel_turn_prepare(session_id)?;
+        // Fire-and-forget kill for sync callers (desktop stop button).
         let handle = tokio::runtime::Handle::try_current();
         if let Ok(h) = handle {
             h.spawn(async move {
-                let mut map = live_shells.lock().await;
-                for id in kill_ids {
-                    if let Some(mut child) = map.remove(&id) {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
-                    }
-                }
+                kill_shells(live_shells, kill_ids).await;
             });
         } else if let Ok(mut map) = live_shells.try_lock() {
             for id in kill_ids {
@@ -2562,6 +2535,69 @@ impl AgentHostHandle {
             }
         }
         Ok(())
+    }
+
+    /// Cancel turn and **await** shell/subagent teardown (duration limits / orchestration).
+    pub async fn cancel_turn_and_await(&self, session_id: Option<Uuid>) -> Result<()> {
+        let (live_shells, kill_ids) = self.cancel_turn_prepare(session_id)?;
+        kill_shells(live_shells, kill_ids).await;
+        // Brief settle so cancel tokens propagate.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        Ok(())
+    }
+
+    fn cancel_turn_prepare(
+        &self,
+        session_id: Option<Uuid>,
+    ) -> Result<(local_tools::LiveShellMap, Vec<Uuid>)> {
+        let mut g = self.inner.lock();
+        match session_id {
+            Some(id) => {
+                let Some(c) = g.turn_cancels.get(&id) else {
+                    bail!("no active turn for session {id}");
+                };
+                c.cancel();
+                let sid = id.to_string();
+                let child_ids: Vec<String> = g
+                    .subagents
+                    .iter()
+                    .filter(|s| {
+                        s.session_id.as_deref() == Some(sid.as_str()) && s.status == "running"
+                    })
+                    .map(|s| s.id.clone())
+                    .collect();
+                for cid in &child_ids {
+                    if let Some(tok) = g.subagent_cancels.remove(cid) {
+                        tok.cancel();
+                    }
+                    if let Some(s) = g.subagents.iter_mut().find(|s| s.id == *cid) {
+                        s.status = "cancelled".into();
+                        s.summary = Some("parent turn cancelled".into());
+                    }
+                }
+                Ok((g.live_shells.clone(), vec![id]))
+            }
+            None => {
+                if g.turn_cancels.is_empty() {
+                    bail!("no active turn");
+                }
+                for c in g.turn_cancels.values() {
+                    c.cancel();
+                }
+                for tok in g.subagent_cancels.values() {
+                    tok.cancel();
+                }
+                g.subagent_cancels.clear();
+                for s in g.subagents.iter_mut() {
+                    if s.status == "running" {
+                        s.status = "cancelled".into();
+                        s.summary = Some("parent turn cancelled".into());
+                    }
+                }
+                let ids: Vec<Uuid> = g.turn_cancels.keys().copied().collect();
+                Ok((g.live_shells.clone(), ids))
+            }
+        }
     }
 
     /// Run a turn. Returns the final assistant text so the UI always has a
@@ -2662,7 +2698,7 @@ impl AgentHostHandle {
                 .or_default()
                 .defer_pending_steering();
         }
-        self.persist_prompt_queue(session_id);
+        let _ = self.persist_prompt_queue(session_id);
         busy_guard.armed = false;
 
         // Append assistant turn(s) written by push_assistant.
@@ -2692,17 +2728,19 @@ impl AgentHostHandle {
         }
     }
 
-    fn persist_prompt_queue(&self, session_id: Uuid) {
+    fn persist_prompt_queue(&self, session_id: Uuid) -> Result<()> {
         let queue = {
             let g = self.inner.lock();
             g.prompt_queues.get(&session_id).cloned()
         };
         if let Some(q) = queue {
-            let _ = session_store::save_prompt_queue(session_id, &q);
+            session_store::save_prompt_queue(session_id, &q)
+                .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
         } else {
-            // Clear on-disk when queue was removed entirely.
-            let _ = session_store::save_prompt_queue(session_id, &SessionPromptQueue::default());
+            session_store::save_prompt_queue(session_id, &SessionPromptQueue::default())
+                .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
         }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

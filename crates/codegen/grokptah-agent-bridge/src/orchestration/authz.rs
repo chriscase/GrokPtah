@@ -53,6 +53,19 @@ pub fn canonical_workspace(path: &Path) -> Result<PathBuf, OrchError> {
     })
 }
 
+/// Constant-time equality for equal-length secrets; length mismatch is not constant-time
+/// (still fail closed without short-circuiting byte compares of equal lengths).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<AuthContext, OrchError> {
     if expected.is_empty() {
         return Err(OrchError::new(
@@ -78,7 +91,7 @@ pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<AuthContex
             "missing bearer token",
         ));
     }
-    if token != expected {
+    if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
         return Err(OrchError::new(
             OrchErrorCode::Unauthenticated,
             "invalid bearer token",

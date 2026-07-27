@@ -217,6 +217,7 @@ fn restart_interrupted_no_auto_resume() {
         terminal_result: None,
         final_response: None,
         error_code: None,
+        aggregates: Default::default(),
     };
     store.save_run(&run).unwrap();
     let store2 = OrchStore::open(d.path()).unwrap();
@@ -376,11 +377,7 @@ async fn submit_task_reaches_terminal_offline() {
             session.id,
             ws.path(),
             "list files please".into(),
-            Some(RunBounds {
-                max_prompt_bytes: 10_000,
-                max_rounds: 2,
-                max_duration_ms: 30_000,
-            }),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 2, "maxDurationMs": 30000})),
         )
         .await
         .unwrap();
@@ -397,11 +394,7 @@ async fn submit_task_reaches_terminal_offline() {
             session.id,
             ws.path(),
             "list files please".into(),
-            Some(RunBounds {
-                max_prompt_bytes: 10_000,
-                max_rounds: 2,
-                max_duration_ms: 30_000,
-            }),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 2, "maxDurationMs": 30000})),
         )
         .await
         .unwrap();
@@ -431,11 +424,7 @@ async fn submit_duration_limit_reached() {
             session.id,
             ws.path(),
             "run sleep 5".into(),
-            Some(RunBounds {
-                max_prompt_bytes: 10_000,
-                max_rounds: 24,
-                max_duration_ms: 80,
-            }),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 24, "maxDurationMs": 80})),
         )
         .await
         .unwrap();
@@ -467,11 +456,7 @@ async fn submit_session_busy_and_capacity() {
             s1.id,
             ws.path(),
             "run sleep 2".into(),
-            Some(RunBounds {
-                max_prompt_bytes: 10_000,
-                max_rounds: 24,
-                max_duration_ms: 30_000,
-            }),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 24, "maxDurationMs": 30000})),
         )
         .await
         .unwrap();
@@ -527,11 +512,7 @@ async fn cancel_isolates_sessions() {
             a.id,
             ws.path(),
             "run sleep 8".into(),
-            Some(RunBounds {
-                max_prompt_bytes: 10_000,
-                max_rounds: 24,
-                max_duration_ms: 60_000,
-            }),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 24, "maxDurationMs": 60000})),
         )
         .await
         .unwrap();
@@ -542,11 +523,7 @@ async fn cancel_isolates_sessions() {
             b.id,
             ws.path(),
             "list files please".into(),
-            Some(RunBounds {
-                max_prompt_bytes: 10_000,
-                max_rounds: 2,
-                max_duration_ms: 30_000,
-            }),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 2, "maxDurationMs": 30000})),
         )
         .await
         .unwrap();
@@ -601,11 +578,7 @@ async fn steer_via_orchestration_service() {
             session.id,
             ws.path(),
             "run sleep 3".into(),
-            Some(RunBounds {
-                max_prompt_bytes: 10_000,
-                max_rounds: 24,
-                max_duration_ms: 30_000,
-            }),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 24, "maxDurationMs": 30000})),
         )
         .await
         .unwrap();
@@ -700,11 +673,7 @@ async fn capacity_race_against_real_submit_task() {
                 sid,
                 &ws_path,
                 "run sleep 3".into(),
-                Some(RunBounds {
-                    max_prompt_bytes: 10_000,
-                    max_rounds: 24,
-                    max_duration_ms: 30_000,
-                }),
+                Some(json!({"maxPromptBytes": 10000, "maxRounds": 24, "maxDurationMs": 30000})),
             )
             .await
         });
@@ -751,11 +720,7 @@ async fn submit_round_limit_reached_via_wired_max_rounds() {
             session.id,
             ws.path(),
             "simulate_tool_rounds please".into(),
-            Some(RunBounds {
-                max_prompt_bytes: 10_000,
-                max_rounds: 2,
-                max_duration_ms: 30_000,
-            }),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 2, "maxDurationMs": 30000})),
         )
         .await
         .unwrap();
