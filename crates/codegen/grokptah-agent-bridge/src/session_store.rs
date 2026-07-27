@@ -142,6 +142,47 @@ fn subagents_path(id: Uuid) -> PathBuf {
     session_dir(id).join("subagents.json")
 }
 
+fn prompt_queue_path(id: Uuid) -> PathBuf {
+    session_dir(id).join("prompt_queue.json")
+}
+
+/// Persist bridge-owned prompt queue entries so ordering survives restart (#196).
+pub fn save_prompt_queue(id: Uuid, queue: &crate::prompt_queue::SessionPromptQueue) -> Result<()> {
+    ensure_home();
+    let _ = fs::create_dir_all(session_dir(id));
+    let path = prompt_queue_path(id);
+    let snap = queue.durable_snapshot();
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(&snap)?)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Load durable prompt queue for a session (empty if missing).
+pub fn load_prompt_queue(id: Uuid) -> Result<crate::prompt_queue::SessionPromptQueue> {
+    let path = prompt_queue_path(id);
+    if !path.is_file() {
+        return Ok(crate::prompt_queue::SessionPromptQueue::default());
+    }
+    let text = fs::read_to_string(&path)?;
+    Ok(serde_json::from_str(&text).unwrap_or_default())
+}
+
+/// Load all persisted queues for known sessions.
+pub fn load_all_prompt_queues(
+    session_ids: impl IntoIterator<Item = Uuid>,
+) -> HashMap<Uuid, crate::prompt_queue::SessionPromptQueue> {
+    let mut out = HashMap::new();
+    for id in session_ids {
+        if let Ok(q) = load_prompt_queue(id) {
+            if !q.list().is_empty() {
+                out.insert(id, q);
+            }
+        }
+    }
+    out
+}
+
 /// Persist subagent history for a session (reopen / historical summary) (#152).
 pub fn save_session_subagents(id: Uuid, list: &[crate::types::SubagentInfo]) -> Result<()> {
     ensure_home();

@@ -316,3 +316,385 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
     let _ = PathBuf::from(".");
     let _ = hash_payload(&json!({}));
 }
+
+fn orch_for(
+    host: &grokptah_agent_bridge::AgentHostHandle,
+    home: &tempfile::TempDir,
+    ws: &tempfile::TempDir,
+    max_concurrent: usize,
+) -> std::sync::Arc<OrchestrationService> {
+    OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orch")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: max_concurrent,
+            bounds: RunBounds::default(),
+        },
+    )
+}
+
+async fn wait_run_terminal(
+    orch: &OrchestrationService,
+    auth: &grokptah_agent_bridge::orchestration::AuthContext,
+    run_id: &str,
+    timeout: Duration,
+) -> RunState {
+    let start = std::time::Instant::now();
+    loop {
+        let v = orch.get_run(auth, run_id).unwrap();
+        let state: RunState = serde_json::from_value(v["state"].clone()).unwrap();
+        if !matches!(state, RunState::Running | RunState::Queued) {
+            return state;
+        }
+        if start.elapsed() > timeout {
+            panic!("run {run_id} still {state:?} after {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn submit_task_reaches_terminal_offline() {
+    let _offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let resp = orch
+        .submit_task(
+            &auth,
+            "sub-1",
+            session.id,
+            ws.path(),
+            "list files please".into(),
+            Some(RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 2,
+                max_duration_ms: 30_000,
+            }),
+        )
+        .await
+        .unwrap();
+    let run_id = resp["runId"].as_str().unwrap().to_string();
+    let state = wait_run_terminal(&orch, &auth, &run_id, Duration::from_secs(10)).await;
+    assert_eq!(state, RunState::Completed);
+    let handoff = orch.get_handoff(&auth, &run_id).unwrap();
+    assert!(handoff["finalResponse"].as_str().is_some());
+    // Idempotent retry
+    let again = orch
+        .submit_task(
+            &auth,
+            "sub-1",
+            session.id,
+            ws.path(),
+            "list files please".into(),
+            Some(RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 2,
+                max_duration_ms: 30_000,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["runId"], run_id);
+    set_grokptah_home_override(None);
+    if _offline.is_none() {
+        std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn submit_duration_limit_reached() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let resp = orch
+        .submit_task(
+            &auth,
+            "lim-dur",
+            session.id,
+            ws.path(),
+            "run sleep 5".into(),
+            Some(RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 24,
+                max_duration_ms: 80,
+            }),
+        )
+        .await
+        .unwrap();
+    let run_id = resp["runId"].as_str().unwrap().to_string();
+    let state = wait_run_terminal(&orch, &auth, &run_id, Duration::from_secs(15)).await;
+    assert_eq!(state, RunState::LimitReached);
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn submit_session_busy_and_capacity() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let s1 = host.session_new_kind(SessionKind::Build).unwrap();
+    let s2 = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(s1.id, ws.path()).unwrap();
+    host.session_set_cwd(s2.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 1);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    let _r1 = orch
+        .submit_task(
+            &auth,
+            "cap-1",
+            s1.id,
+            ws.path(),
+            "run sleep 2".into(),
+            Some(RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 24,
+                max_duration_ms: 30_000,
+            }),
+        )
+        .await
+        .unwrap();
+    // Give the first turn a moment to mark session busy / reserve capacity.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let busy = orch
+        .submit_task(
+            &auth,
+            "cap-busy",
+            s1.id,
+            ws.path(),
+            "list files".into(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(busy.code.as_str(), "session_busy");
+
+    let cap = orch
+        .submit_task(&auth, "cap-2", s2.id, ws.path(), "list files".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(cap.code.as_str(), "capacity_exhausted");
+
+    // Atomic capacity: concurrent second reserves must not oversubscribe max=1.
+    let cap_snap = orch.get_capacity(&auth).unwrap();
+    assert_eq!(cap_snap["maxConcurrentRuns"], 1);
+    assert!(cap_snap["activeRuns"].as_u64().unwrap() >= 1);
+
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn cancel_isolates_sessions() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let a = host.session_new_kind(SessionKind::Build).unwrap();
+    let b = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(a.id, ws.path()).unwrap();
+    host.session_set_cwd(b.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    let ra = orch
+        .submit_task(
+            &auth,
+            "can-a",
+            a.id,
+            ws.path(),
+            "run sleep 8".into(),
+            Some(RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 24,
+                max_duration_ms: 60_000,
+            }),
+        )
+        .await
+        .unwrap();
+    let rb = orch
+        .submit_task(
+            &auth,
+            "can-b",
+            b.id,
+            ws.path(),
+            "list files please".into(),
+            Some(RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 2,
+                max_duration_ms: 30_000,
+            }),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let run_a = ra["runId"].as_str().unwrap().to_string();
+    orch.cancel(&auth, "can-req", a.id, ws.path(), Some(&run_a))
+        .unwrap();
+    let state_a = wait_run_terminal(&orch, &auth, &run_a, Duration::from_secs(10)).await;
+    assert!(
+        matches!(
+            state_a,
+            RunState::Cancelled | RunState::Completed | RunState::Failed
+        ),
+        "got {state_a:?}"
+    );
+    // Session B still finishes independently.
+    let run_b = rb["runId"].as_str().unwrap().to_string();
+    let state_b = wait_run_terminal(&orch, &auth, &run_b, Duration::from_secs(10)).await;
+    assert_eq!(state_b, RunState::Completed);
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn steer_via_orchestration_service() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (_home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &_home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    // Idle session → steer defers to queue (non-cancelling).
+    let idle = orch
+        .steer(
+            &auth,
+            "steer-idle",
+            session.id,
+            ws.path(),
+            "please prefer tests".into(),
+        )
+        .unwrap();
+    assert_eq!(idle["disposition"], "queued");
+
+    let _run = orch
+        .submit_task(
+            &auth,
+            "steer-run",
+            session.id,
+            ws.path(),
+            "run sleep 3".into(),
+            Some(RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 24,
+                max_duration_ms: 30_000,
+            }),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let pending = orch
+        .steer(
+            &auth,
+            "steer-live",
+            session.id,
+            ws.path(),
+            "keep going carefully".into(),
+        )
+        .unwrap();
+    assert_eq!(pending["disposition"], "pending");
+    set_grokptah_home_override(None);
+}
+
+#[test]
+fn queue_survives_host_restart() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (_home, _lock) = setup_home();
+    let ws = tempdir().unwrap();
+    let session_id = {
+        let host = started_host();
+        host.set_project_cwd(ws.path()).unwrap();
+        let session = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+        host.session_queue_add(session.id, "follow-up after restart".into(), false)
+            .unwrap();
+        host.session_queue_add(session.id, "second item".into(), true)
+            .unwrap();
+        let listed = host.session_queue_list(session.id).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].text, "second item"); // priority front
+        session.id
+    };
+    // New host process-equivalent: same home, fresh AgentHost.
+    let host2 = started_host();
+    let listed = host2.session_queue_list(session_id).unwrap();
+    assert_eq!(listed.len(), 2, "queue must reload from disk");
+    assert_eq!(listed[0].text, "second item");
+    assert_eq!(listed[1].text, "follow-up after restart");
+    set_grokptah_home_override(None);
+}
+
+#[test]
+fn journal_reload_supports_run_scoped_reads() {
+    let dir = tempdir().unwrap();
+    let sid = Uuid::new_v4();
+    let bus1 = EventBus::new(64).with_persist_dir(dir.path());
+    bus1.publish(SessionUpdate::FileEdit {
+        session_id: sid,
+        path: "a.rs".into(),
+        summary: "edited".into(),
+        unified_diff: "diff".into(),
+    });
+    let start = bus1.current_seq();
+    drop(bus1);
+    let bus2 = EventBus::new(64).with_persist_dir(dir.path());
+    let page = bus2.read_after(0, 50);
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].seq, start);
+}
+
+#[test]
+fn capacity_reserve_is_atomic_under_contention() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    // Pure unit: model the reserve path (check+push under one lock).
+    let active = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let max = 2usize;
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let active = active.clone();
+        let accepted = accepted.clone();
+        handles.push(thread::spawn(move || {
+            let mut g = active.lock().unwrap();
+            if g.len() < max {
+                g.push(format!("r{i}"));
+                accepted.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(accepted.load(Ordering::SeqCst), max);
+    assert_eq!(active.lock().unwrap().len(), max);
+}

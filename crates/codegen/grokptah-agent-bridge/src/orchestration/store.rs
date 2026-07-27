@@ -2,37 +2,47 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 use parking_lot::Mutex;
 
 use super::types::{AuditEntry, IdempotencyReceipt, RunRecord, RunState};
 
+#[derive(Clone)]
 pub struct OrchStore {
+    inner: Arc<OrchStoreInner>,
+}
+
+struct OrchStoreInner {
     root: PathBuf,
     lock: Mutex<()>,
 }
 
 impl OrchStore {
+    /// Open store and convert unfinished runs to `interrupted` (crash recovery).
+    /// Call once per process boot — not when cloning a handle for background work.
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         let store = Self {
-            root,
-            lock: Mutex::new(()),
+            inner: Arc::new(OrchStoreInner {
+                root,
+                lock: Mutex::new(()),
+            }),
         };
         store.mark_unfinished_interrupted()?;
         Ok(store)
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.inner.root
     }
 
     fn run_path(&self, run_id: &str) -> PathBuf {
-        self.root.join("runs").join(format!("{run_id}.json"))
+        self.inner.root.join("runs").join(format!("{run_id}.json"))
     }
 
     fn idemp_path(&self, request_id: &str) -> PathBuf {
@@ -47,11 +57,14 @@ impl OrchStore {
                 }
             })
             .collect();
-        self.root.join("idempotency").join(format!("{safe}.json"))
+        self.inner
+            .root
+            .join("idempotency")
+            .join(format!("{safe}.json"))
     }
 
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
-        let _g = self.lock.lock();
+        let _g = self.inner.lock.lock();
         let path = self.run_path(&run.run_id);
         atomic_write_json(&path, run)
     }
@@ -67,7 +80,7 @@ impl OrchStore {
 
     pub fn list_runs(&self) -> anyhow::Result<Vec<RunRecord>> {
         let mut out = Vec::new();
-        let dir = self.root.join("runs");
+        let dir = self.inner.root.join("runs");
         if !dir.is_dir() {
             return Ok(out);
         }
@@ -87,7 +100,7 @@ impl OrchStore {
     }
 
     pub fn save_idempotency(&self, receipt: &IdempotencyReceipt) -> anyhow::Result<()> {
-        let _g = self.lock.lock();
+        let _g = self.inner.lock.lock();
         atomic_write_json(&self.idemp_path(&receipt.request_id), receipt)
     }
 
@@ -102,8 +115,8 @@ impl OrchStore {
 
     pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
         use std::io::Write;
-        let _g = self.lock.lock();
-        let path = self.root.join("audit").join("audit.jsonl");
+        let _g = self.inner.lock.lock();
+        let path = self.inner.root.join("audit").join("audit.jsonl");
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -173,6 +186,33 @@ mod tests {
         let loaded = store2.load_run("r1").unwrap().unwrap();
         assert_eq!(loaded.state, RunState::Interrupted);
         assert!(!matches!(loaded.state, RunState::Running));
+    }
+
+    #[test]
+    fn clone_does_not_interrupt_running() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let run = RunRecord {
+            run_id: "r2".into(),
+            session_id: Uuid::new_v4(),
+            workspace: "/tmp/w".into(),
+            request_id: "req2".into(),
+            client_id: None,
+            state: RunState::Running,
+            bounds: RunBounds::default(),
+            prompt_preview: "hi".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+        };
+        store.save_run(&run).unwrap();
+        let clone = store.clone();
+        let loaded = clone.load_run("r2").unwrap().unwrap();
+        assert_eq!(loaded.state, RunState::Running);
     }
 
     #[test]

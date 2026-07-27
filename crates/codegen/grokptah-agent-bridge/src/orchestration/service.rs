@@ -432,8 +432,10 @@ impl OrchestrationService {
             ));
         }
 
+        // Generate id, then reserve capacity under a single lock before durable IO.
+        let run_id = Uuid::new_v4().to_string();
         {
-            let active = self.active.lock();
+            let mut active = self.active.lock();
             let max = self.config.lock().max_concurrent_runs;
             if active.len() >= max {
                 return Err(OrchError::new(
@@ -441,9 +443,9 @@ impl OrchestrationService {
                     "max concurrent runs reached",
                 ));
             }
+            active.push(run_id.clone());
         }
 
-        let run_id = Uuid::new_v4().to_string();
         let start_seq = self.bus.current_seq().saturating_add(1);
         let run = RunRecord {
             run_id: run_id.clone(),
@@ -462,34 +464,56 @@ impl OrchestrationService {
             final_response: None,
             error_code: None,
         };
-        self.store
-            .save_run(&run)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-        self.active.lock().push(run_id.clone());
+        if let Err(e) = self.store.save_run(&run) {
+            self.active.lock().retain(|id| id != &run_id);
+            return Err(OrchError::new(OrchErrorCode::Internal, e.to_string()));
+        }
 
         let host = self.host.clone();
-        let store = OrchStore::open(self.store.root())
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        // Clone the in-process store handle — never re-open (open() is crash recovery).
+        let store = self.store.clone();
         let bus = self.bus.clone();
         let active_slot = self.active.clone();
         let rid = run_id.clone();
         let prompt_owned = prompt.clone();
         let max_ms = bounds.max_duration_ms;
+        let max_rounds = bounds.max_rounds;
 
         let join = tokio::spawn(async move {
             let result = tokio::time::timeout(
                 std::time::Duration::from_millis(max_ms.max(1)),
-                host.session_prompt(session_id, prompt_owned),
+                host.session_prompt_with_max_rounds(
+                    session_id,
+                    prompt_owned,
+                    Some(max_rounds.max(1)),
+                ),
             )
             .await;
             let end_seq = bus.current_seq();
             if let Ok(Some(mut r)) = store.load_run(&rid) {
+                // Cancel/interrupt from another path wins over late worker completion.
+                if matches!(r.state, RunState::Cancelled | RunState::Interrupted) {
+                    r.end_seq = r.end_seq.or(Some(end_seq));
+                    r.updated_at = Utc::now();
+                    let _ = store.save_run(&r);
+                    active_slot.lock().retain(|id| id != &rid);
+                    return;
+                }
                 r.end_seq = Some(end_seq);
                 r.updated_at = Utc::now();
                 match result {
                     Ok(Ok(text)) => {
-                        r.state = RunState::Completed;
-                        r.terminal_result = Some("completed".into());
+                        // Coding loop surfaces round exhaustion as a final assistant message.
+                        let round_capped = text.starts_with("Stopped after ")
+                            && text.contains("tool rounds without a final answer");
+                        if round_capped {
+                            r.state = RunState::LimitReached;
+                            r.terminal_result = Some("limit_reached".into());
+                            r.error_code = Some("limit_reached".into());
+                        } else {
+                            r.state = RunState::Completed;
+                            r.terminal_result = Some("completed".into());
+                        }
                         r.final_response = Some(text.chars().take(8_000).collect());
                     }
                     Ok(Err(e)) => {

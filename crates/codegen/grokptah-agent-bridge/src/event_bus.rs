@@ -66,12 +66,26 @@ impl EventBus {
     }
 
     /// Persist journal snapshots under `dir/event_journal.jsonl` (best-effort).
+    /// Reloads existing journal lines so run-scoped reads survive process restart.
     pub fn with_persist_dir(self, dir: impl AsRef<Path>) -> Self {
         let path = dir.as_ref().join("event_journal.jsonl");
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        self.inner.lock().journal_path = Some(path);
+        {
+            let mut g = self.inner.lock();
+            if path.is_file() {
+                if let Ok(loaded) = load_journal_file(&path, g.capacity) {
+                    if let Some(last) = loaded.back() {
+                        // Next publish seq must be last.seq + 1
+                        self.seq.store(last.seq.saturating_add(1), Ordering::SeqCst);
+                        g.oldest_seq = loaded.front().map(|e| e.seq).unwrap_or(1);
+                    }
+                    g.journal = loaded;
+                }
+            }
+            g.journal_path = Some(path);
+        }
         self
     }
 
@@ -166,6 +180,28 @@ fn append_journal_line(path: &Path, entry: &JournalEntry) {
             let _ = writeln!(f, "{line}");
         }
     }
+}
+
+/// Load the tail of a durable journal, keeping at most `capacity` entries.
+fn load_journal_file(path: &Path, capacity: usize) -> std::io::Result<VecDeque<JournalEntry>> {
+    use std::io::{BufRead, BufReader};
+    let f = std::fs::File::open(path)?;
+    let reader = BufReader::new(f);
+    let mut all: VecDeque<JournalEntry> = VecDeque::new();
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<JournalEntry>(line) {
+            all.push_back(entry);
+            while all.len() > capacity {
+                all.pop_front();
+            }
+        }
+    }
+    Ok(all)
 }
 
 /// Redact secrets and truncate large tool bodies for the durable journal.
@@ -311,5 +347,35 @@ mod tests {
         } else {
             panic!("variant");
         }
+    }
+
+    #[test]
+    fn journal_reloads_from_disk_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = Uuid::new_v4();
+        let bus1 = EventBus::new(64).with_persist_dir(dir.path());
+        for i in 0..3 {
+            bus1.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("m{i}"),
+            });
+        }
+        let seq_before = bus1.current_seq();
+        drop(bus1);
+
+        let bus2 = EventBus::new(64).with_persist_dir(dir.path());
+        let page = bus2.read_after(0, 100);
+        assert!(!page.cursor_expired);
+        assert_eq!(page.entries.len(), 3);
+        assert_eq!(bus2.current_seq(), seq_before);
+        // New publish continues sequence
+        bus2.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "m3".into(),
+        });
+        assert_eq!(bus2.current_seq(), seq_before + 1);
+        let page2 = bus2.read_after(seq_before, 10);
+        assert_eq!(page2.entries.len(), 1);
+        assert_eq!(page2.entries[0].seq, seq_before + 1);
     }
 }

@@ -123,6 +123,8 @@ pub(crate) struct Inner {
     turn_cancels: HashMap<Uuid, CancellationToken>,
     /// Authoritative follow-up queue plus non-cancelling steering inbox.
     prompt_queues: HashMap<Uuid, SessionPromptQueue>,
+    /// Per-turn model-step budget override (orchestration `RunBounds.max_rounds`).
+    turn_max_rounds: HashMap<Uuid, u32>,
     event_tx: crate::event_bus::EventBus,
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
@@ -155,12 +157,16 @@ impl Drop for TurnBusyGuard {
         if !self.armed {
             return;
         }
-        let mut g = self.host.inner.lock();
-        g.turn_cancels.remove(&self.session_id);
-        g.prompt_queues
-            .entry(self.session_id)
-            .or_default()
-            .defer_pending_steering();
+        {
+            let mut g = self.host.inner.lock();
+            g.turn_cancels.remove(&self.session_id);
+            g.turn_max_rounds.remove(&self.session_id);
+            g.prompt_queues
+                .entry(self.session_id)
+                .or_default()
+                .defer_pending_steering();
+        }
+        self.host.persist_prompt_queue(self.session_id);
     }
 }
 
@@ -228,6 +234,7 @@ impl AgentHost {
             .filter(|id| sessions.contains_key(id))
             .or_else(|| open_tab_ids.first().copied())
             .or_else(|| sessions.keys().next().copied());
+        let prompt_queues = session_store::load_all_prompt_queues(sessions.keys().copied());
         let inner = Inner {
             running: false,
             project_cwd,
@@ -263,7 +270,8 @@ impl AgentHost {
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
-            prompt_queues: HashMap::new(),
+            prompt_queues,
+            turn_max_rounds: HashMap::new(),
             event_tx,
             edited_files: Vec::new(),
             edit_snapshots: HashMap::new(), // session_id → path → original
@@ -2311,13 +2319,17 @@ impl AgentHostHandle {
         text: String,
         priority: bool,
     ) -> Result<Vec<PromptQueueEntry>> {
-        let mut g = self.inner.lock();
-        if !g.sessions.contains_key(&session_id) {
-            bail!("unknown session");
-        }
-        let queue = g.prompt_queues.entry(session_id).or_default();
-        queue.add(text, "composer", priority)?;
-        Ok(queue.list())
+        let list = {
+            let mut g = self.inner.lock();
+            if !g.sessions.contains_key(&session_id) {
+                bail!("unknown session");
+            }
+            let queue = g.prompt_queues.entry(session_id).or_default();
+            queue.add(text, "composer", priority)?;
+            queue.list()
+        };
+        self.persist_prompt_queue(session_id);
+        Ok(list)
     }
 
     pub fn session_queue_edit(
@@ -2327,13 +2339,17 @@ impl AgentHostHandle {
         version: u64,
         text: String,
     ) -> Result<Vec<PromptQueueEntry>> {
-        let mut g = self.inner.lock();
-        let queue = g
-            .prompt_queues
-            .get_mut(&session_id)
-            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-        queue.edit(entry_id, version, text)?;
-        Ok(queue.list())
+        let list = {
+            let mut g = self.inner.lock();
+            let queue = g
+                .prompt_queues
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+            queue.edit(entry_id, version, text)?;
+            queue.list()
+        };
+        self.persist_prompt_queue(session_id);
+        Ok(list)
     }
 
     pub fn session_queue_remove(
@@ -2341,21 +2357,28 @@ impl AgentHostHandle {
         session_id: Uuid,
         entry_id: &str,
     ) -> Result<Vec<PromptQueueEntry>> {
-        let mut g = self.inner.lock();
-        let queue = g
-            .prompt_queues
-            .get_mut(&session_id)
-            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-        queue.remove(entry_id)?;
-        Ok(queue.list())
+        let list = {
+            let mut g = self.inner.lock();
+            let queue = g
+                .prompt_queues
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+            queue.remove(entry_id)?;
+            queue.list()
+        };
+        self.persist_prompt_queue(session_id);
+        Ok(list)
     }
 
     pub fn session_queue_clear(&self, session_id: Uuid) -> Result<Vec<PromptQueueEntry>> {
-        let mut g = self.inner.lock();
-        if !g.sessions.contains_key(&session_id) {
-            bail!("unknown session");
+        {
+            let mut g = self.inner.lock();
+            if !g.sessions.contains_key(&session_id) {
+                bail!("unknown session");
+            }
+            g.prompt_queues.entry(session_id).or_default().clear();
         }
-        g.prompt_queues.entry(session_id).or_default().clear();
+        self.persist_prompt_queue(session_id);
         Ok(Vec::new())
     }
 
@@ -2365,29 +2388,40 @@ impl AgentHostHandle {
         entry_id: &str,
         to_index: usize,
     ) -> Result<Vec<PromptQueueEntry>> {
-        let mut g = self.inner.lock();
-        let queue = g
-            .prompt_queues
-            .get_mut(&session_id)
-            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-        queue.move_to(entry_id, to_index)?;
-        Ok(queue.list())
+        let list = {
+            let mut g = self.inner.lock();
+            let queue = g
+                .prompt_queues
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+            queue.move_to(entry_id, to_index)?;
+            queue.list()
+        };
+        self.persist_prompt_queue(session_id);
+        Ok(list)
     }
 
     pub fn session_queue_take_next(&self, session_id: Uuid) -> Result<PromptQueueTakeResult> {
-        let mut g = self.inner.lock();
-        if !g.sessions.contains_key(&session_id) {
-            bail!("unknown session");
+        let result = {
+            let mut g = self.inner.lock();
+            if !g.sessions.contains_key(&session_id) {
+                bail!("unknown session");
+            }
+            let active = g.turn_cancels.contains_key(&session_id);
+            let queue = g.prompt_queues.entry(session_id).or_default();
+            if active {
+                PromptQueueTakeResult {
+                    batch: None,
+                    entries: queue.list(),
+                }
+            } else {
+                queue.take_next()
+            }
+        };
+        if result.batch.is_some() {
+            self.persist_prompt_queue(session_id);
         }
-        let active = g.turn_cancels.contains_key(&session_id);
-        let queue = g.prompt_queues.entry(session_id).or_default();
-        if active {
-            return Ok(PromptQueueTakeResult {
-                batch: None,
-                entries: queue.list(),
-            });
-        }
-        Ok(queue.take_next())
+        Ok(result)
     }
 
     pub fn session_queue_run_next(
@@ -2404,6 +2438,7 @@ impl AgentHostHandle {
             queue.run_next(entry_id)?;
             g.turn_cancels.contains_key(&session_id)
         };
+        self.persist_prompt_queue(session_id);
         let cancelled_active = active && self.cancel_turn(Some(session_id)).is_ok();
         Ok(PromptQueueRunNextResult {
             entries: self.session_queue_list(session_id)?,
@@ -2416,32 +2451,40 @@ impl AgentHostHandle {
         session_id: Uuid,
         entry_id: &str,
     ) -> Result<SteeringReceipt> {
-        let mut g = self.inner.lock();
-        let is_build = g
-            .sessions
-            .get(&session_id)
-            .map(|session| session.kind == SessionKind::Build)
-            .ok_or_else(|| anyhow!("unknown session"))?;
-        let can_inject = is_build && g.turn_cancels.contains_key(&session_id);
-        let queue = g
-            .prompt_queues
-            .get_mut(&session_id)
-            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-        queue.steer_queued(entry_id, can_inject)
+        let receipt = {
+            let mut g = self.inner.lock();
+            let is_build = g
+                .sessions
+                .get(&session_id)
+                .map(|session| session.kind == SessionKind::Build)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            let can_inject = is_build && g.turn_cancels.contains_key(&session_id);
+            let queue = g
+                .prompt_queues
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+            queue.steer_queued(entry_id, can_inject)?
+        };
+        self.persist_prompt_queue(session_id);
+        Ok(receipt)
     }
 
     pub fn session_steer(&self, session_id: Uuid, text: String) -> Result<SteeringReceipt> {
-        let mut g = self.inner.lock();
-        let is_build = g
-            .sessions
-            .get(&session_id)
-            .map(|session| session.kind == SessionKind::Build)
-            .ok_or_else(|| anyhow!("unknown session"))?;
-        let can_inject = is_build && g.turn_cancels.contains_key(&session_id);
-        g.prompt_queues
-            .entry(session_id)
-            .or_default()
-            .steer_text(text, can_inject)
+        let receipt = {
+            let mut g = self.inner.lock();
+            let is_build = g
+                .sessions
+                .get(&session_id)
+                .map(|session| session.kind == SessionKind::Build)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            let can_inject = is_build && g.turn_cancels.contains_key(&session_id);
+            g.prompt_queues
+                .entry(session_id)
+                .or_default()
+                .steer_text(text, can_inject)?
+        };
+        self.persist_prompt_queue(session_id);
+        Ok(receipt)
     }
 
     /// Cancel the in-flight turn for `session_id`, or every active turn when
@@ -2526,6 +2569,18 @@ impl AgentHostHandle {
     /// Multiple sessions may run turns concurrently; each keeps its own
     /// cancellation token keyed by `session_id`.
     pub async fn session_prompt(&self, session_id: Uuid, prompt: String) -> Result<String> {
+        self.session_prompt_with_max_rounds(session_id, prompt, None)
+            .await
+    }
+
+    /// Like [`session_prompt`] but applies a per-turn model-round budget
+    /// (orchestration `RunBounds.max_rounds`). `None` uses host default.
+    pub async fn session_prompt_with_max_rounds(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+    ) -> Result<String> {
         self.ensure_transcript_loaded(session_id)?;
         let (cwd, model, effort, plan_mode, kind, cancel, event_tx) = {
             let mut g = self.inner.lock();
@@ -2541,6 +2596,11 @@ impl AgentHostHandle {
             let effort = g.effort;
             let cancel = CancellationToken::new();
             g.turn_cancels.insert(session_id, cancel.clone());
+            if let Some(n) = max_rounds {
+                g.turn_max_rounds.insert(session_id, n.max(1));
+            } else {
+                g.turn_max_rounds.remove(&session_id);
+            }
             g.active_session = Some(session_id);
             let event_tx = g.event_tx.clone();
             let s = g
@@ -2595,11 +2655,13 @@ impl AgentHostHandle {
         {
             let mut g = self.inner.lock();
             g.turn_cancels.remove(&session_id);
+            g.turn_max_rounds.remove(&session_id);
             g.prompt_queues
                 .entry(session_id)
                 .or_default()
                 .defer_pending_steering();
         }
+        self.persist_prompt_queue(session_id);
         busy_guard.armed = false;
 
         // Append assistant turn(s) written by push_assistant.
@@ -2626,6 +2688,19 @@ impl AgentHostHandle {
                 });
                 Err(e)
             }
+        }
+    }
+
+    fn persist_prompt_queue(&self, session_id: Uuid) {
+        let queue = {
+            let g = self.inner.lock();
+            g.prompt_queues.get(&session_id).cloned()
+        };
+        if let Some(q) = queue {
+            let _ = session_store::save_prompt_queue(session_id, &q);
+        } else {
+            // Clear on-disk when queue was removed entirely.
+            let _ = session_store::save_prompt_queue(session_id, &SessionPromptQueue::default());
         }
     }
 
@@ -3342,7 +3417,11 @@ impl AgentHostHandle {
     ) -> Result<String> {
         let max_rounds = {
             let g = self.inner.lock();
-            g.max_agent_rounds
+            // Per-turn orchestration override wins over host-wide config.
+            g.turn_max_rounds
+                .get(&session_id)
+                .copied()
+                .or(g.max_agent_rounds)
                 .map(|n| n.max(1) as usize)
                 .unwrap_or(24)
                 .min(24)

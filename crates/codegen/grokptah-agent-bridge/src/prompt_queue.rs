@@ -72,13 +72,24 @@ pub struct SteeringReceipt {
     pub entries: Vec<PromptQueueEntry>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionPromptQueue {
+    #[serde(default)]
     queued: VecDeque<PromptQueueEntry>,
+    /// Mid-turn only; not meaningful after process restart (drained or deferred).
+    #[serde(default)]
     steering: VecDeque<PromptQueueEntry>,
 }
 
 impl SessionPromptQueue {
+    /// Durable snapshot: queued follow-ups only (steering is process-local).
+    pub fn durable_snapshot(&self) -> Self {
+        Self {
+            queued: self.queued.clone(),
+            steering: VecDeque::new(),
+        }
+    }
+
     pub fn list(&self) -> Vec<PromptQueueEntry> {
         self.queued.iter().cloned().collect()
     }
