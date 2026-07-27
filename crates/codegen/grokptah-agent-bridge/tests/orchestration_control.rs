@@ -8,19 +8,21 @@ use grokptah_agent_bridge::orchestration::{
     WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    discovered_tool_names, set_grokptah_home_override, start_control_server, AgentHost, EventBus,
-    HostConfig, SessionKind, SessionUpdate, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    discovered_tool_names, home_override_serial, set_grokptah_home_override, start_control_server,
+    AgentHost, EventBus, HostConfig, SessionKind, SessionUpdate, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
 
-fn setup_home() -> tempfile::TempDir {
+/// Serializes home-override + instance-lock across tests (same as bridge lifecycle tests).
+fn setup_home() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+    let guard = home_override_serial();
     let d = tempdir().unwrap();
     let home = d.path().join(".grokptah");
     std::fs::create_dir_all(&home).unwrap();
     set_grokptah_home_override(Some(home));
-    d
+    (d, guard)
 }
 
 fn started_host() -> grokptah_agent_bridge::AgentHostHandle {
@@ -34,7 +36,7 @@ fn started_host() -> grokptah_agent_bridge::AgentHostHandle {
 
 #[test]
 fn dual_subscriber_same_ordered_sequences() {
-    let _home = setup_home();
+    let (_home, _lock) = setup_home();
     let host = started_host();
     let bus = host.event_bus();
     let mut gui = bus.subscribe();
@@ -84,7 +86,7 @@ fn schema_snapshot_excludes_forbidden() {
 
 #[test]
 fn idempotency_conflict_and_replay() {
-    let home = setup_home();
+    let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
@@ -140,7 +142,7 @@ fn idempotency_conflict_and_replay() {
 
 #[test]
 fn workspace_mismatch_fail_closed() {
-    let home = setup_home();
+    let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
     let other = tempdir().unwrap();
@@ -167,7 +169,7 @@ fn workspace_mismatch_fail_closed() {
 
 #[test]
 fn reject_shell_and_admin_prompts() {
-    let home = setup_home();
+    let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
@@ -224,7 +226,7 @@ fn restart_interrupted_no_auto_resume() {
 
 #[tokio::test]
 async fn e2e_mcp_client_valid_and_invalid_token() {
-    let home = setup_home();
+    let (home, _lock) = setup_home();
     let ws = tempdir().unwrap();
     let host = started_host();
     host.set_project_cwd(ws.path()).unwrap();
