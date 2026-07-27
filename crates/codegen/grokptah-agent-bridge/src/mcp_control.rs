@@ -248,10 +248,7 @@ async fn dispatch_tool(
         }
         "ptah_get_events" => {
             let after = args.get("after_seq").and_then(|v| v.as_u64()).unwrap_or(0);
-            let limit = args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(50) as usize;
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let run_id = args.get("run_id").and_then(|v| v.as_str());
             orch.get_events(auth, run_id, after, limit)
         }
@@ -272,9 +269,9 @@ async fn dispatch_tool(
             let session_id = uuid_arg(args, "session_id")?;
             let workspace = PathBuf::from(str_arg(args, "workspace")?);
             let prompt = str_arg(args, "prompt")?.to_string();
-            let bounds = args.get("bounds").and_then(|v| {
-                serde_json::from_value::<RunBounds>(v.clone()).ok()
-            });
+            let bounds = args
+                .get("bounds")
+                .and_then(|v| serde_json::from_value::<RunBounds>(v.clone()).ok());
             orch.submit_task(auth, &request_id, session_id, &workspace, prompt, bounds)
                 .await
         }
@@ -382,10 +379,7 @@ mod tests {
         assert_eq!(good.status(), 200);
         let body: Value = good.json().await.unwrap();
         let tools = body["result"]["tools"].as_array().unwrap();
-        let names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"ptah_list_sessions"));
         assert!(!names.iter().any(|n| *n == "run_terminal_cmd"));
 

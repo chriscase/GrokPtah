@@ -91,10 +91,7 @@ impl OrchStore {
         atomic_write_json(&self.idemp_path(&receipt.request_id), receipt)
     }
 
-    pub fn load_idempotency(
-        &self,
-        request_id: &str,
-    ) -> anyhow::Result<Option<IdempotencyReceipt>> {
+    pub fn load_idempotency(&self, request_id: &str) -> anyhow::Result<Option<IdempotencyReceipt>> {
         let path = self.idemp_path(request_id);
         if !path.is_file() {
             return Ok(None);

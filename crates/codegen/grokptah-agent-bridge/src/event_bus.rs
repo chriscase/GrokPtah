@@ -107,10 +107,7 @@ impl EventBus {
     }
 
     /// Compatibility with existing `let _ = event_tx.send(...)` call sites.
-    pub fn send(
-        &self,
-        update: SessionUpdate,
-    ) -> Result<(), mpsc::error::SendError<SessionUpdate>> {
+    pub fn send(&self, update: SessionUpdate) -> Result<(), mpsc::error::SendError<SessionUpdate>> {
         self.publish(update);
         Ok(())
     }
@@ -193,7 +190,9 @@ pub fn redact_update(mut update: SessionUpdate) -> SessionUpdate {
             *text = truncate_redact(text, 4_000);
         }
         SessionUpdate::FileEdit { unified_diff, .. }
-        | SessionUpdate::ShellOutput { data: unified_diff, .. } => {
+        | SessionUpdate::ShellOutput {
+            data: unified_diff, ..
+        } => {
             *unified_diff = truncate_redact(unified_diff, 4_000);
         }
         SessionUpdate::SteeringInjected { text, .. } => {

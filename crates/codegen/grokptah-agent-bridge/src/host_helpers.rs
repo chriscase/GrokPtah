@@ -80,11 +80,7 @@ pub(crate) fn push_tool(
     }
 }
 
-pub(crate) fn emit_message(
-    tx: &crate::event_bus::EventBus,
-    session_id: Uuid,
-    text: &str,
-) {
+pub(crate) fn emit_message(tx: &crate::event_bus::EventBus, session_id: Uuid, text: &str) {
     let _ = tx.send(SessionUpdate::AgentMessageChunk {
         session_id,
         text: text.into(),
@@ -112,11 +108,7 @@ pub(crate) fn surface_rate_limit_or_error(
 }
 
 #[allow(dead_code)] // reserved if we re-enable quiet diagnostics
-pub(crate) fn emit_thought(
-    tx: &crate::event_bus::EventBus,
-    session_id: Uuid,
-    text: &str,
-) {
+pub(crate) fn emit_thought(tx: &crate::event_bus::EventBus, session_id: Uuid, text: &str) {
     if text.is_empty() {
         return;
     }

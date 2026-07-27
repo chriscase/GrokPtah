@@ -159,14 +159,7 @@ fn workspace_mismatch_fail_closed() {
     );
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let err = orch
-        .queue_prompt(
-            &auth,
-            "r",
-            session.id,
-            other.path(),
-            "x".into(),
-            false,
-        )
+        .queue_prompt(&auth, "r", session.id, other.path(), "x".into(), false)
         .unwrap_err();
     assert_eq!(err.code.as_str(), "workspace_mismatch");
     set_grokptah_home_override(None);
@@ -195,14 +188,7 @@ fn reject_shell_and_admin_prompts() {
         .queue_prompt(&auth, "a", session.id, ws.path(), "!rm -rf /".into(), false)
         .is_err());
     assert!(orch
-        .queue_prompt(
-            &auth,
-            "b",
-            session.id,
-            ws.path(),
-            "/mcp list".into(),
-            false
-        )
+        .queue_prompt(&auth, "b", session.id, ws.path(), "/mcp list".into(), false)
         .is_err());
     set_grokptah_home_override(None);
 }
@@ -294,7 +280,12 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
         .send()
         .await
         .unwrap();
-    assert_eq!(q.status(), 200, "body={}", q.text().await.unwrap_or_default());
+    assert_eq!(
+        q.status(),
+        200,
+        "body={}",
+        q.text().await.unwrap_or_default()
+    );
 
     // workspace mismatch does not mutate
     let before = host.session_queue_list(session.id).unwrap().len();

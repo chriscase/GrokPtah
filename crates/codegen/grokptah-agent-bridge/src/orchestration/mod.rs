@@ -11,6 +11,6 @@ pub use authz::{canonical_workspace, AuthContext, WorkspaceAllowlist};
 pub use service::{OrchestrationConfig, OrchestrationService};
 pub use store::OrchStore;
 pub use types::{
-    hash_payload, prompt_preview, reject_control_prompt, AuditEntry, CONTROL_TOOLS,
-    FORBIDDEN_TOOLS, IdempotencyReceipt, OrchError, OrchErrorCode, RunBounds, RunRecord, RunState,
+    hash_payload, prompt_preview, reject_control_prompt, AuditEntry, IdempotencyReceipt, OrchError,
+    OrchErrorCode, RunBounds, RunRecord, RunState, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };

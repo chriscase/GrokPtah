@@ -278,7 +278,9 @@ impl OrchestrationService {
         let mut observed = Vec::new();
         for e in page.entries {
             match e.update {
-                crate::events::SessionUpdate::ShellSessionStarted { command, call_id, .. } => {
+                crate::events::SessionUpdate::ShellSessionStarted {
+                    command, call_id, ..
+                } => {
                     if command.to_ascii_lowercase().contains("test")
                         || command.contains("cargo test")
                         || command.contains("npm test")
@@ -702,7 +704,11 @@ impl OrchestrationService {
             Some(&claimed.display().to_string()),
             "accepted",
             None,
-            if cancelled { "cancelled" } else { "no active turn" },
+            if cancelled {
+                "cancelled"
+            } else {
+                "no active turn"
+            },
         );
         Ok(response)
     }

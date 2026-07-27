@@ -6,8 +6,8 @@
 mod agents_personas;
 mod auth_store;
 mod discover;
-pub mod event_bus;
 pub mod eval_oracle;
+pub mod event_bus;
 mod events;
 mod exec_risk;
 mod gateway_config;
@@ -66,12 +66,12 @@ pub use event_bus::{EventBus, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use mcp_control::{discovered_tool_names, start_control_server, ControlServerHandle};
-pub use orchestration::{
-    OrchestrationConfig, OrchestrationService, OrchStore, RunBounds, RunRecord, RunState,
-    WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
-};
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
+pub use orchestration::{
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState,
+    WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+};
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use search_engine::{SearchHit, SearchQuery};
 pub use session::{SessionKind, SessionSummary, TranscriptEntry};
