@@ -108,8 +108,8 @@ async fn rpc_handler(
     headers: HeaderMap,
     Json(req): Json<JsonRpcReq>,
 ) -> Response {
-    // Strict JSON-RPC 2.0 version.
-    if !req.jsonrpc.is_empty() && req.jsonrpc != "2.0" {
+    // Strict JSON-RPC 2.0 — missing/empty version is rejected (no silent default).
+    if req.jsonrpc != "2.0" {
         return json_err(
             req.id,
             StatusCode::BAD_REQUEST,

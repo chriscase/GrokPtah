@@ -567,20 +567,45 @@ impl OrchestrationService {
         let max_ms = bounds.max_duration_ms;
         let max_rounds = bounds.max_rounds;
 
+        // Live subscriber for incremental durable aggregates (survives journal rollover).
+        let mut event_rx = bus.subscribe();
         let join = tokio::spawn(async move {
             let prompt_fut = host.session_prompt_with_max_rounds(
                 session_id,
                 prompt_owned,
                 Some(max_rounds.max(1)),
             );
-            let result =
-                tokio::time::timeout(std::time::Duration::from_millis(max_ms.max(1)), prompt_fut)
-                    .await;
+            tokio::pin!(prompt_fut);
+            let deadline = tokio::time::sleep(std::time::Duration::from_millis(max_ms.max(1)));
+            tokio::pin!(deadline);
 
-            let timed_out = result.is_err();
-            if timed_out {
-                // Cancel turn, kill shells/subagents, and await teardown.
-                let _ = host.cancel_turn_and_await(Some(session_id)).await;
+            // Drive the turn until completion or duration limit. On timeout we
+            // cancel while the future is still alive (turn_cancels still present),
+            // await shell teardown, then await the future — never drop it first.
+            let mut timed_out = false;
+            let result: Result<String, anyhow::Error> = loop {
+                tokio::select! {
+                    biased;
+                    ev = event_rx.recv() => {
+                        if let Some(update) = ev {
+                            apply_run_aggregate(&store, &rid, session_id, &update);
+                        }
+                    }
+                    r = &mut prompt_fut => {
+                        break r;
+                    }
+                    _ = &mut deadline, if !timed_out => {
+                        timed_out = true;
+                        // Future still pinned — cancel_turn finds active turn.
+                        let _ = host.cancel_turn_and_await(Some(session_id)).await;
+                        // Fall through: keep selecting until prompt_fut completes.
+                    }
+                }
+            };
+
+            // Drain any trailing events after turn ends (best-effort).
+            while let Ok(update) = event_rx.try_recv() {
+                apply_run_aggregate(&store, &rid, session_id, &update);
             }
 
             let end_seq = bus.current_seq();
@@ -594,75 +619,40 @@ impl OrchestrationService {
                 }
                 r.end_seq = Some(end_seq);
                 r.updated_at = Utc::now();
-                // Collect aggregates from events before they roll off.
-                if let Ok(entries) = bus.read_range_all(
-                    r.start_seq.map(|s| s.saturating_sub(1)).unwrap_or(0),
-                    Some(end_seq),
-                    Some(session_id),
-                ) {
-                    for e in entries {
-                        match e.update {
-                            crate::events::SessionUpdate::FileEdit { path, summary, .. } => {
-                                r.aggregates.changes.push(ChangeRecord { path, summary });
-                            }
-                            crate::events::SessionUpdate::ShellSessionStarted {
-                                command,
-                                call_id,
-                                ..
-                            } if is_recognized_test_command(&command) => {
-                                r.aggregates.tests.push(TestObservation {
-                                    call_id,
-                                    command: Some(command),
-                                    status: "started".into(),
-                                    exit_code: None,
-                                    cancelled: None,
-                                });
-                            }
-                            crate::events::SessionUpdate::ShellSessionEnded {
-                                call_id,
-                                exit_code,
-                                cancelled,
-                                ..
-                            } => {
-                                if let Some(t) =
-                                    r.aggregates.tests.iter_mut().find(|t| t.call_id == call_id)
-                                {
-                                    t.status = "ended".into();
-                                    t.exit_code = exit_code;
-                                    t.cancelled = Some(cancelled);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                match result {
-                    Ok(Ok(text)) => {
-                        if crate::host_helpers::is_round_limit_stop_message(&text) {
-                            r.state = RunState::LimitReached;
-                            r.terminal_result = Some("limit_reached".into());
-                            r.error_code = Some("limit_reached".into());
-                        } else {
-                            r.state = RunState::Completed;
-                            r.terminal_result = Some("completed".into());
-                        }
+                if timed_out {
+                    r.state = RunState::LimitReached;
+                    r.terminal_result = Some("limit_reached".into());
+                    r.error_code = Some("limit_reached".into());
+                    if let Ok(text) = &result {
                         r.final_response = Some(
-                            crate::textutil::truncate_at_char_boundary(&text, 8_000).to_string(),
+                            crate::textutil::truncate_at_char_boundary(text, 8_000).to_string(),
                         );
                     }
-                    Ok(Err(e)) => {
-                        r.state = RunState::Failed;
-                        r.terminal_result = Some("failed".into());
-                        r.error_code = Some("internal".into());
-                        r.final_response = Some(
-                            crate::textutil::truncate_at_char_boundary(&e.to_string(), 2_000)
-                                .to_string(),
-                        );
-                    }
-                    Err(_) => {
-                        r.state = RunState::LimitReached;
-                        r.terminal_result = Some("limit_reached".into());
-                        r.error_code = Some("limit_reached".into());
+                } else {
+                    match result {
+                        Ok(text) => {
+                            if crate::host_helpers::is_round_limit_stop_message(&text) {
+                                r.state = RunState::LimitReached;
+                                r.terminal_result = Some("limit_reached".into());
+                                r.error_code = Some("limit_reached".into());
+                            } else {
+                                r.state = RunState::Completed;
+                                r.terminal_result = Some("completed".into());
+                            }
+                            r.final_response = Some(
+                                crate::textutil::truncate_at_char_boundary(&text, 8_000)
+                                    .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            r.state = RunState::Failed;
+                            r.terminal_result = Some("failed".into());
+                            r.error_code = Some("internal".into());
+                            r.final_response = Some(
+                                crate::textutil::truncate_at_char_boundary(&e.to_string(), 2_000)
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
                 let _ = store.save_run(&r);
@@ -1040,6 +1030,71 @@ fn canonical_cmp(a: &Path, b: &Path) -> Result<(), ()> {
         Ok(())
     } else {
         Err(())
+    }
+}
+
+/// Incrementally persist run-scoped aggregates so journal rollover cannot erase them.
+fn apply_run_aggregate(
+    store: &OrchStore,
+    run_id: &str,
+    session_id: Uuid,
+    update: &crate::events::SessionUpdate,
+) {
+    if session_id_of(update) != Some(session_id) {
+        return;
+    }
+    let Ok(Some(mut r)) = store.load_run(run_id) else {
+        return;
+    };
+    if r.state.is_terminal() {
+        return;
+    }
+    match update {
+        crate::events::SessionUpdate::FileEdit { path, summary, .. } => {
+            if !r.aggregates.changes.iter().any(|c| c.path == *path) {
+                r.aggregates.changes.push(ChangeRecord {
+                    path: path.clone(),
+                    summary: summary.clone(),
+                });
+                r.updated_at = Utc::now();
+                let _ = store.save_run(&r);
+            }
+        }
+        crate::events::SessionUpdate::ShellSessionStarted {
+            command, call_id, ..
+        } if is_recognized_test_command(command) => {
+            if !r.aggregates.tests.iter().any(|t| t.call_id == *call_id) {
+                r.aggregates.tests.push(TestObservation {
+                    call_id: call_id.clone(),
+                    command: Some(command.clone()),
+                    status: "started".into(),
+                    exit_code: None,
+                    cancelled: None,
+                });
+                r.updated_at = Utc::now();
+                let _ = store.save_run(&r);
+            }
+        }
+        crate::events::SessionUpdate::ShellSessionEnded {
+            call_id,
+            exit_code,
+            cancelled,
+            ..
+        } => {
+            if let Some(t) = r
+                .aggregates
+                .tests
+                .iter_mut()
+                .find(|t| t.call_id == *call_id)
+            {
+                t.status = "ended".into();
+                t.exit_code = *exit_code;
+                t.cancelled = Some(*cancelled);
+                r.updated_at = Utc::now();
+                let _ = store.save_run(&r);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -18,6 +18,7 @@ mod instance_lock;
 mod isolation;
 mod local_tools;
 pub mod mcp_control;
+pub mod mcp_control_client;
 mod mcp_runtime;
 mod memory;
 mod models_catalog;
@@ -67,6 +68,7 @@ pub use event_bus::{EventBus, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use mcp_control::{discovered_tool_names, start_control_server, ControlServerHandle};
+pub use mcp_control_client::{ListedTool, McpControlClient};
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
 pub use orchestration::{

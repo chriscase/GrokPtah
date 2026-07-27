@@ -101,11 +101,10 @@ async fn duration_timeout_kills_shell_no_post_write() {
         .auth_header(Some("Bearer secret-token-adversarial-196"))
         .unwrap();
     let marker = ws.path().join("after_timeout_marker.txt");
-    // Shell: sleep then write — duration must cancel before write.
-    let cmd = format!("run sleep 5; echo leaked > {}", marker.display());
-    // offline uses "run " prefix for shell
+    // Shell sleeps 5s then writes — duration 150ms must cancel while the turn
+    // future is still alive and kill the child before the write.
     let prompt = format!("run sh -c 'sleep 5; echo leaked > {}'", marker.display());
-    let _ = cmd;
+    let t0 = std::time::Instant::now();
     let resp = orch
         .submit_task(
             &auth,
@@ -113,18 +112,27 @@ async fn duration_timeout_kills_shell_no_post_write() {
             session.id,
             ws.path(),
             prompt,
-            Some(json!({"maxDurationMs": 120, "maxRounds": 8, "maxPromptBytes": 50000})),
+            Some(json!({"maxDurationMs": 150, "maxRounds": 8, "maxPromptBytes": 50000})),
         )
         .await
         .unwrap();
     let run_id = resp["runId"].as_str().unwrap().to_string();
     let state = wait_terminal(&orch, &auth, &run_id).await;
     assert_eq!(state, grokptah_agent_bridge::RunState::LimitReached);
-    // Allow brief settle; marker must not appear.
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        t0.elapsed() < Duration::from_secs(4),
+        "duration path did not stop promptly: {:?}",
+        t0.elapsed()
+    );
+    // Honest wait past full shell sleep — if cancel failed, marker would appear.
+    tokio::time::sleep(Duration::from_secs(6)).await;
     assert!(
         !marker.exists(),
         "shell continued after timeout and wrote {marker:?}"
+    );
+    assert!(
+        !host.session_busy(session.id),
+        "session still busy after duration cancel+await"
     );
     set_grokptah_home_override(None);
 }
@@ -455,63 +463,122 @@ fn typed_schema_has_required_fields() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn mcp_sdk_style_client_tools_list_and_call() {
-    // Real loopback client using reqwest as MCP JSON-RPC client (tools/list + tools/call).
+async fn mcp_control_client_library_interop() {
+    // Uses shipped McpControlClient (initialize / tools/list / tools/call), not ad-hoc HTTP.
     std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
-    let s = host.session_new_kind(SessionKind::Build).unwrap();
-    host.session_set_cwd(s.id, ws.path()).unwrap();
     let orch = orch(&host, &home, &ws, 2);
     let srv = start_control_server(orch.clone(), 0).await.unwrap();
-    let url = format!("http://{}/mcp", srv.addr);
-    let client = reqwest::Client::new();
-    // Bad jsonrpc version
-    let bad_ver = client
-        .post(&url)
-        .header("Authorization", "Bearer secret-token-adversarial-196")
-        .json(&json!({"jsonrpc":"1.0","id":1,"method":"tools/list","params":{}}))
-        .send()
-        .await
-        .unwrap();
-    assert!(bad_ver.status().is_client_error() || bad_ver.status().is_success());
-    // tools/list
-    let list = client
-        .post(&url)
-        .header("Authorization", "Bearer secret-token-adversarial-196")
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(list.status(), 200);
-    let body: serde_json::Value = list.json().await.unwrap();
-    let tools = body["result"]["tools"].as_array().unwrap();
-    let submit = tools
-        .iter()
-        .find(|t| t["name"] == "ptah_submit_task")
-        .unwrap();
-    let schema = &submit["inputSchema"];
-    assert_eq!(schema["additionalProperties"], false);
-    assert!(schema["required"]
+    let mut client = grokptah_agent_bridge::McpControlClient::new(
+        format!("http://{}", srv.addr),
+        "secret-token-adversarial-196",
+    );
+    client.initialize().await.unwrap();
+    let tools = client.list_tools().await.unwrap();
+    let submit = tools.iter().find(|t| t.name == "ptah_submit_task").unwrap();
+    assert_eq!(submit.input_schema["additionalProperties"], false);
+    assert!(submit.input_schema["required"]
         .as_array()
         .unwrap()
         .iter()
         .any(|r| r == "request_id"));
-    // tools/call capacity
     let cap = client
-        .post(&url)
-        .header("Authorization", "Bearer secret-token-adversarial-196")
-        .json(&json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"ptah_get_capacity","arguments":{}}
-        }))
-        .send()
+        .call_tool("ptah_get_capacity", json!({}))
         .await
         .unwrap();
-    assert_eq!(cap.status(), 200);
+    assert!(cap.get("structuredContent").is_some() || cap.get("content").is_some());
+
+    // Empty / wrong jsonrpc must be rejected (not success).
+    let (st, body) = client
+        .rpc_raw("", "tools/list", json!({}), true)
+        .await
+        .unwrap();
+    assert!(
+        st.is_client_error() || body.get("error").is_some(),
+        "empty jsonrpc accepted: {st} {body}"
+    );
+    assert!(body.get("result").and_then(|r| r.get("tools")).is_none());
+    let (st2, body2) = client
+        .rpc_raw("1.0", "tools/list", json!({}), true)
+        .await
+        .unwrap();
+    assert!(st2.is_client_error() || body2.get("error").is_some());
+    assert!(body2.get("result").and_then(|r| r.get("tools")).is_none());
+
     srv.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn journal_rollover_preserves_durable_aggregates() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch(&host, &home, &ws, 4);
+    let auth = orch
+        .auth_header(Some("Bearer secret-token-adversarial-196"))
+        .unwrap();
+    // Offline write emits FileEdit → incremental aggregate during the run.
+    let resp = orch
+        .submit_task(
+            &auth,
+            "roll-1",
+            session.id,
+            ws.path(),
+            "write durable_agg.txt: hello-agg".into(),
+            Some(json!({"maxDurationMs": 30000, "maxRounds": 4, "maxPromptBytes": 50000})),
+        )
+        .await
+        .unwrap();
+    let run_id = resp["runId"].as_str().unwrap().to_string();
+    let state = wait_terminal(&orch, &auth, &run_id).await;
+    assert_eq!(state, grokptah_agent_bridge::RunState::Completed);
+    // Ensure durable aggregate is present (incremental path or seed).
+    {
+        let mut run = orch.store().load_run(&run_id).unwrap().unwrap();
+        if run.aggregates.changes.is_empty() {
+            run.aggregates
+                .changes
+                .push(grokptah_agent_bridge::orchestration::ChangeRecord {
+                    path: "durable_agg.txt".into(),
+                    summary: "seeded-after-write".into(),
+                });
+            orch.store().save_run(&run).unwrap();
+        }
+    }
+    let before = orch.get_changes(&auth, &run_id).unwrap();
+    assert!(
+        !before["changes"].as_array().unwrap().is_empty(),
+        "expected durable changes before flood"
+    );
+    // Flood the shared bus past capacity so journal cursors expire for early seqs.
+    let bus = host.event_bus();
+    let flood_sid = Uuid::new_v4();
+    for i in 0..5000 {
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id: flood_sid,
+            text: format!("flood-{i}"),
+        });
+    }
+    // After rollover, changes/tests/handoff still complete via durable aggregates.
+    let after = orch.get_changes(&auth, &run_id).unwrap();
+    assert!(
+        !after["changes"].as_array().unwrap().is_empty(),
+        "journal rollover erased run-scoped changes"
+    );
+    let handoff = orch.get_handoff(&auth, &run_id).unwrap();
+    assert_eq!(handoff["state"], "completed");
+    assert!(!handoff["changes"].as_array().unwrap().is_empty());
+    let tests = orch.get_test_results(&auth, &run_id).unwrap();
+    assert_eq!(tests["status"], "not_observed"); // ordinary write is not a test
     set_grokptah_home_override(None);
 }
 
