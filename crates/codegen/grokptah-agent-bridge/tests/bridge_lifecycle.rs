@@ -1087,6 +1087,255 @@ async fn allow_rule_suppresses_shell_prompt() {
 }
 
 #[tokio::test]
+async fn shell_exit_code_and_failure_status_reach_session_events() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    host.session_prompt(session.id, "run printf success".into())
+        .await
+        .unwrap();
+    let success_events = drain_until_turn_complete(&mut rx).await;
+    assert!(success_events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ShellSessionEnded {
+            exit_code: Some(0),
+            cancelled: false,
+            ..
+        }
+    )));
+    assert!(success_events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ToolCallUpdate {
+            status: grokptah_agent_bridge::ToolCallStatus::Completed,
+            output: Some(output),
+            ..
+        } if output.contains("(exit 0)")
+    )));
+
+    host.session_prompt(session.id, "run printf failure; exit 2".into())
+        .await
+        .unwrap();
+    let failure_events = drain_until_turn_complete(&mut rx).await;
+    assert!(failure_events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ShellSessionEnded {
+            exit_code: Some(2),
+            cancelled: false,
+            ..
+        }
+    )));
+    assert!(failure_events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ToolCallUpdate {
+            status: grokptah_agent_bridge::ToolCallStatus::Failed,
+            output: Some(output),
+            ..
+        } if output.contains("(exit 2)")
+    )));
+}
+
+#[tokio::test]
+async fn cancelled_shell_is_distinct_from_nonzero_exit() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let runner = {
+        let host = host.clone();
+        tokio::spawn(async move { host.session_prompt(session.id, "run sleep 10".into()).await })
+    };
+
+    loop {
+        let event = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("shell did not start")
+            .expect("event channel closed");
+        if matches!(event, SessionUpdate::ShellSessionStarted { .. }) {
+            break;
+        }
+    }
+    host.cancel_turn(Some(session.id)).unwrap();
+    timeout(Duration::from_secs(3), runner)
+        .await
+        .expect("cancelled shell did not finish")
+        .unwrap()
+        .unwrap();
+
+    let events = drain_until_turn_complete(&mut rx).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ShellSessionEnded {
+            exit_code: None,
+            cancelled: true,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ToolCallUpdate {
+            status: grokptah_agent_bridge::ToolCallStatus::Failed,
+            output: Some(output),
+            ..
+        } if output.contains("(cancelled)")
+    )));
+}
+
+#[tokio::test]
+async fn bridge_prompt_queue_mutates_reorders_and_drains_authoritatively() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig::default());
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let entries = host
+        .session_queue_add(session.id, "first".into(), false)
+        .unwrap();
+    let first = entries[0].clone();
+    let entries = host
+        .session_queue_add(session.id, "second".into(), false)
+        .unwrap();
+    let second = entries[1].clone();
+    host.session_queue_edit(session.id, &first.id, first.version, "edited first".into())
+        .unwrap();
+    let entries = host.session_queue_move(session.id, &second.id, 0).unwrap();
+    assert_eq!(entries[0].id, second.id);
+
+    let run_next = host.session_queue_run_next(session.id, &first.id).unwrap();
+    assert!(!run_next.cancelled_active);
+    assert!(run_next.entries[0].priority);
+    let drained = host.session_queue_take_next(session.id).unwrap();
+    let batch = drained.batch.unwrap();
+    assert_eq!(batch.entries.len(), 1, "run-next must not combine");
+    assert_eq!(batch.text, "edited first");
+    assert_eq!(drained.entries[0].id, second.id);
+
+    host.session_queue_remove(session.id, &second.id).unwrap();
+    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn steer_now_injects_once_without_cancelling_active_turn() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let runner = {
+        let host = host.clone();
+        tokio::spawn(async move { host.session_prompt(session.id, "run sleep 1".into()).await })
+    };
+    loop {
+        let event = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("shell did not start")
+            .expect("event channel closed");
+        if matches!(event, SessionUpdate::ShellSessionStarted { .. }) {
+            break;
+        }
+    }
+
+    let receipt = host
+        .session_steer(session.id, "focus on the failing test".into())
+        .unwrap();
+    assert_eq!(
+        receipt.disposition,
+        grokptah_agent_bridge::SteeringDisposition::Pending
+    );
+    assert!(
+        host.session_queue_list(session.id).unwrap().is_empty(),
+        "pending steering must not remain in the normal queue"
+    );
+
+    timeout(Duration::from_secs(3), runner)
+        .await
+        .expect("active turn did not finish")
+        .unwrap()
+        .unwrap();
+    let events = drain_until_turn_complete(&mut rx).await;
+    let injected: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionUpdate::SteeringInjected {
+                steering_id, text, ..
+            } => Some((steering_id, text)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(injected.len(), 1);
+    assert_eq!(injected[0].0, &receipt.entry.id);
+    assert_eq!(injected[0].1, "focus on the failing test");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            SessionUpdate::TurnComplete {
+                cancelled: true,
+                ..
+            }
+        )),
+        "steer-now must not cancel the active turn"
+    );
+    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+
+    let transcript = host.session_transcript(session.id).unwrap();
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|entry| {
+                entry.role == "system" && entry.text.contains("focus on the failing test")
+            })
+            .count(),
+        1,
+        "steering must be persisted exactly once"
+    );
+}
+
+#[tokio::test]
+async fn steer_at_idle_boundary_is_preserved_as_run_next_queue_entry() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig::default());
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let receipt = host
+        .session_steer(session.id, "late steering text".into())
+        .unwrap();
+
+    assert_eq!(
+        receipt.disposition,
+        grokptah_agent_bridge::SteeringDisposition::Queued
+    );
+    assert_eq!(receipt.entries.len(), 1);
+    assert!(receipt.entries[0].priority);
+    let drained = host.session_queue_take_next(session.id).unwrap();
+    assert_eq!(drained.batch.unwrap().text, "late steering text");
+}
+
+#[tokio::test]
 async fn concurrent_sessions_shells_do_not_kill_each_other() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();

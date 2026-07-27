@@ -7,6 +7,7 @@ mod agents_personas;
 mod auth_store;
 mod discover;
 pub mod eval_oracle;
+pub mod event_bus;
 mod events;
 mod exec_risk;
 mod gateway_config;
@@ -16,12 +17,15 @@ mod host_helpers;
 mod instance_lock;
 mod isolation;
 mod local_tools;
+pub mod mcp_control;
 mod mcp_runtime;
 mod memory;
 mod models_catalog;
+pub mod orchestration;
 mod permission;
 mod project_context;
 mod prompt_combine;
+mod prompt_queue;
 mod search_engine;
 mod session;
 mod session_store;
@@ -38,6 +42,10 @@ pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, Ri
 pub use gateway_config::{load as load_gateway_config, save as save_gateway_config, GatewayConfig};
 pub use isolation::prepare_isolation_cwd;
 pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};
+pub use prompt_queue::{
+    PromptQueueBatch, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueTakeResult,
+    SteeringDisposition, SteeringReceipt,
+};
 pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
 
 pub use textutil::{truncate_at_char_boundary, truncate_with_marker};
@@ -54,16 +62,22 @@ pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
     set_grokptah_home_override, set_project_mcp_trusted,
 };
+pub use event_bus::{EventBus, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
+pub use mcp_control::{discovered_tool_names, start_control_server, ControlServerHandle};
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
+pub use orchestration::{
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState,
+    WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+};
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use search_engine::{SearchHit, SearchQuery};
 pub use session::{SessionKind, SessionSummary, TranscriptEntry};
 pub use types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
-    SkillInfo, SubagentInfo,
+    SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
 };
 
 /// Crate version string for about / diagnostics.

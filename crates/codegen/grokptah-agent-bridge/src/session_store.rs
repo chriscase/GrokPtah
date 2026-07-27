@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::discover::{ensure_home, grokptah_home};
 use crate::session::{Session, TranscriptEntry};
-use crate::types::EffortLevel;
+use crate::types::{EffortLevel, SubagentIsolationPreference};
 
 const STORE_VERSION: u32 = 2;
 
@@ -54,6 +54,8 @@ pub struct WorkspaceChrome {
     pub appearance: String,
     #[serde(default)]
     pub always_approve: bool,
+    #[serde(default)]
+    pub subagent_isolation: SubagentIsolationPreference,
 }
 
 impl Default for WorkspaceChrome {
@@ -68,6 +70,7 @@ impl Default for WorkspaceChrome {
             sandbox_profile: "workspace-write".into(),
             appearance: "dark".into(),
             always_approve: false,
+            subagent_isolation: SubagentIsolationPreference::Worktree,
         }
     }
 }
@@ -590,6 +593,7 @@ fn migrate_v1_if_needed() -> Result<()> {
                 v1.appearance
             },
             always_approve: v1.always_approve,
+            subagent_isolation: SubagentIsolationPreference::Worktree,
         };
         save_chrome(&chrome)?;
         return Ok(());
@@ -626,6 +630,7 @@ fn migrate_v1_if_needed() -> Result<()> {
             v1.appearance
         },
         always_approve: v1.always_approve,
+        subagent_isolation: SubagentIsolationPreference::Worktree,
     };
     // Backup then replace
     let bak = path.with_extension("json.v1.bak");

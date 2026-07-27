@@ -31,6 +31,10 @@ keyring = { version = "3", features = ["apple-native", "sync-secret-service", "w
 open = "5"
 fs2 = "0.4"
 dunce = "1"
+# #196: loopback MCP control transport (quarantined from monorepo rmcp stack)
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tower = "0.5"
+http-body-util = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "test-util"] }

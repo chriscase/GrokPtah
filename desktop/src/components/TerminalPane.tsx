@@ -207,10 +207,14 @@ export function TerminalPane({
           if (u.type === "shell_session_ended") {
             if (String(u.call_id) === toolCallIdRef.current) {
               const cancelled = Boolean(u.cancelled);
+              const exitCode =
+                typeof u.exit_code === "number" ? u.exit_code : null;
               term.writeln(
                 cancelled
                   ? "\r\n\x1b[31m[tool shell cancelled]\x1b[0m"
-                  : "\r\n\x1b[90m[tool shell ended]\x1b[0m",
+                  : exitCode === 0
+                    ? "\r\n\x1b[90m[tool shell exited 0]\x1b[0m"
+                    : `\r\n\x1b[31m[tool shell failed: exit ${exitCode ?? "unknown"}]\x1b[0m`,
               );
             }
           }

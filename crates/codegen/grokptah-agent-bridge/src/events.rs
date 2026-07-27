@@ -127,4 +127,10 @@ pub enum SessionUpdate {
         message: String,
         retry_after_ms: Option<u64>,
     },
+    /// A pending non-cancelling steering note reached the model context.
+    SteeringInjected {
+        session_id: Uuid,
+        steering_id: String,
+        text: String,
+    },
 }

@@ -1,6 +1,6 @@
 //! Local in-process tools the bridge can run without a child agent process.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -23,6 +23,8 @@ pub struct ToolResult {
     pub permission_summary: String,
     /// True when the tool was stopped by cancellation.
     pub cancelled: bool,
+    /// Process exit code for shell tools; `None` when killed by cancellation.
+    pub exit_code: Option<i32>,
 }
 
 impl ToolResult {
@@ -42,26 +44,62 @@ impl ToolResult {
             needs_permission,
             permission_summary,
             cancelled: false,
+            exit_code: None,
         }
     }
 }
 
 pub fn resolve_under_cwd(cwd: &Path, rel: &str) -> Result<PathBuf> {
-    let p = if Path::new(rel).is_absolute() {
-        PathBuf::from(rel)
-    } else {
-        cwd.join(rel)
-    };
-    let canon_cwd = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    if p.exists() {
-        let c = dunce::canonicalize(&p).context("canonicalize path")?;
-        if !c.starts_with(&canon_cwd) {
-            anyhow::bail!("path escapes project root: {}", c.display());
-        }
-        Ok(c)
-    } else {
-        Ok(p)
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        anyhow::bail!("absolute paths are not allowed: {}", rel_path.display());
     }
+
+    let mut normalized = PathBuf::new();
+    for component in rel_path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    anyhow::bail!("path escapes project root: {}", rel_path.display());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("absolute paths are not allowed: {}", rel_path.display());
+            }
+        }
+    }
+
+    let canon_cwd = dunce::canonicalize(cwd)
+        .with_context(|| format!("canonicalize project root {}", cwd.display()))?;
+    let mut existing_ancestor = cwd.join(&normalized);
+    let mut missing_parts = Vec::new();
+
+    while std::fs::symlink_metadata(&existing_ancestor).is_err() {
+        let Some(part) = existing_ancestor
+            .file_name()
+            .map(|part| part.to_os_string())
+        else {
+            anyhow::bail!("could not resolve path under project root: {rel}");
+        };
+        missing_parts.push(part);
+        if !existing_ancestor.pop() {
+            anyhow::bail!("could not resolve path under project root: {rel}");
+        }
+    }
+
+    let canon_ancestor = dunce::canonicalize(&existing_ancestor)
+        .with_context(|| format!("canonicalize path {}", existing_ancestor.display()))?;
+    if !canon_ancestor.starts_with(&canon_cwd) {
+        anyhow::bail!("path escapes project root: {}", canon_ancestor.display());
+    }
+
+    let mut resolved = canon_ancestor;
+    for part in missing_parts.into_iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved)
 }
 
 pub async fn tool_read_file(cwd: &Path, path: &str) -> Result<ToolResult> {
@@ -162,7 +200,9 @@ pub async fn tool_grep(cwd: &Path, pattern: &str, path: &str) -> Result<ToolResu
 pub async fn tool_write_file(cwd: &Path, path: &str, content: &str) -> Result<ToolResult> {
     let full = resolve_under_cwd(cwd, path)?;
     if let Some(parent) = full.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create parent {}", parent.display()))?;
     }
     tokio::fs::write(&full, content)
         .await
@@ -182,12 +222,23 @@ pub async fn tool_write_files(cwd: &Path, files: &[(String, String)]) -> Result<
     if files.is_empty() {
         anyhow::bail!("write_files requires a non-empty files array");
     }
-    let mut written = Vec::new();
-    let mut total_bytes = 0usize;
+    let mut resolved = Vec::with_capacity(files.len());
+    let mut destinations = std::collections::HashSet::with_capacity(files.len());
     for (path, content) in files {
         let full = resolve_under_cwd(cwd, path)?;
+        if !destinations.insert(full.clone()) {
+            anyhow::bail!("write_files contains duplicate destination: {path}");
+        }
+        resolved.push((path, content, full));
+    }
+
+    let mut written = Vec::new();
+    let mut total_bytes = 0usize;
+    for (path, content, full) in resolved {
         if let Some(parent) = full.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create parent {}", parent.display()))?;
         }
         tokio::fs::write(&full, content)
             .await
@@ -356,10 +407,15 @@ where
         } else {
             format!("{collected}\n(cancelled)")
         }
-    } else if collected.is_empty() {
-        format!("(exit {})", exit_code.unwrap_or(-1))
     } else {
-        collected
+        let exit_summary = exit_code
+            .map(|code| format!("(exit {code})"))
+            .unwrap_or_else(|| "(terminated without exit code)".into());
+        if collected.is_empty() {
+            exit_summary
+        } else {
+            format!("{}\n{exit_summary}", collected.trim_end())
+        }
     };
 
     Ok(ToolResult {
@@ -370,6 +426,7 @@ where
         needs_permission: true,
         permission_summary: format!("Run shell: {command}"),
         cancelled,
+        exit_code,
     })
 }
 
@@ -463,5 +520,162 @@ mod tests {
             res.err().unwrap().to_string().contains("non-empty"),
             "empty files should error"
         );
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_new_target_outside_project() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+
+        let result = tool_write_file(&project, "../outside.txt", "nope").await;
+
+        assert!(result.is_err());
+        assert!(!parent.path().join("outside.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_files_preflights_entire_batch_before_writing() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let files = vec![
+            ("inside.txt".into(), "would be partial".into()),
+            ("../outside.txt".into(), "nope".into()),
+        ];
+
+        let result = tool_write_files(&project, &files).await;
+
+        assert!(result.is_err());
+        assert!(!project.join("inside.txt").exists());
+        assert!(!parent.path().join("outside.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_file_allows_normalized_nested_target_inside_project() {
+        let project = tempfile::tempdir().unwrap();
+
+        tool_write_file(
+            project.path(),
+            "src/generated/../generated/value.rs",
+            "pub const VALUE: u8 = 1;\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("src/generated/value.rs")).unwrap(),
+            "pub const VALUE: u8 = 1;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_absolute_target() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let original = std::fs::read(outside.path()).unwrap();
+
+        let result =
+            tool_write_file(project.path(), &outside.path().to_string_lossy(), "nope").await;
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(outside.path()).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_rejects_symlinked_parent_outside_project() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), project.path().join("linked")).unwrap();
+
+        let result = tool_write_file(project.path(), "linked/escaped.txt", "nope").await;
+
+        assert!(result.is_err());
+        assert!(!outside.path().join("escaped.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rejects_dangling_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        symlink(
+            parent.path().join("missing-outside"),
+            project.join("dangling"),
+        )
+        .unwrap();
+
+        let result = resolve_under_cwd(&project, "dangling/escaped.txt");
+
+        assert!(result.is_err());
+    }
+
+    fn shell_map() -> LiveShellMap {
+        Arc::new(TokioMutex::new(std::collections::HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn shell_reports_zero_exit_code() {
+        let project = tempfile::tempdir().unwrap();
+        let result = tool_shell_streaming(
+            project.path(),
+            "printf success",
+            CancellationToken::new(),
+            uuid::Uuid::new_v4(),
+            shell_map(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.cancelled);
+        assert_eq!(result.output, "success\n(exit 0)");
+    }
+
+    #[tokio::test]
+    async fn shell_reports_nonzero_exit_code() {
+        let project = tempfile::tempdir().unwrap();
+        let result = tool_shell_streaming(
+            project.path(),
+            "printf failure; exit 2",
+            CancellationToken::new(),
+            uuid::Uuid::new_v4(),
+            shell_map(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, Some(2));
+        assert!(!result.cancelled);
+        assert_eq!(result.output, "failure\n(exit 2)");
+    }
+
+    #[tokio::test]
+    async fn shell_cancellation_is_distinct_from_process_failure() {
+        let project = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = tool_shell_streaming(
+            project.path(),
+            "sleep 5",
+            cancel,
+            uuid::Uuid::new_v4(),
+            shell_map(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(result.cancelled);
+        assert_eq!(result.exit_code, None);
+        assert!(result.output.contains("(cancelled)"));
     }
 }

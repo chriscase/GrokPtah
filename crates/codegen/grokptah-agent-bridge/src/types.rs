@@ -34,6 +34,56 @@ impl EffortLevel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentIsolationPreference {
+    #[default]
+    Worktree,
+    Shared,
+}
+
+impl SubagentIsolationPreference {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Worktree => "worktree",
+            Self::Shared => "shared",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "worktree" => Some(Self::Worktree),
+            "shared" => Some(Self::Shared),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentExecutionMode {
+    #[default]
+    Unknown,
+    Worktree,
+    ProjectCopy,
+    SharedReadOnly,
+    SharedMutating,
+    IsolationFailed,
+}
+
+impl SubagentExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Worktree => "worktree",
+            Self::ProjectCopy => "project_copy",
+            Self::SharedReadOnly => "shared_read_only",
+            Self::SharedMutating => "shared_mutating",
+            Self::IsolationFailed => "isolation_failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuthState {
     pub signed_in: bool,
@@ -89,6 +139,12 @@ pub struct SubagentInfo {
     /// Last tool name the child used (live panel).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tool: Option<String>,
+    /// Actual working directory used by this child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Whether this child is isolated, shared read-only, or shared mutating.
+    #[serde(default)]
+    pub execution_mode: SubagentExecutionMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

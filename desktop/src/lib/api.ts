@@ -6,8 +6,15 @@ import type {
   SearchHit,
   SessionKind,
   SessionSummary,
+  SubagentInfo,
   WorkspaceUiState,
 } from "./protocol";
+import type {
+  PromptQueueEntry,
+  PromptQueueRunNextResult,
+  PromptQueueTakeResult,
+  SteeringReceipt,
+} from "./promptQueue";
 
 export const api = {
   agentStart: () => invoke<void>("agent_start"),
@@ -73,6 +80,61 @@ export const api = {
     }),
   sessionPrompt: (sessionId: string, prompt: string) =>
     invoke<string>("session_prompt", { sessionId, prompt }),
+  sessionQueueList: (sessionId: string) =>
+    invoke<PromptQueueEntry[]>("session_queue_list", { sessionId }),
+  sessionQueueAdd: (
+    sessionId: string,
+    text: string,
+    priority = false,
+  ) =>
+    invoke<PromptQueueEntry[]>("session_queue_add", {
+      sessionId,
+      text,
+      priority,
+    }),
+  sessionQueueEdit: (
+    sessionId: string,
+    entryId: string,
+    version: number,
+    text: string,
+  ) =>
+    invoke<PromptQueueEntry[]>("session_queue_edit", {
+      sessionId,
+      entryId,
+      version,
+      text,
+    }),
+  sessionQueueRemove: (sessionId: string, entryId: string) =>
+    invoke<PromptQueueEntry[]>("session_queue_remove", {
+      sessionId,
+      entryId,
+    }),
+  sessionQueueClear: (sessionId: string) =>
+    invoke<PromptQueueEntry[]>("session_queue_clear", { sessionId }),
+  sessionQueueMove: (
+    sessionId: string,
+    entryId: string,
+    toIndex: number,
+  ) =>
+    invoke<PromptQueueEntry[]>("session_queue_move", {
+      sessionId,
+      entryId,
+      toIndex,
+    }),
+  sessionQueueTakeNext: (sessionId: string) =>
+    invoke<PromptQueueTakeResult>("session_queue_take_next", { sessionId }),
+  sessionQueueRunNext: (sessionId: string, entryId: string) =>
+    invoke<PromptQueueRunNextResult>("session_queue_run_next", {
+      sessionId,
+      entryId,
+    }),
+  sessionQueueSteerEntry: (sessionId: string, entryId: string) =>
+    invoke<SteeringReceipt>("session_queue_steer_entry", {
+      sessionId,
+      entryId,
+    }),
+  sessionSteer: (sessionId: string, text: string) =>
+    invoke<SteeringReceipt>("session_steer", { sessionId, text }),
   /** Cancel one session's turn, or all active turns when sessionId omitted. */
   sessionCancel: (sessionId?: string | null) =>
     invoke<void>("session_cancel", {
@@ -162,7 +224,7 @@ export const api = {
   pluginInstall: (id: string) => invoke("plugin_install", { id }),
   skillsList: () => invoke<unknown[]>("skills_list"),
   hooksConfig: () => invoke<string>("hooks_config"),
-  subagentsList: () => invoke<unknown[]>("subagents_list"),
+  subagentsList: () => invoke<SubagentInfo[]>("subagents_list"),
   listAgents: () => invoke<unknown[]>("list_agents"),
   listPersonas: () => invoke<unknown[]>("list_personas"),
   fleetObservability: () =>
@@ -183,6 +245,8 @@ export const api = {
     invoke("schedule_background_task", { title }),
   settingsSnapshot: () => invoke<Record<string, unknown>>("settings_snapshot"),
   setSandbox: (profile: string) => invoke<void>("set_sandbox", { profile }),
+  setSubagentIsolation: (mode: "worktree" | "shared") =>
+    invoke<void>("set_subagent_isolation", { mode }),
   setAppearance: (appearance: string) =>
     invoke<void>("set_appearance", { appearance }),
   setPermissionMode: (mode: string) =>

@@ -6,7 +6,6 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use futures::StreamExt;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -81,11 +80,7 @@ pub(crate) fn push_tool(
     }
 }
 
-pub(crate) fn emit_message(
-    tx: &mpsc::UnboundedSender<SessionUpdate>,
-    session_id: Uuid,
-    text: &str,
-) {
+pub(crate) fn emit_message(tx: &crate::event_bus::EventBus, session_id: Uuid, text: &str) {
     let _ = tx.send(SessionUpdate::AgentMessageChunk {
         session_id,
         text: text.into(),
@@ -99,7 +94,7 @@ pub fn is_rate_limit_error(err: &str) -> bool {
 }
 
 pub(crate) fn surface_rate_limit_or_error(
-    event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    event_tx: &crate::event_bus::EventBus,
     session_id: Uuid,
     err: &str,
 ) {
@@ -113,11 +108,7 @@ pub(crate) fn surface_rate_limit_or_error(
 }
 
 #[allow(dead_code)] // reserved if we re-enable quiet diagnostics
-pub(crate) fn emit_thought(
-    tx: &mpsc::UnboundedSender<SessionUpdate>,
-    session_id: Uuid,
-    text: &str,
-) {
+pub(crate) fn emit_thought(tx: &crate::event_bus::EventBus, session_id: Uuid, text: &str) {
     if text.is_empty() {
         return;
     }
@@ -430,7 +421,7 @@ pub(crate) fn coding_agent_tools(
             "type": "function",
             "function": {
                 "name": "spawn_general_purpose",
-                "description": "Spawn a general-purpose (or plan) subagent that can use write/shell tools under the same permission gate. Use for parallel delegated work.",
+                "description": "Spawn a parallel child. General-purpose children can use write/shell tools and run in an isolated worktree by default; plan children share the cwd read-only.",
                 "parameters": {
                     "type": "object",
                     "properties": {

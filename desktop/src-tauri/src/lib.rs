@@ -4,18 +4,28 @@ mod commands;
 mod event_forward;
 mod pty_host;
 
-use grokptah_agent_bridge::{AgentHost, HostConfig};
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use grokptah_agent_bridge::{
+    grokptah_home, AgentHost, ControlServerHandle, HostConfig, OrchStore, OrchestrationConfig,
+    OrchestrationService, WorkspaceAllowlist,
+};
 use tauri::Manager;
 
 pub struct AppState {
     pub host: grokptah_agent_bridge::AgentHostHandle,
     pub pty: pty_host::PtyHub,
+    /// Loopback MCP control plane (#196); optional when token not configured.
+    pub control: Mutex<Option<ControlServerHandle>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let host = AgentHost::create(HostConfig::default());
-    let event_rx = host.take_event_receiver();
+    // Prefer fan-out subscribe so MCP can also attach; fall back to take for compat.
+    let event_rx = host.subscribe_events();
+    let _primary = host.take_event_receiver();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -23,14 +33,28 @@ pub fn run() {
         .manage(AppState {
             host: host.clone(),
             pty: pty_host::PtyHub::new(),
+            control: Mutex::new(None),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
             app.state::<AppState>().pty.set_app(handle.clone());
             let _ = host.start();
-            if let Some(rx) = event_rx {
-                event_forward::spawn_event_forwarder(handle, rx);
-            }
+            event_forward::spawn_event_forwarder(handle, event_rx);
+
+            // Start authenticated loopback MCP control plane when token is set.
+            let host2 = host.clone();
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(srv) = start_embedded_control(host2).await {
+                    eprintln!(
+                        "[grokptah] MCP control plane listening on http://{}/mcp",
+                        srv.addr
+                    );
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        *state.control.lock().unwrap() = Some(srv);
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -59,6 +83,16 @@ pub fn run() {
             commands::workspace_state,
             commands::set_open_tabs,
             commands::session_prompt,
+            commands::session_queue_list,
+            commands::session_queue_add,
+            commands::session_queue_edit,
+            commands::session_queue_remove,
+            commands::session_queue_clear,
+            commands::session_queue_move,
+            commands::session_queue_take_next,
+            commands::session_queue_run_next,
+            commands::session_queue_steer_entry,
+            commands::session_steer,
             commands::session_cancel,
             commands::session_transcript,
             commands::session_fork,
@@ -108,6 +142,7 @@ pub fn run() {
             commands::schedule_background_task,
             commands::settings_snapshot,
             commands::set_sandbox,
+            commands::set_subagent_isolation,
             commands::set_appearance,
             commands::set_permission_mode,
             commands::set_allow_deny_rules,
@@ -127,4 +162,57 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running GrokPtah");
+}
+
+/// Start control plane when `GROKPTAH_CONTROL_TOKEN` is set (loopback only).
+async fn start_embedded_control(
+    host: grokptah_agent_bridge::AgentHostHandle,
+) -> Option<ControlServerHandle> {
+    let token = std::env::var("GROKPTAH_CONTROL_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let port: u16 = std::env::var("GROKPTAH_CONTROL_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(list) = std::env::var("GROKPTAH_CONTROL_WORKSPACES") {
+        for part in list.split(':') {
+            let p = part.trim();
+            if !p.is_empty() {
+                roots.push(PathBuf::from(p));
+            }
+        }
+    }
+    // Prefer current project cwd from host status.
+    if let Some(cwd) = host.status().project_cwd {
+        roots.push(PathBuf::from(cwd));
+    }
+    if roots.is_empty() {
+        eprintln!("[grokptah] MCP control: no workspaces allowlisted; set GROKPTAH_CONTROL_WORKSPACES");
+        return None;
+    }
+    let store = OrchStore::open(grokptah_home().join("orchestration")).ok()?;
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: token.clone(),
+            allowlist: WorkspaceAllowlist::new(roots),
+            max_concurrent_runs: 4,
+            bounds: Default::default(),
+        },
+    );
+    match grokptah_agent_bridge::start_control_server(orch, port).await {
+        Ok(mut h) => {
+            h.token = token;
+            Some(h)
+        }
+        Err(e) => {
+            eprintln!("[grokptah] MCP control failed to bind: {e:#}");
+            None
+        }
+    }
 }

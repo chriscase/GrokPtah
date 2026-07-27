@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, AgentHost, HostConfig, SessionUpdate,
+    SubagentExecutionMode,
 };
 use tokio::time::timeout;
 
@@ -63,17 +64,14 @@ async fn wait_subagents_done(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Sessi
     assert!(done >= n, "expected {n} finished subagents, got {done}");
 }
 
-/// #162: two isolated GP children write different paths without colliding.
+/// #162 / #195: two default GP children can write the same path without colliding.
 ///
 /// Asserts (not theater):
 /// - each write lands under a *distinct* `.grokptah/worktrees/sub-*` tree
-/// - parent project root does **not** receive either write
+/// - parent project root does **not** receive the write
 #[tokio::test]
-async fn isolation_two_children_writes_do_not_collide() {
+async fn default_isolation_keeps_two_mutating_children_from_colliding() {
     let _iso = IsolatedHome::install();
-    unsafe {
-        std::env::set_var("GROKPTAH_SUBAGENT_ISOLATION", "worktree");
-    }
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("README.md"), "root\n").unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -89,11 +87,19 @@ async fn isolation_two_children_writes_do_not_collide() {
     let session = host.session_new().unwrap();
 
     let a = host
-        .spawn_subagent_public(session.id, "general-purpose", "write a.txt: child-a")
+        .spawn_subagent_public(
+            session.id,
+            "general-purpose",
+            "write collision.txt: child-a",
+        )
         .await
         .unwrap();
     let b = host
-        .spawn_subagent_public(session.id, "general-purpose", "write b.txt: child-b")
+        .spawn_subagent_public(
+            session.id,
+            "general-purpose",
+            "write collision.txt: child-b",
+        )
         .await
         .unwrap();
     assert!(
@@ -109,70 +115,43 @@ async fn isolation_two_children_writes_do_not_collide() {
 
     // Parent must NOT have the writes
     assert!(
-        !dir.path().join("a.txt").exists(),
-        "parent must not contain a.txt (isolation leak)"
-    );
-    assert!(
-        !dir.path().join("b.txt").exists(),
-        "parent must not contain b.txt (isolation leak)"
+        !dir.path().join("collision.txt").exists(),
+        "parent must not contain collision.txt (isolation leak)"
     );
 
-    let wt = dir.path().join(".grokptah").join("worktrees");
-    assert!(wt.is_dir(), "expected .grokptah/worktrees");
-
-    let mut wt_with_a: Option<std::path::PathBuf> = None;
-    let mut wt_with_b: Option<std::path::PathBuf> = None;
-    for e in fs::read_dir(&wt).unwrap().flatten() {
-        let p = e.path();
-        if !p.is_dir() {
-            continue;
-        }
-        let name = p.file_name().unwrap().to_string_lossy();
-        if !name.starts_with("sub-") {
-            continue;
-        }
-        // Isolation tree must still have project files
+    let children: Vec<_> = host
+        .subagents()
+        .into_iter()
+        .filter(|child| child.session_id.as_deref() == Some(&session.id.to_string()))
+        .collect();
+    assert_eq!(children.len(), 2);
+    let mut worktree_a = None;
+    let mut worktree_b = None;
+    for child in children {
+        assert_eq!(child.execution_mode, SubagentExecutionMode::ProjectCopy);
+        let cwd = child.cwd.map(std::path::PathBuf::from).expect("child cwd");
         assert!(
-            p.join("README.md").is_file(),
+            cwd.join("README.md").is_file(),
             "isolation cwd empty or incomplete: {}",
-            p.display()
+            cwd.display()
         );
-        if p.join("a.txt").is_file() {
-            let body = fs::read_to_string(p.join("a.txt")).unwrap();
-            assert!(
-                body.contains("child-a"),
-                "a.txt body in {}: {body}",
-                p.display()
-            );
-            wt_with_a = Some(p.clone());
-        }
-        if p.join("b.txt").is_file() {
-            let body = fs::read_to_string(p.join("b.txt")).unwrap();
-            assert!(
-                body.contains("child-b"),
-                "b.txt body in {}: {body}",
-                p.display()
-            );
-            wt_with_b = Some(p.clone());
+        let body = fs::read_to_string(cwd.join("collision.txt")).unwrap();
+        if body.contains("child-a") {
+            worktree_a = Some(cwd);
+        } else if body.contains("child-b") {
+            worktree_b = Some(cwd);
+        } else {
+            panic!("unexpected collision.txt body: {body}");
         }
     }
 
-    let wa = wt_with_a.expect("child-a write must land under a sub-* worktree");
-    let wb = wt_with_b.expect("child-b write must land under a sub-* worktree");
+    let wa = worktree_a.expect("child-a write must land under a sub-* worktree");
+    let wb = worktree_b.expect("child-b write must land under a sub-* worktree");
     assert_ne!(
         wa,
         wb,
-        "a.txt and b.txt must be in distinct isolation worktrees (got both in {})",
+        "same-path writes must land in distinct isolation worktrees (got {})",
         wa.display()
-    );
-    // Cross-check: neither worktree should hold the other's file
-    assert!(
-        !wa.join("b.txt").exists(),
-        "worktree A must not contain b.txt"
-    );
-    assert!(
-        !wb.join("a.txt").exists(),
-        "worktree B must not contain a.txt"
     );
 }
 
@@ -220,8 +199,19 @@ async fn plan_kind_denies_write_offline() {
         fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
         "safe"
     );
+    let plan = host
+        .subagents()
+        .into_iter()
+        .find(|child| child.kind == "plan")
+        .expect("plan child");
+    assert_eq!(plan.execution_mode, SubagentExecutionMode::SharedReadOnly);
+    assert_eq!(
+        plan.cwd.as_deref(),
+        Some(dir.path().to_string_lossy().as_ref())
+    );
 
     // GP control on same host (one instance lock): general-purpose *does* write.
+    host.set_subagent_isolation("shared".into()).unwrap();
     host.spawn_subagent_public(session.id, "general-purpose", "write gp-ok.txt: from-gp")
         .await
         .unwrap();
@@ -233,6 +223,91 @@ async fn plan_kind_denies_write_offline() {
     assert!(fs::read_to_string(dir.path().join("gp-ok.txt"))
         .unwrap()
         .contains("from-gp"));
+}
+
+#[tokio::test]
+async fn failed_isolation_requires_explicit_shared_cwd_opt_in() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("README.md"), "root\n").unwrap();
+    fs::write(dir.path().join(".grokptah"), "blocks worktree directory").unwrap();
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let denied = host
+        .spawn_subagent_public(
+            session.id,
+            "general-purpose",
+            "write denied.txt: must-not-run",
+        )
+        .await
+        .unwrap();
+    assert!(denied.contains("isolation failed"), "{denied}");
+    wait_subagents_done(&mut rx, 1).await;
+    assert!(!dir.path().join("denied.txt").exists());
+    let failed = host
+        .subagents()
+        .into_iter()
+        .find(|child| child.status == "failed")
+        .expect("failed child row");
+    assert_eq!(
+        failed.execution_mode,
+        SubagentExecutionMode::IsolationFailed
+    );
+    assert!(
+        failed.cwd.is_none(),
+        "failed child must not claim parent cwd"
+    );
+
+    host.set_subagent_isolation("shared".into()).unwrap();
+    let shared = host
+        .spawn_subagent_public(
+            session.id,
+            "general-purpose",
+            "write shared.txt: explicit-opt-in",
+        )
+        .await
+        .unwrap();
+    assert!(shared.contains("explicit user opt-in"), "{shared}");
+    wait_subagents_done(&mut rx, 1).await;
+    assert!(fs::read_to_string(dir.path().join("shared.txt"))
+        .unwrap()
+        .contains("explicit-opt-in"));
+    let shared_child = host
+        .subagents()
+        .into_iter()
+        .find(|child| child.execution_mode == SubagentExecutionMode::SharedMutating)
+        .expect("shared mutating child");
+    assert_eq!(
+        shared_child.cwd.as_deref(),
+        Some(dir.path().to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        host.settings_snapshot()["subagentIsolation"],
+        serde_json::json!("shared")
+    );
+}
+
+#[test]
+fn shared_cwd_preference_is_explicit_and_persistent() {
+    let _iso = IsolatedHome::install();
+    let host = AgentHost::create(HostConfig::default());
+    assert!(host.set_subagent_isolation("off".into()).is_err());
+    host.set_subagent_isolation("shared".into()).unwrap();
+    drop(host);
+
+    let restored = AgentHost::create(HostConfig::default());
+    assert_eq!(
+        restored.settings_snapshot()["subagentIsolation"],
+        serde_json::json!("shared")
+    );
 }
 
 #[tokio::test]

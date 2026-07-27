@@ -1,7 +1,8 @@
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo,
-    PermissionDecision, PluginInfo, SearchHit, SearchQuery, SessionKind, SessionSummary, SkillInfo,
-    SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    PermissionDecision, PluginInfo, PromptQueueEntry, PromptQueueRunNextResult,
+    PromptQueueTakeResult, SearchHit, SearchQuery, SessionKind, SessionSummary, SkillInfo,
+    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -262,6 +263,125 @@ pub async fn session_prompt(
 ) -> Result<String, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state.host.session_prompt(id, prompt).await.map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_queue_list(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<PromptQueueEntry>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state.host.session_queue_list(id).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_queue_add(
+    state: State<'_, AppState>,
+    session_id: String,
+    text: String,
+    priority: bool,
+) -> Result<Vec<PromptQueueEntry>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .session_queue_add(id, text, priority)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_queue_edit(
+    state: State<'_, AppState>,
+    session_id: String,
+    entry_id: String,
+    version: u64,
+    text: String,
+) -> Result<Vec<PromptQueueEntry>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .session_queue_edit(id, &entry_id, version, text)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_queue_remove(
+    state: State<'_, AppState>,
+    session_id: String,
+    entry_id: String,
+) -> Result<Vec<PromptQueueEntry>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .session_queue_remove(id, &entry_id)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_queue_clear(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<PromptQueueEntry>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state.host.session_queue_clear(id).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_queue_move(
+    state: State<'_, AppState>,
+    session_id: String,
+    entry_id: String,
+    to_index: usize,
+) -> Result<Vec<PromptQueueEntry>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .session_queue_move(id, &entry_id, to_index)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_queue_take_next(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<PromptQueueTakeResult, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state.host.session_queue_take_next(id).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_queue_run_next(
+    state: State<'_, AppState>,
+    session_id: String,
+    entry_id: String,
+) -> Result<PromptQueueRunNextResult, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .session_queue_run_next(id, &entry_id)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_queue_steer_entry(
+    state: State<'_, AppState>,
+    session_id: String,
+    entry_id: String,
+) -> Result<SteeringReceipt, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .session_queue_steer_entry(id, &entry_id)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn session_steer(
+    state: State<'_, AppState>,
+    session_id: String,
+    text: String,
+) -> Result<SteeringReceipt, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state.host.session_steer(id, text).map_err(map_err)
 }
 
 #[tauri::command]
@@ -623,6 +743,11 @@ pub fn settings_snapshot(state: State<'_, AppState>) -> serde_json::Value {
 #[tauri::command]
 pub fn set_sandbox(state: State<'_, AppState>, profile: String) {
     state.host.set_sandbox(profile);
+}
+
+#[tauri::command]
+pub fn set_subagent_isolation(state: State<'_, AppState>, mode: String) -> Result<(), String> {
+    state.host.set_subagent_isolation(mode).map_err(map_err)
 }
 
 #[tauri::command]

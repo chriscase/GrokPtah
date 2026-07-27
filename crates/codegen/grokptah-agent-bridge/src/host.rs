@@ -23,12 +23,16 @@ use crate::host_helpers::{
 };
 use crate::local_tools;
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
+use crate::prompt_queue::{
+    format_interjection, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueTakeResult,
+    SessionPromptQueue, SteeringReceipt,
+};
 use crate::search_engine::{self, SearchHit, SearchQuery};
 use crate::session::{Session, SessionKind, SessionSummary, TranscriptEntry};
 use crate::session_store::{self, WorkspaceChrome};
 use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
-    SkillInfo, SubagentInfo,
+    SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
 };
 
 /// UI restore payload: open tabs + active session + project (sessions live in list).
@@ -99,6 +103,7 @@ pub(crate) struct Inner {
     effort: EffortLevel,
     auth: AuthState,
     sandbox_profile: String,
+    subagent_isolation: SubagentIsolationPreference,
     appearance: String,
     permission_mode: String,
     allow_rules: Vec<String>,
@@ -116,7 +121,9 @@ pub(crate) struct Inner {
     /// Per-session turn cancellation so multiple sessions can run concurrently
     /// (Claude Code–style parallel build sessions).
     turn_cancels: HashMap<Uuid, CancellationToken>,
-    event_tx: mpsc::UnboundedSender<SessionUpdate>,
+    /// Authoritative follow-up queue plus non-cancelling steering inbox.
+    prompt_queues: HashMap<Uuid, SessionPromptQueue>,
+    event_tx: crate::event_bus::EventBus,
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
     /// Per-session path → original content before first agent edit (#146).
@@ -150,6 +157,10 @@ impl Drop for TurnBusyGuard {
         }
         let mut g = self.host.inner.lock();
         g.turn_cancels.remove(&self.session_id);
+        g.prompt_queues
+            .entry(self.session_id)
+            .or_default()
+            .defer_pending_steering();
     }
 }
 
@@ -175,7 +186,14 @@ impl AgentHost {
                 None
             }
         };
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut event_tx =
+            crate::event_bus::EventBus::new(crate::event_bus::DEFAULT_JOURNAL_CAPACITY);
+        {
+            let home = crate::discover::grokptah_home();
+            event_tx = event_tx.with_persist_dir(home.join("orchestration"));
+        }
+        // Keep a dedicated channel for take_event_receiver / first GUI subscriber.
+        let event_rx = event_tx.subscribe();
         let auth = crate::auth_store::load_auth_state();
         let (chrome, mut sessions) = session_store::load_workspace().unwrap_or_else(|e| {
             eprintln!("[grokptah] workspace load failed: {e:#}");
@@ -227,6 +245,7 @@ impl AgentHost {
             } else {
                 chrome.sandbox_profile
             },
+            subagent_isolation: chrome.subagent_isolation,
             appearance: if chrome.appearance.is_empty() {
                 "dark".into()
             } else {
@@ -244,6 +263,7 @@ impl AgentHost {
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
+            prompt_queues: HashMap::new(),
             event_tx,
             edited_files: Vec::new(),
             edit_snapshots: HashMap::new(), // session_id → path → original
@@ -263,6 +283,16 @@ impl AgentHostHandle {
         self.event_rx_factory.lock().take()
     }
 
+    /// Shared fan-out event bus (GUI + MCP control plane).
+    pub fn event_bus(&self) -> crate::event_bus::EventBus {
+        self.inner.lock().event_tx.clone()
+    }
+
+    /// Additional live subscriber (does not steal the primary GUI receiver).
+    pub fn subscribe_events(&self) -> mpsc::UnboundedReceiver<SessionUpdate> {
+        self.inner.lock().event_tx.subscribe()
+    }
+
     /// Persist tiny workspace chrome (tabs / project / model) only.
     pub fn persist_chrome(&self) {
         let chrome = {
@@ -277,6 +307,7 @@ impl AgentHostHandle {
                 sandbox_profile: g.sandbox_profile.clone(),
                 appearance: g.appearance.clone(),
                 always_approve: g.always_approve,
+                subagent_isolation: g.subagent_isolation,
             }
         };
         if let Err(e) = session_store::save_chrome(&chrome) {
@@ -638,6 +669,7 @@ impl AgentHostHandle {
                 bail!("cannot delete a session with an active turn — stop it first");
             }
             g.sessions.remove(&id);
+            g.prompt_queues.remove(&id);
             g.open_tab_ids.retain(|t| *t != id);
             if g.active_session == Some(id) {
                 g.active_session = g.open_tab_ids.first().copied();
@@ -1248,6 +1280,14 @@ impl AgentHostHandle {
     pub fn set_sandbox(&self, profile: String) {
         self.inner.lock().sandbox_profile = normalize_sandbox_profile(&profile).to_string();
         self.persist_chrome();
+    }
+
+    pub fn set_subagent_isolation(&self, mode: String) -> Result<()> {
+        let mode = SubagentIsolationPreference::parse(&mode)
+            .ok_or_else(|| anyhow!("subagent isolation must be `worktree` or `shared`"))?;
+        self.inner.lock().subagent_isolation = mode;
+        self.persist_chrome();
+        Ok(())
     }
 
     pub fn set_appearance(&self, appearance: String) {
@@ -2096,11 +2136,16 @@ impl AgentHostHandle {
         }
         let g = self.inner.lock();
         let gw = crate::gateway_config::load();
+        let (subagent_isolation, subagent_isolation_managed_by_env) =
+            effective_subagent_isolation(g.subagent_isolation);
         serde_json::json!({
             "model": g.model,
             "effort": g.effort,
             "alwaysApprove": g.always_approve,
             "sandboxProfile": g.sandbox_profile,
+            "subagentIsolation": subagent_isolation.as_str(),
+            "subagentIsolationConfigured": g.subagent_isolation.as_str(),
+            "subagentIsolationManagedByEnv": subagent_isolation_managed_by_env,
             "appearance": g.appearance,
             // Single effective mode for UI (mirrors alwaysApprove).
             "permissionMode": g.permission_mode,
@@ -2249,6 +2294,156 @@ impl AgentHostHandle {
         Ok(())
     }
 
+    pub fn session_queue_list(&self, session_id: Uuid) -> Result<Vec<PromptQueueEntry>> {
+        let g = self.inner.lock();
+        if !g.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        Ok(g.prompt_queues
+            .get(&session_id)
+            .map(SessionPromptQueue::list)
+            .unwrap_or_default())
+    }
+
+    pub fn session_queue_add(
+        &self,
+        session_id: Uuid,
+        text: String,
+        priority: bool,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        let mut g = self.inner.lock();
+        if !g.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        let queue = g.prompt_queues.entry(session_id).or_default();
+        queue.add(text, "composer", priority)?;
+        Ok(queue.list())
+    }
+
+    pub fn session_queue_edit(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        version: u64,
+        text: String,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        let mut g = self.inner.lock();
+        let queue = g
+            .prompt_queues
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+        queue.edit(entry_id, version, text)?;
+        Ok(queue.list())
+    }
+
+    pub fn session_queue_remove(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        let mut g = self.inner.lock();
+        let queue = g
+            .prompt_queues
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+        queue.remove(entry_id)?;
+        Ok(queue.list())
+    }
+
+    pub fn session_queue_clear(&self, session_id: Uuid) -> Result<Vec<PromptQueueEntry>> {
+        let mut g = self.inner.lock();
+        if !g.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        g.prompt_queues.entry(session_id).or_default().clear();
+        Ok(Vec::new())
+    }
+
+    pub fn session_queue_move(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        to_index: usize,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        let mut g = self.inner.lock();
+        let queue = g
+            .prompt_queues
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+        queue.move_to(entry_id, to_index)?;
+        Ok(queue.list())
+    }
+
+    pub fn session_queue_take_next(&self, session_id: Uuid) -> Result<PromptQueueTakeResult> {
+        let mut g = self.inner.lock();
+        if !g.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        let active = g.turn_cancels.contains_key(&session_id);
+        let queue = g.prompt_queues.entry(session_id).or_default();
+        if active {
+            return Ok(PromptQueueTakeResult {
+                batch: None,
+                entries: queue.list(),
+            });
+        }
+        Ok(queue.take_next())
+    }
+
+    pub fn session_queue_run_next(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+    ) -> Result<PromptQueueRunNextResult> {
+        let active = {
+            let mut g = self.inner.lock();
+            let queue = g
+                .prompt_queues
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+            queue.run_next(entry_id)?;
+            g.turn_cancels.contains_key(&session_id)
+        };
+        let cancelled_active = active && self.cancel_turn(Some(session_id)).is_ok();
+        Ok(PromptQueueRunNextResult {
+            entries: self.session_queue_list(session_id)?,
+            cancelled_active,
+        })
+    }
+
+    pub fn session_queue_steer_entry(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+    ) -> Result<SteeringReceipt> {
+        let mut g = self.inner.lock();
+        let is_build = g
+            .sessions
+            .get(&session_id)
+            .map(|session| session.kind == SessionKind::Build)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        let can_inject = is_build && g.turn_cancels.contains_key(&session_id);
+        let queue = g
+            .prompt_queues
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+        queue.steer_queued(entry_id, can_inject)
+    }
+
+    pub fn session_steer(&self, session_id: Uuid, text: String) -> Result<SteeringReceipt> {
+        let mut g = self.inner.lock();
+        let is_build = g
+            .sessions
+            .get(&session_id)
+            .map(|session| session.kind == SessionKind::Build)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        let can_inject = is_build && g.turn_cancels.contains_key(&session_id);
+        g.prompt_queues
+            .entry(session_id)
+            .or_default()
+            .steer_text(text, can_inject)
+    }
+
     /// Cancel the in-flight turn for `session_id`, or every active turn when
     /// `session_id` is `None` (shutdown / global stop).
     pub fn cancel_turn(&self, session_id: Option<Uuid>) -> Result<()> {
@@ -2394,10 +2589,16 @@ impl AgentHostHandle {
             .await;
 
         // Normal path: disarmed so Drop is a no-op after we clean up below.
-        // (We still remove here for ordering before persist + events.)
+        // Atomically close the active-turn window and defer any steering note
+        // that arrived after the final safe drain. A concurrent steer sees
+        // either "active" (and is moved here) or "idle" (and queues itself).
         {
             let mut g = self.inner.lock();
             g.turn_cancels.remove(&session_id);
+            g.prompt_queues
+                .entry(session_id)
+                .or_default()
+                .defer_pending_steering();
         }
         busy_guard.armed = false;
 
@@ -2439,7 +2640,7 @@ impl AgentHostHandle {
         kind: SessionKind,
         prompt: &str,
         cancel: CancellationToken,
-        event_tx: mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: crate::event_bus::EventBus,
     ) -> Result<String> {
         if cancel.is_cancelled() {
             return Ok("(cancelled)".into());
@@ -2865,6 +3066,55 @@ impl AgentHostHandle {
         }
     }
 
+    fn drain_pending_steering(
+        &self,
+        session_id: Uuid,
+        event_tx: &crate::event_bus::EventBus,
+    ) -> Vec<PromptQueueEntry> {
+        let entries = {
+            let mut g = self.inner.lock();
+            let entries = g
+                .prompt_queues
+                .entry(session_id)
+                .or_default()
+                .drain_steering();
+            if let Some(session) = g.sessions.get_mut(&session_id) {
+                for entry in &entries {
+                    session.transcript.push(TranscriptEntry::system(format!(
+                        "Steering while running: {}",
+                        entry.text
+                    )));
+                    session.updated_at = Utc::now();
+                }
+            }
+            entries
+        };
+        for entry in &entries {
+            let _ = event_tx.send(SessionUpdate::SteeringInjected {
+                session_id,
+                steering_id: entry.id.clone(),
+                text: entry.text.clone(),
+            });
+        }
+        entries
+    }
+
+    fn append_pending_steering_messages(
+        &self,
+        session_id: Uuid,
+        event_tx: &crate::event_bus::EventBus,
+        messages: &mut Vec<serde_json::Value>,
+    ) -> usize {
+        let entries = self.drain_pending_steering(session_id, event_tx);
+        for entry in &entries {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format_interjection(&entry.text),
+            }));
+        }
+        entries.len()
+    }
+
     /// Deterministic Build turn for offline tests (no network).
     #[allow(clippy::too_many_arguments)]
     async fn run_offline_build_turn(
@@ -2873,7 +3123,7 @@ impl AgentHostHandle {
         cwd: &Path,
         prompt: &str,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         let lower = prompt.to_lowercase();
         if lower.contains("list") || lower.contains("files") || lower.contains("ls ") {
@@ -3039,6 +3289,19 @@ impl AgentHostHandle {
                     .await;
             }
         }
+        let steering = self.drain_pending_steering(session_id, event_tx);
+        let steering_note = if steering.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n[steering received: {}]",
+                steering
+                    .iter()
+                    .map(|entry| entry.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            )
+        };
         // Prove wire context still carries compacted_summary after offline turns.
         let wire_note = {
             let g = self.inner.lock();
@@ -3054,7 +3317,7 @@ impl AgentHostHandle {
                 .unwrap_or_default()
         };
         let msg = format!(
-            "(offline agent) done: {}{wire_note}",
+            "(offline agent) done: {}{steering_note}{wire_note}",
             prompt.chars().take(80).collect::<String>()
         );
         emit_message(event_tx, session_id, &msg);
@@ -3075,7 +3338,7 @@ impl AgentHostHandle {
         history: &[(String, String)],
         compacted_summary: Option<&str>,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         let max_rounds = {
             let g = self.inner.lock();
@@ -3153,6 +3416,8 @@ impl AgentHostHandle {
                 return Ok(msg);
             }
 
+            self.append_pending_steering_messages(session_id, event_tx, &mut messages);
+
             // Budget-aware coaching when max_agent_rounds is tight (#187/#188).
             let remaining = max_rounds.saturating_sub(round) + 1;
             let tools_this_round = if max_rounds <= 8 && remaining == 1 {
@@ -3227,6 +3492,20 @@ impl AgentHostHandle {
                             emit_message(event_tx, session_id, &text);
                         }
                         push_assistant(self, session_id, &text);
+                    }
+                    if round < max_rounds {
+                        messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": text,
+                        }));
+                        if self.append_pending_steering_messages(
+                            session_id,
+                            event_tx,
+                            &mut messages,
+                        ) > 0
+                        {
+                            continue;
+                        }
                     }
                     // #168 Stop hooks: optional continue with feedback (once).
                     if !stop_continued && !cancel.is_cancelled() {
@@ -3366,7 +3645,7 @@ impl AgentHostHandle {
         cwd: &Path,
         path: &str,
         summary: &str,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) {
         self.record_edit(path);
         let unified = crate::project_context::diff_for_path(cwd, path);
@@ -3387,7 +3666,7 @@ impl AgentHostHandle {
         name: &str,
         arguments_json: &str,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
         mcp_index: &McpToolIndex,
     ) -> Result<String> {
         let args: serde_json::Value =
@@ -3882,10 +4161,12 @@ impl AgentHostHandle {
                     }
                     if let Some(s) = subs.iter().find(|s| s.id == id) {
                         return Ok(format!(
-                            "subagent {} kind={} status={} summary={}",
+                            "subagent {} kind={} status={} mode={} cwd={} summary={}",
                             s.id,
                             s.kind,
                             s.status,
+                            s.execution_mode.as_str(),
+                            s.cwd.clone().unwrap_or_default(),
                             s.summary.clone().unwrap_or_default()
                         ));
                     }
@@ -3896,7 +4177,14 @@ impl AgentHostHandle {
                     lines.push(format!("task {} [{}] {}", t.id, t.status, t.title));
                 }
                 for s in &subs {
-                    lines.push(format!("subagent {} [{}] {}", s.id, s.status, s.title));
+                    lines.push(format!(
+                        "subagent {} [{}] {} mode={} cwd={}",
+                        s.id,
+                        s.status,
+                        s.title,
+                        s.execution_mode.as_str(),
+                        s.cwd.clone().unwrap_or_default()
+                    ));
                 }
                 if lines.is_empty() {
                     Ok("(no background tasks or subagents)".into())
@@ -3982,7 +4270,7 @@ impl AgentHostHandle {
         cwd: &Path,
         query: &str,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         let sub_id = Uuid::new_v4().to_string();
         {
@@ -3995,6 +4283,8 @@ impl AgentHostHandle {
                 session_id: Some(session_id.to_string()),
                 summary: None,
                 last_tool: None,
+                cwd: Some(cwd.display().to_string()),
+                execution_mode: SubagentExecutionMode::SharedReadOnly,
             });
         }
         let _ = event_tx.send(SessionUpdate::SubagentSpawned {
@@ -4096,7 +4386,7 @@ impl AgentHostHandle {
         prompt: &str,
         kind: &str,
         parent_cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         // kind may be `general-purpose`, `plan`, or `kind@persona` (#164).
         let (kind, persona_name) = if let Some((k, p)) = kind.split_once('@') {
@@ -4115,13 +4405,71 @@ impl AgentHostHandle {
                 .and_then(|n| crate::agents_personas::resolve_persona(project.as_deref(), n))
         };
         let sub_id = Uuid::new_v4().to_string();
-        // Child is cancelled if parent is cancelled *or* cancel_subagent is called.
-        let child_cancel = parent_cancel.child_token();
         let kind_label = if let Some(ref p) = persona_layer {
             format!("{}@{}", kind, p.name)
         } else {
             kind.into()
         };
+        let configured_isolation = self.inner.lock().subagent_isolation;
+        let (isolation_preference, _) = effective_subagent_isolation(configured_isolation);
+        let mut child_cwd = cwd.to_path_buf();
+        let execution_mode = if kind == "plan" {
+            SubagentExecutionMode::SharedReadOnly
+        } else {
+            match isolation_preference {
+                SubagentIsolationPreference::Worktree => {
+                    match crate::isolation::prepare_isolation_cwd(cwd, &sub_id) {
+                        Ok(isolated_cwd) => {
+                            let mode = if isolated_cwd.join(".git").is_file() {
+                                SubagentExecutionMode::Worktree
+                            } else {
+                                SubagentExecutionMode::ProjectCopy
+                            };
+                            child_cwd = isolated_cwd;
+                            mode
+                        }
+                        Err(error) => {
+                            let detail = format!("isolation failed: {error}");
+                            {
+                                let mut g = self.inner.lock();
+                                g.subagents.push(SubagentInfo {
+                                    id: sub_id.clone(),
+                                    kind: kind_label.clone(),
+                                    title: prompt.chars().take(48).collect(),
+                                    status: "failed".into(),
+                                    session_id: Some(session_id.to_string()),
+                                    summary: Some(detail.clone()),
+                                    last_tool: None,
+                                    cwd: None,
+                                    execution_mode: SubagentExecutionMode::IsolationFailed,
+                                });
+                            }
+                            let _ = event_tx.send(SessionUpdate::SubagentSpawned {
+                                session_id,
+                                subagent_id: sub_id.clone(),
+                                kind: kind_label.clone(),
+                                title: prompt.chars().take(64).collect(),
+                            });
+                            let _ = event_tx.send(SessionUpdate::SubagentUpdate {
+                                session_id,
+                                subagent_id: sub_id.clone(),
+                                status: "failed".into(),
+                                detail: Some(detail),
+                            });
+                            let snap = self.inner.lock().subagents.clone();
+                            let _ = session_store::save_session_subagents(session_id, &snap);
+                            return Ok(format!(
+                                "ERROR: subagent isolation failed (not starting child): {error}. \
+                                 Choose shared cwd explicitly to permit mutating the parent workspace."
+                            ));
+                        }
+                    }
+                }
+                SubagentIsolationPreference::Shared => SubagentExecutionMode::SharedMutating,
+            }
+        };
+        // Child is cancelled if parent is cancelled *or* cancel_subagent is called.
+        let child_cancel = parent_cancel.child_token();
         {
             let mut g = self.inner.lock();
             g.subagents.push(SubagentInfo {
@@ -4132,6 +4480,8 @@ impl AgentHostHandle {
                 session_id: Some(session_id.to_string()),
                 summary: None,
                 last_tool: None,
+                cwd: Some(child_cwd.display().to_string()),
+                execution_mode,
             });
             g.subagent_cancels
                 .insert(sub_id.clone(), child_cancel.clone());
@@ -4150,33 +4500,6 @@ impl AgentHostHandle {
 
         let host = self.clone();
         let event_tx = event_tx.clone();
-        // #162 optional worktree isolation (never empty-dir fallback)
-        let mut cwd = cwd.to_path_buf();
-        if std::env::var("GROKPTAH_SUBAGENT_ISOLATION")
-            .map(|v| v == "worktree" || v == "1")
-            .unwrap_or(false)
-        {
-            match crate::isolation::prepare_isolation_cwd(&cwd, &sub_id) {
-                Ok(wt) => cwd = wt,
-                Err(e) => {
-                    // Fail closed: leave parent cwd and record failure on the child row.
-                    let mut g = self.inner.lock();
-                    if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
-                        s.status = "failed".into();
-                        s.summary = Some(format!("isolation failed: {e}"));
-                    }
-                    let _ = event_tx.send(SessionUpdate::SubagentUpdate {
-                        session_id,
-                        subagent_id: sub_id.clone(),
-                        status: "failed".into(),
-                        detail: Some(format!("isolation failed: {e}")),
-                    });
-                    return Ok(format!(
-                        "ERROR: subagent isolation failed (not starting child): {e}"
-                    ));
-                }
-            }
-        }
         let prompt = prompt.to_string();
         let kind_owned = kind.to_string();
         let persona_reminder = persona_layer
@@ -4186,7 +4509,7 @@ impl AgentHostHandle {
         tokio::spawn(async move {
             host.run_gp_subagent_body(
                 session_id,
-                &cwd,
+                &child_cwd,
                 &prompt,
                 &kind_owned,
                 &sub_id_task,
@@ -4197,8 +4520,18 @@ impl AgentHostHandle {
             .await;
         });
 
+        let isolation_note = match execution_mode {
+            SubagentExecutionMode::Worktree => "isolated worktree",
+            SubagentExecutionMode::ProjectCopy => "isolated project copy",
+            SubagentExecutionMode::SharedReadOnly => "shared read-only cwd",
+            SubagentExecutionMode::SharedMutating => "shared mutating cwd (explicit user opt-in)",
+            SubagentExecutionMode::IsolationFailed | SubagentExecutionMode::Unknown => {
+                "unknown cwd mode"
+            }
+        };
         Ok(format!(
-            "Spawned {kind_label} subagent `{sub_id}` (running in parallel — parent is not blocked)."
+            "Spawned {kind_label} subagent `{sub_id}` in {isolation_note} \
+             (running in parallel — parent is not blocked)."
         ))
     }
 
@@ -4212,7 +4545,7 @@ impl AgentHostHandle {
         kind: &str,
         sub_id: &str,
         cancel: CancellationToken,
-        event_tx: mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: crate::event_bus::EventBus,
         persona_reminder: Option<String>,
     ) {
         if cancel.is_cancelled() {
@@ -4440,7 +4773,7 @@ impl AgentHostHandle {
         &self,
         sub_id: &str,
         status: &str,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
         session_id: Uuid,
         detail: Option<String>,
     ) {
@@ -4474,7 +4807,7 @@ impl AgentHostHandle {
         wire_name: &str,
         args: &serde_json::Value,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         if cancel.is_cancelled() {
             return Ok("(cancelled)".into());
@@ -4584,7 +4917,7 @@ impl AgentHostHandle {
         input: &serde_json::Value,
         f: F,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String>
     where
         F: FnOnce() -> Fut,
@@ -4753,7 +5086,7 @@ impl AgentHostHandle {
         cwd: &Path,
         command: &str,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         if cancel.is_cancelled() {
             return Ok("(cancelled)".into());
@@ -4945,20 +5278,27 @@ impl AgentHostHandle {
         match result {
             Ok(tr) => {
                 let cancelled = tr.cancelled;
+                let exit_code = tr.exit_code;
                 let out = tr.output.clone();
-                let status = if cancelled {
+                let status = if cancelled || exit_code != Some(0) {
                     ToolCallStatus::Failed
                 } else {
                     ToolCallStatus::Completed
                 };
                 self.complete_shell_background_task(
                     &call_id,
-                    if cancelled { "cancelled" } else { "completed" },
+                    if cancelled {
+                        "cancelled"
+                    } else if exit_code == Some(0) {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
                 );
                 let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
                     session_id,
                     call_id: call_id.clone(),
-                    exit_code: None,
+                    exit_code,
                     cancelled,
                 });
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
@@ -4975,11 +5315,7 @@ impl AgentHostHandle {
                     status,
                     Some(out.clone()),
                 );
-                Ok(if cancelled {
-                    format!("{out}\n(cancelled)")
-                } else {
-                    out
-                })
+                Ok(out)
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -5016,7 +5352,7 @@ impl AgentHostHandle {
         cwd: &Path,
         command: &str,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<()> {
         if cancel.is_cancelled() {
             return Ok(());
@@ -5155,28 +5491,32 @@ impl AgentHostHandle {
 
         match result {
             Ok(tr) => {
+                let exit_code = tr.exit_code;
+                let status = if tr.cancelled || exit_code != Some(0) {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
                 self.complete_shell_background_task(
                     &call_id,
                     if tr.cancelled {
                         "cancelled"
-                    } else {
+                    } else if exit_code == Some(0) {
                         "completed"
+                    } else {
+                        "failed"
                     },
                 );
                 let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
                     session_id,
                     call_id: call_id.clone(),
-                    exit_code: if tr.cancelled { None } else { Some(0) },
+                    exit_code,
                     cancelled: tr.cancelled,
                 });
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
                     call_id,
-                    status: if tr.cancelled {
-                        ToolCallStatus::Failed
-                    } else {
-                        ToolCallStatus::Completed
-                    },
+                    status,
                     output: Some(tr.output),
                 });
             }
@@ -5205,7 +5545,7 @@ impl AgentHostHandle {
         tool_name: &str,
         f: F,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<()>
     where
         F: FnOnce() -> Fut,
@@ -5310,5 +5650,22 @@ impl AgentHostHandle {
             }
         }
         Ok(())
+    }
+}
+
+fn effective_subagent_isolation(
+    configured: SubagentIsolationPreference,
+) -> (SubagentIsolationPreference, bool) {
+    let override_mode = std::env::var("GROKPTAH_SUBAGENT_ISOLATION")
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "worktree" | "1" => Some(SubagentIsolationPreference::Worktree),
+            // Shared mutation is intentionally accepted only as an explicit value.
+            "shared" => Some(SubagentIsolationPreference::Shared),
+            _ => None,
+        });
+    match override_mode {
+        Some(mode) => (mode, true),
+        None => (configured, false),
     }
 }

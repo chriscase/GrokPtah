@@ -27,7 +27,7 @@ Every capability is **shipped**, **via shell**, or **explicitly deferred**. Noth
 | memory | `memory_write` / `memory_read` | **shipped** | Project-scoped under `~/.grokptah/memory/` |
 | web_fetch / WebFetch | `web_fetch` | **shipped** | Offline stub; live HTTP when online; **SSRF preflight** (#179) |
 | explore subagent | `spawn_explore` | **shipped** | Read-only survey |
-| general-purpose / plan subagent | `spawn_general_purpose` / `spawn_subagent` | **shipped** | Parallel GP; plan mode blocks mutators (#161) |
+| general-purpose / plan subagent | `spawn_general_purpose` / `spawn_subagent` | **shipped** | Parallel GP; mutating children get separate worktrees/copies by default, plan mode shares cwd read-only ([details](SUBAGENT_ISOLATION.md)) |
 | MCP tools | `mcp__server__tool` | **shipped** | Stdio servers only |
 | kill_task / task_output | background task cancel + shell cancel | **shipped** (partial) | Via Tasks panel / `cancel_background_task` / turn cancel — not full Build IDs |
 | notifications | desktop OS notifications | **deferred** | Track under residual; no ship issue yet |

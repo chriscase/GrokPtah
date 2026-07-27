@@ -10,6 +10,7 @@ import {
   type SessionSummary,
   type SessionTab,
   type SessionUpdate,
+  type SubagentInfo,
   type TranscriptItem,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
@@ -24,6 +25,8 @@ import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
+import { PromptQueuePanel } from "./components/PromptQueuePanel";
+import { SubagentCard } from "./components/SubagentCard";
 import {
   appendDeny,
   loadDenyHistory,
@@ -64,6 +67,8 @@ import {
   queuedActivity,
   type ActivityState,
 } from "./lib/activity";
+import type { PromptQueueEntry } from "./lib/promptQueue";
+import { useComposerQueue } from "./lib/useComposerQueue";
 
 type WorkspaceMode = "build" | "chat";
 
@@ -222,20 +227,19 @@ export default function App() {
   const [tabs, setTabs] = useState<SessionTab[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [composer, setComposer] = useState("");
-  /**
-   * Per-session composer drafts — survive focus switches so you can
-   * pre-type prompts for several agents and send when ready.
-   */
-  const [composerDrafts, setComposerDrafts] = useState<Record<string, string>>(
-    {},
-  );
-  /** Taller composer for detailed prompts (power users). */
-  const [composerExpanded, setComposerExpanded] = useState(false);
-  /** Per-session prompt queue while a turn is running (#147). */
-  const [promptQueues, setPromptQueues] = useState<Record<string, string[]>>(
-    {},
-  );
+  const {
+    composer,
+    updateComposer,
+    clearComposerFor,
+    restoreComposer,
+    forgetSession: forgetComposerSession,
+    expanded: composerExpanded,
+    setExpanded: setComposerExpanded,
+    queues: promptQueues,
+    dispatchQueue,
+    queueFor,
+  } = useComposerQueue(activeSessionId);
+  const queueDrainsRef = useRef<Set<string>>(new Set());
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
   /** FIFO of tool permission prompts — concurrent requests must not clobber (#141). */
   const [permissionQueue, setPermissionQueue] = useState<PermissionRequest[]>(
@@ -267,7 +271,7 @@ export default function App() {
   } | null>(null);
   const [plugins, setPlugins] = useState<any[]>([]);
   const [skills, setSkills] = useState<any[]>([]);
-  const [subagents, setSubagents] = useState<any[]>([]);
+  const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
   const [bgTasks, setBgTasks] = useState<any[]>([]);
   const [hooksPreview, setHooksPreview] = useState<string | null>(null);
   const [rules, setRules] = useState<string[]>([]);
@@ -419,12 +423,7 @@ export default function App() {
 
   const closeTab = useCallback((id: string) => {
     setDocks((d) => d.filter((x) => x !== id));
-    setComposerDrafts((d) => {
-      if (!(id in d)) return d;
-      const next = { ...d };
-      delete next[id];
-      return next;
-    });
+    forgetComposerSession(id);
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id);
       setActiveSessionId((cur) => {
@@ -433,38 +432,7 @@ export default function App() {
       });
       return next;
     });
-  }, []);
-
-  /** Write composer into the focused session's draft bag. */
-  const updateComposer = useCallback(
-    (text: string) => {
-      setComposer(text);
-      if (activeSessionId) {
-        setComposerDrafts((d) => {
-          if ((d[activeSessionId] ?? "") === text) return d;
-          if (!text) {
-            if (!(activeSessionId in d)) return d;
-            const next = { ...d };
-            delete next[activeSessionId];
-            return next;
-          }
-          return { ...d, [activeSessionId]: text };
-        });
-      }
-    },
-    [activeSessionId],
-  );
-
-  // Restore draft when focus moves between sessions
-  useEffect(() => {
-    if (!activeSessionId) {
-      setComposer("");
-      return;
-    }
-    setComposer(composerDrafts[activeSessionId] ?? "");
-    // Only rehydrate when the target session changes — not on every draft keystroke.
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: load on focus switch only
-  }, [activeSessionId]);
+  }, [forgetComposerSession]);
 
   const undockSession = useCallback((id: string) => {
     setDocks((d) => {
@@ -1242,23 +1210,59 @@ export default function App() {
     ],
   );
 
+  async function replaceQueue(
+    sessionId: string,
+    mutation: () => Promise<PromptQueueEntry[]>,
+  ) {
+    try {
+      const entries = await mutation();
+      dispatchQueue({ type: "replace", sessionId, entries });
+    } catch (error) {
+      try {
+        const entries = await api.sessionQueueList(sessionId);
+        dispatchQueue({ type: "replace", sessionId, entries });
+      } catch {
+        // Preserve the current UI queue if the bridge itself is unavailable.
+      }
+      throw error;
+    }
+  }
+
+  async function drainNextQueuedPrompt(sessionId: string) {
+    if (queueDrainsRef.current.has(sessionId)) return;
+    queueDrainsRef.current.add(sessionId);
+    try {
+      const result = await api.sessionQueueTakeNext(sessionId);
+      dispatchQueue({
+        type: "replace",
+        sessionId,
+        entries: result.entries,
+      });
+      const batch = result.batch;
+      if (batch?.text.trim()) {
+        await sendPrompt(batch.text, { fromQueue: true, sessionId });
+      }
+    } catch (error) {
+      console.warn("prompt queue drain failed", error);
+    } finally {
+      queueDrainsRef.current.delete(sessionId);
+    }
+  }
+
   async function sendPrompt(
     text?: string,
-    opts?: { interject?: boolean; fromQueue?: boolean; sessionId?: string },
+    opts?: {
+      steer?: boolean;
+      runNext?: boolean;
+      fromQueue?: boolean;
+      sessionId?: string;
+    },
   ) {
     const prompt = (text ?? composer).trim();
     if (!prompt) return;
     const fromComposer = text === undefined;
     if (fromComposer) {
-      setComposer("");
-      if (activeSessionId) {
-        setComposerDrafts((d) => {
-          if (!(activeSessionId in d)) return d;
-          const next = { ...d };
-          delete next[activeSessionId];
-          return next;
-        });
-      }
+      clearComposerFor(activeSessionId);
     }
     let id: string;
     try {
@@ -1266,29 +1270,92 @@ export default function App() {
     } catch (e) {
       console.warn(e);
       // Restore draft if session creation failed after we cleared it
-      if (fromComposer) updateComposer(prompt);
+      if (fromComposer) restoreComposer(prompt, activeSessionId);
       return;
     }
     // After ensureSession, focus may have moved to a new id — clear that draft too
     if (fromComposer) {
-      setComposer("");
-      setComposerDrafts((d) => {
-        if (!(id in d) && !(activeSessionId && activeSessionId in d)) return d;
-        const next = { ...d };
-        delete next[id];
-        if (activeSessionId) delete next[activeSessionId];
-        return next;
-      });
+      clearComposerFor(id, activeSessionId);
     }
 
     const tabBusy = tabs.find((t) => t.id === id)?.busy;
-    // #147: queue while a turn is running (unless interject = cancel then send).
-    if (tabBusy && !opts?.interject && !opts?.fromQueue) {
-      const nextLen = (promptQueues[id]?.length ?? 0) + 1;
-      setPromptQueues((q) => ({
-        ...q,
-        [id]: [...(q[id] ?? []), prompt],
-      }));
+    if (tabBusy && opts?.steer) {
+      try {
+        const receipt = await api.sessionSteer(id, prompt);
+        dispatchQueue({
+          type: "replace",
+          sessionId: id,
+          entries: receipt.entries,
+        });
+        patchTab(id, (tab) => ({
+          ...tab,
+          activity: {
+            ...tab.activity,
+            detail:
+              receipt.disposition === "pending"
+                ? "Steering at next safe step"
+                : "Steering preserved to run next",
+            lastEventAt: Date.now(),
+          },
+        }));
+      } catch (error) {
+        if (fromComposer) restoreComposer(prompt, id);
+        patchTab(id, (tab) => ({
+          ...tab,
+          activity: errorActivity(String(error)),
+        }));
+      }
+      return;
+    }
+    if (tabBusy && opts?.runNext) {
+      try {
+        const added = await api.sessionQueueAdd(id, prompt, false);
+        const entry = added[added.length - 1];
+        if (!entry) throw new Error("Bridge did not queue the prompt");
+        const result = await api.sessionQueueRunNext(id, entry.id);
+        dispatchQueue({
+          type: "replace",
+          sessionId: id,
+          entries: result.entries,
+        });
+        patchTab(id, (tab) => ({
+          ...tab,
+          activity: {
+            ...tab.activity,
+            detail: "Stopping current turn · prompt will run next",
+            lastEventAt: Date.now(),
+          },
+          transcript: [
+            ...tab.transcript,
+            {
+              kind: "thought" as const,
+              text: `Run next: ${prompt.slice(0, 120)}${prompt.length > 120 ? "…" : ""}`,
+            },
+          ],
+        }));
+      } catch (error) {
+        if (fromComposer) restoreComposer(prompt, id);
+        patchTab(id, (tab) => ({
+          ...tab,
+          activity: errorActivity(String(error)),
+        }));
+      }
+      return;
+    }
+    if (tabBusy && !opts?.fromQueue) {
+      let nextLen = 0;
+      try {
+        const entries = await api.sessionQueueAdd(id, prompt, false);
+        nextLen = entries.length;
+        dispatchQueue({ type: "replace", sessionId: id, entries });
+      } catch (error) {
+        if (fromComposer) restoreComposer(prompt, id);
+        patchTab(id, (tab) => ({
+          ...tab,
+          activity: errorActivity(String(error)),
+        }));
+        return;
+      }
       patchTab(id, (t) => ({
         ...t,
         activity: {
@@ -1305,13 +1372,6 @@ export default function App() {
         ],
       }));
       return;
-    }
-    if (tabBusy && opts?.interject) {
-      try {
-        await api.sessionCancel(id);
-      } catch {
-        /* best effort */
-      }
     }
 
     patchTab(id, (t) => ({
@@ -1563,33 +1623,6 @@ export default function App() {
       setBgTasks(await api.backgroundTasks());
       await refreshChrome();
       await refreshSessions();
-      // #147 + #157: drain queued prompts; combine consecutive plain follow-ups.
-      let nextQueued: string | undefined;
-      setPromptQueues((q) => {
-        const list = q[id] ?? [];
-        if (!list.length) return q;
-        // combine_queued_prompts: merge prefix of plain (non-slash) texts
-        let n = 1;
-        for (let i = 1; i < list.length; i++) {
-          const t = list[i]?.trim() ?? "";
-          if (!t || t.startsWith("/") || t.startsWith("!")) break;
-          n++;
-        }
-        const combined = list.slice(0, n).join("\n\n");
-        const rest = list.slice(n);
-        nextQueued = combined;
-        const next = { ...q };
-        if (rest.length) next[id] = rest;
-        else delete next[id];
-        return next;
-      });
-      if (nextQueued) {
-        const drain = nextQueued;
-        // fromQueue bypasses busy re-queue (state may still show busy briefly).
-        setTimeout(() => {
-          void sendPrompt(drain, { fromQueue: true, sessionId: id });
-        }, 0);
-      }
     } catch (e) {
       patchTab(id, (t) => ({
         ...t,
@@ -1600,6 +1633,8 @@ export default function App() {
           { kind: "error", text: String(e) },
         ],
       }));
+    } finally {
+      setTimeout(() => void drainNextQueuedPrompt(id), 0);
     }
   }
 
@@ -2273,7 +2308,7 @@ export default function App() {
               rows={composerExpanded ? 10 : 2}
               placeholder={
                 busy
-                  ? "Turn running — Enter queues · Interject sends now"
+                  ? "Turn running — Enter queues · Steer now guides without stopping"
                   : workspaceMode === "chat"
                     ? "Message Grok… (drafts keep per session · Shift+Enter newline)"
                     : "Message the coding agent… (drafts keep per session · Shift+Enter newline)"
@@ -2287,6 +2322,71 @@ export default function App() {
                 }
               }}
             />
+            {activeSessionId && (
+              <PromptQueuePanel
+                entries={queueFor(activeSessionId)}
+                busy={busy}
+                onEdit={(entry, text) =>
+                  replaceQueue(activeSessionId, () =>
+                    api.sessionQueueEdit(
+                      activeSessionId,
+                      entry.id,
+                      entry.version,
+                      text,
+                    ),
+                  )
+                }
+                onRemove={(entry) =>
+                  replaceQueue(activeSessionId, () =>
+                    api.sessionQueueRemove(activeSessionId, entry.id),
+                  )
+                }
+                onClear={() =>
+                  replaceQueue(activeSessionId, () =>
+                    api.sessionQueueClear(activeSessionId),
+                  )
+                }
+                onMove={(entry, toIndex) =>
+                  replaceQueue(activeSessionId, () =>
+                    api.sessionQueueMove(activeSessionId, entry.id, toIndex),
+                  )
+                }
+                onSteer={async (entry) => {
+                  const receipt = await api.sessionQueueSteerEntry(
+                    activeSessionId,
+                    entry.id,
+                  );
+                  dispatchQueue({
+                    type: "replace",
+                    sessionId: activeSessionId,
+                    entries: receipt.entries,
+                  });
+                  if (receipt.disposition === "queued") {
+                    setTimeout(
+                      () => void drainNextQueuedPrompt(activeSessionId),
+                      0,
+                    );
+                  }
+                }}
+                onRunNext={async (entry) => {
+                  const result = await api.sessionQueueRunNext(
+                    activeSessionId,
+                    entry.id,
+                  );
+                  dispatchQueue({
+                    type: "replace",
+                    sessionId: activeSessionId,
+                    entries: result.entries,
+                  });
+                  if (!result.cancelled_active) {
+                    setTimeout(
+                      () => void drainNextQueuedPrompt(activeSessionId),
+                      0,
+                    );
+                  }
+                }}
+              />
+            )}
             <div className="composer-toolbar">
               <div className="composer-toolbar-left">
                 <label
@@ -2415,31 +2515,34 @@ export default function App() {
                   </button>
                 )}
                 {busy && composer.trim() && (
-                  <button
-                    type="button"
-                    className="composer-chip"
-                    title="Cancel current turn and send this prompt now (#147)"
-                    onClick={() => void sendPrompt(undefined, { interject: true })}
-                  >
-                    Interject
-                  </button>
-                )}
-                {activeSessionId &&
-                  (promptQueues[activeSessionId]?.length ?? 0) > 0 && (
-                    <span
-                      className="composer-hint"
-                      title="Prompts waiting for the current turn to finish"
+                  <>
+                    <button
+                      type="button"
+                      className="composer-chip"
+                      title="Guide the running agent at its next safe step without stopping it"
+                      onClick={() => void sendPrompt(undefined, { steer: true })}
                     >
-                      Queue {promptQueues[activeSessionId].length}
-                    </span>
-                  )}
+                      Steer now
+                    </button>
+                    <button
+                      type="button"
+                      className="composer-chip"
+                      title="Stop the current turn and make this prompt run next"
+                      onClick={() =>
+                        void sendPrompt(undefined, { runNext: true })
+                      }
+                    >
+                      Run next
+                    </button>
+                  </>
+                )}
                 <button
                   type="button"
                   className="composer-send"
                   disabled={!composer.trim()}
                   title={
                     busy
-                      ? "Queue prompt (turn running) · Interject to send now"
+                      ? "Queue prompt (turn running) · use Steer now for guidance"
                       : "Send (Enter) · newline with Shift+Enter"
                   }
                   onClick={() => void sendPrompt()}
@@ -2819,43 +2922,15 @@ export default function App() {
                     a.session_id === activeSessionId,
                 )
                 .map((a) => (
-                <div
-                  key={a.id}
-                  className={`subagent-card is-${String(a.status).toLowerCase().replace(/\s+/g, "-")}`}
-                  data-testid="subagent-card"
-                >
-                  <div className="subagent-card-kind">{a.kind || "agent"}</div>
-                  <div className="subagent-card-title">
-                    {a.title || a.id.slice(0, 8)}
-                  </div>
-                  <div className="subagent-card-status">{a.status}</div>
-                  {a.summary && (
-                    <div className="subagent-card-summary" title={a.summary}>
-                      {String(a.summary).slice(0, 160)}
-                      {String(a.summary).length > 160 ? "…" : ""}
-                    </div>
-                  )}
-                  {a.last_tool && (
-                    <div className="subagent-card-tool">tool: {a.last_tool}</div>
-                  )}
-                  {String(a.status) === "running" && (
-                    <button
-                      type="button"
-                      className="danger"
-                      data-testid="subagent-cancel"
-                      title="Cancel this child only"
-                      onClick={() => {
-                        void (async () => {
-                          await api.cancelSubagent(a.id);
-                          setSubagents(await api.subagentsList());
-                        })();
-                      }}
-                    >
-                      Cancel child
-                    </button>
-                  )}
-                </div>
-              ))}
+                  <SubagentCard
+                    key={a.id}
+                    agent={a}
+                    onCancel={async (id) => {
+                      await api.cancelSubagent(id);
+                      setSubagents(await api.subagentsList());
+                    }}
+                  />
+                ))}
             </div>
             <div className="section-title">Background / scheduled</div>
             <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 0.5rem" }}>
@@ -3385,6 +3460,30 @@ function applyUpdate(
             phase: "tool",
             label: "Shell",
             detail: "Streaming command output…",
+            live: true,
+          },
+        ),
+      );
+      break;
+    case "steering_injected":
+      withTab(sid!, (tab) =>
+        withActivity(
+          mapTranscript(
+            tab,
+            (transcript) => [
+              ...transcript,
+              {
+                kind: "thought" as const,
+                text: `Steering applied: ${u.text}`,
+                streaming: false,
+              },
+            ],
+            { busy: true },
+          ),
+          {
+            phase: "streaming",
+            label: "Steering",
+            detail: "Guidance delivered at a safe step",
             live: true,
           },
         ),

@@ -102,6 +102,12 @@ export type SessionUpdate =
       session_id: string;
       message: string;
       retry_after_ms?: number | null;
+    }
+  | {
+      type: "steering_injected";
+      session_id: string;
+      steering_id: string;
+      text: string;
     };
 
 export interface PermissionRequest {
@@ -205,6 +211,26 @@ export interface AuthState {
   signed_in: boolean;
   display_name?: string | null;
   method?: string | null;
+}
+
+export type SubagentExecutionMode =
+  | "unknown"
+  | "worktree"
+  | "project_copy"
+  | "shared_read_only"
+  | "shared_mutating"
+  | "isolation_failed";
+
+export interface SubagentInfo {
+  id: string;
+  kind: string;
+  title: string;
+  status: string;
+  session_id?: string | null;
+  summary?: string | null;
+  last_tool?: string | null;
+  cwd?: string | null;
+  execution_mode: SubagentExecutionMode;
 }
 
 export interface AgentStatus {
