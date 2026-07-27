@@ -169,13 +169,33 @@ impl OrchestrationService {
     }
 
     pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
-        let cfg = self.config.lock();
+        // Lock order: config → active (never nest the other way).
+        let max = self.config.lock().max_concurrent_runs;
         let active = self.active.lock().len();
         Ok(json!({
-            "maxConcurrentRuns": cfg.max_concurrent_runs,
+            "maxConcurrentRuns": max,
             "activeRuns": active,
-            "available": cfg.max_concurrent_runs.saturating_sub(active),
+            "available": max.saturating_sub(active),
         }))
+    }
+
+    /// Atomically reserve a capacity slot for `run_id`.
+    /// Lock order matches [`get_capacity`]: config (read+release) then active.
+    fn try_reserve_capacity(&self, run_id: &str) -> Result<(), OrchError> {
+        let max = self.config.lock().max_concurrent_runs;
+        let mut active = self.active.lock();
+        if active.len() >= max {
+            return Err(OrchError::new(
+                OrchErrorCode::CapacityExhausted,
+                "max concurrent runs reached",
+            ));
+        }
+        active.push(run_id.to_string());
+        Ok(())
+    }
+
+    fn release_capacity(&self, run_id: &str) {
+        self.active.lock().retain(|id| id != run_id);
     }
 
     pub fn get_run(
@@ -432,19 +452,9 @@ impl OrchestrationService {
             ));
         }
 
-        // Generate id, then reserve capacity under a single lock before durable IO.
+        // Generate id, then reserve capacity (config→active) before durable IO.
         let run_id = Uuid::new_v4().to_string();
-        {
-            let mut active = self.active.lock();
-            let max = self.config.lock().max_concurrent_runs;
-            if active.len() >= max {
-                return Err(OrchError::new(
-                    OrchErrorCode::CapacityExhausted,
-                    "max concurrent runs reached",
-                ));
-            }
-            active.push(run_id.clone());
-        }
+        self.try_reserve_capacity(&run_id)?;
 
         let start_seq = self.bus.current_seq().saturating_add(1);
         let run = RunRecord {
@@ -465,7 +475,7 @@ impl OrchestrationService {
             error_code: None,
         };
         if let Err(e) = self.store.save_run(&run) {
-            self.active.lock().retain(|id| id != &run_id);
+            self.release_capacity(&run_id);
             return Err(OrchError::new(OrchErrorCode::Internal, e.to_string()));
         }
 
@@ -503,10 +513,9 @@ impl OrchestrationService {
                 r.updated_at = Utc::now();
                 match result {
                     Ok(Ok(text)) => {
-                        // Coding loop surfaces round exhaustion as a final assistant message.
-                        let round_capped = text.starts_with("Stopped after ")
-                            && text.contains("tool rounds without a final answer");
-                        if round_capped {
+                        // Coding / offline simulate path surfaces round exhaustion
+                        // via the shared stop message (#196).
+                        if crate::host_helpers::is_round_limit_stop_message(&text) {
                             r.state = RunState::LimitReached;
                             r.terminal_result = Some("limit_reached".into());
                             r.error_code = Some("limit_reached".into());

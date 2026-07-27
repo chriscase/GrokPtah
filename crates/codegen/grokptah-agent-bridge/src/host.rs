@@ -16,8 +16,9 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     api_context_messages, build_agent_messages, build_compact_summary, call_xai_agent_step,
     call_xai_chat, cargo_test_output_failed, coding_agent_tools, emit_message, emit_thought,
-    filter_tools_edit_and_shell, normalize_sandbox_profile, offline_plan_steps, parse_effort_arg,
-    propose_plan_with_model, push_assistant, push_thought, push_tool, sandbox_blocks_shell,
+    filter_tools_edit_and_shell, is_round_limit_stop_message, normalize_sandbox_profile,
+    offline_plan_steps, parse_effort_arg, propose_plan_with_model, push_assistant, push_thought,
+    push_tool, resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell,
     sandbox_is_readonly, surface_rate_limit_or_error, tool_kind, tool_web_fetch, AgentStep,
     McpToolIndex,
 };
@@ -3200,7 +3201,35 @@ impl AgentHostHandle {
         cancel: &CancellationToken,
         event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
+        // Honor per-turn / host max_rounds so orchestration bounds are testable offline.
+        let max_rounds = {
+            let g = self.inner.lock();
+            resolve_turn_max_rounds(
+                g.turn_max_rounds.get(&session_id).copied(),
+                g.max_agent_rounds,
+            )
+        };
         let lower = prompt.to_lowercase();
+        // Explicit multi-round simulation: exhaust the wired budget and return the
+        // same stop text the online coding loop emits (#196 round limits).
+        if lower.contains("simulate_tool_rounds") {
+            for round in 1..=max_rounds {
+                if cancel.is_cancelled() {
+                    return Ok("(cancelled)".into());
+                }
+                let _ = event_tx.send(SessionUpdate::AgentProgress {
+                    session_id,
+                    round: round as u32,
+                    max_rounds: max_rounds as u32,
+                    last_tool: Some("simulate".into()),
+                    detail: format!("Offline simulate step {round}/{max_rounds}"),
+                });
+            }
+            let msg = round_limit_stop_message(max_rounds);
+            emit_message(event_tx, session_id, &msg);
+            push_assistant(self, session_id, &msg);
+            return Ok(msg);
+        }
         if lower.contains("list") || lower.contains("files") || lower.contains("ls ") {
             let _ = self
                 .run_tool_for_output(
@@ -3417,14 +3446,10 @@ impl AgentHostHandle {
     ) -> Result<String> {
         let max_rounds = {
             let g = self.inner.lock();
-            // Per-turn orchestration override wins over host-wide config.
-            g.turn_max_rounds
-                .get(&session_id)
-                .copied()
-                .or(g.max_agent_rounds)
-                .map(|n| n.max(1) as usize)
-                .unwrap_or(24)
-                .min(24)
+            resolve_turn_max_rounds(
+                g.turn_max_rounds.get(&session_id).copied(),
+                g.max_agent_rounds,
+            )
         };
         // Auto-compact when wire window is large (non-destructive local history).
         {
@@ -3708,10 +3733,8 @@ impl AgentHostHandle {
             }
         }
 
-        let msg = format!(
-            "Stopped after {max_rounds} tool rounds without a final answer. \
-             Ask me to continue, or narrow the task."
-        );
+        let msg = round_limit_stop_message(max_rounds);
+        debug_assert!(is_round_limit_stop_message(&msg));
         emit_message(event_tx, session_id, &msg);
         push_assistant(self, session_id, &msg);
         Ok(msg)

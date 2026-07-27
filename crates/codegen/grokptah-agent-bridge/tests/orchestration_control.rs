@@ -670,31 +670,103 @@ fn journal_reload_supports_run_scoped_reads() {
     assert_eq!(page.entries[0].seq, start);
 }
 
-#[test]
-fn capacity_reserve_is_atomic_under_contention() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::thread;
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn capacity_race_against_real_submit_task() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    // max_concurrent_runs=2; flood 8 distinct sessions so capacity (not busy) is the gate.
+    let mut sessions = Vec::new();
+    for _ in 0..8 {
+        let s = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(s.id, ws.path()).unwrap();
+        sessions.push(s.id);
+    }
+    let orch = orch_for(&host, &home, &ws, 2);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
 
-    // Pure unit: model the reserve path (check+push under one lock).
-    let active = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let max = 2usize;
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let mut handles = Vec::new();
-    for i in 0..20 {
-        let active = active.clone();
-        let accepted = accepted.clone();
-        handles.push(thread::spawn(move || {
-            let mut g = active.lock().unwrap();
-            if g.len() < max {
-                g.push(format!("r{i}"));
-                accepted.fetch_add(1, Ordering::SeqCst);
-            }
-        }));
+    let mut futs = Vec::new();
+    for (i, sid) in sessions.into_iter().enumerate() {
+        let orch = orch.clone();
+        let auth = auth.clone();
+        let ws_path = ws.path().to_path_buf();
+        futs.push(async move {
+            orch.submit_task(
+                &auth,
+                &format!("race-{i}"),
+                sid,
+                &ws_path,
+                "run sleep 3".into(),
+                Some(RunBounds {
+                    max_prompt_bytes: 10_000,
+                    max_rounds: 24,
+                    max_duration_ms: 30_000,
+                }),
+            )
+            .await
+        });
     }
-    for h in handles {
-        h.join().unwrap();
-    }
-    assert_eq!(accepted.load(Ordering::SeqCst), max);
-    assert_eq!(active.lock().unwrap().len(), max);
+    let results = futures::future::join_all(futs).await;
+    let accepted = results.iter().filter(|r| r.is_ok()).count();
+    let exhausted = results
+        .iter()
+        .filter(|r| {
+            r.as_ref()
+                .err()
+                .map(|e| e.code.as_str() == "capacity_exhausted")
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(
+        accepted, 2,
+        "exactly max_concurrent_runs must accept under race"
+    );
+    assert_eq!(exhausted, 6, "remainder must fail capacity_exhausted");
+    let cap = orch.get_capacity(&auth).unwrap();
+    assert_eq!(cap["activeRuns"].as_u64().unwrap(), 2);
+    assert_eq!(cap["maxConcurrentRuns"].as_u64().unwrap(), 2);
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn submit_round_limit_reached_via_wired_max_rounds() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    // Offline path honors turn_max_rounds for simulate_tool_rounds prompts.
+    let resp = orch
+        .submit_task(
+            &auth,
+            "round-lim",
+            session.id,
+            ws.path(),
+            "simulate_tool_rounds please".into(),
+            Some(RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 2,
+                max_duration_ms: 30_000,
+            }),
+        )
+        .await
+        .unwrap();
+    let run_id = resp["runId"].as_str().unwrap().to_string();
+    let state = wait_run_terminal(&orch, &auth, &run_id, Duration::from_secs(10)).await;
+    assert_eq!(state, RunState::LimitReached);
+    let handoff = orch.get_handoff(&auth, &run_id).unwrap();
+    let text = handoff["finalResponse"].as_str().unwrap_or("");
+    assert!(
+        text.contains("Stopped after 2 tool rounds"),
+        "expected stop message reflecting max_rounds=2, got {text:?}"
+    );
+    set_grokptah_home_override(None);
 }

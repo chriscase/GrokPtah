@@ -642,6 +642,32 @@ pub(crate) fn sandbox_blocks_shell(profile: &str, command: &str) -> bool {
     mutators.iter().any(|m| c.contains(m))
 }
 
+/// Resolve model-step budget for a turn (#196 RunBounds.max_rounds).
+/// Per-turn override wins over host-wide config; default 24; hard cap 24.
+pub(crate) fn resolve_turn_max_rounds(
+    turn_override: Option<u32>,
+    host_default: Option<u32>,
+) -> usize {
+    turn_override
+        .or(host_default)
+        .map(|n| n.max(1) as usize)
+        .unwrap_or(24)
+        .min(24)
+}
+
+/// Final assistant text emitted when the coding loop exhausts its round budget.
+pub(crate) fn round_limit_stop_message(max_rounds: usize) -> String {
+    format!(
+        "Stopped after {max_rounds} tool rounds without a final answer. \
+         Ask me to continue, or narrow the task."
+    )
+}
+
+/// True when final assistant text is the round-budget stop message.
+pub(crate) fn is_round_limit_stop_message(text: &str) -> bool {
+    text.starts_with("Stopped after ") && text.contains("tool rounds without a final answer")
+}
+
 pub(crate) fn offline_plan_steps(goal: &str) -> Vec<String> {
     let g = goal.trim();
     let mut steps = vec![
@@ -1516,6 +1542,23 @@ pub(crate) async fn call_xai_chat(
 #[cfg(test)]
 mod efficiency_tests {
     use super::*;
+
+    #[test]
+    fn resolve_turn_max_rounds_prefers_override() {
+        assert_eq!(resolve_turn_max_rounds(Some(2), Some(24)), 2);
+        assert_eq!(resolve_turn_max_rounds(None, Some(3)), 3);
+        assert_eq!(resolve_turn_max_rounds(None, None), 24);
+        assert_eq!(resolve_turn_max_rounds(Some(0), None), 1); // floor
+        assert_eq!(resolve_turn_max_rounds(Some(99), None), 24); // cap
+    }
+
+    #[test]
+    fn round_limit_stop_message_is_detectable() {
+        let msg = round_limit_stop_message(2);
+        assert!(is_round_limit_stop_message(&msg));
+        assert!(msg.contains("Stopped after 2 tool rounds"));
+        assert!(!is_round_limit_stop_message("(offline agent) done: hi"));
+    }
 
     #[test]
     fn efficiency_guidance_covers_multi_bug_and_rename() {
