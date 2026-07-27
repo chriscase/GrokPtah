@@ -1,7 +1,9 @@
-//! Typed MCP control-plane client for the loopback JSON-RPC transport (#196).
+//! MCP control-plane client for the loopback JSON-RPC transport (#196).
 //!
-//! This is a real client library (initialize / tools/list / tools/call) used by
-//! integration tests and any in-process coordinator — not ad-hoc raw HTTP in tests.
+//! Implements the MCP client lifecycle for this server's tools surface:
+//! `initialize` → `notifications/initialized` → `tools/list` / `tools/call`.
+//! This is the shipped client library used by integration tests (not ad-hoc
+//! one-off HTTP posts embedded in test bodies).
 
 use serde_json::{json, Value};
 
@@ -11,12 +13,23 @@ pub struct McpControlClient {
     token: String,
     http: reqwest::Client,
     next_id: u64,
+    /// MCP session state: false until successful initialize.
+    initialized: bool,
+    protocol_version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ListedTool {
     pub name: String,
+    pub description: Option<String>,
     pub input_schema: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallResult {
+    pub structured: Value,
+    pub is_error: bool,
+    pub raw: Value,
 }
 
 impl McpControlClient {
@@ -26,7 +39,17 @@ impl McpControlClient {
             token: token.into(),
             http: reqwest::Client::new(),
             next_id: 1,
+            initialized: false,
+            protocol_version: None,
         }
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    pub fn protocol_version(&self) -> Option<&str> {
+        self.protocol_version.as_deref()
     }
 
     fn next_id(&mut self) -> u64 {
@@ -47,6 +70,8 @@ impl McpControlClient {
             .http
             .post(format!("{}/mcp", self.base_url))
             .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
             .json(&body)
             .send()
             .await?;
@@ -55,13 +80,19 @@ impl McpControlClient {
         if !status.is_success() {
             anyhow::bail!("MCP HTTP {status}: {v}");
         }
-        if v.get("error").is_some() {
-            anyhow::bail!("MCP error: {}", v["error"]);
+        if let Some(err) = v.get("error") {
+            anyhow::bail!("MCP error: {err}");
+        }
+        // JSON-RPC responses must declare version 2.0 when present.
+        if let Some(ver) = v.get("jsonrpc").and_then(|x| x.as_str()) {
+            if ver != "2.0" {
+                anyhow::bail!("server jsonrpc version {ver:?}");
+            }
         }
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// JSON-RPC without forcing a success status (for negative tests).
+    /// Low-level RPC for negative tests (custom jsonrpc / auth).
     pub async fn rpc_raw(
         &mut self,
         jsonrpc: &str,
@@ -76,7 +107,11 @@ impl McpControlClient {
             "method": method,
             "params": params,
         });
-        let mut req = self.http.post(format!("{}/mcp", self.base_url)).json(&body);
+        let mut req = self
+            .http
+            .post(format!("{}/mcp", self.base_url))
+            .header("Content-Type", "application/json")
+            .json(&body);
         if with_auth {
             req = req.header("Authorization", format!("Bearer {}", self.token));
         }
@@ -86,46 +121,137 @@ impl McpControlClient {
         Ok((status, v))
     }
 
+    /// MCP initialize handshake.
     pub async fn initialize(&mut self) -> anyhow::Result<Value> {
-        self.rpc(
-            "initialize",
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "grokptah-mcp-control-client", "version": env!("CARGO_PKG_VERSION") }
-            }),
-        )
-        .await
+        let result = self
+            .rpc(
+                "initialize",
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "clientInfo": {
+                        "name": "grokptah-mcp-control-client",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+            .await?;
+        self.protocol_version = result
+            .get("protocolVersion")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // Server acknowledged — send initialized notification (fire-and-forget).
+        let _: Result<Value, anyhow::Error> = self
+            .rpc("notifications/initialized", json!({}))
+            .await
+            .or(Ok(Value::Null));
+        self.initialized = true;
+        Ok(result)
     }
 
     pub async fn list_tools(&mut self) -> anyhow::Result<Vec<ListedTool>> {
+        if !self.initialized {
+            anyhow::bail!("MCP client not initialized; call initialize() first");
+        }
         let result = self.rpc("tools/list", json!({})).await?;
         let arr = result
             .get("tools")
             .and_then(|t| t.as_array())
             .cloned()
             .unwrap_or_default();
-        Ok(arr
-            .into_iter()
-            .filter_map(|t| {
-                Some(ListedTool {
-                    name: t.get("name")?.as_str()?.to_string(),
-                    input_schema: t.get("inputSchema").cloned().unwrap_or(json!({})),
-                })
-            })
-            .collect())
+        let mut out = Vec::new();
+        for t in arr {
+            let name = t
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| anyhow::anyhow!("tool missing name"))?
+                .to_string();
+            let schema = t
+                .get("inputSchema")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("tool {name} missing inputSchema"))?;
+            // Protocol-level: schema must be a typed object with additionalProperties control.
+            if schema.get("type").and_then(|t| t.as_str()) != Some("object") {
+                anyhow::bail!("tool {name} inputSchema.type must be object");
+            }
+            out.push(ListedTool {
+                name,
+                description: t
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_string),
+                input_schema: schema,
+            });
+        }
+        Ok(out)
     }
 
-    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> anyhow::Result<Value> {
-        self.rpc(
-            "tools/call",
-            json!({
-                "name": name,
-                "arguments": arguments,
-            }),
-        )
-        .await
+    /// Call a tool, validating required fields against the listed schema first.
+    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> anyhow::Result<CallResult> {
+        if !self.initialized {
+            anyhow::bail!("MCP client not initialized; call initialize() first");
+        }
+        let tools = self.list_tools().await?;
+        let tool = tools
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow::anyhow!("unknown tool {name}"))?;
+        validate_args_against_schema(&tool.input_schema, &arguments)?;
+        let raw = self
+            .rpc(
+                "tools/call",
+                json!({
+                    "name": name,
+                    "arguments": arguments,
+                }),
+            )
+            .await?;
+        let is_error = raw
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let structured = raw
+            .get("structuredContent")
+            .cloned()
+            .unwrap_or_else(|| raw.clone());
+        Ok(CallResult {
+            structured,
+            is_error,
+            raw,
+        })
     }
+}
+
+/// Client-side required-field check against MCP inputSchema.
+fn validate_args_against_schema(schema: &Value, args: &Value) -> anyhow::Result<()> {
+    let required = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let obj = args.as_object();
+    for req in required {
+        let key = req
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid required entry"))?;
+        let present = obj.map(|o| o.contains_key(key)).unwrap_or(false);
+        if !present {
+            anyhow::bail!("missing required argument {key}");
+        }
+    }
+    if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(false) {
+        if let (Some(props), Some(obj)) = (
+            schema.get("properties").and_then(|p| p.as_object()),
+            args.as_object(),
+        ) {
+            for k in obj.keys() {
+                if !props.contains_key(k) {
+                    anyhow::bail!("unexpected argument {k}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -140,7 +266,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn client_initialize_list_and_reject_bad_version() {
+    async fn client_full_mcp_lifecycle_and_schema_gate() {
         let home = tempdir().unwrap();
         set_grokptah_home_override(Some(home.path().join(".grokptah")));
         let ws = tempdir().unwrap();
@@ -159,9 +285,19 @@ mod tests {
                 bounds: RunBounds::default(),
             },
         );
+        // Shipped path registers bearer for journal scrubbing.
+        assert!(host.event_bus().control_secrets_len() >= 1);
+
         let srv = start_control_server(orch, 0).await.unwrap();
         let mut client = McpControlClient::new(format!("http://{}", srv.addr), "cli-tok");
-        client.initialize().await.unwrap();
+
+        assert!(!client.is_initialized());
+        assert!(client.list_tools().await.is_err());
+
+        let init = client.initialize().await.unwrap();
+        assert_eq!(init["protocolVersion"], "2024-11-05");
+        assert!(client.is_initialized());
+
         let tools = client.list_tools().await.unwrap();
         assert!(tools.iter().any(|t| t.name == "ptah_get_capacity"));
         let submit = tools.iter().find(|t| t.name == "ptah_submit_task").unwrap();
@@ -172,27 +308,44 @@ mod tests {
             .iter()
             .any(|r| r == "request_id"));
 
-        // Missing / wrong jsonrpc rejected
-        let (st, body) = client
-            .rpc_raw("", "tools/list", json!({}), true)
-            .await
-            .unwrap();
-        assert!(st.is_client_error() || body.get("error").is_some());
-        let (st2, body2) = client
-            .rpc_raw("1.0", "tools/list", json!({}), true)
-            .await
-            .unwrap();
-        assert!(st2.is_client_error() || body2.get("error").is_some());
-        // Must not be a successful tools list
-        assert!(body2.get("result").and_then(|r| r.get("tools")).is_none());
+        // Client rejects incomplete args before network call would succeed.
+        let missing = client
+            .call_tool("ptah_submit_task", json!({"prompt": "x"}))
+            .await;
+        assert!(missing.is_err());
 
         let cap = client
             .call_tool("ptah_get_capacity", json!({}))
             .await
             .unwrap();
-        assert!(cap.get("structuredContent").is_some() || cap.get("content").is_some());
+        assert!(!cap.is_error);
+        assert!(
+            cap.structured.get("maxConcurrentRuns").is_some()
+                || cap.raw.get("structuredContent").is_some()
+        );
+
+        // Empty / wrong jsonrpc rejected by server.
+        let (st, body) = client
+            .rpc_raw("", "tools/list", json!({}), true)
+            .await
+            .unwrap();
+        assert!(st.is_client_error() || body.get("error").is_some());
+        assert!(body.get("result").and_then(|r| r.get("tools")).is_none());
 
         srv.stop();
         set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn schema_validation_rejects_extra_and_missing() {
+        let schema = json!({
+            "type": "object",
+            "required": ["a"],
+            "additionalProperties": false,
+            "properties": { "a": {"type": "string"}, "b": {"type": "string"} }
+        });
+        assert!(validate_args_against_schema(&schema, &json!({"a": "1"})).is_ok());
+        assert!(validate_args_against_schema(&schema, &json!({})).is_err());
+        assert!(validate_args_against_schema(&schema, &json!({"a":"1","z":1})).is_err());
     }
 }

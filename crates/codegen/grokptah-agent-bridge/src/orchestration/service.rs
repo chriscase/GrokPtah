@@ -52,6 +52,11 @@ impl OrchestrationService {
         store: OrchStore,
         config: OrchestrationConfig,
     ) -> Arc<Self> {
+        // Register control bearer (and any future secrets) on the *shared* host bus
+        // so durable journal redaction covers the shipped desktop path.
+        if !config.bearer_token.is_empty() {
+            bus.add_control_secrets([config.bearer_token.clone()]);
+        }
         Arc::new(Self {
             host,
             bus,
@@ -71,6 +76,9 @@ impl OrchestrationService {
     }
 
     pub fn set_token(&self, token: String) {
+        if !token.is_empty() {
+            self.bus.add_control_secrets([token.clone()]);
+        }
         self.config.lock().bearer_token = token;
     }
 
@@ -567,8 +575,17 @@ impl OrchestrationService {
         let max_ms = bounds.max_duration_ms;
         let max_rounds = bounds.max_rounds;
 
-        // Live subscriber for incremental durable aggregates (survives journal rollover).
-        let mut event_rx = bus.subscribe();
+        // Dedicated aggregator task: must not share a biased select with the
+        // duration deadline (chatty ShellOutput must not starve max_duration_ms).
+        let mut agg_rx = bus.subscribe();
+        let store_agg = store.clone();
+        let rid_agg = run_id.clone();
+        let agg_task = tokio::spawn(async move {
+            while let Some(update) = agg_rx.recv().await {
+                apply_run_aggregate(&store_agg, &rid_agg, session_id, &update);
+            }
+        });
+
         let join = tokio::spawn(async move {
             let prompt_fut = host.session_prompt_with_max_rounds(
                 session_id,
@@ -582,31 +599,27 @@ impl OrchestrationService {
             // Drive the turn until completion or duration limit. On timeout we
             // cancel while the future is still alive (turn_cancels still present),
             // await shell teardown, then await the future — never drop it first.
+            // Deadline is polled first (biased) so event flood cannot starve it.
             let mut timed_out = false;
             let result: Result<String, anyhow::Error> = loop {
                 tokio::select! {
                     biased;
-                    ev = event_rx.recv() => {
-                        if let Some(update) = ev {
-                            apply_run_aggregate(&store, &rid, session_id, &update);
-                        }
-                    }
-                    r = &mut prompt_fut => {
-                        break r;
-                    }
                     _ = &mut deadline, if !timed_out => {
                         timed_out = true;
                         // Future still pinned — cancel_turn finds active turn.
                         let _ = host.cancel_turn_and_await(Some(session_id)).await;
                         // Fall through: keep selecting until prompt_fut completes.
                     }
+                    r = &mut prompt_fut => {
+                        break r;
+                    }
                 }
             };
 
-            // Drain any trailing events after turn ends (best-effort).
-            while let Ok(update) = event_rx.try_recv() {
-                apply_run_aggregate(&store, &rid, session_id, &update);
-            }
+            // Stop aggregator; then reconcile aggregates from the journal range
+            // so late FileEdit/test events are not lost if the task was aborted mid-drain.
+            agg_task.abort();
+            let _ = agg_task.await;
 
             let end_seq = bus.current_seq();
             if let Ok(Some(mut r)) = store.load_run(&rid) {
@@ -619,6 +632,8 @@ impl OrchestrationService {
                 }
                 r.end_seq = Some(end_seq);
                 r.updated_at = Utc::now();
+                // Final journal pass (does not replace incremental path; fills gaps).
+                reconcile_aggregates_from_bus(&bus, &mut r);
                 if timed_out {
                     r.state = RunState::LimitReached;
                     r.terminal_result = Some("limit_reached".into());
@@ -1046,34 +1061,41 @@ fn apply_run_aggregate(
     let Ok(Some(mut r)) = store.load_run(run_id) else {
         return;
     };
-    if r.state.is_terminal() {
-        return;
+    if fold_aggregate_update(&mut r.aggregates, update) {
+        r.updated_at = Utc::now();
+        let _ = store.save_run(&r);
     }
+}
+
+fn fold_aggregate_update(
+    aggregates: &mut RunAggregates,
+    update: &crate::events::SessionUpdate,
+) -> bool {
     match update {
         crate::events::SessionUpdate::FileEdit { path, summary, .. } => {
-            if !r.aggregates.changes.iter().any(|c| c.path == *path) {
-                r.aggregates.changes.push(ChangeRecord {
-                    path: path.clone(),
-                    summary: summary.clone(),
-                });
-                r.updated_at = Utc::now();
-                let _ = store.save_run(&r);
+            if aggregates.changes.iter().any(|c| c.path == *path) {
+                return false;
             }
+            aggregates.changes.push(ChangeRecord {
+                path: path.clone(),
+                summary: summary.clone(),
+            });
+            true
         }
         crate::events::SessionUpdate::ShellSessionStarted {
             command, call_id, ..
         } if is_recognized_test_command(command) => {
-            if !r.aggregates.tests.iter().any(|t| t.call_id == *call_id) {
-                r.aggregates.tests.push(TestObservation {
-                    call_id: call_id.clone(),
-                    command: Some(command.clone()),
-                    status: "started".into(),
-                    exit_code: None,
-                    cancelled: None,
-                });
-                r.updated_at = Utc::now();
-                let _ = store.save_run(&r);
+            if aggregates.tests.iter().any(|t| t.call_id == *call_id) {
+                return false;
             }
+            aggregates.tests.push(TestObservation {
+                call_id: call_id.clone(),
+                command: Some(command.clone()),
+                status: "started".into(),
+                exit_code: None,
+                cancelled: None,
+            });
+            true
         }
         crate::events::SessionUpdate::ShellSessionEnded {
             call_id,
@@ -1081,20 +1103,26 @@ fn apply_run_aggregate(
             cancelled,
             ..
         } => {
-            if let Some(t) = r
-                .aggregates
-                .tests
-                .iter_mut()
-                .find(|t| t.call_id == *call_id)
-            {
+            if let Some(t) = aggregates.tests.iter_mut().find(|t| t.call_id == *call_id) {
                 t.status = "ended".into();
                 t.exit_code = *exit_code;
                 t.cancelled = Some(*cancelled);
-                r.updated_at = Utc::now();
-                let _ = store.save_run(&r);
+                true
+            } else {
+                false
             }
         }
-        _ => {}
+        _ => false,
+    }
+}
+
+fn reconcile_aggregates_from_bus(bus: &EventBus, run: &mut RunRecord) {
+    let after = run.start_seq.map(|s| s.saturating_sub(1)).unwrap_or(0);
+    let Ok(entries) = bus.read_range_all(after, run.end_seq, Some(run.session_id)) else {
+        return;
+    };
+    for e in entries {
+        fold_aggregate_update(&mut run.aggregates, &e.update);
     }
 }
 

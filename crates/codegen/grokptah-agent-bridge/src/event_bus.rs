@@ -66,11 +66,23 @@ impl EventBus {
 
     /// Register secrets that must never appear in the durable journal.
     pub fn with_control_secrets(self, secrets: impl IntoIterator<Item = String>) -> Self {
-        let mut g = self.inner.lock();
-        g.control_secrets
-            .extend(secrets.into_iter().filter(|s| !s.is_empty()));
-        drop(g);
+        self.add_control_secrets(secrets);
         self
+    }
+
+    /// Register secrets on a shared bus handle (desktop/orchestration start).
+    pub fn add_control_secrets(&self, secrets: impl IntoIterator<Item = String>) {
+        let mut g = self.inner.lock();
+        for s in secrets {
+            if !s.is_empty() && !g.control_secrets.iter().any(|x| x == &s) {
+                g.control_secrets.push(s);
+            }
+        }
+    }
+
+    /// Secrets currently configured for durable redaction (test/introspection).
+    pub fn control_secrets_len(&self) -> usize {
+        self.inner.lock().control_secrets.len()
     }
 
     /// Persist journal under `dir/event_journal.jsonl`; reload tail; compact file.
