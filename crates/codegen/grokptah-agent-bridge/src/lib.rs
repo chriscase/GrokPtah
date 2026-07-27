@@ -6,6 +6,7 @@
 mod agents_personas;
 mod auth_store;
 mod discover;
+pub mod event_bus;
 pub mod eval_oracle;
 mod events;
 mod exec_risk;
@@ -16,9 +17,11 @@ mod host_helpers;
 mod instance_lock;
 mod isolation;
 mod local_tools;
+pub mod mcp_control;
 mod mcp_runtime;
 mod memory;
 mod models_catalog;
+pub mod orchestration;
 mod permission;
 mod project_context;
 mod prompt_combine;
@@ -59,8 +62,14 @@ pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
     set_grokptah_home_override, set_project_mcp_trusted,
 };
+pub use event_bus::{EventBus, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
+pub use mcp_control::{discovered_tool_names, start_control_server, ControlServerHandle};
+pub use orchestration::{
+    OrchestrationConfig, OrchestrationService, OrchStore, RunBounds, RunRecord, RunState,
+    WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+};
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
 pub use permission::{PermissionDecision, PermissionRequest};

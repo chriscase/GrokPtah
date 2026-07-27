@@ -6,7 +6,6 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use futures::StreamExt;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -82,7 +81,7 @@ pub(crate) fn push_tool(
 }
 
 pub(crate) fn emit_message(
-    tx: &mpsc::UnboundedSender<SessionUpdate>,
+    tx: &crate::event_bus::EventBus,
     session_id: Uuid,
     text: &str,
 ) {
@@ -99,7 +98,7 @@ pub fn is_rate_limit_error(err: &str) -> bool {
 }
 
 pub(crate) fn surface_rate_limit_or_error(
-    event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    event_tx: &crate::event_bus::EventBus,
     session_id: Uuid,
     err: &str,
 ) {
@@ -114,7 +113,7 @@ pub(crate) fn surface_rate_limit_or_error(
 
 #[allow(dead_code)] // reserved if we re-enable quiet diagnostics
 pub(crate) fn emit_thought(
-    tx: &mpsc::UnboundedSender<SessionUpdate>,
+    tx: &crate::event_bus::EventBus,
     session_id: Uuid,
     text: &str,
 ) {

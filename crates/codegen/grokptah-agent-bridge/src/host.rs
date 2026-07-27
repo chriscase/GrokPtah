@@ -123,7 +123,7 @@ pub(crate) struct Inner {
     turn_cancels: HashMap<Uuid, CancellationToken>,
     /// Authoritative follow-up queue plus non-cancelling steering inbox.
     prompt_queues: HashMap<Uuid, SessionPromptQueue>,
-    event_tx: mpsc::UnboundedSender<SessionUpdate>,
+    event_tx: crate::event_bus::EventBus,
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
     /// Per-session path → original content before first agent edit (#146).
@@ -186,7 +186,14 @@ impl AgentHost {
                 None
             }
         };
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut event_tx =
+            crate::event_bus::EventBus::new(crate::event_bus::DEFAULT_JOURNAL_CAPACITY);
+        {
+            let home = crate::discover::grokptah_home();
+            event_tx = event_tx.with_persist_dir(home.join("orchestration"));
+        }
+        // Keep a dedicated channel for take_event_receiver / first GUI subscriber.
+        let event_rx = event_tx.subscribe();
         let auth = crate::auth_store::load_auth_state();
         let (chrome, mut sessions) = session_store::load_workspace().unwrap_or_else(|e| {
             eprintln!("[grokptah] workspace load failed: {e:#}");
@@ -274,6 +281,16 @@ impl AgentHost {
 impl AgentHostHandle {
     pub fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<SessionUpdate>> {
         self.event_rx_factory.lock().take()
+    }
+
+    /// Shared fan-out event bus (GUI + MCP control plane).
+    pub fn event_bus(&self) -> crate::event_bus::EventBus {
+        self.inner.lock().event_tx.clone()
+    }
+
+    /// Additional live subscriber (does not steal the primary GUI receiver).
+    pub fn subscribe_events(&self) -> mpsc::UnboundedReceiver<SessionUpdate> {
+        self.inner.lock().event_tx.subscribe()
     }
 
     /// Persist tiny workspace chrome (tabs / project / model) only.
@@ -2623,7 +2640,7 @@ impl AgentHostHandle {
         kind: SessionKind,
         prompt: &str,
         cancel: CancellationToken,
-        event_tx: mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: crate::event_bus::EventBus,
     ) -> Result<String> {
         if cancel.is_cancelled() {
             return Ok("(cancelled)".into());
@@ -3052,7 +3069,7 @@ impl AgentHostHandle {
     fn drain_pending_steering(
         &self,
         session_id: Uuid,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Vec<PromptQueueEntry> {
         let entries = {
             let mut g = self.inner.lock();
@@ -3085,7 +3102,7 @@ impl AgentHostHandle {
     fn append_pending_steering_messages(
         &self,
         session_id: Uuid,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
         messages: &mut Vec<serde_json::Value>,
     ) -> usize {
         let entries = self.drain_pending_steering(session_id, event_tx);
@@ -3106,7 +3123,7 @@ impl AgentHostHandle {
         cwd: &Path,
         prompt: &str,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         let lower = prompt.to_lowercase();
         if lower.contains("list") || lower.contains("files") || lower.contains("ls ") {
@@ -3321,7 +3338,7 @@ impl AgentHostHandle {
         history: &[(String, String)],
         compacted_summary: Option<&str>,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         let max_rounds = {
             let g = self.inner.lock();
@@ -3628,7 +3645,7 @@ impl AgentHostHandle {
         cwd: &Path,
         path: &str,
         summary: &str,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) {
         self.record_edit(path);
         let unified = crate::project_context::diff_for_path(cwd, path);
@@ -3649,7 +3666,7 @@ impl AgentHostHandle {
         name: &str,
         arguments_json: &str,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
         mcp_index: &McpToolIndex,
     ) -> Result<String> {
         let args: serde_json::Value =
@@ -4253,7 +4270,7 @@ impl AgentHostHandle {
         cwd: &Path,
         query: &str,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         let sub_id = Uuid::new_v4().to_string();
         {
@@ -4369,7 +4386,7 @@ impl AgentHostHandle {
         prompt: &str,
         kind: &str,
         parent_cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         // kind may be `general-purpose`, `plan`, or `kind@persona` (#164).
         let (kind, persona_name) = if let Some((k, p)) = kind.split_once('@') {
@@ -4528,7 +4545,7 @@ impl AgentHostHandle {
         kind: &str,
         sub_id: &str,
         cancel: CancellationToken,
-        event_tx: mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: crate::event_bus::EventBus,
         persona_reminder: Option<String>,
     ) {
         if cancel.is_cancelled() {
@@ -4756,7 +4773,7 @@ impl AgentHostHandle {
         &self,
         sub_id: &str,
         status: &str,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
         session_id: Uuid,
         detail: Option<String>,
     ) {
@@ -4790,7 +4807,7 @@ impl AgentHostHandle {
         wire_name: &str,
         args: &serde_json::Value,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         if cancel.is_cancelled() {
             return Ok("(cancelled)".into());
@@ -4900,7 +4917,7 @@ impl AgentHostHandle {
         input: &serde_json::Value,
         f: F,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String>
     where
         F: FnOnce() -> Fut,
@@ -5069,7 +5086,7 @@ impl AgentHostHandle {
         cwd: &Path,
         command: &str,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<String> {
         if cancel.is_cancelled() {
             return Ok("(cancelled)".into());
@@ -5335,7 +5352,7 @@ impl AgentHostHandle {
         cwd: &Path,
         command: &str,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<()> {
         if cancel.is_cancelled() {
             return Ok(());
@@ -5528,7 +5545,7 @@ impl AgentHostHandle {
         tool_name: &str,
         f: F,
         cancel: &CancellationToken,
-        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        event_tx: &crate::event_bus::EventBus,
     ) -> Result<()>
     where
         F: FnOnce() -> Fut,
