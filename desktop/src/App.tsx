@@ -10,6 +10,7 @@ import {
   type SessionSummary,
   type SessionTab,
   type SessionUpdate,
+  type SubagentInfo,
   type TranscriptItem,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
@@ -25,6 +26,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
 import { PromptQueuePanel } from "./components/PromptQueuePanel";
+import { SubagentCard } from "./components/SubagentCard";
 import {
   appendDeny,
   loadDenyHistory,
@@ -269,7 +271,7 @@ export default function App() {
   } | null>(null);
   const [plugins, setPlugins] = useState<any[]>([]);
   const [skills, setSkills] = useState<any[]>([]);
-  const [subagents, setSubagents] = useState<any[]>([]);
+  const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
   const [bgTasks, setBgTasks] = useState<any[]>([]);
   const [hooksPreview, setHooksPreview] = useState<string | null>(null);
   const [rules, setRules] = useState<string[]>([]);
@@ -2920,43 +2922,15 @@ export default function App() {
                     a.session_id === activeSessionId,
                 )
                 .map((a) => (
-                <div
-                  key={a.id}
-                  className={`subagent-card is-${String(a.status).toLowerCase().replace(/\s+/g, "-")}`}
-                  data-testid="subagent-card"
-                >
-                  <div className="subagent-card-kind">{a.kind || "agent"}</div>
-                  <div className="subagent-card-title">
-                    {a.title || a.id.slice(0, 8)}
-                  </div>
-                  <div className="subagent-card-status">{a.status}</div>
-                  {a.summary && (
-                    <div className="subagent-card-summary" title={a.summary}>
-                      {String(a.summary).slice(0, 160)}
-                      {String(a.summary).length > 160 ? "…" : ""}
-                    </div>
-                  )}
-                  {a.last_tool && (
-                    <div className="subagent-card-tool">tool: {a.last_tool}</div>
-                  )}
-                  {String(a.status) === "running" && (
-                    <button
-                      type="button"
-                      className="danger"
-                      data-testid="subagent-cancel"
-                      title="Cancel this child only"
-                      onClick={() => {
-                        void (async () => {
-                          await api.cancelSubagent(a.id);
-                          setSubagents(await api.subagentsList());
-                        })();
-                      }}
-                    >
-                      Cancel child
-                    </button>
-                  )}
-                </div>
-              ))}
+                  <SubagentCard
+                    key={a.id}
+                    agent={a}
+                    onCancel={async (id) => {
+                      await api.cancelSubagent(id);
+                      setSubagents(await api.subagentsList());
+                    }}
+                  />
+                ))}
             </div>
             <div className="section-title">Background / scheduled</div>
             <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 0.5rem" }}>

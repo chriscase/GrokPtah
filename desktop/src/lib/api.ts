@@ -6,6 +6,7 @@ import type {
   SearchHit,
   SessionKind,
   SessionSummary,
+  SubagentInfo,
   WorkspaceUiState,
 } from "./protocol";
 import type {
@@ -223,7 +224,7 @@ export const api = {
   pluginInstall: (id: string) => invoke("plugin_install", { id }),
   skillsList: () => invoke<unknown[]>("skills_list"),
   hooksConfig: () => invoke<string>("hooks_config"),
-  subagentsList: () => invoke<unknown[]>("subagents_list"),
+  subagentsList: () => invoke<SubagentInfo[]>("subagents_list"),
   listAgents: () => invoke<unknown[]>("list_agents"),
   listPersonas: () => invoke<unknown[]>("list_personas"),
   fleetObservability: () =>
@@ -244,6 +245,8 @@ export const api = {
     invoke("schedule_background_task", { title }),
   settingsSnapshot: () => invoke<Record<string, unknown>>("settings_snapshot"),
   setSandbox: (profile: string) => invoke<void>("set_sandbox", { profile }),
+  setSubagentIsolation: (mode: "worktree" | "shared") =>
+    invoke<void>("set_subagent_isolation", { mode }),
   setAppearance: (appearance: string) =>
     invoke<void>("set_appearance", { appearance }),
   setPermissionMode: (mode: string) =>

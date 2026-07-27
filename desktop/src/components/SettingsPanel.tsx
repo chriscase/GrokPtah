@@ -31,6 +31,9 @@ type SettingsSnap = {
   effort?: string;
   alwaysApprove?: boolean;
   sandboxProfile?: string;
+  subagentIsolation?: "worktree" | "shared";
+  subagentIsolationConfigured?: "worktree" | "shared";
+  subagentIsolationManagedByEnv?: boolean;
   appearance?: string;
   permissionMode?: string;
   allowRules?: string[];
@@ -306,6 +309,50 @@ export function SettingsPanel({
                     Not an OS sandbox. These are substring/tool-level soft
                     rails inside the agent bridge — trivially bypassable by a
                     determined command. Do not treat this as isolation.
+                  </span>
+                </label>
+
+                <label className="settings-field">
+                  <span className="settings-field-label">
+                    Mutating subagent folders
+                  </span>
+                  <StyledSelect
+                    disabled={busy || snap.subagentIsolationManagedByEnv}
+                    value={snap.subagentIsolation ?? "worktree"}
+                    options={[
+                      {
+                        value: "worktree",
+                        label: "Separate worktree / copy (recommended)",
+                      },
+                      {
+                        value: "shared",
+                        label: "Shared project folder (unsafe)",
+                      },
+                    ]}
+                    onChange={(value) =>
+                      void apply(
+                        () =>
+                          api.setSubagentIsolation(
+                            value as "worktree" | "shared",
+                          ),
+                        value === "shared"
+                          ? "Shared-folder mutation enabled"
+                          : "Separate subagent folders enabled",
+                      )
+                    }
+                  />
+                  <span
+                    className={`settings-hint ${
+                      snap.subagentIsolation === "shared" ? "is-warning" : ""
+                    }`}
+                  >
+                    {snap.subagentIsolationManagedByEnv
+                      ? `Managed by GROKPTAH_SUBAGENT_ISOLATION. Saved preference: ${
+                          snap.subagentIsolationConfigured ?? "worktree"
+                        }.`
+                      : snap.subagentIsolation === "shared"
+                        ? "Warning: mutating children can edit the same files as the parent and each other."
+                        : "General-purpose children get separate worktrees. Plan and explore children stay shared and read-only."}
                   </span>
                 </label>
 

@@ -746,6 +746,11 @@ pub fn set_sandbox(state: State<'_, AppState>, profile: String) {
 }
 
 #[tauri::command]
+pub fn set_subagent_isolation(state: State<'_, AppState>, mode: String) -> Result<(), String> {
+    state.host.set_subagent_isolation(mode).map_err(map_err)
+}
+
+#[tauri::command]
 pub fn set_appearance(state: State<'_, AppState>, appearance: String) {
     state.host.set_appearance(appearance);
 }

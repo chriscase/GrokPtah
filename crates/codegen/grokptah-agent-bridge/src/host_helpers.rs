@@ -430,7 +430,7 @@ pub(crate) fn coding_agent_tools(
             "type": "function",
             "function": {
                 "name": "spawn_general_purpose",
-                "description": "Spawn a general-purpose (or plan) subagent that can use write/shell tools under the same permission gate. Use for parallel delegated work.",
+                "description": "Spawn a parallel child. General-purpose children can use write/shell tools and run in an isolated worktree by default; plan children share the cwd read-only.",
                 "parameters": {
                     "type": "object",
                     "properties": {

@@ -213,6 +213,26 @@ export interface AuthState {
   method?: string | null;
 }
 
+export type SubagentExecutionMode =
+  | "unknown"
+  | "worktree"
+  | "project_copy"
+  | "shared_read_only"
+  | "shared_mutating"
+  | "isolation_failed";
+
+export interface SubagentInfo {
+  id: string;
+  kind: string;
+  title: string;
+  status: string;
+  session_id?: string | null;
+  summary?: string | null;
+  last_tool?: string | null;
+  cwd?: string | null;
+  execution_mode: SubagentExecutionMode;
+}
+
 export interface AgentStatus {
   running: boolean;
   project_cwd?: string | null;

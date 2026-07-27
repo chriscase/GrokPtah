@@ -110,9 +110,14 @@ describe("background tasks panel (#52)", () => {
 describe("multi-agent panel (#152)", () => {
   it("shows cancel-one-child and subagent summary fields", () => {
     const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
-    expect(app).toMatch(/Cancel child/);
+    const card = readFileSync(
+      join(root, "..", "components", "SubagentCard.tsx"),
+      "utf8",
+    );
+    expect(card).toMatch(/Cancel child/);
     expect(app).toMatch(/cancelSubagent/);
-    expect(app).toMatch(/subagent-card/);
+    expect(card).toMatch(/subagent-card/);
+    expect(card).toMatch(/agent\.summary/);
     expect(app).toMatch(/subagent_spawned|subagent_update/);
     expect(app).toMatch(/setSubagents\(await api\.subagentsList\(\)\)/);
   });

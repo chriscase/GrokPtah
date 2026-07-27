@@ -118,6 +118,7 @@ pub fn run() {
             commands::schedule_background_task,
             commands::settings_snapshot,
             commands::set_sandbox,
+            commands::set_subagent_isolation,
             commands::set_appearance,
             commands::set_permission_mode,
             commands::set_allow_deny_rules,

@@ -32,7 +32,7 @@ use crate::session::{Session, SessionKind, SessionSummary, TranscriptEntry};
 use crate::session_store::{self, WorkspaceChrome};
 use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
-    SkillInfo, SubagentInfo,
+    SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
 };
 
 /// UI restore payload: open tabs + active session + project (sessions live in list).
@@ -103,6 +103,7 @@ pub(crate) struct Inner {
     effort: EffortLevel,
     auth: AuthState,
     sandbox_profile: String,
+    subagent_isolation: SubagentIsolationPreference,
     appearance: String,
     permission_mode: String,
     allow_rules: Vec<String>,
@@ -237,6 +238,7 @@ impl AgentHost {
             } else {
                 chrome.sandbox_profile
             },
+            subagent_isolation: chrome.subagent_isolation,
             appearance: if chrome.appearance.is_empty() {
                 "dark".into()
             } else {
@@ -288,6 +290,7 @@ impl AgentHostHandle {
                 sandbox_profile: g.sandbox_profile.clone(),
                 appearance: g.appearance.clone(),
                 always_approve: g.always_approve,
+                subagent_isolation: g.subagent_isolation,
             }
         };
         if let Err(e) = session_store::save_chrome(&chrome) {
@@ -1262,6 +1265,14 @@ impl AgentHostHandle {
         self.persist_chrome();
     }
 
+    pub fn set_subagent_isolation(&self, mode: String) -> Result<()> {
+        let mode = SubagentIsolationPreference::parse(&mode)
+            .ok_or_else(|| anyhow!("subagent isolation must be `worktree` or `shared`"))?;
+        self.inner.lock().subagent_isolation = mode;
+        self.persist_chrome();
+        Ok(())
+    }
+
     pub fn set_appearance(&self, appearance: String) {
         self.inner.lock().appearance = appearance;
         self.persist_chrome();
@@ -2108,11 +2119,16 @@ impl AgentHostHandle {
         }
         let g = self.inner.lock();
         let gw = crate::gateway_config::load();
+        let (subagent_isolation, subagent_isolation_managed_by_env) =
+            effective_subagent_isolation(g.subagent_isolation);
         serde_json::json!({
             "model": g.model,
             "effort": g.effort,
             "alwaysApprove": g.always_approve,
             "sandboxProfile": g.sandbox_profile,
+            "subagentIsolation": subagent_isolation.as_str(),
+            "subagentIsolationConfigured": g.subagent_isolation.as_str(),
+            "subagentIsolationManagedByEnv": subagent_isolation_managed_by_env,
             "appearance": g.appearance,
             // Single effective mode for UI (mirrors alwaysApprove).
             "permissionMode": g.permission_mode,
@@ -4128,10 +4144,12 @@ impl AgentHostHandle {
                     }
                     if let Some(s) = subs.iter().find(|s| s.id == id) {
                         return Ok(format!(
-                            "subagent {} kind={} status={} summary={}",
+                            "subagent {} kind={} status={} mode={} cwd={} summary={}",
                             s.id,
                             s.kind,
                             s.status,
+                            s.execution_mode.as_str(),
+                            s.cwd.clone().unwrap_or_default(),
                             s.summary.clone().unwrap_or_default()
                         ));
                     }
@@ -4142,7 +4160,14 @@ impl AgentHostHandle {
                     lines.push(format!("task {} [{}] {}", t.id, t.status, t.title));
                 }
                 for s in &subs {
-                    lines.push(format!("subagent {} [{}] {}", s.id, s.status, s.title));
+                    lines.push(format!(
+                        "subagent {} [{}] {} mode={} cwd={}",
+                        s.id,
+                        s.status,
+                        s.title,
+                        s.execution_mode.as_str(),
+                        s.cwd.clone().unwrap_or_default()
+                    ));
                 }
                 if lines.is_empty() {
                     Ok("(no background tasks or subagents)".into())
@@ -4241,6 +4266,8 @@ impl AgentHostHandle {
                 session_id: Some(session_id.to_string()),
                 summary: None,
                 last_tool: None,
+                cwd: Some(cwd.display().to_string()),
+                execution_mode: SubagentExecutionMode::SharedReadOnly,
             });
         }
         let _ = event_tx.send(SessionUpdate::SubagentSpawned {
@@ -4361,13 +4388,71 @@ impl AgentHostHandle {
                 .and_then(|n| crate::agents_personas::resolve_persona(project.as_deref(), n))
         };
         let sub_id = Uuid::new_v4().to_string();
-        // Child is cancelled if parent is cancelled *or* cancel_subagent is called.
-        let child_cancel = parent_cancel.child_token();
         let kind_label = if let Some(ref p) = persona_layer {
             format!("{}@{}", kind, p.name)
         } else {
             kind.into()
         };
+        let configured_isolation = self.inner.lock().subagent_isolation;
+        let (isolation_preference, _) = effective_subagent_isolation(configured_isolation);
+        let mut child_cwd = cwd.to_path_buf();
+        let execution_mode = if kind == "plan" {
+            SubagentExecutionMode::SharedReadOnly
+        } else {
+            match isolation_preference {
+                SubagentIsolationPreference::Worktree => {
+                    match crate::isolation::prepare_isolation_cwd(cwd, &sub_id) {
+                        Ok(isolated_cwd) => {
+                            let mode = if isolated_cwd.join(".git").is_file() {
+                                SubagentExecutionMode::Worktree
+                            } else {
+                                SubagentExecutionMode::ProjectCopy
+                            };
+                            child_cwd = isolated_cwd;
+                            mode
+                        }
+                        Err(error) => {
+                            let detail = format!("isolation failed: {error}");
+                            {
+                                let mut g = self.inner.lock();
+                                g.subagents.push(SubagentInfo {
+                                    id: sub_id.clone(),
+                                    kind: kind_label.clone(),
+                                    title: prompt.chars().take(48).collect(),
+                                    status: "failed".into(),
+                                    session_id: Some(session_id.to_string()),
+                                    summary: Some(detail.clone()),
+                                    last_tool: None,
+                                    cwd: None,
+                                    execution_mode: SubagentExecutionMode::IsolationFailed,
+                                });
+                            }
+                            let _ = event_tx.send(SessionUpdate::SubagentSpawned {
+                                session_id,
+                                subagent_id: sub_id.clone(),
+                                kind: kind_label.clone(),
+                                title: prompt.chars().take(64).collect(),
+                            });
+                            let _ = event_tx.send(SessionUpdate::SubagentUpdate {
+                                session_id,
+                                subagent_id: sub_id.clone(),
+                                status: "failed".into(),
+                                detail: Some(detail),
+                            });
+                            let snap = self.inner.lock().subagents.clone();
+                            let _ = session_store::save_session_subagents(session_id, &snap);
+                            return Ok(format!(
+                                "ERROR: subagent isolation failed (not starting child): {error}. \
+                                 Choose shared cwd explicitly to permit mutating the parent workspace."
+                            ));
+                        }
+                    }
+                }
+                SubagentIsolationPreference::Shared => SubagentExecutionMode::SharedMutating,
+            }
+        };
+        // Child is cancelled if parent is cancelled *or* cancel_subagent is called.
+        let child_cancel = parent_cancel.child_token();
         {
             let mut g = self.inner.lock();
             g.subagents.push(SubagentInfo {
@@ -4378,6 +4463,8 @@ impl AgentHostHandle {
                 session_id: Some(session_id.to_string()),
                 summary: None,
                 last_tool: None,
+                cwd: Some(child_cwd.display().to_string()),
+                execution_mode,
             });
             g.subagent_cancels
                 .insert(sub_id.clone(), child_cancel.clone());
@@ -4396,33 +4483,6 @@ impl AgentHostHandle {
 
         let host = self.clone();
         let event_tx = event_tx.clone();
-        // #162 optional worktree isolation (never empty-dir fallback)
-        let mut cwd = cwd.to_path_buf();
-        if std::env::var("GROKPTAH_SUBAGENT_ISOLATION")
-            .map(|v| v == "worktree" || v == "1")
-            .unwrap_or(false)
-        {
-            match crate::isolation::prepare_isolation_cwd(&cwd, &sub_id) {
-                Ok(wt) => cwd = wt,
-                Err(e) => {
-                    // Fail closed: leave parent cwd and record failure on the child row.
-                    let mut g = self.inner.lock();
-                    if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
-                        s.status = "failed".into();
-                        s.summary = Some(format!("isolation failed: {e}"));
-                    }
-                    let _ = event_tx.send(SessionUpdate::SubagentUpdate {
-                        session_id,
-                        subagent_id: sub_id.clone(),
-                        status: "failed".into(),
-                        detail: Some(format!("isolation failed: {e}")),
-                    });
-                    return Ok(format!(
-                        "ERROR: subagent isolation failed (not starting child): {e}"
-                    ));
-                }
-            }
-        }
         let prompt = prompt.to_string();
         let kind_owned = kind.to_string();
         let persona_reminder = persona_layer
@@ -4432,7 +4492,7 @@ impl AgentHostHandle {
         tokio::spawn(async move {
             host.run_gp_subagent_body(
                 session_id,
-                &cwd,
+                &child_cwd,
                 &prompt,
                 &kind_owned,
                 &sub_id_task,
@@ -4443,8 +4503,18 @@ impl AgentHostHandle {
             .await;
         });
 
+        let isolation_note = match execution_mode {
+            SubagentExecutionMode::Worktree => "isolated worktree",
+            SubagentExecutionMode::ProjectCopy => "isolated project copy",
+            SubagentExecutionMode::SharedReadOnly => "shared read-only cwd",
+            SubagentExecutionMode::SharedMutating => "shared mutating cwd (explicit user opt-in)",
+            SubagentExecutionMode::IsolationFailed | SubagentExecutionMode::Unknown => {
+                "unknown cwd mode"
+            }
+        };
         Ok(format!(
-            "Spawned {kind_label} subagent `{sub_id}` (running in parallel — parent is not blocked)."
+            "Spawned {kind_label} subagent `{sub_id}` in {isolation_note} \
+             (running in parallel — parent is not blocked)."
         ))
     }
 
@@ -5563,5 +5633,22 @@ impl AgentHostHandle {
             }
         }
         Ok(())
+    }
+}
+
+fn effective_subagent_isolation(
+    configured: SubagentIsolationPreference,
+) -> (SubagentIsolationPreference, bool) {
+    let override_mode = std::env::var("GROKPTAH_SUBAGENT_ISOLATION")
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "worktree" | "1" => Some(SubagentIsolationPreference::Worktree),
+            // Shared mutation is intentionally accepted only as an explicit value.
+            "shared" => Some(SubagentIsolationPreference::Shared),
+            _ => None,
+        });
+    match override_mode {
+        Some(mode) => (mode, true),
+        None => (configured, false),
     }
 }

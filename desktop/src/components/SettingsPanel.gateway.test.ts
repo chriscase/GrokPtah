@@ -14,3 +14,13 @@ describe("settings gateway UI (#169)", () => {
     expect(settings).toMatch(/gateway\.json/);
   });
 });
+
+describe("subagent isolation setting (#195)", () => {
+  it("makes shared-folder mutation an explicit unsafe choice", () => {
+    const settings = readFileSync(join(root, "SettingsPanel.tsx"), "utf8");
+    expect(settings).toMatch(/setSubagentIsolation/);
+    expect(settings).toMatch(/Separate worktree \/ copy \(recommended\)/);
+    expect(settings).toMatch(/Shared project folder \(unsafe\)/);
+    expect(settings).toMatch(/mutating children can edit the same files/);
+  });
+});

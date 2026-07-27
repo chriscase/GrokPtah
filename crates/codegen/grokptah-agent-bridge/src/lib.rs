@@ -68,7 +68,7 @@ pub use search_engine::{SearchHit, SearchQuery};
 pub use session::{SessionKind, SessionSummary, TranscriptEntry};
 pub use types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
-    SkillInfo, SubagentInfo,
+    SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
 };
 
 /// Crate version string for about / diagnostics.
