@@ -24,7 +24,7 @@ import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
-import { PromptQueueSummary } from "./components/PromptQueuePanel";
+import { PromptQueuePanel } from "./components/PromptQueuePanel";
 import {
   appendDeny,
   loadDenyHistory,
@@ -65,10 +65,7 @@ import {
   queuedActivity,
   type ActivityState,
 } from "./lib/activity";
-import {
-  createPromptQueueEntry,
-  drainPromptQueuePrefix,
-} from "./lib/promptQueue";
+import type { PromptQueueEntry } from "./lib/promptQueue";
 import { useComposerQueue } from "./lib/useComposerQueue";
 
 type WorkspaceMode = "build" | "chat";
@@ -239,8 +236,8 @@ export default function App() {
     queues: promptQueues,
     dispatchQueue,
     queueFor,
-    currentQueueFor,
   } = useComposerQueue(activeSessionId);
+  const queueDrainsRef = useRef<Set<string>>(new Set());
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
   /** FIFO of tool permission prompts — concurrent requests must not clobber (#141). */
   const [permissionQueue, setPermissionQueue] = useState<PermissionRequest[]>(
@@ -1211,9 +1208,53 @@ export default function App() {
     ],
   );
 
+  async function replaceQueue(
+    sessionId: string,
+    mutation: () => Promise<PromptQueueEntry[]>,
+  ) {
+    try {
+      const entries = await mutation();
+      dispatchQueue({ type: "replace", sessionId, entries });
+    } catch (error) {
+      try {
+        const entries = await api.sessionQueueList(sessionId);
+        dispatchQueue({ type: "replace", sessionId, entries });
+      } catch {
+        // Preserve the current UI queue if the bridge itself is unavailable.
+      }
+      throw error;
+    }
+  }
+
+  async function drainNextQueuedPrompt(sessionId: string) {
+    if (queueDrainsRef.current.has(sessionId)) return;
+    queueDrainsRef.current.add(sessionId);
+    try {
+      const result = await api.sessionQueueTakeNext(sessionId);
+      dispatchQueue({
+        type: "replace",
+        sessionId,
+        entries: result.entries,
+      });
+      const batch = result.batch;
+      if (batch?.text.trim()) {
+        await sendPrompt(batch.text, { fromQueue: true, sessionId });
+      }
+    } catch (error) {
+      console.warn("prompt queue drain failed", error);
+    } finally {
+      queueDrainsRef.current.delete(sessionId);
+    }
+  }
+
   async function sendPrompt(
     text?: string,
-    opts?: { interject?: boolean; fromQueue?: boolean; sessionId?: string },
+    opts?: {
+      steer?: boolean;
+      runNext?: boolean;
+      fromQueue?: boolean;
+      sessionId?: string;
+    },
   ) {
     const prompt = (text ?? composer).trim();
     if (!prompt) return;
@@ -1236,14 +1277,83 @@ export default function App() {
     }
 
     const tabBusy = tabs.find((t) => t.id === id)?.busy;
-    // #147: queue while a turn is running (unless interject = cancel then send).
-    if (tabBusy && !opts?.interject && !opts?.fromQueue) {
-      const nextLen = (promptQueues[id]?.length ?? 0) + 1;
-      dispatchQueue({
-        type: "add",
-        sessionId: id,
-        entry: createPromptQueueEntry(prompt),
-      });
+    if (tabBusy && opts?.steer) {
+      try {
+        const receipt = await api.sessionSteer(id, prompt);
+        dispatchQueue({
+          type: "replace",
+          sessionId: id,
+          entries: receipt.entries,
+        });
+        patchTab(id, (tab) => ({
+          ...tab,
+          activity: {
+            ...tab.activity,
+            detail:
+              receipt.disposition === "pending"
+                ? "Steering at next safe step"
+                : "Steering preserved to run next",
+            lastEventAt: Date.now(),
+          },
+        }));
+      } catch (error) {
+        if (fromComposer) restoreComposer(prompt, id);
+        patchTab(id, (tab) => ({
+          ...tab,
+          activity: errorActivity(String(error)),
+        }));
+      }
+      return;
+    }
+    if (tabBusy && opts?.runNext) {
+      try {
+        const added = await api.sessionQueueAdd(id, prompt, false);
+        const entry = added[added.length - 1];
+        if (!entry) throw new Error("Bridge did not queue the prompt");
+        const result = await api.sessionQueueRunNext(id, entry.id);
+        dispatchQueue({
+          type: "replace",
+          sessionId: id,
+          entries: result.entries,
+        });
+        patchTab(id, (tab) => ({
+          ...tab,
+          activity: {
+            ...tab.activity,
+            detail: "Stopping current turn · prompt will run next",
+            lastEventAt: Date.now(),
+          },
+          transcript: [
+            ...tab.transcript,
+            {
+              kind: "thought" as const,
+              text: `Run next: ${prompt.slice(0, 120)}${prompt.length > 120 ? "…" : ""}`,
+            },
+          ],
+        }));
+      } catch (error) {
+        if (fromComposer) restoreComposer(prompt, id);
+        patchTab(id, (tab) => ({
+          ...tab,
+          activity: errorActivity(String(error)),
+        }));
+      }
+      return;
+    }
+    if (tabBusy && !opts?.fromQueue) {
+      let nextLen = 0;
+      try {
+        const entries = await api.sessionQueueAdd(id, prompt, false);
+        nextLen = entries.length;
+        dispatchQueue({ type: "replace", sessionId: id, entries });
+      } catch (error) {
+        if (fromComposer) restoreComposer(prompt, id);
+        patchTab(id, (tab) => ({
+          ...tab,
+          activity: errorActivity(String(error)),
+        }));
+        return;
+      }
       patchTab(id, (t) => ({
         ...t,
         activity: {
@@ -1260,13 +1370,6 @@ export default function App() {
         ],
       }));
       return;
-    }
-    if (tabBusy && opts?.interject) {
-      try {
-        await api.sessionCancel(id);
-      } catch {
-        /* best effort */
-      }
     }
 
     patchTab(id, (t) => ({
@@ -1518,19 +1621,6 @@ export default function App() {
       setBgTasks(await api.backgroundTasks());
       await refreshChrome();
       await refreshSessions();
-      // #147 + #157: drain queued prompts; combine consecutive plain follow-ups.
-      const drained = drainPromptQueuePrefix(currentQueueFor(id));
-      if (drained) {
-        dispatchQueue({
-          type: "replace",
-          sessionId: id,
-          entries: drained.remaining,
-        });
-        // fromQueue bypasses busy re-queue (state may still show busy briefly).
-        setTimeout(() => {
-          void sendPrompt(drained.text, { fromQueue: true, sessionId: id });
-        }, 0);
-      }
     } catch (e) {
       patchTab(id, (t) => ({
         ...t,
@@ -1541,6 +1631,8 @@ export default function App() {
           { kind: "error", text: String(e) },
         ],
       }));
+    } finally {
+      setTimeout(() => void drainNextQueuedPrompt(id), 0);
     }
   }
 
@@ -2214,7 +2306,7 @@ export default function App() {
               rows={composerExpanded ? 10 : 2}
               placeholder={
                 busy
-                  ? "Turn running — Enter queues · Interject sends now"
+                  ? "Turn running — Enter queues · Steer now guides without stopping"
                   : workspaceMode === "chat"
                     ? "Message Grok… (drafts keep per session · Shift+Enter newline)"
                     : "Message the coding agent… (drafts keep per session · Shift+Enter newline)"
@@ -2228,6 +2320,71 @@ export default function App() {
                 }
               }}
             />
+            {activeSessionId && (
+              <PromptQueuePanel
+                entries={queueFor(activeSessionId)}
+                busy={busy}
+                onEdit={(entry, text) =>
+                  replaceQueue(activeSessionId, () =>
+                    api.sessionQueueEdit(
+                      activeSessionId,
+                      entry.id,
+                      entry.version,
+                      text,
+                    ),
+                  )
+                }
+                onRemove={(entry) =>
+                  replaceQueue(activeSessionId, () =>
+                    api.sessionQueueRemove(activeSessionId, entry.id),
+                  )
+                }
+                onClear={() =>
+                  replaceQueue(activeSessionId, () =>
+                    api.sessionQueueClear(activeSessionId),
+                  )
+                }
+                onMove={(entry, toIndex) =>
+                  replaceQueue(activeSessionId, () =>
+                    api.sessionQueueMove(activeSessionId, entry.id, toIndex),
+                  )
+                }
+                onSteer={async (entry) => {
+                  const receipt = await api.sessionQueueSteerEntry(
+                    activeSessionId,
+                    entry.id,
+                  );
+                  dispatchQueue({
+                    type: "replace",
+                    sessionId: activeSessionId,
+                    entries: receipt.entries,
+                  });
+                  if (receipt.disposition === "queued") {
+                    setTimeout(
+                      () => void drainNextQueuedPrompt(activeSessionId),
+                      0,
+                    );
+                  }
+                }}
+                onRunNext={async (entry) => {
+                  const result = await api.sessionQueueRunNext(
+                    activeSessionId,
+                    entry.id,
+                  );
+                  dispatchQueue({
+                    type: "replace",
+                    sessionId: activeSessionId,
+                    entries: result.entries,
+                  });
+                  if (!result.cancelled_active) {
+                    setTimeout(
+                      () => void drainNextQueuedPrompt(activeSessionId),
+                      0,
+                    );
+                  }
+                }}
+              />
+            )}
             <div className="composer-toolbar">
               <div className="composer-toolbar-left">
                 <label
@@ -2356,23 +2513,34 @@ export default function App() {
                   </button>
                 )}
                 {busy && composer.trim() && (
-                  <button
-                    type="button"
-                    className="composer-chip"
-                    title="Cancel current turn and send this prompt now (#147)"
-                    onClick={() => void sendPrompt(undefined, { interject: true })}
-                  >
-                    Interject
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className="composer-chip"
+                      title="Guide the running agent at its next safe step without stopping it"
+                      onClick={() => void sendPrompt(undefined, { steer: true })}
+                    >
+                      Steer now
+                    </button>
+                    <button
+                      type="button"
+                      className="composer-chip"
+                      title="Stop the current turn and make this prompt run next"
+                      onClick={() =>
+                        void sendPrompt(undefined, { runNext: true })
+                      }
+                    >
+                      Run next
+                    </button>
+                  </>
                 )}
-                <PromptQueueSummary entries={queueFor(activeSessionId)} />
                 <button
                   type="button"
                   className="composer-send"
                   disabled={!composer.trim()}
                   title={
                     busy
-                      ? "Queue prompt (turn running) · Interject to send now"
+                      ? "Queue prompt (turn running) · use Steer now for guidance"
                       : "Send (Enter) · newline with Shift+Enter"
                   }
                   onClick={() => void sendPrompt()}
@@ -3318,6 +3486,30 @@ function applyUpdate(
             phase: "tool",
             label: "Shell",
             detail: "Streaming command output…",
+            live: true,
+          },
+        ),
+      );
+      break;
+    case "steering_injected":
+      withTab(sid!, (tab) =>
+        withActivity(
+          mapTranscript(
+            tab,
+            (transcript) => [
+              ...transcript,
+              {
+                kind: "thought" as const,
+                text: `Steering applied: ${u.text}`,
+                streaming: false,
+              },
+            ],
+            { busy: true },
+          ),
+          {
+            phase: "streaming",
+            label: "Steering",
+            detail: "Guidance delivered at a safe step",
             live: true,
           },
         ),

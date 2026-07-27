@@ -1,6 +1,7 @@
 export type PromptQueueKind = "prompt" | "command";
 export type PromptQueueSource =
   | "composer"
+  | "steer_now"
   | "steering_deferred"
   | "desktop";
 
@@ -10,6 +11,7 @@ export type PromptQueueEntry = {
   text: string;
   kind: PromptQueueKind;
   source: PromptQueueSource;
+  owner?: string | null;
   created_at: string;
   priority: boolean;
 };
@@ -58,6 +60,7 @@ export function createPromptQueueEntry(
     text,
     kind: overrides.kind ?? queueKind(text),
     source: overrides.source ?? "composer",
+    owner: overrides.owner ?? "desktop",
     created_at: overrides.created_at ?? new Date().toISOString(),
     priority: overrides.priority ?? false,
   };
@@ -132,6 +135,27 @@ export type DrainedPromptQueue = {
   entries: PromptQueueEntry[];
   text: string;
   remaining: PromptQueueEntry[];
+};
+
+export type PromptQueueBatch = {
+  entries: PromptQueueEntry[];
+  text: string;
+};
+
+export type PromptQueueTakeResult = {
+  batch?: PromptQueueBatch | null;
+  entries: PromptQueueEntry[];
+};
+
+export type PromptQueueRunNextResult = {
+  entries: PromptQueueEntry[];
+  cancelled_active: boolean;
+};
+
+export type SteeringReceipt = {
+  entry: PromptQueueEntry;
+  disposition: "pending" | "queued";
+  entries: PromptQueueEntry[];
 };
 
 export function drainPromptQueuePrefix(

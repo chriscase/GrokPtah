@@ -22,6 +22,7 @@ mod models_catalog;
 mod permission;
 mod project_context;
 mod prompt_combine;
+mod prompt_queue;
 mod search_engine;
 mod session;
 mod session_store;
@@ -38,6 +39,10 @@ pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, Ri
 pub use gateway_config::{load as load_gateway_config, save as save_gateway_config, GatewayConfig};
 pub use isolation::prepare_isolation_cwd;
 pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};
+pub use prompt_queue::{
+    PromptQueueBatch, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueTakeResult,
+    SteeringDisposition, SteeringReceipt,
+};
 pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
 
 pub use textutil::{truncate_at_char_boundary, truncate_with_marker};

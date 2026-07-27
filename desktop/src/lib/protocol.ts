@@ -102,6 +102,12 @@ export type SessionUpdate =
       session_id: string;
       message: string;
       retry_after_ms?: number | null;
+    }
+  | {
+      type: "steering_injected";
+      session_id: string;
+      steering_id: string;
+      text: string;
     };
 
 export interface PermissionRequest {

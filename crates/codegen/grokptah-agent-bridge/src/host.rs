@@ -23,6 +23,10 @@ use crate::host_helpers::{
 };
 use crate::local_tools;
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
+use crate::prompt_queue::{
+    format_interjection, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueTakeResult,
+    SessionPromptQueue, SteeringReceipt,
+};
 use crate::search_engine::{self, SearchHit, SearchQuery};
 use crate::session::{Session, SessionKind, SessionSummary, TranscriptEntry};
 use crate::session_store::{self, WorkspaceChrome};
@@ -116,6 +120,8 @@ pub(crate) struct Inner {
     /// Per-session turn cancellation so multiple sessions can run concurrently
     /// (Claude Code–style parallel build sessions).
     turn_cancels: HashMap<Uuid, CancellationToken>,
+    /// Authoritative follow-up queue plus non-cancelling steering inbox.
+    prompt_queues: HashMap<Uuid, SessionPromptQueue>,
     event_tx: mpsc::UnboundedSender<SessionUpdate>,
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
@@ -150,6 +156,10 @@ impl Drop for TurnBusyGuard {
         }
         let mut g = self.host.inner.lock();
         g.turn_cancels.remove(&self.session_id);
+        g.prompt_queues
+            .entry(self.session_id)
+            .or_default()
+            .defer_pending_steering();
     }
 }
 
@@ -244,6 +254,7 @@ impl AgentHost {
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
+            prompt_queues: HashMap::new(),
             event_tx,
             edited_files: Vec::new(),
             edit_snapshots: HashMap::new(), // session_id → path → original
@@ -638,6 +649,7 @@ impl AgentHostHandle {
                 bail!("cannot delete a session with an active turn — stop it first");
             }
             g.sessions.remove(&id);
+            g.prompt_queues.remove(&id);
             g.open_tab_ids.retain(|t| *t != id);
             if g.active_session == Some(id) {
                 g.active_session = g.open_tab_ids.first().copied();
@@ -2249,6 +2261,156 @@ impl AgentHostHandle {
         Ok(())
     }
 
+    pub fn session_queue_list(&self, session_id: Uuid) -> Result<Vec<PromptQueueEntry>> {
+        let g = self.inner.lock();
+        if !g.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        Ok(g.prompt_queues
+            .get(&session_id)
+            .map(SessionPromptQueue::list)
+            .unwrap_or_default())
+    }
+
+    pub fn session_queue_add(
+        &self,
+        session_id: Uuid,
+        text: String,
+        priority: bool,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        let mut g = self.inner.lock();
+        if !g.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        let queue = g.prompt_queues.entry(session_id).or_default();
+        queue.add(text, "composer", priority)?;
+        Ok(queue.list())
+    }
+
+    pub fn session_queue_edit(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        version: u64,
+        text: String,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        let mut g = self.inner.lock();
+        let queue = g
+            .prompt_queues
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+        queue.edit(entry_id, version, text)?;
+        Ok(queue.list())
+    }
+
+    pub fn session_queue_remove(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        let mut g = self.inner.lock();
+        let queue = g
+            .prompt_queues
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+        queue.remove(entry_id)?;
+        Ok(queue.list())
+    }
+
+    pub fn session_queue_clear(&self, session_id: Uuid) -> Result<Vec<PromptQueueEntry>> {
+        let mut g = self.inner.lock();
+        if !g.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        g.prompt_queues.entry(session_id).or_default().clear();
+        Ok(Vec::new())
+    }
+
+    pub fn session_queue_move(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        to_index: usize,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        let mut g = self.inner.lock();
+        let queue = g
+            .prompt_queues
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+        queue.move_to(entry_id, to_index)?;
+        Ok(queue.list())
+    }
+
+    pub fn session_queue_take_next(&self, session_id: Uuid) -> Result<PromptQueueTakeResult> {
+        let mut g = self.inner.lock();
+        if !g.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        let active = g.turn_cancels.contains_key(&session_id);
+        let queue = g.prompt_queues.entry(session_id).or_default();
+        if active {
+            return Ok(PromptQueueTakeResult {
+                batch: None,
+                entries: queue.list(),
+            });
+        }
+        Ok(queue.take_next())
+    }
+
+    pub fn session_queue_run_next(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+    ) -> Result<PromptQueueRunNextResult> {
+        let active = {
+            let mut g = self.inner.lock();
+            let queue = g
+                .prompt_queues
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+            queue.run_next(entry_id)?;
+            g.turn_cancels.contains_key(&session_id)
+        };
+        let cancelled_active = active && self.cancel_turn(Some(session_id)).is_ok();
+        Ok(PromptQueueRunNextResult {
+            entries: self.session_queue_list(session_id)?,
+            cancelled_active,
+        })
+    }
+
+    pub fn session_queue_steer_entry(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+    ) -> Result<SteeringReceipt> {
+        let mut g = self.inner.lock();
+        let is_build = g
+            .sessions
+            .get(&session_id)
+            .map(|session| session.kind == SessionKind::Build)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        let can_inject = is_build && g.turn_cancels.contains_key(&session_id);
+        let queue = g
+            .prompt_queues
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+        queue.steer_queued(entry_id, can_inject)
+    }
+
+    pub fn session_steer(&self, session_id: Uuid, text: String) -> Result<SteeringReceipt> {
+        let mut g = self.inner.lock();
+        let is_build = g
+            .sessions
+            .get(&session_id)
+            .map(|session| session.kind == SessionKind::Build)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        let can_inject = is_build && g.turn_cancels.contains_key(&session_id);
+        g.prompt_queues
+            .entry(session_id)
+            .or_default()
+            .steer_text(text, can_inject)
+    }
+
     /// Cancel the in-flight turn for `session_id`, or every active turn when
     /// `session_id` is `None` (shutdown / global stop).
     pub fn cancel_turn(&self, session_id: Option<Uuid>) -> Result<()> {
@@ -2394,10 +2556,16 @@ impl AgentHostHandle {
             .await;
 
         // Normal path: disarmed so Drop is a no-op after we clean up below.
-        // (We still remove here for ordering before persist + events.)
+        // Atomically close the active-turn window and defer any steering note
+        // that arrived after the final safe drain. A concurrent steer sees
+        // either "active" (and is moved here) or "idle" (and queues itself).
         {
             let mut g = self.inner.lock();
             g.turn_cancels.remove(&session_id);
+            g.prompt_queues
+                .entry(session_id)
+                .or_default()
+                .defer_pending_steering();
         }
         busy_guard.armed = false;
 
@@ -2865,6 +3033,55 @@ impl AgentHostHandle {
         }
     }
 
+    fn drain_pending_steering(
+        &self,
+        session_id: Uuid,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    ) -> Vec<PromptQueueEntry> {
+        let entries = {
+            let mut g = self.inner.lock();
+            let entries = g
+                .prompt_queues
+                .entry(session_id)
+                .or_default()
+                .drain_steering();
+            if let Some(session) = g.sessions.get_mut(&session_id) {
+                for entry in &entries {
+                    session.transcript.push(TranscriptEntry::system(format!(
+                        "Steering while running: {}",
+                        entry.text
+                    )));
+                    session.updated_at = Utc::now();
+                }
+            }
+            entries
+        };
+        for entry in &entries {
+            let _ = event_tx.send(SessionUpdate::SteeringInjected {
+                session_id,
+                steering_id: entry.id.clone(),
+                text: entry.text.clone(),
+            });
+        }
+        entries
+    }
+
+    fn append_pending_steering_messages(
+        &self,
+        session_id: Uuid,
+        event_tx: &mpsc::UnboundedSender<SessionUpdate>,
+        messages: &mut Vec<serde_json::Value>,
+    ) -> usize {
+        let entries = self.drain_pending_steering(session_id, event_tx);
+        for entry in &entries {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format_interjection(&entry.text),
+            }));
+        }
+        entries.len()
+    }
+
     /// Deterministic Build turn for offline tests (no network).
     #[allow(clippy::too_many_arguments)]
     async fn run_offline_build_turn(
@@ -3039,6 +3256,19 @@ impl AgentHostHandle {
                     .await;
             }
         }
+        let steering = self.drain_pending_steering(session_id, event_tx);
+        let steering_note = if steering.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n[steering received: {}]",
+                steering
+                    .iter()
+                    .map(|entry| entry.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            )
+        };
         // Prove wire context still carries compacted_summary after offline turns.
         let wire_note = {
             let g = self.inner.lock();
@@ -3054,7 +3284,7 @@ impl AgentHostHandle {
                 .unwrap_or_default()
         };
         let msg = format!(
-            "(offline agent) done: {}{wire_note}",
+            "(offline agent) done: {}{steering_note}{wire_note}",
             prompt.chars().take(80).collect::<String>()
         );
         emit_message(event_tx, session_id, &msg);
@@ -3153,6 +3383,8 @@ impl AgentHostHandle {
                 return Ok(msg);
             }
 
+            self.append_pending_steering_messages(session_id, event_tx, &mut messages);
+
             // Budget-aware coaching when max_agent_rounds is tight (#187/#188).
             let remaining = max_rounds.saturating_sub(round) + 1;
             let tools_this_round = if max_rounds <= 8 && remaining == 1 {
@@ -3227,6 +3459,20 @@ impl AgentHostHandle {
                             emit_message(event_tx, session_id, &text);
                         }
                         push_assistant(self, session_id, &text);
+                    }
+                    if round < max_rounds {
+                        messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": text,
+                        }));
+                        if self.append_pending_steering_messages(
+                            session_id,
+                            event_tx,
+                            &mut messages,
+                        ) > 0
+                        {
+                            continue;
+                        }
                     }
                     // #168 Stop hooks: optional continue with feedback (once).
                     if !stop_continued && !cancel.is_cancelled() {

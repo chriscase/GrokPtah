@@ -3,7 +3,6 @@ import {
   useCallback,
   useEffect,
   useReducer,
-  useRef,
   useState,
 } from "react";
 import {
@@ -17,15 +16,10 @@ export function useComposerQueue(activeSessionId: string | null) {
   const [composer, setComposer] = useState("");
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [expanded, setExpanded] = useState(false);
-  const [queues, rawDispatchQueue] = useReducer(
+  const [queues, dispatchQueue] = useReducer(
     promptQueueReducer,
     {} as PromptQueueState,
   );
-  const queueStateRef = useRef<PromptQueueState>({});
-  const dispatchQueue = useCallback((action: PromptQueueAction) => {
-    queueStateRef.current = promptQueueReducer(queueStateRef.current, action);
-    rawDispatchQueue(action);
-  }, []);
 
   const updateComposer = useCallback(
     (text: string) => {
@@ -99,7 +93,5 @@ export function useComposerQueue(activeSessionId: string | null) {
     dispatchQueue: dispatchQueue as Dispatch<PromptQueueAction>,
     queueFor: (sessionId: string | null): PromptQueueEntry[] =>
       sessionId ? (queues[sessionId] ?? []) : [],
-    currentQueueFor: (sessionId: string): PromptQueueEntry[] =>
-      queueStateRef.current[sessionId] ?? [],
   };
 }

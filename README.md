@@ -44,6 +44,7 @@ This is **not** an official xAI product. It is a personal/community fork for des
 ## Features (desktop)
 
 - **Chat** — multi-line composer, streaming assistant + thought chunks (Gemini-style fade-in), stop/cancel turn  
+- **Prompt steering** — queue, edit, reorder, steer a running Build without cancelling, or promote a prompt to run next ([details](docs/STEERING_PROMPTS.md))
 - **Tools** — cards for read/search/edit/shell; permission modal (allow / deny / always)  
 - **Plan mode** — propose steps; accept or reject from the UI  
 - **Sessions** — separate **Builds** (coding agent) and **Chats** (plain Grok); multi-tab; full-screen browser (rename / delete / archive / folders / tags); durable under `~/.grokptah/`  
