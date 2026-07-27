@@ -23,6 +23,8 @@ pub struct ToolResult {
     pub permission_summary: String,
     /// True when the tool was stopped by cancellation.
     pub cancelled: bool,
+    /// Process exit code for shell tools; `None` when killed by cancellation.
+    pub exit_code: Option<i32>,
 }
 
 impl ToolResult {
@@ -42,6 +44,7 @@ impl ToolResult {
             needs_permission,
             permission_summary,
             cancelled: false,
+            exit_code: None,
         }
     }
 }
@@ -404,10 +407,15 @@ where
         } else {
             format!("{collected}\n(cancelled)")
         }
-    } else if collected.is_empty() {
-        format!("(exit {})", exit_code.unwrap_or(-1))
     } else {
-        collected
+        let exit_summary = exit_code
+            .map(|code| format!("(exit {code})"))
+            .unwrap_or_else(|| "(terminated without exit code)".into());
+        if collected.is_empty() {
+            exit_summary
+        } else {
+            format!("{}\n{exit_summary}", collected.trim_end())
+        }
     };
 
     Ok(ToolResult {
@@ -418,6 +426,7 @@ where
         needs_permission: true,
         permission_summary: format!("Run shell: {command}"),
         cancelled,
+        exit_code,
     })
 }
 
@@ -605,5 +614,68 @@ mod tests {
         let result = resolve_under_cwd(&project, "dangling/escaped.txt");
 
         assert!(result.is_err());
+    }
+
+    fn shell_map() -> LiveShellMap {
+        Arc::new(TokioMutex::new(std::collections::HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn shell_reports_zero_exit_code() {
+        let project = tempfile::tempdir().unwrap();
+        let result = tool_shell_streaming(
+            project.path(),
+            "printf success",
+            CancellationToken::new(),
+            uuid::Uuid::new_v4(),
+            shell_map(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.cancelled);
+        assert_eq!(result.output, "success\n(exit 0)");
+    }
+
+    #[tokio::test]
+    async fn shell_reports_nonzero_exit_code() {
+        let project = tempfile::tempdir().unwrap();
+        let result = tool_shell_streaming(
+            project.path(),
+            "printf failure; exit 2",
+            CancellationToken::new(),
+            uuid::Uuid::new_v4(),
+            shell_map(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, Some(2));
+        assert!(!result.cancelled);
+        assert_eq!(result.output, "failure\n(exit 2)");
+    }
+
+    #[tokio::test]
+    async fn shell_cancellation_is_distinct_from_process_failure() {
+        let project = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = tool_shell_streaming(
+            project.path(),
+            "sleep 5",
+            cancel,
+            uuid::Uuid::new_v4(),
+            shell_map(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(result.cancelled);
+        assert_eq!(result.exit_code, None);
+        assert!(result.output.contains("(cancelled)"));
     }
 }

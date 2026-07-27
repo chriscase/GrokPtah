@@ -4945,20 +4945,27 @@ impl AgentHostHandle {
         match result {
             Ok(tr) => {
                 let cancelled = tr.cancelled;
+                let exit_code = tr.exit_code;
                 let out = tr.output.clone();
-                let status = if cancelled {
+                let status = if cancelled || exit_code != Some(0) {
                     ToolCallStatus::Failed
                 } else {
                     ToolCallStatus::Completed
                 };
                 self.complete_shell_background_task(
                     &call_id,
-                    if cancelled { "cancelled" } else { "completed" },
+                    if cancelled {
+                        "cancelled"
+                    } else if exit_code == Some(0) {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
                 );
                 let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
                     session_id,
                     call_id: call_id.clone(),
-                    exit_code: None,
+                    exit_code,
                     cancelled,
                 });
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
@@ -4975,11 +4982,7 @@ impl AgentHostHandle {
                     status,
                     Some(out.clone()),
                 );
-                Ok(if cancelled {
-                    format!("{out}\n(cancelled)")
-                } else {
-                    out
-                })
+                Ok(out)
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -5155,28 +5158,32 @@ impl AgentHostHandle {
 
         match result {
             Ok(tr) => {
+                let exit_code = tr.exit_code;
+                let status = if tr.cancelled || exit_code != Some(0) {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
                 self.complete_shell_background_task(
                     &call_id,
                     if tr.cancelled {
                         "cancelled"
-                    } else {
+                    } else if exit_code == Some(0) {
                         "completed"
+                    } else {
+                        "failed"
                     },
                 );
                 let _ = event_tx.send(SessionUpdate::ShellSessionEnded {
                     session_id,
                     call_id: call_id.clone(),
-                    exit_code: if tr.cancelled { None } else { Some(0) },
+                    exit_code,
                     cancelled: tr.cancelled,
                 });
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
                     call_id,
-                    status: if tr.cancelled {
-                        ToolCallStatus::Failed
-                    } else {
-                        ToolCallStatus::Completed
-                    },
+                    status,
                     output: Some(tr.output),
                 });
             }

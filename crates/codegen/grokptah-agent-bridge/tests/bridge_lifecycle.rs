@@ -1087,6 +1087,115 @@ async fn allow_rule_suppresses_shell_prompt() {
 }
 
 #[tokio::test]
+async fn shell_exit_code_and_failure_status_reach_session_events() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    host.session_prompt(session.id, "run printf success".into())
+        .await
+        .unwrap();
+    let success_events = drain_until_turn_complete(&mut rx).await;
+    assert!(success_events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ShellSessionEnded {
+            exit_code: Some(0),
+            cancelled: false,
+            ..
+        }
+    )));
+    assert!(success_events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ToolCallUpdate {
+            status: grokptah_agent_bridge::ToolCallStatus::Completed,
+            output: Some(output),
+            ..
+        } if output.contains("(exit 0)")
+    )));
+
+    host.session_prompt(session.id, "run printf failure; exit 2".into())
+        .await
+        .unwrap();
+    let failure_events = drain_until_turn_complete(&mut rx).await;
+    assert!(failure_events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ShellSessionEnded {
+            exit_code: Some(2),
+            cancelled: false,
+            ..
+        }
+    )));
+    assert!(failure_events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ToolCallUpdate {
+            status: grokptah_agent_bridge::ToolCallStatus::Failed,
+            output: Some(output),
+            ..
+        } if output.contains("(exit 2)")
+    )));
+}
+
+#[tokio::test]
+async fn cancelled_shell_is_distinct_from_nonzero_exit() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let runner = {
+        let host = host.clone();
+        tokio::spawn(async move { host.session_prompt(session.id, "run sleep 10".into()).await })
+    };
+
+    loop {
+        let event = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("shell did not start")
+            .expect("event channel closed");
+        if matches!(event, SessionUpdate::ShellSessionStarted { .. }) {
+            break;
+        }
+    }
+    host.cancel_turn(Some(session.id)).unwrap();
+    timeout(Duration::from_secs(3), runner)
+        .await
+        .expect("cancelled shell did not finish")
+        .unwrap()
+        .unwrap();
+
+    let events = drain_until_turn_complete(&mut rx).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ShellSessionEnded {
+            exit_code: None,
+            cancelled: true,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionUpdate::ToolCallUpdate {
+            status: grokptah_agent_bridge::ToolCallStatus::Failed,
+            output: Some(output),
+            ..
+        } if output.contains("(cancelled)")
+    )));
+}
+
+#[tokio::test]
 async fn concurrent_sessions_shells_do_not_kill_each_other() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
