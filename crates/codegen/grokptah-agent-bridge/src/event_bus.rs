@@ -179,11 +179,12 @@ pub fn redact_update(mut update: SessionUpdate) -> SessionUpdate {
                 *title = "redacted_tool".into();
             }
         }
-        SessionUpdate::ToolCallUpdate { output, .. } => {
-            if let Some(o) = output {
-                *o = truncate_redact(o, 2_000);
-            }
+        SessionUpdate::ToolCallUpdate {
+            output: Some(o), ..
+        } => {
+            *o = truncate_redact(o, 2_000);
         }
+        SessionUpdate::ToolCallUpdate { output: None, .. } => {}
         SessionUpdate::AgentMessageChunk { text, .. }
         | SessionUpdate::AgentThoughtChunk { text, .. }
         | SessionUpdate::Error { message: text, .. } => {

@@ -81,6 +81,7 @@ impl OrchestrationService {
         super::authz::require_bearer(header, &tok)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn audit(
         &self,
         tool: &str,
@@ -187,8 +188,8 @@ impl OrchestrationService {
             .load_run(run_id)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
-        Ok(serde_json::to_value(run)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?)
+        serde_json::to_value(run)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
     pub fn get_progress(

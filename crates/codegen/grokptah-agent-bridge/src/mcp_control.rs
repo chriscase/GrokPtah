@@ -381,7 +381,7 @@ mod tests {
         let tools = body["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"ptah_list_sessions"));
-        assert!(!names.iter().any(|n| *n == "run_terminal_cmd"));
+        assert!(!names.contains(&"run_terminal_cmd"));
 
         srv.stop();
         set_grokptah_home_override(None);
