@@ -34,6 +34,8 @@ use crate::orchestration::{
 
 /// Max concurrent in-flight MCP requests (post-auth).
 const MAX_CONCURRENT_REQUESTS: usize = 32;
+/// Hard cap on Streamable HTTP sessions (LRU eviction beyond this).
+const MAX_SESSIONS: usize = 256;
 /// Hard wall-clock bound per request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Supported MCP protocol versions (initialize + header validation).
@@ -533,6 +535,51 @@ fn require_session_if_present(state: &AppState, headers: &HeaderMap) -> Result<(
     Ok(())
 }
 
+/// Evict least-recently-seen sessions until `map.len() <= max`.
+fn evict_sessions_lru(map: &mut HashMap<String, SessionState>, max: usize) {
+    while map.len() > max {
+        let victim = map
+            .iter()
+            .min_by_key(|(_, s)| s.last_seen)
+            .map(|(id, _)| id.clone());
+        match victim {
+            Some(id) => {
+                map.remove(&id);
+            }
+            None => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_cap_tests {
+    use super::*;
+
+    #[test]
+    fn lru_evicts_oldest_when_over_cap() {
+        let mut map = HashMap::new();
+        let t0 = Instant::now() - Duration::from_secs(100);
+        for i in 0..5 {
+            map.insert(
+                format!("s{i}"),
+                SessionState {
+                    protocol_version: "2025-11-25".into(),
+                    initialized: true,
+                    created_at: t0,
+                    last_seen: t0 + Duration::from_secs(i),
+                },
+            );
+        }
+        evict_sessions_lru(&mut map, 3);
+        assert_eq!(map.len(), 3);
+        assert!(!map.contains_key("s0"));
+        assert!(!map.contains_key("s1"));
+        assert!(map.contains_key("s2"));
+        assert!(map.contains_key("s3"));
+        assert!(map.contains_key("s4"));
+    }
+}
+
 fn handle_initialize(
     state: &AppState,
     headers: &HeaderMap,
@@ -561,22 +608,20 @@ fn handle_initialize(
         }
     }
     let session_id = Uuid::new_v4().to_string();
-    state.sessions.lock().insert(
-        session_id.clone(),
-        SessionState {
-            protocol_version: negotiated.to_string(),
-            initialized: false,
-            created_at: Instant::now(),
-            last_seen: Instant::now(),
-        },
-    );
-    // Bound session map growth.
     {
         let mut g = state.sessions.lock();
-        if g.len() > 256 {
-            let cutoff = Instant::now() - Duration::from_secs(3600);
-            g.retain(|_, s| s.last_seen > cutoff);
-        }
+        g.insert(
+            session_id.clone(),
+            SessionState {
+                protocol_version: negotiated.to_string(),
+                initialized: false,
+                created_at: Instant::now(),
+                last_seen: Instant::now(),
+            },
+        );
+        // Hard-cap: always keep ≤ MAX_SESSIONS by evicting least-recently-seen.
+        // Age-only pruning is insufficient when attackers keep last_seen fresh.
+        evict_sessions_lru(&mut g, MAX_SESSIONS);
     }
     Ok((
         json!({
