@@ -50,7 +50,7 @@ impl Drop for IsolatedHome {
 }
 
 async fn drain_until_turn_complete(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>,
+    rx: &mut grokptah_agent_bridge::EventReceiver,
 ) -> Vec<SessionUpdate> {
     let mut events = Vec::new();
     loop {

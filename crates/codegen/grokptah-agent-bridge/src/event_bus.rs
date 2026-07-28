@@ -2,16 +2,22 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 use crate::events::SessionUpdate;
 
 /// Default max journal entries retained for cursor replay.
 pub const DEFAULT_JOURNAL_CAPACITY: usize = 4096;
+const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EVENT_BYTES: usize = 256 * 1024;
+const MAX_JOURNAL_LINE_BYTES: usize = MAX_EVENT_BYTES + 4096;
+const SEQUENCE_RESERVATION_SIZE: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,14 +37,20 @@ pub struct JournalPage {
 }
 
 struct BusInner {
-    subscribers: Vec<mpsc::UnboundedSender<SessionUpdate>>,
+    stream_tx: broadcast::Sender<SequencedUpdate>,
+    critical_tx: broadcast::Sender<SequencedUpdate>,
     journal: VecDeque<JournalEntry>,
+    journal_bytes: usize,
     capacity: usize,
     /// Next sequence number to allocate (starts at 1).
     next_seq: u64,
+    /// Last sequence actually published (may trail a reserved range start).
+    last_seq: u64,
+    reserved_through: u64,
+    sequence_path: Option<PathBuf>,
     /// Lowest seq still in the journal (for cursor expiry).
     oldest_seq: u64,
-    journal_path: Option<PathBuf>,
+    persistence: Option<Arc<PersistenceHandle>>,
     /// Optional configured control secrets to scrub from durable text.
     control_secrets: Vec<String>,
 }
@@ -47,20 +59,177 @@ struct BusInner {
 #[derive(Clone)]
 pub struct EventBus {
     inner: Arc<Mutex<BusInner>>,
+    lagged_events: Arc<AtomicU64>,
+    persistence_error: Arc<Mutex<Option<String>>>,
+    journal_gap: Arc<Mutex<Option<(u64, u64)>>>,
+}
+
+struct PersistenceHandle {
+    tx: Mutex<Option<SyncSender<JournalEntry>>>,
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
+    gap_path: PathBuf,
+}
+
+impl Drop for PersistenceHandle {
+    fn drop(&mut self) {
+        self.tx.lock().take();
+        if let Some(join) = self.join.lock().take() {
+            let _ = join.join();
+        }
+    }
+}
+
+pub struct EventReceiver {
+    stream_rx: broadcast::Receiver<SequencedUpdate>,
+    critical_rx: broadcast::Receiver<SequencedUpdate>,
+    pending_stream: Option<SequencedUpdate>,
+    pending_critical: Option<SequencedUpdate>,
+    pending_lagged: u64,
+    stream_closed: bool,
+    critical_closed: bool,
+    lagged_events: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct SequencedUpdate {
+    seq: u64,
+    update: SessionUpdate,
+}
+
+impl EventReceiver {
+    pub async fn recv(&mut self) -> Option<SessionUpdate> {
+        loop {
+            match self.try_recv() {
+                Ok(update) => return Some(update),
+                Err(broadcast::error::TryRecvError::Closed) => return None,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => unreachable!(),
+                Err(broadcast::error::TryRecvError::Empty) => {}
+            }
+
+            tokio::select! {
+                result = self.stream_rx.recv(), if !self.stream_closed => {
+                    match result {
+                        Ok(update) => self.pending_stream = Some(update),
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            self.lagged_events.fetch_add(count, Ordering::Relaxed);
+                            self.pending_lagged = self.pending_lagged.saturating_add(count);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            self.stream_closed = true;
+                        }
+                    }
+                }
+                result = self.critical_rx.recv(), if !self.critical_closed => {
+                    match result {
+                        Ok(update) => self.pending_critical = Some(update),
+                        Err(broadcast::error::RecvError::Lagged(count)) => {
+                            self.lagged_events.fetch_add(count, Ordering::Relaxed);
+                            self.pending_lagged = self.pending_lagged.saturating_add(count);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            self.critical_closed = true;
+                        }
+                    }
+                }
+                else => return None,
+            }
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Result<SessionUpdate, broadcast::error::TryRecvError> {
+        if let Some(gap) = self.take_gap_notice() {
+            return Ok(gap);
+        }
+        self.fill_stream();
+        self.fill_critical();
+        if let Some(gap) = self.take_gap_notice() {
+            return Ok(gap);
+        }
+
+        let take_stream = match (&self.pending_stream, &self.pending_critical) {
+            (Some(stream), Some(critical)) => stream.seq < critical.seq,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => {
+                return if self.stream_closed && self.critical_closed {
+                    Err(broadcast::error::TryRecvError::Closed)
+                } else {
+                    Err(broadcast::error::TryRecvError::Empty)
+                };
+            }
+        };
+        let next = if take_stream {
+            self.pending_stream.take()
+        } else {
+            self.pending_critical.take()
+        };
+        Ok(next.expect("a pending event was selected").update)
+    }
+
+    fn fill_stream(&mut self) {
+        while self.pending_stream.is_none() && !self.stream_closed {
+            match self.stream_rx.try_recv() {
+                Ok(update) => self.pending_stream = Some(update),
+                Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                    self.lagged_events.fetch_add(count, Ordering::Relaxed);
+                    self.pending_lagged = self.pending_lagged.saturating_add(count);
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Closed) => self.stream_closed = true,
+            }
+        }
+    }
+
+    fn fill_critical(&mut self) {
+        while self.pending_critical.is_none() && !self.critical_closed {
+            match self.critical_rx.try_recv() {
+                Ok(update) => self.pending_critical = Some(update),
+                Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                    self.lagged_events.fetch_add(count, Ordering::Relaxed);
+                    self.pending_lagged = self.pending_lagged.saturating_add(count);
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Closed) => self.critical_closed = true,
+            }
+        }
+    }
+
+    fn take_gap_notice(&mut self) -> Option<SessionUpdate> {
+        if self.pending_lagged == 0 {
+            return None;
+        }
+        let count = std::mem::take(&mut self.pending_lagged);
+        Some(SessionUpdate::Error {
+            session_id: uuid::Uuid::nil(),
+            message: format!(
+                "live event receiver missed {count} bounded backlog event(s); resynchronize from the durable journal"
+            ),
+        })
+    }
 }
 
 impl EventBus {
     pub fn new(capacity: usize) -> Self {
+        let (stream_tx, _) = broadcast::channel(capacity.max(1));
+        let (critical_tx, _) = broadcast::channel(512);
         Self {
             inner: Arc::new(Mutex::new(BusInner {
-                subscribers: Vec::new(),
+                stream_tx,
+                critical_tx,
                 journal: VecDeque::new(),
+                journal_bytes: 0,
                 capacity: capacity.max(1),
                 next_seq: 1,
+                last_seq: 0,
+                reserved_through: 0,
+                sequence_path: None,
                 oldest_seq: 1,
-                journal_path: None,
+                persistence: None,
                 control_secrets: Vec::new(),
             })),
+            lagged_events: Arc::new(AtomicU64::new(0)),
+            persistence_error: Arc::new(Mutex::new(None)),
+            journal_gap: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -85,73 +254,201 @@ impl EventBus {
         self.inner.lock().control_secrets.len()
     }
 
+    pub fn redact_text(&self, text: &str, max: usize) -> String {
+        let secrets = self.inner.lock().control_secrets.clone();
+        scrub_text(text, &secrets, max)
+    }
+
     /// Persist journal under `dir/event_journal.jsonl`; reload tail; compact file.
     pub fn with_persist_dir(self, dir: impl AsRef<Path>) -> Self {
         let path = dir.as_ref().join("event_journal.jsonl");
+        let sequence_path = dir.as_ref().join("event_journal.seq");
+        let gap_path = dir.as_ref().join("event_journal.gap.json");
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                *self.persistence_error.lock() = Some(error.to_string());
+            }
         }
         {
             let mut g = self.inner.lock();
-            if path.is_file() {
-                if let Ok(loaded) = load_journal_file(&path, g.capacity) {
-                    if let Some(last) = loaded.back() {
-                        g.next_seq = last.seq.saturating_add(1);
-                        g.oldest_seq = loaded.front().map(|e| e.seq).unwrap_or(1);
+            let mut durable_tail = VecDeque::new();
+            let gap_ready = if gap_path.is_file() {
+                match load_journal_gap(&gap_path) {
+                    Ok(gap) => {
+                        *self.journal_gap.lock() = Some(gap);
+                        true
                     }
-                    g.journal = loaded;
-                    // Compact durable file to current in-memory tail.
-                    let _ = rewrite_journal_file(&path, &g.journal);
+                    Err(error) => {
+                        *self.persistence_error.lock() = Some(error.to_string());
+                        *self.journal_gap.lock() = Some((0, u64::MAX));
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if path.is_file() {
+                match load_journal_file(&path, g.capacity) {
+                    Ok(loaded) => {
+                        if let Some(last) = loaded.back() {
+                            g.next_seq = last.seq.saturating_add(1);
+                            g.last_seq = last.seq;
+                            g.oldest_seq = loaded.front().map(|e| e.seq).unwrap_or(1);
+                        }
+                        g.journal_bytes = loaded.iter().map(journal_entry_size).sum();
+                        g.journal = loaded.clone();
+                        durable_tail = loaded;
+                        // Compact durable file to current in-memory tail.
+                        if let Err(e) = rewrite_journal_file(&path, &g.journal) {
+                            *self.persistence_error.lock() = Some(e.to_string());
+                        }
+                    }
+                    Err(error) => {
+                        *self.persistence_error.lock() = Some(error.to_string());
+                    }
                 }
             }
-            g.journal_path = Some(path);
+            let sequence_ready = match reserve_sequence_range(&sequence_path, g.next_seq) {
+                Ok((start, reserved_through)) => {
+                    g.next_seq = start;
+                    g.reserved_through = reserved_through;
+                    g.sequence_path = Some(sequence_path);
+                    true
+                }
+                Err(error) => {
+                    *self.persistence_error.lock() = Some(error.to_string());
+                    g.reserved_through = u64::MAX;
+                    g.sequence_path = None;
+                    false
+                }
+            };
+            if sequence_ready && gap_ready {
+                let (tx, rx) = sync_channel::<JournalEntry>(256);
+                let persistence_error = self.persistence_error.clone();
+                let journal_gap = self.journal_gap.clone();
+                let writer_path = path.clone();
+                let writer_gap_path = gap_path.clone();
+                let capacity = g.capacity;
+                let join = std::thread::Builder::new()
+                    .name("grokptah-event-journal".into())
+                    .spawn(move || {
+                        run_journal_writer(
+                            &writer_path,
+                            capacity,
+                            durable_tail,
+                            rx,
+                            &persistence_error,
+                            &writer_gap_path,
+                            &journal_gap,
+                        );
+                    });
+                match join {
+                    Ok(join) => {
+                        g.persistence = Some(Arc::new(PersistenceHandle {
+                            tx: Mutex::new(Some(tx)),
+                            join: Mutex::new(Some(join)),
+                            gap_path: gap_path.clone(),
+                        }));
+                    }
+                    Err(error) => {
+                        *self.persistence_error.lock() = Some(error.to_string());
+                    }
+                }
+            }
         }
         self
     }
 
-    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionUpdate> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.inner.lock().subscribers.push(tx);
-        rx
+    pub fn subscribe(&self) -> EventReceiver {
+        let g = self.inner.lock();
+        let stream_rx = g.stream_tx.subscribe();
+        let critical_rx = g.critical_tx.subscribe();
+        drop(g);
+        EventReceiver {
+            stream_rx,
+            critical_rx,
+            pending_stream: None,
+            pending_critical: None,
+            pending_lagged: 0,
+            stream_closed: false,
+            critical_closed: false,
+            lagged_events: self.lagged_events.clone(),
+        }
     }
 
     /// Publish: allocate seq + journal insert + fan-out under one lock (monotonic).
     pub fn publish(&self, update: SessionUpdate) {
         let mut g = self.inner.lock();
+        if g.next_seq > g.reserved_through {
+            if let Some(path) = g.sequence_path.clone() {
+                match reserve_sequence_range(&path, g.next_seq) {
+                    Ok((start, reserved_through)) => {
+                        g.next_seq = start;
+                        g.reserved_through = reserved_through;
+                    }
+                    Err(error) => {
+                        *self.persistence_error.lock() = Some(error.to_string());
+                        g.persistence.take();
+                        g.sequence_path = None;
+                        g.reserved_through = u64::MAX;
+                    }
+                }
+            }
+        }
         let seq = g.next_seq;
         g.next_seq = g.next_seq.saturating_add(1);
+        g.last_seq = seq;
         let ts = chrono::Utc::now().to_rfc3339();
         let secrets = g.control_secrets.clone();
-        let redacted = redact_update_with_secrets(update.clone(), &secrets);
+        let redacted = bound_update_size(redact_update_with_secrets(update, &secrets));
         let entry = JournalEntry {
             seq,
             ts,
-            update: redacted,
+            update: redacted.clone(),
         };
+        g.journal_bytes = g.journal_bytes.saturating_add(journal_entry_size(&entry));
         g.journal.push_back(entry.clone());
-        while g.journal.len() > g.capacity {
+        while g.journal.len() > g.capacity || g.journal_bytes > MAX_JOURNAL_BYTES {
             if let Some(old) = g.journal.pop_front() {
+                g.journal_bytes = g.journal_bytes.saturating_sub(journal_entry_size(&old));
                 g.oldest_seq = old.seq.saturating_add(1);
             }
         }
-        // Bound durable file: rewrite when over 2× capacity lines.
-        if let Some(path) = g.journal_path.clone() {
-            if let Ok(meta) = std::fs::metadata(&path) {
-                // Rough: if file larger than capacity * 4KB, compact.
-                if meta.len() > (g.capacity as u64).saturating_mul(4096) {
-                    let _ = rewrite_journal_file(&path, &g.journal);
-                } else {
-                    append_journal_line(&path, &entry);
+        if let Some(persistence) = &g.persistence {
+            let failure = match persistence.tx.lock().as_ref() {
+                Some(tx) => match tx.try_send(entry.clone()) {
+                    Ok(()) => None,
+                    Err(TrySendError::Full(_)) => Some(("journal writer queue is full", false)),
+                    Err(TrySendError::Disconnected(_)) => Some(("journal writer stopped", true)),
+                },
+                None => Some(("journal writer stopped", true)),
+            };
+            if let Some((detail, disconnected)) = failure {
+                *self.persistence_error.lock() = Some(detail.into());
+                record_journal_gap(&self.journal_gap, seq);
+                if disconnected {
+                    if let Err(error) =
+                        persist_current_gap(&persistence.gap_path, &self.journal_gap)
+                    {
+                        *self.persistence_error.lock() = Some(error.to_string());
+                    }
                 }
-            } else {
-                append_journal_line(&path, &entry);
             }
         }
-        // Drop closed subscribers so growth stays bounded.
-        g.subscribers.retain(|tx| tx.send(update.clone()).is_ok());
+        if is_critical_update(&redacted) {
+            let _ = g.critical_tx.send(SequencedUpdate {
+                seq,
+                update: redacted,
+            });
+        } else {
+            let _ = g.stream_tx.send(SequencedUpdate {
+                seq,
+                update: redacted,
+            });
+        }
     }
 
-    pub fn send(&self, update: SessionUpdate) -> Result<(), mpsc::error::SendError<SessionUpdate>> {
+    pub fn send(&self, update: SessionUpdate) -> Result<(), std::convert::Infallible> {
         self.publish(update);
         Ok(())
     }
@@ -160,6 +457,16 @@ impl EventBus {
     pub fn read_after(&self, after_seq: u64, limit: usize) -> JournalPage {
         let limit = limit.clamp(1, 500);
         let g = self.inner.lock();
+        let gap = *self.journal_gap.lock();
+        if let Some((start, end)) = gap {
+            if after_seq >= start.saturating_sub(1) && after_seq < end {
+                return JournalPage {
+                    entries: Vec::new(),
+                    next_cursor: None,
+                    cursor_expired: true,
+                };
+            }
+        }
         if after_seq > 0 && after_seq + 1 < g.oldest_seq && !g.journal.is_empty() {
             return JournalPage {
                 entries: Vec::new(),
@@ -167,13 +474,18 @@ impl EventBus {
                 cursor_expired: true,
             };
         }
-        let entries: Vec<JournalEntry> = g
+        let mut entries: Vec<JournalEntry> = g
             .journal
             .iter()
             .filter(|e| e.seq > after_seq)
             .take(limit)
             .cloned()
             .collect();
+        if let Some((start, _)) = gap {
+            if after_seq < start.saturating_sub(1) {
+                entries.retain(|entry| entry.seq < start);
+            }
+        }
         let next_cursor = entries.last().map(|e| e.seq);
         let cursor_expired = entries.is_empty()
             && after_seq > 0
@@ -223,8 +535,11 @@ impl EventBus {
     }
 
     pub fn current_seq(&self) -> u64 {
-        let g = self.inner.lock();
-        g.next_seq.saturating_sub(1)
+        self.inner.lock().last_seq
+    }
+
+    pub fn next_seq(&self) -> u64 {
+        self.inner.lock().next_seq
     }
 
     pub fn oldest_seq(&self) -> u64 {
@@ -232,7 +547,50 @@ impl EventBus {
     }
 
     pub fn subscriber_count(&self) -> usize {
-        self.inner.lock().subscribers.len()
+        let g = self.inner.lock();
+        g.stream_tx
+            .receiver_count()
+            .max(g.critical_tx.receiver_count())
+    }
+
+    pub fn lagged_event_count(&self) -> u64 {
+        self.lagged_events.load(Ordering::Relaxed)
+    }
+
+    pub fn last_persistence_error(&self) -> Option<String> {
+        self.persistence_error.lock().clone()
+    }
+}
+
+fn is_critical_update(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::TurnComplete { .. }
+            | SessionUpdate::Error { .. }
+            | SessionUpdate::PermissionRequired { .. }
+            | SessionUpdate::ShellSessionEnded { .. }
+            | SessionUpdate::FileEdit { .. }
+            | SessionUpdate::RateLimited { .. }
+    )
+}
+
+fn journal_entry_size(entry: &JournalEntry) -> usize {
+    serde_json::to_vec(entry)
+        .map(|bytes| bytes.len().saturating_add(1))
+        .unwrap_or(MAX_EVENT_BYTES)
+}
+
+fn bound_update_size(update: SessionUpdate) -> SessionUpdate {
+    if serde_json::to_vec(&update)
+        .map(|bytes| bytes.len() <= MAX_EVENT_BYTES)
+        .unwrap_or(false)
+    {
+        return update;
+    }
+    let session_id = session_id_of(&update).unwrap_or_else(uuid::Uuid::nil);
+    SessionUpdate::Error {
+        session_id,
+        message: "event omitted because its serialized payload exceeded 256 KiB".into(),
     }
 }
 
@@ -263,17 +621,121 @@ fn session_id_of(u: &SessionUpdate) -> Option<uuid::Uuid> {
     }
 }
 
-fn append_journal_line(path: &Path, entry: &JournalEntry) {
+fn run_journal_writer(
+    path: &Path,
+    capacity: usize,
+    mut tail: VecDeque<JournalEntry>,
+    rx: std::sync::mpsc::Receiver<JournalEntry>,
+    persistence_error: &Mutex<Option<String>>,
+    gap_path: &Path,
+    journal_gap: &Mutex<Option<(u64, u64)>>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let mut tail_bytes: usize = tail.iter().map(journal_entry_size).sum();
+    let mut file_bytes = std::fs::metadata(path)
+        .map(|metadata| metadata.len() as usize)
+        .unwrap_or(0);
+    let mut persisted_gap = load_journal_gap(gap_path).ok();
+    loop {
+        let entry = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+            Ok(entry) => Some(entry),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+                break;
+            }
+        };
+        let Some(entry) = entry else {
+            flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+            continue;
+        };
+        let entry_bytes = journal_entry_size(&entry);
+        tail_bytes = tail_bytes.saturating_add(entry_bytes);
+        tail.push_back(entry.clone());
+        while tail.len() > capacity || tail_bytes > MAX_JOURNAL_BYTES {
+            if let Some(old) = tail.pop_front() {
+                tail_bytes = tail_bytes.saturating_sub(journal_entry_size(&old));
+            }
+        }
+        let result = if file_bytes.saturating_add(entry_bytes) > MAX_JOURNAL_BYTES {
+            rewrite_journal_file(path, &tail).map(|_| {
+                file_bytes = tail_bytes;
+            })
+        } else {
+            append_journal_line(path, &entry).map(|_| {
+                file_bytes = file_bytes.saturating_add(entry_bytes);
+            })
+        };
+        if let Err(error) = result {
+            *persistence_error.lock() = Some(error.to_string());
+            record_journal_gap(journal_gap, entry.seq);
+        }
+        flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+    }
+}
+
+fn record_journal_gap(gap: &Mutex<Option<(u64, u64)>>, seq: u64) {
+    let mut current = gap.lock();
+    *current = Some(match *current {
+        Some((start, end)) => (start.min(seq), end.max(seq)),
+        None => (seq, seq),
+    });
+}
+
+fn load_journal_gap(path: &Path) -> std::io::Result<(u64, u64)> {
+    let text = std::fs::read_to_string(path)?;
+    let gap: (u64, u64) = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+    if gap.0 > gap.1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "journal gap start exceeds end",
+        ));
+    }
+    Ok(gap)
+}
+
+fn flush_journal_gap(
+    path: &Path,
+    journal_gap: &Mutex<Option<(u64, u64)>>,
+    persisted_gap: &mut Option<(u64, u64)>,
+    persistence_error: &Mutex<Option<String>>,
+) {
+    let current = *journal_gap.lock();
+    if current.is_none() || current == *persisted_gap {
+        return;
+    }
+    let Some(gap) = current else {
+        return;
+    };
+    let result = serde_json::to_vec(&gap)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| atomic_write_bytes(path, &bytes));
+    match result {
+        Ok(()) => *persisted_gap = Some(gap),
+        Err(error) => *persistence_error.lock() = Some(error.to_string()),
+    }
+}
+
+fn persist_current_gap(
+    path: &Path,
+    journal_gap: &Mutex<Option<(u64, u64)>>,
+) -> std::io::Result<()> {
+    let Some(gap) = *journal_gap.lock() else {
+        return Ok(());
+    };
+    let bytes = serde_json::to_vec(&gap).map_err(std::io::Error::other)?;
+    atomic_write_bytes(path, &bytes)
+}
+
+fn append_journal_line(path: &Path, entry: &JournalEntry) -> std::io::Result<()> {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-    {
-        if let Ok(line) = serde_json::to_string(entry) {
-            let _ = writeln!(f, "{line}");
-        }
-    }
+        .open(path)?;
+    let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+    writeln!(f, "{line}")
 }
 
 fn rewrite_journal_file(path: &Path, journal: &VecDeque<JournalEntry>) -> std::io::Result<()> {
@@ -290,25 +752,104 @@ fn rewrite_journal_file(path: &Path, journal: &VecDeque<JournalEntry>) -> std::i
     Ok(())
 }
 
+fn reserve_sequence_range(path: &Path, requested_start: u64) -> std::io::Result<(u64, u64)> {
+    let previous = match std::fs::read_to_string(path) {
+        Ok(text) => text.trim().parse::<u64>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid sequence reservation: {error}"),
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    let start = requested_start.max(previous.saturating_add(1));
+    let reserved_through = start.saturating_add(SEQUENCE_RESERVATION_SIZE - 1);
+    atomic_write_bytes(path, format!("{reserved_through}\n").as_bytes())?;
+    Ok((start, reserved_through))
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
 fn load_journal_file(path: &Path, capacity: usize) -> std::io::Result<VecDeque<JournalEntry>> {
     use std::io::{BufRead, BufReader};
     let f = std::fs::File::open(path)?;
-    let reader = BufReader::new(f);
+    let mut reader = BufReader::new(f);
     let mut all: VecDeque<JournalEntry> = VecDeque::new();
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<JournalEntry>(line) {
-            all.push_back(entry);
-            while all.len() > capacity {
-                all.pop_front();
+    let mut all_bytes = 0usize;
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if !line.is_empty() && !oversized {
+                push_loaded_journal_line(&line, capacity, &mut all, &mut all_bytes);
             }
+            break;
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if !oversized {
+                if line.len().saturating_add(newline) <= MAX_JOURNAL_LINE_BYTES {
+                    line.extend_from_slice(&available[..newline]);
+                } else {
+                    oversized = true;
+                }
+            }
+            reader.consume(newline + 1);
+            if !oversized {
+                push_loaded_journal_line(&line, capacity, &mut all, &mut all_bytes);
+            }
+            line.clear();
+            oversized = false;
+        } else {
+            let available_len = available.len();
+            if !oversized {
+                if line.len().saturating_add(available_len) <= MAX_JOURNAL_LINE_BYTES {
+                    line.extend_from_slice(available);
+                } else {
+                    oversized = true;
+                    line.clear();
+                }
+            }
+            reader.consume(available_len);
         }
     }
     Ok(all)
+}
+
+fn push_loaded_journal_line(
+    line: &[u8],
+    capacity: usize,
+    all: &mut VecDeque<JournalEntry>,
+    all_bytes: &mut usize,
+) {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return;
+    }
+    if let Ok(entry) = serde_json::from_slice::<JournalEntry>(line) {
+        *all_bytes = all_bytes.saturating_add(journal_entry_size(&entry));
+        all.push_back(entry);
+        while all.len() > capacity || *all_bytes > MAX_JOURNAL_BYTES {
+            if let Some(old) = all.pop_front() {
+                *all_bytes = all_bytes.saturating_sub(journal_entry_size(&old));
+            }
+        }
+    }
 }
 
 /// Public redaction entry used by tests and publish path.
@@ -384,6 +925,7 @@ pub fn redact_update_with_secrets(
             }
         }
         SessionUpdate::Plan { steps, .. } => {
+            steps.truncate(100);
             for s in steps.iter_mut() {
                 *s = scrub_text(s, control_secrets, 500);
             }
@@ -396,10 +938,17 @@ pub fn redact_update_with_secrets(
 }
 
 fn redact_json(v: &serde_json::Value, secrets: &[String]) -> serde_json::Value {
+    redact_json_inner(v, secrets, 0)
+}
+
+fn redact_json_inner(v: &serde_json::Value, secrets: &[String], depth: usize) -> serde_json::Value {
+    if depth >= 8 {
+        return serde_json::json!("[truncated: depth limit]");
+    }
     match v {
         serde_json::Value::Object(map) => {
             let mut out = serde_json::Map::new();
-            for (k, val) in map {
+            for (k, val) in map.iter().take(100) {
                 let lk = k.to_ascii_lowercase();
                 if lk.contains("token")
                     || lk.contains("secret")
@@ -410,14 +959,23 @@ fn redact_json(v: &serde_json::Value, secrets: &[String]) -> serde_json::Value {
                 {
                     out.insert(k.clone(), serde_json::json!("[redacted]"));
                 } else {
-                    out.insert(k.clone(), redact_json(val, secrets));
+                    out.insert(k.clone(), redact_json_inner(val, secrets, depth + 1));
                 }
+            }
+            if map.len() > 100 {
+                out.insert(
+                    "__truncated__".into(),
+                    serde_json::json!(format!("{} fields omitted", map.len() - 100)),
+                );
             }
             serde_json::Value::Object(out)
         }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(|x| redact_json(x, secrets)).collect())
-        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter()
+                .take(100)
+                .map(|value| redact_json_inner(value, secrets, depth + 1))
+                .collect(),
+        ),
         serde_json::Value::String(s) => serde_json::Value::String(scrub_text(s, secrets, 2_000)),
         other => other.clone(),
     }
@@ -425,27 +983,32 @@ fn redact_json(v: &serde_json::Value, secrets: &[String]) -> serde_json::Value {
 
 /// Remove bearer values and secrets entirely (no "marker + original").
 fn scrub_text(s: &str, secrets: &[String], max: usize) -> String {
-    let mut out = s.to_string();
-    // Bearer TOKEN → Bearer [redacted] (token removed)
-    if let Some(idx) = out.find("Bearer ") {
-        let rest = &out[idx + "Bearer ".len()..];
-        let token_end = rest
-            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
-            .unwrap_or(rest.len());
-        let before = &out[..idx];
-        let after = &rest[token_end..];
-        out = format!("{before}Bearer [redacted]{after}");
-    }
-    // Authorization: Bearer ...
-    out = regex_lite_replace_auth(&out);
-    // Common credential assignments
-    out = scrub_assignment(&out, "GROKPTAH_CONTROL_TOKEN");
-    out = scrub_assignment(&out, "API_KEY");
-    out = scrub_assignment(&out, "OPENAI_API_KEY");
-    out = scrub_assignment(&out, "XAI_API_KEY");
+    static BEARER: OnceLock<regex::Regex> = OnceLock::new();
+    static AUTH: OnceLock<regex::Regex> = OnceLock::new();
+    static ASSIGNMENT: OnceLock<regex::Regex> = OnceLock::new();
+    let bearer = BEARER.get_or_init(|| {
+        regex::Regex::new(r#"(?i)\bbearer\s+[^\s"',;]+"#).expect("valid bearer redaction")
+    });
+    let auth = AUTH.get_or_init(|| {
+        regex::Regex::new(r"(?im)authorization\s*:\s*[^\r\n]+")
+            .expect("valid authorization redaction")
+    });
+    let assignment = ASSIGNMENT.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|ACCESS_KEY)(?:_ID)?["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s"',;]+)"#,
+        )
+        .expect("valid assignment redaction")
+    });
+    let mut out = bearer.replace_all(s, "Bearer [redacted]").into_owned();
+    out = auth
+        .replace_all(&out, "authorization: [redacted]")
+        .into_owned();
+    out = assignment
+        .replace_all(&out, "credential=[redacted]")
+        .into_owned();
     for secret in secrets {
         if !secret.is_empty() && out.contains(secret) {
-            out = out.replace(secret, "[redacted]");
+            out = scrub_registered_secret(&out, secret);
         }
     }
     if out.len() <= max {
@@ -456,33 +1019,26 @@ fn scrub_text(s: &str, secrets: &[String], max: usize) -> String {
     }
 }
 
-fn regex_lite_replace_auth(s: &str) -> String {
-    // Strip "authorization: <anything until whitespace>"
-    let lower = s.to_ascii_lowercase();
-    if let Some(idx) = lower.find("authorization:") {
-        let after = idx + "authorization:".len();
-        let rest = &s[after..];
-        let end = rest.find(['\n', '\r']).unwrap_or(rest.len());
-        format!("{}authorization: [redacted]{}", &s[..idx], &rest[end..])
-    } else {
-        s.to_string()
+fn scrub_registered_secret(text: &str, secret: &str) -> String {
+    if secret.len() >= 8 {
+        return text.replace(secret, "[redacted]");
     }
-}
-
-fn scrub_assignment(s: &str, key: &str) -> String {
-    // KEY=value or KEY=value; KEY: value
-    let patterns = [format!("{key}="), format!("{key}:"), format!("{key} =")];
-    let mut out = s.to_string();
-    for p in patterns {
-        if let Some(idx) = out.find(&p) {
-            let start = idx + p.len();
-            let rest = &out[start..];
-            let end = rest
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ';')
-                .unwrap_or(rest.len());
-            out = format!("{}{}[redacted]{}", &out[..start], "", &rest[end..]);
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(relative) = text[cursor..].find(secret) {
+        let start = cursor + relative;
+        let end = start + secret.len();
+        let before_is_word = start > 0 && text.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let after_is_word = end < text.len() && text.as_bytes()[end].is_ascii_alphanumeric();
+        out.push_str(&text[cursor..start]);
+        if before_is_word || after_is_word {
+            out.push_str(secret);
+        } else {
+            out.push_str("[redacted]");
         }
+        cursor = end;
     }
+    out.push_str(&text[cursor..]);
     out
 }
 
@@ -517,6 +1073,107 @@ mod tests {
                 _ => panic!("wrong variant"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_is_bounded_and_lag_is_observable() {
+        let bus = EventBus::new(2);
+        let mut rx = bus.subscribe();
+        let sid = Uuid::new_v4();
+        for i in 0..20 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("{i}"),
+            });
+        }
+        let update = rx.recv().await.expect("gap notice");
+        assert!(matches!(
+            update,
+            SessionUpdate::Error {
+                session_id,
+                ref message,
+            } if session_id.is_nil() && message.contains("resynchronize")
+        ));
+        let update = rx.recv().await.expect("latest retained update");
+        assert!(matches!(update, SessionUpdate::AgentMessageChunk { .. }));
+        assert!(bus.lagged_event_count() > 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_event_survives_stream_flood() {
+        let bus = EventBus::new(2);
+        let mut rx = bus.subscribe();
+        let sid = Uuid::new_v4();
+        for i in 0..100 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("{i}"),
+            });
+        }
+        bus.publish(SessionUpdate::TurnComplete {
+            session_id: sid,
+            cancelled: false,
+        });
+        let mut found_terminal = false;
+        for _ in 0..4 {
+            if matches!(rx.recv().await, Some(SessionUpdate::TurnComplete { .. })) {
+                found_terminal = true;
+                break;
+            }
+        }
+        assert!(found_terminal);
+    }
+
+    #[tokio::test]
+    async fn critical_overflow_surfaces_receiver_gap_notice() {
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        let sid = Uuid::new_v4();
+        for i in 0..600 {
+            bus.publish(SessionUpdate::Error {
+                session_id: sid,
+                message: format!("critical-{i}"),
+            });
+        }
+        assert!(matches!(
+            rx.recv().await,
+            Some(SessionUpdate::Error {
+                session_id,
+                ref message,
+            }) if session_id.is_nil() && message.contains("resynchronize")
+        ));
+    }
+
+    #[test]
+    fn critical_and_stream_events_rejoin_in_publish_order() {
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        let sid = Uuid::new_v4();
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "before".into(),
+        });
+        bus.publish(SessionUpdate::TurnComplete {
+            session_id: sid,
+            cancelled: false,
+        });
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "after".into(),
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionUpdate::AgentMessageChunk { ref text, .. }) if text == "before"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionUpdate::TurnComplete { .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionUpdate::AgentMessageChunk { ref text, .. }) if text == "after"
+        ));
     }
 
     #[test]
@@ -591,6 +1248,22 @@ mod tests {
     }
 
     #[test]
+    fn quoted_credentials_are_scrubbed() {
+        let text = scrub_text(
+            "OPENAI_API_KEY=\"secret-one\" XAI_API_KEY='secret-two' \
+             AWS_SECRET_ACCESS_KEY=\"secret-three\" \"GITHUB_TOKEN\": 'secret-four' \
+             PASSWORD=\"secret-five\"",
+            &[],
+            1_000,
+        );
+        assert!(!text.contains("secret-one"));
+        assert!(!text.contains("secret-two"));
+        assert!(!text.contains("secret-three"));
+        assert!(!text.contains("secret-four"));
+        assert!(!text.contains("secret-five"));
+    }
+
+    #[test]
     fn journal_reloads_from_disk_on_open() {
         let dir = tempfile::tempdir().unwrap();
         let sid = Uuid::new_v4();
@@ -613,7 +1286,92 @@ mod tests {
             session_id: sid,
             text: "m3".into(),
         });
-        assert_eq!(bus2.current_seq(), seq_before + 1);
+        assert!(bus2.current_seq() > seq_before);
+    }
+
+    #[test]
+    fn restart_never_reuses_a_reserved_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = Uuid::new_v4();
+        let bus1 = EventBus::new(8).with_persist_dir(dir.path());
+        bus1.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "first".into(),
+        });
+        let reserved_through = std::fs::read_to_string(dir.path().join("event_journal.seq"))
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        drop(bus1);
+
+        let bus2 = EventBus::new(8).with_persist_dir(dir.path());
+        bus2.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "after restart".into(),
+        });
+        assert!(bus2.current_seq() > reserved_through);
+    }
+
+    #[test]
+    fn corrupt_sequence_reservation_disables_durable_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("event_journal.seq"), b"not-a-number").unwrap();
+        let bus = EventBus::new(8).with_persist_dir(dir.path());
+        bus.publish(SessionUpdate::TurnComplete {
+            session_id: Uuid::new_v4(),
+            cancelled: false,
+        });
+        assert!(bus.last_persistence_error().is_some());
+        drop(bus);
+        assert!(!dir.path().join("event_journal.jsonl").is_file());
+    }
+
+    #[test]
+    fn corrupt_gap_metadata_fails_closed_for_replay_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("event_journal.gap.json"), b"{broken").unwrap();
+        let bus = EventBus::new(8).with_persist_dir(dir.path());
+        assert!(bus.read_after(0, 8).cursor_expired);
+        bus.publish(SessionUpdate::TurnComplete {
+            session_id: Uuid::new_v4(),
+            cancelled: false,
+        });
+        drop(bus);
+        assert!(!dir.path().join("event_journal.jsonl").is_file());
+    }
+
+    #[test]
+    fn stopped_writer_persists_gap_on_exceptional_publish_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new(8).with_persist_dir(dir.path());
+        let persistence = bus.inner.lock().persistence.clone().expect("writer handle");
+        persistence.tx.lock().take();
+        if let Some(join) = persistence.join.lock().take() {
+            join.join().unwrap();
+        }
+        bus.publish(SessionUpdate::TurnComplete {
+            session_id: Uuid::new_v4(),
+            cancelled: false,
+        });
+        drop(bus);
+
+        let gap: (u64, u64) = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("event_journal.gap.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(gap.0, gap.1);
+    }
+
+    #[test]
+    fn durable_gap_marker_stops_replay_at_missing_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new(8).with_persist_dir(dir.path());
+        record_journal_gap(&bus.journal_gap, 7);
+        drop(bus);
+
+        let reopened = EventBus::new(8).with_persist_dir(dir.path());
+        assert!(reopened.read_after(6, 8).cursor_expired);
     }
 
     #[test]
@@ -672,5 +1430,42 @@ mod tests {
         let page = bus2.read_after(0, 10);
         let text = serde_json::to_string(&page.entries).unwrap();
         assert!(!text.contains(&secret));
+    }
+
+    #[test]
+    fn persistence_setup_failure_is_observable() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bus = EventBus::new(8).with_persist_dir(&blocker);
+        assert!(bus.last_persistence_error().is_some());
+    }
+
+    #[test]
+    fn oversized_journal_line_is_discarded_without_hiding_later_entries() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("event_journal.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&vec![b'x'; MAX_JOURNAL_LINE_BYTES + 1])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        let sid = Uuid::new_v4();
+        let valid = JournalEntry {
+            seq: 42,
+            ts: chrono::Utc::now().to_rfc3339(),
+            update: SessionUpdate::TurnComplete {
+                session_id: sid,
+                cancelled: false,
+            },
+        };
+        writeln!(file, "{}", serde_json::to_string(&valid).unwrap()).unwrap();
+        drop(file);
+
+        let bus = EventBus::new(8).with_persist_dir(dir.path());
+        let page = bus.read_after(0, 8);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].seq, 42);
     }
 }

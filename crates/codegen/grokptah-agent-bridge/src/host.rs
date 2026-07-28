@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -122,6 +122,13 @@ pub(crate) struct Inner {
     /// Per-session turn cancellation so multiple sessions can run concurrently
     /// (Claude Code–style parallel build sessions).
     turn_cancels: HashMap<Uuid, CancellationToken>,
+    /// Short-lived orchestration admission reservations. These close the gap
+    /// between accepting a run and polling its async prompt future.
+    turn_reservations: HashMap<Uuid, String>,
+    /// Host-global orchestration admissions shared by every control service.
+    orchestration_admissions: HashMap<String, Uuid>,
+    /// One authoritative ceiling shared by every control service on this host.
+    orchestration_admission_limit: usize,
     /// Authoritative follow-up queue plus non-cancelling steering inbox.
     prompt_queues: HashMap<Uuid, SessionPromptQueue>,
     /// Per-turn model-step budget override (orchestration `RunBounds.max_rounds`).
@@ -165,7 +172,7 @@ impl Drop for TurnBusyGuard {
             g.prompt_queues
                 .entry(self.session_id)
                 .or_default()
-                .defer_pending_steering();
+                .recover_pending_steering();
         }
         let _ = self.host.persist_prompt_queue(self.session_id);
     }
@@ -175,8 +182,7 @@ async fn kill_shells(live_shells: local_tools::LiveShellMap, kill_ids: Vec<Uuid>
     let mut map = live_shells.lock().await;
     for id in kill_ids {
         if let Some(mut child) = map.remove(&id) {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            crate::process_tree::terminate(&mut child).await;
         }
     }
 }
@@ -185,7 +191,7 @@ async fn kill_shells(live_shells: local_tools::LiveShellMap, kill_ids: Vec<Uuid>
 #[derive(Clone)]
 pub struct AgentHostHandle {
     pub(crate) inner: Arc<Mutex<Inner>>,
-    event_rx_factory: Arc<Mutex<Option<mpsc::UnboundedReceiver<SessionUpdate>>>>,
+    event_rx_factory: Arc<Mutex<Option<crate::event_bus::EventReceiver>>>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
 }
@@ -281,6 +287,9 @@ impl AgentHost {
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
+            turn_reservations: HashMap::new(),
+            orchestration_admissions: HashMap::new(),
+            orchestration_admission_limit: usize::MAX,
             prompt_queues,
             turn_max_rounds: HashMap::new(),
             event_tx,
@@ -298,7 +307,7 @@ impl AgentHost {
 }
 
 impl AgentHostHandle {
-    pub fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<SessionUpdate>> {
+    pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {
         self.event_rx_factory.lock().take()
     }
 
@@ -308,7 +317,7 @@ impl AgentHostHandle {
     }
 
     /// Additional live subscriber (does not steal the primary GUI receiver).
-    pub fn subscribe_events(&self) -> mpsc::UnboundedReceiver<SessionUpdate> {
+    pub fn subscribe_events(&self) -> crate::event_bus::EventReceiver {
         self.inner.lock().event_tx.subscribe()
     }
 
@@ -605,7 +614,66 @@ impl AgentHostHandle {
 
     /// Whether a session currently has an in-flight turn.
     pub fn session_busy(&self, id: Uuid) -> bool {
-        self.inner.lock().turn_cancels.contains_key(&id)
+        let g = self.inner.lock();
+        g.turn_cancels.contains_key(&id) || g.turn_reservations.contains_key(&id)
+    }
+
+    pub fn reserve_orchestration_turn(&self, run_id: &str, session_id: Uuid) -> Result<()> {
+        let mut g = self.inner.lock();
+        if !g.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        if g.turn_cancels.contains_key(&session_id) || g.turn_reservations.contains_key(&session_id)
+        {
+            bail!("session already has an active turn");
+        }
+        if g.orchestration_admissions.len() >= g.orchestration_admission_limit {
+            bail!("max concurrent runs reached");
+        }
+        g.turn_reservations.insert(session_id, run_id.to_string());
+        g.orchestration_admissions
+            .insert(run_id.to_string(), session_id);
+        Ok(())
+    }
+
+    pub fn release_orchestration_turn(&self, run_id: &str) {
+        let mut g = self.inner.lock();
+        if let Some(session_id) = g.orchestration_admissions.remove(run_id) {
+            if g.turn_reservations.get(&session_id).map(String::as_str) == Some(run_id) {
+                g.turn_reservations.remove(&session_id);
+            }
+        }
+    }
+
+    pub fn orchestration_active_count(&self) -> usize {
+        self.inner.lock().orchestration_admissions.len()
+    }
+
+    pub fn configure_orchestration_capacity(&self, limit: usize) -> usize {
+        let mut g = self.inner.lock();
+        g.orchestration_admission_limit = g.orchestration_admission_limit.min(limit.max(1));
+        g.orchestration_admission_limit
+    }
+
+    pub fn orchestration_capacity_limit(&self) -> usize {
+        self.inner.lock().orchestration_admission_limit
+    }
+
+    pub async fn wait_turn_idle(&self, session_id: Uuid) {
+        while self.session_busy(session_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Release an unconsumed reservation owned by `owner`.
+    pub fn release_turn_reservation(&self, session_id: Uuid, owner: &str) -> bool {
+        let mut g = self.inner.lock();
+        if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) {
+            g.turn_reservations.remove(&session_id);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
@@ -2354,11 +2422,18 @@ impl AgentHostHandle {
             if !g.sessions.contains_key(&session_id) {
                 bail!("unknown session");
             }
-            let queue = g.prompt_queues.entry(session_id).or_default();
-            queue.add_with_owner(text, source, priority, owner)?;
-            queue.list()
+            let mut next = g
+                .prompt_queues
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_default();
+            next.add_with_owner(text, source, priority, owner)?;
+            session_store::save_prompt_queue(session_id, &next)
+                .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
+            let list = next.list();
+            g.prompt_queues.insert(session_id, next);
+            list
         };
-        self.persist_prompt_queue(session_id)?;
         Ok(list)
     }
 
@@ -2500,6 +2575,15 @@ impl AgentHostHandle {
     }
 
     pub fn session_steer(&self, session_id: Uuid, text: String) -> Result<SteeringReceipt> {
+        self.session_steer_with_owner(session_id, text, Some("desktop".into()))
+    }
+
+    pub fn session_steer_with_owner(
+        &self,
+        session_id: Uuid,
+        text: String,
+        owner: Option<String>,
+    ) -> Result<SteeringReceipt> {
         let receipt = {
             let mut g = self.inner.lock();
             let is_build = g
@@ -2508,12 +2592,17 @@ impl AgentHostHandle {
                 .map(|session| session.kind == SessionKind::Build)
                 .ok_or_else(|| anyhow!("unknown session"))?;
             let can_inject = is_build && g.turn_cancels.contains_key(&session_id);
-            g.prompt_queues
-                .entry(session_id)
-                .or_default()
-                .steer_text(text, can_inject)?
+            let mut next = g
+                .prompt_queues
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_default();
+            let receipt = next.steer_text_with_owner(text, can_inject, owner)?;
+            session_store::save_prompt_queue(session_id, &next)
+                .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
+            g.prompt_queues.insert(session_id, next);
+            receipt
         };
-        let _ = self.persist_prompt_queue(session_id);
         Ok(receipt)
     }
 
@@ -2530,7 +2619,7 @@ impl AgentHostHandle {
         } else if let Ok(mut map) = live_shells.try_lock() {
             for id in kill_ids {
                 if let Some(mut child) = map.remove(&id) {
-                    let _ = child.start_kill();
+                    crate::process_tree::terminate_now(&mut child);
                 }
             }
         }
@@ -2618,6 +2707,29 @@ impl AgentHostHandle {
         prompt: String,
         max_rounds: Option<u32>,
     ) -> Result<String> {
+        self.session_prompt_inner(session_id, prompt, max_rounds, None)
+            .await
+    }
+
+    /// Start a turn using a reservation previously created by `reserve_turn`.
+    pub async fn session_prompt_reserved_with_max_rounds(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+        owner: &str,
+    ) -> Result<String> {
+        self.session_prompt_inner(session_id, prompt, max_rounds, Some(owner))
+            .await
+    }
+
+    async fn session_prompt_inner(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+        reservation_owner: Option<&str>,
+    ) -> Result<String> {
         self.ensure_transcript_loaded(session_id)?;
         let (cwd, model, effort, plan_mode, kind, cancel, event_tx) = {
             let mut g = self.inner.lock();
@@ -2627,6 +2739,18 @@ impl AgentHostHandle {
             // One in-flight turn per session (re-prompt while busy is an error).
             if g.turn_cancels.contains_key(&session_id) {
                 bail!("session already has an active turn");
+            }
+            match reservation_owner {
+                Some(owner)
+                    if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) =>
+                {
+                    g.turn_reservations.remove(&session_id);
+                }
+                Some(_) => bail!("missing or mismatched turn reservation"),
+                None if g.turn_reservations.contains_key(&session_id) => {
+                    bail!("session already has an active turn");
+                }
+                None => {}
             }
             // Keep session model in sync with host selection
             let model = g.model.clone();
@@ -2685,28 +2809,12 @@ impl AgentHostHandle {
             )
             .await;
 
-        // Normal path: disarmed so Drop is a no-op after we clean up below.
-        // Atomically close the active-turn window and defer any steering note
-        // that arrived after the final safe drain. A concurrent steer sees
-        // either "active" (and is moved here) or "idle" (and queues itself).
-        {
-            let mut g = self.inner.lock();
-            g.turn_cancels.remove(&session_id);
-            g.turn_max_rounds.remove(&session_id);
-            g.prompt_queues
-                .entry(session_id)
-                .or_default()
-                .defer_pending_steering();
-        }
-        let _ = self.persist_prompt_queue(session_id);
-        busy_guard.armed = false;
-
         // Append assistant turn(s) written by push_assistant.
         self.persist_session(session_id);
         self.persist_chrome();
 
         let cancelled = cancel.is_cancelled();
-        match result {
+        let final_result = match result {
             Ok(reply) => {
                 let _ = event_tx.send(SessionUpdate::TurnComplete {
                     session_id,
@@ -2725,7 +2833,22 @@ impl AgentHostHandle {
                 });
                 Err(e)
             }
+        };
+
+        // Keep the turn busy through the terminal event. A waiter observing an
+        // idle session therefore knows model work and terminal fan-out ended.
+        {
+            let mut g = self.inner.lock();
+            g.turn_cancels.remove(&session_id);
+            g.turn_max_rounds.remove(&session_id);
+            g.prompt_queues
+                .entry(session_id)
+                .or_default()
+                .defer_pending_steering();
         }
+        let _ = self.persist_prompt_queue(session_id);
+        busy_guard.armed = false;
+        final_result
     }
 
     fn persist_prompt_queue(&self, session_id: Uuid) -> Result<()> {
@@ -3164,6 +3287,12 @@ impl AgentHostHandle {
         {
             Ok(reply) => Ok(reply),
             Err(e) => {
+                if let Err(persist_error) = self.recover_pending_steering_delivery(session_id) {
+                    let _ = event_tx.send(SessionUpdate::Error {
+                        session_id,
+                        message: persist_error.to_string(),
+                    });
+                }
                 let es = e.to_string();
                 surface_rate_limit_or_error(&event_tx, session_id, &es);
                 let msg = format!(
@@ -3180,29 +3309,62 @@ impl AgentHostHandle {
         }
     }
 
+    fn recover_pending_steering_delivery(&self, session_id: Uuid) -> Result<()> {
+        let mut g = self.inner.lock();
+        let mut next = g
+            .prompt_queues
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        next.recover_pending_steering();
+        session_store::save_prompt_queue(session_id, &next)
+            .map_err(|error| anyhow!("persist steering recovery: {error}"))?;
+        g.prompt_queues.insert(session_id, next);
+        Ok(())
+    }
+
     fn drain_pending_steering(
         &self,
         session_id: Uuid,
         event_tx: &crate::event_bus::EventBus,
     ) -> Vec<PromptQueueEntry> {
-        let entries = {
+        let entries = match (|| -> Result<Vec<PromptQueueEntry>> {
             let mut g = self.inner.lock();
-            let entries = g
+            let mut next = g
                 .prompt_queues
-                .entry(session_id)
-                .or_default()
-                .drain_steering();
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_default();
+            let entries = next.drain_steering();
+            if entries.is_empty() {
+                return Ok(entries);
+            }
+            // Persist the in-flight delivery state before exposing the note to
+            // the model. The next completed boundary acknowledges it.
+            session_store::save_prompt_queue(session_id, &next)
+                .map_err(|e| anyhow!("persist consumed steering: {e}"))?;
+            g.prompt_queues.insert(session_id, next);
             if let Some(session) = g.sessions.get_mut(&session_id) {
                 for entry in &entries {
                     session.transcript.push(TranscriptEntry::system(format!(
-                        "Steering while running: {}",
-                        entry.text
+                        "Steering while running [{}]: {}",
+                        entry.id, entry.text
                     )));
                     session.updated_at = Utc::now();
                 }
             }
-            entries
+            Ok(entries)
+        })() {
+            Ok(entries) => entries,
+            Err(error) => {
+                let _ = event_tx.send(SessionUpdate::Error {
+                    session_id,
+                    message: error.to_string(),
+                });
+                return Vec::new();
+            }
         };
+        self.persist_session(session_id);
         for entry in &entries {
             let _ = event_tx.send(SessionUpdate::SteeringInjected {
                 session_id,

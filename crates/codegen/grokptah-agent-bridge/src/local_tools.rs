@@ -285,6 +285,7 @@ where
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     crate::spawn_env::scrub_tokio_command(&mut cmd);
+    crate::process_tree::configure(&mut cmd);
     let mut child = cmd.spawn().context("spawn shell")?;
 
     let stdout = child.stdout.take().context("stdout")?;
@@ -294,8 +295,7 @@ where
         let mut map = live_shells.lock().await;
         // Replace only this session's previous child (if any).
         if let Some(mut old) = map.remove(&session_id) {
-            let _ = old.kill().await;
-            let _ = old.wait().await;
+            crate::process_tree::terminate(&mut old).await;
         }
         map.insert(session_id, child);
     }
@@ -344,8 +344,7 @@ where
                 cancelled = true;
                 let mut map = live_shells.lock().await;
                 if let Some(mut child) = map.remove(&session_id) {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    crate::process_tree::terminate(&mut child).await;
                 }
                 break;
             }
@@ -393,9 +392,8 @@ where
         let mut map = live_shells.lock().await;
         if let Some(mut child) = map.remove(&session_id) {
             if cancelled {
-                let _ = child.kill().await;
-            }
-            if let Ok(status) = child.wait().await {
+                crate::process_tree::terminate(&mut child).await;
+            } else if let Ok(status) = child.wait().await {
                 exit_code = status.code();
             }
         }

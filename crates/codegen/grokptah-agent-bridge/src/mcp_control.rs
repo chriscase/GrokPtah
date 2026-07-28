@@ -7,8 +7,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -51,6 +53,11 @@ pub async fn start_control_server(
         .route("/", post(rpc_handler))
         .route("/mcp", post(rpc_handler))
         .fallback(fail_closed_fallback)
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_request,
+        ))
         .with_state(state);
 
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
@@ -74,6 +81,21 @@ pub async fn start_control_server(
     })
 }
 
+async fn authenticate_request(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let auth_header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    match state.orch.auth_header(auth_header) {
+        Ok(_) => next.run(request).await,
+        Err(error) => json_err(None, StatusCode::UNAUTHORIZED, &error),
+    }
+}
+
 async fn fail_closed_fallback() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
@@ -90,6 +112,82 @@ struct JsonRpcReq {
     method: Option<String>,
     #[serde(default)]
     params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolsCallParams {
+    name: String,
+    #[serde(default = "empty_object")]
+    arguments: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyArgs {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunArgs {
+    run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventsArgs {
+    run_id: String,
+    #[serde(default)]
+    after_seq: u64,
+    #[serde(default = "default_event_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    prompt: String,
+    #[serde(default)]
+    bounds: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    prompt: String,
+    #[serde(default)]
+    priority: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SteerArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+}
+
+fn empty_object() -> Value {
+    json!({})
+}
+
+fn default_event_limit() -> usize {
+    50
 }
 
 #[derive(Debug, Serialize)]
@@ -307,18 +405,25 @@ async fn tools_call(
     auth: &crate::orchestration::AuthContext,
     params: &Value,
 ) -> Result<Value, OrchError> {
-    let name = params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "missing tool name"))?;
+    let call: ToolsCallParams = match parse_value(params) {
+        Ok(call) => call,
+        Err(error) => {
+            orch.audit_transport_result("tools/call", Some(&error));
+            return Err(error);
+        }
+    };
+    let name = call.name.as_str();
     if FORBIDDEN_TOOLS.contains(&name) || !CONTROL_TOOLS.contains(&name) {
-        return Err(OrchError::new(
+        let error = OrchError::new(
             OrchErrorCode::ForbiddenScope,
             format!("tool {name} is not available"),
-        ));
+        );
+        orch.audit_transport_result(name, Some(&error));
+        return Err(error);
     }
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    let body = dispatch_tool(orch, auth, name, &args).await?;
+    let result = dispatch_tool(orch, auth, name, &call.arguments).await;
+    orch.audit_transport_result(name, result.as_ref().err());
+    let body = result?;
     Ok(json!({
         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap_or_default() }],
         "structuredContent": body,
@@ -333,67 +438,95 @@ async fn dispatch_tool(
     args: &Value,
 ) -> Result<Value, OrchError> {
     match name {
-        "ptah_list_sessions" => orch.list_sessions(auth),
-        "ptah_get_capacity" => orch.get_capacity(auth),
+        "ptah_list_sessions" => {
+            let _: EmptyArgs = parse_value(args)?;
+            orch.list_sessions(auth)
+        }
+        "ptah_get_capacity" => {
+            let _: EmptyArgs = parse_value(args)?;
+            orch.get_capacity(auth)
+        }
         "ptah_get_run" => {
-            let run_id = str_arg(args, "run_id")?;
-            orch.get_run(auth, run_id)
+            let args: RunArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            orch.get_run(auth, &args.run_id)
         }
         "ptah_get_progress" => {
-            let run_id = str_arg(args, "run_id")?;
-            orch.get_progress(auth, run_id)
+            let args: RunArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            orch.get_progress(auth, &args.run_id)
         }
         "ptah_get_events" => {
-            let after = args.get("after_seq").and_then(|v| v.as_u64()).unwrap_or(0);
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-            let run_id = args.get("run_id").and_then(|v| v.as_str());
-            orch.get_events(auth, run_id, after, limit)
+            let args: EventsArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            if !(1..=500).contains(&args.limit) {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "limit must be between 1 and 500",
+                ));
+            }
+            orch.get_events(auth, Some(&args.run_id), args.after_seq, args.limit)
         }
         "ptah_get_changes" => {
-            let run_id = str_arg(args, "run_id")?;
-            orch.get_changes(auth, run_id)
+            let args: RunArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            orch.get_changes(auth, &args.run_id)
         }
         "ptah_get_test_results" => {
-            let run_id = str_arg(args, "run_id")?;
-            orch.get_test_results(auth, run_id)
+            let args: RunArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            orch.get_test_results(auth, &args.run_id)
         }
         "ptah_get_handoff" => {
-            let run_id = str_arg(args, "run_id")?;
-            orch.get_handoff(auth, run_id)
+            let args: RunArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            orch.get_handoff(auth, &args.run_id)
         }
         "ptah_submit_task" => {
-            let request_id = str_arg(args, "request_id")?.to_string();
-            let session_id = uuid_arg(args, "session_id")?;
-            let workspace = PathBuf::from(str_arg(args, "workspace")?);
-            let prompt = str_arg(args, "prompt")?.to_string();
-            let bounds = args.get("bounds").cloned();
-            orch.submit_task(auth, &request_id, session_id, &workspace, prompt, bounds)
-                .await
+            let args: SubmitArgs = parse_value(args)?;
+            orch.submit_task(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                args.prompt,
+                args.bounds,
+            )
+            .await
         }
         "ptah_queue_prompt" => {
-            let request_id = str_arg(args, "request_id")?.to_string();
-            let session_id = uuid_arg(args, "session_id")?;
-            let workspace = PathBuf::from(str_arg(args, "workspace")?);
-            let prompt = str_arg(args, "prompt")?.to_string();
-            let priority = args
-                .get("priority")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            orch.queue_prompt(auth, &request_id, session_id, &workspace, prompt, priority)
+            let args: QueueArgs = parse_value(args)?;
+            orch.queue_prompt(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                args.prompt,
+                args.priority,
+            )
+            .await
         }
         "ptah_steer" => {
-            let request_id = str_arg(args, "request_id")?.to_string();
-            let session_id = uuid_arg(args, "session_id")?;
-            let workspace = PathBuf::from(str_arg(args, "workspace")?);
-            let text = str_arg(args, "text")?.to_string();
-            orch.steer(auth, &request_id, session_id, &workspace, text)
+            let args: SteerArgs = parse_value(args)?;
+            orch.steer(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                args.text,
+            )
+            .await
         }
         "ptah_cancel" => {
-            let request_id = str_arg(args, "request_id")?.to_string();
-            let session_id = uuid_arg(args, "session_id")?;
-            let workspace = PathBuf::from(str_arg(args, "workspace")?);
-            let run_id = args.get("run_id").and_then(|v| v.as_str());
-            orch.cancel(auth, &request_id, session_id, &workspace, run_id)
+            let args: CancelArgs = parse_value(args)?;
+            orch.cancel(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                Some(&args.run_id),
+            )
+            .await
         }
         other => Err(OrchError::new(
             OrchErrorCode::Unsupported,
@@ -402,16 +535,24 @@ async fn dispatch_tool(
     }
 }
 
-fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, OrchError> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, format!("missing {key}")))
+fn parse_value<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, OrchError> {
+    serde_json::from_value(value.clone()).map_err(|e| {
+        OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("invalid tool arguments: {e}"),
+        )
+    })
 }
 
-fn uuid_arg(args: &Value, key: &str) -> Result<Uuid, OrchError> {
-    let s = str_arg(args, key)?;
-    Uuid::parse_str(s)
-        .map_err(|_| OrchError::new(OrchErrorCode::InvalidRequest, format!("invalid {key}")))
+fn require_nonempty(value: &str, key: &str) -> Result<(), OrchError> {
+    if value.trim().is_empty() {
+        Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{key} must not be empty"),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Discoverable tool names for schema snapshot tests.
@@ -424,11 +565,13 @@ mod tests {
     use super::*;
     use crate::host::{AgentHost, HostConfig};
     use crate::orchestration::{OrchStore, OrchestrationConfig, RunBounds, WorkspaceAllowlist};
-    use crate::set_grokptah_home_override;
+    use crate::{home_override_serial, set_grokptah_home_override};
     use tempfile::tempdir;
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn e2e_loopback_auth_and_read() {
+        let _guard = home_override_serial();
         let home = tempdir().unwrap();
         set_grokptah_home_override(Some(home.path().join(".grokptah")));
         let ws = tempdir().unwrap();
@@ -462,6 +605,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad.status(), 401);
+        let malformed_unauthenticated = client
+            .post(&base)
+            .header("Content-Type", "application/json")
+            .body("not-json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            malformed_unauthenticated.status(),
+            StatusCode::UNAUTHORIZED,
+            "authentication must run before body extraction"
+        );
 
         // valid token
         let good = client
@@ -478,6 +633,75 @@ mod tests {
         assert!(names.contains(&"ptah_list_sessions"));
         assert!(!names.contains(&"run_terminal_cmd"));
 
+        srv.stop();
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn malformed_tool_arguments_fail_closed_without_mutation() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let ws = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        host.start().unwrap();
+        host.set_project_cwd(ws.path()).unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            OrchStore::open(home.path().join("orch")).unwrap(),
+            OrchestrationConfig {
+                bearer_token: "strict-token".into(),
+                allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        let srv = start_control_server(orch, 0).await.unwrap();
+        let url = format!("http://{}/mcp", srv.addr);
+        let client = reqwest::Client::new();
+        let cases = [
+            json!({
+                "name": "ptah_queue_prompt",
+                "arguments": {
+                    "request_id": "bad-priority",
+                    "session_id": session.id,
+                    "workspace": ws.path(),
+                    "prompt": "do not queue",
+                    "priority": "yes"
+                }
+            }),
+            json!({
+                "name": "ptah_list_sessions",
+                "arguments": {"unexpected": true}
+            }),
+            json!({
+                "name": "ptah_get_events",
+                "arguments": {"run_id": "x", "limit": "many"}
+            }),
+        ];
+        for (id, params) in cases.into_iter().enumerate() {
+            let response = client
+                .post(&url)
+                .header("Authorization", "Bearer strict-token")
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": params
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(host.session_queue_list(session.id).unwrap().is_empty());
         srv.stop();
         set_grokptah_home_override(None);
     }

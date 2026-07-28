@@ -106,7 +106,7 @@ async fn duration_timeout_kills_shell_no_post_write() {
     let marker = ws.path().join("after_timeout_marker.txt");
     // Shell sleeps 5s then writes — duration 150ms must cancel while the turn
     // future is still alive and kill the child before the write.
-    let prompt = format!("run sh -c 'sleep 5; echo leaked > {}'", marker.display());
+    let prompt = format!("run (sleep 5; echo leaked > {}) & wait", marker.display());
     let t0 = std::time::Instant::now();
     let resp = orch
         .submit_task(
@@ -239,7 +239,7 @@ async fn reads_require_run_ownership_no_global_events() {
     let foreign = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        OrchStore::open(home.path().join("orch")).unwrap(),
+        orch.store().clone(),
         OrchestrationConfig {
             bearer_token: "secret-token-adversarial-196".into(),
             allowlist: WorkspaceAllowlist::new([other.path().to_path_buf()]),
@@ -285,6 +285,7 @@ async fn concurrent_idempotent_submit_single_effect() {
                 "follow up once".into(),
                 false,
             )
+            .await
         });
     }
     let results = futures::future::join_all(futs).await;
@@ -305,7 +306,7 @@ async fn concurrent_idempotent_submit_single_effect() {
         "different".into(),
         false,
     );
-    assert!(conflict.is_err());
+    assert!(conflict.await.is_err());
     set_grokptah_home_override(None);
 }
 
@@ -341,13 +342,14 @@ async fn cancel_requires_matching_run_stays_cancelled() {
     let auth = orch
         .auth_header(Some("Bearer secret-token-adversarial-196"))
         .unwrap();
+    let marker = ws.path().join("explicit_cancel_descendant.txt");
     let ra = orch
         .submit_task(
             &auth,
             "c-a",
             a.id,
             ws.path(),
-            "run sleep 8".into(),
+            format!("run (sleep 3; echo leaked > {}) & wait", marker.display()),
             Some(json!({"maxDurationMs": 60000, "maxRounds": 8, "maxPromptBytes": 50000})),
         )
         .await
@@ -355,24 +357,43 @@ async fn cancel_requires_matching_run_stays_cancelled() {
     let run_a = ra["runId"].as_str().unwrap().to_string();
     tokio::time::sleep(Duration::from_millis(80)).await;
     // Missing run_id
-    assert!(orch.cancel(&auth, "cx0", a.id, ws.path(), None).is_err());
+    assert!(orch
+        .cancel(&auth, "cx0", a.id, ws.path(), None)
+        .await
+        .is_err());
     // Unknown
     assert!(orch
         .cancel(&auth, "cx1", a.id, ws.path(), Some("nope"))
+        .await
         .is_err());
     // Mismatched session
     assert!(orch
         .cancel(&auth, "cx2", b.id, ws.path(), Some(&run_a))
+        .await
         .is_err());
     // Success
-    orch.cancel(&auth, "cx3", a.id, ws.path(), Some(&run_a))
+    let cancelled = orch
+        .cancel(&auth, "cx3", a.id, ws.path(), Some(&run_a))
+        .await
         .unwrap();
+    assert_eq!(cancelled["teardownComplete"], true);
+    assert!(!host.session_busy(a.id));
+    let replay = orch
+        .cancel(&auth, "cx3", a.id, ws.path(), Some(&run_a))
+        .await
+        .unwrap();
+    assert_eq!(replay, cancelled);
     let st = wait_terminal(&orch, &auth, &run_a).await;
     assert_eq!(st, grokptah_agent_bridge::RunState::Cancelled);
     // Still cancelled after settle
     tokio::time::sleep(Duration::from_millis(200)).await;
     let again = orch.get_run(&auth, &run_a).unwrap();
     assert_eq!(again["state"], "cancelled");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        !marker.exists(),
+        "explicit cancel allowed a descendant to survive"
+    );
     set_grokptah_home_override(None);
 }
 
@@ -392,10 +413,12 @@ async fn non_build_queue_steer_rejected() {
         .unwrap();
     let e = orch
         .queue_prompt(&auth, "nb1", chat.id, ws.path(), "hi".into(), false)
+        .await
         .unwrap_err();
     assert_eq!(e.code.as_str(), "forbidden_scope");
     let e = orch
         .steer(&auth, "nb2", chat.id, ws.path(), "note".into())
+        .await
         .unwrap_err();
     assert_eq!(e.code.as_str(), "forbidden_scope");
     set_grokptah_home_override(None);
@@ -536,26 +559,40 @@ async fn journal_rollover_preserves_durable_aggregates() {
     let auth = orch
         .auth_header(Some("Bearer secret-token-adversarial-196"))
         .unwrap();
-    // Offline write emits FileEdit → apply_run_aggregate must record it (no seed).
+    // Keep the run active while production bus events are folded durably.
     let resp = orch
         .submit_task(
             &auth,
             "roll-1",
             session.id,
             ws.path(),
-            "write durable_agg.txt: hello-agg".into(),
+            "run sleep 1".into(),
             Some(json!({"maxDurationMs": 30000, "maxRounds": 4, "maxPromptBytes": 50000})),
         )
         .await
         .unwrap();
     let run_id = resp["runId"].as_str().unwrap().to_string();
+    std::fs::write(ws.path().join("durable_agg.txt"), "hello-agg").unwrap();
+    host.event_bus().publish(SessionUpdate::FileEdit {
+        session_id: session.id,
+        path: "durable_agg.txt".into(),
+        summary: "durable aggregate".into(),
+        unified_diff: "+hello-agg".into(),
+    });
+    host.event_bus().publish(SessionUpdate::AgentProgress {
+        session_id: session.id,
+        round: 2,
+        max_rounds: 4,
+        last_tool: Some("write_file".into()),
+        detail: "durably recorded".into(),
+    });
     let state = wait_terminal(&orch, &auth, &run_id).await;
     assert_eq!(state, grokptah_agent_bridge::RunState::Completed);
     assert!(
         ws.path().join("durable_agg.txt").is_file(),
         "write must succeed so FileEdit is emitted"
     );
-    // Poll briefly for aggregator task to flush (no artificial seed).
+    // Poll briefly for the production aggregator task to flush.
     let mut aggs_ok = false;
     for _ in 0..40 {
         let run = orch.store().load_run(&run_id).unwrap().unwrap();
@@ -571,6 +608,11 @@ async fn journal_rollover_preserves_durable_aggregates() {
     );
     let before = orch.get_changes(&auth, &run_id).unwrap();
     assert!(!before["changes"].as_array().unwrap().is_empty());
+    let progress_before = orch.get_progress(&auth, &run_id).unwrap();
+    assert!(
+        progress_before["progress"].is_object(),
+        "structured progress must be persisted with the run"
+    );
     // Flood past journal capacity so early seqs expire.
     let bus = host.event_bus();
     let flood_sid = Uuid::new_v4();
@@ -585,6 +627,8 @@ async fn journal_rollover_preserves_durable_aggregates() {
         !after["changes"].as_array().unwrap().is_empty(),
         "journal rollover erased run-scoped changes"
     );
+    let progress_after = orch.get_progress(&auth, &run_id).unwrap();
+    assert_eq!(progress_after["progress"], progress_before["progress"]);
     let handoff = orch.get_handoff(&auth, &run_id).unwrap();
     assert_eq!(handoff["state"], "completed");
     assert!(!handoff["changes"].as_array().unwrap().is_empty());
@@ -652,7 +696,10 @@ async fn control_secret_redacted_on_shared_host_bus() {
     let host = started_host();
     let ws = tempdir().unwrap();
     let token = "secret-token-adversarial-196";
-    let _orch = orch(&host, &home, &ws, 2);
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch(&host, &home, &ws, 2);
     assert!(host.event_bus().control_secrets_len() >= 1);
     // Publish error containing the token; durable journal path must scrub it.
     let dir = home.path().join(".grokptah/orchestration");
@@ -668,6 +715,68 @@ async fn control_secret_redacted_on_shared_host_bus() {
         !dumped.contains(token),
         "control token must be redacted in journal entries: {dumped}"
     );
+    let auth = orch
+        .auth_header(Some("Bearer secret-token-adversarial-196"))
+        .unwrap();
+    assert!(orch
+        .queue_prompt(&auth, token, session.id, ws.path(), "/yolo".into(), false,)
+        .await
+        .is_err());
+    let audit_path = home.path().join("orch/audit/audit.jsonl");
+    for _ in 0..100 {
+        if audit_path.is_file() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let audit = std::fs::read_to_string(audit_path).unwrap();
+    assert!(!audit.contains(token), "control token leaked into audit");
+    let accepted = orch
+        .submit_task(
+            &auth,
+            "secret-aggregate-run",
+            session.id,
+            ws.path(),
+            format!("run sleep 2 # {token}"),
+            None,
+        )
+        .await
+        .unwrap();
+    host.event_bus().publish(SessionUpdate::AgentProgress {
+        session_id: session.id,
+        round: 1,
+        max_rounds: 8,
+        last_tool: Some(format!("tool-{token}")),
+        detail: format!("progress {token}"),
+    });
+    host.event_bus().publish(SessionUpdate::FileEdit {
+        session_id: session.id,
+        path: "secret.txt".into(),
+        summary: format!("summary {token}"),
+        unified_diff: format!("+{token}"),
+    });
+    host.event_bus()
+        .publish(SessionUpdate::ShellSessionStarted {
+            session_id: session.id,
+            call_id: "secret-test".into(),
+            command: format!("XAI_API_KEY={token} cargo test"),
+        });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let run_id = accepted["runId"].as_str().unwrap();
+    let durable = serde_json::to_string(&orch.store().load_run(run_id).unwrap()).unwrap();
+    assert!(
+        !durable.contains(token),
+        "control token leaked into run data"
+    );
+    orch.cancel(
+        &auth,
+        "secret-aggregate-cancel",
+        session.id,
+        ws.path(),
+        Some(run_id),
+    )
+    .await
+    .unwrap();
     let _ = dir;
     set_grokptah_home_override(None);
 }
@@ -693,7 +802,34 @@ async fn id_traversal_rejected() {
             "x".into(),
             false
         )
+        .await
         .is_err());
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn queue_persistence_failure_does_not_mutate_memory() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    let tmp_path = home
+        .path()
+        .join(".grokptah")
+        .join("sessions")
+        .join(session.id.to_string())
+        .join("prompt_queue.json.tmp");
+    std::fs::create_dir_all(&tmp_path).unwrap();
+    assert!(host
+        .session_queue_add_with_source(
+            session.id,
+            "must roll back".into(),
+            false,
+            "control",
+            Some("mcp".into()),
+        )
+        .is_err());
+    assert!(host.session_queue_list(session.id).unwrap().is_empty());
     set_grokptah_home_override(None);
 }
 

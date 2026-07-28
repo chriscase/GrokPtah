@@ -24,6 +24,7 @@ mod memory;
 mod models_catalog;
 pub mod orchestration;
 mod permission;
+mod process_tree;
 mod project_context;
 mod prompt_combine;
 mod prompt_queue;
@@ -64,7 +65,7 @@ pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
     set_grokptah_home_override, set_project_mcp_trusted,
 };
-pub use event_bus::{EventBus, JournalEntry, JournalPage};
+pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use mcp_control::{discovered_tool_names, start_control_server, ControlServerHandle};

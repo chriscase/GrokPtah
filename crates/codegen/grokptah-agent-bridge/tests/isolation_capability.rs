@@ -46,7 +46,7 @@ impl Drop for IsolatedHome {
     }
 }
 
-async fn wait_subagents_done(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>, n: u32) {
+async fn wait_subagents_done(rx: &mut grokptah_agent_bridge::EventReceiver, n: u32) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut done = 0u32;
     while done < n && tokio::time::Instant::now() < deadline {

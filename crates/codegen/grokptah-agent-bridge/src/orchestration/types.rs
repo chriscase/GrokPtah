@@ -232,6 +232,16 @@ pub struct RunAggregates {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RunProgress {
+    pub round: u32,
+    pub max_rounds: u32,
+    pub last_tool: Option<String>,
+    pub detail: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChangeRecord {
     pub path: String,
     pub summary: String,
@@ -268,6 +278,9 @@ pub struct RunRecord {
     /// Durable per-run aggregates for journal rollover (#196 residual).
     #[serde(default)]
     pub aggregates: RunAggregates,
+    /// Latest attributable progress, independent of journal retention.
+    #[serde(default)]
+    pub progress: Option<RunProgress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,8 +291,11 @@ pub struct IdempotencyReceipt {
     pub run_id: Option<String>,
     pub tool: String,
     pub response: serde_json::Value,
+    /// Durable rejected/failed outcome. Exact retries replay this error.
+    #[serde(default)]
+    pub error: Option<OrchError>,
     pub created_at: DateTime<Utc>,
-    /// pending | complete
+    /// pending | complete | failed
     #[serde(default = "default_receipt_status")]
     pub status: String,
 }
@@ -362,36 +378,23 @@ impl std::error::Error for OrchError {}
 /// Reject shell bang prompts and administrative slash commands at the control boundary.
 pub fn reject_control_prompt(prompt: &str) -> Result<(), OrchError> {
     let t = prompt.trim_start();
+    if t.is_empty() {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "control prompt cannot be empty",
+        ));
+    }
     if t.starts_with('!') {
         return Err(OrchError::new(
             OrchErrorCode::ForbiddenScope,
             "shell-style ! prompts are not allowed via control plane",
         ));
     }
-    let lower = t.to_ascii_lowercase();
-    let admin = [
-        "/mcp",
-        "/plugin",
-        "/settings",
-        "/config",
-        "/sandbox",
-        "/gateway",
-        "/hooks",
-        "/skills",
-        "/login",
-        "/logout",
-        "/clear",
-        "/compact",
-    ];
     if t.starts_with('/') {
-        for a in admin {
-            if lower.starts_with(a) {
-                return Err(OrchError::new(
-                    OrchErrorCode::ForbiddenScope,
-                    format!("administrative command {a} rejected at control boundary"),
-                ));
-            }
-        }
+        return Err(OrchError::new(
+            OrchErrorCode::ForbiddenScope,
+            "slash commands are not allowed via the orchestration control plane",
+        ));
     }
     Ok(())
 }
@@ -403,15 +406,12 @@ pub fn prompt_preview(prompt: &str) -> String {
 }
 
 pub fn hash_payload(v: &serde_json::Value) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
     let s = serde_json::to_string(v).unwrap_or_default();
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:016x}", h.finish())
+    hex_sha256(&Sha256::digest(s.as_bytes()))
 }
 
-/// Collision-resistant, path-safe filename for request/run ids.
+/// Stable collision-resistant, path-safe filename for request/run ids.
 pub fn safe_id_filename(id: &str) -> Result<String, OrchError> {
     if id.is_empty() || id.len() > 256 {
         return Err(OrchError::new(
@@ -425,12 +425,17 @@ pub fn safe_id_filename(id: &str) -> Result<String, OrchError> {
             "id contains path separators",
         ));
     }
-    // Hash always — avoids sanitized-name collisions and traversal.
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    id.hash(&mut h);
-    Ok(format!("{:016x}", h.finish()))
+    use sha2::{Digest, Sha256};
+    Ok(hex_sha256(&Sha256::digest(id.as_bytes())))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Recognized test-runner commands (not mere substring "test").
@@ -505,6 +510,10 @@ mod tests {
     fn rejects_bang_and_admin_slash() {
         assert!(reject_control_prompt("!ls").is_err());
         assert!(reject_control_prompt("/mcp list").is_err());
+        assert!(reject_control_prompt("/yolo").is_err());
+        assert!(reject_control_prompt("/model grok").is_err());
+        assert!(reject_control_prompt("/effort max").is_err());
+        assert!(reject_control_prompt("   ").is_err());
         assert!(reject_control_prompt("fix the tests").is_ok());
     }
 
@@ -556,7 +565,8 @@ mod tests {
         assert!(safe_id_filename("a/b").is_err());
         let a = safe_id_filename("req-1").unwrap();
         let b = safe_id_filename("req_1").unwrap();
-        // different ids → different hashes (almost always; both path-safe)
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
         assert!(!a.contains('/'));
         assert!(!b.contains(".."));
     }
