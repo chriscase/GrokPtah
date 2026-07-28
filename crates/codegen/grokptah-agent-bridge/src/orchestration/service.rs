@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -40,9 +41,91 @@ pub struct OrchestrationService {
     bus: EventBus,
     store: OrchStore,
     config: Mutex<OrchestrationConfig>,
-    active: Arc<Mutex<Vec<String>>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+struct AdmissionGuard {
+    host: AgentHostHandle,
+    run_id: String,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.host.release_orchestration_turn(&self.run_id);
+    }
+}
+
+enum IdempotencyStart {
+    Perform(IdempotencyLease),
+    Replay(serde_json::Value),
+}
+
+struct IdempotencyLease {
+    store: OrchStore,
+    tool: String,
+    request_id: String,
+    payload_hash: String,
+    settled: bool,
+}
+
+impl IdempotencyLease {
+    fn complete(
+        &mut self,
+        run_id: Option<String>,
+        response: serde_json::Value,
+    ) -> Result<(), OrchError> {
+        self.store.complete_idempotency(
+            &self.tool,
+            &self.request_id,
+            &self.payload_hash,
+            run_id,
+            response,
+        )?;
+        self.settled = true;
+        Ok(())
+    }
+
+    fn fail(&mut self, run_id: Option<String>, error: OrchError) -> OrchError {
+        match self.store.fail_idempotency(
+            &self.tool,
+            &self.request_id,
+            &self.payload_hash,
+            run_id,
+            error.clone(),
+        ) {
+            Ok(()) => {
+                self.settled = true;
+                error
+            }
+            Err(store_error) => store_error,
+        }
+    }
+}
+
+impl Drop for IdempotencyLease {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let error = OrchError::new(
+            OrchErrorCode::Internal,
+            "mutation abandoned before its durable outcome completed",
+        );
+        if self
+            .store
+            .fail_idempotency(
+                &self.tool,
+                &self.request_id,
+                &self.payload_hash,
+                None,
+                error,
+            )
+            .is_ok()
+        {
+            self.settled = true;
+        }
+    }
 }
 
 impl OrchestrationService {
@@ -50,19 +133,20 @@ impl OrchestrationService {
         host: AgentHostHandle,
         bus: EventBus,
         store: OrchStore,
-        config: OrchestrationConfig,
+        mut config: OrchestrationConfig,
     ) -> Arc<Self> {
         // Register control bearer (and any future secrets) on the *shared* host bus
         // so durable journal redaction covers the shipped desktop path.
         if !config.bearer_token.is_empty() {
             bus.add_control_secrets([config.bearer_token.clone()]);
         }
+        config.max_concurrent_runs =
+            host.configure_orchestration_capacity(config.max_concurrent_runs);
         Arc::new(Self {
             host,
             bus,
             store,
             config: Mutex::new(config),
-            active: Arc::new(Mutex::new(Vec::new())),
             join_handles: Mutex::new(Vec::new()),
         })
     }
@@ -84,6 +168,22 @@ impl OrchestrationService {
 
     pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) {
         self.config.lock().allowlist = allowlist;
+    }
+
+    pub(crate) fn audit_transport_result(&self, tool: &str, error: Option<&OrchError>) {
+        self.audit(
+            tool,
+            None,
+            None,
+            None,
+            if error.is_some() {
+                "rejected"
+            } else {
+                "accepted"
+            },
+            error.map(|e| e.code.as_str()),
+            "mcp transport call",
+        );
     }
 
     pub fn auth_header(&self, header: Option<&str>) -> Result<AuthContext, OrchError> {
@@ -116,15 +216,17 @@ impl OrchestrationService {
     ) {
         let entry = AuditEntry {
             ts: Utc::now(),
-            tool: tool.into(),
-            request_id: request_id.map(str::to_string),
+            tool: self.bus.redact_text(tool, 100),
+            request_id: request_id.map(|value| self.bus.redact_text(value, 256)),
             session_id,
-            workspace: workspace.map(str::to_string),
-            outcome: outcome.into(),
-            error_code: error_code.map(str::to_string),
-            detail: crate::textutil::truncate_at_char_boundary(detail, 500).to_string(),
+            workspace: workspace.map(|value| self.bus.redact_text(value, 1_000)),
+            outcome: self.bus.redact_text(outcome, 100),
+            error_code: error_code.map(|value| self.bus.redact_text(value, 100)),
+            detail: self.bus.redact_text(detail, 500),
         };
-        let _ = self.store.append_audit(&entry);
+        if let Err(e) = self.store.enqueue_audit(entry) {
+            eprintln!("[grokptah] orchestration audit persistence failed: {e}");
+        }
     }
 
     fn audit_err(
@@ -146,21 +248,114 @@ impl OrchestrationService {
         );
     }
 
-    fn try_reserve_capacity(&self, run_id: &str) -> Result<(), OrchError> {
-        let max = self.config.lock().max_concurrent_runs;
-        let mut active = self.active.lock();
-        if active.len() >= max {
-            return Err(OrchError::new(
-                OrchErrorCode::CapacityExhausted,
-                "max concurrent runs reached",
-            ));
-        }
-        active.push(run_id.to_string());
-        Ok(())
+    fn try_reserve_capacity(&self, run_id: &str, session_id: Uuid) -> Result<(), OrchError> {
+        self.host
+            .reserve_orchestration_turn(run_id, session_id)
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("max concurrent") {
+                    OrchError::new(OrchErrorCode::CapacityExhausted, message)
+                } else {
+                    OrchError::new(OrchErrorCode::SessionBusy, message)
+                }
+            })
     }
 
     fn release_capacity(&self, run_id: &str) {
-        self.active.lock().retain(|id| id != run_id);
+        self.host.release_orchestration_turn(run_id);
+    }
+
+    async fn begin_idempotency(
+        &self,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<IdempotencyStart, OrchError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.store.claim_idempotency(tool, request_id, payload_hash) {
+                Ok(IdempotencyClaim::Perform) => {
+                    return Ok(IdempotencyStart::Perform(IdempotencyLease {
+                        store: self.store.clone(),
+                        tool: tool.into(),
+                        request_id: request_id.into(),
+                        payload_hash: payload_hash.into(),
+                        settled: false,
+                    }));
+                }
+                Ok(IdempotencyClaim::Replay(Ok(value))) => {
+                    self.audit(
+                        tool,
+                        Some(request_id),
+                        Some(session_id),
+                        Some(&workspace.display().to_string()),
+                        "replayed",
+                        None,
+                        "replayed successful mutation outcome",
+                    );
+                    return Ok(IdempotencyStart::Replay(value));
+                }
+                Ok(IdempotencyClaim::Replay(Err(error))) => {
+                    self.audit(
+                        tool,
+                        Some(request_id),
+                        Some(session_id),
+                        Some(&workspace.display().to_string()),
+                        "replayed",
+                        Some(error.code.as_str()),
+                        "replayed rejected mutation outcome",
+                    );
+                    return Err(error);
+                }
+                Ok(IdempotencyClaim::Pending) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        let error = OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "matching request_id is still in progress",
+                        );
+                        self.audit_err(
+                            tool,
+                            Some(request_id),
+                            Some(session_id),
+                            Some(&workspace.display().to_string()),
+                            &error,
+                        );
+                        return Err(error);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => {
+                    self.audit_err(
+                        tool,
+                        Some(request_id),
+                        Some(session_id),
+                        Some(&workspace.display().to_string()),
+                        &error,
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn fail_claim(
+        &self,
+        lease: &mut IdempotencyLease,
+        run_id: Option<String>,
+        session_id: Uuid,
+        workspace: &Path,
+        error: OrchError,
+    ) -> OrchError {
+        self.audit_err(
+            &lease.tool,
+            Some(&lease.request_id),
+            Some(session_id),
+            Some(&workspace.display().to_string()),
+            &error,
+        );
+        lease.fail(run_id, error)
     }
 
     fn reaping_handles(&self) {
@@ -233,12 +428,30 @@ impl OrchestrationService {
     }
 
     pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
-        let max = self.config.lock().max_concurrent_runs;
-        let active = self.active.lock().len();
+        let max = self.host.orchestration_capacity_limit();
+        let active = self.host.orchestration_active_count();
+        let event_error = self
+            .bus
+            .last_persistence_error()
+            .map(|error| self.bus.redact_text(&error, 500));
+        let audit_error = self
+            .store
+            .last_audit_error()
+            .map(|error| self.bus.redact_text(&error, 500));
+        let run_error = self
+            .store
+            .last_run_error()
+            .map(|error| self.bus.redact_text(&error, 500));
         Ok(json!({
             "maxConcurrentRuns": max,
             "activeRuns": active,
             "available": max.saturating_sub(active),
+            "health": {
+                "laggedLiveEvents": self.bus.lagged_event_count(),
+                "eventJournalPersistenceError": event_error,
+                "auditPersistenceError": audit_error,
+                "runPersistenceError": run_error,
+            },
         }))
     }
 
@@ -267,6 +480,11 @@ impl OrchestrationService {
             "startSeq": run.start_seq,
             "endSeq": run.end_seq,
             "promptPreview": run.prompt_preview,
+            "progress": run.progress,
+            "createdAt": run.created_at,
+            "updatedAt": run.updated_at,
+            "terminalResult": run.terminal_result,
+            "errorCode": run.error_code,
         }))
     }
 
@@ -474,15 +692,6 @@ impl OrchestrationService {
         });
         let phash = hash_payload(&payload);
 
-        match self.store.claim_idempotency(tool, request_id, &phash) {
-            Ok(IdempotencyClaim::Replay(prev)) => return Ok(prev),
-            Ok(IdempotencyClaim::Perform) => {}
-            Err(e) => {
-                self.audit_err(tool, Some(request_id), Some(session_id), None, &e);
-                return Err(e);
-            }
-        }
-
         let finish_err = |svc: &Self, e: OrchError| -> OrchError {
             svc.audit_err(
                 tool,
@@ -528,20 +737,27 @@ impl OrchestrationService {
             Err(e) => return Err(finish_err(self, e)),
         };
 
+        let mut lease = match self
+            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .await?
+        {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+
         if self.host.session_busy(session_id) {
             let e = OrchError::new(
                 OrchErrorCode::SessionBusy,
                 "session already has an active turn",
             );
-            return Err(finish_err(self, e));
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
         }
 
         let run_id = Uuid::new_v4().to_string();
-        if let Err(e) = self.try_reserve_capacity(&run_id) {
-            return Err(finish_err(self, e));
+        if let Err(e) = self.try_reserve_capacity(&run_id, session_id) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
         }
-
-        let start_seq = self.bus.current_seq().saturating_add(1);
+        let start_seq = self.bus.next_seq();
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -550,7 +766,7 @@ impl OrchestrationService {
             client_id: None,
             state: RunState::Running,
             bounds: bounds.clone(),
-            prompt_preview: prompt_preview(&prompt),
+            prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),
             start_seq: Some(start_seq),
             end_seq: None,
             created_at: Utc::now(),
@@ -559,21 +775,51 @@ impl OrchestrationService {
             final_response: None,
             error_code: None,
             aggregates: RunAggregates::default(),
+            progress: None,
         };
         if let Err(e) = self.store.save_run(&run) {
+            self.host.release_turn_reservation(session_id, &run_id);
             self.release_capacity(&run_id);
             let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
-            return Err(finish_err(self, e));
+            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
         }
+
+        let response = json!({
+            "runId": run_id,
+            "sessionId": session_id,
+            "state": RunState::Running,
+            "requestId": request_id,
+        });
+        if let Err(e) = lease.complete(Some(run_id.clone()), response.clone()) {
+            let _ = self.store.update_run(&run_id, |r| {
+                r.state = RunState::Failed;
+                r.terminal_result = Some("failed".into());
+                r.error_code = Some("receipt_persistence_failed".into());
+                r.updated_at = Utc::now();
+                Ok(())
+            });
+            self.host.release_turn_reservation(session_id, &run_id);
+            self.release_capacity(&run_id);
+            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
+        }
+        self.audit(
+            tool,
+            Some(request_id),
+            Some(session_id),
+            Some(&claimed.display().to_string()),
+            "accepted",
+            None,
+            "run started",
+        );
 
         let host = self.host.clone();
         let store = self.store.clone();
         let bus = self.bus.clone();
-        let active_slot = self.active.clone();
         let rid = run_id.clone();
         let prompt_owned = prompt.clone();
         let max_ms = bounds.max_duration_ms;
         let max_rounds = bounds.max_rounds;
+        let run_template = run.clone();
 
         // Dedicated aggregator task: must not share a biased select with the
         // duration deadline (chatty ShellOutput must not starve max_duration_ms).
@@ -587,33 +833,42 @@ impl OrchestrationService {
         });
 
         let join = tokio::spawn(async move {
-            let prompt_fut = host.session_prompt_with_max_rounds(
+            let _admission_guard = AdmissionGuard {
+                host: host.clone(),
+                run_id: rid.clone(),
+            };
+            let prompt_fut = host.session_prompt_reserved_with_max_rounds(
                 session_id,
                 prompt_owned,
                 Some(max_rounds.max(1)),
+                &rid,
             );
             tokio::pin!(prompt_fut);
             let deadline = tokio::time::sleep(std::time::Duration::from_millis(max_ms.max(1)));
             tokio::pin!(deadline);
 
-            // Drive the turn until completion or duration limit. On timeout we
-            // cancel while the future is still alive (turn_cancels still present),
-            // await shell teardown, then await the future — never drop it first.
-            // Deadline is polled first (biased) so event flood cannot starve it.
-            let mut timed_out = false;
-            let result: Result<String, anyhow::Error> = loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut deadline, if !timed_out => {
-                        timed_out = true;
-                        // Future still pinned — cancel_turn finds active turn.
-                        let _ = host.cancel_turn_and_await(Some(session_id)).await;
-                        // Fall through: keep selecting until prompt_fut completes.
-                    }
-                    r = &mut prompt_fut => {
-                        break r;
-                    }
+            // Cancellation and teardown are bounded. A backend that ignores its
+            // token cannot hold admission capacity forever.
+            let (timed_out, result): (bool, Result<String, anyhow::Error>) = tokio::select! {
+                biased;
+                _ = &mut deadline => {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        host.cancel_turn_and_await(Some(session_id)),
+                    ).await;
+                    let settled = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        &mut prompt_fut,
+                    ).await;
+                    let result = match settled {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "turn did not stop within the teardown deadline"
+                        )),
+                    };
+                    (true, result)
                 }
+                r = &mut prompt_fut => (false, r),
             };
 
             // Stop aggregator; then reconcile aggregates from the journal range
@@ -622,97 +877,83 @@ impl OrchestrationService {
             let _ = agg_task.await;
 
             let end_seq = bus.current_seq();
-            if let Ok(Some(mut r)) = store.load_run(&rid) {
-                if matches!(r.state, RunState::Cancelled | RunState::Interrupted) {
-                    r.end_seq = r.end_seq.or(Some(end_seq));
-                    r.updated_at = Utc::now();
-                    let _ = store.save_run(&r);
-                    active_slot.lock().retain(|id| id != &rid);
-                    return;
-                }
-                r.end_seq = Some(end_seq);
-                r.updated_at = Utc::now();
-                // Final journal pass (does not replace incremental path; fills gaps).
-                reconcile_aggregates_from_bus(&bus, &mut r);
+            let reconciliation = collect_run_updates(&bus, &store, &rid, end_seq);
+            let durable_result = match &result {
+                Ok(text) => Ok(bus.redact_text(text, 8_000)),
+                Err(error) => Err(bus.redact_text(&error.to_string(), 2_000)),
+            };
+            let round_limited = result
+                .as_ref()
+                .is_ok_and(|text| crate::host_helpers::is_round_limit_stop_message(text));
+            let mut candidate = store.load_run(&rid).ok().flatten().unwrap_or(run_template);
+            for update in &reconciliation {
+                fold_run_update(&mut candidate, update);
+            }
+            candidate.end_seq = candidate.end_seq.or(Some(end_seq));
+            candidate.updated_at = Utc::now();
+            if !candidate.state.is_terminal() {
                 if timed_out {
-                    r.state = RunState::LimitReached;
-                    r.terminal_result = Some("limit_reached".into());
-                    r.error_code = Some("limit_reached".into());
-                    if let Ok(text) = &result {
-                        r.final_response = Some(
-                            crate::textutil::truncate_at_char_boundary(text, 8_000).to_string(),
-                        );
+                    candidate.state = RunState::LimitReached;
+                    candidate.terminal_result = Some("limit_reached".into());
+                    candidate.error_code = Some("limit_reached".into());
+                    if let Ok(text) = &durable_result {
+                        candidate.final_response = Some(text.clone());
                     }
                 } else {
-                    match result {
+                    match &durable_result {
                         Ok(text) => {
-                            if crate::host_helpers::is_round_limit_stop_message(&text) {
-                                r.state = RunState::LimitReached;
-                                r.terminal_result = Some("limit_reached".into());
-                                r.error_code = Some("limit_reached".into());
+                            if round_limited {
+                                candidate.state = RunState::LimitReached;
+                                candidate.terminal_result = Some("limit_reached".into());
+                                candidate.error_code = Some("limit_reached".into());
                             } else {
-                                r.state = RunState::Completed;
-                                r.terminal_result = Some("completed".into());
+                                candidate.state = RunState::Completed;
+                                candidate.terminal_result = Some("completed".into());
                             }
-                            r.final_response = Some(
-                                crate::textutil::truncate_at_char_boundary(&text, 8_000)
-                                    .to_string(),
-                            );
+                            candidate.final_response = Some(text.clone());
                         }
-                        Err(e) => {
-                            r.state = RunState::Failed;
-                            r.terminal_result = Some("failed".into());
-                            r.error_code = Some("internal".into());
-                            r.final_response = Some(
-                                crate::textutil::truncate_at_char_boundary(&e.to_string(), 2_000)
-                                    .to_string(),
-                            );
+                        Err(error) => {
+                            candidate.state = RunState::Failed;
+                            candidate.terminal_result = Some("failed".into());
+                            candidate.error_code = Some("internal".into());
+                            candidate.final_response = Some(error.clone());
                         }
                     }
                 }
-                let _ = store.save_run(&r);
             }
-            active_slot.lock().retain(|id| id != &rid);
+            let mut attempt = 0u32;
+            loop {
+                let error = match store.persist_finalization(&candidate) {
+                    Ok(_) => break,
+                    Err(error) => error.to_string(),
+                };
+                if attempt == 0 {
+                    let entry = AuditEntry {
+                        ts: Utc::now(),
+                        tool: "run_finalization".into(),
+                        request_id: None,
+                        session_id: Some(session_id),
+                        workspace: None,
+                        outcome: "retrying".into(),
+                        error_code: Some("run_persistence_failed".into()),
+                        detail: bus.redact_text(&error, 500),
+                    };
+                    let _ = store.enqueue_audit(entry);
+                    eprintln!("[grokptah] run {rid} finalization retrying: {error}");
+                }
+                attempt = attempt.saturating_add(1);
+                let shift = attempt.min(6);
+                let backoff_ms = 25u64.saturating_mul(1u64 << shift).min(1_000);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
         });
         self.reaping_handles();
         self.join_handles.lock().push(join);
 
-        let response = json!({
-            "runId": run_id,
-            "sessionId": session_id,
-            "state": RunState::Running,
-            "requestId": request_id,
-        });
-        if let Err(e) = self.store.complete_idempotency(
-            tool,
-            request_id,
-            &phash,
-            Some(run_id.clone()),
-            response.clone(),
-        ) {
-            // Action already started — still surface error; retry should replay if claim remains.
-            self.audit_err(
-                tool,
-                Some(request_id),
-                Some(session_id),
-                Some(&claimed.display().to_string()),
-                &e,
-            );
-            return Err(e);
-        }
-        self.audit(
-            tool,
-            Some(request_id),
-            Some(session_id),
-            Some(&claimed.display().to_string()),
-            "accepted",
-            None,
-            "run started",
-        );
         Ok(response)
     }
 
-    pub fn queue_prompt(
+    pub async fn queue_prompt(
         &self,
         auth: &AuthContext,
         request_id: &str,
@@ -730,14 +971,6 @@ impl OrchestrationService {
             "priority": priority,
         });
         let phash = hash_payload(&payload);
-        match self.store.claim_idempotency(tool, request_id, &phash) {
-            Ok(IdempotencyClaim::Replay(prev)) => return Ok(prev),
-            Ok(IdempotencyClaim::Perform) => {}
-            Err(e) => {
-                self.audit_err(tool, Some(request_id), Some(session_id), None, &e);
-                return Err(e);
-            }
-        }
         let fail = |svc: &Self, e: OrchError| {
             svc.audit_err(
                 tool,
@@ -765,6 +998,15 @@ impl OrchestrationService {
             Ok(c) => c,
             Err(e) => return Err(fail(self, e)),
         };
+
+        let mut lease = match self
+            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .await?
+        {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+
         let entries = match self.host.session_queue_add_with_source(
             session_id,
             prompt,
@@ -774,8 +1016,11 @@ impl OrchestrationService {
         ) {
             Ok(e) => e,
             Err(e) => {
-                return Err(fail(
-                    self,
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
                     OrchError::new(OrchErrorCode::Internal, e.to_string()),
                 ));
             }
@@ -785,8 +1030,9 @@ impl OrchestrationService {
             "sessionId": session_id,
             "entries": entries,
         });
-        self.store
-            .complete_idempotency(tool, request_id, &phash, None, response.clone())?;
+        if let Err(e) = lease.complete(None, response.clone()) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
+        }
         self.audit(
             tool,
             Some(request_id),
@@ -799,7 +1045,7 @@ impl OrchestrationService {
         Ok(response)
     }
 
-    pub fn steer(
+    pub async fn steer(
         &self,
         auth: &AuthContext,
         request_id: &str,
@@ -815,14 +1061,6 @@ impl OrchestrationService {
             "text": text,
         });
         let phash = hash_payload(&payload);
-        match self.store.claim_idempotency(tool, request_id, &phash) {
-            Ok(IdempotencyClaim::Replay(prev)) => return Ok(prev),
-            Ok(IdempotencyClaim::Perform) => {}
-            Err(e) => {
-                self.audit_err(tool, Some(request_id), Some(session_id), None, &e);
-                return Err(e);
-            }
-        }
         let fail = |svc: &Self, e: OrchError| {
             svc.audit_err(
                 tool,
@@ -850,11 +1088,26 @@ impl OrchestrationService {
             Ok(c) => c,
             Err(e) => return Err(fail(self, e)),
         };
-        let receipt = match self.host.session_steer(session_id, text) {
+
+        let mut lease = match self
+            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .await?
+        {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+
+        let receipt = match self
+            .host
+            .session_steer_with_owner(session_id, text, Some("mcp".into()))
+        {
             Ok(r) => r,
             Err(e) => {
-                return Err(fail(
-                    self,
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
                     OrchError::new(OrchErrorCode::Internal, e.to_string()),
                 ));
             }
@@ -866,8 +1119,9 @@ impl OrchestrationService {
             "entry": receipt.entry,
             "entries": receipt.entries,
         });
-        self.store
-            .complete_idempotency(tool, request_id, &phash, None, response.clone())?;
+        if let Err(e) = lease.complete(None, response.clone()) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
+        }
         self.audit(
             tool,
             Some(request_id),
@@ -880,7 +1134,7 @@ impl OrchestrationService {
         Ok(response)
     }
 
-    pub fn cancel(
+    pub async fn cancel(
         &self,
         auth: &AuthContext,
         request_id: &str,
@@ -896,14 +1150,6 @@ impl OrchestrationService {
             "runId": run_id,
         });
         let phash = hash_payload(&payload);
-        match self.store.claim_idempotency(tool, request_id, &phash) {
-            Ok(IdempotencyClaim::Replay(prev)) => return Ok(prev),
-            Ok(IdempotencyClaim::Perform) => {}
-            Err(e) => {
-                self.audit_err(tool, Some(request_id), Some(session_id), None, &e);
-                return Err(e);
-            }
-        }
         let fail = |svc: &Self, e: OrchError| {
             svc.audit_err(
                 tool,
@@ -928,7 +1174,7 @@ impl OrchestrationService {
             }
         };
 
-        let mut run = match self.store.load_run(rid) {
+        let run = match self.store.load_run(rid) {
             Ok(Some(r)) => r,
             Ok(None) => {
                 return Err(fail(
@@ -953,16 +1199,6 @@ impl OrchestrationService {
                 ),
             ));
         }
-        if run.state.is_terminal() {
-            return Err(fail(
-                self,
-                OrchError::new(
-                    OrchErrorCode::InvalidRequest,
-                    format!("run already terminal ({:?})", run.state),
-                ),
-            ));
-        }
-
         let session = match self.host.session_load(session_id) {
             Ok(s) => s,
             Err(_) => {
@@ -995,36 +1231,77 @@ impl OrchestrationService {
             ));
         }
 
-        // Persist cancelled BEFORE signalling cancel so late workers cannot complete.
-        run.state = RunState::Cancelled;
-        run.updated_at = Utc::now();
-        run.end_seq = Some(self.bus.current_seq());
-        run.terminal_result = Some("cancelled".into());
-        if let Err(e) = self.store.save_run(&run) {
-            return Err(fail(
-                self,
-                OrchError::new(OrchErrorCode::Internal, e.to_string()),
+        let mut lease = match self
+            .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
+            .await?
+        {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if run.state.is_terminal() {
+            let error = OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                format!("run already terminal ({:?})", run.state),
+            );
+            return Err(self.fail_claim(&mut lease, Some(rid.into()), session_id, &claimed, error));
+        }
+
+        // Persist cancelled transactionally before signalling. The closure
+        // rechecks state so a concurrent completion can never be overwritten.
+        let cancel_update = self.store.update_run(rid, |current| {
+            if current.session_id != session_id {
+                return Err(anyhow::anyhow!("run_id does not belong to session"));
+            }
+            if current.state.is_terminal() {
+                return Err(anyhow::anyhow!(
+                    "run already terminal ({:?})",
+                    current.state
+                ));
+            }
+            current.state = RunState::Cancelled;
+            current.updated_at = Utc::now();
+            current.end_seq = None;
+            current.terminal_result = Some("cancelled".into());
+            Ok(())
+        });
+        if !matches!(cancel_update, Ok(Some(_))) {
+            let message = match cancel_update {
+                Ok(None) => "run record disappeared during cancel".into(),
+                Err(error) => error.to_string(),
+                Ok(Some(_)) => unreachable!(),
+            };
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(rid.into()),
+                session_id,
+                &claimed,
+                OrchError::new(OrchErrorCode::Internal, message),
             ));
         }
 
-        let cancelled = self.host.cancel_turn(Some(session_id)).is_ok();
-        // Only release this run's capacity.
-        self.release_capacity(rid);
+        let reservation_released = self.host.release_turn_reservation(session_id, rid);
+        let teardown_complete = if reservation_released {
+            true
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let _ = self.host.cancel_turn_and_await(Some(session_id)).await;
+                self.host.wait_turn_idle(session_id).await;
+            })
+            .await
+            .is_ok()
+        };
 
         let response = json!({
             "requestId": request_id,
             "sessionId": session_id,
             "runId": rid,
-            "cancelled": cancelled,
+            "cancelled": true,
+            "teardownComplete": teardown_complete,
             "state": RunState::Cancelled,
         });
-        self.store.complete_idempotency(
-            tool,
-            request_id,
-            &phash,
-            Some(rid.into()),
-            response.clone(),
-        )?;
+        if let Err(e) = lease.complete(Some(rid.into()), response.clone()) {
+            return Err(self.fail_claim(&mut lease, Some(rid.into()), session_id, &claimed, e));
+        }
         self.audit(
             tool,
             Some(request_id),
@@ -1058,25 +1335,30 @@ fn apply_run_aggregate(
     if session_id_of(update) != Some(session_id) {
         return;
     }
-    let Ok(Some(mut r)) = store.load_run(run_id) else {
+    if !matches!(
+        update,
+        crate::events::SessionUpdate::FileEdit { .. }
+            | crate::events::SessionUpdate::ShellSessionStarted { .. }
+            | crate::events::SessionUpdate::ShellSessionEnded { .. }
+            | crate::events::SessionUpdate::AgentProgress { .. }
+    ) {
         return;
-    };
-    if fold_aggregate_update(&mut r.aggregates, update) {
-        r.updated_at = Utc::now();
-        let _ = store.save_run(&r);
     }
+    let _ = store.update_run(run_id, |r| {
+        if fold_run_update(r, update) {
+            r.updated_at = Utc::now();
+        }
+        Ok(())
+    });
 }
 
-fn fold_aggregate_update(
-    aggregates: &mut RunAggregates,
-    update: &crate::events::SessionUpdate,
-) -> bool {
+fn fold_run_update(run: &mut RunRecord, update: &crate::events::SessionUpdate) -> bool {
     match update {
         crate::events::SessionUpdate::FileEdit { path, summary, .. } => {
-            if aggregates.changes.iter().any(|c| c.path == *path) {
+            if run.aggregates.changes.iter().any(|c| c.path == *path) {
                 return false;
             }
-            aggregates.changes.push(ChangeRecord {
+            run.aggregates.changes.push(ChangeRecord {
                 path: path.clone(),
                 summary: summary.clone(),
             });
@@ -1085,10 +1367,10 @@ fn fold_aggregate_update(
         crate::events::SessionUpdate::ShellSessionStarted {
             command, call_id, ..
         } if is_recognized_test_command(command) => {
-            if aggregates.tests.iter().any(|t| t.call_id == *call_id) {
+            if run.aggregates.tests.iter().any(|t| t.call_id == *call_id) {
                 return false;
             }
-            aggregates.tests.push(TestObservation {
+            run.aggregates.tests.push(TestObservation {
                 call_id: call_id.clone(),
                 command: Some(command.clone()),
                 status: "started".into(),
@@ -1103,7 +1385,12 @@ fn fold_aggregate_update(
             cancelled,
             ..
         } => {
-            if let Some(t) = aggregates.tests.iter_mut().find(|t| t.call_id == *call_id) {
+            if let Some(t) = run
+                .aggregates
+                .tests
+                .iter_mut()
+                .find(|t| t.call_id == *call_id)
+            {
                 t.status = "ended".into();
                 t.exit_code = *exit_code;
                 t.cancelled = Some(*cancelled);
@@ -1112,18 +1399,39 @@ fn fold_aggregate_update(
                 false
             }
         }
+        crate::events::SessionUpdate::AgentProgress {
+            round,
+            max_rounds,
+            last_tool,
+            detail,
+            ..
+        } => {
+            run.progress = Some(RunProgress {
+                round: *round,
+                max_rounds: *max_rounds,
+                last_tool: last_tool.clone(),
+                detail: crate::textutil::truncate_at_char_boundary(detail, 2_000).to_string(),
+                updated_at: Utc::now(),
+            });
+            true
+        }
         _ => false,
     }
 }
 
-fn reconcile_aggregates_from_bus(bus: &EventBus, run: &mut RunRecord) {
-    let after = run.start_seq.map(|s| s.saturating_sub(1)).unwrap_or(0);
-    let Ok(entries) = bus.read_range_all(after, run.end_seq, Some(run.session_id)) else {
-        return;
+fn collect_run_updates(
+    bus: &EventBus,
+    store: &OrchStore,
+    run_id: &str,
+    end_seq: u64,
+) -> Vec<crate::events::SessionUpdate> {
+    let Ok(Some(run)) = store.load_run(run_id) else {
+        return Vec::new();
     };
-    for e in entries {
-        fold_aggregate_update(&mut run.aggregates, &e.update);
-    }
+    let after = run.start_seq.map(|s| s.saturating_sub(1)).unwrap_or(0);
+    bus.read_range_all(after, Some(end_seq), Some(run.session_id))
+        .map(|entries| entries.into_iter().map(|e| e.update).collect())
+        .unwrap_or_default()
 }
 
 fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {

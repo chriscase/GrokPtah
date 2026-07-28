@@ -262,11 +262,13 @@ mod tests {
     use crate::orchestration::{
         OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
     };
-    use crate::set_grokptah_home_override;
+    use crate::{home_override_serial, set_grokptah_home_override};
     use tempfile::tempdir;
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn client_full_mcp_lifecycle_and_schema_gate() {
+        let _guard = home_override_serial();
         let home = tempdir().unwrap();
         set_grokptah_home_override(Some(home.path().join(".grokptah")));
         let ws = tempdir().unwrap();

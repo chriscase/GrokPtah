@@ -152,10 +152,7 @@ pub fn save_prompt_queue(id: Uuid, queue: &crate::prompt_queue::SessionPromptQue
     let _ = fs::create_dir_all(session_dir(id));
     let path = prompt_queue_path(id);
     let snap = queue.durable_snapshot();
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(&snap)?)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    atomic_write_json(&path, &snap)
 }
 
 /// Load durable prompt queue for a session (empty if missing).

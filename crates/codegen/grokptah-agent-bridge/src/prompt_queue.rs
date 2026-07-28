@@ -79,14 +79,33 @@ pub(crate) struct SessionPromptQueue {
     /// Mid-turn only; not meaningful after process restart (drained or deferred).
     #[serde(default)]
     steering: VecDeque<PromptQueueEntry>,
+    /// Steering handed to the current model boundary but not yet acknowledged.
+    #[serde(default)]
+    delivering: VecDeque<PromptQueueEntry>,
 }
 
 impl SessionPromptQueue {
     /// Durable snapshot: queued follow-ups only (steering is process-local).
     pub fn durable_snapshot(&self) -> Self {
+        let mut queued = self.queued.clone();
+        // A crash cannot safely preserve mid-turn injection position. Persist an
+        // equivalent high-priority follow-up so accepted steering is not lost.
+        for mut entry in self.steering.iter().cloned().rev() {
+            entry.source = "steering_deferred".into();
+            entry.priority = true;
+            entry.version += 1;
+            queued.push_front(entry);
+        }
+        for mut entry in self.delivering.iter().cloned().rev() {
+            entry.source = "steering_delivery_recovery".into();
+            entry.priority = true;
+            entry.version += 1;
+            queued.push_front(entry);
+        }
         Self {
-            queued: self.queued.clone(),
+            queued,
             steering: VecDeque::new(),
+            delivering: VecDeque::new(),
         }
     }
 
@@ -199,13 +218,24 @@ impl SessionPromptQueue {
         }
     }
 
+    #[allow(dead_code)]
     pub fn steer_text(&mut self, text: String, can_inject: bool) -> Result<SteeringReceipt> {
+        self.steer_text_with_owner(text, can_inject, Some("desktop".into()))
+    }
+
+    pub fn steer_text_with_owner(
+        &mut self,
+        text: String,
+        can_inject: bool,
+        owner: Option<String>,
+    ) -> Result<SteeringReceipt> {
         let source = if can_inject {
             "steer_now"
         } else {
             "steering_deferred"
         };
-        let entry = PromptQueueEntry::new(text, source, !can_inject)?;
+        let mut entry = PromptQueueEntry::new(text, source, !can_inject)?;
+        entry.owner = owner;
         if can_inject {
             self.steering.push_back(entry.clone());
         } else {
@@ -223,14 +253,30 @@ impl SessionPromptQueue {
     }
 
     pub fn drain_steering(&mut self) -> Vec<PromptQueueEntry> {
-        self.steering.drain(..).collect()
+        self.delivering.clear();
+        self.delivering.extend(self.steering.drain(..));
+        self.delivering.iter().cloned().collect()
     }
 
     pub fn defer_pending_steering(&mut self) -> usize {
+        self.delivering.clear();
         let pending: Vec<_> = self.steering.drain(..).collect();
         let count = pending.len();
         for mut entry in pending.into_iter().rev() {
             entry.source = "steering_deferred".into();
+            entry.priority = true;
+            entry.version += 1;
+            self.queued.push_front(entry);
+        }
+        count
+    }
+
+    pub fn recover_pending_steering(&mut self) -> usize {
+        let mut pending: Vec<_> = self.delivering.drain(..).collect();
+        pending.extend(self.steering.drain(..));
+        let count = pending.len();
+        for mut entry in pending.into_iter().rev() {
+            entry.source = "steering_delivery_recovery".into();
             entry.priority = true;
             entry.version += 1;
             self.queued.push_front(entry);
@@ -364,6 +410,33 @@ mod tests {
         assert_eq!(queue.list().len(), 1);
         assert_eq!(queue.list()[0].source, "steering_deferred");
         assert!(queue.drain_steering().is_empty());
+    }
+
+    #[test]
+    fn in_flight_steering_remains_durably_recoverable_until_acknowledged() {
+        let mut queue = SessionPromptQueue::default();
+        let receipt = queue.steer_text("keep this".into(), true).expect("steer");
+        assert_eq!(queue.drain_steering().len(), 1);
+        let recovery = queue.durable_snapshot().list();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].id, receipt.entry.id);
+        assert_eq!(recovery[0].source, "steering_delivery_recovery");
+
+        assert!(queue.drain_steering().is_empty());
+        assert!(queue.durable_snapshot().list().is_empty());
+    }
+
+    #[test]
+    fn durable_snapshot_defers_pending_steering_with_owner() {
+        let mut queue = SessionPromptQueue::default();
+        queue
+            .steer_text_with_owner("focus".into(), true, Some("mcp".into()))
+            .unwrap();
+        let durable = queue.durable_snapshot();
+        let entry = &durable.list()[0];
+        assert_eq!(entry.source, "steering_deferred");
+        assert_eq!(entry.owner.as_deref(), Some("mcp"));
+        assert!(entry.priority);
     }
 
     #[test]

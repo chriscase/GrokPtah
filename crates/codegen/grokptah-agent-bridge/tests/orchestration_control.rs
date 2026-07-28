@@ -84,8 +84,9 @@ fn schema_snapshot_excludes_forbidden() {
     }
 }
 
-#[test]
-fn idempotency_conflict_and_replay() {
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn idempotency_conflict_and_replay() {
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -116,6 +117,7 @@ fn idempotency_conflict_and_replay() {
             "hello world".into(),
             false,
         )
+        .await
         .unwrap();
     let r2 = orch
         .queue_prompt(
@@ -126,6 +128,7 @@ fn idempotency_conflict_and_replay() {
             "hello world".into(),
             false,
         )
+        .await
         .unwrap();
     assert_eq!(r1, r2);
     let conflict = orch.queue_prompt(
@@ -136,12 +139,13 @@ fn idempotency_conflict_and_replay() {
         "different payload".into(),
         false,
     );
-    assert!(conflict.is_err());
+    assert!(conflict.await.is_err());
     set_grokptah_home_override(None);
 }
 
-#[test]
-fn workspace_mismatch_fail_closed() {
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn workspace_mismatch_fail_closed() {
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -162,13 +166,15 @@ fn workspace_mismatch_fail_closed() {
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let err = orch
         .queue_prompt(&auth, "r", session.id, other.path(), "x".into(), false)
+        .await
         .unwrap_err();
     assert_eq!(err.code.as_str(), "workspace_mismatch");
     set_grokptah_home_override(None);
 }
 
-#[test]
-fn reject_shell_and_admin_prompts() {
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn reject_shell_and_admin_prompts() {
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -188,10 +194,28 @@ fn reject_shell_and_admin_prompts() {
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
     assert!(orch
         .queue_prompt(&auth, "a", session.id, ws.path(), "!rm -rf /".into(), false)
+        .await
         .is_err());
     assert!(orch
         .queue_prompt(&auth, "b", session.id, ws.path(), "/mcp list".into(), false)
+        .await
         .is_err());
+    assert!(orch
+        .queue_prompt(&auth, "c", session.id, ws.path(), "/yolo".into(), false)
+        .await
+        .is_err());
+    // Validation happens before idempotency is claimed: a rejected payload
+    // cannot poison the request ID for a later valid request.
+    orch.queue_prompt(
+        &auth,
+        "c",
+        session.id,
+        ws.path(),
+        "valid follow-up".into(),
+        false,
+    )
+    .await
+    .unwrap();
     set_grokptah_home_override(None);
 }
 
@@ -218,8 +242,10 @@ fn restart_interrupted_no_auto_resume() {
         final_response: None,
         error_code: None,
         aggregates: Default::default(),
+        progress: None,
     };
     store.save_run(&run).unwrap();
+    drop(store);
     let store2 = OrchStore::open(d.path()).unwrap();
     let loaded = store2.load_run("run-x").unwrap().unwrap();
     assert_eq!(loaded.state, RunState::Interrupted);
@@ -530,6 +556,7 @@ async fn cancel_isolates_sessions() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     let run_a = ra["runId"].as_str().unwrap().to_string();
     orch.cancel(&auth, "can-req", a.id, ws.path(), Some(&run_a))
+        .await
         .unwrap();
     let state_a = wait_run_terminal(&orch, &auth, &run_a, Duration::from_secs(10)).await;
     assert!(
@@ -568,6 +595,7 @@ async fn steer_via_orchestration_service() {
             ws.path(),
             "please prefer tests".into(),
         )
+        .await
         .unwrap();
     assert_eq!(idle["disposition"], "queued");
 
@@ -591,6 +619,7 @@ async fn steer_via_orchestration_service() {
             ws.path(),
             "keep going carefully".into(),
         )
+        .await
         .unwrap();
     assert_eq!(pending["disposition"], "pending");
     set_grokptah_home_override(None);
@@ -697,6 +726,201 @@ async fn capacity_race_against_real_submit_task() {
     let cap = orch.get_capacity(&auth).unwrap();
     assert_eq!(cap["activeRuns"].as_u64().unwrap(), 2);
     assert_eq!(cap["maxConcurrentRuns"].as_u64().unwrap(), 2);
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn admitted_run_reserves_session_against_desktop_prompt() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 2);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let accepted = orch
+        .submit_task(
+            &auth,
+            "reserve-1",
+            session.id,
+            ws.path(),
+            "run sleep 3".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(host
+        .session_prompt(session.id, "desktop collision".into())
+        .await
+        .is_err());
+    let run_id = accepted["runId"].as_str().unwrap();
+    orch.cancel(&auth, "reserve-cancel", session.id, ws.path(), Some(run_id))
+        .await
+        .unwrap();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn concurrent_same_session_submits_accept_exactly_one() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let one = orch.submit_task(
+        &auth,
+        "same-session-1",
+        session.id,
+        ws.path(),
+        "run sleep 3".into(),
+        None,
+    );
+    let two = orch.submit_task(
+        &auth,
+        "same-session-2",
+        session.id,
+        ws.path(),
+        "run sleep 3".into(),
+        None,
+    );
+    let (one, two) = tokio::join!(one, two);
+    let results = [one, two];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let rejected = results
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .expect("one submit must be rejected");
+    assert_eq!(rejected.code.as_str(), "session_busy");
+    let accepted = results
+        .iter()
+        .find_map(|result| result.as_ref().ok())
+        .expect("one submit must be accepted");
+    orch.cancel(
+        &auth,
+        "same-session-cancel",
+        session.id,
+        ws.path(),
+        accepted["runId"].as_str(),
+    )
+    .await
+    .unwrap();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn capacity_is_shared_across_control_service_instances() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let first = host.session_new_kind(SessionKind::Build).unwrap();
+    let second = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(first.id, ws.path()).unwrap();
+    host.session_set_cwd(second.id, ws.path()).unwrap();
+    let one = orch_for(&host, &home, &ws, 1);
+    let two = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        one.store().clone(),
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 8,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth_one = one.auth_header(Some("Bearer t")).unwrap();
+    let auth_two = two.auth_header(Some("Bearer t")).unwrap();
+    assert_eq!(two.get_capacity(&auth_two).unwrap()["maxConcurrentRuns"], 1);
+    let accepted = one
+        .submit_task(
+            &auth_one,
+            "global-cap-1",
+            first.id,
+            ws.path(),
+            "run sleep 3".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let error = two
+        .submit_task(
+            &auth_two,
+            "global-cap-2",
+            second.id,
+            ws.path(),
+            "run sleep 3".into(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), "capacity_exhausted");
+    one.cancel(
+        &auth_one,
+        "global-cap-cancel",
+        first.id,
+        ws.path(),
+        accepted["runId"].as_str(),
+    )
+    .await
+    .unwrap();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn agent_progress_is_durable_outside_event_retention() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 2);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let accepted = orch
+        .submit_task(
+            &auth,
+            "progress-1",
+            session.id,
+            ws.path(),
+            "run sleep 2".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    host.event_bus().publish(SessionUpdate::AgentProgress {
+        session_id: session.id,
+        round: 3,
+        max_rounds: 8,
+        last_tool: Some("shell".into()),
+        detail: "verifying".into(),
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let run_id = accepted["runId"].as_str().unwrap();
+    let progress = orch.get_progress(&auth, run_id).unwrap();
+    assert_eq!(progress["progress"]["round"], 3);
+    assert_eq!(progress["progress"]["lastTool"], "shell");
+    orch.cancel(
+        &auth,
+        "progress-cancel",
+        session.id,
+        ws.path(),
+        Some(run_id),
+    )
+    .await
+    .unwrap();
     set_grokptah_home_override(None);
 }
 

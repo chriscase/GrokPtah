@@ -45,7 +45,7 @@ impl Drop for IsolatedHome {
     }
 }
 
-async fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>) {
+async fn drain(rx: &mut grokptah_agent_bridge::EventReceiver) {
     loop {
         match timeout(Duration::from_secs(5), rx.recv()).await {
             Ok(Some(SessionUpdate::TurnComplete { .. })) => break,
