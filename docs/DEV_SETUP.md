@@ -80,3 +80,9 @@ need network credentials; bridge tests and offline local tools do not.
 ## Scratch / evidence
 
 Goal harness captures logs under the implementer scratch directory, not shared `/tmp`.
+
+## Build acceleration
+
+Optional local compiler caching, focused verification commands, diagnostics,
+safe reset steps, and CI/worktree behavior are documented in
+[BUILD_PERFORMANCE.md](BUILD_PERFORMANCE.md).

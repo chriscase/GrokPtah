@@ -2,6 +2,8 @@ name: Desktop
 
 on:
   push:
+    branches:
+      - main
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
@@ -12,46 +14,68 @@ on:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
       - "evals/**"
+      - ".github/workflows/desktop.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Preserve every main run; only superseded PR heads are safe to cancel.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   desktop:
     runs-on: macos-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'READ_ONLY' || 'READ_WRITE' }}
     defaults:
       run:
         working-directory: desktop
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: desktop/package-lock.json
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: "1.92.0"
           components: rustfmt, clippy
+      - name: Configure compiler-cache namespace
+        env:
+          SCCACHE_NAMESPACE: grokptah-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('desktop/src-tauri/Cargo.lock', 'crates/codegen/grokptah-agent-bridge/Cargo.lock') }}
+        run: echo "SCCACHE_GHA_VERSION=${SCCACHE_NAMESPACE}" >> "$GITHUB_ENV"
+      - name: Install compiler cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.16.0"
       - name: Install frontend deps
         run: npm ci
       - name: Typecheck + unit tests
         run: |
           npm run typecheck
           npm test
-      - name: Cargo check + unit tests (desktop)
+      - name: Cargo tests (desktop)
         working-directory: desktop/src-tauri
-        run: |
-          cargo check
-          cargo test
+        # cargo test compiles the library, binary, and test targets.
+        run: cargo test --locked
       - name: Bridge fmt + clippy + tests
         # Bridge is its own Cargo workspace root (path dep of desktop).
         working-directory: crates/codegen/grokptah-agent-bridge
         run: |
           cargo fmt --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test
+          cargo clippy --locked --all-targets -- -D warnings
+          # Store tests use advisory file locks and must not overlap in-process.
+          cargo test --locked -- --test-threads=1
       - name: Offline parity oracles (no network)
         # Structured oracle unit tests + fixture selftests; live suite is on-demand.
         working-directory: crates/codegen/grokptah-agent-bridge
-        run: cargo test eval_oracle -- --nocapture
+        run: cargo test --locked eval_oracle -- --nocapture
       - name: Offline oracle suite shape (repo root)
         working-directory: .
         run: |
