@@ -58,6 +58,20 @@ Hosted before/after timing and GitHub cache size are recorded from the exact
 pull-request head because the local disk backend is not equivalent to
 GitHub's cache service.
 
+The first hosted run on PR #203 was an empty-cache proof. It passed in 5m01s:
+desktop Rust took 2m17s, bridge verification took 1m59s, and `sccache`
+reported 84 hits, 573 misses, and zero errors. This is 12 seconds slower than
+the earlier single PR job, but it replaced the two simultaneous PR and push
+jobs that had consumed about 10.6 runner-minutes for one commit.
+
+A same-commit rerun produced 653 hits, 2 misses, a 99.69% hit rate, and zero
+cache errors. Desktop Rust fell to 1m39s, and bridge compilation and tests
+reached a pre-existing parallel store-lock race in 1m03s versus 1m59s cold.
+CI now uses the repository's documented single-threaded bridge test mode to
+avoid that race without skipping any tests. The resulting GitHub compiler
+cache occupied 412,458,826 bytes across 576 content-addressed entries; the
+existing npm cache occupied 29,930,510 bytes.
+
 ## Optional local compiler cache
 
 Install `sccache` separately, then enable it in a shell:
