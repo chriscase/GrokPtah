@@ -43,6 +43,10 @@ jobs:
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
         with:
           version: "v0.16.0"
+      - name: Install hermetic tool launcher
+        run: |
+          cargo install dotslash --version 0.5.7 --locked
+          bin/protoc --version
       - name: Format, lint, and test focused upstream crates
         run: |
           cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check
