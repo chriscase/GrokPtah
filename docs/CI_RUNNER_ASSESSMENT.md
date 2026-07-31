@@ -12,22 +12,24 @@ that better configuration solves.
 ## Governing constraint: this is a public repository
 
 `gh repo view` → `visibility=PUBLIC`, and `.github/workflows/desktop.yml`
-triggers on `pull_request` with no fork restriction. Any GitHub user can open a
-pull request whose head branch contains arbitrary workflow-invoked code
-(build scripts, `build.rs`, test code, npm lifecycle scripts).
+triggers on `pull_request`. A fork pull request can contain arbitrary
+workflow-invoked code (build scripts, `build.rs`, test code, npm lifecycle
+scripts). The repository currently requires approval for first-time
+contributors, which reduces automatic exposure but does not make approved code
+safe to run on owned hardware.
 
 On GitHub-hosted runners that is contained: the VM is ephemeral, isolated, and
-destroyed after the job. On a self-hosted runner that same PR executes attacker
--controlled code **on your hardware**, with access to whatever the runner user
-can reach. GitHub's own documentation is unambiguous that self-hosted runners
-should not be used with public repositories for exactly this reason.
+destroyed after the job. On a self-hosted runner that same PR executes
+attacker-controlled code **on your hardware**, with access to whatever the
+runner user can reach. GitHub documents this risk in
+[Managing access to self-hosted runners][github-runner-access].
 
 Mitigations exist but each has a real cost:
 
 | Mitigation | Cost |
 |---|---|
 | Require approval for all outside-collaborator PRs | Manual gate on every fork PR; a mis-click is full code execution |
-| Restrict the workflow to `pull_request_target` / same-repo branches | Fork PRs get **no** CI — loses the verification the gate exists to provide |
+| Route fork PRs only to GitHub-hosted runners | Requires split routing and does not validate self-hosted-specific state |
 | Ephemeral (just-in-time) runners in a throwaway VM per job | Rebuilds the isolation GitHub already provides, on hardware you now operate |
 | Make the repository private | Contradicts the fork's source-transparency purpose |
 
@@ -68,7 +70,9 @@ Recorded so a future decision starts from requirements rather than a blank page.
 **Capacity & cleanup**
 - Concurrency limit of 1 heavy Rust job per machine, or per-job CPU/RAM caps; the measured 2× variance came from contention.
 - Disk budget: existing local evidence is ~3.2 GiB desktop target + ~1 GiB bridge target per checkout, and ~22 GiB across active worktrees — a runner needs headroom plus automatic reclamation, or it silently fills.
-- Scheduled prune of caches, `target/` dirs, and stale `hdiutil` mounts (see `docs/PACKAGING.md` — leftover DMG mounts break the next packaging run).
+- Scheduled prune of bounded cache and `target/` paths. Detach only
+  job-created `hdiutil` mounts tracked by the runner; never sweep broad
+  `/Volumes/dmg.*` paths that may belong to another process or project.
 
 **Toolchain drift**
 - The runner must pin the same versions CI asserts today (Rust `1.92.0` via `rust-toolchain.toml`, Node 20). A self-hosted host drifts silently as the operator upgrades local tooling; the Wave 1 npm episode is the cautionary case — a lockfile produced by npm 11/Node 25 locally was rejected by CI's older npm. Pin explicitly and verify in-job rather than inheriting the host's state.
@@ -84,3 +88,5 @@ Recorded so a future decision starts from requirements rather than a blank page.
 1. Keep the current design (recommended): warm cache is already 99.39% effective; expected PR cost ≈2.5 min.
 2. `#203` already removed duplicate push+PR execution per commit — the largest structural saving, already banked.
 3. If macOS minutes become the binding constraint, move only the *frontend* job (typecheck + vitest, ~15s) to `ubuntu-latest`; the Rust/Tauri work genuinely requires macOS.
+
+[github-runner-access]: https://docs.github.com/actions/how-tos/manage-runners/self-hosted-runners/manage-access
