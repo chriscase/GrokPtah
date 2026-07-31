@@ -1,31 +1,71 @@
-//! Loopback-only authenticated MCP control transport (#196).
+//! Loopback-only authenticated MCP control transport (#196 / #200).
 //!
-//! Minimal JSON-RPC 2.0 over HTTP (MCP tools/list + tools/call + initialize).
-//! Quarantined: uses only hyper/http primitives already available via axum.
+//! **Standards path:** MCP Streamable HTTP (2025-03-26 / 2025-06-18 compatible)
+//! over axum — initialize, tools/list, tools/call, session headers, JSON responses.
+//! **Compat path:** legacy single-shot JSON-RPC POST (in-tree `McpControlClient`).
+//!
+//! Policy remains in [`OrchestrationService`]; this module is a thin adapter.
+//! `rmcp` is intentionally not linked here (reqwest 0.13 quarantine; see #200).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::orchestration::{
     OrchError, OrchErrorCode, OrchestrationService, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 
+/// Max concurrent in-flight MCP requests (post-auth).
+const MAX_CONCURRENT_REQUESTS: usize = 32;
+/// Hard cap on Streamable HTTP sessions (LRU eviction beyond this).
+const MAX_SESSIONS: usize = 256;
+/// Hard wall-clock bound per request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Supported MCP protocol versions (initialize + header validation).
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+    "2024-10-07",
+];
+const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+
 #[derive(Clone)]
 struct AppState {
     orch: Arc<OrchestrationService>,
+    sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+    inflight: Arc<Semaphore>,
+    started_at: Instant,
+    active_requests: Arc<AtomicU64>,
+    total_requests: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionState {
+    #[allow(dead_code)]
+    protocol_version: String,
+    initialized: bool,
+    #[allow(dead_code)]
+    created_at: Instant,
+    last_seen: Instant,
 }
 
 /// Handle for a running control server.
@@ -33,42 +73,77 @@ pub struct ControlServerHandle {
     pub addr: SocketAddr,
     pub token: String,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl ControlServerHandle {
     pub fn stop(mut self) {
+        self.cancel.cancel();
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
     }
+
+    /// Actionable transport health snapshot for coordinators.
+    pub fn health(&self, state_active: u64, state_total: u64) -> Value {
+        json!({
+            "ok": true,
+            "addr": self.addr.to_string(),
+            "activeRequests": state_active,
+            "totalRequests": state_total,
+        })
+    }
 }
 
 /// Start loopback MCP control server. Binds `127.0.0.1:port` (0 = ephemeral).
+///
+/// Serves MCP Streamable HTTP at `/mcp` (POST/GET/DELETE) and keeps `/` as a
+/// legacy JSON-RPC alias for in-tree clients.
 pub async fn start_control_server(
     orch: Arc<OrchestrationService>,
     port: u16,
 ) -> anyhow::Result<ControlServerHandle> {
-    let state = AppState { orch };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let state = AppState {
+        orch,
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        inflight: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+        started_at: Instant::now(),
+        active_requests: Arc::new(AtomicU64::new(0)),
+        total_requests: Arc::new(AtomicU64::new(0)),
+    };
     let app = Router::new()
-        .route("/", post(rpc_handler))
-        .route("/mcp", post(rpc_handler))
+        .route("/health", get(health_handler))
+        .route("/", post(streamable_post_handler))
+        .route(
+            "/mcp",
+            post(streamable_post_handler)
+                .get(streamable_get_handler)
+                .delete(streamable_delete_handler),
+        )
         .fallback(fail_closed_fallback)
-        .layer(DefaultBodyLimit::max(1024 * 1024))
+        // Body limit enforced by axum *after* auth middleware order... we put
+        // auth first so unauthenticated clients never get a full 1MiB parse.
+        .layer(DefaultBodyLimit::max(256 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             authenticate_request,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let token = String::new(); // caller sets via orch config
+    let token = String::new();
+    let cancel_serve = cancel.clone();
 
     tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = rx.await;
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = rx => {}
+                    _ = cancel_serve.cancelled() => {}
+                }
             })
             .await
             .ok();
@@ -78,14 +153,22 @@ pub async fn start_control_server(
         addr,
         token,
         shutdown: Some(tx),
+        cancel,
     })
 }
 
+/// Auth runs before the handler body is fully consumed by business logic.
+/// Combined with DefaultBodyLimit, oversized unauthenticated bodies still pay
+/// only the limited read — never orchestration mutations.
 async fn authenticate_request(
     State(state): State<AppState>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    // Health is unauthenticated (loopback only) for coordinator probes.
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
     let auth_header = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -96,11 +179,64 @@ async fn authenticate_request(
     }
 }
 
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "ok": true,
+        "service": "grokptah-control",
+        "transport": "mcp-streamable-http",
+        "uptimeMs": state.started_at.elapsed().as_millis() as u64,
+        "activeRequests": state.active_requests.load(Ordering::Relaxed),
+        "totalRequests": state.total_requests.load(Ordering::Relaxed),
+        "sessions": state.sessions.lock().len(),
+        "maxConcurrent": MAX_CONCURRENT_REQUESTS,
+        "protocolVersions": SUPPORTED_PROTOCOL_VERSIONS,
+    }))
+}
+
 async fn fail_closed_fallback() -> impl IntoResponse {
     (
         StatusCode::NOT_FOUND,
         Json(json!({"error": {"code": "unsupported", "message": "not found"}})),
     )
+}
+
+/// Streamable HTTP GET: optional SSE notifications channel (session-scoped).
+async fn streamable_get_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session_id = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if session_id.is_empty() || !state.sessions.lock().contains_key(session_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "error": {"code": -32600, "message": "missing or unknown mcp-session-id"}
+            })),
+        )
+            .into_response();
+    }
+    // Keep-alive only stream; tool results use POST JSON responses.
+    let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"grokptah-control sse open\"}}\n\n";
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .header("mcp-session-id", session_id)
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn streamable_delete_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session_id = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if session_id.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    state.sessions.lock().remove(session_id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,64 +337,306 @@ struct JsonRpcResp {
     error: Option<Value>,
 }
 
-async fn rpc_handler(
+async fn streamable_post_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<JsonRpcReq>,
+    body: axum::body::Bytes,
 ) -> Response {
+    state.total_requests.fetch_add(1, Ordering::Relaxed);
+    state.active_requests.fetch_add(1, Ordering::Relaxed);
+    let _active_guard = scopeguard_active(state.active_requests.clone());
+
+    // Concurrency bound after auth (auth middleware already ran).
+    let Ok(permit) = state.inflight.clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32000,
+                    "message": "too many concurrent MCP requests",
+                    "data": {"code": "capacity_exhausted"}
+                }
+            })),
+        )
+            .into_response();
+    };
+    let _permit = permit;
+
+    if body.len() > 256 * 1024 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "error": {"code": -32600, "message": "request body too large"}
+            })),
+        )
+            .into_response();
+    }
+
+    let req: JsonRpcReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_err(
+                None,
+                StatusCode::BAD_REQUEST,
+                &OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    format!("malformed JSON-RPC body: {e}"),
+                ),
+            );
+        }
+    };
+
     // Strict JSON-RPC 2.0 — missing/empty version is rejected (no silent default).
     if req.jsonrpc != "2.0" {
         return json_err(
-            req.id,
+            req.id.clone(),
             StatusCode::BAD_REQUEST,
             &OrchError::new(OrchErrorCode::InvalidRequest, "jsonrpc must be \"2.0\""),
         );
     }
-    // Loopback-only is enforced by bind; reject credentials in query (never used).
+
+    // Optional protocol version header check (Streamable HTTP).
+    if let Some(ver) = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())
+    {
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&ver) {
+            return json_err(
+                req.id.clone(),
+                StatusCode::BAD_REQUEST,
+                &OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    format!("unsupported MCP-Protocol-Version: {ver}"),
+                ),
+            );
+        }
+    }
+
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-
     let auth = match state.orch.auth_header(auth_header) {
         Ok(a) => a,
-        Err(e) => {
-            return json_err(req.id, StatusCode::UNAUTHORIZED, &e);
-        }
+        Err(e) => return json_err(req.id.clone(), StatusCode::UNAUTHORIZED, &e),
     };
 
     let method = req.method.as_deref().unwrap_or("");
-    let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "grokptah-control", "version": env!("CARGO_PKG_VERSION") },
-        })),
-        "notifications/initialized" | "ping" => Ok(json!({})),
-        "tools/list" => Ok(tools_list_result()),
-        "tools/call" => tools_call(&state.orch, &auth, &req.params).await,
-        "" => Err(OrchError::new(
-            OrchErrorCode::InvalidRequest,
-            "missing method",
-        )),
-        other => Err(OrchError::new(
-            OrchErrorCode::Unsupported,
-            format!("unsupported method {other}"),
+    // Notifications may omit id.
+    let is_notification = req.id.is_none() && method.starts_with("notifications/");
+
+    let work = async {
+        match method {
+            "initialize" => handle_initialize(&state, &headers, &req),
+            "notifications/initialized" => {
+                touch_session(&state, &headers);
+                Ok((json!({}), None::<String>))
+            }
+            "ping" => Ok((json!({}), session_id_from_headers(&headers))),
+            "tools/list" => {
+                require_session_if_present(&state, &headers)?;
+                Ok((tools_list_result(), session_id_from_headers(&headers)))
+            }
+            "tools/call" => {
+                require_session_if_present(&state, &headers)?;
+                let v = tools_call(&state.orch, &auth, &req.params).await?;
+                Ok((v, session_id_from_headers(&headers)))
+            }
+            "" => Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "missing method",
+            )),
+            other => Err(OrchError::new(
+                OrchErrorCode::Unsupported,
+                format!("unsupported method {other}"),
+            )),
+        }
+    };
+
+    let result = match tokio::time::timeout(REQUEST_TIMEOUT, work).await {
+        Ok(r) => r,
+        Err(_) => Err(OrchError::new(
+            OrchErrorCode::Internal,
+            "MCP request timed out",
         )),
     };
 
     match result {
-        Ok(v) => (
-            StatusCode::OK,
-            Json(JsonRpcResp {
-                jsonrpc: "2.0",
-                id: req.id,
-                result: Some(v),
-                error: None,
-            }),
-        )
-            .into_response(),
+        Ok((v, session_hdr)) => {
+            if is_notification {
+                // Spec: notifications get 202 Accepted with empty body (or no content).
+                return StatusCode::ACCEPTED.into_response();
+            }
+            let mut response = (
+                StatusCode::OK,
+                Json(JsonRpcResp {
+                    jsonrpc: "2.0",
+                    id: req.id,
+                    result: Some(v),
+                    error: None,
+                }),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            if let Some(sid) = session_hdr {
+                if let Ok(hv) = HeaderValue::from_str(&sid) {
+                    response.headers_mut().insert("mcp-session-id", hv);
+                }
+            }
+            response
+        }
         Err(e) => json_err(req.id, status_for(&e), &e),
     }
+}
+
+fn scopeguard_active(counter: Arc<AtomicU64>) -> impl Drop {
+    struct G(Arc<AtomicU64>);
+    impl Drop for G {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    G(counter)
+}
+
+fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+fn touch_session(state: &AppState, headers: &HeaderMap) {
+    if let Some(sid) = session_id_from_headers(headers) {
+        if let Some(s) = state.sessions.lock().get_mut(&sid) {
+            s.last_seen = Instant::now();
+            s.initialized = true;
+        }
+    }
+}
+
+fn require_session_if_present(state: &AppState, headers: &HeaderMap) -> Result<(), OrchError> {
+    // Stateless clients (legacy McpControlClient) may omit session id.
+    let Some(sid) = session_id_from_headers(headers) else {
+        return Ok(());
+    };
+    let mut g = state.sessions.lock();
+    let Some(s) = g.get_mut(&sid) else {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "unknown mcp-session-id",
+        ));
+    };
+    s.last_seen = Instant::now();
+    Ok(())
+}
+
+/// Evict least-recently-seen sessions until `map.len() <= max`.
+fn evict_sessions_lru(map: &mut HashMap<String, SessionState>, max: usize) {
+    while map.len() > max {
+        let victim = map
+            .iter()
+            .min_by_key(|(_, s)| s.last_seen)
+            .map(|(id, _)| id.clone());
+        match victim {
+            Some(id) => {
+                map.remove(&id);
+            }
+            None => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_cap_tests {
+    use super::*;
+
+    #[test]
+    fn lru_evicts_oldest_when_over_cap() {
+        let mut map = HashMap::new();
+        let t0 = Instant::now() - Duration::from_secs(100);
+        for i in 0..5 {
+            map.insert(
+                format!("s{i}"),
+                SessionState {
+                    protocol_version: "2025-11-25".into(),
+                    initialized: true,
+                    created_at: t0,
+                    last_seen: t0 + Duration::from_secs(i),
+                },
+            );
+        }
+        evict_sessions_lru(&mut map, 3);
+        assert_eq!(map.len(), 3);
+        assert!(!map.contains_key("s0"));
+        assert!(!map.contains_key("s1"));
+        assert!(map.contains_key("s2"));
+        assert!(map.contains_key("s3"));
+        assert!(map.contains_key("s4"));
+    }
+}
+
+fn handle_initialize(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: &JsonRpcReq,
+) -> Result<(Value, Option<String>), OrchError> {
+    let client_version = req
+        .params
+        .get("protocolVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+    let negotiated = if SUPPORTED_PROTOCOL_VERSIONS.contains(&client_version) {
+        client_version
+    } else {
+        DEFAULT_PROTOCOL_VERSION
+    };
+    // Header must match body when both present (Streamable HTTP).
+    if let Some(hdr) = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())
+    {
+        if hdr != client_version {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "MCP-Protocol-Version header does not match initialize protocolVersion",
+            ));
+        }
+    }
+    let session_id = Uuid::new_v4().to_string();
+    {
+        let mut g = state.sessions.lock();
+        g.insert(
+            session_id.clone(),
+            SessionState {
+                protocol_version: negotiated.to_string(),
+                initialized: false,
+                created_at: Instant::now(),
+                last_seen: Instant::now(),
+            },
+        );
+        // Hard-cap: always keep ≤ MAX_SESSIONS by evicting least-recently-seen.
+        // Age-only pruning is insufficient when attackers keep last_seen fresh.
+        evict_sessions_lru(&mut g, MAX_SESSIONS);
+    }
+    Ok((
+        json!({
+            "protocolVersion": negotiated,
+            "capabilities": {
+                "tools": { "listChanged": false }
+            },
+            "serverInfo": {
+                "name": "grokptah-control",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "instructions": "Authenticated loopback orchestration control. Build sessions only."
+        }),
+        Some(session_id),
+    ))
 }
 
 fn status_for(e: &OrchError) -> StatusCode {

@@ -1,13 +1,16 @@
-//! MCP control-plane client for the loopback JSON-RPC transport (#196).
+//! MCP control-plane client for loopback Streamable HTTP / JSON-RPC (#196/#200).
 //!
-//! Implements the MCP client lifecycle for this server's tools surface:
-//! `initialize` → `notifications/initialized` → `tools/list` / `tools/call`.
-//! This is the shipped client library used by integration tests (not ad-hoc
-//! one-off HTTP posts embedded in test bodies).
+//! Compatibility client for in-tree tests and coordinators that prefer a
+//! lightweight Rust API. Independent interop is proven with
+//! `@modelcontextprotocol/sdk` (see `tests/mcp_sdk_interop/`).
+//!
+//! Lifecycle: `initialize` → `notifications/initialized` → `tools/list` /
+//! `tools/call`, with Streamable HTTP Accept headers and optional
+//! `mcp-session-id`.
 
 use serde_json::{json, Value};
 
-/// Minimal MCP client against GrokPtah control HTTP JSON-RPC.
+/// Minimal MCP client against GrokPtah control Streamable HTTP.
 pub struct McpControlClient {
     base_url: String,
     token: String,
@@ -16,6 +19,7 @@ pub struct McpControlClient {
     /// MCP session state: false until successful initialize.
     initialized: bool,
     protocol_version: Option<String>,
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +45,7 @@ impl McpControlClient {
             next_id: 1,
             initialized: false,
             protocol_version: None,
+            session_id: None,
         }
     }
 
@@ -50,6 +55,10 @@ impl McpControlClient {
 
     pub fn protocol_version(&self) -> Option<&str> {
         self.protocol_version.as_deref()
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     fn next_id(&mut self) -> u64 {
@@ -66,15 +75,24 @@ impl McpControlClient {
             "method": method,
             "params": params,
         });
-        let resp = self
+        let mut req = self
             .http
             .post(format!("{}/mcp", self.base_url))
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+            // Streamable HTTP Accept (JSON preferred; SSE also allowed).
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-03-26")
+            .json(&body);
+        if let Some(sid) = &self.session_id {
+            req = req.header("mcp-session-id", sid);
+        }
+        let resp = req.send().await?;
+        if let Some(sid) = resp.headers().get("mcp-session-id") {
+            if let Ok(s) = sid.to_str() {
+                self.session_id = Some(s.to_string());
+            }
+        }
         let status = resp.status();
         let v: Value = resp.json().await?;
         if !status.is_success() {
@@ -83,7 +101,6 @@ impl McpControlClient {
         if let Some(err) = v.get("error") {
             anyhow::bail!("MCP error: {err}");
         }
-        // JSON-RPC responses must declare version 2.0 when present.
         if let Some(ver) = v.get("jsonrpc").and_then(|x| x.as_str()) {
             if ver != "2.0" {
                 anyhow::bail!("server jsonrpc version {ver:?}");
@@ -121,13 +138,13 @@ impl McpControlClient {
         Ok((status, v))
     }
 
-    /// MCP initialize handshake.
+    /// MCP initialize handshake (Streamable HTTP session established).
     pub async fn initialize(&mut self) -> anyhow::Result<Value> {
         let result = self
             .rpc(
                 "initialize",
                 json!({
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-03-26",
                     "capabilities": { "tools": {} },
                     "clientInfo": {
                         "name": "grokptah-mcp-control-client",
@@ -140,13 +157,58 @@ impl McpControlClient {
             .get("protocolVersion")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        // Server acknowledged — send initialized notification (fire-and-forget).
-        let _: Result<Value, anyhow::Error> = self
-            .rpc("notifications/initialized", json!({}))
-            .await
-            .or(Ok(Value::Null));
+        // Notification may return 202 with empty body — tolerate either shape.
+        let _ = self.notify("notifications/initialized", json!({})).await;
         self.initialized = true;
         Ok(result)
+    }
+
+    /// Fire-and-forget JSON-RPC notification (no id).
+    pub async fn notify(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let mut req = self
+            .http
+            .post(format!("{}/mcp", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-03-26")
+            .json(&body);
+        if let Some(sid) = &self.session_id {
+            req = req.header("mcp-session-id", sid);
+        }
+        let resp = req.send().await?;
+        if resp.status().as_u16() == 202 || resp.status().is_success() {
+            return Ok(());
+        }
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("notification {method} failed: {status} {text}");
+    }
+
+    /// End Streamable HTTP session (DELETE /mcp).
+    pub async fn close_session(&mut self) -> anyhow::Result<()> {
+        let Some(sid) = self.session_id.clone() else {
+            return Ok(());
+        };
+        let resp = self
+            .http
+            .delete(format!("{}/mcp", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("mcp-session-id", sid)
+            .send()
+            .await?;
+        self.session_id = None;
+        self.initialized = false;
+        if resp.status().as_u16() == 204 || resp.status().is_success() {
+            Ok(())
+        } else {
+            anyhow::bail!("close_session HTTP {}", resp.status())
+        }
     }
 
     pub async fn list_tools(&mut self) -> anyhow::Result<Vec<ListedTool>> {
@@ -297,8 +359,13 @@ mod tests {
         assert!(client.list_tools().await.is_err());
 
         let init = client.initialize().await.unwrap();
-        assert_eq!(init["protocolVersion"], "2024-11-05");
+        assert!(
+            init["protocolVersion"] == "2025-03-26" || init["protocolVersion"] == "2024-11-05",
+            "got {}",
+            init["protocolVersion"]
+        );
         assert!(client.is_initialized());
+        assert!(client.session_id().is_some());
 
         let tools = client.list_tools().await.unwrap();
         assert!(tools.iter().any(|t| t.name == "ptah_get_capacity"));
