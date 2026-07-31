@@ -105,10 +105,6 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 /// RAII env-var override for tests: constructors snapshot the prior value
 /// under [`ENV_LOCK`], `Drop` restores it, panics included.
-///
-/// Available under `cfg(test)` and to sibling crates that enable the
-/// `test-support` feature (as a dev-dependency), so the guard can live in
-/// this leaf crate and be shared instead of duplicated per crate.
 #[cfg(any(test, feature = "test-support"))]
 pub struct EnvVarGuard {
     key: &'static str,

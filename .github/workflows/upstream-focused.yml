@@ -1,0 +1,50 @@
+name: Focused Upstream Cargo
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/codegen/xai-grok-env/**"
+      - "crates/codegen/xai-grok-shell-base/**"
+      - ".github/workflows/upstream-focused.yml"
+  pull_request:
+    paths:
+      - "crates/codegen/xai-grok-env/**"
+      - "crates/codegen/xai-grok-shell-base/**"
+      - ".github/workflows/upstream-focused.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-focused-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  shell-base:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'READ_ONLY' || 'READ_WRITE' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+      - name: Configure compiler-cache namespace
+        env:
+          SCCACHE_NAMESPACE: grokptah-upstream-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('Cargo.lock') }}
+        run: echo "SCCACHE_GHA_VERSION=${SCCACHE_NAMESPACE}" >> "$GITHUB_ENV"
+      - name: Install compiler cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.16.0"
+      - name: Format, lint, and test focused upstream crates
+        run: |
+          cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check
+          cargo clippy -p xai-grok-env -p xai-grok-shell-base --all-targets --all-features --locked -- -D warnings
+          cargo test -p xai-grok-shell-base --all-features --locked

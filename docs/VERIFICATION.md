@@ -17,9 +17,10 @@ All are runnable from a clean clone with caches disabled
 | Desktop shell | `cargo test --locked` | `desktop/src-tauri` |
 | Agent bridge | `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked -- --test-threads=1` | `crates/codegen/grokptah-agent-bridge` |
 | Offline oracles | `cargo test --locked eval_oracle -- --nocapture` | `crates/codegen/grokptah-agent-bridge` |
+| Focused upstream support | `cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check && cargo clippy -p xai-grok-env -p xai-grok-shell-base --all-targets --all-features --locked -- -D warnings && cargo test -p xai-grok-shell-base --all-features --locked` | repository root |
 
-A focused single upstream crate can also be verified, e.g.
-`cargo test -p xai-grok-shell-base`.
+Other focused upstream crates may be tested individually, but their Cargo
+feature wiring varies because Bazel remains the parent project's primary gate.
 
 ## Unsupported: root-wide `cargo test` / `cargo test --workspace [--no-run]`
 
@@ -35,14 +36,14 @@ crates (`xai-grok-pager` alone: ~160 such errors).
 
 Do **not** try to make the whole workspace `cargo test` green by feature-gating
 the upstream crates: it is a large, upstream-divergent change that would be
-clobbered on the next vendor sync and adds no coverage the supported paths lack.
-Verify upstream crates individually, or with Bazel.
+clobbered on the next vendor sync. Verify relevant upstream crates individually,
+or with Bazel, and keep any intentional backport aligned with the parent.
 
 ### One completed exception
 
-`xai-grok-env` exposes its `EnvVarGuard` test helper behind an off-by-default
-`test-support` feature (in addition to `#[cfg(test)]`), and
-`xai-grok-shell-base` enables it as a dev-dependency. This completes a fix that
-was already scaffolded in `xai-grok-shell-base/Cargo.toml` and makes
-`cargo test -p xai-grok-shell-base` pass standalone. It changes no existing
-build config (the feature is additive and off by default).
+`xai-grok-env` exposes its `EnvVarGuard` test helper behind a `test-support`
+feature (in addition to `#[cfg(test)]`), and `xai-grok-shell-base` forwards that
+feature for its own downstream test seams. This is a focused backport of the
+parent project's wiring in Grok Build commit `8adf901`; it makes
+`cargo test -p xai-grok-shell-base` pass standalone while keeping the fork
+aligned with the parent.
