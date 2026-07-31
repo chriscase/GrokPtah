@@ -41,7 +41,7 @@ windows = { workspace = true }
 tempfile = { workspace = true }
 # `cfg(test)` in this crate does not enable features on dependencies, so the
 # tests' `EnvVarGuard` re-export needs the feature turned on explicitly.
-xai-grok-env = { workspace = true, features = [] }
+xai-grok-env = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

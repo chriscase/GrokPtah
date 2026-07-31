@@ -97,21 +97,25 @@ impl std::fmt::Display for GrokBuildEnvironment {
     }
 }
 /// Serializes env-var mutation across tests; `std::env` is process-global.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 /// RAII env-var override for tests: constructors snapshot the prior value
 /// under [`ENV_LOCK`], `Drop` restores it, panics included.
-#[cfg(test)]
+///
+/// Available under `cfg(test)` and to sibling crates that enable the
+/// `test-support` feature (as a dev-dependency), so the guard can live in
+/// this leaf crate and be shared instead of duplicated per crate.
+#[cfg(any(test, feature = "test-support"))]
 pub struct EnvVarGuard {
     key: &'static str,
     prev: Option<String>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl EnvVarGuard {
     pub fn set(key: &'static str, value: &str) -> Self {
         let lock = env_lock();
@@ -138,7 +142,7 @@ impl EnvVarGuard {
         unsafe { std::env::set_var(self.key, value) };
     }
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         match self.prev.take() {

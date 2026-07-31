@@ -8,6 +8,10 @@ description = "Backend environment presets for the Grok CLI crate family: endpoi
 [features]
 # single shared rlib per crate, so downstream Bazel test targets need the
 default-bazel = []
+# Exposes the `EnvVarGuard` test helper to sibling crates via a dev-dependency
+# (see the type's docs). Off by default; enabling it in a non-test build is
+# harmless (the guard is a pure RAII wrapper over std::env).
+test-support = []
 
 [dependencies]
 tracing = { workspace = true }
