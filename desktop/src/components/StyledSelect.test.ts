@@ -44,6 +44,16 @@ describe("StyledSelect (#126)", () => {
     expect(app).toMatch(/const splashReady = workspaceRestored;/);
   });
 
+  it("keeps live thought tokens in a stable readable line box", () => {
+    const css = readFileSync(join(root, "..", "styles", "app.css"), "utf8");
+    expect(css).toMatch(/\.bubble\.thought \{[\s\S]*line-height: 1\.6;/);
+    expect(css).toMatch(
+      /\.bubble\.thought \.stream-text\.is-streaming \{[\s\S]*text-shadow: none;/,
+    );
+    const pane = readFileSync(join(root, "SessionPane.tsx"), "utf8");
+    expect(pane).toMatch(/item\.kind === "thought"[\s\S]*animated=\{false\}/);
+  });
+
   it("flips a bottom-anchored menu above its trigger", () => {
     vi.spyOn(HTMLButtonElement.prototype, "getBoundingClientRect").mockReturnValue({
       top: 700,

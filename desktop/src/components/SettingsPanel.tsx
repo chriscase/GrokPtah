@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import type { AuthState, ModelInfo } from "../lib/protocol";
 import { StyledSelect } from "./StyledSelect";
+import { effortForModel, effortOptionsForModel } from "../lib/modelOptions";
 import {
   applyAppearanceChrome,
   loadAppearanceChrome,
@@ -43,16 +44,6 @@ type SettingsSnap = {
   gatewayBaseUrl?: string;
   gatewayApiKeySet?: boolean;
 };
-
-const EFFORTS = [
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
 
 /**
  * Full-screen settings: defaults (model, effort, permissions, tool safety,
@@ -125,6 +116,8 @@ export function SettingsPanel({
     models.some((m) => m.id === snap.model)
       ? (snap.model ?? models[0]?.id ?? "grok-build")
       : (models[0]?.id ?? snap.model ?? "grok-build");
+  const effortOptions = effortOptionsForModel(models, modelValue);
+  const currentEffort = effortForModel(models, modelValue, snap.effort);
 
   return (
     <div
@@ -202,7 +195,13 @@ export function SettingsPanel({
                       label: m.display_name,
                     }))}
                     onChange={(v) =>
-                      void apply(() => api.setModel(v), "Default model saved")
+                      void apply(async () => {
+                        await api.setModel(v);
+                        const nextEffort = effortForModel(models, v, snap.effort);
+                        if (nextEffort !== snap.effort) {
+                          await api.setEffort(nextEffort);
+                        }
+                      }, "Default model saved")
                     }
                   />
                   <span className="settings-hint">
@@ -214,8 +213,8 @@ export function SettingsPanel({
                   <span className="settings-field-label">Default effort</span>
                   <StyledSelect
                     disabled={busy}
-                    value={String(snap.effort ?? "medium")}
-                    options={EFFORTS.map((e) => ({ value: e, label: e }))}
+                    value={currentEffort}
+                    options={effortOptions.map((e) => ({ value: e, label: e }))}
                     onChange={(v) =>
                       void apply(() => api.setEffort(v), "Default effort saved")
                     }

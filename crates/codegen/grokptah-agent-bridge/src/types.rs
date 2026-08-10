@@ -5,6 +5,8 @@ pub struct ModelInfo {
     pub id: String,
     pub display_name: String,
     pub supports_effort: bool,
+    /// Canonical effort values accepted by this model, in UI order.
+    pub effort_options: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

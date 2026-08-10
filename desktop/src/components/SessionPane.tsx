@@ -300,7 +300,11 @@ export const SessionPane = memo(function SessionPane({
                   />
                 )}
                 {item.kind === "thought" && (
-                  <StreamingText text={item.text} streaming={item.streaming} />
+                  <StreamingText
+                    text={item.text}
+                    streaming={item.streaming}
+                    animated={false}
+                  />
                 )}
                 {item.kind === "user" && (
                   <div className="user-text">{item.text}</div>

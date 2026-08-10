@@ -205,6 +205,7 @@ export interface ModelInfo {
   id: string;
   display_name: string;
   supports_effort: boolean;
+  effort_options?: string[];
 }
 
 export interface AuthState {

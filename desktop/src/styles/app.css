@@ -1728,9 +1728,18 @@ button:disabled {
 .bubble.thought {
   color: var(--thought);
   font-size: 12px;
+  line-height: 1.6;
   border-style: dashed;
   background: transparent;
   white-space: pre-wrap;
+}
+
+/* Thought chunks are plain cumulative text while the transcript is reflowing.
+ * Keep their line box stable; animated word spans can stack at the left edge
+ * of a narrow pane before the browser settles the layout.
+ */
+.bubble.thought .stream-text.is-streaming {
+  text-shadow: none;
 }
 
 .bubble.tool {
