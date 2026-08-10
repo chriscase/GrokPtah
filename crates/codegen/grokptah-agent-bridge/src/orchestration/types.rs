@@ -328,6 +328,8 @@ pub enum OrchErrorCode {
     StaleVersion,
     CursorExpired,
     Internal,
+    /// Wall-clock / transport request deadline exceeded (maps to HTTP 504).
+    Timeout,
     InvalidRequest,
     Unsupported,
     Conflict,
@@ -344,6 +346,7 @@ impl OrchErrorCode {
             Self::StaleVersion => "stale_version",
             Self::CursorExpired => "cursor_expired",
             Self::Internal => "internal",
+            Self::Timeout => "timeout",
             Self::InvalidRequest => "invalid_request",
             Self::Unsupported => "unsupported",
             Self::Conflict => "conflict",

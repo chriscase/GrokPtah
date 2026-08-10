@@ -509,7 +509,7 @@ async fn streamable_post_handler(
     let result = match tokio::time::timeout(state.request_timeout, work).await {
         Ok(r) => r,
         Err(_) => Err(OrchError::new(
-            OrchErrorCode::Internal,
+            OrchErrorCode::Timeout,
             "MCP request timed out",
         )),
     };
@@ -699,6 +699,7 @@ fn status_for(e: &OrchError) -> StatusCode {
         OrchErrorCode::Unsupported => StatusCode::METHOD_NOT_ALLOWED,
         OrchErrorCode::CursorExpired => StatusCode::GONE,
         OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted => StatusCode::CONFLICT,
+        OrchErrorCode::Timeout => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
