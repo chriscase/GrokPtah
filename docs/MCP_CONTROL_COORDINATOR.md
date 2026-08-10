@@ -66,6 +66,17 @@ Crash recovery contract: reopening `OrchStore` marks unfinished runs
 **`interrupted`**; session prompt queues reload from the GrokPtah home.
 MCP transport sessions are **not** durable across process restart (re-`initialize`).
 
+
+### Optional transport knobs (tests / soak only)
+
+Unset in production. When set, `start_control_from_env` applies them:
+
+| Env var | Effect |
+|---------|--------|
+| `GROKPTAH_CONTROL_MAX_CONCURRENT` | MCP in-flight request semaphore (default 32) |
+| `GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS` | Per-request wall timeout (default 120000) |
+| `GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS` | Hold work after permit (timeout/429 diagnostics) |
+
 ### Authentication
 
 - Every `/mcp` request: `Authorization: Bearer <GROKPTAH_CONTROL_TOKEN>`
