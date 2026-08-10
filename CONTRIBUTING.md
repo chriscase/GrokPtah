@@ -7,6 +7,12 @@ SpaceXAI develops this software internally. The public tree is published for
 source transparency and local builds under the terms of the Apache License,
 Version 2.0 (see [`LICENSE`](LICENSE)).
 
+## Building & verifying locally
+
+Supported build/test commands and the reason a root-wide `cargo test
+--workspace` is **not** supported (the vendored upstream crates are
+Bazel-tested) are documented in [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
+
 ## Security reports
 
 Please report security issues through the process described in
