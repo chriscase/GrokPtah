@@ -8,8 +8,9 @@ use grokptah_agent_bridge::orchestration::{
     OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
-    McpControlClient, SessionKind, CONTROL_TOOLS,
+    home_override_serial, set_grokptah_home_override, start_control_server,
+    start_control_server_with, AgentHost, ControlServerLimits, HostConfig, McpControlClient,
+    SessionKind, CONTROL_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -550,6 +551,202 @@ async fn session_map_hard_capped_under_initialize_spam() {
         "evicted session still accepted: {}",
         stale.status()
     );
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn binds_loopback_only() {
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    assert!(
+        srv.addr.ip().is_loopback(),
+        "control server must bind loopback, got {}",
+        srv.addr
+    );
+    assert_eq!(
+        srv.addr.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        "control server must bind 127.0.0.1 (not ::1-only or public)"
+    );
+    // Health reports the same address; coordinator probes use it.
+    let health = reqwest::Client::new()
+        .get(format!("http://{}/health", srv.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+    let h: serde_json::Value = health.json().await.unwrap();
+    assert_eq!(h["ok"], true);
+    assert!(
+        h["maxConcurrent"].as_u64().unwrap() >= 1,
+        "health must advertise concurrency bound"
+    );
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn concurrency_cap_returns_429() {
+    // Hold max_concurrent permits via inject_work_delay; overflow must 429.
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let limits = ControlServerLimits {
+        max_concurrent: 2,
+        request_timeout: Duration::from_secs(5),
+        inject_work_delay: Some(Duration::from_millis(800)),
+    };
+    let srv = start_control_server_with(orch.clone(), 0, limits)
+        .await
+        .unwrap();
+    let url = format!("http://{}/mcp", srv.addr);
+    let http = reqwest::Client::new();
+    let body = json!({
+        "jsonrpc":"2.0","id":1,"method":"tools/list","params":{}
+    });
+
+    let hold_a = {
+        let http = http.clone();
+        let url = url.clone();
+        let body = body.clone();
+        tokio::spawn(async move {
+            http.post(&url)
+                .header("Authorization", "Bearer stream-token-200")
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+        })
+    };
+    let hold_b = {
+        let http = http.clone();
+        let url = url.clone();
+        let body = body.clone();
+        tokio::spawn(async move {
+            http.post(&url)
+                .header("Authorization", "Bearer stream-token-200")
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+        })
+    };
+    // Let both holders enter work (permit acquired + delay started).
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let overflow = http
+        .post(&url)
+        .header("Authorization", "Bearer stream-token-200")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        overflow.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "body={}",
+        overflow.text().await.unwrap_or_default()
+    );
+
+    let a = hold_a.await.unwrap().unwrap();
+    let b = hold_b.await.unwrap().unwrap();
+    assert_eq!(a.status(), 200);
+    assert_eq!(b.status(), 200);
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn request_timeout_returns_error() {
+    // inject_work_delay > request_timeout trips the real timeout branch.
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let limits = ControlServerLimits {
+        max_concurrent: 4,
+        request_timeout: Duration::from_millis(80),
+        inject_work_delay: Some(Duration::from_millis(500)),
+    };
+    let srv = start_control_server_with(orch.clone(), 0, limits)
+        .await
+        .unwrap();
+    let url = format!("http://{}/mcp", srv.addr);
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", "Bearer stream-token-200")
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "jsonrpc":"2.0","id":42,"method":"tools/list","params":{}
+        }))
+        .send()
+        .await
+        .unwrap();
+    // Timeout maps to Internal → 500 with JSON-RPC error body.
+    assert!(
+        resp.status().is_server_error() || resp.status().is_client_error(),
+        "expected error status, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        msg.contains("timed out") || msg.contains("timeout"),
+        "expected timeout error message, got {body}"
+    );
+    assert_eq!(body["id"], 42);
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn http_steer_idle_queues_without_starting_run() {
+    // HTTP path: ptah_steer on idle Build session defers to queue (non-cancelling).
+    let (_home, _lock, host, ws, orch) = setup();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let before = host.session_queue_list(session.id).unwrap().len();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), "stream-token-200");
+    client.initialize().await.unwrap();
+    let steer = client
+        .call_tool(
+            "ptah_steer",
+            json!({
+                "request_id": "steer-http-idle-1",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "text": "prefer unit tests"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!steer.is_error);
+    let disposition = steer
+        .structured
+        .get("disposition")
+        .or_else(|| steer.raw.pointer("/structuredContent/disposition"))
+        .or_else(|| steer.raw.pointer("/result/structuredContent/disposition"))
+        .cloned()
+        .unwrap_or(json!(null));
+    assert_eq!(
+        disposition, "queued",
+        "idle steer must queue, not cancel/start a turn; body={:?}",
+        steer.raw
+    );
+    let after = host.session_queue_list(session.id).unwrap().len();
+    assert_eq!(after, before + 1, "steer must enqueue exactly one entry");
+    // No active run started by steer alone.
+    let cap = client
+        .call_tool("ptah_get_capacity", json!({}))
+        .await
+        .unwrap();
+    assert!(!cap.is_error);
+    client.close_session().await.unwrap();
     srv.stop();
     set_grokptah_home_override(None);
 }

@@ -48,14 +48,43 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
 ];
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 
+/// Tunable transport limits for the loopback control server.
+///
+/// Production callers use [`ControlServerLimits::default`]. Tests may lower
+/// concurrency / timeout and optionally inject a work delay to exercise the
+/// capacity (429) and request-timeout paths without waiting on wall-clock 120s.
+#[derive(Debug, Clone)]
+pub struct ControlServerLimits {
+    /// Max concurrent in-flight MCP requests after auth (default 32).
+    pub max_concurrent: usize,
+    /// Hard wall-clock bound per request (default 120s).
+    pub request_timeout: Duration,
+    /// When set, sleep this long at the start of the timed work future
+    /// (after the concurrency permit is held). Test-only; production leaves `None`.
+    pub inject_work_delay: Option<Duration>,
+}
+
+impl Default for ControlServerLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent: MAX_CONCURRENT_REQUESTS,
+            request_timeout: REQUEST_TIMEOUT,
+            inject_work_delay: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     orch: Arc<OrchestrationService>,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     inflight: Arc<Semaphore>,
+    request_timeout: Duration,
+    inject_work_delay: Option<Duration>,
     started_at: Instant,
     active_requests: Arc<AtomicU64>,
     total_requests: Arc<AtomicU64>,
+    max_concurrent: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -103,14 +132,27 @@ pub async fn start_control_server(
     orch: Arc<OrchestrationService>,
     port: u16,
 ) -> anyhow::Result<ControlServerHandle> {
+    start_control_server_with(orch, port, ControlServerLimits::default()).await
+}
+
+/// Start the control server with explicit transport limits (tests / diagnostics).
+pub async fn start_control_server_with(
+    orch: Arc<OrchestrationService>,
+    port: u16,
+    limits: ControlServerLimits,
+) -> anyhow::Result<ControlServerHandle> {
     let cancel = tokio_util::sync::CancellationToken::new();
+    let max_concurrent = limits.max_concurrent.max(1);
     let state = AppState {
         orch,
         sessions: Arc::new(Mutex::new(HashMap::new())),
-        inflight: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+        inflight: Arc::new(Semaphore::new(max_concurrent)),
+        request_timeout: limits.request_timeout,
+        inject_work_delay: limits.inject_work_delay,
         started_at: Instant::now(),
         active_requests: Arc::new(AtomicU64::new(0)),
         total_requests: Arc::new(AtomicU64::new(0)),
+        max_concurrent,
     };
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -131,8 +173,12 @@ pub async fn start_control_server(
         ))
         .with_state(state.clone());
 
+    // Fail closed: IPv4 loopback only — never 0.0.0.0 / public interfaces.
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
     let addr = listener.local_addr()?;
+    if !addr.ip().is_loopback() {
+        anyhow::bail!("control server refused non-loopback bind address {addr}");
+    }
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let token = String::new();
     let cancel_serve = cancel.clone();
@@ -188,7 +234,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         "activeRequests": state.active_requests.load(Ordering::Relaxed),
         "totalRequests": state.total_requests.load(Ordering::Relaxed),
         "sessions": state.sessions.lock().len(),
-        "maxConcurrent": MAX_CONCURRENT_REQUESTS,
+        "maxConcurrent": state.max_concurrent,
         "protocolVersions": SUPPORTED_PROTOCOL_VERSIONS,
     }))
 }
@@ -426,7 +472,13 @@ async fn streamable_post_handler(
     // Notifications may omit id.
     let is_notification = req.id.is_none() && method.starts_with("notifications/");
 
+    let work_delay = state.inject_work_delay;
     let work = async {
+        // Test hook: hold the concurrency permit / trip request timeout without
+        // waiting on production 120s or inventing a fake tool.
+        if let Some(delay) = work_delay {
+            tokio::time::sleep(delay).await;
+        }
         match method {
             "initialize" => handle_initialize(&state, &headers, &req),
             "notifications/initialized" => {
@@ -454,7 +506,7 @@ async fn streamable_post_handler(
         }
     };
 
-    let result = match tokio::time::timeout(REQUEST_TIMEOUT, work).await {
+    let result = match tokio::time::timeout(state.request_timeout, work).await {
         Ok(r) => r,
         Err(_) => Err(OrchError::new(
             OrchErrorCode::Internal,
