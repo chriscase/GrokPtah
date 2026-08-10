@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { entriesToTranscriptItems } from "./transcript";
+import { entriesToTranscriptItems, hasInterruptedTurn } from "./transcript";
 
 describe("entriesToTranscriptItems", () => {
   it("maps tool rows with title/status/output", () => {
@@ -52,3 +52,32 @@ describe("entriesToTranscriptItems", () => {
   });
 });
 
+describe("hasInterruptedTurn", () => {
+  it("recognizes a persisted user turn with no completion", () => {
+    expect(
+      hasInterruptedTurn([
+        { role: "assistant", text: "Earlier" },
+        { role: "user", text: "Continue the task" },
+      ]),
+    ).toBe(true);
+  });
+
+  it("allows durable steering context before an unfinished turn", () => {
+    expect(
+      hasInterruptedTurn([
+        { role: "user", text: "Continue the task" },
+        { role: "system", text: "Steering while running: focus" },
+      ]),
+    ).toBe(true);
+  });
+
+  it("does not flag a completed or empty session", () => {
+    expect(
+      hasInterruptedTurn([
+        { role: "user", text: "Continue the task" },
+        { role: "assistant", text: "Done" },
+      ]),
+    ).toBe(false);
+    expect(hasInterruptedTurn([])).toBe(false);
+  });
+});

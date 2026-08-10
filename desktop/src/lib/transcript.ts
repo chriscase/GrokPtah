@@ -10,6 +10,24 @@ export type TranscriptEntryDto = {
   tool_output?: string | null;
 };
 
+/**
+ * A user entry is persisted before model work begins. If no assistant or
+ * error entry follows the latest user entry, a process restart likely stopped
+ * that turn before it produced a durable completion.
+ */
+export function hasInterruptedTurn(entries: TranscriptEntryDto[]): boolean {
+  let latestUser = -1;
+  for (let index = 0; index < entries.length; index += 1) {
+    if ((entries[index].role || "").toLowerCase() === "user") {
+      latestUser = index;
+    }
+  }
+  if (latestUser < 0) return false;
+  return !entries
+    .slice(latestUser + 1)
+    .some((entry) => ["assistant", "error"].includes((entry.role || "").toLowerCase()));
+}
+
 /** Map durable transcript entries → UI items (including tools). */
 export function entriesToTranscriptItems(
   entries: TranscriptEntryDto[],
