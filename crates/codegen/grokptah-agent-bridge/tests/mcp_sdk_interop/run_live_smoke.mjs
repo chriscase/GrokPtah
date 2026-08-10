@@ -12,6 +12,11 @@
  *
  * Independent of McpControlClient. Protocol-level fetch is the hard gate.
  */
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+
 const url = process.env.GROKPTAH_MCP_URL;
 const token = process.env.GROKPTAH_MCP_TOKEN;
 const hostSessionId = process.env.GROKPTAH_MCP_SESSION_ID;
@@ -24,6 +29,7 @@ if (!url || !token || !hostSessionId || !workspace) {
 }
 const endpoint = url.endsWith("/mcp") ? url : `${url.replace(/\/$/, "")}/mcp`;
 const base = endpoint.replace(/\/mcp$/, "");
+const endpointUrl = new URL(endpoint);
 
 const checks = {};
 const steps = [];
@@ -197,15 +203,19 @@ try {
     { id: 4, sessionId: mcpSession }
   );
   const sessSc = structured(sessions.json);
-  const sessArr = sessSc?.sessions ?? sessSc?.entries ?? (Array.isArray(sessSc) ? sessSc : []);
+  const sessArr = Array.isArray(sessSc?.sessions) ? sessSc.sessions : [];
+  const hasHostSession = sessArr.some(
+    (s) => String(s.sessionId ?? "") === String(hostSessionId)
+  );
   record(
     "listSessions",
-    sessions.status === 200 &&
-      (Array.isArray(sessArr)
-        ? sessArr.some((s) => String(s.id ?? s.sessionId ?? "") === hostSessionId) ||
-          sessArr.length >= 0
-        : true),
-    { count: Array.isArray(sessArr) ? sessArr.length : null }
+    sessions.status === 200 && hasHostSession,
+    {
+      count: sessArr.length,
+      hostSessionId,
+      found: hasHostSession,
+      ids: sessArr.map((s) => s.sessionId),
+    }
   );
 
   // --- Unknown tool ---
@@ -222,7 +232,7 @@ try {
     unk.json?.error
   );
 
-  // --- Allowlist fail-closed ---
+  // --- Allowlist fail-closed (plain path + symlink escape) ---
   const badWs = await mcpFetch(
     "tools/call",
     {
@@ -237,6 +247,66 @@ try {
     { id: 6, sessionId: mcpSession }
   );
   record("allowlistFailClosed", badWs.status >= 400, badWs.status);
+
+  // Symlink whose target resolves *outside* the allowlisted workspace root.
+  let symlinkEscapeOk = false;
+  let symlinkDetail = null;
+  try {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "ptah-escape-"));
+    const linkPath = path.join(workspace, `escape-link-${Date.now()}`);
+    fs.symlinkSync(outside, linkPath);
+    const badLink = await mcpFetch(
+      "tools/call",
+      {
+        name: "ptah_queue_prompt",
+        arguments: {
+          request_id: "live-symlink-escape",
+          session_id: hostSessionId,
+          workspace: linkPath,
+          prompt: "must fail closed on symlink escape",
+        },
+      },
+      { id: 7, sessionId: mcpSession }
+    );
+    const badSubmit = await mcpFetch(
+      "tools/call",
+      {
+        name: "ptah_submit_task",
+        arguments: {
+          request_id: "live-symlink-escape-submit",
+          session_id: hostSessionId,
+          workspace: linkPath,
+          prompt: "must fail closed on symlink escape",
+        },
+      },
+      { id: 8, sessionId: mcpSession }
+    );
+    symlinkEscapeOk =
+      badLink.status >= 400 &&
+      badLink.status < 500 &&
+      badSubmit.status >= 400 &&
+      badSubmit.status < 500;
+    symlinkDetail = {
+      linkPath,
+      outside,
+      queueStatus: badLink.status,
+      submitStatus: badSubmit.status,
+      queueCode: badLink.json?.error?.data?.code,
+    };
+    try {
+      fs.unlinkSync(linkPath);
+    } catch {
+      /* best-effort */
+    }
+    try {
+      fs.rmdirSync(outside);
+    } catch {
+      /* best-effort */
+    }
+  } catch (e) {
+    symlinkDetail = String(e?.message || e);
+  }
+  record("symlinkEscapeFailClosed", symlinkEscapeOk, symlinkDetail);
 
   // --- Queue + idempotent replay ---
   const qArgs = {
@@ -351,21 +421,65 @@ try {
       { name: "ptah_get_changes", arguments: { run_id: runId } },
       { id: 24, sessionId: mcpSession }
     );
-    record("changes", changes.status === 200, changes.status);
+    const chSc = structured(changes.json);
+    const changeEntriesOk =
+      Array.isArray(chSc?.changes) &&
+      chSc.changes.every(
+        (c) =>
+          c &&
+          typeof c === "object" &&
+          typeof c.path === "string" &&
+          typeof c.summary === "string"
+      );
+    record(
+      "changes",
+      changes.status === 200 &&
+        chSc != null &&
+        chSc.runId === runId &&
+        Array.isArray(chSc.changes) &&
+        changeEntriesOk,
+      {
+        status: changes.status,
+        runId: chSc?.runId,
+        changeCount: Array.isArray(chSc?.changes) ? chSc.changes.length : null,
+      }
+    );
 
     const tests = await mcpFetch(
       "tools/call",
       { name: "ptah_get_test_results", arguments: { run_id: runId } },
       { id: 25, sessionId: mcpSession }
     );
-    record("testResults", tests.status === 200, tests.status);
+    const tSc = structured(tests.json);
+    record(
+      "testResults",
+      tests.status === 200 &&
+        tSc != null &&
+        tSc.runId === runId &&
+        typeof tSc.status === "string" &&
+        Array.isArray(tSc.results),
+      {
+        status: tests.status,
+        runId: tSc?.runId,
+        obsStatus: tSc?.status,
+        resultCount: Array.isArray(tSc?.results) ? tSc.results.length : null,
+      }
+    );
 
     const handoff = await mcpFetch(
       "tools/call",
       { name: "ptah_get_handoff", arguments: { run_id: runId } },
       { id: 26, sessionId: mcpSession }
     );
-    record("handoff", handoff.status === 200 && !!structured(handoff.json), handoff.status);
+    const hSc = structured(handoff.json);
+    record(
+      "handoff",
+      handoff.status === 200 &&
+        hSc != null &&
+        hSc.runId === runId &&
+        hSc.state != null,
+      { status: handoff.status, state: hSc?.state }
+    );
 
     // Idempotent submit replay
     const submitReplay = await mcpFetch(
@@ -530,8 +644,88 @@ try {
   );
   mcpSession = reinit.sessionId;
 
-  // --- Client disconnect mid-request (idempotent retry already covered by queue) ---
-  record("disconnectRetryCoveredByQueueIdempotency", checks.queueIdempotent === true);
+  // --- Real client disconnect mid-request + idempotent retry (no double mutation) ---
+  // Full POST body is written then the TCP connection is dropped without reading
+  // the response; retry with the same request_id must not double-enqueue.
+  const discReqId = `live-disconnect-retry-${Date.now()}`;
+  const discBody = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 50,
+    method: "tools/call",
+    params: {
+      name: "ptah_queue_prompt",
+      arguments: {
+        request_id: discReqId,
+        session_id: hostSessionId,
+        workspace,
+        prompt: "queued once despite disconnect",
+      },
+    },
+  });
+  const discPayload = [
+    `POST ${endpointUrl.pathname} HTTP/1.1`,
+    `Host: ${endpointUrl.host}`,
+    `Authorization: Bearer ${token}`,
+    "Content-Type: application/json",
+    "Accept: application/json",
+    `Content-Length: ${Buffer.byteLength(discBody)}`,
+    "Connection: close",
+    "",
+    discBody,
+  ].join("\r\n");
+  await new Promise((resolve, reject) => {
+    const sock = net.connect(
+      { host: endpointUrl.hostname, port: Number(endpointUrl.port) },
+      () => {
+        sock.write(discPayload, () => {
+          // Drop without reading response = client disconnect.
+          sock.destroy();
+          resolve();
+        });
+      }
+    );
+    sock.on("error", (err) => {
+      // ECONNRESET after destroy is fine.
+      if (err.code === "ECONNRESET" || err.code === "EPIPE") resolve();
+      else reject(err);
+    });
+  });
+  await new Promise((r) => setTimeout(r, 150));
+  const discRetry = await mcpFetch(
+    "tools/call",
+    {
+      name: "ptah_queue_prompt",
+      arguments: {
+        request_id: discReqId,
+        session_id: hostSessionId,
+        workspace,
+        prompt: "queued once despite disconnect",
+      },
+    },
+    { id: 51, sessionId: mcpSession }
+  );
+  const discConflict = await mcpFetch(
+    "tools/call",
+    {
+      name: "ptah_queue_prompt",
+      arguments: {
+        request_id: discReqId,
+        session_id: hostSessionId,
+        workspace,
+        prompt: "different payload after disconnect",
+      },
+    },
+    { id: 52, sessionId: mcpSession }
+  );
+  record(
+    "disconnectMidRequestIdempotentRetry",
+    discRetry.status === 200 && discConflict.status >= 400,
+    {
+      retryStatus: discRetry.status,
+      conflictStatus: discConflict.status,
+      requestId: discReqId,
+    }
+  );
 
   // --- Malformed with auth ---
   const mal = await fetch(endpoint, {

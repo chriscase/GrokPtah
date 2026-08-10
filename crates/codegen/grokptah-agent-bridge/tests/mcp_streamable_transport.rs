@@ -1038,6 +1038,11 @@ async fn independent_node_coordinator_conformance() {
     );
     // SDK path reported honestly (may be false); must not be invented as true without success.
     assert!(report.get("sdkOk").is_some());
+    // Durable transcript for verifiers (`--nocapture`).
+    eprintln!("MCP_CONFORMANCE_NODE_JSON {report}");
+    if !stderr.trim().is_empty() {
+        eprintln!("MCP_CONFORMANCE_NODE_STDERR {stderr}");
+    }
     srv.stop();
     set_grokptah_home_override(None);
 }
