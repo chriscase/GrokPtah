@@ -14,13 +14,14 @@ use uuid::Uuid;
 
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
-    api_context_messages, build_agent_messages, build_compact_summary, call_xai_agent_step,
-    call_xai_chat, cargo_test_output_failed, coding_agent_tools, emit_message, emit_thought,
-    filter_tools_edit_and_shell, is_round_limit_stop_message, normalize_sandbox_profile,
-    offline_plan_steps, parse_effort_arg, propose_plan_with_model, push_assistant, push_thought,
-    push_tool, resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell,
-    sandbox_is_readonly, surface_rate_limit_or_error, tool_kind, tool_web_fetch, AgentStep,
-    McpToolIndex,
+    action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
+    build_agent_messages, build_compact_summary, call_xai_agent_step, call_xai_chat,
+    cargo_test_output_failed, coding_agent_tools, emit_message, emit_thought,
+    filter_tools_edit_and_shell, is_round_limit_stop_message, is_true_noop_tool_step,
+    normalize_sandbox_profile, offline_plan_steps, parse_effort_arg, propose_plan_with_model,
+    push_assistant, push_thought, push_tool, resolve_turn_max_rounds, round_limit_stop_message,
+    sandbox_blocks_shell, sandbox_is_readonly, surface_rate_limit_or_error, tool_kind,
+    tool_step_signature, tool_web_fetch, AgentStep, IdenticalToolCallRun, McpToolIndex,
 };
 use crate::local_tools;
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
@@ -3711,6 +3712,7 @@ impl AgentHostHandle {
         let (tools, mcp_index) = coding_agent_tools(&mcp_specs);
         // #168: at most one Stop-hook continue per user turn
         let mut stop_continued = false;
+        let mut identical_tool_calls = IdenticalToolCallRun::default();
 
         for round in 1..=max_rounds {
             if cancel.is_cancelled() {
@@ -3720,7 +3722,43 @@ impl AgentHostHandle {
                 return Ok(msg);
             }
 
-            self.append_pending_steering_messages(session_id, event_tx, &mut messages);
+            let steering_count =
+                self.append_pending_steering_messages(session_id, event_tx, &mut messages);
+
+            // Give an explicit steering prompt one model boundary to break a
+            // stationary run before applying the automatic stop.
+            if steering_count == 0 {
+                if let Some((run_len, tool_name, true_noop)) = identical_tool_calls.stop_info() {
+                    let msg = action_stationarity_stop_message(run_len, &tool_name, true_noop);
+                    let _ = event_tx.send(SessionUpdate::AgentProgress {
+                        session_id,
+                        round: round as u32,
+                        max_rounds: max_rounds as u32,
+                        last_tool: Some(tool_name),
+                        detail: msg.clone(),
+                    });
+                    emit_message(event_tx, session_id, &msg);
+                    push_assistant(self, session_id, &msg);
+                    return Ok(msg);
+                }
+            }
+
+            if identical_tool_calls.take_nudge() {
+                let run_len = identical_tool_calls.run_len();
+                let tool_name = identical_tool_calls.tool_name();
+                let nudge = action_stationarity_nudge(&tool_name, run_len);
+                let _ = event_tx.send(SessionUpdate::AgentProgress {
+                    session_id,
+                    round: round as u32,
+                    max_rounds: max_rounds as u32,
+                    last_tool: Some(tool_name),
+                    detail: nudge.clone(),
+                });
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": nudge,
+                }));
+            }
 
             // Budget-aware coaching when max_agent_rounds is tight (#187/#188).
             let remaining = max_rounds.saturating_sub(round) + 1;
@@ -3929,6 +3967,17 @@ impl AgentHostHandle {
                             "content": content,
                         }));
                     }
+
+                    let signature = tool_step_signature(&tool_calls);
+                    let tool_name = tool_calls
+                        .first()
+                        .map(|tool_call| tool_call.name.as_str())
+                        .unwrap_or("");
+                    identical_tool_calls.observe(
+                        &signature,
+                        tool_name,
+                        is_true_noop_tool_step(&tool_calls),
+                    );
                 }
             }
         }
