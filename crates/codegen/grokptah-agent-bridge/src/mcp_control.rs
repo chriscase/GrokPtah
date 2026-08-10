@@ -28,8 +28,11 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use crate::discover::grokptah_home;
+use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    OrchError, OrchErrorCode, OrchestrationService, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    OrchError, OrchErrorCode, OrchStore, OrchestrationConfig, OrchestrationService,
+    WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 
 /// Max concurrent in-flight MCP requests (post-auth).
@@ -121,6 +124,65 @@ impl ControlServerHandle {
             "activeRequests": state_active,
             "totalRequests": state_total,
         })
+    }
+}
+
+/// Desktop / live-smoke bootstrap: start control from the same env contract the
+/// Tauri app uses (`GROKPTAH_CONTROL_TOKEN`, `GROKPTAH_CONTROL_PORT`,
+/// `GROKPTAH_CONTROL_WORKSPACES`). Returns `None` when token is unset, no
+/// workspaces can be allowlisted, or bind fails.
+///
+/// This is the **production entry path** shared by desktop and the live
+/// coordinator smoke harness — not a second policy surface.
+pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServerHandle> {
+    let token = std::env::var("GROKPTAH_CONTROL_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let port: u16 = std::env::var("GROKPTAH_CONTROL_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(list) = std::env::var("GROKPTAH_CONTROL_WORKSPACES") {
+        // Platform-correct path list (':' on Unix, ';' on Windows).
+        for part in std::env::split_paths(&list) {
+            if !part.as_os_str().is_empty() {
+                roots.push(part);
+            }
+        }
+    }
+    // Prefer current project cwd from host status (desktop sets this from UI).
+    if let Some(cwd) = host.status().project_cwd {
+        roots.push(PathBuf::from(cwd));
+    }
+    if roots.is_empty() {
+        eprintln!(
+            "[grokptah] MCP control: no workspaces allowlisted; set GROKPTAH_CONTROL_WORKSPACES"
+        );
+        return None;
+    }
+    let store = OrchStore::open(grokptah_home().join("orchestration")).ok()?;
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: token.clone(),
+            allowlist: WorkspaceAllowlist::new(roots),
+            max_concurrent_runs: 4,
+            bounds: Default::default(),
+        },
+    );
+    match start_control_server(orch, port).await {
+        Ok(mut h) => {
+            h.token = token;
+            Some(h)
+        }
+        Err(e) => {
+            eprintln!("[grokptah] MCP control failed to bind: {e:#}");
+            None
+        }
     }
 }
 

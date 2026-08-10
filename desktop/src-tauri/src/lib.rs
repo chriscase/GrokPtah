@@ -4,13 +4,9 @@ mod commands;
 mod event_forward;
 mod pty_host;
 
-use std::path::PathBuf;
 use std::sync::Mutex;
 
-use grokptah_agent_bridge::{
-    grokptah_home, AgentHost, ControlServerHandle, HostConfig, OrchStore, OrchestrationConfig,
-    OrchestrationService, WorkspaceAllowlist,
-};
+use grokptah_agent_bridge::{start_control_from_env, AgentHost, ControlServerHandle, HostConfig};
 use tauri::Manager;
 
 pub struct AppState {
@@ -165,54 +161,9 @@ pub fn run() {
 }
 
 /// Start control plane when `GROKPTAH_CONTROL_TOKEN` is set (loopback only).
+/// Delegates to the shared bridge bootstrap used by the live coordinator smoke.
 async fn start_embedded_control(
     host: grokptah_agent_bridge::AgentHostHandle,
 ) -> Option<ControlServerHandle> {
-    let token = std::env::var("GROKPTAH_CONTROL_TOKEN")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())?;
-    let port: u16 = std::env::var("GROKPTAH_CONTROL_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Ok(list) = std::env::var("GROKPTAH_CONTROL_WORKSPACES") {
-        // Platform-correct path list (':' on Unix, ';' on Windows).
-        for part in std::env::split_paths(&list) {
-            if !part.as_os_str().is_empty() {
-                roots.push(part);
-            }
-        }
-    }
-    // Prefer current project cwd from host status.
-    if let Some(cwd) = host.status().project_cwd {
-        roots.push(PathBuf::from(cwd));
-    }
-    if roots.is_empty() {
-        eprintln!("[grokptah] MCP control: no workspaces allowlisted; set GROKPTAH_CONTROL_WORKSPACES");
-        return None;
-    }
-    let store = OrchStore::open(grokptah_home().join("orchestration")).ok()?;
-    let orch = OrchestrationService::new(
-        host.clone(),
-        host.event_bus(),
-        store,
-        OrchestrationConfig {
-            bearer_token: token.clone(),
-            allowlist: WorkspaceAllowlist::new(roots),
-            max_concurrent_runs: 4,
-            bounds: Default::default(),
-        },
-    );
-    match grokptah_agent_bridge::start_control_server(orch, port).await {
-        Ok(mut h) => {
-            h.token = token;
-            Some(h)
-        }
-        Err(e) => {
-            eprintln!("[grokptah] MCP control failed to bind: {e:#}");
-            None
-        }
-    }
+    start_control_from_env(host).await
 }

@@ -8,6 +8,61 @@ This document is the **contract** a coordinator should implement against.
 Deterministic tests that prove it live under
 `crates/codegen/grokptah-agent-bridge/tests/`.
 
+## Launch (desktop / production)
+
+The Tauri desktop app starts the control plane only when a token is configured.
+Bootstrap is **`start_control_from_env`** in the bridge (desktop
+`start_embedded_control` is a thin wrapper — do not fork this logic).
+
+| Env var | Required | Meaning |
+|---------|----------|---------|
+| `GROKPTAH_CONTROL_TOKEN` | **yes** | Bearer secret; empty/unset → control **does not start** |
+| `GROKPTAH_CONTROL_PORT` | no | Bind port; default **`0`** (ephemeral). Always `127.0.0.1` |
+| `GROKPTAH_CONTROL_WORKSPACES` | conditional | Platform path list (`:` on Unix, `;` on Windows). If empty, host **project cwd** is used when set; if still empty → fail closed (no server) |
+
+### Desktop dev example
+
+```bash
+# Disposable workspace only — never point at private user trees for tests.
+export GROKPTAH_CONTROL_TOKEN="$(openssl rand -hex 24)"
+export GROKPTAH_CONTROL_PORT=0          # or fixed e.g. 39200
+export GROKPTAH_CONTROL_WORKSPACES="/path/to/disposable/project"
+# optional: offline agent for deterministic smoke
+export GROKPTAH_AGENT_OFFLINE=1
+
+cd desktop && npm run tauri:dev
+# Log line on success:
+#   [grokptah] MCP control plane listening on http://127.0.0.1:<port>/mcp
+```
+
+Discover the bound address from that log or `GET http://127.0.0.1:<port>/health`
+(if you fixed the port). Health is **unauthenticated** but loopback-only.
+
+### Headless / CI equivalent
+
+Rust integration test `live_desktop_bootstrap_node_smoke` starts the **same**
+bootstrap (`start_control_from_env`) with a disposable home + workspace, then
+runs `tests/mcp_sdk_interop/run_live_smoke.mjs` (independent Node client).
+
+```bash
+cd crates/codegen/grokptah-agent-bridge
+cargo test --test mcp_streamable_transport live_desktop_bootstrap_node_smoke -- --nocapture
+```
+
+### Authentication
+
+- Every `/mcp` request: `Authorization: Bearer <GROKPTAH_CONTROL_TOKEN>`
+- Missing or wrong token → **401** (including malformed body without token —
+  auth runs **before** body work)
+- Token is held only in process memory / env; not written to tool outputs or shell env for agent children
+
+### Shutdown
+
+- Desktop process exit tears down the listener (graceful shutdown on control handle drop / cancel).
+- Coordinator should `DELETE /mcp` with `mcp-session-id` to end an MCP session (**204**).
+- Stale `mcp-session-id` after DELETE → client error (fail closed).
+- Reconnect = new `initialize` (new session id); durable **runs** survive process restart when the same GrokPtah home + orch store is reused; in-memory MCP sessions do not.
+
 ## Transport
 
 | Property | Value |

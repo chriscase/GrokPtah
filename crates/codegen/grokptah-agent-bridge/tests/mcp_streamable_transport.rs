@@ -8,7 +8,7 @@ use grokptah_agent_bridge::orchestration::{
     OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, start_control_server,
+    home_override_serial, set_grokptah_home_override, start_control_from_env, start_control_server,
     start_control_server_with, AgentHost, ControlServerLimits, HostConfig, McpControlClient,
     SessionKind, CONTROL_TOOLS,
 };
@@ -1089,4 +1089,132 @@ async fn http_steer_idle_queues_without_starting_run() {
     client.close_session().await.unwrap();
     srv.stop();
     set_grokptah_home_override(None);
+}
+
+/// Live coordinator smoke against the **desktop env bootstrap** path
+/// (`start_control_from_env` — same contract as Tauri `start_embedded_control`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn live_desktop_bootstrap_node_smoke() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let guard = home_override_serial();
+    let home = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".grokptah")).unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+
+    // Disposable token — never a real credential.
+    let token = format!("live-smoke-{}", uuid::Uuid::new_v4());
+    // Isolate env mutations for this process; restore best-effort after.
+    let prev_token = std::env::var("GROKPTAH_CONTROL_TOKEN").ok();
+    let prev_port = std::env::var("GROKPTAH_CONTROL_PORT").ok();
+    let prev_ws = std::env::var("GROKPTAH_CONTROL_WORKSPACES").ok();
+    std::env::set_var("GROKPTAH_CONTROL_TOKEN", &token);
+    std::env::set_var("GROKPTAH_CONTROL_PORT", "0");
+    std::env::set_var("GROKPTAH_CONTROL_WORKSPACES", ws.path().as_os_str());
+
+    let srv = start_control_from_env(host.clone())
+        .await
+        .expect("desktop env bootstrap must start control server");
+    assert!(
+        srv.addr.ip().is_loopback(),
+        "desktop bootstrap must bind loopback, got {}",
+        srv.addr
+    );
+    assert_eq!(srv.token, token);
+
+    // Without token the shared bootstrap fails closed (structural desktop path).
+    std::env::remove_var("GROKPTAH_CONTROL_TOKEN");
+    assert!(
+        start_control_from_env(host.clone()).await.is_none(),
+        "missing GROKPTAH_CONTROL_TOKEN must not start control"
+    );
+    std::env::set_var("GROKPTAH_CONTROL_TOKEN", &token);
+
+    let url = format!("http://{}/mcp", srv.addr);
+    let sdk_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_sdk_interop");
+    if !sdk_dir
+        .join("node_modules/@modelcontextprotocol/sdk")
+        .is_dir()
+    {
+        let st = tokio::process::Command::new("npm")
+            .args(["install", "--no-fund", "--no-audit"])
+            .current_dir(&sdk_dir)
+            .status()
+            .await
+            .expect("npm install");
+        assert!(st.success());
+    }
+    let output = tokio::process::Command::new("node")
+        .arg(sdk_dir.join("run_live_smoke.mjs"))
+        .env("GROKPTAH_MCP_URL", &url)
+        .env("GROKPTAH_MCP_TOKEN", &token)
+        .env("GROKPTAH_MCP_SESSION_ID", session.id.to_string())
+        .env("GROKPTAH_MCP_WORKSPACE", ws.path().display().to_string())
+        .output()
+        .await
+        .expect("spawn live smoke");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "live desktop bootstrap smoke failed\nstdout={stdout}\nstderr={stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(report["ok"], true, "live smoke report={report}");
+    if let Some(failed) = report["failed"].as_array() {
+        assert!(failed.is_empty(), "failed checks: {failed:?}");
+    }
+    // Durable transcript for verifiers (`--nocapture`).
+    eprintln!("LIVE_DESKTOP_MCP_SMOKE_REPORT {report}");
+    if !stderr.trim().is_empty() {
+        eprintln!("LIVE_DESKTOP_MCP_SMOKE_STDERR {stderr}");
+    }
+
+    srv.stop();
+    // Restore env
+    match prev_token {
+        Some(v) => std::env::set_var("GROKPTAH_CONTROL_TOKEN", v),
+        None => std::env::remove_var("GROKPTAH_CONTROL_TOKEN"),
+    }
+    match prev_port {
+        Some(v) => std::env::set_var("GROKPTAH_CONTROL_PORT", v),
+        None => std::env::remove_var("GROKPTAH_CONTROL_PORT"),
+    }
+    match prev_ws {
+        Some(v) => std::env::set_var("GROKPTAH_CONTROL_WORKSPACES", v),
+        None => std::env::remove_var("GROKPTAH_CONTROL_WORKSPACES"),
+    }
+    set_grokptah_home_override(None);
+    drop(guard);
+}
+
+/// Desktop wiring must keep delegating to the shared bootstrap (no fork of policy).
+#[test]
+fn desktop_control_bootstrap_uses_shared_start_control_from_env() {
+    let lib =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../desktop/src-tauri/src/lib.rs");
+    let src = std::fs::read_to_string(&lib).expect("read desktop lib.rs");
+    assert!(
+        src.contains("start_control_from_env"),
+        "desktop must call shared start_control_from_env"
+    );
+    assert!(
+        src.contains("GROKPTAH_CONTROL_TOKEN") || src.contains("start_embedded_control"),
+        "desktop control entry must remain present"
+    );
+    // Must not re-implement OrchStore::open + start_control_server inline.
+    assert!(
+        !src.contains("OrchStore::open(grokptah_home()"),
+        "desktop must not re-open orch store outside shared bootstrap"
+    );
 }
