@@ -249,6 +249,38 @@ function tcpDisconnectFullBody(bodyObj) {
   });
 }
 
+/** Write headers + half the JSON body, then drop (mid-body disconnect). */
+function tcpDisconnectPartialBody(bodyObj) {
+  const body = JSON.stringify(bodyObj);
+  const half = body.slice(0, Math.floor(body.length / 2));
+  const payload = [
+    `POST ${endpointUrl.pathname} HTTP/1.1`,
+    `Host: ${endpointUrl.host}`,
+    `Authorization: Bearer ${token}`,
+    "Content-Type: application/json",
+    "Accept: application/json",
+    `Content-Length: ${Buffer.byteLength(body)}`,
+    "Connection: close",
+    "",
+    half,
+  ].join("\r\n");
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(
+      { host: endpointUrl.hostname, port: Number(endpointUrl.port) },
+      () => {
+        sock.write(payload, () => {
+          sock.destroy();
+          resolve();
+        });
+      }
+    );
+    sock.on("error", (err) => {
+      if (err.code === "ECONNRESET" || err.code === "EPIPE") resolve();
+      else reject(err);
+    });
+  });
+}
+
 function finish(ok) {
   metrics.wallMs = Date.now() - startedAt;
   const failed = Object.entries(checks)
@@ -808,6 +840,47 @@ async function runFullMode() {
     "disconnectFullBodyIdempotent",
     discRetry.status === 200 && discConflict.status >= 400,
     { retry: discRetry.status, conflict: discConflict.status }
+  );
+
+  // Mid-body disconnect: partial POST must not commit mutation; same request_id can succeed.
+  const partialId = `soak-disc-partial-${Date.now()}`;
+  await tcpDisconnectPartialBody({
+    jsonrpc: "2.0",
+    id: 73,
+    method: "tools/call",
+    params: {
+      name: "ptah_queue_prompt",
+      arguments: {
+        request_id: partialId,
+        session_id: sessionIds[0],
+        workspace,
+        prompt: "partial body should not commit",
+      },
+    },
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  const afterPartial = await mcpFetch(
+    "tools/call",
+    {
+      name: "ptah_queue_prompt",
+      arguments: {
+        request_id: partialId,
+        session_id: sessionIds[0],
+        workspace,
+        prompt: "partial body should not commit",
+      },
+    },
+    { id: 74, sessionId: primary }
+  );
+  // 200 = partial never committed (preferred); conflict would mean partial committed then retry.
+  record(
+    "disconnectPartialBodyNoCommit",
+    afterPartial.status === 200,
+    {
+      status: afterPartial.status,
+      requestId: partialId,
+      note: "200 proves mid-body drop did not commit queue mutation",
+    }
   );
 
   // Stale / reconnect

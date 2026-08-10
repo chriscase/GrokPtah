@@ -328,6 +328,7 @@ async fn soak_desktop_bootstrap_node_campaign() {
         "cancelRace",
         "queueIdempotent",
         "disconnectFullBodyIdempotent",
+        "disconnectPartialBodyNoCommit",
         "staleSessionFailClosed",
         "reconnect",
         "durableRunVisibleAfterMcpReconnect",
@@ -590,6 +591,8 @@ fn soak_harness_and_desktop_bootstrap_present() {
     assert!(body.contains("requestTimeout504"));
     assert!(body.contains("durableChanges"));
     assert!(body.contains("completedHandoff"));
+    assert!(body.contains("tcpDisconnectPartialBody"));
+    assert!(body.contains("disconnectPartialBodyNoCommit"));
     let desktop =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../desktop/src-tauri/src/lib.rs");
     let dsrc = std::fs::read_to_string(desktop).unwrap();
