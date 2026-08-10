@@ -84,4 +84,45 @@ describe("StyledSelect (#126)", () => {
     expect(menu).toHaveAttribute("data-placement", "above");
     expect(menu).toHaveStyle({ position: "fixed", bottom: "72px" });
   });
+
+  it("supports keyboard navigation and returns focus after selection", () => {
+    const onChange = vi.fn();
+    render(
+      createElement(StyledSelect, {
+        "aria-label": "Effort",
+        value: "medium",
+        options: ["low", "medium", "high"].map((value) => ({
+          value,
+          label: value,
+        })),
+        onChange,
+      }),
+    );
+
+    const trigger = screen.getByRole("button", { name: "Effort" });
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    const current = screen.getByRole("option", { name: "medium" });
+    fireEvent.keyDown(current, { key: "ArrowDown" });
+    fireEvent.keyDown(screen.getByRole("option", { name: "high" }), {
+      key: "Enter",
+    });
+
+    expect(onChange).toHaveBeenCalledWith("high");
+    expect(trigger).toHaveFocus();
+  });
+
+  it("does not open while disabled", () => {
+    render(
+      createElement(StyledSelect, {
+        "aria-label": "Model",
+        value: "grok-build",
+        options: [{ value: "grok-build", label: "Grok Build" }],
+        disabled: true,
+        onChange: vi.fn(),
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
 });

@@ -59,6 +59,7 @@ import {
 import { displaySessionTitle } from "./lib/sessionTitle";
 import { entriesToTranscriptItems, hasInterruptedTurn } from "./lib/transcript";
 import { appendThoughtChunk } from "./lib/thoughtText";
+import { createLatestRequestGuard } from "./lib/latestRequest";
 import {
   doneActivity,
   errorActivity,
@@ -323,6 +324,7 @@ export default function App() {
   const maxDocks = useMaxDocks(stageRef, layoutDensity);
   const splitOk = maxDocks >= 2;
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
+  const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
 
   // Keep docks valid: unique, open tabs only, within capacity, include focus
   useEffect(() => {
@@ -564,6 +566,7 @@ export default function App() {
   }, [refreshSessions]);
 
   const refreshChrome = useCallback(async () => {
+    const request = chromeRefreshGuard.begin();
     try {
       const [st, au, md, sess, info] = await Promise.all([
         api.agentStatus(),
@@ -572,11 +575,13 @@ export default function App() {
         api.sessionList(),
         api.productInfo(),
       ]);
+      if (!chromeRefreshGuard.isCurrent(request)) return;
       let effectiveStatus = st;
       if (md.some((model) => model.id === st.model)) {
         const normalizedEffort = effortForModel(md, st.model, st.effort);
         if (normalizedEffort !== st.effort) {
           await api.setEffort(normalizedEffort);
+          if (!chromeRefreshGuard.isCurrent(request)) return;
           effectiveStatus = { ...st, effort: normalizedEffort };
         }
       }
@@ -598,7 +603,7 @@ export default function App() {
     } catch (e) {
       console.warn("refresh failed (browser-only?)", e);
     }
-  }, []);
+  }, [chromeRefreshGuard]);
 
   // Chrome refresh on mount only (not tied to the event listener).
   useEffect(() => {
@@ -2462,18 +2467,25 @@ export default function App() {
                     );
                   }
                 }}
+                onError={(message) => {
+                  patchTab(activeSessionId, (tab) => ({
+                    ...tab,
+                    activity: errorActivity(message),
+                  }));
+                }}
               />
             )}
             <div className="composer-toolbar">
               <div className="composer-toolbar-left">
                 <label
-                  className="composer-pill"
+                  className={`composer-pill ${models.length === 0 ? "is-disabled" : ""}`}
                   title="Model (default from Settings)"
                 >
                   <span className="composer-pill-label">Model</span>
                   <StyledSelect
                     aria-label="Model"
                     className="composer-select"
+                    disabled={models.length === 0}
                     value={
                       models.some((m) => m.id === status?.model)
                         ? (status?.model ?? models[0]?.id ?? "grok-build")
@@ -2500,13 +2512,14 @@ export default function App() {
                   />
                 </label>
                 <label
-                  className="composer-pill"
+                  className={`composer-pill ${models.length === 0 ? "is-disabled" : ""}`}
                   title="Effort (default from Settings)"
                 >
                   <span className="composer-pill-label">Effort</span>
                   <StyledSelect
                     aria-label="Effort"
                     className="composer-select"
+                    disabled={models.length === 0}
                     value={currentEffort}
                     options={effortOptions.map((e) => ({ value: e, label: e }))}
                     onChange={(v) => {
