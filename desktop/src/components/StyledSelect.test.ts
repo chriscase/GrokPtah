@@ -1,9 +1,17 @@
 import { readFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
-import { describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { StyledSelect } from "./StyledSelect";
 
 const root = dirname(fileURLToPath(import.meta.url));
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("StyledSelect (#126)", () => {
   it("Settings and composer no longer use native <select>", () => {
@@ -21,5 +29,49 @@ describe("StyledSelect (#126)", () => {
     expect(src).toMatch(/role="listbox"/);
     expect(src).toMatch(/role="option"/);
     expect(src).not.toMatch(/<select[\s>]/);
+  });
+
+  it("positions menus against the viewport so bottom-toolbar pickers can flip up", () => {
+    const src = readFileSync(join(root, "StyledSelect.tsx"), "utf8");
+    expect(src).toMatch(/position: "fixed"/);
+    expect(src).toMatch(/placement === "above"/);
+    expect(src).toMatch(/addEventListener\("resize"/);
+    expect(src).toMatch(/addEventListener\("scroll", onViewportChange, true\)/);
+  });
+
+  it("does not require bridge status before dismissing the launch splash", () => {
+    const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
+    expect(app).toMatch(/const splashReady = workspaceRestored;/);
+  });
+
+  it("flips a bottom-anchored menu above its trigger", () => {
+    vi.spyOn(HTMLButtonElement.prototype, "getBoundingClientRect").mockReturnValue({
+      top: 700,
+      bottom: 720,
+      left: 900,
+      right: 960,
+      width: 60,
+      height: 20,
+      x: 900,
+      y: 700,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    render(
+      createElement(StyledSelect, {
+        "aria-label": "Effort",
+        value: "medium",
+        options: ["none", "low", "medium", "high", "max"].map((value) => ({
+          value,
+          label: value,
+        })),
+        onChange: vi.fn(),
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Effort" }));
+    const menu = screen.getByRole("listbox");
+    expect(menu).toHaveAttribute("data-placement", "above");
+    expect(menu).toHaveStyle({ position: "fixed", bottom: "72px" });
   });
 });

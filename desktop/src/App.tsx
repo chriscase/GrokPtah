@@ -1676,7 +1676,9 @@ export default function App() {
     }
   }
 
-  const splashReady = workspaceRestored && status !== null;
+  // A missing status is rendered as an offline/no-project state elsewhere;
+  // it must not leave the launch splash blocking every control forever.
+  const splashReady = workspaceRestored;
 
   return (
     <div

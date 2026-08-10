@@ -4129,12 +4129,20 @@ button:disabled {
 }
 
 /* Jump to latest when user scrolled up mid-stream (#123) */
+.jump-to-latest-slot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-height: 2.35rem;
+  padding: 0.25rem 0.5rem 0.35rem;
+  border-top: 1px solid var(--border-soft);
+  background: var(--bg);
+  z-index: 10;
+}
 .jump-to-latest {
-  position: absolute;
-  bottom: 3.25rem;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 5;
+  position: static;
+  transform: none;
   padding: 0.35rem 0.85rem;
   border-radius: 999px;
   border: 1px solid var(--accent-dim);
@@ -4144,6 +4152,7 @@ button:disabled {
   font-family: var(--font-ui);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
   cursor: pointer;
+  white-space: nowrap;
 }
 .jump-to-latest:hover {
   background: var(--accent-bg);
