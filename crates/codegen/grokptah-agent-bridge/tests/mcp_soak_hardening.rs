@@ -161,7 +161,7 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     let r429: serde_json::Value = serde_json::from_str(s429.trim()).unwrap();
     assert_eq!(r429["checks"]["capacity429"], true);
     assert!(r429["metrics"]["capacity429"].as_u64().unwrap_or(0) >= 1);
-    srv.stop();
+    srv.stop_and_wait().await;
 
     // --- 504: inject > request timeout ---
     std::env::set_var("GROKPTAH_CONTROL_MAX_CONCURRENT", "4");
@@ -187,7 +187,7 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     assert!(out504.status.success(), "504 soak failed: {s504}");
     let r504: serde_json::Value = serde_json::from_str(s504.trim()).unwrap();
     assert_eq!(r504["checks"]["requestTimeout504"], true);
-    srv2.stop();
+    srv2.stop_and_wait().await;
 
     for (k, v) in prev {
         restore_env(k, v);
@@ -361,7 +361,7 @@ async fn soak_desktop_bootstrap_node_campaign() {
     );
 
     // Live control process restart: stop server, re-bootstrap, durable run still readable.
-    srv.stop();
+    srv.stop_and_wait().await;
     let srv2 = start_control_from_env(host.clone())
         .await
         .expect("re-bootstrap after stop");
@@ -377,7 +377,7 @@ async fn soak_desktop_bootstrap_node_campaign() {
         ws.path().join("soak_marker.txt").is_file(),
         "offline write must leave soak_marker.txt"
     );
-    srv2.stop();
+    srv2.stop_and_wait().await;
 
     restore_env("GROKPTAH_CONTROL_TOKEN", prev_token);
     restore_env("GROKPTAH_CONTROL_PORT", prev_port);
