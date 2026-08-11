@@ -17,9 +17,10 @@ use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     build_agent_messages, build_compact_summary, call_xai_agent_step, call_xai_chat,
     cargo_test_output_failed, coding_agent_tools, emit_message, emit_thought,
-    filter_tools_edit_and_shell, is_round_limit_stop_message, is_true_noop_tool_step,
-    normalize_sandbox_profile, offline_plan_steps, parse_effort_arg, propose_plan_with_model,
-    push_assistant, push_thought, push_tool, resolve_turn_max_rounds, round_limit_stop_message,
+    filter_tools_edit_and_shell, filter_tools_edit_only, is_round_limit_stop_message,
+    is_true_noop_tool_step, normalize_sandbox_profile, offline_plan_steps, parse_effort_arg,
+    propose_plan_with_model, push_assistant, push_thought, push_tool,
+    recovery_round_limit_stop_message, resolve_turn_max_rounds, round_limit_stop_message,
     sandbox_blocks_shell, sandbox_is_readonly, surface_rate_limit_or_error, tool_kind,
     tool_step_signature, tool_web_fetch, AgentStep, IdenticalToolCallRun, McpToolIndex,
 };
@@ -3713,8 +3714,19 @@ impl AgentHostHandle {
         // #168: at most one Stop-hook continue per user turn
         let mut stop_continued = false;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
+        let mut test_failure_needs_edit = false;
+        let mut recovery_grace = false;
 
-        for round in 1..=max_rounds {
+        for round in 1..=max_rounds.saturating_add(1) {
+            let in_recovery_grace = round > max_rounds;
+            if in_recovery_grace && !recovery_grace {
+                break;
+            }
+            let visible_max_rounds = if in_recovery_grace {
+                max_rounds.saturating_add(1)
+            } else {
+                max_rounds
+            };
             if cancel.is_cancelled() {
                 let msg = "(cancelled)".to_string();
                 emit_message(event_tx, session_id, &msg);
@@ -3733,7 +3745,7 @@ impl AgentHostHandle {
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
                         session_id,
                         round: round as u32,
-                        max_rounds: max_rounds as u32,
+                        max_rounds: visible_max_rounds as u32,
                         last_tool: Some(tool_name),
                         detail: msg.clone(),
                     });
@@ -3750,7 +3762,7 @@ impl AgentHostHandle {
                 let _ = event_tx.send(SessionUpdate::AgentProgress {
                     session_id,
                     round: round as u32,
-                    max_rounds: max_rounds as u32,
+                    max_rounds: visible_max_rounds as u32,
                     last_tool: Some(tool_name),
                     detail: nudge.clone(),
                 });
@@ -3761,8 +3773,21 @@ impl AgentHostHandle {
             }
 
             // Budget-aware coaching when max_agent_rounds is tight (#187/#188).
-            let remaining = max_rounds.saturating_sub(round) + 1;
-            let tools_this_round = if max_rounds <= 8 && remaining == 1 {
+            let remaining = if in_recovery_grace {
+                1
+            } else {
+                max_rounds.saturating_sub(round) + 1
+            };
+            let tools_this_round = if in_recovery_grace {
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": "TEST RECOVERY: the model budget ended with an unresolved cargo test failure. Use the reported failures and source already in context, then apply all required edits now. This is one bounded recovery step; do not stop at a diagnosis or claim success without editing.",
+                }));
+                // The model has already received a concrete failing test report.
+                // Make this one recovery boundary an edit boundary so it cannot
+                // spend the bounded grace step on another exploratory read.
+                filter_tools_edit_only(&tools)
+            } else if max_rounds <= 8 && remaining == 1 {
                 messages.push(serde_json::json!({
                     "role": "system",
                     "content": "BUDGET: FINAL model step. Exploration tools are disabled. Use only write_files / write_file / apply_patch / run_terminal_cmd. Apply all remaining fixes and run cargo test now.",
@@ -3782,9 +3807,9 @@ impl AgentHostHandle {
             let _ = event_tx.send(SessionUpdate::AgentProgress {
                 session_id,
                 round: round as u32,
-                max_rounds: max_rounds as u32,
+                max_rounds: visible_max_rounds as u32,
                 last_tool: None,
-                detail: format!("Model step {round}/{max_rounds}"),
+                detail: format!("Model step {round}/{visible_max_rounds}"),
             });
 
             let step = match call_xai_agent_step(
@@ -3818,6 +3843,20 @@ impl AgentHostHandle {
                 } => {
                     if let Some(r) = reasoning.as_deref() {
                         push_thought(self, session_id, r);
+                    }
+                    if max_rounds <= 8 && test_failure_needs_edit && round <= max_rounds {
+                        messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": text,
+                        }));
+                        if round == max_rounds {
+                            recovery_grace = true;
+                        }
+                        messages.push(serde_json::json!({
+                            "role": "system",
+                            "content": "TEST RECOVERY is incomplete. Do not provide a final answer yet. Apply the code edits required by the failing tests.",
+                        }));
+                        continue;
                     }
                     let text = if text.trim().is_empty() {
                         if reasoning.as_ref().is_some_and(|r| !r.trim().is_empty()) {
@@ -3921,7 +3960,7 @@ impl AgentHostHandle {
                         let _ = event_tx.send(SessionUpdate::AgentProgress {
                             session_id,
                             round: round as u32,
-                            max_rounds: max_rounds as u32,
+                            max_rounds: visible_max_rounds as u32,
                             last_tool: Some(tc.name.clone()),
                             detail: format!("Tool `{}` (round {round})", tc.name),
                         });
@@ -3951,14 +3990,24 @@ impl AgentHostHandle {
                         } else {
                             content
                         };
-                        // After cargo test failures under a tight budget, force edit-next coaching.
+                        if output.is_ok()
+                            && matches!(
+                                tc.name.as_str(),
+                                "write_files" | "write_file" | "apply_patch"
+                            )
+                            && !content.starts_with("ERROR:")
+                            && !content.starts_with("DENIED")
+                        {
+                            test_failure_needs_edit = false;
+                        }
                         if max_rounds <= 8
                             && tc.name == "run_terminal_cmd"
                             && cargo_test_output_failed(&content)
                         {
+                            test_failure_needs_edit = true;
                             messages.push(serde_json::json!({
                                 "role": "system",
-                                "content": "cargo test reported failures. Your next step MUST apply code edits for ALL failing tests (prefer write_files or multi-file apply_patch in one step). Do not only re-read docs/README. Then re-run cargo test.",
+                                "content": "cargo test reported failures. Continue diagnosing as needed, but apply code edits for ALL failing tests before providing a final answer.",
                             }));
                         }
                         messages.push(serde_json::json!({
@@ -3966,6 +4015,12 @@ impl AgentHostHandle {
                             "tool_call_id": tc.id,
                             "content": content,
                         }));
+                    }
+
+                    // Preserve normal inspection after an early failure. If the
+                    // budget ends without an edit, arm exactly one edit-only pass.
+                    if max_rounds <= 8 && round == max_rounds && test_failure_needs_edit {
+                        recovery_grace = true;
                     }
 
                     let signature = tool_step_signature(&tool_calls);
@@ -3982,7 +4037,11 @@ impl AgentHostHandle {
             }
         }
 
-        let msg = round_limit_stop_message(max_rounds);
+        let msg = if recovery_grace {
+            recovery_round_limit_stop_message(max_rounds)
+        } else {
+            round_limit_stop_message(max_rounds)
+        };
         debug_assert!(is_round_limit_stop_message(&msg));
         emit_message(event_tx, session_id, &msg);
         push_assistant(self, session_id, &msg);

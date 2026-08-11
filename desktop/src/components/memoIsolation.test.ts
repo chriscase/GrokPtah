@@ -104,3 +104,19 @@ describe("jump to latest (#123)", () => {
     expect(src).toMatch(/showJump/);
   });
 });
+
+describe("compact stage layout", () => {
+  it("keeps narrow-window rails out of the stage grid", () => {
+    const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
+    const css = readFileSync(join(root, "..", "styles", "app.css"), "utf8");
+
+    // Compact windows collapse both rails on first render; header controls can
+    // explicitly reopen them as overlays without shrinking the composer.
+    expect(app).toMatch(
+      /layoutDensity === "compact"[\s\S]*setSidebarCollapsed\(true\)[\s\S]*setRightbarCollapsed\(true\)/,
+    );
+    expect(css).toMatch(
+      /@media \(max-width: 760px\)[\s\S]*grid-template-columns: minmax\(0, 1fr\)[\s\S]*\.sidebar,[\s\S]*\.rightbar[\s\S]*position: absolute[\s\S]*\.sidebar\.is-collapsed,[\s\S]*\.rightbar\.is-collapsed[\s\S]*display: none;/,
+    );
+  });
+});

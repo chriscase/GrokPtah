@@ -140,10 +140,17 @@ pub fn cargo_test_output_failed(output: &str) -> bool {
         // Still check common cargo failure markers without requiring the word cargo
         // (quiet mode may omit it in tails).
     }
+    let nonzero_exit = lower.split("(exit ").skip(1).any(|tail| {
+        tail.split(')')
+            .next()
+            .and_then(|code| code.trim().parse::<i32>().ok())
+            .is_some_and(|code| code != 0)
+    });
     lower.contains("error: test failed")
         || lower.contains("test result: failed")
         || lower.contains("failures:")
         || (lower.contains("failed") && lower.contains("test") && !lower.contains("0 failed"))
+        || (nonzero_exit && (lower.contains("cargo") || lower.contains("test")))
 }
 
 /// Efficiency / multi-step guidance shared by the coding-agent system prompt (#187/#188).
@@ -390,6 +397,27 @@ pub(crate) fn filter_tools_edit_and_shell(tools: &serde_json::Value) -> serde_js
     } else {
         serde_json::Value::Array(filtered)
     }
+}
+
+/// Restrict a bounded recovery boundary to tools that can change source files.
+pub(crate) fn filter_tools_edit_only(tools: &serde_json::Value) -> serde_json::Value {
+    let Some(arr) = tools.as_array() else {
+        return tools.clone();
+    };
+    let keep = ["write_files", "write_file", "apply_patch"];
+    let filtered: Vec<serde_json::Value> = arr
+        .iter()
+        .filter(|t| {
+            let name = t
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            keep.contains(&name)
+        })
+        .cloned()
+        .collect();
+    serde_json::Value::Array(filtered)
 }
 
 fn tool_schema_priority(tool: &serde_json::Value) -> u8 {
@@ -795,9 +823,20 @@ pub(crate) fn round_limit_stop_message(max_rounds: usize) -> String {
     )
 }
 
+/// Final text when one bounded test-recovery step was used and still did not
+/// produce a final answer.
+pub(crate) fn recovery_round_limit_stop_message(max_rounds: usize) -> String {
+    format!(
+        "Stopped after {max_rounds} tool rounds plus one bounded test-recovery step without a final answer. \
+         Ask me to continue, or narrow the task."
+    )
+}
+
 /// True when final assistant text is the round-budget stop message.
 pub(crate) fn is_round_limit_stop_message(text: &str) -> bool {
-    text.starts_with("Stopped after ") && text.contains("tool rounds without a final answer")
+    text.starts_with("Stopped after ")
+        && text.contains("tool rounds")
+        && text.contains("without a final answer")
 }
 
 pub(crate) fn offline_plan_steps(goal: &str) -> Vec<String> {
@@ -1690,6 +1729,9 @@ mod efficiency_tests {
         assert!(is_round_limit_stop_message(&msg));
         assert!(msg.contains("Stopped after 2 tool rounds"));
         assert!(!is_round_limit_stop_message("(offline agent) done: hi"));
+        let recovery = recovery_round_limit_stop_message(2);
+        assert!(is_round_limit_stop_message(&recovery));
+        assert!(recovery.contains("bounded test-recovery step"));
     }
 
     #[test]
@@ -1715,6 +1757,8 @@ mod efficiency_tests {
         assert!(cargo_test_output_failed(
             "error: test failed, to rerun pass"
         ));
+        assert!(cargo_test_output_failed("cargo test output\n(exit 101)"));
+        assert!(!cargo_test_output_failed("cargo test output\n(exit 0)"));
         assert!(!cargo_test_output_failed(
             "test result: ok. 2 passed; 0 failed; 0 ignored"
         ));
@@ -1734,6 +1778,29 @@ mod efficiency_tests {
         assert!(names.contains(&"run_terminal_cmd"));
         assert!(!names.contains(&"list_dir"));
         assert!(!names.contains(&"grep"));
+    }
+
+    #[test]
+    fn filter_tools_edit_only_drops_non_mutating_tools() {
+        let (tools, _) = coding_agent_tools(&[]);
+        let filtered = filter_tools_edit_only(&tools);
+        let names: Vec<&str> = filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"write_files"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"apply_patch"));
+        assert!(!names.contains(&"run_terminal_cmd"));
+        assert!(!names.contains(&"read_file"));
+
+        let unknown = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "future_tool"}
+        }]);
+        assert_eq!(filter_tools_edit_only(&unknown), serde_json::json!([]));
     }
 
     #[test]
