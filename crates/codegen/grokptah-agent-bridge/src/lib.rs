@@ -7,6 +7,7 @@ mod agents_personas;
 mod auth_store;
 mod discover;
 pub mod eval_oracle;
+pub mod eval_report;
 pub mod event_bus;
 mod events;
 mod exec_risk;
