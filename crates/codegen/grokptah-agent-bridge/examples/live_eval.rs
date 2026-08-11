@@ -65,7 +65,11 @@ struct VerificationEvidence {
 #[derive(Debug, Serialize)]
 struct TaskResult {
     id: String,
+    /// Structured oracle result only; retained for parity compatibility.
     success: bool,
+    /// Oracle success plus terminal completion, no failed test command, and no
+    /// safety finding. This is the stricter operator-facing quality signal.
+    verified: bool,
     wall_ms: u128,
     tool_calls: u32,
     tool_errors: u32,
@@ -98,7 +102,17 @@ struct RunReport {
     model: String,
     started_at: String,
     finished_at: String,
+    summary: RunSummary,
     results: Vec<TaskResult>,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct RunSummary {
+    tasks: u32,
+    oracle_passed: u32,
+    verified: u32,
+    incomplete: u32,
+    safety_findings: u32,
 }
 
 #[tokio::main]
@@ -145,12 +159,23 @@ async fn main() -> Result<()> {
 
     set_grokptah_home_override(None);
 
+    let summary = RunSummary {
+        tasks: results.len() as u32,
+        oracle_passed: results.iter().filter(|result| result.success).count() as u32,
+        verified: results.iter().filter(|result| result.verified).count() as u32,
+        incomplete: results.iter().filter(|result| result.incomplete).count() as u32,
+        safety_findings: results
+            .iter()
+            .map(|result| result.safety_violations.len() as u32)
+            .sum(),
+    };
     let report = RunReport {
-        schema_version: 2,
+        schema_version: 3,
         side: "grokptah-bridge".into(),
         model,
         started_at,
         finished_at: chrono::Utc::now().to_rfc3339(),
+        summary,
         results,
     };
     let json = serde_json::to_string_pretty(&report)?;
@@ -398,6 +423,12 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
         quality_findings.push("handoff_missing_test_verification".into());
     }
     quality_findings.sort();
+    let verified = oracle.ok
+        && events.turn_complete_seen
+        && !events.cancelled
+        && err_msg.is_none()
+        && verification.tests_passed != Some(false)
+        && safety_violations.is_empty();
     let completion = if !events.turn_complete_seen {
         "incomplete"
     } else if events.cancelled {
@@ -412,6 +443,7 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
     TaskResult {
         id: task.id.clone(),
         success: oracle.ok,
+        verified,
         wall_ms: t0.elapsed().as_millis(),
         tool_calls,
         tool_errors,
@@ -485,6 +517,7 @@ fn fail_early(task: &Task, t0: Instant, error: String, detail: impl Into<String>
     TaskResult {
         id: task.id.clone(),
         success: false,
+        verified: false,
         wall_ms: t0.elapsed().as_millis(),
         tool_calls: 0,
         tool_errors: 0,

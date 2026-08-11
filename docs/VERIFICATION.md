@@ -19,6 +19,16 @@ All are runnable from a clean clone with caches disabled
 | Offline oracles | `cargo test --locked eval_oracle -- --nocapture` | `crates/codegen/grokptah-agent-bridge` |
 | Focused upstream support | `cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check && cargo clippy -p xai-grok-env -p xai-grok-shell-base --all-targets --all-features --locked -- -D warnings && cargo test -p xai-grok-shell-base --all-features --locked` | repository root |
 
+The deterministic reliability campaign is also a supported focused check:
+
+```sh
+cd crates/codegen/grokptah-agent-bridge
+cargo test --locked --test reliability_eval -- --test-threads=1
+```
+
+For the report-producing operator command and scenario matrix, see
+[RELIABILITY_EVALS.md](RELIABILITY_EVALS.md).
+
 Other focused upstream crates may be tested individually, but their Cargo
 feature wiring varies because Bazel remains the parent project's primary gate.
 

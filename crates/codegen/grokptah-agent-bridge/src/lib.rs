@@ -30,6 +30,7 @@ mod process_tree;
 mod project_context;
 mod prompt_combine;
 mod prompt_queue;
+pub mod reliability_eval;
 mod search_engine;
 mod session;
 mod session_store;
