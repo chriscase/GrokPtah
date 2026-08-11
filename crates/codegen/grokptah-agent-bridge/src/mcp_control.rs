@@ -134,6 +134,12 @@ impl ControlServerHandle {
 ///
 /// This is the **production entry path** shared by desktop and the live
 /// coordinator smoke harness — not a second policy surface.
+///
+/// Optional transport knobs (unset in production → defaults of 32 concurrent /
+/// 120s timeout / no inject delay). Soak and diagnostics may set:
+/// - `GROKPTAH_CONTROL_MAX_CONCURRENT`
+/// - `GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS`
+/// - `GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS` (holds permit for timeout/429 tests)
 pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServerHandle> {
     let token = std::env::var("GROKPTAH_CONTROL_TOKEN")
         .ok()
@@ -174,7 +180,25 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
             bounds: Default::default(),
         },
     );
-    match start_control_server(orch, port).await {
+    let mut limits = ControlServerLimits::default();
+    if let Ok(n) = std::env::var("GROKPTAH_CONTROL_MAX_CONCURRENT") {
+        if let Ok(v) = n.parse::<usize>() {
+            limits.max_concurrent = v.max(1);
+        }
+    }
+    if let Ok(ms) = std::env::var("GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS") {
+        if let Ok(v) = ms.parse::<u64>() {
+            limits.request_timeout = Duration::from_millis(v.max(1));
+        }
+    }
+    if let Ok(ms) = std::env::var("GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS") {
+        if let Ok(v) = ms.parse::<u64>() {
+            if v > 0 {
+                limits.inject_work_delay = Some(Duration::from_millis(v));
+            }
+        }
+    }
+    match start_control_server_with(orch, port, limits).await {
         Ok(mut h) => {
             h.token = token;
             Some(h)

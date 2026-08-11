@@ -76,9 +76,9 @@ pub use mcp_control_client::{ListedTool, McpControlClient};
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
 pub use orchestration::{
-    is_recognized_test_command, merge_bounds, prompt_preview, OrchStore, OrchestrationConfig,
-    OrchestrationService, RunBounds, RunRecord, RunState, WorkspaceAllowlist, CONTROL_TOOLS,
-    FORBIDDEN_TOOLS,
+    is_recognized_test_command, merge_bounds, prompt_preview, safe_id_filename, OrchStore,
+    OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState, WorkspaceAllowlist,
+    CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use search_engine::{SearchHit, SearchQuery};

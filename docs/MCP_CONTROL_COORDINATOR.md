@@ -49,6 +49,34 @@ cd crates/codegen/grokptah-agent-bridge
 cargo test --test mcp_streamable_transport live_desktop_bootstrap_node_smoke -- --nocapture
 ```
 
+### Soak + failure injection (coordinator hardening)
+
+Bounded multi-session campaign (real TCP disconnects, auth/symlink/traversal
+fail-closed, queue/steer/cancel, sustained polling, restart recovery):
+
+```bash
+cd crates/codegen/grokptah-agent-bridge
+cargo test --test mcp_soak_hardening -- --nocapture --test-threads=1
+# Node harness: tests/mcp_sdk_interop/run_soak.mjs
+# Env (set by the Rust driver): GROKPTAH_MCP_URL/TOKEN/WORKSPACE/SESSION_IDS
+# Optional: GROKPTAH_SOAK_SECONDS (default 25), GROKPTAH_SOAK_CONCURRENCY (default 6)
+```
+
+Crash recovery contract: reopening `OrchStore` marks unfinished runs
+**`interrupted`**; session prompt queues reload from the GrokPtah home.
+MCP transport sessions are **not** durable across process restart (re-`initialize`).
+
+
+### Optional transport knobs (tests / soak only)
+
+Unset in production. When set, `start_control_from_env` applies them:
+
+| Env var | Effect |
+|---------|--------|
+| `GROKPTAH_CONTROL_MAX_CONCURRENT` | MCP in-flight request semaphore (default 32) |
+| `GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS` | Per-request wall timeout (default 120000) |
+| `GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS` | Hold work after permit (timeout/429 diagnostics) |
+
 ### Authentication
 
 - Every `/mcp` request: `Authorization: Bearer <GROKPTAH_CONTROL_TOKEN>`
