@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn typed_events_produce_authoritative_observations() {
         let session_id = Uuid::new_v4();
-        let updates = vec![
+        let updates = [
             SessionUpdate::FileEdit {
                 session_id,
                 path: "src/lib.rs".into(),
