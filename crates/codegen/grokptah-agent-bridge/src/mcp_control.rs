@@ -106,6 +106,7 @@ pub struct ControlServerHandle {
     pub token: String,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     cancel: tokio_util::sync::CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ControlServerHandle {
@@ -113,6 +114,18 @@ impl ControlServerHandle {
         self.cancel.cancel();
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
+        }
+    }
+
+    /// Stop the server and wait until its serving task has released the
+    /// orchestration store and other owned resources.
+    pub async fn stop_and_wait(mut self) {
+        self.cancel.cancel();
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
         }
     }
 
@@ -269,7 +282,7 @@ pub async fn start_control_server_with(
     let token = String::new();
     let cancel_serve = cancel.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 tokio::select! {
@@ -286,6 +299,7 @@ pub async fn start_control_server_with(
         token,
         shutdown: Some(tx),
         cancel,
+        task: Some(task),
     })
 }
 
