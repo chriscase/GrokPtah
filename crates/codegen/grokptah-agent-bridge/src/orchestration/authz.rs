@@ -152,4 +152,39 @@ mod tests {
         let other = tempdir().unwrap();
         assert!(!al.contains(other.path()));
     }
+
+    #[test]
+    fn allowlist_symlink_into_root_accepted_outside_rejected() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let al = WorkspaceAllowlist::new([root.path().to_path_buf()]);
+
+        // Symlink whose target resolves inside the allowlisted root → allowed.
+        let link_in = root.path().join("via-link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.path(), &link_in).unwrap();
+            assert!(
+                al.contains(&link_in),
+                "symlink canonicalizing into allowlisted root must be accepted"
+            );
+        }
+
+        // Symlink whose target is outside the allowlist → fail closed.
+        let link_out = root.path().join("escape");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), &link_out).unwrap();
+            assert!(
+                !al.contains(&link_out),
+                "symlink escaping allowlisted root must be rejected"
+            );
+            // require_workspace_match also fails closed on escaped claim.
+            let err = require_workspace_match(&al, Some(root.path()), &link_out);
+            assert!(err.is_err());
+        }
+
+        // Path that canonicalizes outside the allowlisted root is rejected.
+        assert!(!al.contains(outside.path()));
+    }
 }

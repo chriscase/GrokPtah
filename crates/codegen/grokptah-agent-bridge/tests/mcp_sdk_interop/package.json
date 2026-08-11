@@ -1,0 +1,8 @@
+{
+  "name": "grokptah-mcp-sdk-interop",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}

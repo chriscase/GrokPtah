@@ -68,7 +68,10 @@ pub use discover::{
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
-pub use mcp_control::{discovered_tool_names, start_control_server, ControlServerHandle};
+pub use mcp_control::{
+    discovered_tool_names, start_control_server, start_control_server_with, ControlServerHandle,
+    ControlServerLimits,
+};
 pub use mcp_control_client::{ListedTool, McpControlClient};
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
