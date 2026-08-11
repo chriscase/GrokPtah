@@ -329,6 +329,15 @@ export default function App() {
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
   const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
 
+  // Narrow windows need the stage first; rails remain available through the
+  // header toggles and open as overlays when explicitly requested.
+  useEffect(() => {
+    if (layoutDensity === "compact") {
+      setSidebarCollapsed(true);
+      setRightbarCollapsed(true);
+    }
+  }, [layoutDensity]);
+
   // Keep docks valid: unique, open tabs only, within capacity, include focus
   useEffect(() => {
     setDocks((prev) => {
