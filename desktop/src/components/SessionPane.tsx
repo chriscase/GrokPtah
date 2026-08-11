@@ -300,7 +300,11 @@ export const SessionPane = memo(function SessionPane({
                   />
                 )}
                 {item.kind === "thought" && (
-                  <StreamingText text={item.text} streaming={item.streaming} />
+                  <StreamingText
+                    text={item.text}
+                    streaming={item.streaming}
+                    animated={false}
+                  />
                 )}
                 {item.kind === "user" && (
                   <div className="user-text">{item.text}</div>
@@ -316,14 +320,16 @@ export const SessionPane = memo(function SessionPane({
       </div>
 
       {showJump && (
-        <button
-          type="button"
-          className="jump-to-latest"
-          onClick={jumpToLatest}
-          title="Return to the live end of the transcript"
-        >
-          Jump to latest ↓
-        </button>
+        <div className="jump-to-latest-slot">
+          <button
+            type="button"
+            className="jump-to-latest"
+            onClick={jumpToLatest}
+            title="Return to the live end of the transcript"
+          >
+            Jump to latest ↓
+          </button>
+        </div>
       )}
 
       <ActivityIndicator activity={tab.activity} busy={busy} />

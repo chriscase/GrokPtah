@@ -36,7 +36,7 @@ describe("light theme tokens (#133)", () => {
   it("App applies data-theme from agent status appearance", () => {
     const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
     expect(app).toMatch(/document\.documentElement\.dataset\.theme/);
-    expect(app).toMatch(/st\.appearance === ["']light["']/);
+    expect(app).toMatch(/(?:st|effectiveStatus)\.appearance === ["']light["']/);
   });
 
   it("Settings still stamps data-theme on change", () => {

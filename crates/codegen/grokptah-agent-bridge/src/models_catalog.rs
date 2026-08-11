@@ -5,7 +5,7 @@
 //! hardcode a short outdated list (`grok-2`/`grok-3`/…) and default to `grok-3`.
 //! Prefer the same cache + config so the desktop dropdown matches the TUI.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -24,6 +24,9 @@ const BUILTIN: &[(&str, &str, bool)] = &[
     ("grok-3-mini", "Grok 3 Mini", false),
     ("grok-2", "Grok 2", false),
 ];
+
+const EFFORT_ORDER: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const LEGACY_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 
 #[derive(Debug, Clone)]
 pub struct CatalogModel {
@@ -116,6 +119,7 @@ pub fn load_catalog() -> Vec<CatalogModel> {
                     id: (*id).to_string(),
                     display_name: (*name).to_string(),
                     supports_effort: *effort,
+                    effort_options: effort_options(*effort, &[]),
                 },
                 base_url: None,
                 wire_model: (*id).to_string(),
@@ -177,7 +181,32 @@ struct CacheInfo {
     hidden: bool,
     #[serde(default)]
     supports_reasoning_effort: bool,
+    #[serde(default)]
+    reasoning_efforts: Vec<serde_json::Value>,
     supported_in_api: Option<bool>,
+}
+
+fn effort_options(supports_effort: bool, values: &[serde_json::Value]) -> Vec<String> {
+    let mut accepted = BTreeSet::new();
+    for value in values {
+        let raw = value
+            .as_str()
+            .or_else(|| value.get("value").and_then(serde_json::Value::as_str));
+        if let Some(raw) = raw {
+            let normalized = raw.trim().to_ascii_lowercase();
+            if EFFORT_ORDER.contains(&normalized.as_str()) {
+                accepted.insert(normalized);
+            }
+        }
+    }
+    if accepted.is_empty() && supports_effort {
+        accepted.extend(LEGACY_EFFORTS.iter().map(|value| (*value).to_string()));
+    }
+    EFFORT_ORDER
+        .iter()
+        .filter(|value| accepted.contains(**value))
+        .map(|value| (*value).to_string())
+        .collect()
 }
 
 fn read_models_cache() -> Option<Vec<CatalogModel>> {
@@ -204,7 +233,12 @@ fn read_models_cache() -> Option<Vec<CatalogModel>> {
             info: ModelInfo {
                 id: id.clone(),
                 display_name: display,
-                supports_effort: entry.info.supports_reasoning_effort,
+                supports_effort: entry.info.supports_reasoning_effort
+                    || !entry.info.reasoning_efforts.is_empty(),
+                effort_options: effort_options(
+                    entry.info.supports_reasoning_effort,
+                    &entry.info.reasoning_efforts,
+                ),
             },
             base_url: entry.info.base_url,
             wire_model: wire,
@@ -241,6 +275,7 @@ mod tests {
                     id: "grok-2".into(),
                     display_name: "Grok 2".into(),
                     supports_effort: false,
+                    effort_options: vec![],
                 },
                 base_url: None,
                 wire_model: "grok-2".into(),
@@ -250,6 +285,7 @@ mod tests {
                     id: "grok-4.5".into(),
                     display_name: "Grok 4.5".into(),
                     supports_effort: true,
+                    effort_options: effort_options(true, &[]),
                 },
                 base_url: None,
                 wire_model: "grok-4.5".into(),
@@ -259,5 +295,21 @@ mod tests {
             pick_preferred_default(&catalog).as_deref(),
             Some("grok-4.5")
         );
+    }
+
+    #[test]
+    fn server_effort_menu_is_filtered_and_ordered() {
+        let values = vec![
+            serde_json::json!({ "value": "high" }),
+            serde_json::json!("low"),
+            serde_json::json!({ "value": "not-supported" }),
+            serde_json::json!({ "value": "medium" }),
+        ];
+        assert_eq!(effort_options(true, &values), vec!["low", "medium", "high"]);
+    }
+
+    #[test]
+    fn unsupported_models_have_no_effort_options() {
+        assert!(effort_options(false, &[]).is_empty());
     }
 }

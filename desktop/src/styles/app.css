@@ -1728,9 +1728,18 @@ button:disabled {
 .bubble.thought {
   color: var(--thought);
   font-size: 12px;
+  line-height: 1.6;
   border-style: dashed;
   background: transparent;
   white-space: pre-wrap;
+}
+
+/* Thought chunks are plain cumulative text while the transcript is reflowing.
+ * Keep their line box stable; animated word spans can stack at the left edge
+ * of a narrow pane before the browser settles the layout.
+ */
+.bubble.thought .stream-text.is-streaming {
+  text-shadow: none;
 }
 
 .bubble.tool {
@@ -4129,12 +4138,20 @@ button:disabled {
 }
 
 /* Jump to latest when user scrolled up mid-stream (#123) */
+.jump-to-latest-slot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-height: 2.35rem;
+  padding: 0.25rem 0.5rem 0.35rem;
+  border-top: 1px solid var(--border-soft);
+  background: var(--bg);
+  z-index: 10;
+}
 .jump-to-latest {
-  position: absolute;
-  bottom: 3.25rem;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 5;
+  position: static;
+  transform: none;
   padding: 0.35rem 0.85rem;
   border-radius: 999px;
   border: 1px solid var(--accent-dim);
@@ -4144,6 +4161,7 @@ button:disabled {
   font-family: var(--font-ui);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
   cursor: pointer;
+  white-space: nowrap;
 }
 .jump-to-latest:hover {
   background: var(--accent-bg);

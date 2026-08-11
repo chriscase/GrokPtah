@@ -4,11 +4,11 @@ import { splitStreamingMarkdown } from "../lib/streamMarkdown";
 import { useMaterializingText } from "../lib/useMaterializingText";
 
 /**
- * Progressive markdown + Gemini-style materialization.
+ * Progressive markdown + paced live text.
  *
  * 1. Large SSE chunks are **paced word-by-word** (`useMaterializingText`)
  * 2. Older content → full GFM (`stable`)
- * 3. Live tip (~100–280 chars) → beamed word spans (`tail`)
+ * 3. Live tip (~100–280 chars) → one stable text flow (`tail`)
  * 4. On finish → full markdown with settle flash
  */
 export function StreamingMarkdown({
@@ -45,7 +45,9 @@ export function StreamingMarkdown({
       ) : null}
       {tail ? (
         <div className="stream-md-tail">
-          <StreamingText text={tail} streaming />
+          {/* Keep live prose reflow-stable. Word-level transforms can collapse
+           * into the left edge of a narrow pane while the browser lays out. */}
+          <StreamingText text={tail} streaming animated={false} />
         </div>
       ) : (
         <span className="stream-text is-streaming">

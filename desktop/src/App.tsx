@@ -33,6 +33,7 @@ import {
   type DenyHistoryEntry,
 } from "./lib/denyHistory";
 import { StyledSelect } from "./components/StyledSelect";
+import { effortForModel, effortOptionsForModel } from "./lib/modelOptions";
 import { LaunchSplash } from "./components/LaunchSplash";
 import {
   applyAppearanceChrome,
@@ -56,6 +57,7 @@ import {
 } from "./lib/sessionEvents";
 import { displaySessionTitle } from "./lib/sessionTitle";
 import { entriesToTranscriptItems } from "./lib/transcript";
+import { appendThoughtChunk } from "./lib/thoughtText";
 import {
   doneActivity,
   errorActivity,
@@ -360,6 +362,11 @@ export default function App() {
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
     [sessions, activeSessionId],
   );
+  const effortOptions = useMemo(
+    () => effortOptionsForModel(models, status?.model),
+    [models, status?.model],
+  );
+  const currentEffort = effortForModel(models, status?.model, status?.effort);
   const activeIsBuild =
     (activeSummary?.kind ?? workspaceMode) === "build";
 
@@ -525,14 +532,22 @@ export default function App() {
         api.sessionList(),
         api.productInfo(),
       ]);
-      setStatus(st);
+      let effectiveStatus = st;
+      if (md.some((model) => model.id === st.model)) {
+        const normalizedEffort = effortForModel(md, st.model, st.effort);
+        if (normalizedEffort !== st.effort) {
+          await api.setEffort(normalizedEffort);
+          effectiveStatus = { ...st, effort: normalizedEffort };
+        }
+      }
+      setStatus(effectiveStatus);
       setAuth(au);
       setModels(md);
       setSessions(sess);
       setProduct(info);
       // Apply persisted appearance so Light is real after reload (#133).
       document.documentElement.dataset.theme =
-        st.appearance === "light" ? "light" : "dark";
+        effectiveStatus.appearance === "light" ? "light" : "dark";
       // Keep tab titles in sync with session list
       setTabs((prev) =>
         prev.map((t) => {
@@ -1676,7 +1691,9 @@ export default function App() {
     }
   }
 
-  const splashReady = workspaceRestored && status !== null;
+  // A missing status is rendered as an offline/no-project state elsewhere;
+  // it must not leave the launch splash blocking every control forever.
+  const splashReady = workspaceRestored;
 
   return (
     <div
@@ -2409,6 +2426,14 @@ export default function App() {
                     onChange={(v) => {
                       void (async () => {
                         await api.setModel(v);
+                        const nextEffort = effortForModel(
+                          models,
+                          v,
+                          status?.effort,
+                        );
+                        if (nextEffort !== status?.effort) {
+                          await api.setEffort(nextEffort);
+                        }
                         await refreshChrome();
                       })();
                     }}
@@ -2422,16 +2447,8 @@ export default function App() {
                   <StyledSelect
                     aria-label="Effort"
                     className="composer-select"
-                    value={String(status?.effort ?? "medium")}
-                    options={[
-                      "none",
-                      "minimal",
-                      "low",
-                      "medium",
-                      "high",
-                      "xhigh",
-                      "max",
-                    ].map((e) => ({ value: e, label: e }))}
+                    value={currentEffort}
+                    options={effortOptions.map((e) => ({ value: e, label: e }))}
                     onChange={(v) => {
                       void (async () => {
                         await api.setEffort(v);
@@ -3321,30 +3338,30 @@ function applyUpdate(
       break;
     case "agent_thought_chunk":
       withTab(sid!, (tab) => {
-        const snippet = u.text.trim().slice(0, 72);
+        const chunk = u.text.trim();
+        const snippet = chunk.slice(0, 72);
         const next = mapTranscript(
           tab,
           (t) => {
+            if (!chunk) return t;
             const last = t[t.length - 1];
-            // Host thoughts are whole lines (status crumbs), not token streams.
-            // Append on a new line when the last bubble is already a thought so
-            // we never glue "kind=build…" into itself across deliveries.
             if (last?.kind === "thought") {
-              // Exact duplicate of a multi-listener race — drop it.
-              if (last.text === u.text || last.text.endsWith(u.text)) {
+              // Exact duplicate of a multi-listener race — drop it. Natural
+              // language chunks join with spaces; diagnostics stay line-based.
+              if (last.text === chunk || last.text.endsWith(chunk)) {
                 return t;
               }
               const copy = t.slice(0, -1);
               copy.push({
                 kind: "thought",
-                text: `${last.text}\n${u.text}`,
+                text: appendThoughtChunk(last.text, chunk),
                 streaming: true,
               });
               return copy;
             }
             return [
               ...t,
-              { kind: "thought", text: u.text, streaming: true },
+              { kind: "thought", text: chunk, streaming: true },
             ];
           },
           { busy: true },
