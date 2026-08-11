@@ -168,6 +168,10 @@ export type AttentionKind = "none" | "unseen" | "permission";
 export interface SessionTab {
   id: string;
   title: string;
+  /** Stable client-side identity even when the sidebar list is mode-filtered. */
+  kind: SessionKind;
+  /** Last known working directory for this tab, including when hidden by the mode filter. */
+  cwd?: string;
   transcript: TranscriptItem[];
   busy: boolean;
   plan: { steps: string[]; status: string } | null;

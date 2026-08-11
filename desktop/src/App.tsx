@@ -7,6 +7,7 @@ import {
   type AuthState,
   type ModelInfo,
   type PermissionRequest,
+  type SessionKind,
   type SessionSummary,
   type SessionTab,
   type SessionUpdate,
@@ -56,7 +57,7 @@ import {
   subscribeSessionUpdates,
 } from "./lib/sessionEvents";
 import { displaySessionTitle } from "./lib/sessionTitle";
-import { entriesToTranscriptItems } from "./lib/transcript";
+import { entriesToTranscriptItems, hasInterruptedTurn } from "./lib/transcript";
 import { appendThoughtChunk } from "./lib/thoughtText";
 import {
   doneActivity,
@@ -71,6 +72,7 @@ import {
 } from "./lib/activity";
 import type { PromptQueueEntry } from "./lib/promptQueue";
 import { useComposerQueue } from "./lib/useComposerQueue";
+import { findTabOfKind, kindForTab } from "./lib/sessionTab";
 
 type WorkspaceMode = "build" | "chat";
 
@@ -83,10 +85,17 @@ type RightTab =
   | "tasks"
   | "rules";
 
-function emptyTab(id: string, title = "New session"): SessionTab {
+function emptyTab(
+  id: string,
+  title = "New session",
+  kind: SessionKind = "build",
+  cwd?: string,
+): SessionTab {
   return {
     id,
     title,
+    kind,
+    cwd,
     transcript: [],
     busy: false,
     plan: null,
@@ -239,6 +248,9 @@ export default function App() {
     setExpanded: setComposerExpanded,
     queues: promptQueues,
     dispatchQueue,
+    invalidateQueue,
+    isCurrentQueueRequest,
+    syncQueue,
     queueFor,
   } = useComposerQueue(activeSessionId);
   const queueDrainsRef = useRef<Set<string>>(new Set());
@@ -367,8 +379,9 @@ export default function App() {
     [models, status?.model],
   );
   const currentEffort = effortForModel(models, status?.model, status?.effort);
-  const activeIsBuild =
-    (activeSummary?.kind ?? workspaceMode) === "build";
+  const activeTabKind = kindForTab(activeTab, sessions, workspaceMode);
+  const activeIsBuild = activeTabKind === "build";
+  const activeCwd = activeSummary?.cwd || activeTab?.cwd;
 
   const patchTab = useCallback(
     (id: string, patch: (tab: SessionTab) => SessionTab) => {
@@ -385,12 +398,24 @@ export default function App() {
       setTabs((prev) => {
         if (prev.some((t) => t.id === summary.id)) {
           return prev.map((t) =>
-            t.id === summary.id ? { ...t, title: summary.title } : t,
+            t.id === summary.id
+              ? {
+                  ...t,
+                  title: summary.title,
+                  kind: summary.kind ?? t.kind,
+                  cwd: summary.cwd ?? t.cwd,
+                }
+              : t,
           );
         }
         return [
           ...prev,
-          emptyTab(summary.id, summary.title || "New session"),
+          emptyTab(
+            summary.id,
+            summary.title || "New session",
+            summary.kind ?? "build",
+            summary.cwd,
+          ),
         ];
       });
       if (!hydrate) return;
@@ -398,6 +423,8 @@ export default function App() {
         // Resume: promote backend active session + cwd, then hydrate transcript (#38).
         const loaded = await api.sessionLoad(summary.id);
         const entries = await api.sessionTranscript(loaded.id);
+        const restoredTranscript = entriesToTranscriptItems(entries);
+        const interrupted = hasInterruptedTurn(entries);
         setTabs((prev) =>
           prev.map((t) => {
             if (t.id !== loaded.id) return t;
@@ -406,7 +433,20 @@ export default function App() {
             return {
               ...t,
               title: loaded.title || summary.title,
-              transcript: entriesToTranscriptItems(entries),
+              kind: loaded.kind ?? summary.kind ?? t.kind,
+              cwd: loaded.cwd || summary.cwd || t.cwd,
+              transcript: interrupted
+                ? [
+                    ...restoredTranscript,
+                    {
+                      kind: "thought" as const,
+                      text: "Previous turn was interrupted before it finished. Review the last request and send it again when ready.",
+                    },
+                  ]
+                : restoredTranscript,
+              activity: interrupted
+                ? errorActivity("Previous turn interrupted; ready to retry")
+                : t.activity,
             };
           }),
         );
@@ -707,6 +747,20 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Bridge-owned queues survive process restart; hydrate the visible session
+  // whenever focus changes. The hook rejects stale responses from an older
+  // tab switch or queue mutation.
+  useEffect(() => {
+    if (!workspaceRestored || !activeSessionId) return;
+    const sessionId = activeSessionId;
+    void syncQueue(sessionId, () => api.sessionQueueList(sessionId)).catch(
+      (error) => console.warn("prompt queue restore failed", error),
+    );
+    return () => {
+      invalidateQueue(sessionId);
+    };
+  }, [activeSessionId, invalidateQueue, syncQueue, workspaceRestored]);
+
   // Persist tab *ids* only (not per-token transcript rewrites).
   // Depending on full `tabs` re-wrote workspace.json on every stream chunk.
   const openTabIdsKey = tabs.map((t) => t.id).join(",");
@@ -986,9 +1040,7 @@ export default function App() {
       }
     }
     // Reuse any already-open tab of the right kind.
-    const openMatch = tabs
-      .map((t) => sessions.find((s) => s.id === t.id))
-      .find((s) => s && (s.kind ?? "build") === workspaceMode);
+    const openMatch = findTabOfKind(tabs, workspaceMode);
     if (openMatch) {
       setActiveSessionId(openMatch.id);
       try {
@@ -1230,12 +1282,10 @@ export default function App() {
     mutation: () => Promise<PromptQueueEntry[]>,
   ) {
     try {
-      const entries = await mutation();
-      dispatchQueue({ type: "replace", sessionId, entries });
+      await syncQueue(sessionId, mutation);
     } catch (error) {
       try {
-        const entries = await api.sessionQueueList(sessionId);
-        dispatchQueue({ type: "replace", sessionId, entries });
+        await syncQueue(sessionId, () => api.sessionQueueList(sessionId));
       } catch {
         // Preserve the current UI queue if the bridge itself is unavailable.
       }
@@ -1247,12 +1297,15 @@ export default function App() {
     if (queueDrainsRef.current.has(sessionId)) return;
     queueDrainsRef.current.add(sessionId);
     try {
+      const requestVersion = invalidateQueue(sessionId);
       const result = await api.sessionQueueTakeNext(sessionId);
-      dispatchQueue({
-        type: "replace",
-        sessionId,
-        entries: result.entries,
-      });
+      if (isCurrentQueueRequest(sessionId, requestVersion)) {
+        dispatchQueue({
+          type: "replace",
+          sessionId,
+          entries: result.entries,
+        });
+      }
       const batch = result.batch;
       if (batch?.text.trim()) {
         await sendPrompt(batch.text, { fromQueue: true, sessionId });
@@ -1296,12 +1349,15 @@ export default function App() {
     const tabBusy = tabs.find((t) => t.id === id)?.busy;
     if (tabBusy && opts?.steer) {
       try {
+        const requestVersion = invalidateQueue(id);
         const receipt = await api.sessionSteer(id, prompt);
-        dispatchQueue({
-          type: "replace",
-          sessionId: id,
-          entries: receipt.entries,
-        });
+        if (isCurrentQueueRequest(id, requestVersion)) {
+          dispatchQueue({
+            type: "replace",
+            sessionId: id,
+            entries: receipt.entries,
+          });
+        }
         patchTab(id, (tab) => ({
           ...tab,
           activity: {
@@ -1324,15 +1380,18 @@ export default function App() {
     }
     if (tabBusy && opts?.runNext) {
       try {
+        const requestVersion = invalidateQueue(id);
         const added = await api.sessionQueueAdd(id, prompt, false);
         const entry = added[added.length - 1];
         if (!entry) throw new Error("Bridge did not queue the prompt");
         const result = await api.sessionQueueRunNext(id, entry.id);
-        dispatchQueue({
-          type: "replace",
-          sessionId: id,
-          entries: result.entries,
-        });
+        if (isCurrentQueueRequest(id, requestVersion)) {
+          dispatchQueue({
+            type: "replace",
+            sessionId: id,
+            entries: result.entries,
+          });
+        }
         patchTab(id, (tab) => ({
           ...tab,
           activity: {
@@ -1360,9 +1419,10 @@ export default function App() {
     if (tabBusy && !opts?.fromQueue) {
       let nextLen = 0;
       try {
-        const entries = await api.sessionQueueAdd(id, prompt, false);
+        const entries = await syncQueue(id, () =>
+          api.sessionQueueAdd(id, prompt, false),
+        );
         nextLen = entries.length;
-        dispatchQueue({ type: "replace", sessionId: id, entries });
       } catch (error) {
         if (fromComposer) restoreComposer(prompt, id);
         patchTab(id, (tab) => ({
@@ -1709,9 +1769,12 @@ export default function App() {
           </span>
         </div>
         <div className="title-actions">
-          <span className="path-chip" title={status?.project_cwd ?? ""}>
-            {status?.project_cwd
-              ? shortPath(status.project_cwd, 36)
+          <span
+            className="path-chip"
+            title={status?.project_cwd || (activeIsBuild ? activeCwd : "")}
+          >
+            {status?.project_cwd || (activeIsBuild ? activeCwd : undefined)
+              ? shortPath(status?.project_cwd || activeCwd, 36)
               : "no project open"}
           </span>
           <div className="chrome-toggles" role="group" aria-label="Layout panels">
@@ -1844,10 +1907,7 @@ export default function App() {
             onClick={() => {
               setWorkspaceMode("build");
               // Don't keep answering in a chat tab while Builds is selected.
-              const buildTab = tabs.find((t) => {
-                const s = sessions.find((x) => x.id === t.id);
-                return (s?.kind ?? "build") === "build";
-              });
+              const buildTab = findTabOfKind(tabs, "build");
               if (buildTab) setActiveSessionId(buildTab.id);
               else if (
                 activeSummary &&
@@ -1864,10 +1924,7 @@ export default function App() {
             className={workspaceMode === "chat" ? "active" : ""}
             onClick={() => {
               setWorkspaceMode("chat");
-              const chatTab = tabs.find((t) => {
-                const s = sessions.find((x) => x.id === t.id);
-                return s?.kind === "chat";
-              });
+              const chatTab = findTabOfKind(tabs, "chat");
               if (chatTab) setActiveSessionId(chatTab.id);
               else if (activeSummary?.kind !== "chat") {
                 // Force ensureSession to create a chat on next send.
@@ -2106,7 +2163,7 @@ export default function App() {
             >
               <span className="session-cwd-label">cwd</span>
               <span className="session-cwd-path">
-                {shortPath(activeSummary?.cwd)}
+                {shortPath(activeCwd)}
               </span>
               <span className="session-cwd-change">Change</span>
             </button>
@@ -2178,20 +2235,17 @@ export default function App() {
                     focused={isFocused}
                     zoneIndex={zoneIndex + 1}
                     zoneCount={docks.length}
-                    kindLabel={
-                      sessions.find((s) => s.id === dockTab.id)?.kind ??
-                      workspaceMode
-                    }
+                    kindLabel={kindForTab(dockTab, sessions, workspaceMode)}
                     bridgeVersion={product.bridgeVersion}
                     emptyHint={
-                      workspaceMode === "build"
+                      kindForTab(dockTab, sessions, workspaceMode) === "build"
                         ? "Set a working directory, then send a prompt."
                         : "Message Grok when this pane is focused."
                     }
                     showClose={docks.length > 1}
                     onClosePane={undockSession}
                     onFocusSession={focusSession}
-                    cwd={sessions.find((s) => s.id === dockTab.id)?.cwd}
+                    cwd={dockTab.cwd ?? sessions.find((s) => s.id === dockTab.id)?.cwd}
                     titlePeers={[
                       ...sessions,
                       ...tabs.map((x) => ({
@@ -2307,8 +2361,8 @@ export default function App() {
             {activeTab && (
               <div className="composer-target" title="Composer sends to this session">
                 <span className="composer-target-label">→</span>
-                <span className={`kind-chip ${activeSummary?.kind ?? workspaceMode}`}>
-                  {activeSummary?.kind ?? workspaceMode}
+                <span className={`kind-chip ${kindForTab(activeTab, sessions, workspaceMode)}`}>
+                  {kindForTab(activeTab, sessions, workspaceMode)}
                 </span>
                 <span className="composer-target-title">{activeTab.title}</span>
                 {docks.length > 1 && (
@@ -2369,15 +2423,18 @@ export default function App() {
                   )
                 }
                 onSteer={async (entry) => {
+                  const requestVersion = invalidateQueue(activeSessionId);
                   const receipt = await api.sessionQueueSteerEntry(
                     activeSessionId,
                     entry.id,
                   );
-                  dispatchQueue({
-                    type: "replace",
-                    sessionId: activeSessionId,
-                    entries: receipt.entries,
-                  });
+                  if (isCurrentQueueRequest(activeSessionId, requestVersion)) {
+                    dispatchQueue({
+                      type: "replace",
+                      sessionId: activeSessionId,
+                      entries: receipt.entries,
+                    });
+                  }
                   if (receipt.disposition === "queued") {
                     setTimeout(
                       () => void drainNextQueuedPrompt(activeSessionId),
@@ -2386,15 +2443,18 @@ export default function App() {
                   }
                 }}
                 onRunNext={async (entry) => {
+                  const requestVersion = invalidateQueue(activeSessionId);
                   const result = await api.sessionQueueRunNext(
                     activeSessionId,
                     entry.id,
                   );
-                  dispatchQueue({
-                    type: "replace",
-                    sessionId: activeSessionId,
-                    entries: result.entries,
-                  });
+                  if (isCurrentQueueRequest(activeSessionId, requestVersion)) {
+                    dispatchQueue({
+                      type: "replace",
+                      sessionId: activeSessionId,
+                      entries: result.entries,
+                    });
+                  }
                   if (!result.cancelled_active) {
                     setTimeout(
                       () => void drainNextQueuedPrompt(activeSessionId),
@@ -3266,7 +3326,7 @@ function sessionIdOf(u: SessionUpdate): string | null {
 
 function ensureTab(tabs: SessionTab[], id: string): SessionTab[] {
   if (tabs.some((t) => t.id === id)) return tabs;
-  return [...tabs, emptyTab(id)];
+  return [...tabs, emptyTab(id, "New session", "build")];
 }
 
 function mapTranscript(
