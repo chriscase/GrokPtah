@@ -10,7 +10,21 @@ type PromptQueuePanelProps = {
   onMove: (entry: PromptQueueEntry, toIndex: number) => Promise<void>;
   onSteer: (entry: PromptQueueEntry) => Promise<void>;
   onRunNext: (entry: PromptQueueEntry) => Promise<void>;
+  onError?: (message: string) => void;
 };
+
+function queueState(entry: PromptQueueEntry) {
+  if (entry.priority) {
+    return { label: "Run next", className: "run-next" };
+  }
+  if (entry.source === "steer_now") {
+    return { label: "Steering pending", className: "steering-pending" };
+  }
+  if (entry.source === "steering_deferred") {
+    return { label: "Steering deferred", className: "steering-deferred" };
+  }
+  return { label: "Queued", className: "queued" };
+}
 
 function PromptQueueRow({
   entry,
@@ -22,6 +36,7 @@ function PromptQueueRow({
   onMove,
   onSteer,
   onRunNext,
+  onError,
 }: {
   entry: PromptQueueEntry;
   index: number;
@@ -32,21 +47,27 @@ function PromptQueueRow({
   onMove: PromptQueuePanelProps["onMove"];
   onSteer: PromptQueuePanelProps["onSteer"];
   onRunNext: PromptQueuePanelProps["onRunNext"];
+  onError?: PromptQueuePanelProps["onError"];
 }) {
   const [draft, setDraft] = useState(entry.text);
-  const [working, setWorking] = useState(false);
+  const [workingAction, setWorkingAction] = useState<string | null>(null);
+  const [error, setError] = useState(false);
 
   useEffect(() => {
     setDraft(entry.text);
   }, [entry.id, entry.text, entry.version]);
 
-  async function run(action: () => Promise<void>) {
-    if (working) return;
-    setWorking(true);
+  async function run(label: string, action: () => Promise<void>) {
+    if (workingAction) return;
+    setWorkingAction(label);
+    setError(false);
     try {
       await action();
+    } catch (cause) {
+      setError(true);
+      onError?.(cause instanceof Error ? cause.message : "Queue update failed");
     } finally {
-      setWorking(false);
+      setWorkingAction(null);
     }
   }
 
@@ -57,30 +78,42 @@ function PromptQueueRow({
       return;
     }
     if (text !== entry.text) {
-      await run(() => onEdit(entry, text));
+      await run("Saving", () => onEdit(entry, text));
     }
   }
+
+  const state = queueState(entry);
+  const working = workingAction !== null;
 
   return (
     <li className={`prompt-queue-row ${entry.priority ? "is-priority" : ""}`}>
       <div className="prompt-queue-order" aria-label={`Queue position ${index + 1}`}>
         {index + 1}
       </div>
-      <textarea
-        className="prompt-queue-edit"
-        aria-label={`Queued prompt ${index + 1}`}
-        rows={2}
-        value={draft}
-        disabled={working}
-        onChange={(event) => setDraft(event.target.value)}
-        onBlur={() => void commitEdit()}
-        onKeyDown={(event) => {
-          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-            event.preventDefault();
-            void commitEdit();
-          }
-        }}
-      />
+      <div className="prompt-queue-content">
+        <textarea
+          className="prompt-queue-edit"
+          aria-label={`Queued prompt ${index + 1}`}
+          aria-invalid={error}
+          rows={2}
+          value={draft}
+          disabled={working}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={() => void commitEdit()}
+          onKeyDown={(event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+              event.preventDefault();
+              void commitEdit();
+            }
+          }}
+        />
+        <div className="prompt-queue-meta" aria-live="polite">
+          <span className={`prompt-queue-state ${state.className}`}>
+            {workingAction ?? state.label}
+          </span>
+          {error && <span className="prompt-queue-error">Update failed</span>}
+        </div>
+      </div>
       <div className="prompt-queue-actions">
         <button
           type="button"
@@ -88,7 +121,7 @@ function PromptQueueRow({
           title="Move up"
           aria-label={`Move queued prompt ${index + 1} up`}
           disabled={working || index === 0}
-          onClick={() => void run(() => onMove(entry, index - 1))}
+          onClick={() => void run("Moving", () => onMove(entry, index - 1))}
         >
           ↑
         </button>
@@ -98,7 +131,7 @@ function PromptQueueRow({
           title="Move down"
           aria-label={`Move queued prompt ${index + 1} down`}
           disabled={working || index === count - 1}
-          onClick={() => void run(() => onMove(entry, index + 1))}
+          onClick={() => void run("Moving", () => onMove(entry, index + 1))}
         >
           ↓
         </button>
@@ -111,7 +144,7 @@ function PromptQueueRow({
               : "No turn is running; keep this prompt queued to run next"
           }
           disabled={working}
-          onClick={() => void run(() => onSteer(entry))}
+          onClick={() => void run("Steering", () => onSteer(entry))}
         >
           Steer now
         </button>
@@ -120,7 +153,7 @@ function PromptQueueRow({
           className="prompt-queue-command is-strong"
           title="Make this the next prompt; stops the current turn when one is running"
           disabled={working}
-          onClick={() => void run(() => onRunNext(entry))}
+          onClick={() => void run("Promoting", () => onRunNext(entry))}
         >
           Run next
         </button>
@@ -130,7 +163,7 @@ function PromptQueueRow({
           title="Remove from queue"
           aria-label={`Remove queued prompt ${index + 1}`}
           disabled={working}
-          onClick={() => void run(() => onRemove(entry))}
+          onClick={() => void run("Removing", () => onRemove(entry))}
         >
           ×
         </button>
@@ -148,6 +181,7 @@ export function PromptQueuePanel({
   onMove,
   onSteer,
   onRunNext,
+  onError,
 }: PromptQueuePanelProps) {
   const [clearing, setClearing] = useState(false);
   if (entries.length === 0) return null;
@@ -166,7 +200,13 @@ export function PromptQueuePanel({
           disabled={clearing}
           onClick={() => {
             setClearing(true);
-            void onClear().finally(() => setClearing(false));
+            void onClear()
+              .catch((cause) => {
+                onError?.(
+                  cause instanceof Error ? cause.message : "Queue clear failed",
+                );
+              })
+              .finally(() => setClearing(false));
           }}
         >
           Clear
@@ -185,6 +225,7 @@ export function PromptQueuePanel({
             onMove={onMove}
             onSteer={onSteer}
             onRunNext={onRunNext}
+            onError={onError}
           />
         ))}
       </ol>

@@ -84,4 +84,34 @@ describe("PromptQueuePanel", () => {
       expect.stringMatching(/without stopping/i),
     );
   });
+
+  it("labels steering states and contains failed mutations", async () => {
+    const onSteer = vi.fn().mockRejectedValue(new Error("stale queue"));
+    const onError = vi.fn();
+    render(
+      <PromptQueuePanel
+        entries={[
+          entry("a", "guide it"),
+          { ...entry("b", "defer it"), source: "steering_deferred" },
+          { ...entry("c", "next"), priority: true },
+        ]}
+        busy
+        onEdit={vi.fn()}
+        onRemove={vi.fn()}
+        onClear={vi.fn()}
+        onMove={vi.fn()}
+        onSteer={onSteer}
+        onRunNext={vi.fn()}
+        onError={onError}
+      />,
+    );
+
+    expect(screen.getByText("Queued")).toBeTruthy();
+    expect(screen.getByText("Steering deferred")).toBeTruthy();
+    expect(document.querySelector(".prompt-queue-state.run-next")).toBeTruthy();
+
+    fireEvent.click(screen.getAllByText("Steer now")[0]);
+    await waitFor(() => expect(onError).toHaveBeenCalledWith("stale queue"));
+    expect(screen.getByText("Update failed")).toBeTruthy();
+  });
 });

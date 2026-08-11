@@ -7,6 +7,7 @@ import {
   type AuthState,
   type ModelInfo,
   type PermissionRequest,
+  type SessionKind,
   type SessionSummary,
   type SessionTab,
   type SessionUpdate,
@@ -33,6 +34,7 @@ import {
   type DenyHistoryEntry,
 } from "./lib/denyHistory";
 import { StyledSelect } from "./components/StyledSelect";
+import { effortForModel, effortOptionsForModel } from "./lib/modelOptions";
 import { LaunchSplash } from "./components/LaunchSplash";
 import {
   applyAppearanceChrome,
@@ -55,7 +57,10 @@ import {
   subscribeSessionUpdates,
 } from "./lib/sessionEvents";
 import { displaySessionTitle } from "./lib/sessionTitle";
-import { entriesToTranscriptItems } from "./lib/transcript";
+import { entriesToTranscriptItems, hasInterruptedTurn } from "./lib/transcript";
+import { appendThoughtChunk } from "./lib/thoughtText";
+import { createLatestRequestGuard } from "./lib/latestRequest";
+import { preserveProjectCwd } from "./lib/projectCwd";
 import {
   doneActivity,
   errorActivity,
@@ -69,6 +74,7 @@ import {
 } from "./lib/activity";
 import type { PromptQueueEntry } from "./lib/promptQueue";
 import { useComposerQueue } from "./lib/useComposerQueue";
+import { findTabOfKind, kindForTab } from "./lib/sessionTab";
 
 type WorkspaceMode = "build" | "chat";
 
@@ -81,10 +87,17 @@ type RightTab =
   | "tasks"
   | "rules";
 
-function emptyTab(id: string, title = "New session"): SessionTab {
+function emptyTab(
+  id: string,
+  title = "New session",
+  kind: SessionKind = "build",
+  cwd?: string,
+): SessionTab {
   return {
     id,
     title,
+    kind,
+    cwd,
     transcript: [],
     busy: false,
     plan: null,
@@ -237,6 +250,9 @@ export default function App() {
     setExpanded: setComposerExpanded,
     queues: promptQueues,
     dispatchQueue,
+    invalidateQueue,
+    isCurrentQueueRequest,
+    syncQueue,
     queueFor,
   } = useComposerQueue(activeSessionId);
   const queueDrainsRef = useRef<Set<string>>(new Set());
@@ -294,6 +310,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   /** False until we finish reopening tabs from ~/.grokptah/workspace.json. */
   const [workspaceRestored, setWorkspaceRestored] = useState(false);
+  const projectCwdHintRef = useRef<string | null>(null);
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   /**
@@ -309,6 +326,7 @@ export default function App() {
   const maxDocks = useMaxDocks(stageRef, layoutDensity);
   const splitOk = maxDocks >= 2;
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
+  const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
 
   // Keep docks valid: unique, open tabs only, within capacity, include focus
   useEffect(() => {
@@ -360,8 +378,14 @@ export default function App() {
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
     [sessions, activeSessionId],
   );
-  const activeIsBuild =
-    (activeSummary?.kind ?? workspaceMode) === "build";
+  const effortOptions = useMemo(
+    () => effortOptionsForModel(models, status?.model),
+    [models, status?.model],
+  );
+  const currentEffort = effortForModel(models, status?.model, status?.effort);
+  const activeTabKind = kindForTab(activeTab, sessions, workspaceMode);
+  const activeIsBuild = activeTabKind === "build";
+  const activeCwd = activeSummary?.cwd || activeTab?.cwd;
 
   const patchTab = useCallback(
     (id: string, patch: (tab: SessionTab) => SessionTab) => {
@@ -378,12 +402,24 @@ export default function App() {
       setTabs((prev) => {
         if (prev.some((t) => t.id === summary.id)) {
           return prev.map((t) =>
-            t.id === summary.id ? { ...t, title: summary.title } : t,
+            t.id === summary.id
+              ? {
+                  ...t,
+                  title: summary.title,
+                  kind: summary.kind ?? t.kind,
+                  cwd: summary.cwd ?? t.cwd,
+                }
+              : t,
           );
         }
         return [
           ...prev,
-          emptyTab(summary.id, summary.title || "New session"),
+          emptyTab(
+            summary.id,
+            summary.title || "New session",
+            summary.kind ?? "build",
+            summary.cwd,
+          ),
         ];
       });
       if (!hydrate) return;
@@ -391,6 +427,8 @@ export default function App() {
         // Resume: promote backend active session + cwd, then hydrate transcript (#38).
         const loaded = await api.sessionLoad(summary.id);
         const entries = await api.sessionTranscript(loaded.id);
+        const restoredTranscript = entriesToTranscriptItems(entries);
+        const interrupted = hasInterruptedTurn(entries);
         setTabs((prev) =>
           prev.map((t) => {
             if (t.id !== loaded.id) return t;
@@ -399,10 +437,24 @@ export default function App() {
             return {
               ...t,
               title: loaded.title || summary.title,
-              transcript: entriesToTranscriptItems(entries),
+              kind: loaded.kind ?? summary.kind ?? t.kind,
+              cwd: loaded.cwd || summary.cwd || t.cwd,
+              transcript: interrupted
+                ? [
+                    ...restoredTranscript,
+                    {
+                      kind: "thought" as const,
+                      text: "Previous turn was interrupted before it finished. Review the last request and send it again when ready.",
+                    },
+                  ]
+                : restoredTranscript,
+              activity: interrupted
+                ? errorActivity("Previous turn interrupted; ready to retry")
+                : t.activity,
             };
           }),
         );
+        if (loaded.cwd) projectCwdHintRef.current = loaded.cwd;
         setStatus((st) =>
           st
             ? {
@@ -517,6 +569,7 @@ export default function App() {
   }, [refreshSessions]);
 
   const refreshChrome = useCallback(async () => {
+    const request = chromeRefreshGuard.begin();
     try {
       const [st, au, md, sess, info] = await Promise.all([
         api.agentStatus(),
@@ -525,14 +578,31 @@ export default function App() {
         api.sessionList(),
         api.productInfo(),
       ]);
-      setStatus(st);
+      if (!chromeRefreshGuard.isCurrent(request)) return;
+      const refreshedStatus = preserveProjectCwd(
+        st,
+        projectCwdHintRef.current,
+      );
+      if (refreshedStatus.project_cwd) {
+        projectCwdHintRef.current = refreshedStatus.project_cwd;
+      }
+      let effectiveStatus = refreshedStatus;
+      if (md.some((model) => model.id === st.model)) {
+        const normalizedEffort = effortForModel(md, st.model, st.effort);
+        if (normalizedEffort !== st.effort) {
+          await api.setEffort(normalizedEffort);
+          if (!chromeRefreshGuard.isCurrent(request)) return;
+          effectiveStatus = { ...refreshedStatus, effort: normalizedEffort };
+        }
+      }
+      setStatus(effectiveStatus);
       setAuth(au);
       setModels(md);
       setSessions(sess);
       setProduct(info);
       // Apply persisted appearance so Light is real after reload (#133).
       document.documentElement.dataset.theme =
-        st.appearance === "light" ? "light" : "dark";
+        effectiveStatus.appearance === "light" ? "light" : "dark";
       // Keep tab titles in sync with session list
       setTabs((prev) =>
         prev.map((t) => {
@@ -543,7 +613,7 @@ export default function App() {
     } catch (e) {
       console.warn("refresh failed (browser-only?)", e);
     }
-  }, []);
+  }, [chromeRefreshGuard]);
 
   // Chrome refresh on mount only (not tied to the event listener).
   useEffect(() => {
@@ -675,6 +745,7 @@ export default function App() {
           }
         }
         if (ws.project_cwd) {
+          projectCwdHintRef.current = ws.project_cwd;
           // status refresh will surface path; host already loaded it
           await refreshChrome();
           if (!cancelled) await maybePromptMcpTrust();
@@ -691,6 +762,20 @@ export default function App() {
     // openTab/refreshChrome are stable enough; run once on mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Bridge-owned queues survive process restart; hydrate the visible session
+  // whenever focus changes. The hook rejects stale responses from an older
+  // tab switch or queue mutation.
+  useEffect(() => {
+    if (!workspaceRestored || !activeSessionId) return;
+    const sessionId = activeSessionId;
+    void syncQueue(sessionId, () => api.sessionQueueList(sessionId)).catch(
+      (error) => console.warn("prompt queue restore failed", error),
+    );
+    return () => {
+      invalidateQueue(sessionId);
+    };
+  }, [activeSessionId, invalidateQueue, syncQueue, workspaceRestored]);
 
   // Persist tab *ids* only (not per-token transcript rewrites).
   // Depending on full `tabs` re-wrote workspace.json on every stream chunk.
@@ -729,6 +814,7 @@ export default function App() {
   async function openProject() {
     const path = await api.pickProjectFolder();
     if (path) {
+      projectCwdHintRef.current = path;
       // Also pin the folder on the active build so tools use it.
       if (
         activeSessionId &&
@@ -756,6 +842,7 @@ export default function App() {
       try {
         const updated = await api.pickSessionFolder(sessionId);
         if (!updated) return;
+        if (updated.cwd) projectCwdHintRef.current = updated.cwd;
         await refreshSessions();
         await refreshChrome();
         try {
@@ -776,6 +863,7 @@ export default function App() {
       if (kind === "build" && !status?.project_cwd) {
         const path = await api.pickProjectFolder();
         if (!path) return null;
+        projectCwdHintRef.current = path;
         await refreshChrome();
         await maybePromptMcpTrust();
       }
@@ -971,9 +1059,7 @@ export default function App() {
       }
     }
     // Reuse any already-open tab of the right kind.
-    const openMatch = tabs
-      .map((t) => sessions.find((s) => s.id === t.id))
-      .find((s) => s && (s.kind ?? "build") === workspaceMode);
+    const openMatch = findTabOfKind(tabs, workspaceMode);
     if (openMatch) {
       setActiveSessionId(openMatch.id);
       try {
@@ -1215,12 +1301,10 @@ export default function App() {
     mutation: () => Promise<PromptQueueEntry[]>,
   ) {
     try {
-      const entries = await mutation();
-      dispatchQueue({ type: "replace", sessionId, entries });
+      await syncQueue(sessionId, mutation);
     } catch (error) {
       try {
-        const entries = await api.sessionQueueList(sessionId);
-        dispatchQueue({ type: "replace", sessionId, entries });
+        await syncQueue(sessionId, () => api.sessionQueueList(sessionId));
       } catch {
         // Preserve the current UI queue if the bridge itself is unavailable.
       }
@@ -1232,12 +1316,15 @@ export default function App() {
     if (queueDrainsRef.current.has(sessionId)) return;
     queueDrainsRef.current.add(sessionId);
     try {
+      const requestVersion = invalidateQueue(sessionId);
       const result = await api.sessionQueueTakeNext(sessionId);
-      dispatchQueue({
-        type: "replace",
-        sessionId,
-        entries: result.entries,
-      });
+      if (isCurrentQueueRequest(sessionId, requestVersion)) {
+        dispatchQueue({
+          type: "replace",
+          sessionId,
+          entries: result.entries,
+        });
+      }
       const batch = result.batch;
       if (batch?.text.trim()) {
         await sendPrompt(batch.text, { fromQueue: true, sessionId });
@@ -1281,12 +1368,15 @@ export default function App() {
     const tabBusy = tabs.find((t) => t.id === id)?.busy;
     if (tabBusy && opts?.steer) {
       try {
+        const requestVersion = invalidateQueue(id);
         const receipt = await api.sessionSteer(id, prompt);
-        dispatchQueue({
-          type: "replace",
-          sessionId: id,
-          entries: receipt.entries,
-        });
+        if (isCurrentQueueRequest(id, requestVersion)) {
+          dispatchQueue({
+            type: "replace",
+            sessionId: id,
+            entries: receipt.entries,
+          });
+        }
         patchTab(id, (tab) => ({
           ...tab,
           activity: {
@@ -1309,15 +1399,18 @@ export default function App() {
     }
     if (tabBusy && opts?.runNext) {
       try {
+        const requestVersion = invalidateQueue(id);
         const added = await api.sessionQueueAdd(id, prompt, false);
         const entry = added[added.length - 1];
         if (!entry) throw new Error("Bridge did not queue the prompt");
         const result = await api.sessionQueueRunNext(id, entry.id);
-        dispatchQueue({
-          type: "replace",
-          sessionId: id,
-          entries: result.entries,
-        });
+        if (isCurrentQueueRequest(id, requestVersion)) {
+          dispatchQueue({
+            type: "replace",
+            sessionId: id,
+            entries: result.entries,
+          });
+        }
         patchTab(id, (tab) => ({
           ...tab,
           activity: {
@@ -1345,9 +1438,10 @@ export default function App() {
     if (tabBusy && !opts?.fromQueue) {
       let nextLen = 0;
       try {
-        const entries = await api.sessionQueueAdd(id, prompt, false);
+        const entries = await syncQueue(id, () =>
+          api.sessionQueueAdd(id, prompt, false),
+        );
         nextLen = entries.length;
-        dispatchQueue({ type: "replace", sessionId: id, entries });
       } catch (error) {
         if (fromComposer) restoreComposer(prompt, id);
         patchTab(id, (tab) => ({
@@ -1676,7 +1770,9 @@ export default function App() {
     }
   }
 
-  const splashReady = workspaceRestored && status !== null;
+  // A missing status is rendered as an offline/no-project state elsewhere;
+  // it must not leave the launch splash blocking every control forever.
+  const splashReady = workspaceRestored;
 
   return (
     <div
@@ -1692,9 +1788,12 @@ export default function App() {
           </span>
         </div>
         <div className="title-actions">
-          <span className="path-chip" title={status?.project_cwd ?? ""}>
-            {status?.project_cwd
-              ? shortPath(status.project_cwd, 36)
+          <span
+            className="path-chip"
+            title={status?.project_cwd || (activeIsBuild ? activeCwd : "")}
+          >
+            {status?.project_cwd || (activeIsBuild ? activeCwd : undefined)
+              ? shortPath(status?.project_cwd || activeCwd, 36)
               : "no project open"}
           </span>
           <div className="chrome-toggles" role="group" aria-label="Layout panels">
@@ -1827,10 +1926,7 @@ export default function App() {
             onClick={() => {
               setWorkspaceMode("build");
               // Don't keep answering in a chat tab while Builds is selected.
-              const buildTab = tabs.find((t) => {
-                const s = sessions.find((x) => x.id === t.id);
-                return (s?.kind ?? "build") === "build";
-              });
+              const buildTab = findTabOfKind(tabs, "build");
               if (buildTab) setActiveSessionId(buildTab.id);
               else if (
                 activeSummary &&
@@ -1847,10 +1943,7 @@ export default function App() {
             className={workspaceMode === "chat" ? "active" : ""}
             onClick={() => {
               setWorkspaceMode("chat");
-              const chatTab = tabs.find((t) => {
-                const s = sessions.find((x) => x.id === t.id);
-                return s?.kind === "chat";
-              });
+              const chatTab = findTabOfKind(tabs, "chat");
               if (chatTab) setActiveSessionId(chatTab.id);
               else if (activeSummary?.kind !== "chat") {
                 // Force ensureSession to create a chat on next send.
@@ -2089,7 +2182,7 @@ export default function App() {
             >
               <span className="session-cwd-label">cwd</span>
               <span className="session-cwd-path">
-                {shortPath(activeSummary?.cwd)}
+                {shortPath(activeCwd)}
               </span>
               <span className="session-cwd-change">Change</span>
             </button>
@@ -2161,20 +2254,17 @@ export default function App() {
                     focused={isFocused}
                     zoneIndex={zoneIndex + 1}
                     zoneCount={docks.length}
-                    kindLabel={
-                      sessions.find((s) => s.id === dockTab.id)?.kind ??
-                      workspaceMode
-                    }
+                    kindLabel={kindForTab(dockTab, sessions, workspaceMode)}
                     bridgeVersion={product.bridgeVersion}
                     emptyHint={
-                      workspaceMode === "build"
+                      kindForTab(dockTab, sessions, workspaceMode) === "build"
                         ? "Set a working directory, then send a prompt."
                         : "Message Grok when this pane is focused."
                     }
                     showClose={docks.length > 1}
                     onClosePane={undockSession}
                     onFocusSession={focusSession}
-                    cwd={sessions.find((s) => s.id === dockTab.id)?.cwd}
+                    cwd={dockTab.cwd ?? sessions.find((s) => s.id === dockTab.id)?.cwd}
                     titlePeers={[
                       ...sessions,
                       ...tabs.map((x) => ({
@@ -2290,8 +2380,8 @@ export default function App() {
             {activeTab && (
               <div className="composer-target" title="Composer sends to this session">
                 <span className="composer-target-label">→</span>
-                <span className={`kind-chip ${activeSummary?.kind ?? workspaceMode}`}>
-                  {activeSummary?.kind ?? workspaceMode}
+                <span className={`kind-chip ${kindForTab(activeTab, sessions, workspaceMode)}`}>
+                  {kindForTab(activeTab, sessions, workspaceMode)}
                 </span>
                 <span className="composer-target-title">{activeTab.title}</span>
                 {docks.length > 1 && (
@@ -2352,15 +2442,18 @@ export default function App() {
                   )
                 }
                 onSteer={async (entry) => {
+                  const requestVersion = invalidateQueue(activeSessionId);
                   const receipt = await api.sessionQueueSteerEntry(
                     activeSessionId,
                     entry.id,
                   );
-                  dispatchQueue({
-                    type: "replace",
-                    sessionId: activeSessionId,
-                    entries: receipt.entries,
-                  });
+                  if (isCurrentQueueRequest(activeSessionId, requestVersion)) {
+                    dispatchQueue({
+                      type: "replace",
+                      sessionId: activeSessionId,
+                      entries: receipt.entries,
+                    });
+                  }
                   if (receipt.disposition === "queued") {
                     setTimeout(
                       () => void drainNextQueuedPrompt(activeSessionId),
@@ -2369,15 +2462,18 @@ export default function App() {
                   }
                 }}
                 onRunNext={async (entry) => {
+                  const requestVersion = invalidateQueue(activeSessionId);
                   const result = await api.sessionQueueRunNext(
                     activeSessionId,
                     entry.id,
                   );
-                  dispatchQueue({
-                    type: "replace",
-                    sessionId: activeSessionId,
-                    entries: result.entries,
-                  });
+                  if (isCurrentQueueRequest(activeSessionId, requestVersion)) {
+                    dispatchQueue({
+                      type: "replace",
+                      sessionId: activeSessionId,
+                      entries: result.entries,
+                    });
+                  }
                   if (!result.cancelled_active) {
                     setTimeout(
                       () => void drainNextQueuedPrompt(activeSessionId),
@@ -2385,18 +2481,25 @@ export default function App() {
                     );
                   }
                 }}
+                onError={(message) => {
+                  patchTab(activeSessionId, (tab) => ({
+                    ...tab,
+                    activity: errorActivity(message),
+                  }));
+                }}
               />
             )}
             <div className="composer-toolbar">
               <div className="composer-toolbar-left">
                 <label
-                  className="composer-pill"
+                  className={`composer-pill ${models.length === 0 ? "is-disabled" : ""}`}
                   title="Model (default from Settings)"
                 >
                   <span className="composer-pill-label">Model</span>
                   <StyledSelect
                     aria-label="Model"
                     className="composer-select"
+                    disabled={models.length === 0}
                     value={
                       models.some((m) => m.id === status?.model)
                         ? (status?.model ?? models[0]?.id ?? "grok-build")
@@ -2409,29 +2512,30 @@ export default function App() {
                     onChange={(v) => {
                       void (async () => {
                         await api.setModel(v);
+                        const nextEffort = effortForModel(
+                          models,
+                          v,
+                          status?.effort,
+                        );
+                        if (nextEffort !== status?.effort) {
+                          await api.setEffort(nextEffort);
+                        }
                         await refreshChrome();
                       })();
                     }}
                   />
                 </label>
                 <label
-                  className="composer-pill"
+                  className={`composer-pill ${models.length === 0 ? "is-disabled" : ""}`}
                   title="Effort (default from Settings)"
                 >
                   <span className="composer-pill-label">Effort</span>
                   <StyledSelect
                     aria-label="Effort"
                     className="composer-select"
-                    value={String(status?.effort ?? "medium")}
-                    options={[
-                      "none",
-                      "minimal",
-                      "low",
-                      "medium",
-                      "high",
-                      "xhigh",
-                      "max",
-                    ].map((e) => ({ value: e, label: e }))}
+                    disabled={models.length === 0}
+                    value={currentEffort}
+                    options={effortOptions.map((e) => ({ value: e, label: e }))}
                     onChange={(v) => {
                       void (async () => {
                         await api.setEffort(v);
@@ -3249,7 +3353,7 @@ function sessionIdOf(u: SessionUpdate): string | null {
 
 function ensureTab(tabs: SessionTab[], id: string): SessionTab[] {
   if (tabs.some((t) => t.id === id)) return tabs;
-  return [...tabs, emptyTab(id)];
+  return [...tabs, emptyTab(id, "New session", "build")];
 }
 
 function mapTranscript(
@@ -3321,30 +3425,30 @@ function applyUpdate(
       break;
     case "agent_thought_chunk":
       withTab(sid!, (tab) => {
-        const snippet = u.text.trim().slice(0, 72);
+        const chunk = u.text.trim();
+        const snippet = chunk.slice(0, 72);
         const next = mapTranscript(
           tab,
           (t) => {
+            if (!chunk) return t;
             const last = t[t.length - 1];
-            // Host thoughts are whole lines (status crumbs), not token streams.
-            // Append on a new line when the last bubble is already a thought so
-            // we never glue "kind=build…" into itself across deliveries.
             if (last?.kind === "thought") {
-              // Exact duplicate of a multi-listener race — drop it.
-              if (last.text === u.text || last.text.endsWith(u.text)) {
+              // Exact duplicate of a multi-listener race — drop it. Natural
+              // language chunks join with spaces; diagnostics stay line-based.
+              if (last.text === chunk || last.text.endsWith(chunk)) {
                 return t;
               }
               const copy = t.slice(0, -1);
               copy.push({
                 kind: "thought",
-                text: `${last.text}\n${u.text}`,
+                text: appendThoughtChunk(last.text, chunk),
                 streaming: true,
               });
               return copy;
             }
             return [
               ...t,
-              { kind: "thought", text: u.text, streaming: true },
+              { kind: "thought", text: chunk, streaming: true },
             ];
           },
           { busy: true },

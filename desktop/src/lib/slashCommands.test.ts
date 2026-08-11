@@ -25,7 +25,7 @@ describe("slash commands (#148)", () => {
 });
 
 describe("launch splash (#150)", () => {
-  it("ships Djed splash gated on ready", () => {
+  it("ships Djed splash gated on workspace restore", () => {
     const splash = readFileSync(
       join(root, "..", "components", "LaunchSplash.tsx"),
       "utf8",
@@ -35,7 +35,7 @@ describe("launch splash (#150)", () => {
     expect(splash).toMatch(/grokptah-djed/);
     const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
     expect(app).toMatch(/LaunchSplash/);
-    expect(app).toMatch(/workspaceRestored && status !== null/);
+    expect(app).toMatch(/const splashReady = workspaceRestored;/);
   });
 });
 

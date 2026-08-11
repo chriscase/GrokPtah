@@ -365,13 +365,16 @@ button:disabled {
 
 @media (max-width: 900px) {
   .app-shell {
-    grid-template-columns: minmax(150px, 180px) minmax(0, 1fr) 36px;
+    grid-template-columns: minmax(150px, 180px) minmax(0, 1fr) minmax(180px, 220px);
   }
   .app-shell.sidebar-collapsed {
-    grid-template-columns: 36px minmax(0, 1fr) 36px;
+    grid-template-columns: 36px minmax(0, 1fr) minmax(180px, 220px);
   }
   .app-shell.rightbar-collapsed {
     grid-template-columns: minmax(150px, 180px) minmax(0, 1fr) 36px;
+  }
+  .app-shell.sidebar-collapsed.rightbar-collapsed {
+    grid-template-columns: 36px minmax(0, 1fr) 36px;
   }
 }
 
@@ -1728,9 +1731,18 @@ button:disabled {
 .bubble.thought {
   color: var(--thought);
   font-size: 12px;
+  line-height: 1.6;
   border-style: dashed;
   background: transparent;
   white-space: pre-wrap;
+}
+
+/* Thought chunks are plain cumulative text while the transcript is reflowing.
+ * Keep their line box stable; animated word spans can stack at the left edge
+ * of a narrow pane before the browser settles the layout.
+ */
+.bubble.thought .stream-text.is-streaming {
+  text-shadow: none;
 }
 
 .bubble.tool {
@@ -2367,6 +2379,37 @@ button:disabled {
   border-bottom: 0;
 }
 
+.prompt-queue-content {
+  min-width: 0;
+}
+
+.prompt-queue-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 15px;
+  padding: 0 0.35rem;
+  font-size: 10px;
+  line-height: 1.25;
+}
+
+.prompt-queue-state {
+  color: var(--muted);
+}
+
+.prompt-queue-state.steering-pending,
+.prompt-queue-state.run-next {
+  color: var(--accent);
+}
+
+.prompt-queue-state.steering-deferred {
+  color: #c084fc;
+}
+
+.prompt-queue-error {
+  color: var(--danger);
+}
+
 .prompt-queue-row.is-priority {
   box-shadow: 3px 0 0 var(--accent) inset;
 }
@@ -2512,6 +2555,16 @@ button:disabled {
 .composer-pill:hover {
   border-color: var(--border);
   background: var(--surface-chip);
+}
+
+.composer-pill.is-disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.composer-pill.is-disabled:hover {
+  border-color: var(--border-soft);
+  background: var(--bg-input);
 }
 
 .composer-pill-label {
@@ -4129,12 +4182,20 @@ button:disabled {
 }
 
 /* Jump to latest when user scrolled up mid-stream (#123) */
+.jump-to-latest-slot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-height: 2.35rem;
+  padding: 0.25rem 0.5rem 0.35rem;
+  border-top: 1px solid var(--border-soft);
+  background: var(--bg);
+  z-index: 10;
+}
 .jump-to-latest {
-  position: absolute;
-  bottom: 3.25rem;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 5;
+  position: static;
+  transform: none;
   padding: 0.35rem 0.85rem;
   border-radius: 999px;
   border: 1px solid var(--accent-dim);
@@ -4144,6 +4205,7 @@ button:disabled {
   font-family: var(--font-ui);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
   cursor: pointer;
+  white-space: nowrap;
 }
 .jump-to-latest:hover {
   background: var(--accent-bg);
@@ -4201,7 +4263,7 @@ button:disabled {
 }
 
 .styled-select-menu {
-  position: absolute;
+  position: fixed;
   z-index: 12000;
   top: calc(100% + 3px);
   left: 0;
@@ -4216,6 +4278,7 @@ button:disabled {
   border: 1px solid var(--border);
   background: var(--ctx-menu-bg);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  overscroll-behavior: contain;
 }
 
 .styled-select-option {
@@ -4229,6 +4292,8 @@ button:disabled {
   padding: 0.35rem 0.5rem;
   font: inherit;
   font-size: 12.5px;
+  white-space: normal;
+  overflow-wrap: anywhere;
   cursor: pointer;
 }
 

@@ -16,9 +16,12 @@ type Seg = { id: number; text: string; fresh: boolean };
 export function StreamingText({
   text,
   streaming,
+  animated = true,
 }: {
   text: string;
   streaming?: boolean;
+  /** Thought/status streams stay plain so live line reflow remains stable. */
+  animated?: boolean;
 }) {
   const prevText = useRef("");
   const [segments, setSegments] = useState<Seg[]>([]);
@@ -119,6 +122,15 @@ export function StreamingText({
   }, [streaming]);
 
   if (!text) return null;
+
+  if (!animated) {
+    return (
+      <span className={`stream-text ${streaming ? "is-streaming" : ""}`}>
+        {text}
+        {streaming && <span className="stream-caret" aria-hidden />}
+      </span>
+    );
+  }
 
   if (segments.length === 0) {
     return (
