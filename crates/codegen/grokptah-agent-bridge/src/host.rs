@@ -12,16 +12,18 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::completion::{build_evidence, observe_updates, CompletionObservations, CompletionUsage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     build_agent_messages, build_compact_summary, call_xai_agent_step, call_xai_chat,
     cargo_test_output_failed, coding_agent_tools, emit_message, emit_thought,
-    filter_tools_edit_and_shell, is_round_limit_stop_message, is_true_noop_tool_step,
-    normalize_sandbox_profile, offline_plan_steps, parse_effort_arg, propose_plan_with_model,
-    push_assistant, push_thought, push_tool, resolve_turn_max_rounds, round_limit_stop_message,
-    sandbox_blocks_shell, sandbox_is_readonly, surface_rate_limit_or_error, tool_kind,
-    tool_step_signature, tool_web_fetch, AgentStep, IdenticalToolCallRun, McpToolIndex,
+    filter_tools_edit_and_shell, is_incomplete_stop_message, is_round_limit_stop_message,
+    is_true_noop_tool_step, normalize_sandbox_profile, offline_plan_steps, parse_effort_arg,
+    propose_plan_with_model, push_assistant, push_thought, push_tool, resolve_turn_max_rounds,
+    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
+    IdenticalToolCallRun, McpToolIndex,
 };
 use crate::local_tools;
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
@@ -1342,6 +1344,22 @@ impl AgentHostHandle {
             prompt_tokens.saturating_add(completion_tokens)
         });
         u.requests = u.requests.saturating_add(1);
+    }
+
+    /// Snapshot session usage so a turn can report only its own delta.
+    pub fn session_usage_snapshot(&self, session_id: Uuid) -> (u64, u64, u64, u64) {
+        let g = self.inner.lock();
+        g.session_usage
+            .get(&session_id)
+            .map(|u| {
+                (
+                    u.prompt_tokens,
+                    u.completion_tokens,
+                    u.total_tokens,
+                    u.requests,
+                )
+            })
+            .unwrap_or_default()
     }
 
     pub fn set_effort(&self, effort: EffortLevel) {
@@ -2795,6 +2813,8 @@ impl AgentHostHandle {
         };
         // Durably append the user turn before the long model call.
         self.persist_session(session_id);
+        let start_seq = event_tx.current_seq();
+        let usage_before = self.session_usage_snapshot(session_id);
 
         let result = self
             .run_turn(
@@ -2815,6 +2835,48 @@ impl AgentHostHandle {
         self.persist_chrome();
 
         let cancelled = cancel.is_cancelled();
+        let end_seq = event_tx.current_seq();
+        let observations = match event_tx.read_range_all(start_seq, Some(end_seq), Some(session_id))
+        {
+            Ok(entries) => {
+                let updates = entries
+                    .iter()
+                    .map(|entry| &entry.update)
+                    .collect::<Vec<_>>();
+                observe_updates(&updates)
+            }
+            Err(_) => CompletionObservations::default(),
+        };
+        let usage_after = self.session_usage_snapshot(session_id);
+        let usage = CompletionUsage {
+            prompt_tokens: usage_after.0.saturating_sub(usage_before.0),
+            completion_tokens: usage_after.1.saturating_sub(usage_before.1),
+            total_tokens: usage_after.2.saturating_sub(usage_before.2),
+            requests: usage_after.3.saturating_sub(usage_before.3),
+        };
+        let outcome = if cancelled {
+            "cancelled"
+        } else if result.is_err() {
+            "failed"
+        } else if result
+            .as_ref()
+            .is_ok_and(|text| is_incomplete_stop_message(text))
+        {
+            "limit_reached"
+        } else {
+            "completed"
+        };
+        let evidence = build_evidence(
+            outcome,
+            result.as_ref().ok().map(String::as_str),
+            observations,
+            usage,
+            cancelled,
+        );
+        let _ = event_tx.send(SessionUpdate::CompletionEvidence {
+            session_id,
+            evidence,
+        });
         let final_result = match result {
             Ok(reply) => {
                 let _ = event_tx.send(SessionUpdate::TurnComplete {
