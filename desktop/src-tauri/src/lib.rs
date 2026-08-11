@@ -91,6 +91,7 @@ pub fn run() {
             commands::session_steer,
             commands::session_cancel,
             commands::session_transcript,
+            commands::session_completion_history,
             commands::session_fork,
             commands::session_rewind,
             commands::session_compact,

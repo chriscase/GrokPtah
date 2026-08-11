@@ -41,6 +41,12 @@ export interface CompletionEvidence {
   };
 }
 
+export interface SessionCompletionRecord {
+  turn_id: string;
+  completed_at: string;
+  evidence: CompletionEvidence;
+}
+
 export type SessionUpdate =
   | { type: "agent_message_chunk"; session_id: string; text: string }
   | { type: "agent_thought_chunk"; session_id: string; text: string }
@@ -72,9 +78,11 @@ export type SessionUpdate =
       request: PermissionRequest;
     }
   | { type: "turn_complete"; session_id: string; cancelled: boolean }
+  | { type: "turn_started"; session_id: string; turn_id: string }
   | {
       type: "completion_evidence";
       session_id: string;
+      turn_id: string;
       evidence: CompletionEvidence;
     }
   | { type: "error"; session_id: string; message: string }
@@ -227,6 +235,8 @@ export interface SessionTab {
   totalTokens?: number;
   /** Last authoritative completion summary for this session. */
   completionEvidence: CompletionEvidence | null;
+  /** Turn identity associated with the live or restored evidence. */
+  completionTurnId: string | null;
 }
 
 export type TranscriptItem =

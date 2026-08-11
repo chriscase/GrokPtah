@@ -1474,6 +1474,7 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
     match u {
         AgentMessageChunk { session_id, .. }
         | AgentThoughtChunk { session_id, .. }
+        | TurnStarted { session_id, .. }
         | ToolCall { session_id, .. }
         | ToolCallUpdate { session_id, .. }
         | Plan { session_id, .. }

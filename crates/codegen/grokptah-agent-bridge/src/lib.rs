@@ -87,7 +87,7 @@ pub use orchestration::{
 };
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use search_engine::{SearchHit, SearchQuery};
-pub use session::{SessionKind, SessionSummary, TranscriptEntry};
+pub use session::{SessionCompletion, SessionKind, SessionSummary, TranscriptEntry};
 pub use spawn_env::{scrub_std_command, scrub_tokio_command, CONTROL_SECRET_ENV_KEYS};
 pub use types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,

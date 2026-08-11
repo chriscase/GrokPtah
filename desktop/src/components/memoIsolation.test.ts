@@ -120,7 +120,6 @@ describe("compact stage layout", () => {
     );
   });
 });
-
 describe("completion evidence", () => {
   it("renders the authoritative trust state and counts", () => {
     const src = readFileSync(join(root, "SessionPane.tsx"), "utf8");
@@ -131,5 +130,15 @@ describe("completion evidence", () => {
     expect(src).toMatch(/stopReason/);
     expect(src).toMatch(/model request/);
     expect(src).toMatch(/role="status"/);
+  });
+
+  it("hydrates and guards turn-correlated evidence", () => {
+    const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
+    expect(app).toMatch(/sessionCompletionHistory/);
+    expect(app).toMatch(/completionTurnId/);
+    expect(app).toMatch(/turn_started/);
+    expect(app).toMatch(/u\.turn_id/);
+    expect(app).toMatch(/restoredCompletion/);
+    expect(app).toMatch(/\.catch\(\(\) => \[\]\)/);
   });
 });

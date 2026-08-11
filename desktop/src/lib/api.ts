@@ -4,6 +4,7 @@ import type {
   AuthState,
   ModelInfo,
   SearchHit,
+  SessionCompletionRecord,
   SessionKind,
   SessionSummary,
   SubagentInfo,
@@ -151,6 +152,10 @@ export const api = {
         tool_output?: string | null;
       }[]
     >("session_transcript", { sessionId }),
+  sessionCompletionHistory: (sessionId: string) =>
+    invoke<SessionCompletionRecord[]>("session_completion_history", {
+      sessionId,
+    }),
   sessionFork: (sourceId: string) =>
     invoke<SessionSummary>("session_fork", { sourceId }),
   sessionRewind: (
