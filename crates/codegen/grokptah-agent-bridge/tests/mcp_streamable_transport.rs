@@ -8,7 +8,7 @@ use grokptah_agent_bridge::orchestration::{
     OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, start_control_server,
+    home_override_serial, set_grokptah_home_override, start_control_from_env, start_control_server,
     start_control_server_with, AgentHost, ControlServerLimits, HostConfig, McpControlClient,
     SessionKind, CONTROL_TOOLS,
 };
@@ -682,11 +682,11 @@ async fn request_timeout_returns_error() {
         .send()
         .await
         .unwrap();
-    // Timeout maps to Internal → 500 with JSON-RPC error body.
-    assert!(
-        resp.status().is_server_error() || resp.status().is_client_error(),
-        "expected error status, got {}",
-        resp.status()
+    // Timeout maps to HTTP 504 + structured data.code=timeout.
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "expected 504 Gateway Timeout"
     );
     let body: serde_json::Value = resp.json().await.unwrap();
     let msg = body["error"]["message"]
@@ -697,7 +697,352 @@ async fn request_timeout_returns_error() {
         msg.contains("timed out") || msg.contains("timeout"),
         "expected timeout error message, got {body}"
     );
+    assert_eq!(body["error"]["data"]["code"], "timeout");
     assert_eq!(body["id"], 42);
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn unknown_and_forbidden_tools_fail_closed_over_http() {
+    let (_home, _lock, _host, _ws, orch) = setup();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let url = format!("http://{}/mcp", srv.addr);
+    let http = reqwest::Client::new();
+    for (name, expect_fragment) in [
+        ("run_terminal_cmd", "not available"),
+        ("ptah_shell", "not available"),
+        ("ptah_manage_mcp", "not available"),
+        ("no_such_tool_xyz", "not available"),
+    ] {
+        let resp = http
+            .post(&url)
+            .header("Authorization", "Bearer stream-token-200")
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "jsonrpc":"2.0","id":7,"method":"tools/call",
+                "params":{"name": name, "arguments":{}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "{name} status {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let msg = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains(expect_fragment),
+            "{name}: expected '{expect_fragment}' in {body}"
+        );
+        assert_eq!(body["error"]["data"]["code"], "forbidden_scope");
+    }
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn http_submit_durable_run_events_handoff_and_cancel() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (_home, _lock, host, ws, orch) = setup();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), "stream-token-200");
+    client.initialize().await.unwrap();
+
+    let submitted = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "conf-submit-1",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "prompt": "list files in the project root"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!submitted.is_error);
+    let run_id = submitted
+        .structured
+        .get("runId")
+        .or_else(|| submitted.structured.get("run_id"))
+        .and_then(|v| v.as_str())
+        .expect("submit must return runId")
+        .to_string();
+
+    // Poll durable run visibility until terminal (offline agent completes quickly).
+    let mut state = String::new();
+    for _ in 0..40 {
+        let run = client
+            .call_tool("ptah_get_run", json!({ "run_id": run_id }))
+            .await
+            .unwrap();
+        assert!(!run.is_error);
+        state = run
+            .structured
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if matches!(
+            state.as_str(),
+            "completed" | "failed" | "cancelled" | "interrupted" | "limit_reached"
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !state.is_empty(),
+        "run must reach a durable visible state via MCP"
+    );
+
+    let events = client
+        .call_tool(
+            "ptah_get_events",
+            json!({ "run_id": run_id, "after_seq": 0, "limit": 50 }),
+        )
+        .await
+        .unwrap();
+    assert!(!events.is_error);
+    // Event page is ordered; if present, sequences are non-decreasing.
+    if let Some(arr) = events
+        .structured
+        .get("events")
+        .or_else(|| events.structured.get("entries"))
+        .and_then(|v| v.as_array())
+    {
+        let mut prev = 0u64;
+        for e in arr {
+            if let Some(seq) = e.get("seq").and_then(|s| s.as_u64()) {
+                assert!(seq >= prev, "event seq must be non-decreasing");
+                prev = seq;
+            }
+        }
+    }
+
+    let handoff = client
+        .call_tool("ptah_get_handoff", json!({ "run_id": run_id }))
+        .await
+        .unwrap();
+    assert!(
+        !handoff.is_error,
+        "handoff must be durable for terminal run"
+    );
+
+    // Cancel of already-terminal run fails closed (no silent success).
+    let cancel_term = client
+        .call_tool(
+            "ptah_cancel",
+            json!({
+                "request_id": "conf-cancel-term",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            }),
+        )
+        .await;
+    assert!(
+        cancel_term.is_err(),
+        "cancel on terminal run must fail closed"
+    );
+
+    // Unknown run cancel fails closed.
+    let cancel_unknown = client
+        .call_tool(
+            "ptah_cancel",
+            json!({
+                "request_id": "conf-cancel-unknown",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": "no-such-run-id"
+            }),
+        )
+        .await;
+    assert!(cancel_unknown.is_err());
+
+    // Cross-session: foreign session cannot cancel this run.
+    let other = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(other.id, ws.path()).unwrap();
+    let cross = client
+        .call_tool(
+            "ptah_cancel",
+            json!({
+                "request_id": "conf-cancel-cross",
+                "session_id": other.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            }),
+        )
+        .await;
+    assert!(cross.is_err(), "cross-session cancel must fail closed");
+
+    client.close_session().await.unwrap();
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn http_cancel_busy_run_reaches_cancelled() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (_home, _lock, host, ws, orch) = setup();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), "stream-token-200");
+    client.initialize().await.unwrap();
+
+    // Long shell so cancel races a live run (same pattern as orch adversarial).
+    let marker = ws.path().join("busy_cancel_marker.txt");
+    let submitted = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "conf-busy-1",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "prompt": format!(
+                    "run (sleep 5; echo leaked > {}) & wait",
+                    marker.display()
+                ),
+                "bounds": {"maxDurationMs": 60000, "maxRounds": 8, "maxPromptBytes": 50000}
+            }),
+        )
+        .await
+        .unwrap();
+    let run_id = submitted
+        .structured
+        .get("runId")
+        .or_else(|| submitted.structured.get("run_id"))
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let cancelled = client
+        .call_tool(
+            "ptah_cancel",
+            json!({
+                "request_id": "conf-busy-cancel",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!cancelled.is_error);
+    // Replay same request_id is idempotent.
+    let replay = client
+        .call_tool(
+            "ptah_cancel",
+            json!({
+                "request_id": "conf-busy-cancel",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled
+            .structured
+            .get("runId")
+            .or(cancelled.structured.get("run_id")),
+        replay
+            .structured
+            .get("runId")
+            .or(replay.structured.get("run_id"))
+    );
+
+    let mut final_state = String::new();
+    for _ in 0..40 {
+        let run = client
+            .call_tool("ptah_get_run", json!({ "run_id": run_id }))
+            .await
+            .unwrap();
+        final_state = run
+            .structured
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if final_state == "cancelled" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        final_state, "cancelled",
+        "busy cancel must leave durable cancelled state"
+    );
+
+    client.close_session().await.unwrap();
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn independent_node_coordinator_conformance() {
+    // multi_thread so Node interop does not starve the server runtime.
+    let (_home, _lock, host, ws, orch) = setup();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let url = format!("http://{}/mcp", srv.addr);
+    let sdk_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_sdk_interop");
+    if !sdk_dir
+        .join("node_modules/@modelcontextprotocol/sdk")
+        .is_dir()
+    {
+        let st = tokio::process::Command::new("npm")
+            .args(["install", "--no-fund", "--no-audit"])
+            .current_dir(&sdk_dir)
+            .status()
+            .await
+            .expect("npm install");
+        assert!(st.success());
+    }
+    let output = tokio::process::Command::new("node")
+        .arg(sdk_dir.join("run_conformance.mjs"))
+        .env("GROKPTAH_MCP_URL", &url)
+        .env("GROKPTAH_MCP_TOKEN", "stream-token-200")
+        .env("GROKPTAH_MCP_SESSION_ID", session.id.to_string())
+        .env("GROKPTAH_MCP_WORKSPACE", ws.path().display().to_string())
+        .output()
+        .await
+        .expect("spawn conformance");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "coordinator conformance failed\nstdout={stdout}\nstderr={stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(report["ok"], true, "report={report}");
+    assert!(
+        report["checks"]
+            .as_object()
+            .map(|o| o.values().all(|v| v == &json!(true)))
+            .unwrap_or(false),
+        "not all checks true: {report}"
+    );
+    // SDK path reported honestly (may be false); must not be invented as true without success.
+    assert!(report.get("sdkOk").is_some());
+    // Durable transcript for verifiers (`--nocapture`).
+    eprintln!("MCP_CONFORMANCE_NODE_JSON {report}");
+    if !stderr.trim().is_empty() {
+        eprintln!("MCP_CONFORMANCE_NODE_STDERR {stderr}");
+    }
     srv.stop();
     set_grokptah_home_override(None);
 }
@@ -749,4 +1094,132 @@ async fn http_steer_idle_queues_without_starting_run() {
     client.close_session().await.unwrap();
     srv.stop();
     set_grokptah_home_override(None);
+}
+
+/// Live coordinator smoke against the **desktop env bootstrap** path
+/// (`start_control_from_env` — same contract as Tauri `start_embedded_control`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn live_desktop_bootstrap_node_smoke() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let guard = home_override_serial();
+    let home = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".grokptah")).unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+
+    // Disposable token — never a real credential.
+    let token = format!("live-smoke-{}", uuid::Uuid::new_v4());
+    // Isolate env mutations for this process; restore best-effort after.
+    let prev_token = std::env::var("GROKPTAH_CONTROL_TOKEN").ok();
+    let prev_port = std::env::var("GROKPTAH_CONTROL_PORT").ok();
+    let prev_ws = std::env::var("GROKPTAH_CONTROL_WORKSPACES").ok();
+    std::env::set_var("GROKPTAH_CONTROL_TOKEN", &token);
+    std::env::set_var("GROKPTAH_CONTROL_PORT", "0");
+    std::env::set_var("GROKPTAH_CONTROL_WORKSPACES", ws.path().as_os_str());
+
+    let srv = start_control_from_env(host.clone())
+        .await
+        .expect("desktop env bootstrap must start control server");
+    assert!(
+        srv.addr.ip().is_loopback(),
+        "desktop bootstrap must bind loopback, got {}",
+        srv.addr
+    );
+    assert_eq!(srv.token, token);
+
+    // Without token the shared bootstrap fails closed (structural desktop path).
+    std::env::remove_var("GROKPTAH_CONTROL_TOKEN");
+    assert!(
+        start_control_from_env(host.clone()).await.is_none(),
+        "missing GROKPTAH_CONTROL_TOKEN must not start control"
+    );
+    std::env::set_var("GROKPTAH_CONTROL_TOKEN", &token);
+
+    let url = format!("http://{}/mcp", srv.addr);
+    let sdk_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_sdk_interop");
+    if !sdk_dir
+        .join("node_modules/@modelcontextprotocol/sdk")
+        .is_dir()
+    {
+        let st = tokio::process::Command::new("npm")
+            .args(["install", "--no-fund", "--no-audit"])
+            .current_dir(&sdk_dir)
+            .status()
+            .await
+            .expect("npm install");
+        assert!(st.success());
+    }
+    let output = tokio::process::Command::new("node")
+        .arg(sdk_dir.join("run_live_smoke.mjs"))
+        .env("GROKPTAH_MCP_URL", &url)
+        .env("GROKPTAH_MCP_TOKEN", &token)
+        .env("GROKPTAH_MCP_SESSION_ID", session.id.to_string())
+        .env("GROKPTAH_MCP_WORKSPACE", ws.path().display().to_string())
+        .output()
+        .await
+        .expect("spawn live smoke");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "live desktop bootstrap smoke failed\nstdout={stdout}\nstderr={stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(report["ok"], true, "live smoke report={report}");
+    if let Some(failed) = report["failed"].as_array() {
+        assert!(failed.is_empty(), "failed checks: {failed:?}");
+    }
+    // Durable transcript for verifiers (`--nocapture`).
+    eprintln!("LIVE_DESKTOP_MCP_SMOKE_REPORT {report}");
+    if !stderr.trim().is_empty() {
+        eprintln!("LIVE_DESKTOP_MCP_SMOKE_STDERR {stderr}");
+    }
+
+    srv.stop();
+    // Restore env
+    match prev_token {
+        Some(v) => std::env::set_var("GROKPTAH_CONTROL_TOKEN", v),
+        None => std::env::remove_var("GROKPTAH_CONTROL_TOKEN"),
+    }
+    match prev_port {
+        Some(v) => std::env::set_var("GROKPTAH_CONTROL_PORT", v),
+        None => std::env::remove_var("GROKPTAH_CONTROL_PORT"),
+    }
+    match prev_ws {
+        Some(v) => std::env::set_var("GROKPTAH_CONTROL_WORKSPACES", v),
+        None => std::env::remove_var("GROKPTAH_CONTROL_WORKSPACES"),
+    }
+    set_grokptah_home_override(None);
+    drop(guard);
+}
+
+/// Desktop wiring must keep delegating to the shared bootstrap (no fork of policy).
+#[test]
+fn desktop_control_bootstrap_uses_shared_start_control_from_env() {
+    let lib =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../desktop/src-tauri/src/lib.rs");
+    let src = std::fs::read_to_string(&lib).expect("read desktop lib.rs");
+    assert!(
+        src.contains("start_control_from_env"),
+        "desktop must call shared start_control_from_env"
+    );
+    assert!(
+        src.contains("GROKPTAH_CONTROL_TOKEN") || src.contains("start_embedded_control"),
+        "desktop control entry must remain present"
+    );
+    // Must not re-implement OrchStore::open + start_control_server inline.
+    assert!(
+        !src.contains("OrchStore::open(grokptah_home()"),
+        "desktop must not re-open orch store outside shared bootstrap"
+    );
 }
