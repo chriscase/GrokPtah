@@ -1,8 +1,9 @@
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo,
     PermissionDecision, PluginInfo, PromptQueueEntry, PromptQueueRunNextResult,
-    PromptQueueTakeResult, SearchHit, SearchQuery, SessionKind, SessionSummary, SkillInfo,
-    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    PromptQueueTakeResult, SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary,
+    SkillInfo, SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION,
+    PRODUCT_NAME,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -404,6 +405,16 @@ pub async fn session_transcript(
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     run_blocking(move || host.session_transcript(id).map_err(map_err)).await
+}
+
+#[tauri::command]
+pub async fn session_completion_history(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<SessionCompletion>, String> {
+    let host = state.host.clone();
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    run_blocking(move || host.session_completion_history(id).map_err(map_err)).await
 }
 
 #[tauri::command]

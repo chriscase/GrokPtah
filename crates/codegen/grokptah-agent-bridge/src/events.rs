@@ -38,6 +38,11 @@ pub enum SessionUpdate {
         session_id: Uuid,
         text: String,
     },
+    /// Marks the turn identity used to reject stale terminal evidence.
+    TurnStarted {
+        session_id: Uuid,
+        turn_id: Uuid,
+    },
     ToolCall {
         session_id: Uuid,
         call_id: String,
@@ -68,6 +73,7 @@ pub enum SessionUpdate {
     /// Evidence-backed completion summary; emitted immediately before TurnComplete.
     CompletionEvidence {
         session_id: Uuid,
+        turn_id: Uuid,
         evidence: CompletionEvidence,
     },
     Error {

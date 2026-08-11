@@ -565,7 +565,8 @@ impl EventBus {
 fn is_critical_update(update: &SessionUpdate) -> bool {
     matches!(
         update,
-        SessionUpdate::CompletionEvidence { .. }
+        SessionUpdate::TurnStarted { .. }
+            | SessionUpdate::CompletionEvidence { .. }
             | SessionUpdate::TurnComplete { .. }
             | SessionUpdate::Error { .. }
             | SessionUpdate::PermissionRequired { .. }
@@ -603,6 +604,7 @@ fn session_id_of(u: &SessionUpdate) -> Option<uuid::Uuid> {
     match u {
         AgentMessageChunk { session_id, .. }
         | AgentThoughtChunk { session_id, .. }
+        | TurnStarted { session_id, .. }
         | ToolCall { session_id, .. }
         | ToolCallUpdate { session_id, .. }
         | Plan { session_id, .. }
@@ -932,7 +934,8 @@ pub fn redact_update_with_secrets(
                 *s = scrub_text(s, control_secrets, 500);
             }
         }
-        SessionUpdate::CompletionEvidence { .. }
+        SessionUpdate::TurnStarted { .. }
+        | SessionUpdate::CompletionEvidence { .. }
         | SessionUpdate::TurnComplete { .. }
         | SessionUpdate::ShellSessionEnded { .. }
         | SessionUpdate::SubagentSpawned { .. } => {}
@@ -1172,6 +1175,42 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(SessionUpdate::TurnComplete { .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionUpdate::AgentMessageChunk { ref text, .. }) if text == "after"
+        ));
+    }
+
+    #[test]
+    fn turn_started_is_critical_and_rejoins_in_publish_order() {
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        let sid = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "before".into(),
+        });
+        bus.publish(SessionUpdate::TurnStarted {
+            session_id: sid,
+            turn_id,
+        });
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "after".into(),
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionUpdate::AgentMessageChunk { ref text, .. }) if text == "before"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionUpdate::TurnStarted {
+                session_id,
+                turn_id: received_turn_id,
+            }) if session_id == sid && received_turn_id == turn_id
         ));
         assert!(matches!(
             rx.try_recv(),

@@ -128,6 +128,15 @@ async fn session_lifecycle_prompt_streams_message() {
             ..
         }
     )));
+    let started_turn_id = events.iter().find_map(|e| match e {
+        SessionUpdate::TurnStarted { turn_id, .. } => Some(*turn_id),
+        _ => None,
+    });
+    let evidence_turn_id = events.iter().find_map(|e| match e {
+        SessionUpdate::CompletionEvidence { turn_id, .. } => Some(*turn_id),
+        _ => None,
+    });
+    assert_eq!(started_turn_id, evidence_turn_id);
     let evidence_index = events
         .iter()
         .position(|e| matches!(e, SessionUpdate::CompletionEvidence { .. }))
@@ -137,6 +146,20 @@ async fn session_lifecycle_prompt_streams_message() {
         .position(|e| matches!(e, SessionUpdate::TurnComplete { .. }))
         .expect("every completed turn must emit TurnComplete");
     assert!(evidence_index < complete_index);
+
+    let history = host.session_completion_history(session.id).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].evidence.status, "unverified");
+    let turn_id = history[0].turn_id;
+    drop(host);
+
+    let restored_host = AgentHost::create(HostConfig::default());
+    let restored = restored_host
+        .session_completion_history(session.id)
+        .unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].turn_id, turn_id);
+    assert_eq!(restored[0].evidence.status, "unverified");
 }
 
 #[tokio::test]

@@ -105,6 +105,7 @@ function emptyTab(
     unseen: false,
     needsPermission: false,
     completionEvidence: null,
+    completionTurnId: null,
   };
 }
 
@@ -428,8 +429,13 @@ export default function App() {
         // Resume: promote backend active session + cwd, then hydrate transcript (#38).
         const loaded = await api.sessionLoad(summary.id);
         const entries = await api.sessionTranscript(loaded.id);
+        const completionHistory = await api
+          .sessionCompletionHistory(loaded.id)
+          .catch(() => []);
+        const latestCompletion = completionHistory[completionHistory.length - 1];
         const restoredTranscript = entriesToTranscriptItems(entries);
         const interrupted = hasInterruptedTurn(entries);
+        const restoredCompletion = interrupted ? undefined : latestCompletion;
         setTabs((prev) =>
           prev.map((t) => {
             if (t.id !== loaded.id) return t;
@@ -440,6 +446,8 @@ export default function App() {
               title: loaded.title || summary.title,
               kind: loaded.kind ?? summary.kind ?? t.kind,
               cwd: loaded.cwd || summary.cwd || t.cwd,
+              completionEvidence: restoredCompletion?.evidence ?? null,
+              completionTurnId: restoredCompletion?.turn_id ?? null,
               transcript: interrupted
                 ? [
                     ...restoredTranscript,
@@ -1473,6 +1481,7 @@ export default function App() {
       ...t,
       busy: true,
       completionEvidence: null,
+      completionTurnId: null,
       activity: queuedActivity(),
       title:
         t.title === "New session" || t.title === "New chat"
@@ -3387,6 +3396,14 @@ function applyUpdate(
   };
 
   switch (u.type) {
+    case "turn_started":
+      withTab(sid!, (tab) => ({
+        ...tab,
+        busy: true,
+        completionEvidence: null,
+        completionTurnId: u.turn_id,
+      }));
+      break;
     case "agent_message_chunk":
       withTab(sid!, (tab) => {
         const next = mapTranscript(
@@ -3608,10 +3625,16 @@ function applyUpdate(
       }));
       break;
     case "completion_evidence":
-      withTab(sid!, (tab) => ({
-        ...tab,
-        completionEvidence: u.evidence,
-      }));
+      withTab(sid!, (tab) => {
+        if (tab.completionTurnId && tab.completionTurnId !== u.turn_id) {
+          return tab;
+        }
+        return {
+          ...tab,
+          completionEvidence: u.evidence,
+          completionTurnId: u.turn_id,
+        };
+      });
       break;
     case "error":
       withTab(sid!, (tab) => {

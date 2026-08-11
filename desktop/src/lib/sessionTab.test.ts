@@ -19,6 +19,7 @@ const buildTab: SessionTab = {
   unseen: false,
   needsPermission: false,
   completionEvidence: null,
+  completionTurnId: null,
 };
 
 describe("session tab identity", () => {

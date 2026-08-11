@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::completion::CompletionEvidence;
+
 /// Workspace mode: coding agent builds vs plain Grok conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +50,14 @@ pub struct SessionSummary {
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub kind: SessionKind,
+}
+
+/// Durable evidence for one completed or interrupted model turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionCompletion {
+    pub turn_id: Uuid,
+    pub completed_at: DateTime<Utc>,
+    pub evidence: CompletionEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +185,9 @@ pub struct Session {
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub kind: SessionKind,
+    /// Bounded per-turn completion evidence, restored independently of the transcript.
+    #[serde(default)]
+    pub completion_history: Vec<SessionCompletion>,
     /// True once `transcript.jsonl` has been read into `transcript`.
     #[serde(skip)]
     pub transcript_loaded: bool,
@@ -222,6 +235,7 @@ impl Session {
             archived: false,
             archived_at: None,
             kind,
+            completion_history: Vec::new(),
             transcript_loaded: true,
             persisted_len: 0,
             todos: crate::todo_list::TodoList::default(),

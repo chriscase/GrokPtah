@@ -32,7 +32,7 @@ use crate::prompt_queue::{
     SessionPromptQueue, SteeringReceipt,
 };
 use crate::search_engine::{self, SearchHit, SearchQuery};
-use crate::session::{Session, SessionKind, SessionSummary, TranscriptEntry};
+use crate::session::{Session, SessionCompletion, SessionKind, SessionSummary, TranscriptEntry};
 use crate::session_store::{self, WorkspaceChrome};
 use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
@@ -155,6 +155,8 @@ pub(crate) struct SessionUsage {
     total_tokens: u64,
     requests: u64,
 }
+
+const MAX_SESSION_COMPLETION_HISTORY: usize = 64;
 
 /// Clears `turn_cancels` for a session when dropped — keeps panics from wedging busy.
 struct TurnBusyGuard {
@@ -613,6 +615,51 @@ impl AgentHostHandle {
             .get(&id)
             .ok_or_else(|| anyhow!("unknown session"))?;
         Ok(s.transcript.clone())
+    }
+
+    /// Return durable completion evidence in chronological order.
+    pub fn session_completion_history(&self, id: Uuid) -> Result<Vec<SessionCompletion>> {
+        let g = self.inner.lock();
+        let s = g
+            .sessions
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        Ok(s.completion_history.clone())
+    }
+
+    /// Persist one bounded, turn-correlated completion summary without adding
+    /// redacted evidence blobs to the append-only transcript.
+    pub fn record_completion_evidence(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        evidence: crate::completion::CompletionEvidence,
+    ) -> Result<()> {
+        let snapshot = {
+            let mut g = self.inner.lock();
+            let session = g
+                .sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            session
+                .completion_history
+                .retain(|item| item.turn_id != turn_id);
+            session.completion_history.push(SessionCompletion {
+                turn_id,
+                completed_at: Utc::now(),
+                evidence,
+            });
+            if session.completion_history.len() > MAX_SESSION_COMPLETION_HISTORY {
+                let remove = session
+                    .completion_history
+                    .len()
+                    .saturating_sub(MAX_SESSION_COMPLETION_HISTORY);
+                session.completion_history.drain(0..remove);
+            }
+            session.updated_at = Utc::now();
+            session.clone()
+        };
+        session_store::save_session_meta(&snapshot)
     }
 
     /// Whether a session currently has an in-flight turn.
@@ -2815,6 +2862,11 @@ impl AgentHostHandle {
         self.persist_session(session_id);
         let start_seq = event_tx.current_seq();
         let usage_before = self.session_usage_snapshot(session_id);
+        let turn_id = Uuid::new_v4();
+        let _ = event_tx.send(SessionUpdate::TurnStarted {
+            session_id,
+            turn_id,
+        });
 
         let result = self
             .run_turn(
@@ -2873,8 +2925,12 @@ impl AgentHostHandle {
             usage,
             cancelled,
         );
+        if let Err(error) = self.record_completion_evidence(session_id, turn_id, evidence.clone()) {
+            eprintln!("[grokptah] completion evidence persist failed: {error:#}");
+        }
         let _ = event_tx.send(SessionUpdate::CompletionEvidence {
             session_id,
+            turn_id,
             evidence,
         });
         let final_result = match result {
