@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::completion::{CompletionEvidence, CompletionUsage};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
@@ -228,6 +230,16 @@ fn positive_u64(v: &serde_json::Value, key: &str) -> Result<u64, OrchError> {
 pub struct RunAggregates {
     pub changes: Vec<ChangeRecord>,
     pub tests: Vec<TestObservation>,
+    #[serde(default)]
+    pub permissions_requested: u32,
+    #[serde(default)]
+    pub permissions_granted: u32,
+    #[serde(default)]
+    pub permissions_denied: u32,
+    #[serde(default)]
+    pub usage: CompletionUsage,
+    #[serde(default)]
+    pub verification: Option<CompletionEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

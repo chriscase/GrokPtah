@@ -565,7 +565,8 @@ impl EventBus {
 fn is_critical_update(update: &SessionUpdate) -> bool {
     matches!(
         update,
-        SessionUpdate::TurnComplete { .. }
+        SessionUpdate::CompletionEvidence { .. }
+            | SessionUpdate::TurnComplete { .. }
             | SessionUpdate::Error { .. }
             | SessionUpdate::PermissionRequired { .. }
             | SessionUpdate::ShellSessionEnded { .. }
@@ -606,6 +607,7 @@ fn session_id_of(u: &SessionUpdate) -> Option<uuid::Uuid> {
         | ToolCallUpdate { session_id, .. }
         | Plan { session_id, .. }
         | PermissionRequired { session_id, .. }
+        | CompletionEvidence { session_id, .. }
         | TurnComplete { session_id, .. }
         | Error { session_id, .. }
         | SubagentSpawned { session_id, .. }
@@ -930,7 +932,8 @@ pub fn redact_update_with_secrets(
                 *s = scrub_text(s, control_secrets, 500);
             }
         }
-        SessionUpdate::TurnComplete { .. }
+        SessionUpdate::CompletionEvidence { .. }
+        | SessionUpdate::TurnComplete { .. }
         | SessionUpdate::ShellSessionEnded { .. }
         | SessionUpdate::SubagentSpawned { .. } => {}
     }

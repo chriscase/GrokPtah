@@ -835,6 +835,16 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
         !handoff.is_error,
         "handoff must be durable for terminal run"
     );
+    assert!(
+        handoff.structured["verification"].is_object(),
+        "handoff must expose evidence-backed verification"
+    );
+    assert!(
+        handoff.structured["verification"]["status"]
+            .as_str()
+            .is_some(),
+        "verification must expose a bounded trust status"
+    );
 
     // Cancel of already-terminal run fails closed (no silent success).
     let cancel_term = client

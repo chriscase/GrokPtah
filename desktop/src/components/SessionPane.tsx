@@ -332,7 +332,54 @@ export const SessionPane = memo(function SessionPane({
         </div>
       )}
 
+      {tab.completionEvidence && (
+        <CompletionEvidenceStrip evidence={tab.completionEvidence} />
+      )}
+
       <ActivityIndicator activity={tab.activity} busy={busy} />
     </section>
   );
 });
+
+function CompletionEvidenceStrip({
+  evidence,
+}: {
+  evidence: NonNullable<SessionTab["completionEvidence"]>;
+}) {
+  const { observations } = evidence;
+  const statusLabel = evidence.status[0].toUpperCase() + evidence.status.slice(1);
+  const testSummary = observations.testsObserved
+    ? `${observations.testsPassed}/${observations.testsObserved} tests passed`
+    : "no tests observed";
+  const permissionSummary = observations.permissionsRequested
+    ? `${observations.permissionsDenied} denied${
+        observations.permissionsUnresolved
+          ? ` · ${observations.permissionsUnresolved} unresolved`
+          : ""
+      }`
+    : null;
+  const stopSummary =
+    evidence.stopReason === "completed"
+      ? null
+      : `stopped: ${evidence.stopReason.replaceAll("_", " ")}`;
+  const usageSummary = evidence.usage.requests
+    ? `${evidence.usage.requests} model request${
+        evidence.usage.requests === 1 ? "" : "s"
+      }`
+    : null;
+  return (
+    <div
+      className={`completion-evidence status-${evidence.status}`}
+      role="status"
+      aria-label={`Completion ${evidence.status}: ${observations.changedFiles} files changed, ${testSummary}`}
+    >
+      <strong>{statusLabel}</strong>
+      <span>{observations.changedFiles} files changed</span>
+      <span>{testSummary}</span>
+      {permissionSummary && <span>{permissionSummary}</span>}
+      {stopSummary && <span>{stopSummary}</span>}
+      {usageSummary && <span>{usageSummary}</span>}
+      {evidence.interrupted && <span>interrupted</span>}
+    </div>
+  );
+}

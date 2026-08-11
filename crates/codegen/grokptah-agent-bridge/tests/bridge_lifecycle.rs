@@ -128,6 +128,15 @@ async fn session_lifecycle_prompt_streams_message() {
             ..
         }
     )));
+    let evidence_index = events
+        .iter()
+        .position(|e| matches!(e, SessionUpdate::CompletionEvidence { .. }))
+        .expect("every completed turn must emit completion evidence");
+    let complete_index = events
+        .iter()
+        .position(|e| matches!(e, SessionUpdate::TurnComplete { .. }))
+        .expect("every completed turn must emit TurnComplete");
+    assert!(evidence_index < complete_index);
 }
 
 #[tokio::test]

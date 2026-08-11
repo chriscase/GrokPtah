@@ -632,6 +632,9 @@ async fn journal_rollover_preserves_durable_aggregates() {
     let handoff = orch.get_handoff(&auth, &run_id).unwrap();
     assert_eq!(handoff["state"], "completed");
     assert!(!handoff["changes"].as_array().unwrap().is_empty());
+    assert!(handoff["verification"].is_object());
+    assert!(handoff["verification"]["status"].as_str().is_some());
+    assert!(handoff["verification"]["observations"].is_object());
     let tests = orch.get_test_results(&auth, &run_id).unwrap();
     assert_eq!(tests["status"], "not_observed");
     set_grokptah_home_override(None);

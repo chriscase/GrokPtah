@@ -800,6 +800,13 @@ pub(crate) fn is_round_limit_stop_message(text: &str) -> bool {
     text.starts_with("Stopped after ") && text.contains("tool rounds without a final answer")
 }
 
+/// A turn that stopped for either budget exhaustion or action stationarity did
+/// not produce a trustworthy completion, even when the model returned text.
+pub(crate) fn is_incomplete_stop_message(text: &str) -> bool {
+    is_round_limit_stop_message(text)
+        || (text.starts_with("Stopped after ") && text.contains("without making progress"))
+}
+
 pub(crate) fn offline_plan_steps(goal: &str) -> Vec<String> {
     let g = goal.trim();
     let mut steps = vec![
@@ -1690,6 +1697,16 @@ mod efficiency_tests {
         assert!(is_round_limit_stop_message(&msg));
         assert!(msg.contains("Stopped after 2 tool rounds"));
         assert!(!is_round_limit_stop_message("(offline agent) done: hi"));
+    }
+
+    #[test]
+    fn every_guardrail_stop_is_incomplete() {
+        let stationarity = action_stationarity_stop_message(4, "run_terminal_cmd", true);
+        assert!(is_incomplete_stop_message(&stationarity));
+        assert!(is_incomplete_stop_message(&round_limit_stop_message(4)));
+        assert!(!is_incomplete_stop_message(
+            "Changed src/lib.rs; tests passed."
+        ));
     }
 
     #[test]
