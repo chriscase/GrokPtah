@@ -634,6 +634,8 @@ impl OrchestrationService {
             "endSeq": run.end_seq,
             "changes": run.aggregates.changes,
             "tests": run.aggregates.tests,
+            "verification": run.aggregates.verification,
+            "usage": run.aggregates.usage,
         }))
     }
 
@@ -882,9 +884,9 @@ impl OrchestrationService {
                 Ok(text) => Ok(bus.redact_text(text, 8_000)),
                 Err(error) => Err(bus.redact_text(&error.to_string(), 2_000)),
             };
-            let round_limited = result
+            let incomplete_stop = result
                 .as_ref()
-                .is_ok_and(|text| crate::host_helpers::is_round_limit_stop_message(text));
+                .is_ok_and(|text| crate::host_helpers::is_incomplete_stop_message(text));
             let mut candidate = store.load_run(&rid).ok().flatten().unwrap_or(run_template);
             for update in &reconciliation {
                 fold_run_update(&mut candidate, update);
@@ -902,7 +904,7 @@ impl OrchestrationService {
                 } else {
                     match &durable_result {
                         Ok(text) => {
-                            if round_limited {
+                            if incomplete_stop {
                                 candidate.state = RunState::LimitReached;
                                 candidate.terminal_result = Some("limit_reached".into());
                                 candidate.error_code = Some("limit_reached".into());
@@ -920,6 +922,30 @@ impl OrchestrationService {
                         }
                     }
                 }
+            }
+            // A normal host turn emits this before TurnComplete. If teardown
+            // raced the host before that event, retain a conservative fallback
+            // rather than presenting a durable run without evidence.
+            if candidate.aggregates.verification.is_none() {
+                let observations = crate::completion::observations_from_run(
+                    candidate.aggregates.changes.len(),
+                    candidate
+                        .aggregates
+                        .tests
+                        .iter()
+                        .map(|t| (t.exit_code, t.cancelled)),
+                    candidate.aggregates.permissions_requested,
+                    candidate.aggregates.permissions_granted,
+                    candidate.aggregates.permissions_denied,
+                );
+                let outcome = candidate.terminal_result.as_deref().unwrap_or("incomplete");
+                candidate.aggregates.verification = Some(crate::completion::build_evidence(
+                    outcome,
+                    candidate.final_response.as_deref(),
+                    observations,
+                    candidate.aggregates.usage.clone(),
+                    matches!(candidate.state, RunState::Cancelled | RunState::Interrupted),
+                ));
             }
             let mut attempt = 0u32;
             loop {
@@ -1341,6 +1367,7 @@ fn apply_run_aggregate(
             | crate::events::SessionUpdate::ShellSessionStarted { .. }
             | crate::events::SessionUpdate::ShellSessionEnded { .. }
             | crate::events::SessionUpdate::AgentProgress { .. }
+            | crate::events::SessionUpdate::CompletionEvidence { .. }
     ) {
         return;
     }
@@ -1415,6 +1442,14 @@ fn fold_run_update(run: &mut RunRecord, update: &crate::events::SessionUpdate) -
             });
             true
         }
+        crate::events::SessionUpdate::CompletionEvidence { evidence, .. } => {
+            run.aggregates.usage = evidence.usage.clone();
+            run.aggregates.permissions_requested = evidence.observations.permissions_requested;
+            run.aggregates.permissions_granted = evidence.observations.permissions_granted;
+            run.aggregates.permissions_denied = evidence.observations.permissions_denied;
+            run.aggregates.verification = Some(evidence.clone());
+            true
+        }
         _ => false,
     }
 }
@@ -1443,6 +1478,7 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | ToolCallUpdate { session_id, .. }
         | Plan { session_id, .. }
         | PermissionRequired { session_id, .. }
+        | CompletionEvidence { session_id, .. }
         | TurnComplete { session_id, .. }
         | Error { session_id, .. }
         | SubagentSpawned { session_id, .. }

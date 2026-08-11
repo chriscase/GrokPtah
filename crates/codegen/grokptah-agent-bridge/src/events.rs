@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::completion::CompletionEvidence;
+
 use crate::permission::PermissionRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +64,11 @@ pub enum SessionUpdate {
     TurnComplete {
         session_id: Uuid,
         cancelled: bool,
+    },
+    /// Evidence-backed completion summary; emitted immediately before TurnComplete.
+    CompletionEvidence {
+        session_id: Uuid,
+        evidence: CompletionEvidence,
     },
     Error {
         session_id: Uuid,

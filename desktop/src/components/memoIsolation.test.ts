@@ -120,3 +120,16 @@ describe("compact stage layout", () => {
     );
   });
 });
+
+describe("completion evidence", () => {
+  it("renders the authoritative trust state and counts", () => {
+    const src = readFileSync(join(root, "SessionPane.tsx"), "utf8");
+    expect(src).toMatch(/CompletionEvidenceStrip/);
+    expect(src).toMatch(/completion-evidence/);
+    expect(src).toMatch(/files changed/);
+    expect(src).toMatch(/tests passed/);
+    expect(src).toMatch(/stopReason/);
+    expect(src).toMatch(/model request/);
+    expect(src).toMatch(/role="status"/);
+  });
+});

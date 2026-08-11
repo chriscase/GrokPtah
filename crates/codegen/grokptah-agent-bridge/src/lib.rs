@@ -5,6 +5,7 @@
 
 mod agents_personas;
 mod auth_store;
+mod completion;
 mod discover;
 pub mod eval_oracle;
 pub mod eval_report;
@@ -62,6 +63,9 @@ pub use memory::{
     remember as memory_remember,
 };
 
+pub use completion::{
+    CompletionClaims, CompletionEvidence, CompletionObservations, CompletionUsage,
+};
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
     set_grokptah_home_override, set_project_mcp_trusted,

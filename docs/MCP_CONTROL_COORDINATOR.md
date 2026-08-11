@@ -198,6 +198,51 @@ Mutating tools take `request_id`:
 - Sequences are monotonic for a run-scoped journal page; expired cursors return
   `cursor_expired` (HTTP 410).
 
+### Evidence-backed handoff
+
+`ptah_get_handoff` includes the model's final response plus bounded evidence
+derived from typed bridge events. Coordinators must treat `verification.status`
+as the trust signal, not the model's prose alone:
+
+```json
+{
+  "verification": {
+    "status": "verified | unverified | failed | incomplete",
+    "stopReason": "completed | failed | cancelled | interrupted | limit_reached",
+    "interrupted": false,
+    "claims": {
+      "present": true,
+      "mentionsChanges": true,
+      "mentionsTests": true,
+      "mentionsVerification": true
+    },
+    "observations": {
+      "changedFiles": 2,
+      "testsObserved": 1,
+      "testsPassed": 1,
+      "testsFailed": 0,
+      "testsIncomplete": 0,
+      "permissionsRequested": 0,
+      "permissionsGranted": 0,
+      "permissionsDenied": 0,
+      "permissionsUnresolved": 0
+    },
+    "usage": {
+      "promptTokens": 0,
+      "completionTokens": 0,
+      "totalTokens": 0,
+      "requests": 0
+    }
+  }
+}
+```
+
+`changedFiles`, test outcomes, permission outcomes, interruption, and usage
+are observations; claim booleans only indicate whether the final response
+addressed those topics. `unverified` is expected when no test command was
+observed or when the response omits claims required by the observed work.
+`failed` and `incomplete` must not be reported as successful completion.
+
 ### Capacity
 
 - Orch run capacity (`max_concurrent_runs`) is separate from MCP request

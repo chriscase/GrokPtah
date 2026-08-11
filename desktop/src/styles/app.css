@@ -3949,6 +3949,30 @@ button:disabled {
   min-height: 2.75rem;
 }
 
+.completion-evidence {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2.2rem;
+  padding: 0.35rem 0.65rem;
+  border-top: 1px solid var(--border-soft);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.25;
+  white-space: normal;
+}
+
+.completion-evidence strong {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.completion-evidence.status-verified strong { color: var(--success, #76c893); }
+.completion-evidence.status-unverified strong { color: var(--warning, #e0ad4f); }
+.completion-evidence.status-failed strong { color: var(--danger, #f07178); }
+.completion-evidence.status-incomplete strong { color: var(--accent, #83c5be); }
+
 .pane-empty {
   margin: auto;
 }

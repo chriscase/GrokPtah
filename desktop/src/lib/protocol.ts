@@ -10,6 +10,37 @@ export type ToolCallStatus =
   | "failed"
   | "denied";
 
+export type CompletionStatus = "verified" | "unverified" | "failed" | "incomplete";
+
+export interface CompletionEvidence {
+  status: CompletionStatus;
+  stopReason: string;
+  interrupted: boolean;
+  claims: {
+    present: boolean;
+    mentionsChanges: boolean;
+    mentionsTests: boolean;
+    mentionsVerification: boolean;
+  };
+  observations: {
+    changedFiles: number;
+    testsObserved: number;
+    testsPassed: number;
+    testsFailed: number;
+    testsIncomplete: number;
+    permissionsRequested: number;
+    permissionsGranted: number;
+    permissionsDenied: number;
+    permissionsUnresolved: number;
+  };
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    requests: number;
+  };
+}
+
 export type SessionUpdate =
   | { type: "agent_message_chunk"; session_id: string; text: string }
   | { type: "agent_thought_chunk"; session_id: string; text: string }
@@ -41,6 +72,11 @@ export type SessionUpdate =
       request: PermissionRequest;
     }
   | { type: "turn_complete"; session_id: string; cancelled: boolean }
+  | {
+      type: "completion_evidence";
+      session_id: string;
+      evidence: CompletionEvidence;
+    }
   | { type: "error"; session_id: string; message: string }
   | {
       type: "subagent_spawned";
@@ -189,6 +225,8 @@ export interface SessionTab {
   runningSubagents?: number;
   /** #174 fleet: total tokens this session (when known) */
   totalTokens?: number;
+  /** Last authoritative completion summary for this session. */
+  completionEvidence: CompletionEvidence | null;
 }
 
 export type TranscriptItem =

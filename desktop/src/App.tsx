@@ -104,6 +104,7 @@ function emptyTab(
     activity: idleActivity(),
     unseen: false,
     needsPermission: false,
+    completionEvidence: null,
   };
 }
 
@@ -1480,6 +1481,7 @@ export default function App() {
     patchTab(id, (t) => ({
       ...t,
       busy: true,
+      completionEvidence: null,
       activity: queuedActivity(),
       title:
         t.title === "New session" || t.title === "New chat"
@@ -3612,6 +3614,12 @@ function applyUpdate(
             ? { ...item, streaming: false }
             : item,
         ),
+      }));
+      break;
+    case "completion_evidence":
+      withTab(sid!, (tab) => ({
+        ...tab,
+        completionEvidence: u.evidence,
       }));
       break;
     case "error":
