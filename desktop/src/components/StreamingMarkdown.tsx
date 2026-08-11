@@ -1,15 +1,13 @@
 import { MarkdownBody } from "./MarkdownBody";
 import { StreamingText } from "./StreamingText";
-import { splitStreamingMarkdown } from "../lib/streamMarkdown";
 import { useMaterializingText } from "../lib/useMaterializingText";
 
 /**
  * Progressive markdown + paced live text.
  *
  * 1. Large SSE chunks are **paced word-by-word** (`useMaterializingText`)
- * 2. Older content → full GFM (`stable`)
- * 3. Live tip (~100–280 chars) → one stable text flow (`tail`)
- * 4. On finish → full markdown with settle flash
+ * 2. Live content stays in one stable text flow while chunks arrive
+ * 3. On finish → full GFM markdown with settle flash
  */
 export function StreamingMarkdown({
   text,
@@ -31,29 +29,25 @@ export function StreamingMarkdown({
     );
   }
 
-  const { stable, tail } = splitStreamingMarkdown(visible);
   const catchingUp = pending > 0;
 
   return (
     <div
       className={`stream-md is-streaming ${catchingUp ? "is-catching-up" : ""}`}
     >
-      {stable ? (
-        <div className="stream-md-stable">
-          <MarkdownBody text={stable} />
-        </div>
-      ) : null}
-      {tail ? (
-        <div className="stream-md-tail">
-          {/* Keep live prose reflow-stable. Word-level transforms can collapse
-           * into the left edge of a narrow pane while the browser lays out. */}
-          <StreamingText text={tail} streaming animated={false} />
-        </div>
-      ) : (
-        <span className="stream-text is-streaming">
-          <span className="stream-caret" aria-hidden />
-        </span>
-      )}
+      {/* Keep the live buffer in one stable text flow. Parsing incomplete
+       * markdown while chunks arrive can repeatedly change block geometry and
+       * briefly collapse the newest text against the left edge. Full markdown
+       * rendering resumes once the turn settles. */}
+      <div className="stream-md-live">
+        {visible ? (
+          <StreamingText text={visible} streaming animated={false} />
+        ) : (
+          <span className="stream-text is-streaming">
+            <span className="stream-caret" aria-hidden />
+          </span>
+        )}
+      </div>
     </div>
   );
 }

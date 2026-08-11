@@ -1,4 +1,4 @@
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { StreamingText } from "./StreamingText";
 import { StreamingMarkdown } from "./StreamingMarkdown";
@@ -30,5 +30,23 @@ describe("StreamingText", () => {
     );
 
     expect(container.querySelectorAll(".stream-token")).toHaveLength(0);
+  });
+
+  it("keeps live markdown in one stable text flow until it settles", async () => {
+    const { container } = render(
+      <StreamingMarkdown
+        text="The task is complete. I need to provide a concise handoff covering the changed files and verification."
+        streaming
+      />,
+    );
+
+    expect(container.querySelector(".stream-md-live")).not.toBeNull();
+    expect(container.querySelector(".stream-md-stable")).toBeNull();
+    expect(container.querySelector(".stream-md-tail")).toBeNull();
+    await waitFor(() =>
+      expect(container.querySelector(".stream-md-live")?.textContent).toContain(
+        "The task is complete.",
+      ),
+    );
   });
 });
