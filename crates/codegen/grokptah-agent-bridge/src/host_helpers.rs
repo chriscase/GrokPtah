@@ -165,6 +165,14 @@ You MAY emit **multiple tool calls in one assistant step** — use that. Prefer 
 4. Avoid 3+ rounds of list_dir/grep/read before the first edit.\n\
 \n\
 Prefer `write_files` over serial `write_file` when 2+ files change. Prefer multi-block `apply_patch` for search/replace across files.\n\
+\n\
+### Final handoff (required)\n\
+When the task is complete, give a concise handoff with:\n\
+1. The outcome: completed, blocked, failed, or cancelled.\n\
+2. The changed files (relative paths), or explicitly say that no files changed.\n\
+3. Verification commands and observed results, or explicitly say what was not run.\n\
+4. Remaining risks, blockers, or follow-up work.\n\
+Never claim a test, build, or file change that you did not actually observe.\n\
 "
 }
 
@@ -1566,6 +1574,9 @@ mod efficiency_tests {
         assert!(g.contains("write_files"), "multi-file batch path");
         assert!(g.contains("cargo test"), "cargo-test-first guidance");
         assert!(g.contains("multiple tool calls"), "multi-tool-per-step");
+        assert!(g.contains("Final handoff"), "handoff heading");
+        assert!(g.contains("changed files"), "changed-file reporting");
+        assert!(g.contains("Never claim a test"), "honest verification");
         assert!(
             g.contains("half-renamed") || g.contains("pub use"),
             "rename completeness"

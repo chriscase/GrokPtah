@@ -68,6 +68,30 @@ Live (manual): Build mode should stream assistant tokens mid-step; Stop cancels 
 
 Live network is **not** a CI gate (ADR / non-goals).
 
+## Reliability evidence (live runner schema 2)
+
+`examples/live_eval.rs` writes a machine-readable report for every task. The
+report is intentionally stronger than a success boolean while remaining safe
+to retain:
+
+- `completion` and `incomplete` distinguish a completed turn, cancellation,
+  setup failure, and a missing terminal event;
+- `changes` reports added, modified, and removed paths with byte counts,
+  excluding generated `.git`, `target`, and `node_modules` trees;
+- `events` counts streamed assistant/thought chunks, tool errors, file edits,
+  and whether `TurnComplete` was observed;
+- `verification` records whether a `cargo test` command ran and whether its
+  terminal tool status proved the tests passed;
+- `handoff` records only length, a hash, and coarse change/test mention flags;
+  it never stores final model text;
+- `failure_reasons`, `quality_findings`, and `safety_violations` separate
+  correctness failures from weak handoffs and workspace-boundary findings.
+
+Reports use relative paths and omit file contents and absolute workspace paths.
+The structured oracle remains the correctness gate; evidence fields make a
+passing oracle auditable instead of treating it as proof that the whole turn
+was complete, safe, and well handed off.
+
 ## Tool inventory
 
 See **[TOOL_MATRIX.md](./TOOL_MATRIX.md)** for upstream → GrokPtah status.

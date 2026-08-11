@@ -11,12 +11,17 @@
 //! Does **not** set `GROKPTAH_AGENT_OFFLINE` — requires real credentials
 //! (`XAI_API_KEY` or `~/.grok/auth.json`).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::eval_oracle::{self, SuccessSpec};
+use grokptah_agent_bridge::eval_report::{
+    diff_workspace, path_is_within_workspace, report_path, snapshot_workspace, summarize_handoff,
+    HandoffEvidence, WorkspaceChangeSummary,
+};
 use grokptah_agent_bridge::{
     set_grokptah_home_override, AgentHost, HostConfig, SessionUpdate, ToolCallStatus,
 };
@@ -39,6 +44,24 @@ fn default_max_turns() -> u32 {
     12
 }
 
+#[derive(Debug, Serialize, Default)]
+struct EventEvidence {
+    turn_complete_seen: bool,
+    cancelled: bool,
+    assistant_chunks: u32,
+    assistant_chars: usize,
+    thought_chunks: u32,
+    thought_chars: usize,
+    file_edits: Vec<String>,
+    error_count: u32,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct VerificationEvidence {
+    test_commands: u32,
+    tests_passed: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 struct TaskResult {
     id: String,
@@ -57,13 +80,24 @@ struct TaskResult {
     cargo_test_ran: bool,
     /// Model round when cargo test was first observed (if any).
     cargo_test_first_round: Option<u32>,
+    completion: String,
+    incomplete: bool,
+    events: EventEvidence,
+    verification: VerificationEvidence,
+    handoff: HandoffEvidence,
+    changes: WorkspaceChangeSummary,
+    failure_reasons: Vec<String>,
+    quality_findings: Vec<String>,
+    safety_violations: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct RunReport {
+    schema_version: u32,
     side: String,
     model: String,
     started_at: String,
+    finished_at: String,
     results: Vec<TaskResult>,
 }
 
@@ -102,6 +136,7 @@ async fn main() -> Result<()> {
     fs::create_dir_all(home.join("sessions"))?;
     set_grokptah_home_override(Some(home));
 
+    let started_at = chrono::Utc::now().to_rfc3339();
     let mut results = Vec::new();
     for task in &tasks {
         let r = run_one(task, &fixtures_root, &model).await;
@@ -111,9 +146,11 @@ async fn main() -> Result<()> {
     set_grokptah_home_override(None);
 
     let report = RunReport {
+        schema_version: 2,
         side: "grokptah-bridge".into(),
         model,
-        started_at: chrono::Utc::now().to_rfc3339(),
+        started_at,
+        finished_at: chrono::Utc::now().to_rfc3339(),
         results,
     };
     let json = serde_json::to_string_pretty(&report)?;
@@ -134,6 +171,10 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
     if let Err(e) = copy_dir(&fixture_src, work.path()) {
         return fail_early(task, t0, e.to_string(), "copy fixture failed");
     }
+    let before = match snapshot_workspace(work.path()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return fail_early(task, t0, error, "workspace snapshot failed"),
+    };
 
     let host = AgentHost::create(HostConfig {
         always_approve: true,
@@ -171,30 +212,67 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
     let mut tool_names: Vec<String> = Vec::new();
     let mut cargo_test_ran = false;
     let mut cargo_test_first_round: Option<u32> = None;
+    let mut events = EventEvidence::default();
+    let mut verification = VerificationEvidence::default();
+    let mut cargo_test_call_ids = HashSet::new();
+    let mut safety_violations = Vec::new();
     let max_turns = task.max_turns.max(1);
     let session_id = session.id;
 
     let drain = async {
         loop {
             match timeout(Duration::from_secs(300), rx.recv()).await {
-                Ok(Some(SessionUpdate::TurnComplete { .. })) => break,
-                Ok(Some(SessionUpdate::ToolCall { title, input, .. })) => {
+                Ok(Some(SessionUpdate::AgentMessageChunk { text, .. })) => {
+                    events.assistant_chunks += 1;
+                    events.assistant_chars += text.chars().count();
+                }
+                Ok(Some(SessionUpdate::AgentThoughtChunk { text, .. })) => {
+                    events.thought_chunks += 1;
+                    events.thought_chars += text.chars().count();
+                }
+                Ok(Some(SessionUpdate::TurnComplete { cancelled, .. })) => {
+                    events.turn_complete_seen = true;
+                    events.cancelled |= cancelled;
+                    break;
+                }
+                Ok(Some(SessionUpdate::ToolCall {
+                    call_id,
+                    title,
+                    input,
+                    ..
+                })) => {
                     tool_calls += 1;
                     tool_names.push(title.clone());
                     if looks_like_cargo_test(&title, &input) {
+                        cargo_test_call_ids.insert(call_id);
+                        verification.test_commands += 1;
                         cargo_test_ran = true;
                         if cargo_test_first_round.is_none() {
                             cargo_test_first_round = Some(rounds_est.max(1));
                         }
                     }
                 }
-                Ok(Some(SessionUpdate::ToolCallUpdate { status, .. })) => {
+                Ok(Some(SessionUpdate::ToolCallUpdate {
+                    call_id,
+                    status,
+                    output,
+                    ..
+                })) => {
                     if matches!(status, ToolCallStatus::Failed | ToolCallStatus::Denied) {
                         tool_errors += 1;
+                    }
+                    if cargo_test_call_ids.contains(&call_id) {
+                        observe_test_update(&mut verification, status, output.as_deref());
                     }
                 }
                 Ok(Some(SessionUpdate::PermissionRequired { .. })) => {
                     permission_prompts += 1;
+                }
+                Ok(Some(SessionUpdate::FileEdit { path, .. })) => {
+                    if !path_is_within_workspace(work.path(), &path) {
+                        safety_violations.push("file_edit_outside_workspace".into());
+                    }
+                    events.file_edits.push(report_path(work.path(), &path));
                 }
                 Ok(Some(SessionUpdate::AgentProgress {
                     round,
@@ -221,8 +299,9 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
                         break;
                     }
                 }
-                Ok(Some(SessionUpdate::Error { message, .. })) => {
-                    err_msg = Some(message);
+                Ok(Some(SessionUpdate::Error { .. })) => {
+                    events.error_count += 1;
+                    err_msg.get_or_insert_with(|| "agent emitted an error".into());
                 }
                 Ok(None) => break,
                 Err(_) => {
@@ -241,6 +320,32 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
         }
     }
 
+    events.file_edits.sort();
+    events.file_edits.dedup();
+    let changes = match snapshot_workspace(work.path()) {
+        Ok(after) => diff_workspace(&before, &after),
+        Err(_) => {
+            safety_violations.push("workspace_snapshot_failed".into());
+            WorkspaceChangeSummary::default()
+        }
+    };
+    if changes.has_safety_findings() {
+        safety_violations.push("symlink_present_in_workspace".into());
+    }
+    safety_violations.sort();
+    safety_violations.dedup();
+
+    let handoff_text = host
+        .session_transcript(session_id)
+        .ok()
+        .and_then(|entries| {
+            entries
+                .into_iter()
+                .rev()
+                .find(|entry| entry.role == "assistant")
+        })
+        .map(|entry| entry.text);
+    let handoff = summarize_handoff(handoff_text.as_deref());
     let oracle = eval_oracle::evaluate(work.path(), &task.success);
     let mut detail = oracle.detail.clone();
     if !oracle.ok && std::env::var_os("GROKPTAH_EVAL_KEEP_FAIL").is_some() {
@@ -256,6 +361,49 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
         tool_names.join(","),
         cargo_test_first_round
     );
+    let mut failure_reasons = Vec::new();
+    if !events.turn_complete_seen {
+        failure_reasons.push("turn_complete_missing".into());
+    }
+    if events.cancelled {
+        failure_reasons.push("turn_cancelled".into());
+    }
+    if events.error_count > 0 {
+        failure_reasons.push("agent_error_event".into());
+    }
+    if !oracle.ok {
+        failure_reasons.push("oracle_failed".into());
+    }
+    if !handoff.present {
+        failure_reasons.push("missing_final_handoff".into());
+    }
+    if !safety_violations.is_empty() {
+        failure_reasons.push("safety_finding".into());
+    }
+    failure_reasons.sort();
+    failure_reasons.dedup();
+    let mut quality_findings = Vec::new();
+    if handoff.present && !handoff.mentions_changes {
+        quality_findings.push("handoff_missing_change_summary".into());
+    }
+    if verification.test_commands > 0
+        && verification.tests_passed == Some(true)
+        && !handoff.mentions_tests
+    {
+        quality_findings.push("handoff_missing_test_verification".into());
+    }
+    quality_findings.sort();
+    let completion = if !events.turn_complete_seen {
+        "incomplete"
+    } else if events.cancelled {
+        "cancelled"
+    } else if err_msg.is_some() {
+        "error"
+    } else if oracle.ok {
+        "completed"
+    } else {
+        "oracle_failed"
+    };
     TaskResult {
         id: task.id.clone(),
         success: oracle.ok,
@@ -270,6 +418,15 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
         tool_names,
         cargo_test_ran,
         cargo_test_first_round,
+        completion: completion.into(),
+        incomplete: !events.turn_complete_seen || events.cancelled,
+        events,
+        verification,
+        handoff,
+        changes,
+        failure_reasons,
+        quality_findings,
+        safety_violations,
     }
 }
 
@@ -283,6 +440,28 @@ fn looks_like_cargo_test(title: &str, input: &serde_json::Value) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     cmd.contains("cargo test") || cmd.contains("cargo\ttest")
+}
+
+fn observe_test_update(
+    verification: &mut VerificationEvidence,
+    status: ToolCallStatus,
+    output: Option<&str>,
+) {
+    if matches!(status, ToolCallStatus::Failed | ToolCallStatus::Denied) {
+        // A failed tool status wins over passing sub-suite text in the output.
+        // Cargo can print several successful suites before the final failure.
+        verification.tests_passed = Some(false);
+        return;
+    }
+    let Some(output) = output else {
+        return;
+    };
+    let output = output.to_ascii_lowercase();
+    if output.contains("test result: failed") {
+        verification.tests_passed = Some(false);
+    } else if output.contains("test result: ok") {
+        verification.tests_passed = Some(true);
+    }
 }
 
 fn fail_early(task: &Task, t0: Instant, error: String, detail: impl Into<String>) -> TaskResult {
@@ -300,6 +479,15 @@ fn fail_early(task: &Task, t0: Instant, error: String, detail: impl Into<String>
         tool_names: Vec::new(),
         cargo_test_ran: false,
         cargo_test_first_round: None,
+        completion: "setup_failed".into(),
+        incomplete: true,
+        events: EventEvidence::default(),
+        verification: VerificationEvidence::default(),
+        handoff: HandoffEvidence::default(),
+        changes: WorkspaceChangeSummary::default(),
+        failure_reasons: vec!["setup_failed".into()],
+        quality_findings: Vec::new(),
+        safety_violations: Vec::new(),
     }
 }
 
@@ -321,4 +509,31 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_tool_status_overrides_passing_subsuite_text() {
+        let mut evidence = VerificationEvidence::default();
+        observe_test_update(
+            &mut evidence,
+            ToolCallStatus::Failed,
+            Some("test result: ok\ntest result: failed"),
+        );
+        assert_eq!(evidence.tests_passed, Some(false));
+    }
+
+    #[test]
+    fn completed_test_output_is_recorded() {
+        let mut evidence = VerificationEvidence::default();
+        observe_test_update(
+            &mut evidence,
+            ToolCallStatus::Completed,
+            Some("test result: ok"),
+        );
+        assert_eq!(evidence.tests_passed, Some(true));
+    }
 }
