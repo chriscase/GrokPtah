@@ -18,6 +18,14 @@ function entry(id: string, text: string) {
   });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 describe("PromptQueuePanel", () => {
   it("edits, removes, clears, reorders, steers, and promotes entries", async () => {
     const entries = [entry("a", "first"), entry("b", "second")];
@@ -113,5 +121,31 @@ describe("PromptQueuePanel", () => {
     fireEvent.click(screen.getAllByText("Steer now")[0]);
     await waitFor(() => expect(onError).toHaveBeenCalledWith("stale queue"));
     expect(screen.getByText("Update failed")).toBeTruthy();
+  });
+
+  it("does not duplicate an in-flight steering mutation", async () => {
+    const pending = deferred<void>();
+    const onSteer = vi.fn().mockReturnValue(pending.promise);
+    render(
+      <PromptQueuePanel
+        entries={[entry("a", "guide it")]}
+        busy
+        onEdit={vi.fn()}
+        onRemove={vi.fn()}
+        onClear={vi.fn()}
+        onMove={vi.fn()}
+        onSteer={onSteer}
+        onRunNext={vi.fn()}
+      />,
+    );
+
+    const steer = screen.getByText("Steer now");
+    fireEvent.click(steer);
+    fireEvent.click(steer);
+    expect(onSteer).toHaveBeenCalledTimes(1);
+    expect(steer).toBeDisabled();
+
+    pending.resolve(undefined);
+    await waitFor(() => expect(steer).not.toBeDisabled());
   });
 });

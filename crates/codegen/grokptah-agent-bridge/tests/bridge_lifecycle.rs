@@ -1300,6 +1300,13 @@ async fn steer_now_injects_once_without_cancelling_active_turn() {
         host.session_queue_list(session.id).unwrap().is_empty(),
         "pending steering must not remain in the normal queue"
     );
+    let second_receipt = host
+        .session_steer(session.id, "then verify the narrow regression".into())
+        .unwrap();
+    assert_eq!(
+        second_receipt.disposition,
+        grokptah_agent_bridge::SteeringDisposition::Pending
+    );
 
     timeout(Duration::from_secs(3), runner)
         .await
@@ -1316,9 +1323,11 @@ async fn steer_now_injects_once_without_cancelling_active_turn() {
             _ => None,
         })
         .collect();
-    assert_eq!(injected.len(), 1);
+    assert_eq!(injected.len(), 2);
     assert_eq!(injected[0].0, &receipt.entry.id);
     assert_eq!(injected[0].1, "focus on the failing test");
+    assert_eq!(injected[1].0, &second_receipt.entry.id);
+    assert_eq!(injected[1].1, "then verify the narrow regression");
     assert!(
         !events.iter().any(|event| matches!(
             event,

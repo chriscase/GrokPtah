@@ -7,6 +7,7 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
+import { createPortal } from "react-dom";
 
 export type StyledSelectOption = {
   value: string;
@@ -52,6 +53,7 @@ export function StyledSelect({
   const [activeIndex, setActiveIndex] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLUListElement>(null);
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const listId = useId();
   const selected = options.find((o) => o.value === value) ?? options[0];
@@ -139,7 +141,13 @@ export function StyledSelect({
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) close();
+      const target = e.target as Node;
+      if (
+        !rootRef.current?.contains(target) &&
+        !menuRef.current?.contains(target)
+      ) {
+        close();
+      }
     };
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.key === "Escape") close();
@@ -179,6 +187,88 @@ export function StyledSelect({
     close(true);
   }
 
+  const menu = open ? (
+    <ul
+      id={listId}
+      ref={menuRef}
+      className="styled-select-menu"
+      data-placement={menuPosition?.placement}
+      style={
+        menuPosition
+          ? {
+              position: "fixed",
+              left: menuPosition.left,
+              top:
+                menuPosition.placement === "below"
+                  ? menuPosition.top
+                  : "auto",
+              bottom:
+                menuPosition.placement === "above"
+                  ? menuPosition.bottom
+                  : "auto",
+              width: menuPosition.width,
+              minWidth: menuPosition.width,
+              maxWidth: menuPosition.width,
+              maxHeight: menuPosition.maxHeight,
+            }
+          : { visibility: "hidden" }
+      }
+      role="listbox"
+      aria-activedescendant={
+        options[activeIndex]
+          ? `${listId}-${options[activeIndex].value}`
+          : undefined
+      }
+    >
+      {options.map((o, index) => {
+        const isSel = o.value === value;
+        return (
+          <li key={o.value} role="presentation">
+            <button
+              type="button"
+              role="option"
+              id={`${listId}-${o.value}`}
+              aria-selected={isSel}
+              disabled={o.disabled}
+              ref={(node) => {
+                optionRefs.current[index] = node;
+              }}
+              className={`styled-select-option ${isSel ? "is-selected" : ""}`}
+              onFocus={() => setActiveIndex(index)}
+              onMouseEnter={() => setActiveIndex(index)}
+              onKeyDown={(e) => {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  focusOption(index + 1);
+                } else if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  focusOption(index - 1);
+                } else if (e.key === "Home") {
+                  e.preventDefault();
+                  focusOption(0);
+                } else if (e.key === "End") {
+                  e.preventDefault();
+                  focusOption(options.length - 1);
+                } else if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  selectOption(index);
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  close(true);
+                } else if (e.key === "Tab") {
+                  close();
+                }
+              }}
+              onClick={() => selectOption(index)}
+            >
+              {o.label}
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  ) : null;
+
   return (
     <div
       className={`styled-select ${open ? "is-open" : ""} ${disabled ? "is-disabled" : ""} ${className}`}
@@ -205,86 +295,9 @@ export function StyledSelect({
           ▾
         </span>
       </button>
-      {open && (
-        <ul
-          id={listId}
-          className="styled-select-menu"
-          data-placement={menuPosition?.placement}
-          style={
-            menuPosition
-              ? {
-                  position: "fixed",
-                  left: menuPosition.left,
-                  top:
-                    menuPosition.placement === "below"
-                      ? menuPosition.top
-                      : "auto",
-                  bottom:
-                    menuPosition.placement === "above"
-                      ? menuPosition.bottom
-                      : "auto",
-                  width: menuPosition.width,
-                  minWidth: menuPosition.width,
-                  maxWidth: menuPosition.width,
-                  maxHeight: menuPosition.maxHeight,
-                }
-              : { visibility: "hidden" }
-          }
-          role="listbox"
-          aria-activedescendant={
-            options[activeIndex]
-              ? `${listId}-${options[activeIndex].value}`
-              : undefined
-          }
-        >
-          {options.map((o, index) => {
-            const isSel = o.value === value;
-            return (
-              <li key={o.value} role="presentation">
-                <button
-                  type="button"
-                  role="option"
-                  id={`${listId}-${o.value}`}
-                  aria-selected={isSel}
-                  disabled={o.disabled}
-                  ref={(node) => {
-                    optionRefs.current[index] = node;
-                  }}
-                  className={`styled-select-option ${isSel ? "is-selected" : ""}`}
-                  onFocus={() => setActiveIndex(index)}
-                  onMouseEnter={() => setActiveIndex(index)}
-                  onKeyDown={(e) => {
-                    if (e.key === "ArrowDown") {
-                      e.preventDefault();
-                      focusOption(index + 1);
-                    } else if (e.key === "ArrowUp") {
-                      e.preventDefault();
-                      focusOption(index - 1);
-                    } else if (e.key === "Home") {
-                      e.preventDefault();
-                      focusOption(0);
-                    } else if (e.key === "End") {
-                      e.preventDefault();
-                      focusOption(options.length - 1);
-                    } else if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      selectOption(index);
-                    } else if (e.key === "Escape") {
-                      e.preventDefault();
-                      close(true);
-                    } else if (e.key === "Tab") {
-                      close();
-                    }
-                  }}
-                  onClick={() => selectOption(index)}
-                >
-                  {o.label}
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      )}
+      {typeof document !== "undefined" && menu
+        ? createPortal(menu, document.body)
+        : null}
     </div>
   );
 }

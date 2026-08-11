@@ -19,6 +19,25 @@ All are runnable from a clean clone with caches disabled
 | Offline oracles | `cargo test --locked eval_oracle -- --nocapture` | `crates/codegen/grokptah-agent-bridge` |
 | Focused upstream support | `cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check && cargo clippy -p xai-grok-env -p xai-grok-shell-base --all-targets --all-features --locked -- -D warnings && cargo test -p xai-grok-shell-base --all-features --locked` | repository root |
 
+## Unsigned release build
+
+The manually dispatched `Desktop Release Build` workflow builds the reviewed
+commit on a GitHub-hosted macOS runner and uploads an unsigned app/DMG bundle
+for seven days. It does not sign, notarize, publish, or use release secrets.
+
+The workflow keeps `CARGO_HOME` and `CARGO_TARGET_DIR` under the runner's
+private temporary directory. Its cache key includes the OS, architecture,
+Rust toolchain, frontend lockfile, both desktop/bridge lockfiles, and bundle
+configuration. The cache is an accelerator only: a miss uses the ordinary
+`npm ci` + `tauri build` path, and restored Cargo artifacts remain subject to
+Cargo fingerprint validation. No pull request trigger or self-hosted runner is
+used.
+
+Local DMG creation can still fail because `hdiutil` and Finder state are
+environment-sensitive. In that case, `npm run tauri:build -- --bundles app`
+still verifies the compiled unsigned application without changing signing or
+notarization policy.
+
 Other focused upstream crates may be tested individually, but their Cargo
 feature wiring varies because Bazel remains the parent project's primary gate.
 

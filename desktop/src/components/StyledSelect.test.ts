@@ -85,6 +85,28 @@ describe("StyledSelect (#126)", () => {
     expect(menu).toHaveStyle({ position: "fixed", bottom: "72px" });
   });
 
+  it("portals menus outside clipped composer shells", () => {
+    render(
+      createElement(
+        "div",
+        { style: { overflow: "hidden", height: 40 } },
+        createElement(StyledSelect, {
+          "aria-label": "Model",
+          value: "grok-build",
+          options: [
+            { value: "grok-build", label: "Grok Build" },
+            { value: "grok-4.5", label: "Grok 4.5" },
+          ],
+          onChange: vi.fn(),
+        }),
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+    const menu = screen.getByRole("listbox");
+    expect(menu.parentElement).toBe(document.body);
+  });
+
   it("supports keyboard navigation and returns focus after selection", () => {
     const onChange = vi.fn();
     render(
