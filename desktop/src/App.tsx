@@ -60,6 +60,7 @@ import { displaySessionTitle } from "./lib/sessionTitle";
 import { entriesToTranscriptItems, hasInterruptedTurn } from "./lib/transcript";
 import { appendThoughtChunk } from "./lib/thoughtText";
 import { createLatestRequestGuard } from "./lib/latestRequest";
+import { preserveProjectCwd } from "./lib/projectCwd";
 import {
   doneActivity,
   errorActivity,
@@ -309,6 +310,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   /** False until we finish reopening tabs from ~/.grokptah/workspace.json. */
   const [workspaceRestored, setWorkspaceRestored] = useState(false);
+  const projectCwdHintRef = useRef<string | null>(null);
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   /**
@@ -452,6 +454,7 @@ export default function App() {
             };
           }),
         );
+        if (loaded.cwd) projectCwdHintRef.current = loaded.cwd;
         setStatus((st) =>
           st
             ? {
@@ -576,13 +579,20 @@ export default function App() {
         api.productInfo(),
       ]);
       if (!chromeRefreshGuard.isCurrent(request)) return;
-      let effectiveStatus = st;
+      const refreshedStatus = preserveProjectCwd(
+        st,
+        projectCwdHintRef.current,
+      );
+      if (refreshedStatus.project_cwd) {
+        projectCwdHintRef.current = refreshedStatus.project_cwd;
+      }
+      let effectiveStatus = refreshedStatus;
       if (md.some((model) => model.id === st.model)) {
         const normalizedEffort = effortForModel(md, st.model, st.effort);
         if (normalizedEffort !== st.effort) {
           await api.setEffort(normalizedEffort);
           if (!chromeRefreshGuard.isCurrent(request)) return;
-          effectiveStatus = { ...st, effort: normalizedEffort };
+          effectiveStatus = { ...refreshedStatus, effort: normalizedEffort };
         }
       }
       setStatus(effectiveStatus);
@@ -735,6 +745,7 @@ export default function App() {
           }
         }
         if (ws.project_cwd) {
+          projectCwdHintRef.current = ws.project_cwd;
           // status refresh will surface path; host already loaded it
           await refreshChrome();
           if (!cancelled) await maybePromptMcpTrust();
@@ -803,6 +814,7 @@ export default function App() {
   async function openProject() {
     const path = await api.pickProjectFolder();
     if (path) {
+      projectCwdHintRef.current = path;
       // Also pin the folder on the active build so tools use it.
       if (
         activeSessionId &&
@@ -830,6 +842,7 @@ export default function App() {
       try {
         const updated = await api.pickSessionFolder(sessionId);
         if (!updated) return;
+        if (updated.cwd) projectCwdHintRef.current = updated.cwd;
         await refreshSessions();
         await refreshChrome();
         try {
@@ -850,6 +863,7 @@ export default function App() {
       if (kind === "build" && !status?.project_cwd) {
         const path = await api.pickProjectFolder();
         if (!path) return null;
+        projectCwdHintRef.current = path;
         await refreshChrome();
         await maybePromptMcpTrust();
       }
