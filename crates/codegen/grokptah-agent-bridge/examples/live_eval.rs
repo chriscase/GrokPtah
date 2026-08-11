@@ -217,6 +217,7 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
     let mut cargo_test_call_ids = HashSet::new();
     let mut safety_violations = Vec::new();
     let max_turns = task.max_turns.max(1);
+    let mut advertised_max_rounds = max_turns;
     let session_id = session.id;
 
     let drain = async {
@@ -276,11 +277,13 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
                 }
                 Ok(Some(SessionUpdate::AgentProgress {
                     round,
+                    max_rounds,
                     last_tool,
                     detail,
                     ..
                 })) => {
                     rounds_est = rounds_est.max(round);
+                    advertised_max_rounds = advertised_max_rounds.max(max_rounds);
                     if let Some(t) = last_tool {
                         if t == "run_terminal_cmd" && detail.to_ascii_lowercase().contains("cargo")
                         {
@@ -290,10 +293,12 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
                             }
                         }
                     }
-                    // Enforce task max_turns (parity with CLI --max-turns).
-                    // Round is 1-based model step index emitted at step *start*;
-                    // allow rounds 1..=max_turns, cancel only when a step beyond budget begins.
-                    if round > max_turns {
+                    // Enforce task max_turns while honoring one explicitly
+                    // advertised recovery boundary from the bridge. The host
+                    // reports max_rounds=max_turns+1 only for that bounded step;
+                    // never let a stale or inflated report extend the harness
+                    // beyond one extra model boundary.
+                    if !progress_within_turn_budget(round, max_turns, advertised_max_rounds) {
                         let _ = host.cancel_turn(Some(session_id));
                         err_msg = Some(format!("max turns reached ({max_turns})"));
                         break;
@@ -430,6 +435,18 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
     }
 }
 
+fn progress_within_turn_budget(
+    round: u32,
+    task_max_turns: u32,
+    advertised_max_rounds: u32,
+) -> bool {
+    let task_max_turns = task_max_turns.max(1);
+    let allowed = advertised_max_rounds
+        .max(task_max_turns)
+        .min(task_max_turns.saturating_add(1));
+    round <= allowed
+}
+
 fn looks_like_cargo_test(title: &str, input: &serde_json::Value) -> bool {
     if title != "run_terminal_cmd" {
         return false;
@@ -535,5 +552,20 @@ mod tests {
             Some("test result: ok"),
         );
         assert_eq!(evidence.tests_passed, Some(true));
+    }
+
+    #[test]
+    fn allows_advertised_single_recovery_round() {
+        assert!(progress_within_turn_budget(4, 3, 4));
+    }
+
+    #[test]
+    fn rejects_unadvertised_recovery_round() {
+        assert!(!progress_within_turn_budget(4, 3, 3));
+    }
+
+    #[test]
+    fn rejects_second_recovery_round() {
+        assert!(!progress_within_turn_budget(5, 3, 4));
     }
 }
