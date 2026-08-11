@@ -49,15 +49,40 @@ export function StyledSelect({
 }: StyledSelectProps) {
   const [open, setOpen] = useState(false);
   const [menuPosition, setMenuPosition] = useState<MenuPosition | null>(null);
+  const [activeIndex, setActiveIndex] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const listId = useId();
   const selected = options.find((o) => o.value === value) ?? options[0];
+  const selectedIndex = Math.max(
+    0,
+    options.findIndex((o) => o.value === value),
+  );
 
-  const close = useCallback(() => {
+  function enabledIndex(start: number, direction: 1 | -1 = 1) {
+    if (options.length === 0) return 0;
+    let index = Math.max(0, Math.min(start, options.length - 1));
+    for (let count = 0; count < options.length; count += 1) {
+      if (!options[index]?.disabled) return index;
+      index = (index + direction + options.length) % options.length;
+    }
+    return 0;
+  }
+
+  const close = useCallback((restoreFocus = false) => {
     setOpen(false);
     setMenuPosition(null);
+    if (restoreFocus) {
+      triggerRef.current?.focus();
+    }
   }, []);
+
+  const openMenu = useCallback(() => {
+    if (disabled || options.length === 0) return;
+    setActiveIndex(enabledIndex(selectedIndex));
+    setOpen(true);
+  }, [disabled, options.length, selectedIndex]);
 
   const positionMenu = useCallback(() => {
     const trigger = triggerRef.current;
@@ -106,6 +131,11 @@ export function StyledSelect({
     };
   }, [open, positionMenu]);
 
+  useLayoutEffect(() => {
+    if (!open) return;
+    optionRefs.current[activeIndex]?.focus();
+  }, [activeIndex, open]);
+
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
@@ -124,10 +154,29 @@ export function StyledSelect({
 
   function onTriggerKey(e: KeyboardEvent) {
     if (disabled) return;
-    if (e.key === "ArrowDown" || e.key === "Enter" || e.key === " ") {
+    if (
+      e.key === "ArrowDown" ||
+      e.key === "ArrowUp" ||
+      e.key === "Enter" ||
+      e.key === " "
+    ) {
       e.preventDefault();
-      setOpen(true);
+      openMenu();
     }
+  }
+
+  function focusOption(index: number) {
+    const direction = index < activeIndex ? -1 : 1;
+    const next = enabledIndex(index, direction);
+    setActiveIndex(next);
+    optionRefs.current[next]?.focus();
+  }
+
+  function selectOption(index: number) {
+    const option = options[index];
+    if (!option || option.disabled) return;
+    onChange(option.value);
+    close(true);
   }
 
   return (
@@ -146,7 +195,7 @@ export function StyledSelect({
         aria-expanded={open}
         aria-controls={listId}
         aria-label={ariaLabel}
-        onClick={() => !disabled && setOpen((v) => !v)}
+        onClick={() => (open ? close() : openMenu())}
         onKeyDown={onTriggerKey}
       >
         <span className="styled-select-value">
@@ -183,10 +232,12 @@ export function StyledSelect({
           }
           role="listbox"
           aria-activedescendant={
-            selected ? `${listId}-${selected.value}` : undefined
+            options[activeIndex]
+              ? `${listId}-${options[activeIndex].value}`
+              : undefined
           }
         >
-          {options.map((o) => {
+          {options.map((o, index) => {
             const isSel = o.value === value;
             return (
               <li key={o.value} role="presentation">
@@ -196,12 +247,36 @@ export function StyledSelect({
                   id={`${listId}-${o.value}`}
                   aria-selected={isSel}
                   disabled={o.disabled}
-                  className={`styled-select-option ${isSel ? "is-selected" : ""}`}
-                  onClick={() => {
-                    if (o.disabled) return;
-                    onChange(o.value);
-                    close();
+                  ref={(node) => {
+                    optionRefs.current[index] = node;
                   }}
+                  className={`styled-select-option ${isSel ? "is-selected" : ""}`}
+                  onFocus={() => setActiveIndex(index)}
+                  onMouseEnter={() => setActiveIndex(index)}
+                  onKeyDown={(e) => {
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      focusOption(index + 1);
+                    } else if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      focusOption(index - 1);
+                    } else if (e.key === "Home") {
+                      e.preventDefault();
+                      focusOption(0);
+                    } else if (e.key === "End") {
+                      e.preventDefault();
+                      focusOption(options.length - 1);
+                    } else if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      selectOption(index);
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      close(true);
+                    } else if (e.key === "Tab") {
+                      close();
+                    }
+                  }}
+                  onClick={() => selectOption(index)}
                 >
                   {o.label}
                 </button>

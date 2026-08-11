@@ -59,6 +59,8 @@ import {
 import { displaySessionTitle } from "./lib/sessionTitle";
 import { entriesToTranscriptItems, hasInterruptedTurn } from "./lib/transcript";
 import { appendThoughtChunk } from "./lib/thoughtText";
+import { createLatestRequestGuard } from "./lib/latestRequest";
+import { preserveProjectCwd } from "./lib/projectCwd";
 import {
   doneActivity,
   errorActivity,
@@ -308,6 +310,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   /** False until we finish reopening tabs from ~/.grokptah/workspace.json. */
   const [workspaceRestored, setWorkspaceRestored] = useState(false);
+  const projectCwdHintRef = useRef<string | null>(null);
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   /**
@@ -323,6 +326,7 @@ export default function App() {
   const maxDocks = useMaxDocks(stageRef, layoutDensity);
   const splitOk = maxDocks >= 2;
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
+  const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
 
   // Keep docks valid: unique, open tabs only, within capacity, include focus
   useEffect(() => {
@@ -450,6 +454,7 @@ export default function App() {
             };
           }),
         );
+        if (loaded.cwd) projectCwdHintRef.current = loaded.cwd;
         setStatus((st) =>
           st
             ? {
@@ -564,6 +569,7 @@ export default function App() {
   }, [refreshSessions]);
 
   const refreshChrome = useCallback(async () => {
+    const request = chromeRefreshGuard.begin();
     try {
       const [st, au, md, sess, info] = await Promise.all([
         api.agentStatus(),
@@ -572,12 +578,21 @@ export default function App() {
         api.sessionList(),
         api.productInfo(),
       ]);
-      let effectiveStatus = st;
+      if (!chromeRefreshGuard.isCurrent(request)) return;
+      const refreshedStatus = preserveProjectCwd(
+        st,
+        projectCwdHintRef.current,
+      );
+      if (refreshedStatus.project_cwd) {
+        projectCwdHintRef.current = refreshedStatus.project_cwd;
+      }
+      let effectiveStatus = refreshedStatus;
       if (md.some((model) => model.id === st.model)) {
         const normalizedEffort = effortForModel(md, st.model, st.effort);
         if (normalizedEffort !== st.effort) {
           await api.setEffort(normalizedEffort);
-          effectiveStatus = { ...st, effort: normalizedEffort };
+          if (!chromeRefreshGuard.isCurrent(request)) return;
+          effectiveStatus = { ...refreshedStatus, effort: normalizedEffort };
         }
       }
       setStatus(effectiveStatus);
@@ -598,7 +613,7 @@ export default function App() {
     } catch (e) {
       console.warn("refresh failed (browser-only?)", e);
     }
-  }, []);
+  }, [chromeRefreshGuard]);
 
   // Chrome refresh on mount only (not tied to the event listener).
   useEffect(() => {
@@ -730,6 +745,7 @@ export default function App() {
           }
         }
         if (ws.project_cwd) {
+          projectCwdHintRef.current = ws.project_cwd;
           // status refresh will surface path; host already loaded it
           await refreshChrome();
           if (!cancelled) await maybePromptMcpTrust();
@@ -798,6 +814,7 @@ export default function App() {
   async function openProject() {
     const path = await api.pickProjectFolder();
     if (path) {
+      projectCwdHintRef.current = path;
       // Also pin the folder on the active build so tools use it.
       if (
         activeSessionId &&
@@ -825,6 +842,7 @@ export default function App() {
       try {
         const updated = await api.pickSessionFolder(sessionId);
         if (!updated) return;
+        if (updated.cwd) projectCwdHintRef.current = updated.cwd;
         await refreshSessions();
         await refreshChrome();
         try {
@@ -845,6 +863,7 @@ export default function App() {
       if (kind === "build" && !status?.project_cwd) {
         const path = await api.pickProjectFolder();
         if (!path) return null;
+        projectCwdHintRef.current = path;
         await refreshChrome();
         await maybePromptMcpTrust();
       }
@@ -2462,18 +2481,25 @@ export default function App() {
                     );
                   }
                 }}
+                onError={(message) => {
+                  patchTab(activeSessionId, (tab) => ({
+                    ...tab,
+                    activity: errorActivity(message),
+                  }));
+                }}
               />
             )}
             <div className="composer-toolbar">
               <div className="composer-toolbar-left">
                 <label
-                  className="composer-pill"
+                  className={`composer-pill ${models.length === 0 ? "is-disabled" : ""}`}
                   title="Model (default from Settings)"
                 >
                   <span className="composer-pill-label">Model</span>
                   <StyledSelect
                     aria-label="Model"
                     className="composer-select"
+                    disabled={models.length === 0}
                     value={
                       models.some((m) => m.id === status?.model)
                         ? (status?.model ?? models[0]?.id ?? "grok-build")
@@ -2500,13 +2526,14 @@ export default function App() {
                   />
                 </label>
                 <label
-                  className="composer-pill"
+                  className={`composer-pill ${models.length === 0 ? "is-disabled" : ""}`}
                   title="Effort (default from Settings)"
                 >
                   <span className="composer-pill-label">Effort</span>
                   <StyledSelect
                     aria-label="Effort"
                     className="composer-select"
+                    disabled={models.length === 0}
                     value={currentEffort}
                     options={effortOptions.map((e) => ({ value: e, label: e }))}
                     onChange={(v) => {
