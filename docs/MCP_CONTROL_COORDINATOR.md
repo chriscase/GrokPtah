@@ -76,6 +76,20 @@ No model turn resumes automatically. A coordinator may use `ptah_retry_run`
 with a fresh prompt to create one explicit, linked replacement after checking
 the interrupted handoff.
 
+### Durable retention
+
+The ledger performs conservative cleanup when it opens. By default it keeps
+the newest **500** safely terminal run records and expires safely terminal
+records older than **30 days**. It keeps the newest **1,000** completed or
+failed idempotency receipts and expires receipts older than **7 days**. These
+are bounded replay windows, not a promise of indefinite request-id replay.
+
+Retention never removes queued/running records, a run referenced by a
+`retryOf` descendant, a terminal isolated run whose managed worktree still
+exists, or an unrecognized/corrupt record. Pending and unknown idempotency
+statuses are preserved. Coordinators that need long-term history should copy
+the bounded read-tool results or handoff into their own durable store.
+
 
 ### Optional transport knobs (tests / soak only)
 

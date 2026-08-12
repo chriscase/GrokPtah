@@ -89,9 +89,9 @@ pub use mcp_control_client::{ListedTool, McpControlClient};
 pub use mcp_runtime::list_mcp_tools;
 pub use orchestration::{
     is_recognized_test_command, merge_bounds, prompt_preview, safe_id_filename, OrchStore,
-    OrchestrationConfig, OrchestrationService, PromotionState, RunApproval, RunBounds,
-    RunExecution, RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist, CONTROL_TOOLS,
-    FORBIDDEN_TOOLS,
+    OrchestrationConfig, OrchestrationService, PromotionState, RetentionPolicy, RetentionReport,
+    RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
+    WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use run_promotion::RunReview;

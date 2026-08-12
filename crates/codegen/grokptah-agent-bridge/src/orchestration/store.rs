@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 
@@ -31,6 +31,43 @@ struct OrchStoreInner {
 }
 
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Conservative bounds for the durable orchestration ledger. Retention is
+/// deliberately age- and count-bounded, but never trades away an active run,
+/// a reviewable isolated run, or the source of a retry chain.
+pub const DEFAULT_MAX_TERMINAL_RUNS: usize = 500;
+pub const DEFAULT_MAX_IDEMPOTENCY_RECEIPTS: usize = 1_000;
+pub const DEFAULT_TERMINAL_RUN_AGE: Duration = Duration::days(30);
+pub const DEFAULT_IDEMPOTENCY_RECEIPT_AGE: Duration = Duration::days(7);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub max_terminal_runs: usize,
+    pub max_idempotency_receipts: usize,
+    pub terminal_run_age: Duration,
+    pub idempotency_receipt_age: Duration,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_terminal_runs: DEFAULT_MAX_TERMINAL_RUNS,
+            max_idempotency_receipts: DEFAULT_MAX_IDEMPOTENCY_RECEIPTS,
+            terminal_run_age: DEFAULT_TERMINAL_RUN_AGE,
+            idempotency_receipt_age: DEFAULT_IDEMPOTENCY_RECEIPT_AGE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionReport {
+    pub run_files_scanned: usize,
+    pub run_files_removed: usize,
+    pub idempotency_files_scanned: usize,
+    pub idempotency_files_removed: usize,
+    pub protected_runs: usize,
+    pub skipped_files: usize,
+}
 
 struct AuditWriter {
     tx: Mutex<Option<SyncSender<AuditEntry>>>,
@@ -102,6 +139,9 @@ impl OrchStore {
         store.recover_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
+        // Cleanup is best-effort at the record level, but directory access
+        // failures still surface so a broken ledger cannot look healthy.
+        store.prune_retention(RetentionPolicy::default())?;
         Ok(store)
     }
 
@@ -198,6 +238,139 @@ impl OrchStore {
             }
         }
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
+    }
+
+    /// Apply conservative retention to the durable run and idempotency
+    /// ledgers. This never recursively deletes anything and is safe to call
+    /// while the store is live because it shares the store mutex.
+    pub fn prune_retention(&self, policy: RetentionPolicy) -> anyhow::Result<RetentionReport> {
+        anyhow::ensure!(
+            policy.max_terminal_runs > 0,
+            "retention must preserve at least one terminal run"
+        );
+        anyhow::ensure!(
+            policy.max_idempotency_receipts > 0,
+            "retention must preserve at least one idempotency receipt"
+        );
+        anyhow::ensure!(
+            policy.terminal_run_age > Duration::zero()
+                && policy.idempotency_receipt_age > Duration::zero(),
+            "retention ages must be greater than zero"
+        );
+
+        let _guard = self.inner.lock.lock();
+        let now = Utc::now();
+        let mut report = RetentionReport::default();
+        let runs = self.read_run_entries_unlocked(&mut report)?;
+        let retry_sources: std::collections::HashSet<&str> = runs
+            .iter()
+            .filter_map(|(_, run)| run.retry_of.as_deref())
+            .collect();
+
+        let mut eligible_runs: Vec<(&Path, &RunRecord)> = Vec::new();
+        for (path, run) in &runs {
+            if !run.state.is_terminal() {
+                report.protected_runs += 1;
+                continue;
+            }
+            if retry_sources.contains(run.run_id.as_str()) || !safe_to_expire_run(run) {
+                report.protected_runs += 1;
+                continue;
+            }
+            eligible_runs.push((path.as_path(), run));
+        }
+        eligible_runs.sort_by(|(_, a), (_, b)| b.updated_at.cmp(&a.updated_at));
+        for (index, (path, run)) in eligible_runs.iter().enumerate() {
+            let over_count = index >= policy.max_terminal_runs;
+            let over_age = now.signed_duration_since(run.updated_at) >= policy.terminal_run_age;
+            if !over_count && !over_age {
+                continue;
+            }
+            match fs::remove_file(path) {
+                Ok(()) => report.run_files_removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => report.skipped_files += 1,
+            }
+        }
+
+        let mut receipts = Vec::new();
+        let dir = self.inner.root.join("idempotency");
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                report.skipped_files += 1;
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                report.skipped_files += 1;
+                continue;
+            };
+            report.idempotency_files_scanned += 1;
+            if !matches!(receipt.status.as_str(), "complete" | "failed") {
+                report.skipped_files += 1;
+                continue;
+            }
+            let linked_active = match receipt.run_id.as_deref() {
+                Some(run_id) => match self.load_run_unlocked(run_id) {
+                    Ok(Some(run)) => !run.state.is_terminal(),
+                    Ok(None) => false,
+                    Err(_) => {
+                        // A receipt that cannot be reconciled with its run is
+                        // retained rather than guessed to be safe to remove.
+                        report.skipped_files += 1;
+                        true
+                    }
+                },
+                None => false,
+            };
+            if linked_active {
+                continue;
+            }
+            receipts.push((path, receipt));
+        }
+        receipts.sort_by(|(_, a), (_, b)| b.created_at.cmp(&a.created_at));
+        for (index, (path, receipt)) in receipts.iter().enumerate() {
+            let over_count = index >= policy.max_idempotency_receipts;
+            let over_age =
+                now.signed_duration_since(receipt.created_at) >= policy.idempotency_receipt_age;
+            if !over_count && !over_age {
+                continue;
+            }
+            match fs::remove_file(path) {
+                Ok(()) => report.idempotency_files_removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => report.skipped_files += 1,
+            }
+        }
+        Ok(report)
+    }
+
+    fn read_run_entries_unlocked(
+        &self,
+        report: &mut RetentionReport,
+    ) -> anyhow::Result<Vec<(PathBuf, RunRecord)>> {
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("runs");
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            report.run_files_scanned += 1;
+            let Ok(text) = fs::read_to_string(&path) else {
+                report.skipped_files += 1;
+                continue;
+            };
+            let Ok(run) = serde_json::from_str::<RunRecord>(&text) else {
+                report.skipped_files += 1;
+                continue;
+            };
+            out.push((path, run));
+        }
         Ok(out)
     }
 
@@ -514,6 +687,16 @@ impl OrchStore {
     }
 }
 
+/// A terminal run may be removed only when it no longer owns a live isolated
+/// worktree. Reviewable and promotable records therefore remain durable until
+/// their managed resource is explicitly discarded or otherwise disappears.
+fn safe_to_expire_run(run: &RunRecord) -> bool {
+    run.execution
+        .as_ref()
+        .map(|execution| !Path::new(&execution.execution_workspace).exists())
+        .unwrap_or(true)
+}
+
 fn merge_run_observations(target: &mut RunRecord, current: &RunRecord) {
     for change in &current.aggregates.changes {
         if !target
@@ -750,6 +933,134 @@ mod tests {
             }
             _ => panic!("failed outcome must remain monotonic"),
         }
+    }
+
+    #[test]
+    fn retention_prunes_only_expirable_records() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+
+        let mut old = terminal_run("old-shared");
+        old.updated_at = Utc::now() - Duration::days(10);
+        store.save_run(&old).unwrap();
+
+        let mut retry_source = terminal_run("retry-source");
+        retry_source.state = RunState::Interrupted;
+        retry_source.updated_at = Utc::now() - Duration::days(10);
+        store.save_run(&retry_source).unwrap();
+        let mut retry = terminal_run("retry-child");
+        retry.retry_of = Some(retry_source.run_id.clone());
+        retry.updated_at = Utc::now();
+        store.save_run(&retry).unwrap();
+
+        let mut active = terminal_run("active");
+        active.state = RunState::Running;
+        active.updated_at = Utc::now() - Duration::days(10);
+        store.save_run(&active).unwrap();
+
+        let live_worktree = d.path().join("live-worktree");
+        fs::create_dir_all(&live_worktree).unwrap();
+        let mut isolated = terminal_run("isolated-live");
+        isolated.updated_at = Utc::now() - Duration::days(10);
+        isolated.execution = Some(super::super::types::RunExecution {
+            mode: super::super::types::RunExecutionMode::IsolatedWorktree,
+            source_workspace: d.path().display().to_string(),
+            execution_workspace: live_worktree.display().to_string(),
+            base_revision: "base".into(),
+            source_fingerprint: "source".into(),
+            final_fingerprint: Some("final".into()),
+            promotion_state: PromotionState::Ready,
+            promoted_at: None,
+        });
+        store.save_run(&isolated).unwrap();
+
+        store
+            .save_idempotency(&IdempotencyReceipt {
+                request_id: "old-receipt".into(),
+                payload_hash: "hash".into(),
+                run_id: None,
+                tool: "ptah_submit_task".into(),
+                response: serde_json::json!({"runId": "old-shared"}),
+                error: None,
+                created_at: Utc::now() - Duration::days(10),
+                status: "complete".into(),
+            })
+            .unwrap();
+
+        let report = store
+            .prune_retention(RetentionPolicy {
+                max_terminal_runs: 100,
+                max_idempotency_receipts: 100,
+                terminal_run_age: Duration::days(1),
+                idempotency_receipt_age: Duration::days(1),
+            })
+            .unwrap();
+        assert_eq!(report.run_files_removed, 1);
+        assert_eq!(report.idempotency_files_removed, 1);
+        assert!(store.load_run("old-shared").unwrap().is_none());
+        assert!(store.load_run("retry-source").unwrap().is_some());
+        assert!(store.load_run("retry-child").unwrap().is_some());
+        assert!(store.load_run("active").unwrap().is_some());
+        assert!(store.load_run("isolated-live").unwrap().is_some());
+        assert!(store.load_idempotency("old-receipt").unwrap().is_none());
+    }
+
+    #[test]
+    fn retention_enforces_terminal_run_count_without_deleting_recent_active() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        for (run_id, age_hours) in [("oldest", 3), ("middle", 2), ("newest", 1)] {
+            let mut run = terminal_run(run_id);
+            run.updated_at = Utc::now() - Duration::hours(age_hours);
+            store.save_run(&run).unwrap();
+        }
+        let report = store
+            .prune_retention(RetentionPolicy {
+                max_terminal_runs: 2,
+                max_idempotency_receipts: 100,
+                terminal_run_age: Duration::days(365),
+                idempotency_receipt_age: Duration::days(365),
+            })
+            .unwrap();
+        assert_eq!(report.run_files_removed, 1);
+        assert!(store.load_run("oldest").unwrap().is_none());
+        assert!(store.load_run("middle").unwrap().is_some());
+        assert!(store.load_run("newest").unwrap().is_some());
+    }
+
+    #[test]
+    fn retention_fails_closed_on_invalid_policy_and_unknown_receipt_status() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        store
+            .save_idempotency(&IdempotencyReceipt {
+                request_id: "unknown-status".into(),
+                payload_hash: "hash".into(),
+                run_id: None,
+                tool: "ptah_queue_prompt".into(),
+                response: serde_json::Value::Null,
+                error: None,
+                created_at: Utc::now() - Duration::days(10),
+                status: "future_status".into(),
+            })
+            .unwrap();
+
+        let invalid = RetentionPolicy {
+            terminal_run_age: Duration::days(-1),
+            ..RetentionPolicy::default()
+        };
+        assert!(store.prune_retention(invalid).is_err());
+
+        let report = store
+            .prune_retention(RetentionPolicy {
+                terminal_run_age: Duration::days(1),
+                idempotency_receipt_age: Duration::days(1),
+                ..RetentionPolicy::default()
+            })
+            .unwrap();
+        assert_eq!(report.idempotency_files_removed, 0);
+        assert!(report.skipped_files >= 1);
+        assert!(store.load_idempotency("unknown-status").unwrap().is_some());
     }
 
     #[test]
