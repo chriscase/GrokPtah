@@ -30,8 +30,8 @@ use uuid::Uuid;
 
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService, WorkspaceAllowlist,
-    CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    ChangeRecord, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
+    RunExecutionMode, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 
 /// Max concurrent in-flight MCP requests (post-auth).
@@ -418,6 +418,39 @@ struct RunArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ApproveArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+    source_fingerprint: String,
+    final_fingerprint: String,
+    changed_files: Vec<ChangeRecord>,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromoteArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+    approval_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscardArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EventsArgs {
     run_id: String,
     #[serde(default)]
@@ -435,6 +468,8 @@ struct SubmitArgs {
     prompt: String,
     #[serde(default)]
     bounds: Option<Value>,
+    #[serde(default)]
+    execution_mode: RunExecutionMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -867,7 +902,8 @@ fn tool_input_schema(name: &str) -> Value {
         | "ptah_get_progress"
         | "ptah_get_changes"
         | "ptah_get_test_results"
-        | "ptah_get_handoff" => json!({
+        | "ptah_get_handoff"
+        | "ptah_review_run" => json!({
             "type": "object",
             "required": ["run_id"],
             "additionalProperties": false,
@@ -892,7 +928,66 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "prompt": {"type": "string", "minLength": 1},
-                "bounds": bounds
+                "bounds": bounds,
+                "execution_mode": {
+                    "type": "string",
+                    "enum": ["shared", "isolated_worktree"],
+                    "default": "shared",
+                    "description": "Use shared execution by default; isolated_worktree creates a reviewable managed Git worktree for this Build run."
+                }
+            }
+        }),
+        "ptah_approve_run" => json!({
+            "type": "object",
+            "required": [
+                "request_id", "session_id", "workspace", "run_id",
+                "source_fingerprint", "final_fingerprint", "changed_files"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id,
+                "source_fingerprint": {"type": "string", "minLength": 1},
+                "final_fingerprint": {"type": "string", "minLength": 1},
+                "changed_files": {
+                    "type": "array",
+                    "maxItems": 2000,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["path", "summary"],
+                        "properties": {
+                            "path": {"type": "string", "minLength": 1},
+                            "summary": {"type": "string"}
+                        }
+                    }
+                },
+                "ttl_ms": {"type": "integer", "minimum": 1, "maximum": 900000}
+            }
+        }),
+        "ptah_promote_run" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "run_id", "approval_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id,
+                "approval_id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+        }),
+        "ptah_discard_run" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "run_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id
             }
         }),
         "ptah_queue_prompt" => json!({
@@ -1015,15 +1110,73 @@ async fn dispatch_tool(
             require_nonempty(&args.run_id, "run_id")?;
             orch.get_handoff(auth, &args.run_id)
         }
+        "ptah_review_run" => {
+            let args: RunArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            let run = orch
+                .store()
+                .load_run(&args.run_id)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
+            orch.review_run(
+                auth,
+                run.session_id,
+                PathBuf::from(&run.workspace).as_path(),
+                &args.run_id,
+            )
+        }
         "ptah_submit_task" => {
             let args: SubmitArgs = parse_value(args)?;
-            orch.submit_task(
+            orch.submit_task_with_execution_mode(
                 auth,
                 &args.request_id,
                 args.session_id,
                 &args.workspace,
                 args.prompt,
                 args.bounds,
+                args.execution_mode,
+            )
+            .await
+        }
+        "ptah_approve_run" => {
+            let args: ApproveArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            orch.approve_run(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
+                args.source_fingerprint,
+                args.final_fingerprint,
+                args.changed_files,
+                args.ttl_ms,
+            )
+            .await
+        }
+        "ptah_promote_run" => {
+            let args: PromoteArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            require_nonempty(&args.approval_id, "approval_id")?;
+            orch.promote_run(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
+                &args.approval_id,
+            )
+            .await
+        }
+        "ptah_discard_run" => {
+            let args: DiscardArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            orch.discard_run(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
             )
             .await
         }

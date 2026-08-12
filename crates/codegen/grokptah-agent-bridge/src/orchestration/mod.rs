@@ -14,6 +14,6 @@ pub use store::OrchStore;
 pub use types::{
     hash_payload, is_recognized_test_command, merge_bounds, prompt_preview, reject_control_prompt,
     safe_id_filename, AuditEntry, ChangeRecord, IdempotencyReceipt, OrchError, OrchErrorCode,
-    PromotionState, RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
-    TestObservation, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution, RunExecutionMode,
+    RunRecord, RunState, TestObservation, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };

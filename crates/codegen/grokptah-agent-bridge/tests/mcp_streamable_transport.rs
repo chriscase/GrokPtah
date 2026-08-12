@@ -2,8 +2,10 @@
 //! Independent SDK interop uses Node `@modelcontextprotocol/sdk` (not McpControlClient).
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
+use chrono::{Duration as ChronoDuration, Utc};
 use grokptah_agent_bridge::orchestration::{
     OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
@@ -901,6 +903,242 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
     client.close_session().await.unwrap();
     srv.stop();
     set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn mcp_isolated_run_review_approval_and_restart_promotion() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock, host, ws, orch) = setup();
+    std::fs::write(ws.path().join("README.md"), "baseline\n").unwrap();
+    for args in [
+        vec!["init"],
+        vec!["add", "README.md"],
+        vec![
+            "-c",
+            "user.name=GrokPtah Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "baseline",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(ws.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), "stream-token-200");
+    client.initialize().await.unwrap();
+
+    let submitted = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "isolated-submit-1",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "prompt": "write mcp-approved.txt: hello from isolated run",
+                "execution_mode": "isolated_worktree"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!submitted.is_error, "isolated submit: {:?}", submitted.raw);
+    assert_eq!(submitted.structured["executionMode"], "isolated_worktree");
+    let run_id = submitted.structured["runId"].as_str().unwrap().to_string();
+
+    let mut state = String::new();
+    for _ in 0..80 {
+        let run = client
+            .call_tool("ptah_get_run", json!({ "run_id": run_id }))
+            .await
+            .unwrap();
+        state = run.structured["state"].as_str().unwrap_or_default().into();
+        if state == "completed" || state == "failed" {
+            assert_eq!(run.structured["clientId"], "mcp");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(state, "completed");
+
+    let review = client
+        .call_tool("ptah_review_run", json!({ "run_id": run_id }))
+        .await
+        .unwrap();
+    assert!(!review.is_error, "review: {:?}", review.raw);
+    assert!(review.structured["diff"]
+        .as_str()
+        .unwrap()
+        .contains("mcp-approved"));
+    let approval = client
+        .call_tool(
+            "ptah_approve_run",
+            json!({
+                "request_id": "isolated-approve-1",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id,
+                "source_fingerprint": review.structured["sourceFingerprint"],
+                "final_fingerprint": review.structured["finalFingerprint"],
+                "changed_files": review.structured["changedFiles"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!approval.is_error, "approval: {:?}", approval.raw);
+    let approval_id = approval.structured["approvalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let run_before_tamper = client
+        .call_tool("ptah_get_run", json!({ "run_id": run_id }))
+        .await
+        .unwrap();
+    let isolated_workspace = run_before_tamper.structured["execution"]["executionWorkspace"]
+        .as_str()
+        .unwrap();
+    let isolated_file = PathBuf::from(isolated_workspace).join("mcp-approved.txt");
+    std::fs::write(&isolated_file, "tampered after approval\n").unwrap();
+    let stale = client
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": "isolated-promote-stale",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id,
+                "approval_id": approval_id
+            }),
+        )
+        .await;
+    assert!(stale.is_err(), "tampered worktree must fail closed");
+    std::fs::write(&isolated_file, "hello from isolated run").unwrap();
+    orch.store()
+        .update_run(&run_id, |run| {
+            run.approval.as_mut().unwrap().expires_at = Utc::now() - ChronoDuration::seconds(1);
+            Ok(())
+        })
+        .unwrap();
+    let expired = client
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": "isolated-promote-expired",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id,
+                "approval_id": approval_id
+            }),
+        )
+        .await;
+    assert!(expired.is_err(), "expired approval must fail closed");
+    orch.store()
+        .update_run(&run_id, |run| {
+            run.approval.as_mut().unwrap().expires_at = Utc::now() + ChronoDuration::minutes(5);
+            Ok(())
+        })
+        .unwrap();
+    client.close_session().await.unwrap();
+    srv.stop();
+    drop(orch);
+    drop(host);
+
+    // Reopen the same durable home. The approval must remain usable without
+    // the desktop-only in-memory reviewed_runs marker.
+    let host2 = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host2.start().unwrap();
+    let orch2 = OrchestrationService::new(
+        host2.clone(),
+        host2.event_bus(),
+        OrchStore::open(home.path().join("orch")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "stream-token-200".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 4,
+            bounds: RunBounds::default(),
+        },
+    );
+    let srv2 = start_control_server(orch2.clone(), 0).await.unwrap();
+    let mut client2 = McpControlClient::new(format!("http://{}", srv2.addr), "stream-token-200");
+    client2.initialize().await.unwrap();
+    let other = host2.session_new_kind(SessionKind::Build).unwrap();
+    host2.session_set_cwd(other.id, ws.path()).unwrap();
+    let cross_session = client2
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": "isolated-promote-cross-session",
+                "session_id": other.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id,
+                "approval_id": approval_id
+            }),
+        )
+        .await;
+    assert!(
+        cross_session.is_err(),
+        "approval must be bound to its session"
+    );
+    let promoted = client2
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": "isolated-promote-1",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id,
+                "approval_id": approval_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !promoted.is_error,
+        "promote after restart: {:?}",
+        promoted.raw
+    );
+    assert_eq!(
+        promoted.structured["execution"]["promotionState"],
+        "promoted"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("mcp-approved.txt")).unwrap(),
+        "hello from isolated run"
+    );
+    assert_eq!(
+        orch2.store().list_runs().unwrap().len(),
+        1,
+        "one durable MCP run, no desktop duplicate"
+    );
+    let replay = client2
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": "isolated-promote-1",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id,
+                "approval_id": approval_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.structured["runId"], promoted.structured["runId"]);
+    client2.close_session().await.unwrap();
+    srv2.stop();
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
