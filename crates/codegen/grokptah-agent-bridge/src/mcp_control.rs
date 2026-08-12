@@ -7,20 +7,22 @@
 //! Policy remains in [`OrchestrationService`]; this module is a thin adapter.
 //! `rmcp` is intentionally not linked here (reqwest 0.13 quarantine; see #200).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::DefaultBodyLimit;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
+use futures::stream;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,14 +32,17 @@ use uuid::Uuid;
 
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    ChangeRecord, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
+    AuthContext, ChangeRecord, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
     RunExecutionMode, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
+use crate::{EventReceiver, JournalPage, SessionUpdate};
 
 /// Max concurrent in-flight MCP requests (post-auth).
 const MAX_CONCURRENT_REQUESTS: usize = 32;
 /// Hard cap on Streamable HTTP sessions (LRU eviction beyond this).
 const MAX_SESSIONS: usize = 256;
+/// Bound long-lived coordinator event streams independently of request floods.
+const MAX_LIVE_STREAMS: usize = 32;
 /// Hard wall-clock bound per request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Supported MCP protocol versions (initialize + header validation).
@@ -87,6 +92,7 @@ struct AppState {
     active_requests: Arc<AtomicU64>,
     total_requests: Arc<AtomicU64>,
     max_concurrent: usize,
+    live_streams: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +103,167 @@ struct SessionState {
     #[allow(dead_code)]
     created_at: Instant,
     last_seen: Instant,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveRunQuery {
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    workspace: Option<PathBuf>,
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
+struct LiveStreamState {
+    orch: Arc<OrchestrationService>,
+    auth: AuthContext,
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+    start_seq: u64,
+    end_seq: Option<u64>,
+    receiver: EventReceiver,
+    last_seq: u64,
+    replay_cursor: Option<u64>,
+    pending: VecDeque<Bytes>,
+    heartbeat: tokio::time::Interval,
+    done: bool,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl LiveStreamState {
+    fn queue_page(&mut self, page: JournalPage) {
+        self.replay_cursor = (page.entries.len() >= 500)
+            .then_some(page.next_cursor)
+            .flatten();
+        for entry in page.entries {
+            self.queue_entry(entry.seq, entry.ts, entry.update);
+        }
+        if self.end_seq.is_some_and(|end_seq| self.last_seq >= end_seq) {
+            self.done = true;
+            self.replay_cursor = None;
+        }
+    }
+
+    fn queue_entry(&mut self, seq: u64, ts: String, update: SessionUpdate) {
+        if seq <= self.last_seq || seq < self.start_seq {
+            return;
+        }
+        if let Some(end_seq) = self.end_seq {
+            if seq > end_seq {
+                self.done = true;
+                return;
+            }
+        }
+        let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
+        self.last_seq = seq;
+        self.pending.push_back(sse_message(
+            Some(seq),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/ptah_event",
+                "params": {
+                    "sessionId": self.session_id,
+                    "workspace": self.workspace,
+                    "runId": self.run_id,
+                    "seq": seq,
+                    "ts": ts,
+                    "update": update,
+                }
+            }),
+        ));
+        if terminal || self.end_seq == Some(seq) {
+            self.done = true;
+            self.replay_cursor = None;
+        }
+    }
+
+    fn queue_recovery(&mut self, reason: &str) {
+        self.pending.push_back(sse_message(
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/ptah_recovery",
+                "params": {
+                    "sessionId": self.session_id,
+                    "workspace": self.workspace,
+                    "runId": self.run_id,
+                    "afterSeq": self.last_seq,
+                    "reason": reason,
+                    "pollTool": "ptah_get_events",
+                }
+            }),
+        ));
+        self.done = true;
+        self.replay_cursor = None;
+    }
+
+    async fn next_frame(&mut self) -> Option<Bytes> {
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Some(frame);
+            }
+            if self.done {
+                return None;
+            }
+            if let Some(cursor) = self.replay_cursor.take() {
+                match self.orch.live_run_page(
+                    &self.auth,
+                    self.session_id,
+                    &self.workspace,
+                    &self.run_id,
+                    cursor,
+                    500,
+                ) {
+                    Ok((scope, page)) => {
+                        self.end_seq = scope.end_seq;
+                        self.queue_page(page);
+                        continue;
+                    }
+                    Err(error) => {
+                        self.queue_recovery(&format!(
+                            "durable replay unavailable: {}",
+                            error.message
+                        ));
+                        continue;
+                    }
+                }
+            }
+
+            tokio::select! {
+                event = self.receiver.recv_with_seq() => {
+                    let Some((seq, update)) = event else {
+                        self.done = true;
+                        continue;
+                    };
+                    if seq == 0 {
+                        self.queue_recovery("live event subscriber lagged; resynchronize from the durable journal");
+                        continue;
+                    }
+                    if crate::event_bus::session_id_of(&update) != Some(self.session_id) {
+                        continue;
+                    }
+                    self.queue_entry(seq, chrono::Utc::now().to_rfc3339(), update);
+                }
+                _ = self.heartbeat.tick() => {
+                    return Some(Bytes::from_static(b": grokptah-control keep-alive\n\n"));
+                }
+            }
+        }
+    }
+}
+
+fn sse_message(id: Option<u64>, body: Value) -> Bytes {
+    let mut frame = String::from("event: message\n");
+    if let Some(id) = id {
+        frame.push_str(&format!("id: {id}\n"));
+    }
+    frame.push_str("data: ");
+    frame.push_str(&serde_json::to_string(&body).unwrap_or_else(|_| "{}".into()));
+    frame.push_str("\n\n");
+    Bytes::from(frame)
 }
 
 /// Handle for a running control server.
@@ -261,6 +428,7 @@ pub async fn start_control_server_with(
         active_requests: Arc::new(AtomicU64::new(0)),
         total_requests: Arc::new(AtomicU64::new(0)),
         max_concurrent,
+        live_streams: Arc::new(Semaphore::new(MAX_LIVE_STREAMS)),
     };
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -344,6 +512,8 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         "activeRequests": state.active_requests.load(Ordering::Relaxed),
         "totalRequests": state.total_requests.load(Ordering::Relaxed),
         "sessions": state.sessions.lock().len(),
+        "activeLiveStreams": MAX_LIVE_STREAMS - state.live_streams.available_permits(),
+        "maxLiveStreams": MAX_LIVE_STREAMS,
         "maxConcurrent": state.max_concurrent,
         "protocolVersions": SUPPORTED_PROTOCOL_VERSIONS,
     }))
@@ -357,7 +527,11 @@ async fn fail_closed_fallback() -> impl IntoResponse {
 }
 
 /// Streamable HTTP GET: optional SSE notifications channel (session-scoped).
-async fn streamable_get_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn streamable_get_handler(
+    State(state): State<AppState>,
+    Query(query): Query<LiveRunQuery>,
+    headers: HeaderMap,
+) -> Response {
     let session_id = headers
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
@@ -372,14 +546,126 @@ async fn streamable_get_handler(State(state): State<AppState>, headers: HeaderMa
         )
             .into_response();
     }
-    // Keep-alive only stream; tool results use POST JSON responses.
-    let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"grokptah-control sse open\"}}\n\n";
+
+    let no_scope =
+        query.session_id.is_none() && query.workspace.is_none() && query.run_id.is_none();
+    if no_scope {
+        // Keep-alive only stream; tool results use POST JSON responses. A
+        // scoped query opts into the live run channel below.
+        let body = sse_message(
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {"level": "info", "data": "grokptah-control sse open"}
+            }),
+        );
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .header(axum::http::header::CACHE_CONTROL, "no-cache")
+            .header("mcp-session-id", session_id)
+            .body(axum::body::Body::from(body))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    if query.session_id.is_none() || query.workspace.is_none() || query.run_id.is_none() {
+        return json_err(
+            None,
+            StatusCode::BAD_REQUEST,
+            &OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "live event streams require session_id, workspace, and run_id together",
+            ),
+        );
+    }
+    let session_scope = query.session_id.expect("checked above");
+    let workspace = query.workspace.expect("checked above");
+    let run_id = query.run_id.expect("checked above");
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let auth = match state.orch.auth_header(auth_header) {
+        Ok(auth) => auth,
+        Err(error) => return json_err(None, StatusCode::UNAUTHORIZED, &error),
+    };
+    let last_seq = match headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().parse::<u64>())
+        .transpose()
+    {
+        Ok(value) => value.unwrap_or(0),
+        Err(_) => {
+            return json_err(
+                None,
+                StatusCode::BAD_REQUEST,
+                &OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "Last-Event-ID must be a sequence number",
+                ),
+            )
+        }
+    };
+    let receiver = state.orch.subscribe_events();
+    let (scope, page) =
+        match state
+            .orch
+            .live_run_page(&auth, session_scope, &workspace, &run_id, last_seq, 500)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let status = if error.code == OrchErrorCode::CursorExpired {
+                    StatusCode::GONE
+                } else {
+                    StatusCode::CONFLICT
+                };
+                return json_err(None, status, &error);
+            }
+        };
+    let permit = match state.live_streams.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return json_err(
+                None,
+                StatusCode::TOO_MANY_REQUESTS,
+                &OrchError::new(
+                    OrchErrorCode::CapacityExhausted,
+                    "too many live MCP event streams",
+                ),
+            )
+        }
+    };
+    let mut live = LiveStreamState {
+        orch: state.orch.clone(),
+        auth,
+        session_id: scope.session_id,
+        workspace,
+        run_id: scope.run_id,
+        start_seq: scope.start_seq,
+        end_seq: scope.end_seq,
+        receiver,
+        last_seq,
+        replay_cursor: None,
+        pending: VecDeque::new(),
+        heartbeat: tokio::time::interval(Duration::from_secs(10)),
+        done: false,
+        _permit: permit,
+    };
+    live.queue_page(page);
+    let stream = stream::unfold(live, |mut state| async move {
+        state
+            .next_frame()
+            .await
+            .map(|frame| (Ok::<Bytes, Infallible>(frame), state))
+    });
     Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
         .header(axum::http::header::CACHE_CONTROL, "no-cache")
         .header("mcp-session-id", session_id)
-        .body(axum::body::Body::from(body))
+        .header(axum::http::header::CONNECTION, "keep-alive")
+        .body(axum::body::Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 

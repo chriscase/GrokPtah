@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::event_bus::{CursorExpiredError, EventBus};
+use crate::event_bus::{CursorExpiredError, EventBus, EventReceiver, JournalPage};
 use crate::host::AgentHostHandle;
 use crate::session::{SessionKind, WorkspaceStatus};
 
@@ -63,6 +63,15 @@ pub struct OrchestrationService {
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+/// Authorized bounds for a live run event stream.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveRunScope {
+    pub session_id: Uuid,
+    pub run_id: String,
+    pub start_seq: u64,
+    pub end_seq: Option<u64>,
 }
 
 impl Drop for OrchestrationService {
@@ -799,12 +808,54 @@ impl OrchestrationService {
         )
     }
 
+    /// Authorize a run and return its current journal bounds plus an initial
+    /// durable page for the optional Streamable HTTP live channel.
+    pub(crate) fn live_run_page(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<(LiveRunScope, JournalPage), OrchError> {
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let Some(start_seq) = run.start_seq else {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "run has not started; use ptah_get_progress and open the live stream once running",
+            ));
+        };
+        let scope = LiveRunScope {
+            session_id: run.session_id,
+            run_id: run.run_id.clone(),
+            start_seq,
+            end_seq: run.end_seq,
+        };
+        let page = self.events_page_for_run(run, after_seq, limit)?;
+        Ok((scope, page))
+    }
+
+    pub(crate) fn subscribe_events(&self) -> EventReceiver {
+        self.bus.subscribe()
+    }
+
     fn events_for_run(
         &self,
         run: RunRecord,
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
+        serde_json::to_value(self.events_page_for_run(run, after_seq, limit)?)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
+    }
+
+    fn events_page_for_run(
+        &self,
+        run: RunRecord,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<JournalPage, OrchError> {
         // Read the bounded run range before applying the caller's page limit.
         // Applying `limit` to the global journal first can return a page made
         // entirely of other sessions and advance the cursor past this run's
@@ -825,11 +876,11 @@ impl OrchestrationService {
         });
         entries.truncate(limit.clamp(1, 500));
         let next_cursor = entries.last().map(|e| e.seq);
-        Ok(json!({
-            "entries": entries,
-            "nextCursor": next_cursor,
-            "cursorExpired": false,
-        }))
+        Ok(JournalPage {
+            entries,
+            next_cursor,
+            cursor_expired: false,
+        })
     }
 
     pub fn get_changes(
