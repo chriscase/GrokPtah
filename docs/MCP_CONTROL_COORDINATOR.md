@@ -144,7 +144,7 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_get_test_results` | read | `run_id` |
 | `ptah_get_handoff` | read | `run_id` |
 | `ptah_review_run` | read | `run_id` (completed isolated run only) |
-| `ptah_submit_task` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `bounds`, `execution_mode` |
+| `ptah_submit_task` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `bounds`, `execution_mode`, `allow_queue` |
 | `ptah_approve_run` | mutate | exact run/session/workspace, source and final fingerprints, exact `changed_files`; optional bounded `ttl_ms` |
 | `ptah_promote_run` | mutate | `request_id`, exact run/session/workspace, `approval_id` |
 | `ptah_discard_run` | mutate | `request_id`, exact run/session/workspace |
@@ -190,6 +190,30 @@ Mutating tools take `request_id`:
 - `ptah_queue_prompt` enqueues follow-ups; durable across host restart when the
   host session store reloads from the same GrokPtah home.
 - Priority flag moves to front; combine rules live in host `prompt_queue`.
+
+### Bounded task admission
+
+`ptah_submit_task` is fail-fast by default. Set `allow_queue: true` when the
+coordinator wants a bounded admission queue for capacity or session contention.
+
+- The queue holds at most **32** pending task runs. A full queue returns
+  `capacity_exhausted` (HTTP 429 at the transport boundary).
+- A queued response has `state: "queued"` and a one-based `queuedPosition`;
+  `ptah_get_capacity` reports `queuedRuns` and `queueLimit`.
+- Queued runs have durable `RunState::Queued` records and remain visible through
+  `ptah_get_run`, `ptah_get_progress`, and the handoff/read tools.
+- Admission preserves FIFO order for each session and prefers a different
+  eligible session after a session starts, preventing one session from
+  monopolizing the shared run capacity. Earlier work from the same session
+  cannot be overtaken by later work from that session.
+- A queued task can be cancelled with `ptah_cancel` before it starts. The
+  response includes `wasQueued: true`; cancellation is idempotent and does not
+  launch a model turn.
+- Queue memory is process-local by design. On process restart, durable queued
+  and running records are marked `interrupted`; their in-memory prompts are not
+  resumed automatically. After reconnecting, a coordinator should inspect the
+  durable record and submit a replacement task with a new request id only when
+  it has decided that retrying is safe.
 
 ### Isolated review and promotion
 

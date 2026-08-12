@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use grokptah_agent_bridge::orchestration::{
-    hash_payload, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunState,
-    WorkspaceAllowlist,
+    hash_payload, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
+    RunExecutionMode, RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     discovered_tool_names, set_grokptah_home_override, start_control_server, AgentHost, EventBus,
@@ -757,6 +757,153 @@ async fn capacity_race_against_real_submit_task() {
     assert_eq!(cap["activeRuns"].as_u64().unwrap(), 2);
     assert_eq!(cap["maxConcurrentRuns"].as_u64().unwrap(), 2);
     set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn queued_admission_is_bounded_fair_and_cancellable() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let s1 = host.session_new_kind(SessionKind::Build).unwrap();
+    let s2 = host.session_new_kind(SessionKind::Build).unwrap();
+    let s3 = host.session_new_kind(SessionKind::Build).unwrap();
+    let s4 = host.session_new_kind(SessionKind::Build).unwrap();
+    for session in [&s1, &s2, &s3, &s4] {
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+    }
+    let orch = orch_for(&host, &home, &ws, 1);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let bounds = Some(json!({
+        "maxPromptBytes": 10000,
+        "maxRounds": 24,
+        "maxDurationMs": 30000
+    }));
+
+    let first = orch
+        .submit_task(
+            &auth,
+            "fair-1",
+            s1.id,
+            ws.path(),
+            "run sleep 2".into(),
+            bounds.clone(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let queued_a = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "fair-2a",
+            s2.id,
+            ws.path(),
+            "run sleep 1".into(),
+            bounds.clone(),
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let queued_b = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "fair-3",
+            s3.id,
+            ws.path(),
+            "run sleep 1".into(),
+            bounds.clone(),
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let queued_same_session = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "fair-2b",
+            s2.id,
+            ws.path(),
+            "list files".into(),
+            bounds,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let queued_cancel = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "fair-cancel",
+            s4.id,
+            ws.path(),
+            "list files".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued_a["state"], "queued");
+    assert_eq!(queued_b["state"], "queued");
+    assert_eq!(queued_same_session["state"], "queued");
+    assert_eq!(queued_cancel["state"], "queued");
+    let cap = orch.get_capacity(&auth).unwrap();
+    assert_eq!(cap["activeRuns"], 1);
+    assert_eq!(cap["queuedRuns"], 4);
+    assert_eq!(cap["queueLimit"], 32);
+
+    let cancelled_id = queued_cancel["runId"].as_str().unwrap();
+    let cancelled = orch
+        .cancel(
+            &auth,
+            "fair-cancel-request",
+            s4.id,
+            ws.path(),
+            Some(cancelled_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled["wasQueued"], true);
+    assert_eq!(cancelled["teardownComplete"], true);
+    let cap = orch.get_capacity(&auth).unwrap();
+    assert_eq!(cap["queuedRuns"], 3);
+
+    let first_id = first["runId"].as_str().unwrap().to_string();
+    let second_id = queued_a["runId"].as_str().unwrap().to_string();
+    let third_id = queued_b["runId"].as_str().unwrap().to_string();
+    let same_session_id = queued_same_session["runId"].as_str().unwrap().to_string();
+    assert_eq!(
+        wait_run_terminal(&orch, &auth, &first_id, Duration::from_secs(10)).await,
+        RunState::Completed
+    );
+    assert_eq!(
+        wait_run_terminal(&orch, &auth, &second_id, Duration::from_secs(10)).await,
+        RunState::Completed
+    );
+
+    // Once s2's first task completes, s3 must run before s2's later task.
+    let third_state: RunState =
+        serde_json::from_value(orch.get_run(&auth, &third_id).unwrap()["state"].clone()).unwrap();
+    let same_session_state: RunState =
+        serde_json::from_value(orch.get_run(&auth, &same_session_id).unwrap()["state"].clone())
+            .unwrap();
+    assert_ne!(third_state, RunState::Queued);
+    assert_eq!(same_session_state, RunState::Queued);
+
+    assert_eq!(
+        wait_run_terminal(&orch, &auth, &third_id, Duration::from_secs(10)).await,
+        RunState::Completed
+    );
+    assert_eq!(
+        wait_run_terminal(&orch, &auth, &same_session_id, Duration::from_secs(10)).await,
+        RunState::Completed
+    );
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
 
 #[tokio::test]

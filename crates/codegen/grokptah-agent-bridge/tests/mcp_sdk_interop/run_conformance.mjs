@@ -150,6 +150,12 @@ try {
   if (submit?.inputSchema?.additionalProperties !== false) {
     log("submit schema must deny additionalProperties");
   }
+  const allowQueue = submit?.inputSchema?.properties?.allow_queue;
+  checks.submitQueueOption =
+    allowQueue?.type === "boolean" && allowQueue?.default === false;
+  if (!checks.submitQueueOption) {
+    log("submit schema must expose optional allow_queue=false");
+  }
 
   // tools/call capacity
   const cap = await mcpFetch(
