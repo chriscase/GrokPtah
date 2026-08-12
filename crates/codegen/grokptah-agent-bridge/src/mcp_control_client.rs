@@ -8,7 +8,18 @@
 //! `tools/call`, with Streamable HTTP Accept headers and optional
 //! `mcp-session-id`.
 
+use std::pin::Pin;
+
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::events::SessionUpdate;
+
+/// Bound a coordinator-side SSE frame independently from the server body
+/// limit. A frame larger than this is rejected before it can grow buffers.
+pub const MAX_LIVE_EVENT_FRAME_BYTES: usize = 512 * 1024;
 
 /// Minimal MCP client against GrokPtah control Streamable HTTP.
 pub struct McpControlClient {
@@ -34,6 +45,241 @@ pub struct CallResult {
     pub structured: Value,
     pub is_error: bool,
     pub raw: Value,
+}
+
+/// Exact identity required by the scoped live run-event channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunScope {
+    pub session_id: uuid::Uuid,
+    pub workspace: String,
+    pub run_id: String,
+}
+
+/// A typed event notification delivered by the coordinator event stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtahEventNotification {
+    pub session_id: uuid::Uuid,
+    pub workspace: String,
+    pub run_id: String,
+    pub seq: u64,
+    pub ts: String,
+    pub update: SessionUpdate,
+}
+
+/// A typed recovery notification. The coordinator must poll the durable event
+/// tool before opening another live stream when this is received.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtahRecoveryNotification {
+    pub session_id: uuid::Uuid,
+    pub workspace: String,
+    pub run_id: String,
+    pub after_seq: u64,
+    pub reason: String,
+    pub poll_tool: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum LiveNotification {
+    Event(PtahEventNotification),
+    Recovery(PtahRecoveryNotification),
+    /// Preserve unknown notifications for forward-compatible coordinators.
+    Unknown {
+        method: String,
+        params: Value,
+    },
+}
+
+/// One decoded SSE message, including its resumable durable ID when present.
+#[derive(Debug, Clone)]
+pub struct LiveEventFrame {
+    pub sse_id: Option<u64>,
+    pub notification: LiveNotification,
+}
+
+type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+/// Incremental bounded decoder for the server's JSON-RPC-over-SSE messages.
+pub struct McpEventStream {
+    scope: RunScope,
+    bytes: ByteStream,
+    buffer: Vec<u8>,
+    last_event_id: Option<u64>,
+    max_frame_bytes: usize,
+    closed: bool,
+}
+
+impl std::fmt::Debug for McpEventStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpEventStream")
+            .field("scope", &self.scope)
+            .field("last_event_id", &self.last_event_id)
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl McpEventStream {
+    /// Return the last durable event sequence delivered by this stream.
+    pub fn last_event_id(&self) -> Option<u64> {
+        self.last_event_id
+    }
+
+    /// Read the next typed notification. A clean server close returns `None`;
+    /// a partial or malformed frame is an error and is never silently dropped.
+    pub async fn next_notification(&mut self) -> anyhow::Result<Option<LiveEventFrame>> {
+        loop {
+            while let Some(frame) = self.take_frame()? {
+                if let Some(frame) = frame {
+                    if let Some(id) = frame.sse_id {
+                        if self.last_event_id.is_some_and(|previous| id <= previous) {
+                            anyhow::bail!("live MCP event sequence is not strictly increasing");
+                        }
+                        self.last_event_id = Some(id);
+                    }
+                    return Ok(Some(frame));
+                }
+            }
+
+            if self.closed {
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                }
+                anyhow::bail!("live MCP stream closed with a partial SSE frame");
+            }
+
+            match self.bytes.next().await {
+                Some(Ok(chunk)) => {
+                    if self.buffer.len().saturating_add(chunk.len()) > self.max_frame_bytes {
+                        anyhow::bail!("live MCP SSE frame exceeds {} bytes", self.max_frame_bytes);
+                    }
+                    self.buffer.extend_from_slice(&chunk);
+                }
+                Some(Err(error)) => return Err(error.into()),
+                None => self.closed = true,
+            }
+        }
+    }
+
+    fn take_frame(&mut self) -> anyhow::Result<Option<Option<LiveEventFrame>>> {
+        let Some((end, delimiter_len)) = find_sse_delimiter(&self.buffer) else {
+            return Ok(None);
+        };
+        let frame: Vec<u8> = self.buffer.drain(..end + delimiter_len).collect();
+        let frame = decode_sse_frame(&frame, &self.scope)?;
+        Ok(Some(frame))
+    }
+}
+
+fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+    if buffer.len() >= 4 {
+        for index in 0..=buffer.len() - 4 {
+            if buffer[index..index + 4] == *b"\r\n\r\n" {
+                return Some((index, 4));
+            }
+        }
+    }
+    if buffer.len() >= 2 {
+        for index in 0..=buffer.len() - 2 {
+            if buffer[index..index + 2] == *b"\n\n" {
+                return Some((index, 2));
+            }
+        }
+    }
+    None
+}
+
+fn decode_sse_frame(frame: &[u8], scope: &RunScope) -> anyhow::Result<Option<LiveEventFrame>> {
+    let text = std::str::from_utf8(frame).map_err(|_| anyhow::anyhow!("SSE frame is not UTF-8"))?;
+    let mut event_name = None;
+    let mut sse_id = None;
+    let mut data = Vec::new();
+
+    for raw_line in text.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => event_name = Some(value.to_string()),
+            "id" => {
+                sse_id = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| anyhow::anyhow!("SSE id is not a u64"))?,
+                )
+            }
+            "data" => data.push(value),
+            _ => {}
+        }
+    }
+
+    if data.is_empty() {
+        return Ok(None);
+    }
+    if event_name.as_deref().is_some_and(|name| name != "message") {
+        anyhow::bail!("unexpected MCP SSE event type {:?}", event_name);
+    }
+
+    let body: Value = serde_json::from_str(&data.join("\n"))?;
+    if body.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        anyhow::bail!("live MCP notification is not JSON-RPC 2.0");
+    }
+    let method = body
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("live MCP message has no method"))?;
+    let params = body
+        .get("params")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("live MCP notification has no params"))?;
+    let notification = match method {
+        "notifications/ptah_event" => {
+            let event: PtahEventNotification = serde_json::from_value(params)?;
+            validate_scope(scope, &event.session_id, &event.workspace, &event.run_id)?;
+            if sse_id != Some(event.seq) {
+                anyhow::bail!("SSE id does not match ptah_event seq");
+            }
+            LiveNotification::Event(event)
+        }
+        "notifications/ptah_recovery" => {
+            let recovery: PtahRecoveryNotification = serde_json::from_value(params)?;
+            validate_scope(
+                scope,
+                &recovery.session_id,
+                &recovery.workspace,
+                &recovery.run_id,
+            )?;
+            LiveNotification::Recovery(recovery)
+        }
+        _ => LiveNotification::Unknown {
+            method: method.to_string(),
+            params,
+        },
+    };
+    Ok(Some(LiveEventFrame {
+        sse_id,
+        notification,
+    }))
+}
+
+fn validate_scope(
+    expected: &RunScope,
+    session_id: &uuid::Uuid,
+    workspace: &str,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    if expected.session_id != *session_id
+        || expected.workspace != workspace
+        || expected.run_id != run_id
+    {
+        anyhow::bail!("live MCP notification scope does not match requested run");
+    }
+    Ok(())
 }
 
 impl McpControlClient {
@@ -209,6 +455,64 @@ impl McpControlClient {
         } else {
             anyhow::bail!("close_session HTTP {}", resp.status())
         }
+    }
+
+    /// Open the authenticated, run-scoped live event channel.
+    ///
+    /// Pass the last delivered durable sequence when reconnecting. The server
+    /// replays strictly after that sequence and emits an explicit recovery
+    /// notification when the live channel cannot guarantee continuity.
+    pub async fn open_event_stream(
+        &self,
+        scope: RunScope,
+        after_seq: Option<u64>,
+    ) -> anyhow::Result<McpEventStream> {
+        if !self.initialized {
+            anyhow::bail!("MCP client not initialized; call initialize() first");
+        }
+        let transport_session = self
+            .session_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("MCP client has no transport session"))?;
+        let mut url = reqwest::Url::parse(&format!("{}/mcp", self.base_url))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("session_id", &scope.session_id.to_string());
+            query.append_pair("workspace", &scope.workspace);
+            query.append_pair("run_id", &scope.run_id);
+        }
+        let mut request = self
+            .http
+            .get(url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("mcp-session-id", transport_session)
+            .header("Accept", "text/event-stream")
+            .header("MCP-Protocol-Version", "2025-03-26");
+        if let Some(seq) = after_seq {
+            request = request.header("Last-Event-ID", seq.to_string());
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("MCP live stream HTTP {status}: {body}");
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !content_type.starts_with("text/event-stream") {
+            anyhow::bail!("MCP live stream returned content type {content_type:?}");
+        }
+        Ok(McpEventStream {
+            scope,
+            bytes: Box::pin(response.bytes_stream()),
+            buffer: Vec::new(),
+            last_event_id: after_seq,
+            max_frame_bytes: MAX_LIVE_EVENT_FRAME_BYTES,
+            closed: false,
+        })
     }
 
     pub async fn list_tools(&mut self) -> anyhow::Result<Vec<ListedTool>> {
@@ -416,5 +720,114 @@ mod tests {
         assert!(validate_args_against_schema(&schema, &json!({"a": "1"})).is_ok());
         assert!(validate_args_against_schema(&schema, &json!({})).is_err());
         assert!(validate_args_against_schema(&schema, &json!({"a":"1","z":1})).is_err());
+    }
+
+    #[tokio::test]
+    async fn live_decoder_handles_split_frames_and_comments() {
+        let scope = RunScope {
+            session_id: uuid::Uuid::new_v4(),
+            workspace: "/tmp/disposable".into(),
+            run_id: "run-1".into(),
+        };
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/ptah_event",
+            "params": {
+                "sessionId": scope.session_id,
+                "workspace": scope.workspace,
+                "runId": scope.run_id,
+                "seq": 7,
+                "ts": "2026-08-12T00:00:00Z",
+                "update": {
+                    "type": "turn_complete",
+                    "session_id": scope.session_id,
+                    "cancelled": false
+                }
+            }
+        });
+        let encoded = format!(": keep-alive\n\nid: 7\nevent: message\ndata: {}\n\n", body);
+        let chunks = vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::copy_from_slice(&encoded.as_bytes()[..17])),
+            Ok::<Bytes, reqwest::Error>(Bytes::copy_from_slice(&encoded.as_bytes()[17..])),
+        ];
+        let mut stream = McpEventStream {
+            scope,
+            bytes: Box::pin(futures::stream::iter(chunks)),
+            buffer: Vec::new(),
+            last_event_id: None,
+            max_frame_bytes: MAX_LIVE_EVENT_FRAME_BYTES,
+            closed: false,
+        };
+
+        let frame = stream.next_notification().await.unwrap().unwrap();
+        assert_eq!(frame.sse_id, Some(7));
+        assert!(matches!(
+            frame.notification,
+            LiveNotification::Event(PtahEventNotification {
+                update: SessionUpdate::TurnComplete {
+                    cancelled: false,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(stream.last_event_id(), Some(7));
+        assert!(stream.next_notification().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn live_decoder_rejects_scope_mismatch_and_oversized_frames() {
+        let scope = RunScope {
+            session_id: uuid::Uuid::new_v4(),
+            workspace: "/tmp/disposable".into(),
+            run_id: "run-1".into(),
+        };
+        let recovery_body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/ptah_recovery",
+            "params": {
+                "sessionId": scope.session_id,
+                "workspace": scope.workspace,
+                "runId": scope.run_id,
+                "afterSeq": 4,
+                "reason": "lagged",
+                "pollTool": "ptah_get_events"
+            }
+        });
+        let recovery_frame = format!("event: message\ndata: {}\n\n", recovery_body);
+        let decoded = decode_sse_frame(recovery_frame.as_bytes(), &scope)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            decoded.notification,
+            LiveNotification::Recovery(PtahRecoveryNotification { after_seq: 4, .. })
+        ));
+
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/ptah_recovery",
+            "params": {
+                "sessionId": uuid::Uuid::new_v4(),
+                "workspace": scope.workspace,
+                "runId": scope.run_id,
+                "afterSeq": 4,
+                "reason": "lagged",
+                "pollTool": "ptah_get_events"
+            }
+        });
+        let frame = format!("event: message\ndata: {}\n\n", body);
+        assert!(decode_sse_frame(frame.as_bytes(), &scope).is_err());
+
+        let chunks = vec![Ok::<Bytes, reqwest::Error>(Bytes::from("123456789"))];
+        let mut stream = McpEventStream {
+            scope,
+            bytes: Box::pin(futures::stream::iter(chunks)),
+            buffer: Vec::new(),
+            last_event_id: None,
+            max_frame_bytes: 8,
+            closed: false,
+        };
+        let error = futures::executor::block_on(stream.next_notification()).unwrap_err();
+        assert!(error.to_string().contains("exceeds 8 bytes"));
     }
 }

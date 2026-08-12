@@ -9,7 +9,7 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
-    McpControlClient, SessionKind,
+    LiveNotification, McpControlClient, RunScope, SessionKind, SessionUpdate,
 };
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -196,6 +196,79 @@ async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
     assert!(wrong_session.status().is_client_error());
     let body: Value = wrong_session.json().await.unwrap();
     assert_eq!(body["error"]["data"]["code"], "forbidden_scope");
+
+    server.stop();
+    set_grokptah_home_override(None);
+    match previous_offline {
+        Some(value) => std::env::set_var("GROKPTAH_AGENT_OFFLINE", value),
+        None => std::env::remove_var("GROKPTAH_AGENT_OFFLINE"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn reusable_client_reconnects_from_last_live_event() {
+    let previous_offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (_home, _lock, host, workspace, orch) = setup();
+    let owner = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(owner.id, workspace.path()).unwrap();
+    let server = start_control_server(orch, 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", server.addr), "live-event-token");
+    client.initialize().await.unwrap();
+
+    let submitted = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "reusable-client-submit",
+                "session_id": owner.id,
+                "workspace": workspace.path().display().to_string(),
+                "prompt": "write reusable-client.txt: observed"
+            }),
+        )
+        .await
+        .unwrap();
+    let run_id = submitted.structured["runId"].as_str().unwrap().to_string();
+    let terminal = wait_terminal(&mut client, owner.id, workspace.path(), &run_id).await;
+    let scope = RunScope {
+        session_id: owner.id,
+        workspace: workspace.path().display().to_string(),
+        run_id,
+    };
+
+    let mut stream = client.open_event_stream(scope.clone(), None).await.unwrap();
+    let first = stream.next_notification().await.unwrap().unwrap();
+    let first_seq = first.sse_id.unwrap();
+    assert!(matches!(first.notification, LiveNotification::Event(_)));
+    assert_eq!(stream.last_event_id(), Some(first_seq));
+    drop(stream);
+
+    let mut resumed = client
+        .open_event_stream(scope, Some(first_seq))
+        .await
+        .unwrap();
+    let next = resumed.next_notification().await.unwrap().unwrap();
+    assert!(next.sse_id.unwrap() > first_seq);
+    let mut terminal_seen = matches!(
+        next.notification,
+        LiveNotification::Event(ref event)
+            if matches!(event.update, SessionUpdate::TurnComplete { .. })
+    );
+    while let Some(frame) = resumed.next_notification().await.unwrap() {
+        if matches!(
+            frame.notification,
+            LiveNotification::Event(ref event)
+                if matches!(event.update, SessionUpdate::TurnComplete { .. })
+        ) {
+            terminal_seen = true;
+        }
+    }
+    assert!(
+        terminal_seen,
+        "client must surface terminal event before close"
+    );
+    assert!(terminal["state"].as_str().is_some());
 
     server.stop();
     set_grokptah_home_override(None);
