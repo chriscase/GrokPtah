@@ -2555,10 +2555,12 @@ impl AgentHostHandle {
         // #166: dry-run age GC report for managed isolation worktrees
         let managed = cwd.join(".grokptah").join("worktrees");
         if managed.is_dir() {
-            let report = crate::worktree_gc::gc_worktrees(
+            let protected = self.active_managed_worktrees(&cwd);
+            let report = crate::worktree_gc::gc_worktrees_with_protected(
                 &managed,
                 crate::worktree_gc::DEFAULT_MAX_AGE,
                 true,
+                &protected,
             );
             if report.scanned > 0 {
                 s.push_str(&format!(
@@ -2567,15 +2569,48 @@ impl AgentHostHandle {
                 ));
             }
             if std::env::var_os("GROKPTAH_WORKTREE_GC").is_some() {
-                let live = crate::worktree_gc::gc_worktrees(
+                let live = crate::worktree_gc::gc_worktrees_with_protected(
                     &managed,
                     crate::worktree_gc::DEFAULT_MAX_AGE,
                     false,
+                    &protected,
                 );
                 s.push_str(&format!("# auto-gc removed {} paths\n", live.removed.len()));
             }
         }
         Ok(s)
+    }
+
+    fn active_managed_worktrees(&self, project: &Path) -> Vec<PathBuf> {
+        let managed = dunce::canonicalize(project.join(".grokptah").join("worktrees"));
+        let Ok(managed) = managed else {
+            return Vec::new();
+        };
+        let mut protected = Vec::new();
+        if let Ok(store) = self.ensure_orchestration_store() {
+            if let Ok(runs) = store.list_runs() {
+                for run in runs {
+                    if run.state.is_terminal() {
+                        continue;
+                    }
+                    if let Some(execution) = run.execution {
+                        protected.push(PathBuf::from(execution.execution_workspace));
+                    }
+                }
+            }
+        }
+        let g = self.inner.lock();
+        protected.extend(
+            g.subagents
+                .iter()
+                .filter(|subagent| subagent.status == "running")
+                .filter_map(|subagent| subagent.cwd.as_ref().map(PathBuf::from)),
+        );
+        protected
+            .into_iter()
+            .filter_map(|path| dunce::canonicalize(path).ok())
+            .filter(|path| path.starts_with(&managed))
+            .collect()
     }
 
     /// Create a git worktree under the open project (#43).

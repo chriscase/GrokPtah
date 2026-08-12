@@ -108,6 +108,8 @@ pub fn desktop_auto_update_enabled() -> bool {
     false
 }
 
-pub use worktree_gc::{candidates_older_than, gc_worktrees, GcReport, DEFAULT_MAX_AGE};
+pub use worktree_gc::{
+    candidates_older_than, gc_worktrees, gc_worktrees_with_protected, GcReport, DEFAULT_MAX_AGE,
+};
 
 pub use host_helpers::is_rate_limit_error;
