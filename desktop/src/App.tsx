@@ -61,6 +61,7 @@ import {
   subscribeSessionUpdates,
 } from "./lib/sessionEvents";
 import { displaySessionTitle } from "./lib/sessionTitle";
+import { activeRunOrigin } from "./lib/runOrigin";
 import { entriesToTranscriptItems, hasInterruptedTurn } from "./lib/transcript";
 import { appendThoughtChunk } from "./lib/thoughtText";
 import { createLatestRequestGuard } from "./lib/latestRequest";
@@ -338,6 +339,7 @@ export default function App() {
   const splitOk = maxDocks >= 2;
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
   const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
+  const runOriginSyncInFlight = useRef(false);
 
   const refreshRuns = useCallback(async () => {
     if (!activeSessionId) {
@@ -354,35 +356,64 @@ export default function App() {
     }
   }, [activeSessionId]);
 
-  const syncRunOrigin = useCallback(async (sessionId: string) => {
+  const syncRunOrigins = useCallback(async (sessionIds: string[]) => {
+    if (runOriginSyncInFlight.current) return;
+    runOriginSyncInFlight.current = true;
     try {
-      const records = await api.runList(sessionId);
-      const live = records.find(
-        (run) => run.state === "running" || run.state === "queued",
+      const results = await Promise.all(
+        sessionIds.map(async (sessionId) => {
+          try {
+            return [sessionId, activeRunOrigin(await api.runList(sessionId))] as const;
+          } catch {
+            // The bridge can be unavailable during startup or shutdown.
+            return null;
+          }
+        }),
       );
-      const origin: RunOrigin | null =
-        live?.clientId === "mcp"
-          ? "mcp"
-          : live?.clientId === "desktop"
-            ? "desktop"
-            : live
-              ? "other"
-              : null;
-      setTabs((prev) =>
-        prev.map((tab) =>
-          tab.id === sessionId ? { ...tab, runOrigin: origin } : tab,
+      const origins = new Map(
+        results.filter(
+          (result): result is readonly [string, RunOrigin | null] => result !== null,
         ),
       );
-    } catch {
-      // The bridge can be unavailable during startup or shutdown.
+      if (origins.size === 0) return;
+      setTabs((prev) => {
+        let changed = false;
+        const next = prev.map((tab) => {
+          if (!origins.has(tab.id)) return tab;
+          const runOrigin = origins.get(tab.id) ?? null;
+          if (tab.runOrigin === runOrigin) return tab;
+          changed = true;
+          return { ...tab, runOrigin };
+        });
+        return changed ? next : prev;
+      });
+    } finally {
+      runOriginSyncInFlight.current = false;
     }
   }, []);
 
-  // Hydrate coordinator ownership when switching tabs or reloading the app;
-  // a running MCP turn may have started before this UI subscribed to events.
+  const openSessionIdsKey = tabs.map((tab) => tab.id).join("\u0000");
+  const openSessionIds = useMemo(
+    () => (openSessionIdsKey ? openSessionIdsKey.split("\u0000") : []),
+    [openSessionIdsKey],
+  );
+
+  // Hydrate coordinator ownership for every open tab; an MCP turn may start
+  // in a background session before the user focuses that session.
   useEffect(() => {
-    if (activeSessionId) void syncRunOrigin(activeSessionId);
-  }, [activeSessionId, syncRunOrigin]);
+    if (openSessionIds.length > 0) void syncRunOrigins(openSessionIds);
+  }, [openSessionIds, syncRunOrigins]);
+
+  // Keep the Live rail's MCP badges current without coupling them to the
+  // task inspector or issuing an unbounded global run query.
+  useEffect(() => {
+    if (openSessionIds.length === 0) return;
+    const timer = window.setInterval(
+      () => void syncRunOrigins(openSessionIds),
+      2_000,
+    );
+    return () => window.clearInterval(timer);
+  }, [openSessionIds, syncRunOrigins]);
 
   useEffect(() => {
     if (rightTab !== "tasks" || !activeSessionId) return;
@@ -783,10 +814,10 @@ export default function App() {
       }
       applyUpdate(u, setTabs, setPermissionQueue);
       if (u.type === "turn_started" || u.type === "turn_complete") {
-        void syncRunOrigin(u.session_id);
+        void syncRunOrigins([u.session_id]);
       }
     });
-  }, [syncRunOrigin]);
+  }, [syncRunOrigins]);
 
   // Restore sessions + open tabs from disk (desktop-app durability).
   useEffect(() => {
