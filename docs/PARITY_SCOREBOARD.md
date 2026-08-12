@@ -109,8 +109,9 @@ Model: **grok-4.5** · identical fixtures/prompts/max_turns · YOLO both sides
    - Mid-batch skip explore **and shell** until an edit lands after cargo fail.
    - **Host auto cargo re-verify** after successful edit while cargo was red.
    - **Multi-failure batch gate:** when cargo reports ≥2 failures, edit surface is `write_files`+`apply_patch` only (serial `write_file` removed); coaching bans single-module thrash.
-   - Focused live **5-run variance** (post batch gate): `write_files` **5/5**, serial `write_file` **0/5**, oracle **2/5**, verified **2/5** (verified tracks oracle when fixes complete).
-   - Residual: model still sometimes under-fixes *content* inside `write_files` under max_turns=3 (not tool-path thrash).
+   - Focused live **5-run variance** (post batch gate): `write_files` **5/5**, serial `write_file` **0/5**, oracle **2/5**, verified **2/5**.
+   - **Final gap cells on PR head:** multi_bug **3/3** oracle+verified (write_files only); rename **2/2** oracle+verified.
+   - Residual: broader multi_bug sampling can still under-fix content; full 14-task dual-side not re-run on final head.
 2. **Verified signal** residual: long_horizon on full baselines; multi_bug when suite stays red.
 3. **tool_errors** higher on Ptah than CLI when success ties.
 4. **#209** unit-verified on main; no live intentional-noop injection.
