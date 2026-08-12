@@ -54,53 +54,82 @@ Offline (CI): `cargo test eval_oracle` in the bridge workspace + suite-shape che
 | Offline oracle unit tests + hard-task shape | **Yes** |
 | Full live discriminating suite | **No** (on-demand; required for ≥ claims) |
 
-## Latest live results — turn-efficiency cycle (#187/#188)
+## Latest live results — agent-quality cycle (#223 / #187 / #209)
 
-Model: **grok-4.5** · Suite: **14 tasks** · max_turns **unchanged** (multi_bug=3, cross_cut=4)  
-Merge SHA (efficiency): `e34b0b0c73543d7ae039501e10344d51e80b93d4`  
-Evidence: goal scratch `proof-1/`, `proof-2/`  
-Instrumentation: `tool_names`, `cargo_test_ran`, `cargo_test_first_round` on both sides.
+Model: **grok-4.5** · Focused gap suite: `rename_keep_display_label` + `multi_bug_cascade_undoc` · max_turns **unchanged** (both = 3)  
+Branch: `feat/agent-quality-parity-223-187-209`  
+Evidence: scratch `proof-1/` (pre-reverify coaching), `proof-2/` + `proof-3/` (post-reverify gate)
 
 ### Agent capability changes (this cycle)
 
-- `write_files` multi-file batch tool (real dispatch path + unit tests)
-- Efficiency system guidance + tool schema reorder (edit/test tools first)
-- `HostConfig.max_agent_rounds` aligned with live_eval task budget + final-step tool filter (edit/shell only) + cargo-test-failure coaching
+- Efficiency guidance: multi-bug batch-all-failures; rename preserves `PRODUCT_LABEL` / string literals; ban blind whole-tree sed
+- Cargo-failure coaching lists distinct failing test names and requires batch fix + re-run
+- **Re-verify gate:** after a cargo failure under tight budgets, do not accept Final until cargo is green again; post-edit coaching forces re-run
+- Recovery grace allows edit **+ shell** so the re-run can happen in the bounded extra step
+- **Evidence-backed terminal handoff:** `enrich_terminal_handoff` appends observed changed paths + cargo result when model/stop text omits them (including recovery-stop finals); live_eval quality findings clear
+- #209 stationarity detector already on main (`IdenticalToolCallRun`, true-noop stop at 4, nudge at 8) — unit tests green
 
-### proof-1
+### Focused gap proofs (Ptah bridge)
 
-| Metric | GrokPtah | Grok CLI |
-|--------|---------:|---------:|
-| Success | **14/14** | **14/14** |
+| Run | rename o/v | multi_bug o/v | handoff quality |
+|-----|:----------:|:-------------:|:---------------:|
+| proof-6 (handoff fix) | ✓/✓ | ✓/✓ | **[]** |
+| proof-7 (handoff fix) | ✓/✓ | ✓/✓ | **[]** |
 
-| Gap task | Ptah | CLI | Ptah ≥ CLI |
-|----------|:----:|:---:|:----------:|
-| multi_bug_cascade_undoc | ✓ | ✓ | **YES** |
-| cross_cut_legacy_widget | ✓ | ✓ | **YES** |
+### Dual-side focused baseline (proof-7 Ptah vs Grok CLI)
 
-### proof-2 (consistency)
+Model: **grok-4.5** · max_turns=3 · same fixtures/prompts
 
-| Metric | GrokPtah | Grok CLI |
-|--------|---------:|---------:|
-| Success | **13/14** | **14/14** |
+| Task | Ptah oracle | Ptah verified | CLI oracle | Ptah ≥ CLI |
+|------|:-----------:|:-------------:|:----------:|:----------:|
+| rename_keep_display_label | ✓ | ✓ | ✓ | **YES** |
+| multi_bug_cascade_undoc | ✓ | ✓ | ✓ | **YES** |
 
-| Gap task | Ptah | CLI | Ptah ≥ CLI |
-|----------|:----:|:---:|:----------:|
-| multi_bug_cascade_undoc | ✗ | ✓ | **NO** |
-| cross_cut_legacy_widget | ✓ | ✓ | **YES** |
+### Full dual-side baselines (14 tasks, PR head `fe69fbb`)
 
-### Gap resolution
+Model: **grok-4.5** · identical fixtures/prompts/max_turns · YOLO both sides
 
-| Task | Issue | Outcome |
-|------|-------|---------|
-| cross_cut_legacy_widget | #188 | **Closed** — Ptah ≥ CLI on **both** proof runs (stable) |
-| multi_bug_cascade_undoc | #187 | **Remains open** — still flaky under max_turns=3 (pass proof-1, fail proof-2); residual model noise despite write_files + budget coaching |
+| Run | Ptah oracle | Ptah verified | CLI oracle | Ptah ≥ CLI (success then tool_errors) |
+|-----|------------:|--------------:|-----------:|:--------------------------------------|
+| baseline-1 | **14/14** | 13/14 | **14/14** | NO (tool_errors 7 vs 0) |
+| baseline-2 | **13/14** | 11/14 | **14/14** | NO (oracle + tool_errors) |
 
-**Do not claim full suite ≥ Build.** #187 residual is honest.
+#### Per-task variance (oracle)
 
-### Prior history
+| Task | R1 Ptah | R1 CLI | R2 Ptah | R2 CLI | notes |
+|------|:-------:|:------:|:-------:|:------:|-------|
+| multi_bug_cascade_undoc | ✓ | ✓ | ✗ | ✓ | **Ptah flaky** under max_turns=3 |
+| rename_keep_display_label | ✓ | ✓ | ✓ | ✓ | stable oracle; verified flaked R2 |
+| long_horizon_trap_bug99 | ✓ | ✓ | ✓ | ✓ | oracle stable; verified false both runs |
+| all other tasks (11) | ✓ | ✓ | ✓ | ✓ | stable |
 
-Earlier discriminating baseline (pre-efficiency): Ptah often behind on both gap tasks. See git history / issue threads.
+#### Residual gaps (honest)
+
+1. **#187 multi_bug** residual after multi-file batch harden:
+   - Mid-batch skip explore **and shell** until an edit lands after cargo fail.
+   - **Host auto cargo re-verify** after successful edit while cargo was red.
+   - **Multi-failure batch gate:** when cargo reports ≥2 failures, edit surface is `write_files`+`apply_patch` only (serial `write_file` removed); coaching bans single-module thrash.
+   - Focused live **5-run variance** (post batch gate): `write_files` **5/5**, serial `write_file` **0/5**, oracle **2/5**, verified **2/5**.
+   - **Final gap cells on PR head:** multi_bug **3/3** oracle+verified (write_files only); rename **2/2** oracle+verified.
+   - Residual: broader multi_bug sampling can still under-fix content; full 14-task dual-side not re-run on final head.
+2. **Verified signal** residual: long_horizon on full baselines; multi_bug when suite stays red.
+3. **tool_errors** higher on Ptah than CLI when success ties.
+4. **#209** unit-verified on main; no live intentional-noop injection.
+5. **#223 rename** full dual-side oracle stable both baselines; focused dual-side ≥ CLI.
+6. **Do not claim full suite ≥ Grok Build** — multi_bug oracle still variance under max_turns=3.
+
+Evidence: goal scratch `baselines/run{1,2}/`, `multibug-batch/run-{1..5}/SUMMARY.json`.
+
+### Prior cycle — turn-efficiency (#187/#188)
+
+Merge SHA (efficiency): `e34b0b0c73543d7ae039501e10344d51e80b93d4`
+
+| Task | Issue | Prior outcome |
+|------|-------|---------------|
+| cross_cut_legacy_widget | #188 | **Closed** — stable ≥ CLI |
+| multi_bug_cascade_undoc | #187 | Was flaky under max_turns=3 |
+
+**Do not claim full 14-task suite ≥ Build without a fresh dual-side full run.** This cycle proves the two open gap tasks on Ptah under existing budgets.
 
 ## Honesty / deliberate non-parity
 
