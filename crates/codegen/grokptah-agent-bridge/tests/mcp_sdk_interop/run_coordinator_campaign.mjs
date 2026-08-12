@@ -10,7 +10,10 @@
  *   GROKPTAH_MCP_URL       http://127.0.0.1:PORT[/mcp]
  *   GROKPTAH_MCP_TOKEN     bearer token
  *   GROKPTAH_MCP_SESSION_ID Build session UUID on that host
+ *   GROKPTAH_MCP_OTHER_SESSION_ID second Build session UUID on that host
+ *   GROKPTAH_MCP_DISCARD_SESSION_ID Build session for isolated discard
  *   GROKPTAH_MCP_WORKSPACE  disposable, allowlisted Git workspace
+ *   GROKPTAH_MCP_DISCARD_WORKSPACE second disposable, allowlisted workspace
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -18,11 +21,14 @@ import path from "node:path";
 const url = process.env.GROKPTAH_MCP_URL;
 const token = process.env.GROKPTAH_MCP_TOKEN;
 const hostSessionId = process.env.GROKPTAH_MCP_SESSION_ID;
+const otherSessionId = process.env.GROKPTAH_MCP_OTHER_SESSION_ID;
+const discardSessionId = process.env.GROKPTAH_MCP_DISCARD_SESSION_ID;
 const workspace = process.env.GROKPTAH_MCP_WORKSPACE;
+const discardWorkspace = process.env.GROKPTAH_MCP_DISCARD_WORKSPACE;
 const interruptedRunId = process.env.GROKPTAH_MCP_INTERRUPTED_RUN_ID;
-if (!url || !token || !hostSessionId || !workspace) {
+if (!url || !token || !hostSessionId || !otherSessionId || !discardSessionId || !workspace || !discardWorkspace) {
   console.error(
-    "GROKPTAH_MCP_URL, GROKPTAH_MCP_TOKEN, GROKPTAH_MCP_SESSION_ID, GROKPTAH_MCP_WORKSPACE required"
+    "GROKPTAH_MCP_URL, GROKPTAH_MCP_TOKEN, GROKPTAH_MCP_SESSION_ID, GROKPTAH_MCP_OTHER_SESSION_ID, GROKPTAH_MCP_DISCARD_SESSION_ID, GROKPTAH_MCP_WORKSPACE, GROKPTAH_MCP_DISCARD_WORKSPACE required"
   );
   process.exit(2);
 }
@@ -185,6 +191,21 @@ try {
   const capacity = await call("ptah_get_capacity", {});
   record("capacityRead", capacity.status === 200 && !!structured(capacity.json), structured(capacity.json));
 
+  // Session cwd and workspace allowlist are independent authorization
+  // boundaries. A coordinator must not steer through a sibling path merely
+  // because it is on the same filesystem.
+  const outsideWorkspace = path.resolve(workspace, "..");
+  const workspaceMismatch = await call("ptah_queue_prompt", {
+    request_id: `${prefix}-workspace-mismatch`,
+    session_id: hostSessionId,
+    workspace: outsideWorkspace,
+    prompt: "this must be rejected outside the allowlist",
+  });
+  record("workspaceMismatchFailClosed", workspaceMismatch.status >= 400, {
+    status: workspaceMismatch.status,
+    workspace: outsideWorkspace,
+  });
+
   // A shared run proves ordinary coordinator submission and durable reads.
   const sharedSubmit = await call("ptah_submit_task", {
     request_id: `${prefix}-shared-submit`,
@@ -333,6 +354,28 @@ try {
         midState !== "cancelled",
       { disposition: steerState?.disposition, state: midState }
     );
+    const crossSessionCancel = await call("ptah_cancel", {
+      request_id: `${prefix}-cross-session-cancel`,
+      session_id: otherSessionId,
+      workspace,
+      run_id: busyRunId,
+    });
+    record(
+      "crossSessionRunOwnershipFailClosed",
+      crossSessionCancel.status >= 400,
+      { status: crossSessionCancel.status }
+    );
+    const crossWorkspaceCancel = await call("ptah_cancel", {
+      request_id: `${prefix}-cross-workspace-cancel`,
+      session_id: hostSessionId,
+      workspace: outsideWorkspace,
+      run_id: busyRunId,
+    });
+    record(
+      "crossWorkspaceRunOwnershipFailClosed",
+      crossWorkspaceCancel.status >= 400,
+      { status: crossWorkspaceCancel.status }
+    );
     const cancel = await call("ptah_cancel", {
       request_id: `${prefix}-busy-cancel`,
       session_id: hostSessionId,
@@ -371,6 +414,41 @@ try {
     const review = structured(reviewResponse.json);
     record("boundedDiffReview", reviewResponse.status === 200 && changedFilesAreBounded(review), review);
     if (reviewResponse.status === 200 && changedFilesAreBounded(review)) {
+      const staleApprovalResponse = await call("ptah_approve_run", {
+        request_id: `${prefix}-isolated-stale-approve`,
+        session_id: hostSessionId,
+        workspace,
+        run_id: isolatedRunId,
+        source_fingerprint: review.sourceFingerprint,
+        final_fingerprint: review.finalFingerprint,
+        changed_files: review.changedFiles,
+        ttl_ms: 1,
+      });
+      const staleApproval = structured(staleApprovalResponse.json);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const stalePromotion = await call("ptah_promote_run", {
+        request_id: `${prefix}-isolated-stale-promote`,
+        session_id: hostSessionId,
+        workspace,
+        run_id: isolatedRunId,
+        approval_id: staleApproval?.approvalId,
+      });
+      record(
+        "staleApprovalFailClosed",
+        staleApprovalResponse.status === 200 && stalePromotion.status >= 400,
+        { approvalStatus: staleApprovalResponse.status, promoteStatus: stalePromotion.status }
+      );
+      const scopeConflict = await call("ptah_promote_run", {
+        request_id: `${prefix}-isolated-wrong-approval`,
+        session_id: hostSessionId,
+        workspace,
+        run_id: isolatedRunId,
+        approval_id: "approval-for-a-different-run",
+      });
+      record("approvalScopeConflictFailClosed", scopeConflict.status >= 400, {
+        status: scopeConflict.status,
+      });
+
       const approvalResponse = await call("ptah_approve_run", {
         request_id: `${prefix}-isolated-approve`,
         session_id: hostSessionId,
@@ -399,9 +477,49 @@ try {
             fs.readFileSync(isolatedFile, "utf8").includes("reference coordinator"),
           promoted
         );
+        // The campaign owns this disposable promoted fixture. Restore the
+        // clean baseline before the independent discard case so its isolated
+        // precondition tests the platform rather than our prior artifact.
+        if (promote.status === 200 && fs.existsSync(isolatedFile)) {
+          fs.unlinkSync(isolatedFile);
+        }
       }
     }
   }
+
+  const discardFile = path.join(discardWorkspace, "coordinator-discard.txt");
+  const discardSubmit = await call("ptah_submit_task", {
+    request_id: `${prefix}-discard-submit`,
+    session_id: discardSessionId,
+    workspace: discardWorkspace,
+    prompt: "write coordinator-discard.txt: this isolated result must be discarded",
+    execution_mode: "isolated_worktree",
+    bounds: { maxPromptBytes: 10_000, maxRounds: 8, maxDurationMs: 30_000 },
+  });
+  const discardRun = structured(discardSubmit.json);
+  const discardRunId = discardRun?.runId;
+  const discardTerminal = discardRunId ? await pollTerminal(discardRunId) : null;
+  const discardResponse = discardRunId
+    ? await call("ptah_discard_run", {
+        request_id: `${prefix}-discard-run`,
+        session_id: discardSessionId,
+        workspace: discardWorkspace,
+        run_id: discardRunId,
+      })
+    : { status: 0, json: null };
+  const discardedState = discardRunId
+    ? await call("ptah_get_run", { run_id: discardRunId })
+    : { status: 0, json: null };
+  const discarded = structured(discardedState.json);
+  record(
+    "isolatedDiscard",
+    discardSubmit.status === 200 &&
+      discardTerminal?.state === "completed" &&
+      discardResponse.status === 200 &&
+      discarded?.execution?.promotionState === "discarded" &&
+      !fs.existsSync(discardFile),
+    { runId: discardRunId, state: discardTerminal?.state, discardStatus: discardResponse.status }
+  );
 
   // Idle steering is explicitly non-cancelling and becomes durable queue state.
   const steer = await call("ptah_steer", {
