@@ -103,12 +103,19 @@ struct SessionState {
 pub struct ControlServerHandle {
     pub addr: SocketAddr,
     pub token: String,
+    orch: Arc<OrchestrationService>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     cancel: tokio_util::sync::CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ControlServerHandle {
+    /// Shared policy service for trusted desktop commands that surface the
+    /// same MCP-owned runs. The transport remains the only network boundary.
+    pub fn orchestration_service(&self) -> Arc<OrchestrationService> {
+        self.orch.clone()
+    }
+
     pub fn stop(mut self) {
         self.cancel.cancel();
         if let Some(tx) = self.shutdown.take() {
@@ -299,6 +306,7 @@ pub async fn start_control_server_with(
     Ok(ControlServerHandle {
         addr,
         token,
+        orch: state.orch.clone(),
         shutdown: Some(tx),
         cancel,
         task: Some(task),

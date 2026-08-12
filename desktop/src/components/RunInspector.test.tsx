@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DurableRun, DurableRunEventPage, RunReview } from "../lib/protocol";
 import { RunInspector } from "./RunInspector";
@@ -83,6 +83,7 @@ const actions = {
   onReview: vi.fn(async () => review),
   onPromote: vi.fn(async () => undefined),
   onDiscard: vi.fn(async () => undefined),
+  onRetry: vi.fn(async () => undefined),
   onEvents: vi.fn(async () => eventPage),
 };
 
@@ -177,6 +178,32 @@ describe("RunInspector", () => {
     expect(screen.getByText(/stopped after restart/i)).toBeTruthy();
     fireEvent.click(screen.getByLabelText("Refresh task runs"));
     expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires a fresh prompt before retrying an MCP run", async () => {
+    const onRefresh = vi.fn();
+    const onRetry = vi.fn(async () => undefined);
+    render(
+      <RunInspector
+        runs={[run({ state: "interrupted", clientId: "mcp", runId: "mcp-interrupted" })]}
+        onRefresh={onRefresh}
+        {...actions}
+        onRetry={onRetry}
+      />,
+    );
+
+    const button = screen.getByRole("button", { name: "Retry interrupted run" });
+    expect(button).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Fresh recovery prompt"), {
+      target: { value: "Continue by checking the test failure" },
+    });
+    expect(button).not.toBeDisabled();
+    fireEvent.click(button);
+    expect(onRetry).toHaveBeenCalledWith(
+      "mcp-interrupted",
+      "Continue by checking the test failure",
+    );
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
   });
 
   it("reviews an isolated run before enabling promotion", async () => {

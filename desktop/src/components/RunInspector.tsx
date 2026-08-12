@@ -15,6 +15,7 @@ type RunInspectorProps = {
   onReview: (runId: string) => Promise<RunReview>;
   onPromote: (runId: string) => Promise<void>;
   onDiscard: (runId: string) => Promise<void>;
+  onRetry: (runId: string, prompt: string) => Promise<void>;
   onEvents: (runId: string, afterSeq?: number, limit?: number) => Promise<DurableRunEventPage>;
 };
 
@@ -118,6 +119,7 @@ export function RunInspector({
   onReview,
   onPromote,
   onDiscard,
+  onRetry,
   onEvents,
 }: RunInspectorProps) {
   const [originFilter, setOriginFilter] = useState<"all" | "desktop" | "mcp" | "other">("all");
@@ -128,6 +130,7 @@ export function RunInspector({
   const [eventPages, setEventPages] = useState<Record<string, DurableRunEventPage>>({});
   const [eventLoading, setEventLoading] = useState<string | null>(null);
   const [eventErrors, setEventErrors] = useState<Record<string, string>>({});
+  const [retryPrompts, setRetryPrompts] = useState<Record<string, string>>({});
   const watchValue = watching ?? localWatching;
 
   function setWatchValue(next: boolean) {
@@ -181,6 +184,22 @@ export function RunInspector({
     setActionError(null);
     try {
       await onDiscard(runId);
+      onRefresh();
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setReviewing(null);
+    }
+  }
+
+  async function retry(runId: string) {
+    const prompt = retryPrompts[runId]?.trim() ?? "";
+    if (!prompt) return;
+    setReviewing(runId);
+    setActionError(null);
+    try {
+      await onRetry(runId, prompt);
+      setRetryPrompts((current) => ({ ...current, [runId]: "" }));
       onRefresh();
     } catch (error) {
       setActionError(String(error));
@@ -333,6 +352,32 @@ export function RunInspector({
                 {run.state === "interrupted" && (
                   <div className="run-callout" role="status">
                     This run stopped after restart. Review it before starting a linked retry.
+                  </div>
+                )}
+                {run.state === "interrupted" && run.clientId === "mcp" && (
+                  <div className="run-retry">
+                    <label htmlFor={`retry-prompt-${run.runId}`}>Fresh recovery prompt</label>
+                    <textarea
+                      id={`retry-prompt-${run.runId}`}
+                      value={retryPrompts[run.runId] ?? ""}
+                      onChange={(event) =>
+                        setRetryPrompts((current) => ({
+                          ...current,
+                          [run.runId]: event.target.value,
+                        }))
+                      }
+                      placeholder="Describe what the replacement run should do next"
+                      rows={2}
+                      disabled={reviewing === run.runId}
+                    />
+                    <button
+                      type="button"
+                      className="composer-chip"
+                      onClick={() => void retry(run.runId)}
+                      disabled={reviewing === run.runId || !(retryPrompts[run.runId] ?? "").trim()}
+                    >
+                      {reviewing === run.runId ? "Retrying…" : "Retry interrupted run"}
+                    </button>
                   </div>
                 )}
                 {run.retryOf && (

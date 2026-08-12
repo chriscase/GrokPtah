@@ -1,9 +1,11 @@
+use std::path::PathBuf;
+
 use grokptah_agent_bridge::{
-    desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, McpServerInfo, ModelInfo,
-    PermissionDecision, PluginInfo, PromptQueueEntry, PromptQueueRunNextResult,
-    PromptQueueTakeResult, SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary,
-    SkillInfo, SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION,
-    JournalPage, PRODUCT_NAME, RunExecutionMode, RunReview,
+    desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, JournalPage,
+    McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
+    PromptQueueRunNextResult, PromptQueueTakeResult, RunExecutionMode, RunReview, SearchHit,
+    SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo, SteeringReceipt,
+    SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -511,6 +513,65 @@ pub async fn run_discard(
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     run_blocking(move || host.discard_run(id, &run_id).map_err(map_err)).await
+}
+
+/// Explicitly retry an interrupted MCP-owned run through the shared
+/// orchestration policy service. The desktop supplies only a fresh prompt;
+/// the service preserves ownership, mode, bounds, idempotency, and queueing.
+#[tauri::command]
+pub async fn run_retry(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    prompt: String,
+) -> Result<String, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let (orch, token) = {
+        let control = state
+            .control
+            .lock()
+            .map_err(|_| "MCP control state is unavailable".to_string())?;
+        let server = control
+            .as_ref()
+            .ok_or_else(|| "MCP control plane is not running".to_string())?;
+        (server.orchestration_service(), server.token.clone())
+    };
+    if token.is_empty() {
+        return Err("MCP control authentication is unavailable".into());
+    }
+    let auth = orch
+        .auth_header(Some(&format!("Bearer {token}")))
+        .map_err(map_err)?;
+    let session = state.host.session_load(session_id).map_err(map_err)?;
+    if session.cwd.is_empty() {
+        return Err("the session has no workspace".into());
+    }
+    let source = state
+        .host
+        .get_session_run(session_id, &run_id)
+        .map_err(map_err)?
+        .ok_or_else(|| "unknown run for this session".to_string())?;
+    if source.client_id.as_deref() != Some("mcp") {
+        return Err("desktop retry is limited to MCP-owned runs".into());
+    }
+    let response = orch
+        .retry_run(
+            &auth,
+            &Uuid::new_v4().to_string(),
+            session_id,
+            &PathBuf::from(&session.cwd),
+            &run_id,
+            prompt,
+            None,
+            None,
+            true,
+        )
+        .await
+        .map_err(map_err)?;
+    response["runId"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "retry did not return a run id".into())
 }
 
 #[tauri::command]
