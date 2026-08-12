@@ -1,5 +1,10 @@
 import { useState } from "react";
-import type { DurableRun, RunReview } from "../lib/protocol";
+import type {
+  DurableRun,
+  DurableRunEventPage,
+  RunReview,
+  SessionUpdate,
+} from "../lib/protocol";
 
 type RunInspectorProps = {
   runs: DurableRun[];
@@ -10,6 +15,7 @@ type RunInspectorProps = {
   onReview: (runId: string) => Promise<RunReview>;
   onPromote: (runId: string) => Promise<void>;
   onDiscard: (runId: string) => Promise<void>;
+  onEvents: (runId: string, afterSeq?: number, limit?: number) => Promise<DurableRunEventPage>;
 };
 
 const stateLabels: Record<DurableRun["state"], string> = {
@@ -51,6 +57,58 @@ function runExecutionLabel(run: DurableRun): string {
   return "Shared workspace";
 }
 
+function compactEventText(value: string, maxLength = 220): string {
+  const text = value.replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function eventLabel(update: SessionUpdate): string {
+  switch (update.type) {
+    case "agent_message_chunk":
+      return `Assistant · ${compactEventText(update.text)}`;
+    case "agent_thought_chunk":
+      return `Thought · ${compactEventText(update.text)}`;
+    case "tool_call":
+      return `${compactEventText(update.title, 120)} · ${update.status}`;
+    case "tool_call_update":
+      return `${update.call_id} · ${update.status}${update.output ? ` · ${compactEventText(update.output, 140)}` : ""}`;
+    case "plan":
+      return `Plan · ${update.status} · ${update.steps.length} steps`;
+    case "permission_required":
+      return `Permission requested · ${compactEventText(update.request.summary, 160)}`;
+    case "turn_started":
+      return `Turn started · ${update.turn_id}`;
+    case "turn_complete":
+      return update.cancelled ? "Turn cancelled" : "Turn complete";
+    case "completion_evidence":
+      return `Verification · ${update.evidence.status}`;
+    case "error":
+      return `Error · ${compactEventText(update.message)}`;
+    case "subagent_spawned":
+      return `Subagent started · ${compactEventText(update.title, 140)}`;
+    case "subagent_update":
+      return `Subagent ${update.subagent_id} · ${update.status}${update.detail ? ` · ${compactEventText(update.detail, 140)}` : ""}`;
+    case "background_task":
+      return `Background task · ${compactEventText(update.title, 140)} · ${update.status}`;
+    case "shell_session_started":
+      return `Shell started · ${compactEventText(update.command, 160)}`;
+    case "shell_output":
+      return `Shell output · ${compactEventText(update.data)}`;
+    case "shell_session_ended":
+      return update.cancelled
+        ? `Shell cancelled · ${update.call_id}`
+        : `Shell ended · ${update.call_id} · exit ${update.exit_code ?? "?"}`;
+    case "file_edit":
+      return `${compactEventText(update.path, 140)} · ${compactEventText(update.summary, 140)}`;
+    case "agent_progress":
+      return `Round ${update.round}/${update.max_rounds} · ${compactEventText(update.last_tool || "model step", 100)} · ${compactEventText(update.detail, 120)}`;
+    case "rate_limited":
+      return `Rate limited · ${compactEventText(update.message)}`;
+    case "steering_injected":
+      return `Steering delivered · ${compactEventText(update.text)}`;
+  }
+}
+
 export function RunInspector({
   runs,
   busy,
@@ -60,12 +118,16 @@ export function RunInspector({
   onReview,
   onPromote,
   onDiscard,
+  onEvents,
 }: RunInspectorProps) {
   const [originFilter, setOriginFilter] = useState<"all" | "desktop" | "mcp" | "other">("all");
   const [localWatching, setLocalWatching] = useState(true);
   const [reviewing, setReviewing] = useState<string | null>(null);
   const [reviews, setReviews] = useState<Record<string, RunReview>>({});
   const [actionError, setActionError] = useState<string | null>(null);
+  const [eventPages, setEventPages] = useState<Record<string, DurableRunEventPage>>({});
+  const [eventLoading, setEventLoading] = useState<string | null>(null);
+  const [eventErrors, setEventErrors] = useState<Record<string, string>>({});
   const watchValue = watching ?? localWatching;
 
   function setWatchValue(next: boolean) {
@@ -124,6 +186,32 @@ export function RunInspector({
       setActionError(String(error));
     } finally {
       setReviewing(null);
+    }
+  }
+
+  async function loadEvents(runId: string, afterSeq = 0) {
+    setEventLoading(runId);
+    setEventErrors((current) => {
+      const next = { ...current };
+      delete next[runId];
+      return next;
+    });
+    try {
+      const page = await onEvents(runId, afterSeq, 80);
+      setEventPages((current) => {
+        const previous = afterSeq === 0 ? undefined : current[runId];
+        const entries = [...(previous?.entries ?? []), ...page.entries].filter(
+          (entry, index, all) => all.findIndex((candidate) => candidate.seq === entry.seq) === index,
+        );
+        return {
+          ...current,
+          [runId]: { ...page, entries },
+        };
+      });
+    } catch (error) {
+      setEventErrors((current) => ({ ...current, [runId]: String(error) }));
+    } finally {
+      setEventLoading(null);
     }
   }
 
@@ -187,6 +275,8 @@ export function RunInspector({
         <div className="run-list">
           {visibleRuns.map((run) => {
             const verification = run.aggregates.verification;
+            const eventPage = eventPages[run.runId];
+            const eventError = eventErrors[run.runId];
             return (
               <article className={`run-card state-${run.state}`} key={run.runId}>
                 <div className="run-card-heading">
@@ -243,6 +333,58 @@ export function RunInspector({
                   <div className="run-error" role="status">
                     {run.errorCode.replaceAll("_", " ")}
                   </div>
+                )}
+                <div className="run-actions run-event-actions">
+                  <button
+                    type="button"
+                    className="composer-chip quiet"
+                    onClick={() => void loadEvents(run.runId)}
+                    disabled={eventLoading === run.runId}
+                  >
+                    {eventLoading === run.runId
+                      ? "Loading events…"
+                      : eventPage
+                        ? "Refresh events"
+                        : "Replay events"}
+                  </button>
+                </div>
+                {eventError && (
+                  <div className="run-error" role="alert">
+                    Could not load the event timeline: {eventError}
+                  </div>
+                )}
+                {eventPage && (
+                  <details className="run-events" open>
+                    <summary>Run timeline · {eventPage.entries.length} events</summary>
+                    {eventPage.cursorExpired && (
+                      <div className="run-callout" role="status">
+                        Older events are no longer retained. Durable progress, changes, tests,
+                        and handoff remain available.
+                      </div>
+                    )}
+                    {eventPage.entries.length > 0 ? (
+                      <ol className="run-event-list">
+                        {eventPage.entries.map((entry) => (
+                          <li className="run-event-row" key={entry.seq}>
+                            <time dateTime={entry.ts}>{timeLabel(entry.ts)}</time>
+                            <span className="run-event-detail">{eventLabel(entry.update)}</span>
+                          </li>
+                        ))}
+                      </ol>
+                    ) : (
+                      <div className="run-event-empty">No retained events in this page.</div>
+                    )}
+                    {!eventPage.cursorExpired && eventPage.nextCursor != null && (
+                      <button
+                        type="button"
+                        className="composer-chip quiet"
+                        onClick={() => void loadEvents(run.runId, eventPage.nextCursor ?? 0)}
+                        disabled={eventLoading === run.runId}
+                      >
+                        Load more events
+                      </button>
+                    )}
+                  </details>
                 )}
                 {run.execution?.mode === "isolated_worktree" &&
                   run.state === "completed" && (

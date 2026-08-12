@@ -95,6 +95,7 @@ pub fn run() {
             commands::session_completion_history,
             commands::run_list,
             commands::run_get,
+            commands::run_events,
             commands::run_review,
             commands::run_promote,
             commands::run_discard,

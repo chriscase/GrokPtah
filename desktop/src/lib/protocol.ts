@@ -83,6 +83,18 @@ export interface RunReview {
   fingerprint: string;
 }
 
+export interface DurableRunEvent {
+  seq: number;
+  ts: string;
+  update: SessionUpdate;
+}
+
+export interface DurableRunEventPage {
+  entries: DurableRunEvent[];
+  nextCursor?: number | null;
+  cursorExpired: boolean;
+}
+
 export interface DurableRun {
   runId: string;
   sessionId: string;

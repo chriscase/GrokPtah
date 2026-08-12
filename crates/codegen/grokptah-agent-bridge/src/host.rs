@@ -16,6 +16,7 @@ use crate::completion::{
     build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
     CompletionUsage,
 };
+use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
@@ -445,6 +446,33 @@ impl AgentHostHandle {
         Ok(store
             .load_run(run_id)?
             .filter(|run| run.session_id == session_id))
+    }
+
+    /// Read the bounded journal range belonging to one durable run.
+    pub fn get_session_run_events(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<JournalPage> {
+        let run = self
+            .get_session_run(session_id, run_id)?
+            .ok_or_else(|| anyhow!("unknown run"))?;
+        let Some(start_seq) = run.start_seq else {
+            return Ok(JournalPage {
+                entries: Vec::new(),
+                next_cursor: None,
+                cursor_expired: false,
+            });
+        };
+        let mut page = self.event_bus().read_after(after_seq, limit);
+        page.entries.retain(|entry| {
+            session_id_of(&entry.update) == Some(session_id)
+                && entry.seq >= start_seq
+                && run.end_seq.map(|end| entry.seq <= end).unwrap_or(true)
+        });
+        Ok(page)
     }
 
     /// Read the bounded Git diff for an isolated terminal run.

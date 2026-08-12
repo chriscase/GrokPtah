@@ -3187,6 +3187,10 @@ export default function App() {
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runDiscard(activeSessionId, runId);
               }}
+              onEvents={(runId, afterSeq = 0, limit = 80) => {
+                if (!activeSessionId) return Promise.reject(new Error("No active session"));
+                return api.runEvents(activeSessionId, runId, afterSeq, limit);
+              }}
             />
             <div className="section-title">Multi-agent</div>
             <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 0.5rem" }}>

@@ -3,7 +3,7 @@ use grokptah_agent_bridge::{
     PermissionDecision, PluginInfo, PromptQueueEntry, PromptQueueRunNextResult,
     PromptQueueTakeResult, SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary,
     SkillInfo, SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION,
-    PRODUCT_NAME, RunExecutionMode, RunReview,
+    JournalPage, PRODUCT_NAME, RunExecutionMode, RunReview,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -457,6 +457,24 @@ pub async fn run_get(
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     run_blocking(move || host.get_session_run(id, &run_id).map_err(map_err)).await
+}
+
+/// Read the bounded, durable event journal for one run.
+#[tauri::command]
+pub async fn run_events(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    after_seq: Option<u64>,
+    limit: Option<usize>,
+) -> Result<JournalPage, String> {
+    let host = state.host.clone();
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    run_blocking(move || {
+        host.get_session_run_events(id, &run_id, after_seq.unwrap_or(0), limit.unwrap_or(80))
+            .map_err(map_err)
+    })
+    .await
 }
 
 /// Read the bounded diff for a completed isolated run.
