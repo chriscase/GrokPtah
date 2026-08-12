@@ -748,6 +748,82 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
+async fn http_submit_allow_queue_and_cancel_queued_run() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (_home, _lock, host, ws, orch) = setup();
+    host.configure_orchestration_capacity(1);
+    let first_session = host.session_new_kind(SessionKind::Build).unwrap();
+    let queued_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(first_session.id, ws.path()).unwrap();
+    host.session_set_cwd(queued_session.id, ws.path()).unwrap();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), "stream-token-200");
+    client.initialize().await.unwrap();
+
+    let first = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "http-queue-first",
+                "session_id": first_session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "prompt": "run sleep 3"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!first.is_error);
+    assert_eq!(first.structured["state"], "running");
+
+    let queued = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "http-queue-second",
+                "session_id": queued_session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "prompt": "list files in the project root",
+                "allow_queue": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!queued.is_error);
+    let queued_run_id = queued.structured["runId"].as_str().unwrap().to_string();
+    assert_eq!(queued.structured["state"], "queued");
+    assert_eq!(queued.structured["queuedPosition"], 1);
+
+    let capacity = client
+        .call_tool("ptah_get_capacity", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(capacity.structured["activeRuns"], 1);
+    assert_eq!(capacity.structured["queuedRuns"], 1);
+    assert_eq!(capacity.structured["queueLimit"], 32);
+
+    let cancelled = client
+        .call_tool(
+            "ptah_cancel",
+            json!({
+                "request_id": "http-queue-cancel",
+                "session_id": queued_session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": queued_run_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!cancelled.is_error);
+    assert_eq!(cancelled.structured["wasQueued"], true);
+    assert_eq!(cancelled.structured["teardownComplete"], true);
+    assert_eq!(cancelled.structured["state"], "cancelled");
+
+    srv.stop_and_wait().await;
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
 async fn http_submit_durable_run_events_handoff_and_cancel() {
     std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (_home, _lock, host, ws, orch) = setup();
