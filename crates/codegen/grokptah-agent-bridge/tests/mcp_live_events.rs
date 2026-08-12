@@ -185,6 +185,27 @@ async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
     assert!(event_id(&next) > first_id);
     assert!(next.contains(&run_id));
 
+    // Reconnecting after the terminal sequence must close promptly instead
+    // of leaving a completed run's stream open forever.
+    let terminal_id = terminal["endSeq"].as_u64().expect("terminal end sequence");
+    let completed = http
+        .get(live_url(server.addr, owner.id, workspace.path(), &run_id))
+        .header("Authorization", "Bearer live-event-token")
+        .header("mcp-session-id", &transport_session)
+        .header("Last-Event-ID", terminal_id.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), 200);
+    let mut completed_chunks = completed.bytes_stream();
+    let eof = tokio::time::timeout(Duration::from_secs(3), completed_chunks.next())
+        .await
+        .expect("completed stream did not close promptly");
+    assert!(
+        eof.is_none(),
+        "completed stream emitted data after its terminal sequence"
+    );
+
     // Exact ownership applies to the live channel too.
     let wrong_session = http
         .get(live_url(server.addr, other.id, workspace.path(), &run_id))
