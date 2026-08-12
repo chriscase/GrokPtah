@@ -14,6 +14,8 @@ import {
   type SubagentInfo,
   type TranscriptItem,
   type DurableRun,
+  type RunOrigin,
+  type WorkspaceStatus,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
 import {
@@ -94,12 +96,14 @@ function emptyTab(
   title = "New session",
   kind: SessionKind = "build",
   cwd?: string,
+  workspaceStatus: WorkspaceStatus = "ready",
 ): SessionTab {
   return {
     id,
     title,
     kind,
     cwd,
+    workspaceStatus,
     transcript: [],
     busy: false,
     plan: null,
@@ -349,6 +353,36 @@ export default function App() {
     }
   }, [activeSessionId]);
 
+  const syncRunOrigin = useCallback(async (sessionId: string) => {
+    try {
+      const records = await api.runList(sessionId);
+      const live = records.find(
+        (run) => run.state === "running" || run.state === "queued",
+      );
+      const origin: RunOrigin | null =
+        live?.clientId === "mcp"
+          ? "mcp"
+          : live?.clientId === "desktop"
+            ? "desktop"
+            : live
+              ? "other"
+              : null;
+      setTabs((prev) =>
+        prev.map((tab) =>
+          tab.id === sessionId ? { ...tab, runOrigin: origin } : tab,
+        ),
+      );
+    } catch {
+      // The bridge can be unavailable during startup or shutdown.
+    }
+  }, []);
+
+  // Hydrate coordinator ownership when switching tabs or reloading the app;
+  // a running MCP turn may have started before this UI subscribed to events.
+  useEffect(() => {
+    if (activeSessionId) void syncRunOrigin(activeSessionId);
+  }, [activeSessionId, syncRunOrigin]);
+
   useEffect(() => {
     if (rightTab !== "tasks" || !activeSessionId) return;
     void refreshRuns();
@@ -445,6 +479,8 @@ export default function App() {
                   title: summary.title,
                   kind: summary.kind ?? t.kind,
                   cwd: summary.cwd ?? t.cwd,
+                  workspaceStatus:
+                    summary.workspace_status ?? t.workspaceStatus ?? "ready",
                 }
               : t,
           );
@@ -456,6 +492,7 @@ export default function App() {
             summary.title || "New session",
             summary.kind ?? "build",
             summary.cwd,
+            summary.workspace_status ?? "ready",
           ),
         ];
       });
@@ -481,6 +518,11 @@ export default function App() {
               title: loaded.title || summary.title,
               kind: loaded.kind ?? summary.kind ?? t.kind,
               cwd: loaded.cwd || summary.cwd || t.cwd,
+              workspaceStatus:
+                loaded.workspace_status ??
+                summary.workspace_status ??
+                t.workspaceStatus ??
+                "ready",
               completionEvidence: restoredCompletion?.evidence ?? null,
               completionTurnId: restoredCompletion?.turn_id ?? null,
               transcript: interrupted
@@ -498,20 +540,35 @@ export default function App() {
             };
           }),
         );
-        if (loaded.cwd) projectCwdHintRef.current = loaded.cwd;
+        if (loaded.cwd && loaded.workspace_status === "ready") {
+          projectCwdHintRef.current = loaded.cwd;
+        }
         setStatus((st) =>
           st
             ? {
                 ...st,
                 active_session: loaded.id,
-                project_cwd: loaded.cwd || st.project_cwd,
+                project_cwd:
+                  loaded.workspace_status === "ready"
+                    ? loaded.cwd || st.project_cwd
+                    : st.project_cwd,
               }
             : st,
         );
         // #152: show historical subagent summary after reopen (host loads from disk).
         setSubagents(await api.subagentsList());
-      } catch {
-        /* offline / empty */
+      } catch (error) {
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.id === summary.id
+              ? {
+                  ...t,
+                  workspaceStatus: summary.workspace_status ?? t.workspaceStatus,
+                  activity: errorActivity(String(error)),
+                }
+              : t,
+          ),
+        );
       }
     },
     [],
@@ -573,7 +630,6 @@ export default function App() {
       if (s.kind === "chat" || s.kind === "build") {
         setWorkspaceMode(s.kind);
       }
-      await api.sessionLoad(s.id);
       await openTab(s, true);
       setSessionBrowserOpen(false);
       await refreshSessions();
@@ -724,8 +780,11 @@ export default function App() {
         });
       }
       applyUpdate(u, setTabs, setPermissionQueue);
+      if (u.type === "turn_started" || u.type === "turn_complete") {
+        void syncRunOrigin(u.session_id);
+      }
     });
-  }, []);
+  }, [syncRunOrigin]);
 
   // Restore sessions + open tabs from disk (desktop-app durability).
   useEffect(() => {
@@ -887,6 +946,18 @@ export default function App() {
         const updated = await api.pickSessionFolder(sessionId);
         if (!updated) return;
         if (updated.cwd) projectCwdHintRef.current = updated.cwd;
+        setTabs((prev) =>
+          prev.map((tab) =>
+            tab.id === sessionId
+              ? {
+                  ...tab,
+                  cwd: updated.cwd,
+                  workspaceStatus: updated.workspace_status ?? "ready",
+                  activity: idleActivity(),
+                }
+              : tab,
+          ),
+        );
         await refreshSessions();
         await refreshChrome();
         try {
@@ -2171,6 +2242,14 @@ export default function App() {
                       ],
                     )}
                   </span>
+                  {t.runOrigin === "mcp" && (
+                    <span
+                      className="session-origin-badge"
+                      title="MCP coordinator is driving this session"
+                    >
+                      MCP
+                    </span>
+                  )}
                 </button>
                 <button
                   type="button"
@@ -2311,6 +2390,7 @@ export default function App() {
                     showClose={docks.length > 1}
                     onClosePane={undockSession}
                     onFocusSession={focusSession}
+                    onSetWorkingDirectory={setWorkingDirectory}
                     cwd={dockTab.cwd ?? sessions.find((s) => s.id === dockTab.id)?.cwd}
                     titlePeers={[
                       ...sessions,

@@ -92,7 +92,9 @@ export const FleetStrip = memo(function FleetStrip({
                 t.runningSubagents
                   ? `, ${t.runningSubagents} subagent${t.runningSubagents === 1 ? "" : "s"}`
                   : ""
-              }${t.totalTokens ? `, ${t.totalTokens} tokens` : ""}`}
+              }${t.totalTokens ? `, ${t.totalTokens} tokens` : ""}${
+                t.runOrigin === "mcp" ? ", MCP coordinator" : ""
+              }`}
               title={
                 canSplit
                   ? `${t.title}\nClick: focus · Alt-click / double-click: dock beside`
@@ -122,6 +124,14 @@ export const FleetStrip = memo(function FleetStrip({
                         : "·"}
                 </span>
                 <span className="fleet-card-title">{t.title}</span>
+                {t.runOrigin === "mcp" && (
+                  <span
+                    className="fleet-card-origin"
+                    title="MCP coordinator is driving this session"
+                  >
+                    MCP
+                  </span>
+                )}
                 {inZone ? (
                   <span className="fleet-card-zone" title={`Zone ${zoneIndex + 1}`}>
                     Z{zoneIndex + 1}

@@ -153,23 +153,211 @@ pub fn cargo_test_output_failed(output: &str) -> bool {
         || (nonzero_exit && (lower.contains("cargo") || lower.contains("test")))
 }
 
-/// Efficiency / multi-step guidance shared by the coding-agent system prompt (#187/#188).
+/// Distinct failing test names from cargo output (#187).
+///
+/// Handles common shapes:
+/// - `test path::name ... FAILED`
+/// - `failures:\n    path::name`
+pub fn collect_cargo_test_failure_names(output: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut in_failures = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("failures:") {
+            in_failures = true;
+            continue;
+        }
+        if in_failures {
+            if trimmed.is_empty()
+                || trimmed.starts_with("test result:")
+                || trimmed.starts_with("error:")
+                || trimmed.starts_with("----")
+            {
+                in_failures = false;
+                continue;
+            }
+            // Skip assertion detail blocks that start with the test name + stdout.
+            if trimmed.contains("---") {
+                continue;
+            }
+            let name = trimmed
+                .strip_prefix("test ")
+                .unwrap_or(trimmed)
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(':');
+            if !name.is_empty()
+                && name.contains("::")
+                && !names.iter().any(|existing| existing == name)
+            {
+                names.push(name.to_string());
+            }
+            continue;
+        }
+        // Live line: `test foo::bar ... FAILED` (ignore "test result: FAILED…")
+        if let Some(rest) = trimmed.strip_prefix("test ") {
+            let lower = rest.to_ascii_lowercase();
+            if lower.starts_with("result") {
+                continue;
+            }
+            if lower.contains("failed") {
+                if let Some(name) = rest.split_whitespace().next() {
+                    if !name.is_empty() && !names.iter().any(|existing| existing == name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Count distinct failing tests (for multi-file batch gating).
+///
+/// Prefers named failures; falls back to cargo's `N failed` summary so
+/// `--quiet` runs still arm multi-bug batching when the suite reports a count.
+pub fn count_cargo_test_failures(output: &str) -> u32 {
+    let named = collect_cargo_test_failure_names(output).len() as u32;
+    if named > 0 {
+        return named;
+    }
+    // e.g. "test result: FAILED. 0 passed; 3 failed; 0 ignored"
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("failed")
+            && (lower.contains("passed") || lower.contains("test result")))
+        {
+            continue;
+        }
+        // Take the integer immediately before the word "failed".
+        for (i, _) in lower.match_indices("failed") {
+            let before = lower[..i].trim_end();
+            let num = before
+                .rsplit(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap_or("");
+            if let Ok(n) = num.parse::<u32>() {
+                if n > 0 {
+                    return n;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Caps the list so coaching stays short under tight budgets.
+pub fn summarize_cargo_test_failures(output: &str) -> String {
+    let mut names = collect_cargo_test_failure_names(output);
+    const MAX: usize = 8;
+    if names.is_empty() {
+        return String::new();
+    }
+    let total = names.len();
+    names.truncate(MAX);
+    let joined = names.join(", ");
+    if total > MAX {
+        format!("{joined}, … (+{} more)", total - MAX)
+    } else {
+        joined
+    }
+}
+
+/// True when cargo output shows 2+ independent failures (multi-bug batch path).
+#[allow(dead_code)] // public helper + unit tests; host uses count_cargo_test_failures
+pub fn is_multi_failure_cargo_output(output: &str) -> bool {
+    count_cargo_test_failures(output) >= 2
+}
+
+/// True when tool output looks like a successful `cargo test` run.
+pub fn cargo_test_output_passed(output: &str) -> bool {
+    if cargo_test_output_failed(output) {
+        return false;
+    }
+    let lower = output.to_ascii_lowercase();
+    lower.contains("test result: ok")
+        || (lower.contains("0 failed") && lower.contains("test result:"))
+        || (lower.contains("(exit 0)")
+            && (lower.contains("cargo")
+                || lower.contains("test result")
+                || lower.contains("passed")))
+}
+
+/// Coaching injected after a cargo-test failure under a tight budget (#187).
+pub fn cargo_test_failure_coaching(output: &str) -> String {
+    let n = count_cargo_test_failures(output);
+    let summary = summarize_cargo_test_failures(output);
+    if n >= 2 {
+        format!(
+            "cargo test reported {n} independent failures ({summary}). Docs may mention only one. \
+             CRITICAL under tight turn budget: fix ALL of them in ONE `write_files` call \
+             (every implicated src/*.rs module in the same tool call). \
+             Do NOT use serial single-file `write_file` — that burns the budget after one module. \
+             Multi-hunk `apply_patch` across files is OK. cargo re-runs automatically after edits. \
+             Do not give a final answer until cargo test is green."
+        )
+    } else if summary.is_empty() {
+        "cargo test reported failures. Treat the full output as the bug list (docs may omit some). \
+         In this or the next step, fix ALL failing tests with one `write_files` / multi-file `apply_patch` \
+         batch across every implicated module, then re-run `cargo test`. Do not stop after a single fix \
+         and do not give a final answer until cargo test is green."
+            .into()
+    } else {
+        format!(
+            "cargo test reported failures ({summary}). Treat that full list as the work — docs may \
+             mention only one bug. Fix ALL of them in one `write_files` / multi-file `apply_patch` \
+             batch across every implicated module, then re-run `cargo test`. Do not stop after a single \
+             fix and do not give a final answer until cargo test is green."
+        )
+    }
+}
+
+/// Coaching after edits that still need a green cargo re-run (#187 verified signal).
+pub fn cargo_test_reverify_coaching() -> &'static str {
+    "Edits applied, but cargo test has not passed yet after the failure. Re-run `cargo test` now \
+     in this step (or the next). Do not give a final answer until the re-run is green. \
+     If any tests still fail, batch the remaining fixes with write_files and re-test."
+}
+
+/// Coaching when a multi-failure turn used serial write_file instead of write_files.
+pub fn multi_failure_partial_edit_coaching(failure_count: u32) -> String {
+    format!(
+        "PARTIAL FIX RISK: cargo reported {failure_count} independent failures, but only a \
+         single-file edit was applied. Under max_turns tight budgets this usually leaves other \
+         modules broken. Immediately issue ONE `write_files` (or multi-file apply_patch) covering \
+         EVERY remaining failing module — do not chain serial write_file."
+    )
+}
+
+/// Multi-failure edit surface: batch tools only (no serial write_file, no shell).
+pub fn is_batch_edit_tool(name: &str) -> bool {
+    matches!(name, "write_files" | "apply_patch")
+}
+
+/// Efficiency / multi-step guidance shared by the coding-agent system prompt (#187/#188/#223).
 pub fn coding_agent_efficiency_guidance() -> &'static str {
     "\
 ## Turn budget (critical)\n\
 You MAY emit **multiple tool calls in one assistant step** — use that. Prefer 1–3 dense steps over many exploratory steps.\n\
 \n\
 ### When the user asks to fix tests / make cargo test pass\n\
-1. FIRST step: run `cargo test` — then in the **same** step apply fixes for **all** failures via `write_files` or multi-file `apply_patch`.\n\
-2. Do **not** spend extra steps re-listing the tree after you know failing tests.\n\
-3. Do **not** stop after fixing only the bug mentioned in README if other tests still fail.\n\
-4. Prefer finishing with `cargo test` when feasible.\n\
+1. FIRST step: run `cargo test` — collect **every** failing test (not just the first).\n\
+2. Same step when possible: apply fixes for **all** failures via one `write_files` or multi-file `apply_patch` \
+across every implicated module. Independent bugs in separate files must be fixed together.\n\
+3. Do **not** trust README/docs as a complete bug list — tests are authoritative.\n\
+4. Do **not** stop after fixing only the documented bug if other tests still fail.\n\
+5. Do **not** spend extra steps re-listing the tree after you know failing tests.\n\
+6. Prefer finishing with `cargo test` when feasible.\n\
 \n\
 ### When the user asks for a type/symbol rename across the crate\n\
-1. In **one** step: bulk rename with `run_terminal_cmd` (e.g. find+sed/perl on src/**/*.rs) and/or `write_files` for every changed module including `lib.rs` re-exports.\n\
-2. Same step: ensure public aliases (`pub use`, compat wrappers) compile — never leave half-renamed APIs.\n\
-3. Same or next step only: `cargo test`.\n\
-4. Avoid 3+ rounds of list_dir/grep/read before the first edit.\n\
+1. Prefer `write_files` (or careful multi-hunk `apply_patch`) that rewrites each module with the new type name — \
+**do not** run a blind whole-tree `sed`/`perl -pi` that rewrites string literals.\n\
+2. **Preserve user-facing / telemetry string literals** (e.g. `PRODUCT_LABEL`, constants whose *value* must stay \
+the old name). Rename the **type/identifier** only; leave string-literal contents like OldName untouched when the task says so.\n\
+3. Same step: update `lib.rs` re-exports (`pub use`) and all type references — never leave half-renamed APIs.\n\
+4. Same or next step only: `cargo test` and confirm the preserved label still matches exactly.\n\
+5. Avoid 3+ rounds of list_dir/grep/read before the first edit.\n\
 \n\
 Prefer `write_files` over serial `write_file` when 2+ files change. Prefer multi-block `apply_patch` for search/replace across files.\n\
 \n\
@@ -179,6 +367,7 @@ When the task is complete, give a concise handoff with:\n\
 2. The changed files (relative paths), or explicitly say that no files changed.\n\
 3. Verification commands and observed results, or explicitly say what was not run.\n\
 4. Remaining risks, blockers, or follow-up work.\n\
+Example shape: `Completed. Changed src/a.rs, src/b.rs. cargo test passed (N tests).`\n\
 Never claim a test, build, or file change that you did not actually observe.\n\
 "
 }
@@ -369,17 +558,99 @@ pub(crate) enum AgentStep {
 /// Map of OpenAI function name → (real server name, real tool name).
 pub(crate) type McpToolIndex = std::collections::HashMap<String, (String, String)>;
 
+/// Tools allowed after a cargo failure under a tight turn budget (#187).
+///
+/// Explore-only tools (list/read/grep/glob) are deliberately excluded so the
+/// remaining budget cannot burn on tree walks after failures are known.
+pub fn is_edit_or_shell_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_files" | "write_file" | "apply_patch" | "run_terminal_cmd"
+    )
+}
+
+/// Skip remaining tool calls after cargo failed under a tight budget.
+///
+/// - Explore tools are always skipped while cargo is red.
+/// - Shell is skipped until at least one successful edit lands (cargo re-run
+///   is host-driven after edits). This stops cargo-only thrash under max_turns=3.
+pub fn should_skip_tool_after_cargo_failure(
+    max_rounds: u32,
+    test_failure_needs_edit: bool,
+    tool_name: &str,
+    had_edit_since_cargo_fail: bool,
+) -> bool {
+    if max_rounds > 8 || !test_failure_needs_edit {
+        return false;
+    }
+    if !is_edit_or_shell_tool(tool_name) {
+        return true; // explore
+    }
+    // Shell before any edit: skip (host auto-reverify runs cargo after write).
+    tool_name == "run_terminal_cmd" && !had_edit_since_cargo_fail
+}
+
+/// Message returned when a tool is skipped mid-batch after cargo fail.
+pub fn post_cargo_failure_skip_message(tool_name: &str) -> String {
+    if tool_name == "run_terminal_cmd" {
+        format!(
+            "SKIPPED `{tool_name}`: cargo test already failed and no code edits have landed yet. \
+             Use write_files (all failing modules in one call) / write_file / apply_patch now. \
+             cargo test will re-run automatically after your edits."
+        )
+    } else {
+        format!(
+            "SKIPPED `{tool_name}`: cargo test failed earlier and the turn budget is tight. \
+             Only write_files / write_file / apply_patch are allowed until fixes land. \
+             Fix ALL failing tests in one batch; cargo re-runs automatically after edits."
+        )
+    }
+}
+
+/// After a successful edit following cargo failure under a tight budget,
+/// always schedule a cargo re-run so verified signal can go green (#187).
+///
+/// `edited_after_cargo_fail` is sticky for the tool batch once an edit lands
+/// while cargo was known red.
+pub fn should_auto_cargo_reverify_after_edit(
+    max_rounds: u32,
+    edited_after_cargo_fail: bool,
+) -> bool {
+    max_rounds <= 8 && edited_after_cargo_fail
+}
+
+/// Shell command used for host-driven post-edit re-verify under tight budgets.
+///
+/// Not quiet: named failures + `N failed` summaries are needed to re-arm
+/// multi-bug batch coaching when the re-run is still red.
+pub fn auto_cargo_reverify_command() -> &'static str {
+    "cargo test --manifest-path Cargo.toml"
+}
+
+/// Detect the R2 multi_bug failure signature: cargo ran, no mutating edit,
+/// only explore (+ cargo) tools. Used as a regression oracle for #187.
+pub fn is_post_cargo_explore_only_burn(tool_names: &[&str]) -> bool {
+    if tool_names.is_empty() {
+        return false;
+    }
+    let has_cargo_or_shell = tool_names.contains(&"run_terminal_cmd");
+    let has_edit = tool_names
+        .iter()
+        .any(|n| matches!(*n, "write_files" | "write_file" | "apply_patch"));
+    let has_explore = tool_names.iter().any(|n| {
+        matches!(
+            *n,
+            "list_dir" | "read_file" | "grep" | "glob_files" | "memory_read"
+        )
+    });
+    has_cargo_or_shell && has_explore && !has_edit
+}
+
 /// On final budget step, only allow edit + shell tools (#187/#188).
 pub(crate) fn filter_tools_edit_and_shell(tools: &serde_json::Value) -> serde_json::Value {
     let Some(arr) = tools.as_array() else {
         return tools.clone();
     };
-    let keep = [
-        "write_files",
-        "write_file",
-        "apply_patch",
-        "run_terminal_cmd",
-    ];
     let filtered: Vec<serde_json::Value> = arr
         .iter()
         .filter(|t| {
@@ -388,7 +659,7 @@ pub(crate) fn filter_tools_edit_and_shell(tools: &serde_json::Value) -> serde_js
                 .and_then(|f| f.get("name"))
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            keep.contains(&name)
+            is_edit_or_shell_tool(name)
         })
         .cloned()
         .collect();
@@ -400,6 +671,9 @@ pub(crate) fn filter_tools_edit_and_shell(tools: &serde_json::Value) -> serde_js
 }
 
 /// Restrict a bounded recovery boundary to tools that can change source files.
+///
+/// Used when cargo has failed repeatedly without edits under a tight budget
+/// (#187), so the model cannot thrash `run_terminal_cmd` only.
 pub(crate) fn filter_tools_edit_only(tools: &serde_json::Value) -> serde_json::Value {
     let Some(arr) = tools.as_array() else {
         return tools.clone();
@@ -418,6 +692,34 @@ pub(crate) fn filter_tools_edit_only(tools: &serde_json::Value) -> serde_json::V
         .cloned()
         .collect();
     serde_json::Value::Array(filtered)
+}
+
+/// Multi-failure tight-budget surface: only batch mutators (#187).
+///
+/// Drops serial `write_file` so the model cannot spend the remaining turns
+/// fixing one module at a time under max_turns=3.
+pub(crate) fn filter_tools_batch_edit_only(tools: &serde_json::Value) -> serde_json::Value {
+    let Some(arr) = tools.as_array() else {
+        return tools.clone();
+    };
+    let filtered: Vec<serde_json::Value> = arr
+        .iter()
+        .filter(|t| {
+            let name = t
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            is_batch_edit_tool(name)
+        })
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        // Fall back to full edit surface if schema is unexpected.
+        filter_tools_edit_only(tools)
+    } else {
+        serde_json::Value::Array(filtered)
+    }
 }
 
 fn tool_schema_priority(tool: &serde_json::Value) -> u8 {
@@ -844,6 +1146,8 @@ pub(crate) fn is_round_limit_stop_message(text: &str) -> bool {
 pub(crate) fn is_incomplete_stop_message(text: &str) -> bool {
     is_round_limit_stop_message(text)
         || (text.starts_with("Stopped after ") && text.contains("without making progress"))
+        || (text.starts_with("Stopped after recovery step")
+            && text.contains("unresolved cargo test"))
 }
 
 pub(crate) fn offline_plan_steps(goal: &str) -> Vec<String> {
@@ -1764,6 +2068,24 @@ mod efficiency_tests {
             g.contains("half-renamed") || g.contains("pub use"),
             "rename completeness"
         );
+        // #187: multi-bug batching under tight budgets
+        assert!(
+            g.contains("every") && g.contains("failing"),
+            "must collect all failures"
+        );
+        assert!(
+            g.contains("tests are authoritative"),
+            "docs are incomplete bug lists"
+        );
+        // #223: preserve telemetry / product label strings on rename
+        assert!(
+            g.contains("PRODUCT_LABEL") && g.contains("string literal"),
+            "rename must preserve string literals"
+        );
+        assert!(
+            g.contains("blind") && g.contains("sed"),
+            "must warn against blind whole-tree rewrites"
+        );
     }
 
     #[test]
@@ -1779,6 +2101,184 @@ mod efficiency_tests {
         assert!(!cargo_test_output_failed(
             "test result: ok. 2 passed; 0 failed; 0 ignored"
         ));
+    }
+
+    #[test]
+    fn summarize_cargo_test_failures_lists_distinct_names() {
+        let out = "\
+running 3 tests
+test math::clamp_u8_bounds ... FAILED
+test parse::pair_csv ... FAILED
+test text::title_case_words ... FAILED
+
+failures:
+
+---- math::clamp_u8_bounds stdout ----
+assertion failed
+
+failures:
+    math::clamp_u8_bounds
+    parse::pair_csv
+    text::title_case_words
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored
+";
+        let summary = summarize_cargo_test_failures(out);
+        assert!(summary.contains("math::clamp_u8_bounds"), "{summary}");
+        assert!(summary.contains("parse::pair_csv"), "{summary}");
+        assert!(summary.contains("text::title_case_words"), "{summary}");
+        let coach = cargo_test_failure_coaching(out);
+        assert!(coach.contains("math::clamp_u8_bounds"), "{coach}");
+        assert!(coach.contains("write_files"), "{coach}");
+        assert!(coach.contains("ALL"), "{coach}");
+    }
+
+    #[test]
+    fn cargo_test_failure_coaching_without_names_still_batches() {
+        let coach = cargo_test_failure_coaching("error: test failed, to rerun pass `--lib`");
+        assert!(coach.contains("write_files"), "{coach}");
+        assert!(coach.contains("ALL failing tests"), "{coach}");
+    }
+
+    #[test]
+    fn multi_failure_count_and_batch_coaching() {
+        let out = "\
+test clamp_inclusive ... FAILED
+test parse_comma_pair ... FAILED
+test title_case_words ... FAILED
+test result: FAILED. 0 passed; 3 failed; 0 ignored
+";
+        assert_eq!(count_cargo_test_failures(out), 3);
+        assert!(is_multi_failure_cargo_output(out));
+        let coach = cargo_test_failure_coaching(out);
+        assert!(coach.contains("3 independent"), "{coach}");
+        assert!(coach.contains("write_files"), "{coach}");
+        assert!(
+            coach.contains("serial") || coach.contains("write_file"),
+            "{coach}"
+        );
+        // Quiet-ish summary still counts.
+        assert_eq!(
+            count_cargo_test_failures("test result: FAILED. 0 passed; 3 failed"),
+            3
+        );
+        let partial = multi_failure_partial_edit_coaching(3);
+        assert!(partial.contains("write_files"), "{partial}");
+        assert!(partial.contains("3"), "{partial}");
+    }
+
+    #[test]
+    fn filter_tools_batch_edit_only_drops_serial_write_file() {
+        let (tools, _) = coding_agent_tools(&[]);
+        let f = filter_tools_batch_edit_only(&tools);
+        let names: Vec<&str> = f
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"write_files"), "{names:?}");
+        assert!(names.contains(&"apply_patch"), "{names:?}");
+        assert!(!names.contains(&"write_file"), "{names:?}");
+        assert!(!names.contains(&"run_terminal_cmd"), "{names:?}");
+        assert!(!names.contains(&"list_dir"), "{names:?}");
+    }
+
+    #[test]
+    fn cargo_test_output_passed_requires_green_markers() {
+        assert!(cargo_test_output_passed(
+            "test result: ok. 3 passed; 0 failed; 0 ignored\n(exit 0)"
+        ));
+        assert!(!cargo_test_output_passed(
+            "test result: FAILED. 0 passed; 2 failed\n(exit 101)"
+        ));
+        assert!(!cargo_test_output_passed("wrote src/lib.rs"));
+        assert!(cargo_test_reverify_coaching().contains("Re-run"));
+    }
+
+    #[test]
+    fn post_cargo_failure_skips_explore_and_shell_until_edit() {
+        // Tight budget + armed failure, no edit yet: explore + shell blocked.
+        assert!(should_skip_tool_after_cargo_failure(
+            3, true, "list_dir", false
+        ));
+        assert!(should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "read_file",
+            false
+        ));
+        assert!(should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "run_terminal_cmd",
+            false
+        ));
+        // Edits always allowed while red.
+        assert!(!should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "write_files",
+            false
+        ));
+        assert!(!should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "apply_patch",
+            false
+        ));
+        // After an edit lands, shell is allowed again (model or auto re-verify).
+        assert!(!should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "run_terminal_cmd",
+            true
+        ));
+        // Not armed / loose budget: never skip.
+        assert!(!should_skip_tool_after_cargo_failure(
+            3, false, "list_dir", false
+        ));
+        assert!(!should_skip_tool_after_cargo_failure(
+            24, true, "list_dir", false
+        ));
+        let msg = post_cargo_failure_skip_message("run_terminal_cmd");
+        assert!(msg.contains("SKIPPED"));
+        assert!(msg.contains("write_files"));
+    }
+
+    #[test]
+    fn post_cargo_explore_only_burn_detects_r2_failure_signature() {
+        // Baseline-2 multi_bug failure path: cargo + explore, no edits.
+        assert!(is_post_cargo_explore_only_burn(&[
+            "run_terminal_cmd",
+            "list_dir",
+            "read_file",
+            "glob_files",
+            "run_terminal_cmd",
+            "run_terminal_cmd",
+        ]));
+        // Healthy path: explore then write_files then cargo re-run.
+        assert!(!is_post_cargo_explore_only_burn(&[
+            "run_terminal_cmd",
+            "list_dir",
+            "read_file",
+            "write_files",
+            "run_terminal_cmd",
+        ]));
+        // Cargo-only is not the explore-burn signature.
+        assert!(!is_post_cargo_explore_only_burn(&[
+            "run_terminal_cmd",
+            "run_terminal_cmd",
+        ]));
+        assert!(!is_post_cargo_explore_only_burn(&[]));
+    }
+
+    #[test]
+    fn auto_cargo_reverify_after_edit_under_tight_budget() {
+        assert!(should_auto_cargo_reverify_after_edit(3, true));
+        assert!(!should_auto_cargo_reverify_after_edit(3, false));
+        assert!(!should_auto_cargo_reverify_after_edit(24, true));
+        assert!(auto_cargo_reverify_command().contains("cargo test"));
     }
 
     #[test]
