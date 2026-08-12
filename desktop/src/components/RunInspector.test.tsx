@@ -84,6 +84,7 @@ const eventPage: DurableRunEventPage = {
 
 const actions = {
   onReview: vi.fn(async () => review),
+  onApprove: vi.fn(async () => undefined),
   onPromote: vi.fn(async () => undefined),
   onDiscard: vi.fn(async () => undefined),
   onRetry: vi.fn(async () => undefined),
@@ -266,6 +267,72 @@ describe("RunInspector", () => {
     expect(await screen.findByText(/1 changed files/)).toBeTruthy();
     expect(screen.getByText("Promote reviewed changes")).toBeTruthy();
     expect(screen.getByText(/diff --git/)).toBeTruthy();
+  });
+
+  it("shows durable MCP approval state before allowing promotion", async () => {
+    const mcpRun = run({
+      clientId: "mcp",
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/mcp-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+      approval: {
+        approvalId: "approval-1",
+        runId: "desktop-run-1",
+        sessionId: "session-1",
+        workspace: "/tmp/demo",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        changedFiles: review.changedFiles,
+        issuedAt: "2026-08-11T12:00:00Z",
+        expiresAt: "2099-08-11T12:05:00Z",
+      },
+    });
+    render(
+      <RunInspector
+        runs={[mcpRun]}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByText(/Approval active until/)).toBeTruthy();
+    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText("Promote reviewed changes")).toBeTruthy();
+  });
+
+  it("surfaces an isolated promotion conflict as a blocking state", () => {
+    render(
+      <RunInspector
+        runs={[
+          run({
+            clientId: "mcp",
+            execution: {
+              mode: "isolated_worktree",
+              sourceWorkspace: "/tmp/demo",
+              executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/conflict",
+              baseRevision: "base",
+              sourceFingerprint: "source",
+              finalFingerprint: "changed",
+              promotionState: "conflicted",
+              promotedAt: null,
+            },
+          }),
+        ]}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Promotion blocked");
+    expect(screen.queryByText("Review diff")).toBeNull();
   });
 
   it("replays and paginates a durable run timeline", async () => {

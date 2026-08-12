@@ -83,6 +83,18 @@ export interface RunReview {
   fingerprint: string;
 }
 
+export interface RunApproval {
+  approvalId: string;
+  runId: string;
+  sessionId: string;
+  workspace: string;
+  sourceFingerprint: string;
+  finalFingerprint: string;
+  changedFiles: Array<{ path: string; summary: string }>;
+  issuedAt: string;
+  expiresAt: string;
+}
+
 export interface DurableRunEvent {
   seq: number;
   ts: string;
@@ -142,6 +154,7 @@ export interface DurableRun {
     updatedAt: string;
   } | null;
   execution?: RunExecution | null;
+  approval?: RunApproval | null;
 }
 
 export type SessionUpdate =

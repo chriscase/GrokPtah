@@ -3233,6 +3233,10 @@ export default function App() {
                 if (!activeSessionId) return Promise.reject(new Error("No active session"));
                 return api.runReview(activeSessionId, runId);
               }}
+              onApprove={async (runId) => {
+                if (!activeSessionId) throw new Error("No active session");
+                await api.runApprove(activeSessionId, runId);
+              }}
               onPromote={async (runId) => {
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runPromote(activeSessionId, runId);

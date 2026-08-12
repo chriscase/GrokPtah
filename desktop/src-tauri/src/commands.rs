@@ -513,6 +513,64 @@ pub async fn run_review(
     run_blocking(move || host.review_run(id, &run_id).map_err(map_err)).await
 }
 
+/// Persist an exact-scope approval for an MCP-owned isolated run. The desktop
+/// uses the same durable approval contract as an external coordinator so an
+/// approval remains visible and valid across restart.
+#[tauri::command]
+pub async fn run_approve(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    ttl_ms: Option<u64>,
+) -> Result<grokptah_agent_bridge::RunRecord, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let (orch, token) = desktop_mcp_orchestration(&state)?;
+    let auth = orch
+        .auth_header(Some(&format!("Bearer {token}")))
+        .map_err(map_err)?;
+    let session = state.host.session_load(session_id).map_err(map_err)?;
+    if session.cwd.is_empty() {
+        return Err("the session has no workspace".into());
+    }
+    let source = state
+        .host
+        .get_session_run(session_id, &run_id)
+        .map_err(map_err)?
+        .ok_or_else(|| "unknown run for this session".to_string())?;
+    if source.client_id.as_deref() != Some("mcp") {
+        return Err("desktop approval is limited to MCP-owned runs".into());
+    }
+    let execution = source
+        .execution
+        .clone()
+        .ok_or_else(|| "run used shared execution and has no isolated diff".to_string())?;
+    if execution.mode != RunExecutionMode::IsolatedWorktree {
+        return Err("run used shared execution and cannot be approved".into());
+    }
+    let review = state
+        .host
+        .review_run(session_id, &run_id)
+        .map_err(map_err)?;
+    orch.approve_run(
+        &auth,
+        &Uuid::new_v4().to_string(),
+        session_id,
+        &PathBuf::from(&session.cwd),
+        &run_id,
+        execution.source_fingerprint,
+        review.fingerprint,
+        review.changed_files,
+        ttl_ms,
+    )
+    .await
+    .map_err(map_err)?;
+    state
+        .host
+        .get_session_run(session_id, &run_id)
+        .map_err(map_err)?
+        .ok_or_else(|| "run disappeared after approval".into())
+}
+
 /// Promote a reviewed isolated run into its unchanged source workspace.
 #[tauri::command]
 pub async fn run_promote(
@@ -522,7 +580,19 @@ pub async fn run_promote(
 ) -> Result<grokptah_agent_bridge::RunRecord, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.promote_run(id, &run_id).map_err(map_err)).await
+    run_blocking(move || {
+        let run = host
+            .get_session_run(id, &run_id)
+            .map_err(map_err)?
+            .ok_or_else(|| "unknown run for this session".to_string())?;
+        match run.approval.as_ref() {
+            Some(approval) => host
+                .promote_run_with_approval(id, &run_id, Some(&approval.approval_id))
+                .map_err(map_err),
+            None => host.promote_run(id, &run_id).map_err(map_err),
+        }
+    })
+    .await
 }
 
 /// Discard an isolated run and remove only its managed worktree.
