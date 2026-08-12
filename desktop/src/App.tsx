@@ -297,6 +297,8 @@ export default function App() {
   const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
   const [bgTasks, setBgTasks] = useState<any[]>([]);
   const [runs, setRuns] = useState<DurableRun[]>([]);
+  const [runsSessionId, setRunsSessionId] = useState<string | null>(null);
+  const [runsError, setRunsError] = useState<string | null>(null);
   const [runsBusy, setRunsBusy] = useState(false);
   const [runsWatching, setRunsWatching] = useState(true);
   const [hooksPreview, setHooksPreview] = useState<string | null>(null);
@@ -337,6 +339,8 @@ export default function App() {
   const splitOk = maxDocks >= 2;
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
   const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
+  const runsRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
+  const runsRefreshInFlight = useRef<{ sessionId: string; request: number } | null>(null);
   const runOriginSyncInFlight = useRef(false);
 
   const syncOpenQueues = useCallback(
@@ -361,19 +365,37 @@ export default function App() {
   );
 
   const refreshRuns = useCallback(async () => {
-    if (!activeSessionId) {
+    const sessionId = activeSessionId;
+    if (sessionId && runsRefreshInFlight.current?.sessionId === sessionId) return;
+    const request = runsRefreshGuard.begin();
+    if (!sessionId) {
+      runsRefreshInFlight.current = null;
       setRuns([]);
+      setRunsSessionId(null);
+      setRunsError(null);
+      setRunsBusy(false);
       return;
     }
+    runsRefreshInFlight.current = { sessionId, request };
     setRunsBusy(true);
     try {
-      setRuns(await api.runList(activeSessionId));
+      const nextRuns = await api.runList(sessionId);
+      if (!runsRefreshGuard.isCurrent(request)) return;
+      setRuns(nextRuns);
+      setRunsSessionId(sessionId);
+      setRunsError(null);
     } catch (error) {
+      if (!runsRefreshGuard.isCurrent(request)) return;
+      setRuns([]);
+      setRunsSessionId(sessionId);
+      setRunsError(`Could not refresh durable runs: ${String(error)}`);
       console.warn("durable run refresh failed", error);
     } finally {
-      setRunsBusy(false);
+      if (runsRefreshInFlight.current?.request !== request) return;
+      runsRefreshInFlight.current = null;
+      if (runsRefreshGuard.isCurrent(request)) setRunsBusy(false);
     }
-  }, [activeSessionId]);
+  }, [activeSessionId, runsRefreshGuard]);
 
   const syncRunOrigins = useCallback(async (sessionIds: string[]) => {
     if (runOriginSyncInFlight.current) return;
@@ -3186,7 +3208,8 @@ export default function App() {
         {rightTab === "tasks" && (
           <>
             <RunInspector
-              runs={runs}
+              runs={runsSessionId === activeSessionId ? runs : []}
+              error={runsSessionId === activeSessionId ? runsError : null}
               busy={runsBusy}
               watching={runsWatching}
               onWatchingChange={setRunsWatching}
