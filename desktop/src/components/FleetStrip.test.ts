@@ -14,5 +14,7 @@ describe("FleetStrip cockpit exceed (#174 continuous)", () => {
     expect(src).toMatch(/aria-label/);
     expect(src).toMatch(/data-testid="fleet-card"/);
     expect(src).toMatch(/data-running-subagents/);
+    expect(src).toMatch(/runOrigin/);
+    expect(src).toMatch(/MCP coordinator/);
   });
 });

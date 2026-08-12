@@ -788,6 +788,11 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
             .await
             .unwrap();
         assert!(!run.is_error);
+        assert_eq!(
+            run.structured.get("clientId").and_then(|v| v.as_str()),
+            Some("mcp"),
+            "MCP-submitted runs must retain their origin for desktop visibility"
+        );
         state = run
             .structured
             .get("state")
