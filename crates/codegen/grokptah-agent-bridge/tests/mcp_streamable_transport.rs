@@ -1047,7 +1047,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         })
         .unwrap();
     client.close_session().await.unwrap();
-    srv.stop();
+    srv.stop_and_wait().await;
     drop(orch);
     drop(host);
 
