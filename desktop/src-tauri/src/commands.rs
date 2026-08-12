@@ -3,7 +3,7 @@ use grokptah_agent_bridge::{
     PermissionDecision, PluginInfo, PromptQueueEntry, PromptQueueRunNextResult,
     PromptQueueTakeResult, SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary,
     SkillInfo, SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION,
-    PRODUCT_NAME,
+    PRODUCT_NAME, RunExecutionMode, RunReview,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -189,6 +189,25 @@ pub fn session_set_cwd(
 ) -> Result<SessionSummary, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state.host.session_set_cwd(id, path).map_err(map_err)
+}
+
+/// Set the execution policy for future Build turns in one session.
+#[tauri::command]
+pub fn session_set_execution_mode(
+    state: State<'_, AppState>,
+    session_id: String,
+    mode: String,
+) -> Result<SessionSummary, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let mode = match mode.trim().to_ascii_lowercase().as_str() {
+        "shared" => RunExecutionMode::Shared,
+        "isolated_worktree" | "isolated" => RunExecutionMode::IsolatedWorktree,
+        other => return Err(format!("unknown execution mode {other}")),
+    };
+    state
+        .host
+        .session_set_execution_mode(id, mode)
+        .map_err(map_err)
 }
 
 /// Folder picker scoped to one session (does not require a global project first).
@@ -438,6 +457,42 @@ pub async fn run_get(
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     run_blocking(move || host.get_session_run(id, &run_id).map_err(map_err)).await
+}
+
+/// Read the bounded diff for a completed isolated run.
+#[tauri::command]
+pub async fn run_review(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+) -> Result<RunReview, String> {
+    let host = state.host.clone();
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    run_blocking(move || host.review_run(id, &run_id).map_err(map_err)).await
+}
+
+/// Promote a reviewed isolated run into its unchanged source workspace.
+#[tauri::command]
+pub async fn run_promote(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+) -> Result<grokptah_agent_bridge::RunRecord, String> {
+    let host = state.host.clone();
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    run_blocking(move || host.promote_run(id, &run_id).map_err(map_err)).await
+}
+
+/// Discard an isolated run and remove only its managed worktree.
+#[tauri::command]
+pub async fn run_discard(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+) -> Result<grokptah_agent_bridge::RunRecord, String> {
+    let host = state.host.clone();
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    run_blocking(move || host.discard_run(id, &run_id).map_err(map_err)).await
 }
 
 #[tauri::command]

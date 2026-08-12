@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::completion::CompletionEvidence;
+use crate::orchestration::RunExecutionMode;
 
 /// Workspace mode: coding agent builds vs plain Grok conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -50,6 +51,9 @@ pub struct SessionSummary {
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub kind: SessionKind,
+    /// Execution policy for future Build turns in this session.
+    #[serde(default)]
+    pub execution_mode: RunExecutionMode,
 }
 
 /// Durable evidence for one completed or interrupted model turn.
@@ -185,6 +189,9 @@ pub struct Session {
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub kind: SessionKind,
+    /// Execution policy for future Build turns in this session.
+    #[serde(default)]
+    pub execution_mode: RunExecutionMode,
     /// Bounded per-turn completion evidence, restored independently of the transcript.
     #[serde(default)]
     pub completion_history: Vec<SessionCompletion>,
@@ -235,6 +242,7 @@ impl Session {
             archived: false,
             archived_at: None,
             kind,
+            execution_mode: RunExecutionMode::Shared,
             completion_history: Vec::new(),
             transcript_loaded: true,
             persisted_len: 0,
@@ -262,6 +270,7 @@ impl Session {
             archived: self.archived,
             archived_at: self.archived_at,
             kind: self.kind,
+            execution_mode: self.execution_mode,
         }
     }
 }

@@ -11,7 +11,8 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 
 use super::types::{
-    safe_id_filename, AuditEntry, IdempotencyReceipt, OrchError, OrchErrorCode, RunRecord, RunState,
+    safe_id_filename, AuditEntry, IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState,
+    RunRecord, RunState,
 };
 
 #[derive(Clone)]
@@ -456,6 +457,9 @@ impl OrchStore {
                 run.updated_at = Utc::now();
                 run.terminal_result = Some("interrupted".into());
                 run.error_code = Some("interrupted".into());
+                if let Some(execution) = run.execution.as_mut() {
+                    execution.promotion_state = PromotionState::Conflicted;
+                }
                 self.save_run(&run)?;
                 n += 1;
             }
@@ -627,6 +631,7 @@ mod tests {
             error_code: None,
             aggregates: Default::default(),
             progress: None,
+            execution: None,
         }
     }
 
@@ -652,6 +657,7 @@ mod tests {
             error_code: None,
             aggregates: Default::default(),
             progress: None,
+            execution: None,
         };
         store.save_run(&run).unwrap();
         drop(store);
@@ -682,6 +688,7 @@ mod tests {
             error_code: None,
             aggregates: Default::default(),
             progress: None,
+            execution: None,
         };
         store.save_run(&run).unwrap();
         let clone = store.clone();
@@ -776,6 +783,7 @@ mod tests {
             error_code: None,
             aggregates: Default::default(),
             progress: None,
+            execution: None,
         };
         store.save_run(&run).unwrap();
         store

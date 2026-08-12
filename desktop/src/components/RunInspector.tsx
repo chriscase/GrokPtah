@@ -1,9 +1,13 @@
-import type { DurableRun } from "../lib/protocol";
+import { useState } from "react";
+import type { DurableRun, RunReview } from "../lib/protocol";
 
 type RunInspectorProps = {
   runs: DurableRun[];
   busy?: boolean;
   onRefresh: () => void;
+  onReview: (runId: string) => Promise<RunReview>;
+  onPromote: (runId: string) => Promise<void>;
+  onDiscard: (runId: string) => Promise<void>;
 };
 
 const stateLabels: Record<DurableRun["state"], string> = {
@@ -34,7 +38,65 @@ function testLabel(run: DurableRun): string {
   return `${passed}/${tests.length} tests passed`;
 }
 
-export function RunInspector({ runs, busy, onRefresh }: RunInspectorProps) {
+export function RunInspector({
+  runs,
+  busy,
+  onRefresh,
+  onReview,
+  onPromote,
+  onDiscard,
+}: RunInspectorProps) {
+  const [reviewing, setReviewing] = useState<string | null>(null);
+  const [reviews, setReviews] = useState<Record<string, RunReview>>({});
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  async function review(runId: string) {
+    setReviewing(runId);
+    setActionError(null);
+    try {
+      const result = await onReview(runId);
+      setReviews((current) => ({ ...current, [runId]: result }));
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setReviewing(null);
+    }
+  }
+
+  async function promote(runId: string) {
+    setReviewing(runId);
+    setActionError(null);
+    try {
+      await onPromote(runId);
+      setReviews((current) => {
+        const next = { ...current };
+        delete next[runId];
+        return next;
+      });
+      onRefresh();
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setReviewing(null);
+    }
+  }
+
+  async function discard(runId: string) {
+    if (!window.confirm("Discard this isolated run and its unpromoted changes?")) {
+      return;
+    }
+    setReviewing(runId);
+    setActionError(null);
+    try {
+      await onDiscard(runId);
+      onRefresh();
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setReviewing(null);
+    }
+  }
+
   return (
     <section className="run-inspector" aria-label="Durable task runs">
       <div className="run-inspector-header">
@@ -109,6 +171,55 @@ export function RunInspector({ runs, busy, onRefresh }: RunInspectorProps) {
                     {run.errorCode.replaceAll("_", " ")}
                   </div>
                 )}
+                {run.execution?.mode === "isolated_worktree" &&
+                  run.state === "completed" && (
+                    <div className="run-promotion" aria-label="Isolated run actions">
+                      <div className="run-promotion-status">
+                        Isolated · {run.execution.promotionState.replaceAll("_", " ")}
+                      </div>
+                      <div className="run-actions">
+                        <button
+                          type="button"
+                          className="composer-chip"
+                          onClick={() => void review(run.runId)}
+                          disabled={reviewing === run.runId}
+                        >
+                          {reviewing === run.runId ? "Reviewing…" : "Review diff"}
+                        </button>
+                        {run.execution.promotionState === "ready" &&
+                          reviews[run.runId] && (
+                            <button
+                              type="button"
+                              className="composer-chip on"
+                              onClick={() => void promote(run.runId)}
+                              disabled={reviewing === run.runId}
+                            >
+                              Promote reviewed changes
+                            </button>
+                          )}
+                        {run.execution.promotionState !== "promoted" &&
+                          run.execution.promotionState !== "discarded" && (
+                            <button
+                              type="button"
+                              className="composer-chip quiet"
+                              onClick={() => void discard(run.runId)}
+                              disabled={reviewing === run.runId}
+                            >
+                              Discard
+                            </button>
+                          )}
+                      </div>
+                      {reviews[run.runId] && (
+                        <details className="run-review" open>
+                          <summary>
+                            {reviews[run.runId].changedFiles.length} changed files
+                            {reviews[run.runId].diffTruncated ? " · diff truncated" : ""}
+                          </summary>
+                          <pre>{reviews[run.runId].diff || "No changes"}</pre>
+                        </details>
+                      )}
+                    </div>
+                  )}
                 {run.finalResponse && (
                   <details className="run-handoff">
                     <summary>Handoff</summary>
@@ -118,6 +229,11 @@ export function RunInspector({ runs, busy, onRefresh }: RunInspectorProps) {
               </article>
             );
           })}
+        </div>
+      )}
+      {actionError && (
+        <div className="run-error" role="alert">
+          {actionError}
         </div>
       )}
     </section>

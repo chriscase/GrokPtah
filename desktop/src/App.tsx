@@ -2591,6 +2591,39 @@ export default function App() {
                     }}
                   />
                 </label>
+                {activeIsBuild && activeSummary && (
+                  <button
+                    type="button"
+                    className={`composer-chip ${activeSummary.execution_mode === "isolated_worktree" ? "on" : ""}`}
+                    title="Choose where future Build turns run. Isolated runs require an explicit review before promotion."
+                    onClick={async () => {
+                      const mode =
+                        activeSummary.execution_mode === "isolated_worktree"
+                          ? "shared"
+                          : "isolated_worktree";
+                      try {
+                        const updated = await api.sessionSetExecutionMode(
+                          activeSummary.id,
+                          mode,
+                        );
+                        setSessions((current) =>
+                          current.map((session) =>
+                            session.id === updated.id ? updated : session,
+                          ),
+                        );
+                      } catch (error) {
+                        patchTab(activeSummary.id, (tab) => ({
+                          ...tab,
+                          activity: errorActivity(String(error)),
+                        }));
+                      }
+                    }}
+                  >
+                    {activeSummary.execution_mode === "isolated_worktree"
+                      ? "Isolated"
+                      : "Shared"}
+                  </button>
+                )}
                 <button
                   type="button"
                   className={`composer-chip ${status?.always_approve ? "on" : ""}`}
@@ -3058,6 +3091,18 @@ export default function App() {
               runs={runs}
               busy={runsBusy}
               onRefresh={() => void refreshRuns()}
+              onReview={(runId) => {
+                if (!activeSessionId) return Promise.reject(new Error("No active session"));
+                return api.runReview(activeSessionId, runId);
+              }}
+              onPromote={async (runId) => {
+                if (!activeSessionId) throw new Error("No active session");
+                await api.runPromote(activeSessionId, runId);
+              }}
+              onDiscard={async (runId) => {
+                if (!activeSessionId) throw new Error("No active session");
+                await api.runDiscard(activeSessionId, runId);
+              }}
             />
             <div className="section-title">Multi-agent</div>
             <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 0.5rem" }}>

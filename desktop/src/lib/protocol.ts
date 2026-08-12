@@ -56,6 +56,33 @@ export type DurableRunState =
   | "interrupted"
   | "limit_reached";
 
+export type RunExecutionMode = "shared" | "isolated_worktree";
+export type PromotionState =
+  | "not_applicable"
+  | "preparing"
+  | "ready"
+  | "promoted"
+  | "conflicted"
+  | "discarded";
+
+export interface RunExecution {
+  mode: RunExecutionMode;
+  sourceWorkspace: string;
+  executionWorkspace: string;
+  baseRevision: string;
+  sourceFingerprint: string;
+  finalFingerprint?: string | null;
+  promotionState: PromotionState;
+  promotedAt?: string | null;
+}
+
+export interface RunReview {
+  changedFiles: Array<{ path: string; summary: string }>;
+  diff: string;
+  diffTruncated: boolean;
+  fingerprint: string;
+}
+
 export interface DurableRun {
   runId: string;
   sessionId: string;
@@ -98,6 +125,7 @@ export interface DurableRun {
     detail: string;
     updatedAt: string;
   } | null;
+  execution?: RunExecution | null;
 }
 
 export type SessionUpdate =
@@ -230,6 +258,7 @@ export interface SessionSummary {
   archived?: boolean;
   archived_at?: string | null;
   kind?: SessionKind;
+  execution_mode?: RunExecutionMode;
 }
 
 export interface SearchHit {

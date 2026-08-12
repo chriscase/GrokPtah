@@ -9,6 +9,8 @@ import type {
   SessionSummary,
   SubagentInfo,
   DurableRun,
+  RunExecutionMode,
+  RunReview,
   WorkspaceUiState,
 } from "./protocol";
 import type {
@@ -64,6 +66,8 @@ export const api = {
     invoke<SessionSummary>("session_set_folder", { sessionId, folder }),
   sessionSetCwd: (sessionId: string, path: string) =>
     invoke<SessionSummary>("session_set_cwd", { sessionId, path }),
+  sessionSetExecutionMode: (sessionId: string, mode: RunExecutionMode) =>
+    invoke<SessionSummary>("session_set_execution_mode", { sessionId, mode }),
   /** Folder picker that sets cwd on one session (build project root). */
   pickSessionFolder: (sessionId: string) =>
     invoke<SessionSummary | null>("pick_session_folder", { sessionId }),
@@ -161,6 +165,12 @@ export const api = {
     invoke<DurableRun[]>("run_list", { sessionId }),
   runGet: (sessionId: string, runId: string) =>
     invoke<DurableRun | null>("run_get", { sessionId, runId }),
+  runReview: (sessionId: string, runId: string) =>
+    invoke<RunReview>("run_review", { sessionId, runId }),
+  runPromote: (sessionId: string, runId: string) =>
+    invoke<DurableRun>("run_promote", { sessionId, runId }),
+  runDiscard: (sessionId: string, runId: string) =>
+    invoke<DurableRun>("run_discard", { sessionId, runId }),
   sessionFork: (sourceId: string) =>
     invoke<SessionSummary>("session_fork", { sourceId }),
   sessionRewind: (

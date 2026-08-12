@@ -1,4 +1,5 @@
 /target
+.grokptah/
 **/*.rs.bk
 .DS_Store
 
