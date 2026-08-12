@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
     hash_payload, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
     RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
@@ -875,6 +876,97 @@ fn journal_reload_supports_run_scoped_reads() {
     let page = bus2.read_after(0, 50);
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.entries[0].seq, start);
+}
+
+#[test]
+fn run_event_pages_filter_before_limit_across_sessions() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    let other_session = Uuid::new_v4();
+    let bus = host.event_bus();
+    bus.publish(SessionUpdate::AgentProgress {
+        session_id: other_session,
+        round: 1,
+        max_rounds: 4,
+        last_tool: None,
+        detail: "unrelated before target".into(),
+    });
+    bus.publish(SessionUpdate::AgentProgress {
+        session_id: session.id,
+        round: 1,
+        max_rounds: 4,
+        last_tool: None,
+        detail: "target one".into(),
+    });
+    let start_seq = bus.current_seq();
+    bus.publish(SessionUpdate::AgentProgress {
+        session_id: other_session,
+        round: 2,
+        max_rounds: 4,
+        last_tool: None,
+        detail: "unrelated between target events".into(),
+    });
+    bus.publish(SessionUpdate::AgentProgress {
+        session_id: session.id,
+        round: 2,
+        max_rounds: 4,
+        last_tool: None,
+        detail: "target two".into(),
+    });
+    let end_seq = bus.current_seq();
+
+    let run_id = Uuid::new_v4().to_string();
+    orch.store()
+        .save_run(&RunRecord {
+            run_id: run_id.clone(),
+            session_id: session.id,
+            workspace: dunce::canonicalize(ws.path())
+                .unwrap()
+                .display()
+                .to_string(),
+            request_id: "event-page-test".into(),
+            client_id: None,
+            state: RunState::Completed,
+            retry_of: None,
+            queue_position: None,
+            bounds: RunBounds::default(),
+            prompt_preview: "event page test".into(),
+            start_seq: Some(start_seq - 1),
+            end_seq: Some(end_seq),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            terminal_result: Some("completed".into()),
+            final_response: None,
+            error_code: None,
+            aggregates: Default::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        })
+        .unwrap();
+
+    let page = orch.get_events(&auth, Some(&run_id), 0, 1).unwrap();
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(page["entries"][0]["seq"], start_seq);
+    assert_eq!(page["nextCursor"], start_seq);
+    let next = orch
+        .get_events(
+            &auth,
+            Some(&run_id),
+            page["nextCursor"].as_u64().unwrap(),
+            1,
+        )
+        .unwrap();
+    assert_eq!(next["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(next["entries"][0]["seq"], end_seq);
+    set_grokptah_home_override(None);
 }
 
 #[tokio::test]
