@@ -170,6 +170,22 @@ describe("RunInspector", () => {
     expect(onWatchingChange).toHaveBeenCalledWith(false);
   });
 
+  it("shows a current-session refresh failure with a retry action", () => {
+    const onRefresh = vi.fn();
+    render(
+      <RunInspector
+        runs={[]}
+        error="Could not refresh durable runs: bridge unavailable"
+        onRefresh={onRefresh}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("bridge unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "Retry refresh" }));
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
   it("makes an interrupted run actionable and refreshable", () => {
     const onRefresh = vi.fn();
     render(

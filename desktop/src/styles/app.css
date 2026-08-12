@@ -3720,6 +3720,14 @@ button:disabled {
   background: rgba(240, 113, 120, 0.08);
 }
 
+.run-inspector-refresh-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
 .run-handoff {
   margin-top: 0.45rem;
   color: var(--muted);

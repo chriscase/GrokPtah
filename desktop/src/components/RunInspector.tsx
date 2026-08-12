@@ -8,6 +8,7 @@ import type {
 
 type RunInspectorProps = {
   runs: DurableRun[];
+  error?: string | null;
   busy?: boolean;
   watching?: boolean;
   onWatchingChange?: (watching: boolean) => void;
@@ -115,6 +116,7 @@ function eventLabel(update: SessionUpdate): string {
 
 export function RunInspector({
   runs,
+  error,
   busy,
   watching,
   onWatchingChange,
@@ -331,6 +333,20 @@ export function RunInspector({
           <span>Watch live</span>
         </label>
       </div>
+
+      {error && (
+        <div className="run-error run-inspector-refresh-error" role="alert">
+          <span>{error}</span>
+          <button
+            type="button"
+            className="composer-chip quiet"
+            onClick={onRefresh}
+            disabled={busy}
+          >
+            Retry refresh
+          </button>
+        </div>
+      )}
 
       {runs.length === 0 ? (
         <div className="panel-block run-inspector-empty">
