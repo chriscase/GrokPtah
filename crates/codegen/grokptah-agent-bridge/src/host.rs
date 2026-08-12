@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -108,6 +108,16 @@ struct PendingPermission {
     tx: oneshot::Sender<PermissionDecision>,
 }
 
+/// Host-global admission metadata. The prompt remains owned by the
+/// orchestration service that accepted it, but scheduling order and the
+/// active-turn reservation are decided under this host lock so embedded
+/// control services cannot make conflicting choices.
+#[derive(Debug, Clone, Copy)]
+struct OrchestrationPendingAdmission {
+    session_id: Uuid,
+    sequence: u64,
+}
+
 pub(crate) struct Inner {
     running: bool,
     project_cwd: Option<PathBuf>,
@@ -147,7 +157,11 @@ pub(crate) struct Inner {
     /// Host-global orchestration admissions shared by every control service.
     orchestration_admissions: HashMap<String, Uuid>,
     /// Host-global bounded pending admissions shared by every control service.
-    orchestration_pending_admissions: HashSet<String>,
+    orchestration_pending_admissions: HashMap<String, OrchestrationPendingAdmission>,
+    /// Monotonic arrival order for queued task admissions.
+    orchestration_next_pending_sequence: u64,
+    /// Last session selected by the host-global fair scheduler.
+    orchestration_last_started_session: Option<Uuid>,
     /// One authoritative ceiling shared by every control service on this host.
     orchestration_admission_limit: usize,
     /// Authoritative follow-up queue plus non-cancelling steering inbox.
@@ -266,6 +280,9 @@ pub struct AgentHostHandle {
     /// Prevent concurrent desktop promotion/discard operations for one run.
     promotion_locks: Arc<Mutex<HashSet<String>>>,
     reviewed_runs: Arc<Mutex<HashSet<String>>>,
+    /// Wakes every embedded orchestration service after a global admission
+    /// slot is actually released, after the completion event itself.
+    orchestration_wakeup: Arc<Notify>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
 }
@@ -369,7 +386,9 @@ impl AgentHost {
             turn_cancels: HashMap::new(),
             turn_reservations: HashMap::new(),
             orchestration_admissions: HashMap::new(),
-            orchestration_pending_admissions: HashSet::new(),
+            orchestration_pending_admissions: HashMap::new(),
+            orchestration_next_pending_sequence: 0,
+            orchestration_last_started_session: None,
             orchestration_admission_limit: usize::MAX,
             prompt_queues,
             turn_max_rounds: HashMap::new(),
@@ -385,6 +404,7 @@ impl AgentHost {
             orchestration_store: Arc::new(Mutex::new(None)),
             promotion_locks: Arc::new(Mutex::new(HashSet::new())),
             reviewed_runs: Arc::new(Mutex::new(HashSet::new())),
+            orchestration_wakeup: Arc::new(Notify::new()),
             _instance_lock: instance_lock,
         }
     }
@@ -403,6 +423,11 @@ impl AgentHostHandle {
     /// Additional live subscriber (does not steal the primary GUI receiver).
     pub fn subscribe_events(&self) -> crate::event_bus::EventReceiver {
         self.inner.lock().event_tx.subscribe()
+    }
+
+    /// Shared wake-up for every embedded orchestration scheduler.
+    pub(crate) fn orchestration_wakeup(&self) -> Arc<Notify> {
+        self.orchestration_wakeup.clone()
     }
 
     /// Open the single process-owned durable run ledger on first use.
@@ -1180,11 +1205,19 @@ impl AgentHostHandle {
     }
 
     pub fn release_orchestration_turn(&self, run_id: &str) {
-        let mut g = self.inner.lock();
-        if let Some(session_id) = g.orchestration_admissions.remove(run_id) {
-            if g.turn_reservations.get(&session_id).map(String::as_str) == Some(run_id) {
-                g.turn_reservations.remove(&session_id);
+        let released = {
+            let mut g = self.inner.lock();
+            if let Some(session_id) = g.orchestration_admissions.remove(run_id) {
+                if g.turn_reservations.get(&session_id).map(String::as_str) == Some(run_id) {
+                    g.turn_reservations.remove(&session_id);
+                }
+                true
+            } else {
+                false
             }
+        };
+        if released {
+            self.orchestration_wakeup.notify_waiters();
         }
     }
 
@@ -1192,20 +1225,31 @@ impl AgentHostHandle {
         self.inner.lock().orchestration_admissions.len()
     }
 
-    /// Reserve one process-wide pending-admission slot. Keeping this ledger on
+    /// Register one process-wide pending admission. Keeping this ledger on
     /// the host prevents multiple embedded control services from multiplying
-    /// their local queue limits into an unbounded prompt store.
-    pub fn reserve_orchestration_queue_slot(&self, run_id: &str) -> Result<()> {
+    /// their local queue limits into an unbounded prompt store, while the
+    /// sequence number gives the scheduler one ordering domain.
+    pub fn reserve_orchestration_queue_slot(&self, run_id: &str, session_id: Uuid) -> Result<()> {
         const MAX_PENDING_ADMISSIONS: usize = 32;
         let mut g = self.inner.lock();
-        if g.orchestration_pending_admissions.contains(run_id) {
+        if let Some(existing) = g.orchestration_pending_admissions.get(run_id) {
+            if existing.session_id != session_id {
+                bail!("pending admission is owned by another session");
+            }
             return Ok(());
         }
         if g.orchestration_pending_admissions.len() >= MAX_PENDING_ADMISSIONS {
             bail!("bounded admission queue is full ({MAX_PENDING_ADMISSIONS} pending runs)");
         }
-        g.orchestration_pending_admissions
-            .insert(run_id.to_string());
+        let sequence = g.orchestration_next_pending_sequence;
+        g.orchestration_next_pending_sequence = sequence.saturating_add(1);
+        g.orchestration_pending_admissions.insert(
+            run_id.to_string(),
+            OrchestrationPendingAdmission {
+                session_id,
+                sequence,
+            },
+        );
         Ok(())
     }
 
@@ -1214,10 +1258,98 @@ impl AgentHostHandle {
             .lock()
             .orchestration_pending_admissions
             .remove(run_id)
+            .is_some()
     }
 
     pub fn orchestration_pending_count(&self) -> usize {
         self.inner.lock().orchestration_pending_admissions.len()
+    }
+
+    /// Return the current one-based global arrival position for a queued run.
+    /// This is computed from the host ledger rather than a service-local
+    /// queue, so it stays truthful when another embedded service enqueues or
+    /// cancels work.
+    pub fn orchestration_pending_position(&self, run_id: &str) -> Option<usize> {
+        let g = self.inner.lock();
+        let target = g.orchestration_pending_admissions.get(run_id)?.sequence;
+        Some(
+            g.orchestration_pending_admissions
+                .values()
+                .filter(|pending| pending.sequence <= target)
+                .count(),
+        )
+    }
+
+    /// Atomically select a globally fair pending run and reserve its active
+    /// turn. Returning false means this service should leave its local queue
+    /// untouched; another embedded service may own the globally eligible run.
+    pub fn claim_orchestration_pending(&self, run_id: &str, session_id: Uuid) -> bool {
+        let mut g = self.inner.lock();
+        let Some(requested) = g.orchestration_pending_admissions.get(run_id).copied() else {
+            return false;
+        };
+        if requested.session_id != session_id
+            || g.orchestration_admissions.len() >= g.orchestration_admission_limit
+            || g.turn_cancels.contains_key(&session_id)
+            || g.turn_reservations.contains_key(&session_id)
+        {
+            return false;
+        }
+
+        // Only the oldest pending run for each session is eligible. This
+        // preserves per-session FIFO while allowing different sessions to
+        // share one global fairness decision across service instances.
+        let mut oldest_by_session: HashMap<Uuid, (String, u64)> = HashMap::new();
+        for (pending_id, pending) in &g.orchestration_pending_admissions {
+            let entry = oldest_by_session
+                .entry(pending.session_id)
+                .or_insert_with(|| (pending_id.clone(), pending.sequence));
+            if pending.sequence < entry.1 {
+                *entry = (pending_id.clone(), pending.sequence);
+            }
+        }
+        let mut eligible = oldest_by_session
+            .values()
+            .filter(|(_, sequence)| {
+                g.orchestration_pending_admissions
+                    .values()
+                    .find(|pending| pending.sequence == *sequence)
+                    .is_some_and(|pending| {
+                        !g.turn_cancels.contains_key(&pending.session_id)
+                            && !g.turn_reservations.contains_key(&pending.session_id)
+                    })
+            })
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            return false;
+        }
+        eligible.sort_by_key(|(_, sequence)| *sequence);
+        let selected = g
+            .orchestration_last_started_session
+            .and_then(|last| {
+                eligible
+                    .iter()
+                    .find(|(pending_id, _)| {
+                        g.orchestration_pending_admissions
+                            .get(pending_id)
+                            .is_some_and(|pending| pending.session_id != last)
+                    })
+                    .copied()
+            })
+            .or_else(|| eligible.first().copied());
+        let Some((selected_id, _)) = selected else {
+            return false;
+        };
+        if selected_id != run_id {
+            return false;
+        }
+
+        g.orchestration_pending_admissions.remove(run_id);
+        g.turn_reservations.insert(session_id, run_id.to_string());
+        g.orchestration_admissions
+            .insert(run_id.to_string(), session_id);
+        g.orchestration_last_started_session = Some(session_id);
+        true
     }
 
     pub fn configure_orchestration_capacity(&self, limit: usize) -> usize {
@@ -1241,6 +1373,8 @@ impl AgentHostHandle {
         let mut g = self.inner.lock();
         if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) {
             g.turn_reservations.remove(&session_id);
+            drop(g);
+            self.orchestration_wakeup.notify_waiters();
             true
         } else {
             false

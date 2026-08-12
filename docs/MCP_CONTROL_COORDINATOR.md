@@ -202,16 +202,19 @@ coordinator wants a bounded admission queue for capacity or session contention.
 - A queued response has `state: "queued"` and a one-based `queuedPosition`;
   `ptah_get_capacity` reports `queuedRuns` and `queueLimit`.
 - The durable run record also exposes the current optional `queuePosition`.
-  It is updated as earlier work is cancelled or admitted, cleared when the run
-  starts, and shown by the desktop Task runs inspector. Treat it as live
-  visibility, not a reservation: the run state is authoritative if a race is
-  observed.
+  It is computed from the host-global arrival ledger, updated as earlier work
+  is cancelled or admitted, cleared when the run starts, and shown by the
+  desktop Task runs inspector. Reads refresh the position across embedded
+  control services, so it remains meaningful when another service changes the
+  queue. Treat it as live visibility, not a reservation: the run state is
+  authoritative if a race is observed.
 - Queued runs have durable `RunState::Queued` records and remain visible through
   `ptah_get_run`, `ptah_get_progress`, and the handoff/read tools.
-- Admission preserves FIFO order for each session and prefers a different
-  eligible session after a session starts, preventing one session from
-  monopolizing the shared run capacity. Earlier work from the same session
-  cannot be overtaken by later work from that session.
+- Admission uses one host-global scheduler across embedded control services.
+  It preserves FIFO order for each session and prefers a different eligible
+  session after a session starts, preventing one session from monopolizing the
+  shared run capacity. Earlier work from the same session cannot be overtaken
+  by later work from that session.
 - A queued task can be cancelled with `ptah_cancel` before it starts. The
   response includes `wasQueued: true`; cancellation is idempotent and does not
   launch a model turn.

@@ -459,6 +459,31 @@ async fn wait_run_terminal(
     }
 }
 
+async fn wait_run_state(
+    orch: &OrchestrationService,
+    auth: &grokptah_agent_bridge::orchestration::AuthContext,
+    run_id: &str,
+    expected: RunState,
+    timeout: Duration,
+) {
+    let start = std::time::Instant::now();
+    loop {
+        let value = orch.get_run(auth, run_id).unwrap();
+        let state: RunState = serde_json::from_value(value["state"].clone()).unwrap();
+        if state == expected {
+            return;
+        }
+        assert!(
+            !state.is_terminal(),
+            "run {run_id} reached {state:?} before {expected:?}"
+        );
+        if start.elapsed() > timeout {
+            panic!("run {run_id} still {state:?} after {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn submit_task_reaches_terminal_offline() {
@@ -1213,6 +1238,173 @@ async fn pending_admission_bound_is_shared_across_control_services() {
     .await
     .unwrap();
     assert_eq!(one.get_capacity(&auth_one).unwrap()["queuedRuns"], 0);
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn global_scheduler_fairness_spans_control_services() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+
+    let active = host.session_new_kind(SessionKind::Build).unwrap();
+    let session_a = host.session_new_kind(SessionKind::Build).unwrap();
+    let session_b = host.session_new_kind(SessionKind::Build).unwrap();
+    for session in [&active, &session_a, &session_b] {
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+    }
+
+    let one = orch_for(&host, &home, &ws, 1);
+    let two = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        one.store().clone(),
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 8,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth_one = one.auth_header(Some("Bearer t")).unwrap();
+    let auth_two = two.auth_header(Some("Bearer t")).unwrap();
+
+    let active_run = one
+        .submit_task(
+            &auth_one,
+            "fair-global-active",
+            active.id,
+            ws.path(),
+            "run sleep 3".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_run_state(
+        &one,
+        &auth_one,
+        active_run["runId"].as_str().unwrap(),
+        RunState::Running,
+        Duration::from_secs(2),
+    )
+    .await;
+    let first = one
+        .submit_task_with_execution_mode_and_queue(
+            &auth_one,
+            "fair-global-a1",
+            session_a.id,
+            ws.path(),
+            "run sleep 2".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let second = one
+        .submit_task_with_execution_mode_and_queue(
+            &auth_one,
+            "fair-global-a2",
+            session_a.id,
+            ws.path(),
+            "run sleep 2".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let third = two
+        .submit_task_with_execution_mode_and_queue(
+            &auth_two,
+            "fair-global-b1",
+            session_b.id,
+            ws.path(),
+            "run sleep 2".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first["queuedPosition"], 1);
+    assert_eq!(second["queuedPosition"], 2);
+    assert_eq!(third["queuedPosition"], 3);
+
+    one.cancel(
+        &auth_one,
+        "fair-global-cancel-active",
+        active.id,
+        ws.path(),
+        active_run["runId"].as_str(),
+    )
+    .await
+    .unwrap();
+    let first_id = first["runId"].as_str().unwrap();
+    let second_id = second["runId"].as_str().unwrap();
+    let third_id = third["runId"].as_str().unwrap();
+    wait_run_state(
+        &one,
+        &auth_one,
+        first_id,
+        RunState::Running,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_value::<RunState>(
+            one.get_run(&auth_one, second_id).unwrap()["state"].clone()
+        )
+        .unwrap(),
+        RunState::Queued,
+        "same-service later work must wait behind its session's older run"
+    );
+    assert_eq!(
+        serde_json::from_value::<RunState>(
+            two.get_run(&auth_two, third_id).unwrap()["state"].clone()
+        )
+        .unwrap(),
+        RunState::Queued,
+        "different service work must remain queued while the selected run is active"
+    );
+    assert_eq!(
+        one.get_progress(&auth_one, second_id).unwrap()["queuePosition"],
+        1
+    );
+    assert_eq!(
+        two.get_progress(&auth_two, third_id).unwrap()["queuePosition"],
+        2
+    );
+
+    wait_run_terminal(&one, &auth_one, first_id, Duration::from_secs(8)).await;
+    wait_run_state(
+        &two,
+        &auth_two,
+        third_id,
+        RunState::Running,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_value::<RunState>(
+            one.get_run(&auth_one, second_id).unwrap()["state"].clone()
+        )
+        .unwrap(),
+        RunState::Queued,
+        "the global scheduler must prefer service B after service A starts"
+    );
+    assert_eq!(
+        one.get_progress(&auth_one, second_id).unwrap()["queuePosition"],
+        1
+    );
+
+    wait_run_terminal(&two, &auth_two, third_id, Duration::from_secs(8)).await;
+    wait_run_terminal(&one, &auth_one, second_id, Duration::from_secs(8)).await;
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
