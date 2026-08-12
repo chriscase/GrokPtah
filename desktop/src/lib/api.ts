@@ -8,6 +8,7 @@ import type {
   SessionKind,
   SessionSummary,
   SubagentInfo,
+  DurableRun,
   WorkspaceUiState,
 } from "./protocol";
 import type {
@@ -156,6 +157,10 @@ export const api = {
     invoke<SessionCompletionRecord[]>("session_completion_history", {
       sessionId,
     }),
+  runList: (sessionId: string) =>
+    invoke<DurableRun[]>("run_list", { sessionId }),
+  runGet: (sessionId: string, runId: string) =>
+    invoke<DurableRun | null>("run_get", { sessionId, runId }),
   sessionFork: (sourceId: string) =>
     invoke<SessionSummary>("session_fork", { sourceId }),
   sessionRewind: (

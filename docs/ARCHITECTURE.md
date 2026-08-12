@@ -27,7 +27,7 @@ that keeps the upstream CLI/TUI and adds a **desktop client** on Tauri 2 + React
                            │ in-process API
 ┌──────────────────────────▼───────────────────────────────┐
 │  grokptah-agent-bridge — session lifecycle, streaming,   │
-│  permission futures, tool cards, plan mode, local tools  │
+│  durable run ledger, permissions, tools, plan mode       │
 └──────────────────────────┬───────────────────────────────┘
                            │ optional future: shell embed
 ┌──────────────────────────▼───────────────────────────────┐
@@ -50,6 +50,9 @@ The bridge:
 - Accepts prompts, streams `message` / `thought` / `tool_call` / `tool_call_update` / `plan`
 - Completes permission requests from the UI
 - Supports cancel, fork, rewind, compact, sessions list
+- Owns one durable Build-run ledger shared by the desktop and MCP coordinator
+  surfaces; unfinished runs become `interrupted` on restart and never resume
+  model execution implicitly
 - Runs **local tools** (read/list/grep, shell, write with permission) in-process
 - **Build sessions** run a multi-round **tool-calling agent loop** (list/read/grep/glob/write/apply_patch/shell) with permissions; **Chat sessions** are single-shot completions
 - Injects project instructions (`AGENTS.md`, etc.) into Build context; sends effort on the wire

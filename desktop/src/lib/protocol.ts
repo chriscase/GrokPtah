@@ -47,6 +47,59 @@ export interface SessionCompletionRecord {
   evidence: CompletionEvidence;
 }
 
+export type DurableRunState =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "limit_reached";
+
+export interface DurableRun {
+  runId: string;
+  sessionId: string;
+  workspace: string;
+  requestId: string;
+  clientId?: string | null;
+  state: DurableRunState;
+  bounds: {
+    maxPromptBytes: number;
+    maxRounds: number;
+    maxDurationMs: number;
+  };
+  promptPreview: string;
+  startSeq?: number | null;
+  endSeq?: number | null;
+  createdAt: string;
+  updatedAt: string;
+  terminalResult?: string | null;
+  finalResponse?: string | null;
+  errorCode?: string | null;
+  aggregates: {
+    changes: Array<{ path: string; summary: string }>;
+    tests: Array<{
+      callId: string;
+      command?: string | null;
+      status: string;
+      exitCode?: number | null;
+      cancelled?: boolean | null;
+    }>;
+    permissionsRequested: number;
+    permissionsGranted: number;
+    permissionsDenied: number;
+    usage: CompletionEvidence["usage"];
+    verification?: CompletionEvidence | null;
+  };
+  progress?: {
+    round: number;
+    maxRounds: number;
+    lastTool?: string | null;
+    detail: string;
+    updatedAt: string;
+  } | null;
+}
+
 export type SessionUpdate =
   | { type: "agent_message_chunk"; session_id: string; text: string }
   | { type: "agent_thought_chunk"; session_id: string; text: string }
