@@ -427,6 +427,38 @@ mod tests {
     }
 
     #[test]
+    fn multiple_steering_entries_keep_fifo_order_through_delivery_recovery() {
+        let mut queue = SessionPromptQueue::default();
+        let first = queue
+            .steer_text_with_owner("first direction".into(), true, Some("desktop".into()))
+            .unwrap();
+        let second = queue
+            .steer_text_with_owner("second direction".into(), true, Some("mcp".into()))
+            .unwrap();
+
+        let delivered = queue.drain_steering();
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.entry.id.as_str(), second.entry.id.as_str()]
+        );
+
+        let recovered = queue.durable_snapshot().list();
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first direction", "second direction"]
+        );
+        assert!(recovered.iter().all(|entry| entry.priority));
+        assert_eq!(recovered[0].source, "steering_delivery_recovery");
+        assert_eq!(recovered[1].owner.as_deref(), Some("mcp"));
+    }
+
+    #[test]
     fn durable_snapshot_defers_pending_steering_with_owner() {
         let mut queue = SessionPromptQueue::default();
         queue

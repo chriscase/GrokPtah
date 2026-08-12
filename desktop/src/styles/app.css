@@ -984,6 +984,7 @@ button:disabled {
 .stream-md {
   display: block;
   position: relative;
+  min-width: 0;
 }
 
 .stream-md.is-streaming {
@@ -1007,6 +1008,13 @@ button:disabled {
     rgba(160, 200, 255, 0.05) 80%,
     transparent
   );
+}
+
+.stream-md-live {
+  display: block;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .stream-md-settled {
@@ -1747,6 +1755,8 @@ button:disabled {
 
 .bubble {
   max-width: 52rem;
+  min-width: 0;
+  width: min(100%, 52rem);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
   padding: 0.4rem 0.6rem;
