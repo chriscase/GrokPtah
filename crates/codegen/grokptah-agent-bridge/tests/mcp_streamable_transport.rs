@@ -1051,7 +1051,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         })
         .unwrap();
     client.close_session().await.unwrap();
-    srv.stop();
+    srv.stop_and_wait().await;
     drop(orch);
     drop(host);
 
@@ -1140,7 +1140,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         .unwrap();
     assert_eq!(replay.structured["runId"], promoted.structured["runId"]);
     client2.close_session().await.unwrap();
-    srv2.stop();
+    srv2.stop_and_wait().await;
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
