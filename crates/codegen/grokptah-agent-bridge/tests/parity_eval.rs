@@ -294,6 +294,51 @@ async fn tools_persist_on_transcript_after_offline_write() {
     );
 }
 
+/// Terminal handoff must report observed changed paths even when the model
+/// (or offline stub) final text omits them — live_eval quality gate.
+#[tokio::test]
+async fn terminal_handoff_enrichment_reports_changed_files() {
+    let _iso = IsolatedHome::install();
+    let dir = fixture_repo();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let s = host.session_new().unwrap();
+    let reply = host
+        .session_prompt(s.id, "write handoff-proof.txt: payload".into())
+        .await
+        .unwrap();
+    drain(&mut rx).await;
+    assert!(
+        reply.to_ascii_lowercase().contains("changed"),
+        "return value must claim changed files, got: {reply}"
+    );
+    assert!(
+        reply.contains("handoff-proof.txt"),
+        "return value must list the edited path, got: {reply}"
+    );
+    let entries = host.session_transcript(s.id).unwrap();
+    let last_assistant = entries
+        .iter()
+        .rev()
+        .find(|e| e.role == "assistant")
+        .expect("assistant handoff");
+    assert!(
+        last_assistant.text.to_ascii_lowercase().contains("changed"),
+        "transcript handoff must claim changed files, got: {}",
+        last_assistant.text
+    );
+    assert!(
+        last_assistant.text.contains("handoff-proof.txt"),
+        "transcript handoff must list path, got: {}",
+        last_assistant.text
+    );
+}
+
 #[tokio::test]
 async fn smoke_web_fetch_offline() {
     let _iso = IsolatedHome::install();
