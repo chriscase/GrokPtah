@@ -21,9 +21,10 @@ use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     auto_cargo_reverify_command, build_agent_messages, build_compact_summary, call_xai_agent_step,
     call_xai_chat, cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
-    cargo_test_reverify_coaching, coding_agent_tools, emit_message, emit_thought,
-    filter_tools_edit_and_shell, filter_tools_edit_only, is_incomplete_stop_message,
-    is_round_limit_stop_message, is_true_noop_tool_step, normalize_sandbox_profile,
+    cargo_test_reverify_coaching, coding_agent_tools, count_cargo_test_failures, emit_message,
+    emit_thought, filter_tools_batch_edit_only, filter_tools_edit_and_shell,
+    filter_tools_edit_only, is_incomplete_stop_message, is_round_limit_stop_message,
+    is_true_noop_tool_step, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
     offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
     push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
     resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
@@ -3915,6 +3916,8 @@ impl AgentHostHandle {
         let mut cargo_fails_since_edit: u32 = 0;
         // Sticky for the turn: at least one successful edit after cargo went red.
         let mut had_edit_since_cargo_fail = false;
+        // Distinct failing tests from the last cargo failure (multi-bug batching).
+        let mut last_failure_count: u32 = 0;
         let mut recovery_grace = false;
 
         for round in 1..=max_rounds.saturating_add(1) {
@@ -3986,26 +3989,49 @@ impl AgentHostHandle {
                 max_rounds <= 8 && (in_recovery_grace || remaining == 1 || test_failure_needs_edit);
             // While cargo is red and no edit has landed, advertise edit-only so
             // the model cannot thrash shell. After an edit, restore edit+shell
-            // (host also auto-re-runs cargo after writes).
+            // (host also auto-re-runs cargo after writes). With 2+ failures,
+            // drop serial write_file so multi-module write_files is forced.
             let force_edit_only = max_rounds <= 8
                 && test_failure_needs_edit
                 && !had_edit_since_cargo_fail
                 && !in_recovery_grace;
+            let multi_failure_batch = last_failure_count >= 2;
             let tools_this_round = if force_edit_shell {
                 let coach = if in_recovery_grace {
-                    "TEST RECOVERY: the model budget ended with unresolved cargo test failures (or edits that were not re-verified). Use failures and source already in context. In this one bounded recovery step: apply any remaining fixes with write_files and re-run cargo test. Do not stop at a diagnosis or claim success without a green cargo test."
+                    if multi_failure_batch {
+                        format!(
+                            "TEST RECOVERY: {last_failure_count} independent cargo failures remain. \
+                             Use ONE write_files call covering every implicated module (not serial \
+                             write_file), then cargo will re-verify. Do not stop at a diagnosis."
+                        )
+                    } else {
+                        "TEST RECOVERY: the model budget ended with unresolved cargo test failures (or edits that were not re-verified). Use failures and source already in context. In this one bounded recovery step: apply any remaining fixes with write_files and re-run cargo test. Do not stop at a diagnosis or claim success without a green cargo test.".into()
+                    }
+                } else if force_edit_only && multi_failure_batch {
+                    format!(
+                        "BUDGET: {last_failure_count} independent test failures. Shell and serial \
+                         write_file are disabled. Use ONE write_files (or multi-file apply_patch) \
+                         fixing ALL modules now. cargo re-runs automatically after edits."
+                    )
                 } else if force_edit_only {
-                    "BUDGET: cargo test failed. Shell is disabled until you edit. Use write_files (preferred — every failing module in ONE call) / write_file / apply_patch to fix ALL failures now. cargo test re-runs automatically after your edits."
+                    "BUDGET: cargo test failed. Shell is disabled until you edit. Use write_files (preferred — every failing module in ONE call) / write_file / apply_patch to fix ALL failures now. cargo test re-runs automatically after your edits.".into()
+                } else if test_failure_needs_edit && multi_failure_batch {
+                    format!(
+                        "BUDGET: {last_failure_count} independent failures still open. Prefer ONE \
+                         write_files batch for remaining modules; cargo re-runs after edits."
+                    )
                 } else if test_failure_needs_edit {
-                    "BUDGET: cargo test has failed and is not green yet. Prefer write_files for remaining fixes; cargo re-runs automatically after edits."
+                    "BUDGET: cargo test has failed and is not green yet. Prefer write_files for remaining fixes; cargo re-runs automatically after edits.".into()
                 } else {
-                    "BUDGET: FINAL model step. Exploration tools are disabled. Use only write_files / write_file / apply_patch / run_terminal_cmd. Apply ALL remaining fixes in one batch (every failing test / complete rename including re-exports) and run cargo test now. For renames: change type identifiers only — never rewrite user-facing / PRODUCT_LABEL string literals."
+                    "BUDGET: FINAL model step. Exploration tools are disabled. Use only write_files / write_file / apply_patch / run_terminal_cmd. Apply ALL remaining fixes in one batch (every failing test / complete rename including re-exports) and run cargo test now. For renames: change type identifiers only — never rewrite user-facing / PRODUCT_LABEL string literals.".into()
                 };
                 messages.push(serde_json::json!({
                     "role": "system",
                     "content": coach,
                 }));
-                if force_edit_only {
+                if force_edit_only && multi_failure_batch {
+                    filter_tools_batch_edit_only(&tools)
+                } else if force_edit_only {
                     filter_tools_edit_only(&tools)
                 } else {
                     filter_tools_edit_and_shell(&tools)
@@ -4239,6 +4265,12 @@ impl AgentHostHandle {
                             if cargo_test_output_failed(&content) {
                                 test_failure_needs_edit = true;
                                 cargo_fails_since_edit = cargo_fails_since_edit.saturating_add(1);
+                                let n = count_cargo_test_failures(&content);
+                                if n > 0 {
+                                    last_failure_count = n;
+                                } else {
+                                    last_failure_count = last_failure_count.max(1);
+                                }
                                 messages.push(serde_json::json!({
                                     "role": "system",
                                     "content": cargo_test_failure_coaching(&content),
@@ -4246,6 +4278,7 @@ impl AgentHostHandle {
                             } else if cargo_test_output_passed(&content) {
                                 test_failure_needs_edit = false;
                                 cargo_fails_since_edit = 0;
+                                last_failure_count = 0;
                             }
                         }
                         if max_rounds <= 8
@@ -4261,6 +4294,12 @@ impl AgentHostHandle {
                             cargo_fails_since_edit = 0;
                             had_edit_since_cargo_fail = true;
                             edited_while_needs_reverify = true;
+                            if last_failure_count >= 2 && tc.name == "write_file" {
+                                messages.push(serde_json::json!({
+                                    "role": "system",
+                                    "content": multi_failure_partial_edit_coaching(last_failure_count),
+                                }));
+                            }
                             messages.push(serde_json::json!({
                                 "role": "system",
                                 "content": cargo_test_reverify_coaching(),
@@ -4335,6 +4374,14 @@ impl AgentHostHandle {
                         if cargo_test_output_failed(&content) {
                             test_failure_needs_edit = true;
                             cargo_fails_since_edit = cargo_fails_since_edit.saturating_add(1);
+                            let n = count_cargo_test_failures(&content);
+                            if n > 0 {
+                                last_failure_count = n;
+                            } else {
+                                last_failure_count = last_failure_count.max(1);
+                            }
+                            // Partial multi-file fix: require another batch edit.
+                            had_edit_since_cargo_fail = false;
                             messages.push(serde_json::json!({
                                 "role": "system",
                                 "content": cargo_test_failure_coaching(&content),
@@ -4342,6 +4389,7 @@ impl AgentHostHandle {
                         } else if cargo_test_output_passed(&content) {
                             test_failure_needs_edit = false;
                             cargo_fails_since_edit = 0;
+                            last_failure_count = 0;
                             messages.push(serde_json::json!({
                                 "role": "system",
                                 "content": "Auto re-verify: cargo test passed after edits.",
