@@ -58,6 +58,10 @@ pub use textutil::{truncate_at_char_boundary, truncate_with_marker};
 
 /// Coding-agent efficiency guidance (system prompt fragment for multi-file / multi-bug turns).
 pub use host_helpers::coding_agent_efficiency_guidance;
+/// Post-cargo tight-budget tool gate helpers (#187 multi_bug burn prevention).
+pub use host_helpers::{
+    is_edit_or_shell_tool, is_post_cargo_explore_only_burn, should_skip_tool_after_cargo_failure,
+};
 
 pub use memory::{
     inject_context as memory_inject_context, list_facts as memory_list_facts,

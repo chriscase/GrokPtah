@@ -22,11 +22,12 @@ use crate::host_helpers::{
     build_agent_messages, build_compact_summary, call_xai_agent_step, call_xai_chat,
     cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
     cargo_test_reverify_coaching, coding_agent_tools, emit_message, emit_thought,
-    filter_tools_edit_and_shell, is_incomplete_stop_message, is_round_limit_stop_message,
-    is_true_noop_tool_step, normalize_sandbox_profile, offline_plan_steps, parse_effort_arg,
-    propose_plan_with_model, push_assistant, push_thought, push_tool,
-    recovery_round_limit_stop_message, resolve_turn_max_rounds, round_limit_stop_message,
-    sandbox_blocks_shell, sandbox_is_readonly, surface_rate_limit_or_error, tool_kind,
+    filter_tools_edit_and_shell, filter_tools_edit_only, is_incomplete_stop_message,
+    is_round_limit_stop_message, is_true_noop_tool_step, normalize_sandbox_profile,
+    offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
+    push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
+    resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    should_skip_tool_after_cargo_failure, surface_rate_limit_or_error, tool_kind,
     tool_step_signature, tool_web_fetch, AgentStep, IdenticalToolCallRun, McpToolIndex,
 };
 use crate::local_tools;
@@ -3909,6 +3910,9 @@ impl AgentHostHandle {
         let mut stop_continued = false;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
         let mut test_failure_needs_edit = false;
+        // Cargo failures since last successful edit while armed. After 2,
+        // force edit-only so the model cannot thrash cargo under budget (#187).
+        let mut cargo_fails_since_edit: u32 = 0;
         let mut recovery_grace = false;
 
         for round in 1..=max_rounds.saturating_add(1) {
@@ -3974,11 +3978,17 @@ impl AgentHostHandle {
             };
             // After any observed cargo failure under a tight budget, stop burning
             // steps on list/grep/read — force edit + shell until cargo is green.
+            // After repeated cargo fails without an edit, force edit-only so the
+            // model cannot thrash shell-only under max_turns=3 (#187 R2).
             let force_edit_shell =
                 max_rounds <= 8 && (in_recovery_grace || remaining == 1 || test_failure_needs_edit);
+            let force_edit_only =
+                max_rounds <= 8 && test_failure_needs_edit && cargo_fails_since_edit >= 2;
             let tools_this_round = if force_edit_shell {
                 let coach = if in_recovery_grace {
                     "TEST RECOVERY: the model budget ended with unresolved cargo test failures (or edits that were not re-verified). Use failures and source already in context. In this one bounded recovery step: apply any remaining fixes with write_files and re-run cargo test. Do not stop at a diagnosis or claim success without a green cargo test."
+                } else if force_edit_only {
+                    "BUDGET: cargo test has failed repeatedly without code edits. Shell is disabled this step. Use write_files / write_file / apply_patch to fix ALL failing tests across every implicated module NOW."
                 } else if test_failure_needs_edit {
                     "BUDGET: cargo test has failed and is not green yet. Exploration tools are disabled. Fix ALL failing tests with write_files / apply_patch (every implicated module) and re-run cargo test now. Do not list/grep/read further."
                 } else {
@@ -3988,7 +3998,11 @@ impl AgentHostHandle {
                     "role": "system",
                     "content": coach,
                 }));
-                filter_tools_edit_and_shell(&tools)
+                if force_edit_only && !in_recovery_grace {
+                    filter_tools_edit_only(&tools)
+                } else {
+                    filter_tools_edit_and_shell(&tools)
+                }
             } else {
                 if max_rounds <= 8 && remaining <= 2 {
                     messages.push(serde_json::json!({
@@ -4160,6 +4174,22 @@ impl AgentHostHandle {
                         if cancel.is_cancelled() {
                             break;
                         }
+                        // Mid-batch gate (#187): once cargo has failed under a
+                        // tight budget, do not burn remaining calls in this step
+                        // (or later steps) on list/read/grep/glob exploration.
+                        if should_skip_tool_after_cargo_failure(
+                            max_rounds as u32,
+                            test_failure_needs_edit,
+                            &tc.name,
+                        ) {
+                            let content = post_cargo_failure_skip_message(&tc.name);
+                            messages.push(serde_json::json!({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": content,
+                            }));
+                            continue;
+                        }
                         let _ = event_tx.send(SessionUpdate::AgentProgress {
                             session_id,
                             round: round as u32,
@@ -4199,12 +4229,14 @@ impl AgentHostHandle {
                         if max_rounds <= 8 && tc.name == "run_terminal_cmd" {
                             if cargo_test_output_failed(&content) {
                                 test_failure_needs_edit = true;
+                                cargo_fails_since_edit = cargo_fails_since_edit.saturating_add(1);
                                 messages.push(serde_json::json!({
                                     "role": "system",
                                     "content": cargo_test_failure_coaching(&content),
                                 }));
                             } else if cargo_test_output_passed(&content) {
                                 test_failure_needs_edit = false;
+                                cargo_fails_since_edit = 0;
                             }
                         }
                         if max_rounds <= 8
@@ -4217,6 +4249,7 @@ impl AgentHostHandle {
                             && !content.starts_with("ERROR:")
                             && !content.starts_with("DENIED")
                         {
+                            cargo_fails_since_edit = 0;
                             messages.push(serde_json::json!({
                                 "role": "system",
                                 "content": cargo_test_reverify_coaching(),

@@ -105,13 +105,13 @@ Model: **grok-4.5** · identical fixtures/prompts/max_turns · YOLO both sides
 
 #### Residual gaps (honest)
 
-1. **#187 multi_bug** still flaky on full suite (pass R1, fail R2 — explore-only path without write_files before budget end).
-2. **Verified signal** not always green when oracle is: long_horizon both runs; rename R2.
+1. **#187 multi_bug** was flaky on full suite baseline-2 (explore-only path). **Hardened** mid-batch explore skip after cargo fail + edit-only thrash gate after 2 cargo fails without edit. Focused live recheck (runs 4–6): **3/3 oracle**, 0 explore-only burns; verified still often false when edit lands last without re-run cargo in-budget.
+2. **Verified signal** not always green when oracle is: long_horizon; post-edit without observed green cargo.
 3. **tool_errors** higher on Ptah than CLI (definition of ≥ when success ties).
 4. **#209** unit-verified on main; no live intentional-noop injection this cycle.
-5. **Do not claim full suite ≥ Grok Build.**
+5. **Do not claim full suite ≥ Grok Build** until multi_bug stays green across two full dual-side baselines after this harden.
 
-Evidence: goal scratch `baselines/run1/`, `baselines/run2/`, `baselines/COMPARISON.json`.
+Evidence: goal scratch `baselines/run1/`, `baselines/run2/`, `multibug-harden/run-{4,5,6}/`.
 
 ### Prior cycle — turn-efficiency (#187/#188)
 

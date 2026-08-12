@@ -486,17 +486,63 @@ pub(crate) enum AgentStep {
 /// Map of OpenAI function name → (real server name, real tool name).
 pub(crate) type McpToolIndex = std::collections::HashMap<String, (String, String)>;
 
+/// Tools allowed after a cargo failure under a tight turn budget (#187).
+///
+/// Explore-only tools (list/read/grep/glob) are deliberately excluded so the
+/// remaining budget cannot burn on tree walks after failures are known.
+pub fn is_edit_or_shell_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_files" | "write_file" | "apply_patch" | "run_terminal_cmd"
+    )
+}
+
+/// Skip remaining tool calls in the current model step after cargo failed.
+///
+/// Under `max_rounds <= 8`, once `test_failure_needs_edit` is armed, only
+/// edit/shell tools may run for the rest of the turn (including later calls
+/// in the same multi-tool assistant step).
+pub fn should_skip_tool_after_cargo_failure(
+    max_rounds: u32,
+    test_failure_needs_edit: bool,
+    tool_name: &str,
+) -> bool {
+    max_rounds <= 8 && test_failure_needs_edit && !is_edit_or_shell_tool(tool_name)
+}
+
+/// Message returned when an explore tool is skipped mid-batch after cargo fail.
+pub fn post_cargo_failure_skip_message(tool_name: &str) -> String {
+    format!(
+        "SKIPPED `{tool_name}`: cargo test failed earlier and the turn budget is tight. \
+         Only write_files / write_file / apply_patch / run_terminal_cmd are allowed now. \
+         Fix ALL failing tests in one batch, then re-run cargo test."
+    )
+}
+
+/// Detect the R2 multi_bug failure signature: cargo ran, no mutating edit,
+/// only explore (+ cargo) tools. Used as a regression oracle for #187.
+pub fn is_post_cargo_explore_only_burn(tool_names: &[&str]) -> bool {
+    if tool_names.is_empty() {
+        return false;
+    }
+    let has_cargo_or_shell = tool_names.contains(&"run_terminal_cmd");
+    let has_edit = tool_names
+        .iter()
+        .any(|n| matches!(*n, "write_files" | "write_file" | "apply_patch"));
+    let has_explore = tool_names.iter().any(|n| {
+        matches!(
+            *n,
+            "list_dir" | "read_file" | "grep" | "glob_files" | "memory_read"
+        )
+    });
+    has_cargo_or_shell && has_explore && !has_edit
+}
+
 /// On final budget step, only allow edit + shell tools (#187/#188).
 pub(crate) fn filter_tools_edit_and_shell(tools: &serde_json::Value) -> serde_json::Value {
     let Some(arr) = tools.as_array() else {
         return tools.clone();
     };
-    let keep = [
-        "write_files",
-        "write_file",
-        "apply_patch",
-        "run_terminal_cmd",
-    ];
     let filtered: Vec<serde_json::Value> = arr
         .iter()
         .filter(|t| {
@@ -505,7 +551,7 @@ pub(crate) fn filter_tools_edit_and_shell(tools: &serde_json::Value) -> serde_js
                 .and_then(|f| f.get("name"))
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            keep.contains(&name)
+            is_edit_or_shell_tool(name)
         })
         .cloned()
         .collect();
@@ -518,10 +564,8 @@ pub(crate) fn filter_tools_edit_and_shell(tools: &serde_json::Value) -> serde_js
 
 /// Restrict a bounded recovery boundary to tools that can change source files.
 ///
-/// Retained for stricter edit-only recovery modes and unit tests; the default
-/// post-budget recovery path uses [`filter_tools_edit_and_shell`] so cargo can
-/// be re-run after fixes (#187).
-#[allow(dead_code)]
+/// Used when cargo has failed repeatedly without edits under a tight budget
+/// (#187), so the model cannot thrash `run_terminal_cmd` only.
 pub(crate) fn filter_tools_edit_only(tools: &serde_json::Value) -> serde_json::Value {
     let Some(arr) = tools.as_array() else {
         return tools.clone();
@@ -1970,6 +2014,65 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         ));
         assert!(!cargo_test_output_passed("wrote src/lib.rs"));
         assert!(cargo_test_reverify_coaching().contains("Re-run"));
+    }
+
+    #[test]
+    fn post_cargo_failure_skips_explore_but_allows_edit_and_shell() {
+        // Tight budget + armed failure: list/read/grep/glob blocked mid-batch.
+        assert!(should_skip_tool_after_cargo_failure(3, true, "list_dir"));
+        assert!(should_skip_tool_after_cargo_failure(3, true, "read_file"));
+        assert!(should_skip_tool_after_cargo_failure(3, true, "grep"));
+        assert!(should_skip_tool_after_cargo_failure(3, true, "glob_files"));
+        // Edit + shell remain available so the model can fix and re-verify.
+        assert!(!should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "write_files"
+        ));
+        assert!(!should_skip_tool_after_cargo_failure(3, true, "write_file"));
+        assert!(!should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "apply_patch"
+        ));
+        assert!(!should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "run_terminal_cmd"
+        ));
+        // Not armed yet, or loose budget: never skip.
+        assert!(!should_skip_tool_after_cargo_failure(3, false, "list_dir"));
+        assert!(!should_skip_tool_after_cargo_failure(24, true, "list_dir"));
+        let msg = post_cargo_failure_skip_message("list_dir");
+        assert!(msg.contains("SKIPPED"));
+        assert!(msg.contains("write_files"));
+    }
+
+    #[test]
+    fn post_cargo_explore_only_burn_detects_r2_failure_signature() {
+        // Baseline-2 multi_bug failure path: cargo + explore, no edits.
+        assert!(is_post_cargo_explore_only_burn(&[
+            "run_terminal_cmd",
+            "list_dir",
+            "read_file",
+            "glob_files",
+            "run_terminal_cmd",
+            "run_terminal_cmd",
+        ]));
+        // Healthy path: explore then write_files then cargo re-run.
+        assert!(!is_post_cargo_explore_only_burn(&[
+            "run_terminal_cmd",
+            "list_dir",
+            "read_file",
+            "write_files",
+            "run_terminal_cmd",
+        ]));
+        // Cargo-only is not the explore-burn signature.
+        assert!(!is_post_cargo_explore_only_burn(&[
+            "run_terminal_cmd",
+            "run_terminal_cmd",
+        ]));
+        assert!(!is_post_cargo_explore_only_burn(&[]));
     }
 
     #[test]
