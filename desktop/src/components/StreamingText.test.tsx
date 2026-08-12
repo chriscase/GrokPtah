@@ -2,6 +2,11 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { StreamingText } from "./StreamingText";
 import { StreamingMarkdown } from "./StreamingMarkdown";
+import { readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
+
+const root = dirname(fileURLToPath(import.meta.url));
 
 afterEach(() => cleanup());
 
@@ -47,6 +52,15 @@ describe("StreamingText", () => {
       expect(container.querySelector(".stream-md-live")?.textContent).toContain(
         "The task is complete.",
       ),
+    );
+  });
+
+  it("gives live transcript content a bounded block line box", () => {
+    const css = readFileSync(join(root, "..", "styles", "app.css"), "utf8");
+    expect(css).toMatch(/\.stream-md-live \{[\s\S]*width: 100%;/);
+    expect(css).toMatch(/\.stream-text \{[\s\S]*display: block;/);
+    expect(css).toMatch(
+      /\.bubble\.assistant > \.stream-md,[\s\S]*width: 100%;/,
     );
   });
 });

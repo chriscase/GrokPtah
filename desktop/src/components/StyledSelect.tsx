@@ -35,6 +35,27 @@ type MenuPosition = {
   maxHeight: number;
 };
 
+type ViewportRect = {
+  top: number;
+  left: number;
+  width: number;
+  height: number;
+};
+
+function getViewportRect(): ViewportRect {
+  if (typeof window === "undefined") {
+    return { top: 0, left: 0, width: 0, height: 0 };
+  }
+
+  const visual = window.visualViewport;
+  return {
+    top: visual?.offsetTop ?? 0,
+    left: visual?.offsetLeft ?? 0,
+    width: visual?.width ?? window.innerWidth,
+    height: visual?.height ?? window.innerHeight,
+  };
+}
+
 /**
  * Custom dropdown matching GrokPtah amber chrome — replaces native &lt;select&gt;
  * so Settings/composer never show OS chevrons (#126).
@@ -91,30 +112,33 @@ export function StyledSelect({
     if (!trigger || typeof window === "undefined") return;
 
     const rect = trigger.getBoundingClientRect();
+    const viewport = getViewportRect();
     const edge = 8;
     const gap = 4;
     const desiredHeight = Math.min(240, Math.max(64, options.length * 34 + 8));
-    const spaceBelow = window.innerHeight - rect.bottom - edge;
-    const spaceAbove = rect.top - edge;
-    const opensAbove =
-      spaceBelow < desiredHeight && spaceAbove > spaceBelow;
+    const spaceBelow = viewport.top + viewport.height - rect.bottom - edge;
+    const spaceAbove = rect.top - viewport.top - edge;
+    const opensAbove = spaceBelow < desiredHeight && spaceAbove > spaceBelow;
     const available = Math.max(
       32,
       Math.min(desiredHeight, (opensAbove ? spaceAbove : spaceBelow) - gap),
     );
     const width = Math.min(
       Math.max(rect.width, 160),
-      Math.max(1, window.innerWidth - edge * 2),
+      Math.max(1, viewport.width - edge * 2),
     );
     const left = Math.min(
-      Math.max(edge, rect.left),
-      Math.max(edge, window.innerWidth - width - edge),
+      Math.max(viewport.left + edge, rect.left),
+      Math.max(
+        viewport.left + edge,
+        viewport.left + viewport.width - width - edge,
+      ),
     );
 
     setMenuPosition({
       placement: opensAbove ? "above" : "below",
       top: rect.bottom + gap,
-      bottom: window.innerHeight - rect.top + gap,
+      bottom: viewport.top + viewport.height - rect.top + gap,
       left,
       width,
       maxHeight: available,
@@ -124,12 +148,21 @@ export function StyledSelect({
   useLayoutEffect(() => {
     if (!open) return;
     positionMenu();
-    const onViewportChange = () => positionMenu();
+    let frame = 0;
+    const onViewportChange = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(positionMenu);
+    };
     window.addEventListener("resize", onViewportChange);
     window.addEventListener("scroll", onViewportChange, true);
+    window.visualViewport?.addEventListener("resize", onViewportChange);
+    window.visualViewport?.addEventListener("scroll", onViewportChange);
     return () => {
+      window.cancelAnimationFrame(frame);
       window.removeEventListener("resize", onViewportChange);
       window.removeEventListener("scroll", onViewportChange, true);
+      window.visualViewport?.removeEventListener("resize", onViewportChange);
+      window.visualViewport?.removeEventListener("scroll", onViewportChange);
     };
   }, [open, positionMenu]);
 
