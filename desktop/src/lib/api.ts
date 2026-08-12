@@ -174,6 +174,12 @@ export const api = {
     invoke<DurableRun>("run_promote", { sessionId, runId }),
   runDiscard: (sessionId: string, runId: string) =>
     invoke<DurableRun>("run_discard", { sessionId, runId }),
+  runRetry: (sessionId: string, runId: string, prompt: string) =>
+    invoke<string>("run_retry", { sessionId, runId, prompt }),
+  runSteer: (sessionId: string, runId: string, text: string) =>
+    invoke<void>("run_steer", { sessionId, runId, text }),
+  runCancel: (sessionId: string, runId: string) =>
+    invoke<void>("run_cancel", { sessionId, runId }),
   sessionFork: (sourceId: string) =>
     invoke<SessionSummary>("session_fork", { sourceId }),
   sessionRewind: (

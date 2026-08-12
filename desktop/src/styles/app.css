@@ -3622,6 +3622,62 @@ button:disabled {
   background: rgba(224, 173, 79, 0.08);
 }
 
+.run-retry {
+  display: grid;
+  gap: 0.3rem;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border-soft);
+}
+
+.run-retry label {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.run-retry textarea {
+  width: 100%;
+  min-height: 3rem;
+  max-height: 8rem;
+  resize: vertical;
+  box-sizing: border-box;
+  padding: 0.35rem 0.4rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.35;
+}
+
+.run-control {
+  display: grid;
+  gap: 0.3rem;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border-soft);
+}
+
+.run-control label {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.run-control textarea {
+  width: 100%;
+  min-height: 3rem;
+  max-height: 8rem;
+  resize: vertical;
+  box-sizing: border-box;
+  padding: 0.35rem 0.4rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.35;
+}
+
 .run-error {
   color: var(--danger, #f07178);
   background: rgba(240, 113, 120, 0.08);
