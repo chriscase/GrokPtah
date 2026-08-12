@@ -76,6 +76,14 @@ No model turn resumes automatically. A coordinator may use `ptah_retry_run`
 with a fresh prompt to create one explicit, linked replacement after checking
 the interrupted handoff.
 
+The desktop bootstrap soak also proves a **fresh-host restart** path: it stops
+the first control server, drops the original `AgentHost`, creates a new host
+against the same disposable GrokPtah home, recovers the owning Build session,
+and reads the prior run's state, events, and handoff through a new MCP session.
+It replays a completed submission's exact `request_id` after restart and
+requires the original run ID, proving the durable idempotency receipt prevents
+a duplicate run.
+
 ### Durable retention
 
 The ledger performs conservative cleanup when it opens. By default it keeps
@@ -430,6 +438,10 @@ SDK. The campaign verifies:
 - isolated submission, bounded diff review, exact short-lived approval, and
   promotion into a disposable Git workspace;
 - MCP session deletion/reconnect with durable run reads after reconnect.
+
+The soak hardening suite additionally exercises a fresh-host restart against
+the same durable home, including session recovery, scoped evidence reads, and
+post-restart idempotent submission replay.
 
 The Rust integration test launches the real loopback server and the Node
 campaign against an offline host, so the workflow is deterministic and safe

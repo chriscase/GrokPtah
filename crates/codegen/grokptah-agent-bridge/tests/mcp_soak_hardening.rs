@@ -11,7 +11,7 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_from_env, AgentHost,
-    HostConfig, SessionKind, SessionUpdate,
+    HostConfig, McpControlClient, SessionKind, SessionUpdate,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -360,11 +360,74 @@ async fn soak_desktop_bootstrap_node_campaign() {
         "fd counts required"
     );
 
-    // Live control process restart: stop server, re-bootstrap, durable run still readable.
-    srv.stop_and_wait().await;
-    let srv2 = start_control_from_env(host.clone())
+    let completed_run_id = report["steps"]
+        .as_array()
+        .and_then(|steps| steps.iter().find(|step| step["name"] == "completedSubmit"))
+        .and_then(|step| step["detail"].as_str())
+        .map(str::to_string)
+        .expect("soak report must identify the completed run");
+
+    let replay_args = json!({
+        "request_id": "process-restart-idempotent-submit",
+        "session_id": session_ids[0],
+        "workspace": ws.path().display().to_string(),
+        "prompt": "list files in the project root",
+        "execution_mode": "shared",
+        "bounds": { "maxPromptBytes": 10_000, "maxRounds": 6, "maxDurationMs": 30_000 },
+    });
+    let mut pre_restart_mcp = McpControlClient::new(format!("http://{}", srv.addr), &token);
+    pre_restart_mcp.initialize().await.unwrap();
+    let pre_restart_submit = pre_restart_mcp
+        .call_tool("ptah_submit_task", replay_args.clone())
         .await
-        .expect("re-bootstrap after stop");
+        .unwrap();
+    assert!(!pre_restart_submit.is_error);
+    let replay_run_id = pre_restart_submit.structured["runId"]
+        .as_str()
+        .expect("restart idempotency submit must return a run")
+        .to_string();
+    let mut replay_terminal = false;
+    for _ in 0..100 {
+        let state = pre_restart_mcp
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session_ids[0],
+                    "workspace": ws.path().display().to_string(),
+                    "run_id": replay_run_id,
+                }),
+            )
+            .await
+            .unwrap();
+        if matches!(
+            state.structured["state"].as_str(),
+            Some("completed" | "failed" | "cancelled" | "interrupted" | "limit_reached")
+        ) {
+            replay_terminal = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(replay_terminal, "restart idempotency fixture must finish");
+
+    // Simulate a real desktop process restart: stop the first server and drop
+    // its host so the next host must reopen the same durable home and ledger.
+    srv.stop_and_wait().await;
+    drop(host);
+    let host2 = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host2.start().unwrap();
+    host2.set_project_cwd(ws.path()).unwrap();
+    let recovered_session = Uuid::parse_str(&session_ids[0]).unwrap();
+    assert!(
+        host2.session_load(recovered_session).is_ok(),
+        "fresh host must recover the owning Build session"
+    );
+    let srv2 = start_control_from_env(host2.clone())
+        .await
+        .expect("fresh host bootstrap after restart");
     let client = reqwest::Client::new();
     let health = client
         .get(format!("http://{}/health", srv2.addr))
@@ -372,12 +435,56 @@ async fn soak_desktop_bootstrap_node_campaign() {
         .await
         .unwrap();
     assert_eq!(health.status(), 200);
-    // Marker file from offline write should exist on disk.
+
+    let mut mcp = McpControlClient::new(format!("http://{}", srv2.addr), &token);
+    mcp.initialize().await.unwrap();
+    let scoped = json!({
+        "session_id": session_ids[0],
+        "workspace": ws.path().display().to_string(),
+        "run_id": completed_run_id,
+    });
+    let recovered_run = mcp.call_tool("ptah_get_run", scoped.clone()).await.unwrap();
+    assert!(!recovered_run.is_error);
+    assert_eq!(recovered_run.structured["state"], "completed");
+    assert_eq!(recovered_run.structured["runId"], completed_run_id);
+
+    let replayed_submit = mcp
+        .call_tool("ptah_submit_task", replay_args)
+        .await
+        .unwrap();
+    assert!(!replayed_submit.is_error);
+    assert_eq!(
+        replayed_submit.structured["runId"], replay_run_id,
+        "same request_id must replay the pre-restart run"
+    );
+
+    let events = mcp
+        .call_tool(
+            "ptah_get_events",
+            json!({
+                "session_id": session_ids[0],
+                "workspace": ws.path().display().to_string(),
+                "run_id": completed_run_id,
+                "after_seq": 0,
+                "limit": 100,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!events.is_error);
+    assert!(!events.structured["entries"].as_array().unwrap().is_empty());
+
+    let handoff = mcp.call_tool("ptah_get_handoff", scoped).await.unwrap();
+    assert!(!handoff.is_error);
+    assert_eq!(handoff.structured["state"], "completed");
+
+    // Marker file from the offline write should still exist on disk.
     assert!(
         ws.path().join("soak_marker.txt").is_file(),
         "offline write must leave soak_marker.txt"
     );
     srv2.stop_and_wait().await;
+    drop(host2);
 
     restore_env("GROKPTAH_CONTROL_TOKEN", prev_token);
     restore_env("GROKPTAH_CONTROL_PORT", prev_port);
