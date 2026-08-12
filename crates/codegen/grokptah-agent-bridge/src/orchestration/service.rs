@@ -754,21 +754,29 @@ impl OrchestrationService {
             )
         })?;
         let run = self.load_authorized_run(rid)?;
-        let mut page = self.bus.read_after(after_seq, limit);
-        page.entries.retain(|e| {
-            session_id_of(&e.update) == Some(run.session_id)
-                && run.start_seq.map(|s| e.seq >= s).unwrap_or(true)
+        // Read the bounded run range before applying the caller's page limit.
+        // Applying `limit` to the global journal first can return a page made
+        // entirely of other sessions and advance the cursor past this run's
+        // events. `read_range_all` is bounded by the journal retention policy
+        // and preserves cursor-expiry failures instead of silently skipping.
+        let mut entries = self
+            .bus
+            .read_range_all(after_seq, run.end_seq, Some(run.session_id))
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::CursorExpired,
+                    "event cursor expired; restart from seq 0 or latest",
+                )
+            })?;
+        entries.retain(|e| {
+            run.start_seq.map(|s| e.seq >= s).unwrap_or(true)
                 && run.end_seq.map(|s| e.seq <= s).unwrap_or(true)
         });
-        if page.cursor_expired {
-            return Err(OrchError::new(
-                OrchErrorCode::CursorExpired,
-                "event cursor expired; restart from seq 0 or latest",
-            ));
-        }
+        entries.truncate(limit.clamp(1, 500));
+        let next_cursor = entries.last().map(|e| e.seq);
         Ok(json!({
-            "entries": page.entries,
-            "nextCursor": page.next_cursor,
+            "entries": entries,
+            "nextCursor": next_cursor,
             "cursorExpired": false,
         }))
     }
