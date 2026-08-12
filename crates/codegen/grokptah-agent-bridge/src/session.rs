@@ -5,6 +5,40 @@ use uuid::Uuid;
 use crate::completion::CompletionEvidence;
 use crate::orchestration::RunExecutionMode;
 
+/// Whether a session's persisted working directory is safe to use.
+///
+/// Keeping this in the durable session summary lets the desktop and control
+/// plane show a recovery state without guessing from a path string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceStatus {
+    #[default]
+    Ready,
+    Missing,
+    Inaccessible,
+    NotDirectory,
+}
+
+impl WorkspaceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Missing => "missing",
+            Self::Inaccessible => "inaccessible",
+            Self::NotDirectory => "not_directory",
+        }
+    }
+}
+
+pub fn workspace_status(path: &std::path::Path) -> WorkspaceStatus {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => WorkspaceStatus::Ready,
+        Ok(_) => WorkspaceStatus::NotDirectory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => WorkspaceStatus::Missing,
+        Err(_) => WorkspaceStatus::Inaccessible,
+    }
+}
+
 /// Workspace mode: coding agent builds vs plain Grok conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +88,8 @@ pub struct SessionSummary {
     /// Execution policy for future Build turns in this session.
     #[serde(default)]
     pub execution_mode: RunExecutionMode,
+    #[serde(default)]
+    pub workspace_status: WorkspaceStatus,
 }
 
 /// Durable evidence for one completed or interrupted model turn.
@@ -271,6 +307,7 @@ impl Session {
             archived_at: self.archived_at,
             kind: self.kind,
             execution_mode: self.execution_mode,
+            workspace_status: workspace_status(&self.cwd),
         }
     }
 }
