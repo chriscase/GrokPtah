@@ -803,6 +803,21 @@ button:disabled {
   white-space: nowrap;
 }
 
+.session-origin-badge,
+.fleet-card-origin,
+.run-origin {
+  flex: 0 0 auto;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  line-height: 1.2;
+  padding: 0.1rem 0.28rem;
+  border: 1px solid rgba(240, 180, 41, 0.32);
+  border-radius: 4px;
+  color: var(--accent);
+  background: rgba(240, 180, 41, 0.12);
+}
+
 .session-tab-close {
   background: transparent;
   border: none;
@@ -3351,6 +3366,10 @@ button:disabled {
   min-width: 0;
 }
 
+.run-card-heading {
+  flex-wrap: wrap;
+}
+
 .run-card-heading time {
   flex: 0 0 auto;
   color: var(--muted);
@@ -4414,6 +4433,10 @@ button:disabled {
   max-width: 13rem;
   flex: 1 1 auto;
   color: var(--text);
+}
+
+.fleet-card-origin {
+  flex-shrink: 0;
 }
 
 .fleet-card-zone {

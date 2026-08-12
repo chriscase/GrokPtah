@@ -765,7 +765,10 @@ impl OrchestrationService {
             session_id,
             workspace: claimed.display().to_string(),
             request_id: request_id.into(),
-            client_id: None,
+            // Distinguish coordinator-owned work from desktop turns so the
+            // desktop can surface external activity without guessing from
+            // transport timing.
+            client_id: Some("mcp".into()),
             state: RunState::Running,
             bounds: bounds.clone(),
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),

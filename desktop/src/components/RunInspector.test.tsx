@@ -76,6 +76,19 @@ describe("RunInspector", () => {
     expect(screen.getByText("1/1 tests passed")).toBeTruthy();
     expect(screen.getByText("Verification: verified")).toBeTruthy();
     expect(screen.getByText("Handoff")).toBeTruthy();
+    expect(screen.getByText("Desktop")).toBeTruthy();
+  });
+
+  it("labels coordinator-owned runs", () => {
+    render(
+      <RunInspector
+        runs={[run({ clientId: "mcp" })]}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByText("MCP coordinator")).toBeTruthy();
   });
 
   it("makes an interrupted run actionable and refreshable", () => {

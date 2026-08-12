@@ -14,6 +14,7 @@ import {
   type SubagentInfo,
   type TranscriptItem,
   type DurableRun,
+  type RunOrigin,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
 import {
@@ -348,6 +349,36 @@ export default function App() {
       setRunsBusy(false);
     }
   }, [activeSessionId]);
+
+  const syncRunOrigin = useCallback(async (sessionId: string) => {
+    try {
+      const records = await api.runList(sessionId);
+      const live = records.find(
+        (run) => run.state === "running" || run.state === "queued",
+      );
+      const origin: RunOrigin | null =
+        live?.clientId === "mcp"
+          ? "mcp"
+          : live?.clientId === "desktop"
+            ? "desktop"
+            : live
+              ? "other"
+              : null;
+      setTabs((prev) =>
+        prev.map((tab) =>
+          tab.id === sessionId ? { ...tab, runOrigin: origin } : tab,
+        ),
+      );
+    } catch {
+      // The bridge can be unavailable during startup or shutdown.
+    }
+  }, []);
+
+  // Hydrate coordinator ownership when switching tabs or reloading the app;
+  // a running MCP turn may have started before this UI subscribed to events.
+  useEffect(() => {
+    if (activeSessionId) void syncRunOrigin(activeSessionId);
+  }, [activeSessionId, syncRunOrigin]);
 
   useEffect(() => {
     if (rightTab !== "tasks" || !activeSessionId) return;
@@ -724,8 +755,11 @@ export default function App() {
         });
       }
       applyUpdate(u, setTabs, setPermissionQueue);
+      if (u.type === "turn_started" || u.type === "turn_complete") {
+        void syncRunOrigin(u.session_id);
+      }
     });
-  }, []);
+  }, [syncRunOrigin]);
 
   // Restore sessions + open tabs from disk (desktop-app durability).
   useEffect(() => {
@@ -2171,6 +2205,14 @@ export default function App() {
                       ],
                     )}
                   </span>
+                  {t.runOrigin === "mcp" && (
+                    <span
+                      className="session-origin-badge"
+                      title="MCP coordinator is driving this session"
+                    >
+                      MCP
+                    </span>
+                  )}
                 </button>
                 <button
                   type="button"

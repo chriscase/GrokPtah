@@ -244,6 +244,7 @@ export interface PermissionRequest {
 }
 
 export type SessionKind = "build" | "chat";
+export type RunOrigin = "desktop" | "mcp" | "other";
 
 export interface SessionSummary {
   id: string;
@@ -319,6 +320,8 @@ export interface SessionTab {
   completionEvidence: CompletionEvidence | null;
   /** Turn identity associated with the live or restored evidence. */
   completionTurnId: string | null;
+  /** Optional source of the currently active run, when known. */
+  runOrigin?: RunOrigin | null;
 }
 
 export type TranscriptItem =

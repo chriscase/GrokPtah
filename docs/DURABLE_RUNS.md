@@ -48,6 +48,15 @@ worktrees, protected metadata paths, and promotion conflicts fail closed. A
 run cannot be promoted through the MCP surface yet; this slice intentionally
 keeps that control desktop-only until the coordinator contract is extended.
 
+## Coordinator visibility
+
+MCP-submitted runs are recorded with `clientId: "mcp"`, while desktop turns use
+`clientId: "desktop"`. When a coordinator is driving a Build session, the
+existing session tab and optional Live rail show an `MCP` badge, and the Tasks
+rail labels the durable run `MCP coordinator`. The same label is hydrated when
+switching sessions or reloading while a run is still active, so the desktop
+does not need a second event stream or a separate coordinator dashboard.
+
 ## Privacy and bounds
 
 - Desktop queries are scoped to one session ID.

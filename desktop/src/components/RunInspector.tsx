@@ -38,6 +38,12 @@ function testLabel(run: DurableRun): string {
   return `${passed}/${tests.length} tests passed`;
 }
 
+function runOriginLabel(run: DurableRun): string {
+  if (run.clientId === "mcp") return "MCP coordinator";
+  if (run.clientId === "desktop") return "Desktop";
+  return run.clientId || "Unknown origin";
+}
+
 export function RunInspector({
   runs,
   busy,
@@ -103,7 +109,7 @@ export function RunInspector({
         <div>
           <div className="section-title">Task runs</div>
           <p className="run-inspector-subtitle">
-            Durable progress and verification for this Build session.
+            Durable progress and verification from desktop and MCP activity.
           </p>
         </div>
         <button
@@ -132,6 +138,12 @@ export function RunInspector({
                   <span className="run-state">
                     <span className="run-state-dot" aria-hidden />
                     {stateLabels[run.state]}
+                  </span>
+                  <span
+                    className="run-origin"
+                    title={`Run submitted by ${runOriginLabel(run)}`}
+                  >
+                    {runOriginLabel(run)}
                   </span>
                   <time dateTime={run.updatedAt}>{timeLabel(run.updatedAt)}</time>
                 </div>
