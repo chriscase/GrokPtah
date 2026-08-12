@@ -700,7 +700,20 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let mut run = self.load_authorized_run(run_id)?;
+        self.run_value(self.load_authorized_run(run_id)?)
+    }
+
+    pub fn get_run_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
+    }
+
+    fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         serde_json::to_value(run)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
@@ -711,7 +724,20 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let mut run = self.load_authorized_run(run_id)?;
+        self.progress_value(self.load_authorized_run(run_id)?)
+    }
+
+    pub fn get_progress_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
+    }
+
+    fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
         Ok(json!({
@@ -754,6 +780,31 @@ impl OrchestrationService {
             )
         })?;
         let run = self.load_authorized_run(rid)?;
+        self.events_for_run(run, after_seq, limit)
+    }
+
+    pub fn get_events_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.events_for_run(
+            self.authorize_run_request(session_id, workspace, run_id)?,
+            after_seq,
+            limit,
+        )
+    }
+
+    fn events_for_run(
+        &self,
+        run: RunRecord,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<serde_json::Value, OrchError> {
         // Read the bounded run range before applying the caller's page limit.
         // Applying `limit` to the global journal first can return a page made
         // entirely of other sessions and advance the cursor past this run's
@@ -786,7 +837,20 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self.load_authorized_run(run_id)?;
+        self.changes_for_run(self.load_authorized_run(run_id)?)
+    }
+
+    pub fn get_changes_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.changes_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+    }
+
+    fn changes_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
         // Prefer durable aggregates (survive journal rollover).
         let mut paths: Vec<serde_json::Value> = run
             .aggregates
@@ -803,7 +867,7 @@ impl OrchestrationService {
                 }
             }
         }
-        Ok(json!({ "runId": run_id, "changes": paths }))
+        Ok(json!({ "runId": run.run_id, "changes": paths }))
     }
 
     pub fn get_test_results(
@@ -811,7 +875,20 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self.load_authorized_run(run_id)?;
+        self.test_results_for_run(self.load_authorized_run(run_id)?)
+    }
+
+    pub fn get_test_results_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.test_results_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+    }
+
+    fn test_results_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
         let mut by_id: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
         // Seed from durable aggregates.
@@ -864,13 +941,13 @@ impl OrchestrationService {
         let observed: Vec<_> = by_id.into_values().collect();
         if observed.is_empty() {
             Ok(json!({
-                "runId": run_id,
+                "runId": run.run_id,
                 "status": "not_observed",
                 "results": [],
             }))
         } else {
             Ok(json!({
-                "runId": run_id,
+                "runId": run.run_id,
                 "status": "observed",
                 "results": observed,
             }))
@@ -882,7 +959,20 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self.load_authorized_run(run_id)?;
+        self.handoff_for_run(self.load_authorized_run(run_id)?)
+    }
+
+    pub fn get_handoff_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+    }
+
+    fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
         Ok(json!({
             "runId": run.run_id,
             "sessionId": run.session_id,

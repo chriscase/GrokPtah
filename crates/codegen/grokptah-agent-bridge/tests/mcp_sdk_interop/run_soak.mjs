@@ -26,6 +26,15 @@ const sessionIds = (process.env.GROKPTAH_MCP_SESSION_IDS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+const scopedReadTools = new Set([
+  "ptah_get_run",
+  "ptah_get_progress",
+  "ptah_get_events",
+  "ptah_get_changes",
+  "ptah_get_test_results",
+  "ptah_get_handoff",
+  "ptah_review_run",
+]);
 const soakSeconds = Math.max(5, Number(process.env.GROKPTAH_SOAK_SECONDS || 22));
 const concurrency = Math.max(2, Number(process.env.GROKPTAH_SOAK_CONCURRENCY || 6));
 const serverPid = process.env.GROKPTAH_MCP_SERVER_PID || null;
@@ -92,12 +101,28 @@ async function mcpFetch(
     auth = true,
     protocolVersion = "2025-11-25",
     timeoutMs = 20000,
+    appSessionId = sessionIds[0],
+    appWorkspace = workspace,
   } = {}
 ) {
   metrics.requests += 1;
+  const scopedParams =
+    method === "tools/call" &&
+    scopedReadTools.has(params?.name) &&
+    params?.arguments?.run_id &&
+    !params.arguments.session_id
+      ? {
+          ...params,
+          arguments: {
+            ...params.arguments,
+            session_id: appSessionId,
+            workspace: appWorkspace,
+          },
+        }
+      : params;
   const body = notification
-    ? { jsonrpc: "2.0", method, params }
-    : { jsonrpc: "2.0", id, method, params };
+    ? { jsonrpc: "2.0", method, params: scopedParams }
+    : { jsonrpc: "2.0", id, method, params: scopedParams };
   const headers = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
@@ -198,14 +223,25 @@ async function openMcpSession(name) {
   return init.sessionId;
 }
 
-async function pollRun(mcpSession, runId, ms = 15000) {
+async function pollRun(
+  mcpSession,
+  runId,
+  ms = 15000,
+  appSessionId = sessionIds[0],
+  appWorkspace = workspace
+) {
   const start = Date.now();
   let last = null;
   while (Date.now() - start < ms) {
     const r = await mcpFetch(
       "tools/call",
       { name: "ptah_get_run", arguments: { run_id: runId } },
-      { id: Date.now() % 1e9, sessionId: mcpSession }
+      {
+        id: Date.now() % 1e9,
+        sessionId: mcpSession,
+        appSessionId,
+        appWorkspace,
+      }
     );
     last = structured(r.json);
     if (
@@ -624,11 +660,11 @@ async function runFullMode() {
     metrics.submits += 1;
     const testRunId = structured(testSubmit.json)?.runId;
     if (testRunId) {
-      await pollRun(primary, testRunId, 15000);
+      await pollRun(primary, testRunId, 15000, sessionIds[1] || sessionIds[0], workspace);
       const tests = await mcpFetch(
         "tools/call",
         { name: "ptah_get_test_results", arguments: { run_id: testRunId } },
-        { id: 207, sessionId: primary }
+        { id: 207, sessionId: primary, appSessionId: sessionIds[1] || sessionIds[0] }
       );
       const tr = structured(tests.json);
       // Observed if cargo test classified; otherwise structure must still be valid.
@@ -756,7 +792,7 @@ async function runFullMode() {
       { id: 303, sessionId: primary }
     );
     metrics.cancels += 1;
-    const term = await pollRun(primary, busyId, 10000);
+    const term = await pollRun(primary, busyId, 10000, sessionIds[1], workspace);
     record(
       "cancelRace",
       cancel.status === 200 && term?.state === "cancelled",
