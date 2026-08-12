@@ -470,6 +470,9 @@ struct SubmitArgs {
     bounds: Option<Value>,
     #[serde(default)]
     execution_mode: RunExecutionMode,
+    /// When true, capacity/session contention uses the bounded fair admission queue.
+    #[serde(default)]
+    allow_queue: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -934,6 +937,11 @@ fn tool_input_schema(name: &str) -> Value {
                     "enum": ["shared", "isolated_worktree"],
                     "default": "shared",
                     "description": "Use shared execution by default; isolated_worktree creates a reviewable managed Git worktree for this Build run."
+                },
+                "allow_queue": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, queue behind bounded capacity/session contention instead of failing fast."
                 }
             }
         }),
@@ -1127,7 +1135,7 @@ async fn dispatch_tool(
         }
         "ptah_submit_task" => {
             let args: SubmitArgs = parse_value(args)?;
-            orch.submit_task_with_execution_mode(
+            orch.submit_task_with_execution_mode_and_queue(
                 auth,
                 &args.request_id,
                 args.session_id,
@@ -1135,6 +1143,7 @@ async fn dispatch_tool(
                 args.prompt,
                 args.bounds,
                 args.execution_mode,
+                args.allow_queue,
             )
             .await
         }

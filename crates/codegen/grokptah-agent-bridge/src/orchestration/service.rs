@@ -1,7 +1,8 @@
 //! Orchestration service: reads + bounded mutations over AgentHostHandle (#196).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -16,6 +17,25 @@ use crate::session::SessionKind;
 use super::authz::{require_workspace_match, AuthContext, WorkspaceAllowlist};
 use super::store::{IdempotencyClaim, OrchStore};
 use super::types::*;
+
+/// Admission is deliberately bounded so an untrusted coordinator cannot turn
+/// queued submissions into an unbounded in-memory prompt store.
+const MAX_PENDING_ADMISSIONS: usize = 32;
+
+#[derive(Default)]
+struct AdmissionQueueState {
+    pending: VecDeque<PendingRun>,
+    /// Prefer a different session when one is available, while preserving
+    /// FIFO order within each session.
+    last_started_session: Option<Uuid>,
+}
+
+struct PendingRun {
+    run_id: String,
+    session_id: Uuid,
+    prompt: String,
+    execution_mode: RunExecutionMode,
+}
 
 #[derive(Clone)]
 pub struct OrchestrationConfig {
@@ -41,8 +61,19 @@ pub struct OrchestrationService {
     bus: EventBus,
     store: OrchStore,
     config: Mutex<OrchestrationConfig>,
+    self_ref: Weak<OrchestrationService>,
+    pending_admissions: Mutex<AdmissionQueueState>,
+    scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for OrchestrationService {
+    fn drop(&mut self) {
+        if let Some(watcher) = self.scheduler_watcher.get_mut().take() {
+            watcher.abort();
+        }
+    }
 }
 
 struct AdmissionGuard {
@@ -146,13 +177,41 @@ impl OrchestrationService {
         }
         config.max_concurrent_runs =
             host.configure_orchestration_capacity(config.max_concurrent_runs);
-        Arc::new(Self {
+        let service = Arc::new_cyclic(|self_ref| Self {
             host,
             bus,
             store,
             config: Mutex::new(config),
+            self_ref: self_ref.clone(),
+            pending_admissions: Mutex::new(AdmissionQueueState::default()),
+            scheduler_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
-        })
+        });
+        service.start_scheduler_watcher();
+        service
+    }
+
+    fn start_scheduler_watcher(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut events = self.host.subscribe_events();
+        let service_ref = self.self_ref.clone();
+        let watcher = runtime.spawn(async move {
+            while let Some(update) = events.recv().await {
+                if matches!(
+                    update,
+                    crate::events::SessionUpdate::TurnComplete { .. }
+                        | crate::events::SessionUpdate::Error { .. }
+                ) {
+                    let Some(service) = service_ref.upgrade() else {
+                        break;
+                    };
+                    service.pump_pending();
+                }
+            }
+        });
+        *self.scheduler_watcher.lock() = Some(watcher);
     }
 
     pub fn bus(&self) -> &EventBus {
@@ -267,6 +326,109 @@ impl OrchestrationService {
 
     fn release_capacity(&self, run_id: &str) {
         self.host.release_orchestration_turn(run_id);
+        self.pump_pending();
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending_admissions.lock().pending.len()
+    }
+
+    fn enqueue_pending(&self, pending: PendingRun) -> Result<usize, OrchError> {
+        let mut queue = self.pending_admissions.lock();
+        if queue.pending.len() >= MAX_PENDING_ADMISSIONS {
+            return Err(OrchError::new(
+                OrchErrorCode::CapacityExhausted,
+                format!("bounded admission queue is full ({MAX_PENDING_ADMISSIONS} pending runs)"),
+            ));
+        }
+        queue.pending.push_back(pending);
+        Ok(queue.pending.len())
+    }
+
+    fn remove_pending(&self, run_id: &str) -> bool {
+        let mut queue = self.pending_admissions.lock();
+        let before = queue.pending.len();
+        queue.pending.retain(|pending| pending.run_id != run_id);
+        before != queue.pending.len()
+    }
+
+    /// Choose the oldest eligible task, preferring a session different from
+    /// the last started one when possible. Earlier tasks from the same session
+    /// remain ahead of later tasks, preventing same-session leapfrogging.
+    fn next_pending_index(&self, queue: &AdmissionQueueState) -> Option<usize> {
+        let eligible = queue
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(index, pending)| {
+                !self.host.session_busy(pending.session_id)
+                    && !queue
+                        .pending
+                        .range(..*index)
+                        .any(|prior| prior.session_id == pending.session_id)
+            })
+            .collect::<Vec<_>>();
+        eligible
+            .iter()
+            .find(|(_, pending)| Some(pending.session_id) != queue.last_started_session)
+            .or_else(|| eligible.first())
+            .map(|(index, _)| *index)
+    }
+
+    /// Promote as many queued tasks as the shared host capacity allows.
+    fn pump_pending(&self) {
+        loop {
+            if self.host.orchestration_active_count() >= self.host.orchestration_capacity_limit() {
+                return;
+            }
+            let pending = {
+                let mut queue = self.pending_admissions.lock();
+                let Some(index) = self.next_pending_index(&queue) else {
+                    return;
+                };
+                let pending = queue.pending.remove(index).expect("pending index exists");
+                queue.last_started_session = Some(pending.session_id);
+                pending
+            };
+
+            // Cancellation can win after the task left the queue but before
+            // promotion. Treat terminal records as a normal, safe skip.
+            let Some(current) = self.store.load_run(&pending.run_id).ok().flatten() else {
+                continue;
+            };
+            if current.state != RunState::Queued {
+                continue;
+            }
+
+            if let Err(error) = self.try_reserve_capacity(&pending.run_id, pending.session_id) {
+                let mut queue = self.pending_admissions.lock();
+                queue.pending.push_front(pending);
+                if !matches!(
+                    error.code,
+                    OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted
+                ) {
+                    eprintln!("[grokptah] queued run admission failed: {error}");
+                }
+                return;
+            }
+
+            let start_seq = self.bus.next_seq();
+            let transitioned = self.store.update_run(&pending.run_id, |run| {
+                if run.state != RunState::Queued {
+                    anyhow::bail!("queued run is no longer pending");
+                }
+                run.state = RunState::Running;
+                run.start_seq = Some(start_seq);
+                run.updated_at = Utc::now();
+                Ok(())
+            });
+            match transitioned {
+                Ok(Some(run)) => self.spawn_run(run, pending.prompt, pending.execution_mode),
+                Ok(None) | Err(_) => {
+                    self.host.release_orchestration_turn(&pending.run_id);
+                }
+            }
+        }
     }
 
     async fn begin_idempotency(
@@ -434,6 +596,7 @@ impl OrchestrationService {
     pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
         let max = self.host.orchestration_capacity_limit();
         let active = self.host.orchestration_active_count();
+        let queued = self.pending_admissions.lock().pending.len();
         let event_error = self
             .bus
             .last_persistence_error()
@@ -450,6 +613,8 @@ impl OrchestrationService {
             "maxConcurrentRuns": max,
             "activeRuns": active,
             "available": max.saturating_sub(active),
+            "queuedRuns": queued,
+            "queueLimit": MAX_PENDING_ADMISSIONS,
             "health": {
                 "laggedLiveEvents": self.bus.lagged_event_count(),
                 "eventJournalPersistenceError": event_error,
@@ -1064,6 +1229,31 @@ impl OrchestrationService {
         bounds_json: Option<serde_json::Value>,
         execution_mode: RunExecutionMode,
     ) -> Result<serde_json::Value, OrchError> {
+        self.submit_task_with_execution_mode_and_queue(
+            auth,
+            request_id,
+            session_id,
+            workspace,
+            prompt,
+            bounds_json,
+            execution_mode,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_task_with_execution_mode_and_queue(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        prompt: String,
+        bounds_json: Option<serde_json::Value>,
+        execution_mode: RunExecutionMode,
+        allow_queue: bool,
+    ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
         let tool = "ptah_submit_task";
         let payload = json!({
@@ -1072,6 +1262,7 @@ impl OrchestrationService {
             "prompt": prompt,
             "bounds": bounds_json,
             "executionMode": execution_mode,
+            "allowQueue": allow_queue,
         });
         let phash = hash_payload(&payload);
 
@@ -1128,19 +1319,26 @@ impl OrchestrationService {
             IdempotencyStart::Perform(lease) => lease,
         };
 
-        if self.host.session_busy(session_id) {
-            let e = OrchError::new(
-                OrchErrorCode::SessionBusy,
-                "session already has an active turn",
-            );
-            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
-        }
-
+        // Give older queued work first claim on any newly available capacity.
+        self.pump_pending();
         let run_id = Uuid::new_v4().to_string();
-        if let Err(e) = self.try_reserve_capacity(&run_id, session_id) {
-            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
+        let queue_ahead = self.pending_count() > 0;
+        let mut queued = false;
+        if allow_queue && queue_ahead {
+            queued = true;
+        } else if let Err(e) = self.try_reserve_capacity(&run_id, session_id) {
+            if allow_queue
+                && matches!(
+                    e.code,
+                    OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted
+                )
+            {
+                queued = true;
+            } else {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
+            }
         }
-        let start_seq = self.bus.next_seq();
+        let start_seq = (!queued).then(|| self.bus.next_seq());
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -1150,10 +1348,14 @@ impl OrchestrationService {
             // desktop can surface external activity without guessing from
             // transport timing.
             client_id: Some("mcp".into()),
-            state: RunState::Running,
+            state: if queued {
+                RunState::Queued
+            } else {
+                RunState::Running
+            },
             bounds: bounds.clone(),
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),
-            start_seq: Some(start_seq),
+            start_seq,
             end_seq: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1166,18 +1368,50 @@ impl OrchestrationService {
             approval: None,
         };
         if let Err(e) = self.store.save_run(&run) {
-            self.host.release_turn_reservation(session_id, &run_id);
-            self.release_capacity(&run_id);
+            if !queued {
+                self.host.release_turn_reservation(session_id, &run_id);
+                self.release_capacity(&run_id);
+            }
             let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
             return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
         }
 
+        let queued_position = if queued {
+            match self.enqueue_pending(PendingRun {
+                run_id: run_id.clone(),
+                session_id,
+                prompt: prompt.clone(),
+                execution_mode,
+            }) {
+                Ok(position) => Some(position),
+                Err(error) => {
+                    let _ = self.store.update_run(&run_id, |current| {
+                        current.state = RunState::Failed;
+                        current.terminal_result = Some("failed".into());
+                        current.error_code = Some(error.code.as_str().into());
+                        current.updated_at = Utc::now();
+                        Ok(())
+                    });
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        Some(run_id),
+                        session_id,
+                        &claimed,
+                        error,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         let response = json!({
             "runId": run_id,
             "sessionId": session_id,
-            "state": RunState::Running,
+            "state": run.state,
             "requestId": request_id,
             "executionMode": execution_mode,
+            "queuedPosition": queued_position,
         });
         if let Err(e) = lease.complete(Some(run_id.clone()), response.clone()) {
             let _ = self.store.update_run(&run_id, |r| {
@@ -1187,8 +1421,11 @@ impl OrchestrationService {
                 r.updated_at = Utc::now();
                 Ok(())
             });
-            self.host.release_turn_reservation(session_id, &run_id);
-            self.release_capacity(&run_id);
+            self.remove_pending(&run_id);
+            if !queued {
+                self.host.release_turn_reservation(session_id, &run_id);
+                self.release_capacity(&run_id);
+            }
             return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
         }
         self.audit(
@@ -1198,23 +1435,35 @@ impl OrchestrationService {
             Some(&claimed.display().to_string()),
             "accepted",
             None,
-            "run started",
+            if queued { "run queued" } else { "run started" },
         );
+        if !queued {
+            self.spawn_run(run, prompt, execution_mode);
+        } else {
+            // A capacity release can race the enqueue; this also makes an
+            // immediately available slot visible without requiring polling.
+            self.pump_pending();
+        }
 
+        Ok(response)
+    }
+
+    /// Start a run whose host admission has already been reserved.
+    fn spawn_run(&self, run: RunRecord, prompt: String, execution_mode: RunExecutionMode) {
         let host = self.host.clone();
         let store = self.store.clone();
         let bus = self.bus.clone();
-        let rid = run_id.clone();
-        let prompt_owned = prompt.clone();
-        let max_ms = bounds.max_duration_ms;
-        let max_rounds = bounds.max_rounds;
-        let run_template = run.clone();
+        let service_ref = self.self_ref.clone();
+        let session_id = run.session_id;
+        let rid = run.run_id.clone();
+        let max_ms = run.bounds.max_duration_ms;
+        let max_rounds = run.bounds.max_rounds;
 
         // Dedicated aggregator task: must not share a biased select with the
         // duration deadline (chatty ShellOutput must not starve max_duration_ms).
         let mut agg_rx = bus.subscribe();
         let store_agg = store.clone();
-        let rid_agg = run_id.clone();
+        let rid_agg = rid.clone();
         let agg_task = tokio::spawn(async move {
             while let Some(update) = agg_rx.recv().await {
                 apply_run_aggregate(&store_agg, &rid_agg, session_id, &update);
@@ -1222,20 +1471,20 @@ impl OrchestrationService {
         });
 
         let join = tokio::spawn(async move {
-            let _admission_guard = AdmissionGuard {
+            let admission_guard = AdmissionGuard {
                 host: host.clone(),
                 run_id: rid.clone(),
             };
             let prompt_fut = host.session_prompt_reserved_with_max_rounds_for_run(
                 session_id,
-                prompt_owned,
+                prompt,
                 Some(max_rounds.max(1)),
                 &rid,
                 &rid,
                 execution_mode,
             );
             tokio::pin!(prompt_fut);
-            let deadline = tokio::time::sleep(std::time::Duration::from_millis(max_ms.max(1)));
+            let deadline = tokio::time::sleep(Duration::from_millis(max_ms.max(1)));
             tokio::pin!(deadline);
 
             // Cancellation and teardown are bounded. A backend that ignores its
@@ -1276,7 +1525,7 @@ impl OrchestrationService {
             let incomplete_stop = result
                 .as_ref()
                 .is_ok_and(|text| crate::host_helpers::is_incomplete_stop_message(text));
-            let mut candidate = store.load_run(&rid).ok().flatten().unwrap_or(run_template);
+            let mut candidate = store.load_run(&rid).ok().flatten().unwrap_or(run);
             for update in &reconciliation {
                 fold_run_update(&mut candidate, update);
             }
@@ -1312,9 +1561,6 @@ impl OrchestrationService {
                     }
                 }
             }
-            // A normal host turn emits this before TurnComplete. If teardown
-            // raced the host before that event, retain a conservative fallback
-            // rather than presenting a durable run without evidence.
             if candidate.aggregates.verification.is_none() {
                 let observations = crate::completion::observations_from_run(
                     candidate.aggregates.changes.len(),
@@ -1336,9 +1582,7 @@ impl OrchestrationService {
                     matches!(candidate.state, RunState::Cancelled | RunState::Interrupted),
                 ));
             }
-            // External isolated runs do not pass through the desktop
-            // finalizer. Capture the same final fingerprint and changed-file
-            // set here so review and approval remain valid after restart.
+            // External isolated runs do not pass through the desktop finalizer.
             if let Some(execution) = candidate.execution.as_mut() {
                 if execution.mode == RunExecutionMode::IsolatedWorktree {
                     if candidate.state == RunState::Completed {
@@ -1398,11 +1642,16 @@ impl OrchestrationService {
                 let backoff_ms = 25u64.saturating_mul(1u64 << shift).min(1_000);
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
+
+            // Release capacity before waking the scheduler, so a queued task
+            // can be promoted immediately and fairly.
+            drop(admission_guard);
+            if let Some(service) = service_ref.upgrade() {
+                service.pump_pending();
+            }
         });
         self.reaping_handles();
         self.join_handles.lock().push(join);
-
-        Ok(response)
     }
 
     pub async fn queue_prompt(
@@ -1731,8 +1980,9 @@ impl OrchestrationService {
             ));
         }
 
+        let was_pending = self.remove_pending(rid);
         let reservation_released = self.host.release_turn_reservation(session_id, rid);
-        let teardown_complete = if reservation_released {
+        let teardown_complete = if was_pending || reservation_released {
             true
         } else {
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -1748,6 +1998,7 @@ impl OrchestrationService {
             "sessionId": session_id,
             "runId": rid,
             "cancelled": true,
+            "wasQueued": was_pending,
             "teardownComplete": teardown_complete,
             "state": RunState::Cancelled,
         });
@@ -1763,6 +2014,9 @@ impl OrchestrationService {
             None,
             "cancelled",
         );
+        if was_pending {
+            self.pump_pending();
+        }
         Ok(response)
     }
 }
