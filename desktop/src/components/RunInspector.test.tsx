@@ -77,6 +77,7 @@ describe("RunInspector", () => {
     expect(screen.getByText("Verification: verified")).toBeTruthy();
     expect(screen.getByText("Handoff")).toBeTruthy();
     expect(screen.getByText("Desktop", { selector: ".run-origin" })).toBeTruthy();
+    expect(screen.getByText("Shared workspace", { selector: ".run-execution-mode" })).toBeTruthy();
   });
 
   it("labels coordinator-owned runs", () => {
@@ -147,6 +148,7 @@ describe("RunInspector", () => {
     render(<RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} />);
 
     expect(screen.getByText(/Isolated · ready/)).toBeTruthy();
+    expect(screen.getByText("Isolated worktree", { selector: ".run-execution-mode" })).toBeTruthy();
     expect(screen.queryByText("Promote reviewed changes")).toBeNull();
     fireEvent.click(screen.getByText("Review diff"));
     expect(await screen.findByText(/1 changed files/)).toBeTruthy();

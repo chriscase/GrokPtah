@@ -326,6 +326,7 @@ cargo clippy --all-targets -- -D warnings
 
 # Focused transport + orch
 cargo test --test mcp_streamable_transport -- --test-threads=1
+cargo test --test mcp_coordinator_campaign -- --test-threads=1
 cargo test --test orchestration_control --test orchestration_adversarial -- --test-threads=1
 
 # Full bridge
@@ -335,7 +336,32 @@ cargo test
 # Rust entry points:
 #   independent_node_mcp_sdk_interop
 #   independent_node_coordinator_conformance
+#   reference_coordinator_campaign_is_protocol_complete
 ```
+
+### Reference coordinator campaign
+
+`tests/mcp_sdk_interop/run_coordinator_campaign.mjs` is the reference
+protocol-level coordinator workflow. It uses the platform `fetch` API so it
+does not hide transport behavior behind the Rust compatibility client or an
+SDK. The campaign verifies:
+
+- bounded tool discovery, session ownership, and capacity reads;
+- shared submission, durable evidence reads, idempotent replay, and cursor
+  pagination with strictly increasing event sequences;
+- busy-turn non-cancelling steering, explicit cancellation, idle steering, and
+  queue idempotency;
+- isolated submission, bounded diff review, exact short-lived approval, and
+  promotion into a disposable Git workspace;
+- MCP session deletion/reconnect with durable run reads after reconnect.
+
+The Rust integration test launches the real loopback server and the Node
+campaign against an offline host, so the workflow is deterministic and safe
+for CI. To run the campaign against a desktop-started server, provide
+`GROKPTAH_MCP_URL`, `GROKPTAH_MCP_TOKEN`, `GROKPTAH_MCP_SESSION_ID`, and an
+explicitly disposable `GROKPTAH_MCP_WORKSPACE` that is allowlisted and has a
+clean Git baseline. The campaign writes one named file through isolated
+promotion and must never be pointed at a user's active workspace.
 
 Optional desktop (only if desktop paths change):
 

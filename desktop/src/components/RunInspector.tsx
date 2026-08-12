@@ -46,6 +46,11 @@ function runOriginLabel(run: DurableRun): string {
   return run.clientId || "Unknown origin";
 }
 
+function runExecutionLabel(run: DurableRun): string {
+  if (run.execution?.mode === "isolated_worktree") return "Isolated worktree";
+  return "Shared workspace";
+}
+
 export function RunInspector({
   runs,
   busy,
@@ -194,6 +199,12 @@ export function RunInspector({
                     title={`Run submitted by ${runOriginLabel(run)}`}
                   >
                     {runOriginLabel(run)}
+                  </span>
+                  <span
+                    className="run-execution-mode"
+                    title={`Execution mode: ${runExecutionLabel(run)}`}
+                  >
+                    {runExecutionLabel(run)}
                   </span>
                   <time dateTime={run.updatedAt}>{timeLabel(run.updatedAt)}</time>
                 </div>
