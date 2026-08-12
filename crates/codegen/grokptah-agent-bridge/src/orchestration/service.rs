@@ -1335,8 +1335,37 @@ impl OrchestrationService {
         execution_mode: RunExecutionMode,
         allow_queue: bool,
     ) -> Result<serde_json::Value, OrchError> {
+        self.submit_task_with_execution_mode_and_queue_parent(
+            auth,
+            request_id,
+            session_id,
+            workspace,
+            prompt,
+            bounds_json,
+            execution_mode,
+            allow_queue,
+            None,
+            "ptah_submit_task",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_task_with_execution_mode_and_queue_parent(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        prompt: String,
+        bounds_json: Option<serde_json::Value>,
+        execution_mode: RunExecutionMode,
+        allow_queue: bool,
+        retry_of: Option<&str>,
+        idempotency_tool: &str,
+    ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
-        let tool = "ptah_submit_task";
+        let tool = idempotency_tool;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -1344,6 +1373,7 @@ impl OrchestrationService {
             "bounds": bounds_json,
             "executionMode": execution_mode,
             "allowQueue": allow_queue,
+            "retryOf": retry_of,
         });
         let phash = hash_payload(&payload);
 
@@ -1434,6 +1464,7 @@ impl OrchestrationService {
             } else {
                 RunState::Running
             },
+            retry_of: retry_of.map(str::to_string),
             queue_position: None,
             bounds: bounds.clone(),
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),
@@ -1528,6 +1559,134 @@ impl OrchestrationService {
             self.pump_pending();
         }
 
+        Ok(response)
+    }
+
+    /// Explicitly create a bounded replacement for one interrupted run.
+    /// Restart recovery never resumes a model turn implicitly; the caller
+    /// supplies a fresh prompt and the new request is idempotent on its own.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_run(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        source_run_id: &str,
+        prompt: String,
+        bounds_json: Option<serde_json::Value>,
+        execution_mode: Option<RunExecutionMode>,
+        allow_queue: bool,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_retry_run";
+        let fail = |svc: &Self, error: OrchError| {
+            svc.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&workspace.display().to_string()),
+                &error,
+            );
+            error
+        };
+        let source = match self.authorize_run_request(session_id, workspace, source_run_id) {
+            Ok(run) => run,
+            Err(error) => return Err(fail(self, error)),
+        };
+        if source.state != RunState::Interrupted {
+            return Err(fail(
+                self,
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "only interrupted runs can be explicitly retried",
+                ),
+            ));
+        }
+
+        let previous_mode = source
+            .execution
+            .as_ref()
+            .map(|execution| execution.mode)
+            .unwrap_or(RunExecutionMode::Shared);
+        if let Some(requested_mode) = execution_mode {
+            if requested_mode != previous_mode {
+                return Err(fail(
+                    self,
+                    OrchError::new(
+                        OrchErrorCode::InvalidRequest,
+                        "a linked retry must preserve the interrupted run execution mode",
+                    ),
+                ));
+            }
+        }
+        let server_bounds = self.config.lock().bounds.clone();
+        if source.bounds.max_prompt_bytes > server_bounds.max_prompt_bytes
+            || source.bounds.max_rounds > server_bounds.max_rounds
+            || source.bounds.max_duration_ms > server_bounds.max_duration_ms
+        {
+            return Err(fail(
+                self,
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "interrupted run exceeds the current retry policy ceiling",
+                ),
+            ));
+        }
+        let bounds = match bounds_json {
+            Some(value) => {
+                let retry_bounds = merge_bounds(&source.bounds, Some(&value))
+                    .map_err(|error| fail(self, error))?;
+                Some(serde_json::to_value(retry_bounds).map_err(|error| {
+                    fail(
+                        self,
+                        OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                    )
+                })?)
+            }
+            None => Some(serde_json::to_value(&source.bounds).map_err(|error| {
+                fail(
+                    self,
+                    OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                )
+            })?),
+        };
+        let response = self
+            .submit_task_with_execution_mode_and_queue_parent(
+                auth,
+                request_id,
+                session_id,
+                workspace,
+                prompt,
+                bounds,
+                previous_mode,
+                allow_queue,
+                Some(source_run_id),
+                tool,
+            )
+            .await
+            .map_err(|error| fail(self, error))?;
+        if response["runId"].as_str().is_none() {
+            return Err(fail(
+                self,
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "retry submission returned no run_id",
+                ),
+            ));
+        }
+        let mut response = response;
+        response["sourceRunId"] = json!(source_run_id);
+        response["retryOf"] = json!(source_run_id);
+        response["requestId"] = json!(request_id);
+        self.audit(
+            tool,
+            Some(request_id),
+            Some(session_id),
+            Some(&source.workspace),
+            "accepted",
+            None,
+            "explicit replacement created for interrupted run",
+        );
         Ok(response)
     }
 

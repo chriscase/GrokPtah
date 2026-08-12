@@ -72,6 +72,9 @@ cargo test --test mcp_soak_hardening -- --nocapture --test-threads=1
 Crash recovery contract: reopening `OrchStore` marks unfinished runs
 **`interrupted`**; session prompt queues reload from the GrokPtah home.
 MCP transport sessions are **not** durable across process restart (re-`initialize`).
+No model turn resumes automatically. A coordinator may use `ptah_retry_run`
+with a fresh prompt to create one explicit, linked replacement after checking
+the interrupted handoff.
 
 
 ### Optional transport knobs (tests / soak only)
@@ -145,6 +148,7 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_get_handoff` | read | `run_id` |
 | `ptah_review_run` | read | `run_id` (completed isolated run only) |
 | `ptah_submit_task` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `bounds`, `execution_mode`, `allow_queue` |
+| `ptah_retry_run` | mutate | `request_id`, `session_id`, `workspace`, `run_id`, `prompt`; optional narrower `bounds`, matching `execution_mode`, `allow_queue` |
 | `ptah_approve_run` | mutate | exact run/session/workspace, source and final fingerprints, exact `changed_files`; optional bounded `ttl_ms` |
 | `ptah_promote_run` | mutate | `request_id`, exact run/session/workspace, `approval_id` |
 | `ptah_discard_run` | mutate | `request_id`, exact run/session/workspace |
@@ -177,6 +181,22 @@ Mutating tools take `request_id`:
 - Same `request_id` + same payload → **replay** prior receipt (no double effect).
 - Same `request_id` + different payload → **conflict** (fail closed).
 - Safe after mid-request disconnect: retry with the same `request_id`.
+
+### `ptah_retry_run` (explicit restart recovery)
+
+- The source `run_id` must belong to the supplied Build session and allowlisted
+  workspace, and its durable state must be **`interrupted`**.
+- The caller must provide a fresh prompt. The original prompt is not retained
+  for automatic replay, which keeps durable retention bounded and avoids
+  silently repeating a partially executed task.
+- The replacement preserves the source execution mode. Bounds may be omitted
+  to reuse the source bounds or supplied to narrow them; server ceilings still
+  apply. `allow_queue` uses the same bounded global admission scheduler.
+- The new durable run exposes `retryOf` and the response exposes
+  `sourceRunId`; the interrupted source record is never changed back to live.
+- The mutation is idempotent and conflict-detecting on its new `request_id`.
+  Cross-session, workspace-mismatched, non-interrupted, or mode-changing
+  requests fail closed.
 
 ### `ptah_steer` (non-cancelling)
 
@@ -221,8 +241,8 @@ coordinator wants a bounded admission queue for capacity or session contention.
 - Queue memory is process-local by design. On process restart, durable queued
   and running records are marked `interrupted`; their in-memory prompts are not
   resumed automatically. After reconnecting, a coordinator should inspect the
-  durable record and submit a replacement task with a new request id only when
-  it has decided that retrying is safe.
+  durable record and use `ptah_retry_run` with a new request id only when it
+  has decided that retrying is safe.
 
 ### Isolated review and promotion
 

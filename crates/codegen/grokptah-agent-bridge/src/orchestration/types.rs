@@ -336,6 +336,9 @@ pub struct RunRecord {
     pub request_id: String,
     pub client_id: Option<String>,
     pub state: RunState,
+    /// The interrupted run this explicit replacement was created from.
+    #[serde(default)]
+    pub retry_of: Option<String>,
     /// One-based position in the bounded host-global admission queue.
     /// Cleared when the run starts, is cancelled, or is interrupted on restart.
     #[serde(default)]
@@ -566,6 +569,7 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_get_handoff",
     "ptah_review_run",
     "ptah_submit_task",
+    "ptah_retry_run",
     "ptah_approve_run",
     "ptah_promote_run",
     "ptah_discard_run",
