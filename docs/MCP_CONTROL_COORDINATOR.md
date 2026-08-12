@@ -418,6 +418,8 @@ SDK. The campaign verifies:
   pagination with strictly increasing event sequences;
 - busy-turn non-cancelling steering, explicit cancellation, idle steering, and
   queue idempotency;
+- cross-session and cross-workspace mutation rejection, stale approval
+  rejection, approval-scope conflicts, and isolated discard cleanup;
 - isolated submission, bounded diff review, exact short-lived approval, and
   promotion into a disposable Git workspace;
 - MCP session deletion/reconnect with durable run reads after reconnect.
@@ -425,9 +427,11 @@ SDK. The campaign verifies:
 The Rust integration test launches the real loopback server and the Node
 campaign against an offline host, so the workflow is deterministic and safe
 for CI. To run the campaign against a desktop-started server, provide
-`GROKPTAH_MCP_URL`, `GROKPTAH_MCP_TOKEN`, `GROKPTAH_MCP_SESSION_ID`, and an
-explicitly disposable `GROKPTAH_MCP_WORKSPACE` that is allowlisted and has a
-clean Git baseline. The campaign writes one named file through isolated
+`GROKPTAH_MCP_URL`, `GROKPTAH_MCP_TOKEN`, `GROKPTAH_MCP_SESSION_ID`,
+`GROKPTAH_MCP_OTHER_SESSION_ID`, `GROKPTAH_MCP_DISCARD_SESSION_ID`,
+`GROKPTAH_MCP_WORKSPACE`, and `GROKPTAH_MCP_DISCARD_WORKSPACE`. Both
+workspaces must be explicitly disposable, allowlisted, and have clean Git
+baselines. The campaign writes one named file through isolated
 promotion and must never be pointed at a user's active workspace.
 
 Optional desktop (only if desktop paths change):

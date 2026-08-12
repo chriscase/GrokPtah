@@ -55,6 +55,26 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
         ],
         workspace.path(),
     );
+    let discard_workspace = tempdir().unwrap();
+    std::fs::write(
+        discard_workspace.path().join("README.md"),
+        "discard campaign baseline\n",
+    )
+    .unwrap();
+    git(&["init"], discard_workspace.path());
+    git(&["add", "README.md"], discard_workspace.path());
+    git(
+        &[
+            "-c",
+            "user.name=GrokPtah Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "baseline",
+        ],
+        discard_workspace.path(),
+    );
     set_grokptah_home_override(Some(home.path().join(".grokptah")));
 
     let host = AgentHost::create(HostConfig {
@@ -64,6 +84,12 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
     host.start().unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, workspace.path()).unwrap();
+    let other_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(other_session.id, workspace.path())
+        .unwrap();
+    let discard_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(discard_session.id, discard_workspace.path())
+        .unwrap();
     let interrupted_run_id = "coordinator-interrupted-source";
     let store = OrchStore::open(home.path().join("orch")).unwrap();
     service_store_seed(&store, interrupted_run_id, session.id, workspace.path());
@@ -73,7 +99,10 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
         store,
         OrchestrationConfig {
             bearer_token: "coordinator-campaign-token".into(),
-            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            allowlist: WorkspaceAllowlist::new([
+                workspace.path().to_path_buf(),
+                discard_workspace.path().to_path_buf(),
+            ]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
         },
@@ -87,7 +116,16 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
         .env("GROKPTAH_MCP_URL", format!("http://{}/mcp", server.addr))
         .env("GROKPTAH_MCP_TOKEN", "coordinator-campaign-token")
         .env("GROKPTAH_MCP_SESSION_ID", session.id.to_string())
+        .env(
+            "GROKPTAH_MCP_OTHER_SESSION_ID",
+            other_session.id.to_string(),
+        )
+        .env(
+            "GROKPTAH_MCP_DISCARD_SESSION_ID",
+            discard_session.id.to_string(),
+        )
         .env("GROKPTAH_MCP_WORKSPACE", workspace.path())
+        .env("GROKPTAH_MCP_DISCARD_WORKSPACE", discard_workspace.path())
         .env("GROKPTAH_MCP_INTERRUPTED_RUN_ID", interrupted_run_id)
         .output()
         .await
@@ -105,13 +143,19 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
         "boundedToolCatalog",
         "sharedSubmit",
         "submitIdempotency",
+        "workspaceMismatchFailClosed",
         "cursorReplayNoGaps",
         "busySteerNonCancelling",
+        "crossSessionRunOwnershipFailClosed",
+        "crossWorkspaceRunOwnershipFailClosed",
         "explicitCancel",
         "isolatedRun",
         "boundedDiffReview",
         "scopedApproval",
+        "staleApprovalFailClosed",
+        "approvalScopeConflictFailClosed",
         "scopedPromotion",
+        "isolatedDiscard",
         "idleSteerQueues",
         "queueIdempotency",
         "sessionReconnectFailClosed",
@@ -123,11 +167,6 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
             "failed coordinator check {check}: {report}"
         );
     }
-    assert!(
-        workspace.path().join("coordinator-campaign.txt").is_file(),
-        "promotion must apply the isolated file to the source workspace"
-    );
-
     server.stop();
     set_grokptah_home_override(None);
     match previous_offline {
