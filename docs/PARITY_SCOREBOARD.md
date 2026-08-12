@@ -85,7 +85,33 @@ Model: **grok-4.5** · max_turns=3 · same fixtures/prompts
 | rename_keep_display_label | ✓ | ✓ | ✓ | **YES** |
 | multi_bug_cascade_undoc | ✓ | ✓ | ✓ | **YES** |
 
-Evidence under goal scratch `handoff-proof/` + `dual-side/`. **Do not claim full 14-task suite ≥ Build** without a full dual-side run.
+### Full dual-side baselines (14 tasks, PR head `fe69fbb`)
+
+Model: **grok-4.5** · identical fixtures/prompts/max_turns · YOLO both sides
+
+| Run | Ptah oracle | Ptah verified | CLI oracle | Ptah ≥ CLI (success then tool_errors) |
+|-----|------------:|--------------:|-----------:|:--------------------------------------|
+| baseline-1 | **14/14** | 13/14 | **14/14** | NO (tool_errors 7 vs 0) |
+| baseline-2 | **13/14** | 11/14 | **14/14** | NO (oracle + tool_errors) |
+
+#### Per-task variance (oracle)
+
+| Task | R1 Ptah | R1 CLI | R2 Ptah | R2 CLI | notes |
+|------|:-------:|:------:|:-------:|:------:|-------|
+| multi_bug_cascade_undoc | ✓ | ✓ | ✗ | ✓ | **Ptah flaky** under max_turns=3 |
+| rename_keep_display_label | ✓ | ✓ | ✓ | ✓ | stable oracle; verified flaked R2 |
+| long_horizon_trap_bug99 | ✓ | ✓ | ✓ | ✓ | oracle stable; verified false both runs |
+| all other tasks (11) | ✓ | ✓ | ✓ | ✓ | stable |
+
+#### Residual gaps (honest)
+
+1. **#187 multi_bug** still flaky on full suite (pass R1, fail R2 — explore-only path without write_files before budget end).
+2. **Verified signal** not always green when oracle is: long_horizon both runs; rename R2.
+3. **tool_errors** higher on Ptah than CLI (definition of ≥ when success ties).
+4. **#209** unit-verified on main; no live intentional-noop injection this cycle.
+5. **Do not claim full suite ≥ Grok Build.**
+
+Evidence: goal scratch `baselines/run1/`, `baselines/run2/`, `baselines/COMPARISON.json`.
 
 ### Prior cycle — turn-efficiency (#187/#188)
 
