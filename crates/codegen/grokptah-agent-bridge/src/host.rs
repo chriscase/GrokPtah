@@ -12,7 +12,10 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::completion::{build_evidence, observe_updates, CompletionObservations, CompletionUsage};
+use crate::completion::{
+    build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
+    CompletionUsage,
+};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
@@ -1721,6 +1724,24 @@ impl AgentHostHandle {
         }
     }
 
+    /// Replace the most recent assistant transcript entry (used when evidence-
+    /// backed handoff enrichment extends a weak model final).
+    fn replace_last_assistant_text(&self, session_id: Uuid, text: &str) {
+        let mut g = self.inner.lock();
+        if let Some(session) = g.sessions.get_mut(&session_id) {
+            if let Some(entry) = session
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.role == "assistant")
+            {
+                entry.text = text.to_string();
+            } else {
+                session.transcript.push(TranscriptEntry::assistant(text));
+            }
+        }
+    }
+
     pub fn subagents(&self) -> Vec<SubagentInfo> {
         self.inner.lock().subagents.clone()
     }
@@ -2889,23 +2910,78 @@ impl AgentHostHandle {
 
         let cancelled = cancel.is_cancelled();
         let end_seq = event_tx.current_seq();
-        let observations = match event_tx.read_range_all(start_seq, Some(end_seq), Some(session_id))
-        {
-            Ok(entries) => {
-                let updates = entries
-                    .iter()
-                    .map(|entry| &entry.update)
-                    .collect::<Vec<_>>();
-                observe_updates(&updates)
+        let (observations, mut changed_paths, tests_passed) =
+            match event_tx.read_range_all(start_seq, Some(end_seq), Some(session_id)) {
+                Ok(entries) => {
+                    let updates = entries
+                        .iter()
+                        .map(|entry| &entry.update)
+                        .collect::<Vec<_>>();
+                    let observations = observe_updates(&updates);
+                    let mut paths = Vec::new();
+                    for update in &updates {
+                        if let SessionUpdate::FileEdit { path, .. } = update {
+                            if !paths.iter().any(|p: &String| p == path) {
+                                paths.push(path.clone());
+                            }
+                        }
+                    }
+                    let tests_passed = if observations.tests_observed == 0 {
+                        None
+                    } else if observations.tests_failed > 0 || observations.tests_incomplete > 0 {
+                        Some(false)
+                    } else if observations.tests_passed > 0 {
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    (observations, paths, tests_passed)
+                }
+                Err(_) => (CompletionObservations::default(), Vec::new(), None),
+            };
+        // Fall back to host-recorded edits when the journal page expired or
+        // FileEdit events were filtered out of the turn window.
+        if changed_paths.is_empty() {
+            let g = self.inner.lock();
+            for path in &g.edited_files {
+                if !changed_paths.iter().any(|p| p == path) {
+                    changed_paths.push(path.clone());
+                }
             }
-            Err(_) => CompletionObservations::default(),
-        };
+        }
         let usage_after = self.session_usage_snapshot(session_id);
         let usage = CompletionUsage {
             prompt_tokens: usage_after.0.saturating_sub(usage_before.0),
             completion_tokens: usage_after.1.saturating_sub(usage_before.1),
             total_tokens: usage_after.2.saturating_sub(usage_before.2),
             requests: usage_after.3.saturating_sub(usage_before.3),
+        };
+        // Enrich weak model finals with observed paths/test outcomes so the
+        // terminal handoff and transcript always report what actually happened.
+        let result = match result {
+            Ok(reply) => {
+                let incomplete = is_incomplete_stop_message(&reply);
+                let enriched =
+                    enrich_terminal_handoff(&reply, &changed_paths, tests_passed, incomplete);
+                if enriched != reply {
+                    // Always rewrite the last assistant line so transcript
+                    // consumers (live_eval handoff) see the evidence trailer.
+                    self.replace_last_assistant_text(session_id, &enriched);
+                    // Append-only JSONL cannot mutate prior lines — rewrite so
+                    // disk reload agrees with memory.
+                    self.persist_session_rewrite(session_id);
+                    let trailer = enriched
+                        .strip_prefix(reply.trim())
+                        .map(str::trim_start)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("");
+                    if !trailer.is_empty() {
+                        emit_message(&event_tx, session_id, trailer);
+                    }
+                }
+                Ok(enriched)
+            }
+            Err(e) => Err(e),
         };
         let outcome = if cancelled {
             "cancelled"

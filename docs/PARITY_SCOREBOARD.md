@@ -66,21 +66,26 @@ Evidence: scratch `proof-1/` (pre-reverify coaching), `proof-2/` + `proof-3/` (p
 - Cargo-failure coaching lists distinct failing test names and requires batch fix + re-run
 - **Re-verify gate:** after a cargo failure under tight budgets, do not accept Final until cargo is green again; post-edit coaching forces re-run
 - Recovery grace allows edit **+ shell** so the re-run can happen in the bounded extra step
-- #209 stationarity detector already on main (`IdenticalToolCallRun`, true-noop stop at 4, nudge at 8) — unit tests green; no behavior change this PR
+- **Evidence-backed terminal handoff:** `enrich_terminal_handoff` appends observed changed paths + cargo result when model/stop text omits them (including recovery-stop finals); live_eval quality findings clear
+- #209 stationarity detector already on main (`IdenticalToolCallRun`, true-noop stop at 4, nudge at 8) — unit tests green
 
-### Focused gap proofs (Ptah bridge only)
+### Focused gap proofs (Ptah bridge)
 
-| Run | rename oracle | rename verified | multi_bug oracle | multi_bug verified |
-|-----|:-------------:|:---------------:|:----------------:|:------------------:|
-| proof-1 (pre-reverify) | ✓ | ✓ | ✓ | ✗ (no post-edit cargo re-run) |
-| proof-2 | ✓ | ✓ | ✓ | ✓ |
-| proof-3 (pre force-edit-shell) | ✓ | ✓ | ✗ | ✗ (explore-until-Final, no edits) |
-| **proof-4 (final)** | ✓ | ✓ | ✓ | ✓ |
-| **proof-5 (final)** | ✓ | ✓ | ✓ | ✓ |
+| Run | rename o/v | multi_bug o/v | handoff quality |
+|-----|:----------:|:-------------:|:---------------:|
+| proof-6 (handoff fix) | ✓/✓ | ✓/✓ | **[]** |
+| proof-7 (handoff fix) | ✓/✓ | ✓/✓ | **[]** |
 
-**Acceptance for #223 / #187 (focused):** two consecutive Ptah runs on final HEAD both pass oracle + verified under max_turns=3 without raising budgets.
+### Dual-side focused baseline (proof-7 Ptah vs Grok CLI)
 
-Handoff residual (quality findings only, not oracle failures): short finals sometimes omit change-path wording (`handoff_missing_change_summary`). Guidance + example shape updated; not claimed fully closed.
+Model: **grok-4.5** · max_turns=3 · same fixtures/prompts
+
+| Task | Ptah oracle | Ptah verified | CLI oracle | Ptah ≥ CLI |
+|------|:-----------:|:-------------:|:----------:|:----------:|
+| rename_keep_display_label | ✓ | ✓ | ✓ | **YES** |
+| multi_bug_cascade_undoc | ✓ | ✓ | ✓ | **YES** |
+
+Evidence under goal scratch `handoff-proof/` + `dual-side/`. **Do not claim full 14-task suite ≥ Build** without a full dual-side run.
 
 ### Prior cycle — turn-efficiency (#187/#188)
 

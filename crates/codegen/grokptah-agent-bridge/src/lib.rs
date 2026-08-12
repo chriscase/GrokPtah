@@ -65,7 +65,8 @@ pub use memory::{
 };
 
 pub use completion::{
-    CompletionClaims, CompletionEvidence, CompletionObservations, CompletionUsage,
+    enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
+    CompletionUsage,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
