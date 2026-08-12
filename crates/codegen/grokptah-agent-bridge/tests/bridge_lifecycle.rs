@@ -1486,7 +1486,7 @@ async fn rewind_files_isolated_per_session() {
 }
 
 #[tokio::test]
-async fn session_load_rebinds_missing_cwd() {
+async fn session_load_preserves_missing_cwd_without_rebinding() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     let host = AgentHost::create(HostConfig {
@@ -1501,13 +1501,41 @@ async fn session_load_rebinds_missing_cwd() {
         // session_set_cwd only works for existing dirs — set then drop dir
         let live = tempfile::tempdir().unwrap();
         host.session_set_cwd(s.id, live.path()).unwrap();
+        host.set_project_cwd(dir.path()).unwrap();
         drop(live); // delete
     }
-    // Project still open at dir — load should rebind
+    // Project is still open at dir, but loading must preserve the missing
+    // session workspace instead of silently changing repository ownership.
     let sum = host.session_load(s.id).unwrap();
-    assert!(
-        std::path::Path::new(&sum.cwd).is_dir(),
-        "rebound cwd must exist: {}",
-        sum.cwd
+    assert_eq!(sum.workspace_status.as_str(), "missing");
+    assert!(!std::path::Path::new(&sum.cwd).is_dir());
+    assert_eq!(
+        host.status().project_cwd,
+        Some(dir.path().display().to_string())
     );
+}
+
+#[tokio::test]
+async fn missing_build_workspace_blocks_prompt_until_explicit_rebind() {
+    let _iso = IsolatedHome::install();
+    let live = tempfile::tempdir().unwrap();
+    let deleted = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(live.path()).unwrap();
+    let session = host.session_new().unwrap();
+    host.session_set_cwd(session.id, deleted.path()).unwrap();
+    drop(deleted);
+
+    let error = host
+        .session_prompt(session.id, "list files".into())
+        .await
+        .expect_err("deleted workspace must fail closed");
+    assert!(error.to_string().contains("workspace is missing"));
+
+    let rebound = host.session_set_cwd(session.id, live.path()).unwrap();
+    assert_eq!(rebound.workspace_status.as_str(), "ready");
 }

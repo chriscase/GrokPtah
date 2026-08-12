@@ -33,7 +33,10 @@ use crate::prompt_queue::{
     SessionPromptQueue, SteeringReceipt,
 };
 use crate::search_engine::{self, SearchHit, SearchQuery};
-use crate::session::{Session, SessionCompletion, SessionKind, SessionSummary, TranscriptEntry};
+use crate::session::{
+    workspace_status, Session, SessionCompletion, SessionKind, SessionSummary, TranscriptEntry,
+    WorkspaceStatus,
+};
 use crate::session_store::{self, WorkspaceChrome};
 use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
@@ -561,31 +564,13 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("unknown session"))?;
             (s.kind, s.cwd.clone())
         };
-        // #167: rebind cwd when the stored path moved (project open or host project).
-        if kind == SessionKind::Build {
-            if !cwd.is_dir() {
-                let rebind = {
-                    let g = self.inner.lock();
-                    g.project_cwd
-                        .clone()
-                        .filter(|p| p.is_dir())
-                        .or_else(|| std::env::current_dir().ok().filter(|p| p.is_dir()))
-                };
-                if let Some(new_cwd) = rebind {
-                    let mut g = self.inner.lock();
-                    if let Some(s) = g.sessions.get_mut(&id) {
-                        s.cwd = new_cwd.clone();
-                        s.updated_at = Utc::now();
-                    }
-                    drop(g);
-                    self.persist_session_meta_only(id);
-                    let _ = self.set_project_cwd(&new_cwd);
-                }
-            } else {
-                let current = self.inner.lock().project_cwd.clone();
-                if current.as_ref() != Some(&cwd) {
-                    let _ = self.set_project_cwd(&cwd);
-                }
+        // A missing session workspace is recoverable, not permission to run in
+        // whichever project happens to be open. Rebinding is explicit through
+        // session_set_cwd, normally driven by the desktop folder picker.
+        if kind == SessionKind::Build && workspace_status(&cwd) == WorkspaceStatus::Ready {
+            let current = self.inner.lock().project_cwd.clone();
+            if current.as_ref() != Some(&cwd) {
+                let _ = self.set_project_cwd(&cwd);
             }
         }
         let summary = {
@@ -2798,6 +2783,7 @@ impl AgentHostHandle {
         reservation_owner: Option<&str>,
     ) -> Result<String> {
         self.ensure_transcript_loaded(session_id)?;
+        self.ensure_build_workspace_ready(session_id)?;
         let (cwd, model, effort, plan_mode, kind, cancel, event_tx) = {
             let mut g = self.inner.lock();
             if !g.running {
@@ -2969,6 +2955,28 @@ impl AgentHostHandle {
         let _ = self.persist_prompt_queue(session_id);
         busy_guard.armed = false;
         final_result
+    }
+
+    fn ensure_build_workspace_ready(&self, session_id: Uuid) -> Result<()> {
+        let (kind, cwd) = {
+            let g = self.inner.lock();
+            let session = g
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            (session.kind, session.cwd.clone())
+        };
+        if kind == SessionKind::Build {
+            match workspace_status(&cwd) {
+                WorkspaceStatus::Ready => {}
+                status => bail!(
+                    "session workspace is {}: {}; choose a working directory before sending a prompt",
+                    status.as_str(),
+                    cwd.display()
+                ),
+            }
+        }
+        Ok(())
     }
 
     fn persist_prompt_queue(&self, session_id: Uuid) -> Result<()> {
