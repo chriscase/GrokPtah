@@ -13,6 +13,8 @@ import {
   type SessionUpdate,
   type SubagentInfo,
   type TranscriptItem,
+  type DurableRun,
+  type WorkspaceStatus,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
 import {
@@ -27,6 +29,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
 import { PromptQueuePanel } from "./components/PromptQueuePanel";
+import { RunInspector } from "./components/RunInspector";
 import { SubagentCard } from "./components/SubagentCard";
 import {
   appendDeny,
@@ -92,12 +95,14 @@ function emptyTab(
   title = "New session",
   kind: SessionKind = "build",
   cwd?: string,
+  workspaceStatus: WorkspaceStatus = "ready",
 ): SessionTab {
   return {
     id,
     title,
     kind,
     cwd,
+    workspaceStatus,
     transcript: [],
     busy: false,
     plan: null,
@@ -291,6 +296,8 @@ export default function App() {
   const [skills, setSkills] = useState<any[]>([]);
   const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
   const [bgTasks, setBgTasks] = useState<any[]>([]);
+  const [runs, setRuns] = useState<DurableRun[]>([]);
+  const [runsBusy, setRunsBusy] = useState(false);
   const [hooksPreview, setHooksPreview] = useState<string | null>(null);
   const [rules, setRules] = useState<string[]>([]);
   const [product, setProduct] = useState({
@@ -329,6 +336,28 @@ export default function App() {
   const splitOk = maxDocks >= 2;
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
   const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
+
+  const refreshRuns = useCallback(async () => {
+    if (!activeSessionId) {
+      setRuns([]);
+      return;
+    }
+    setRunsBusy(true);
+    try {
+      setRuns(await api.runList(activeSessionId));
+    } catch (error) {
+      console.warn("durable run refresh failed", error);
+    } finally {
+      setRunsBusy(false);
+    }
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    if (rightTab !== "tasks" || !activeSessionId) return;
+    void refreshRuns();
+    const timer = window.setInterval(() => void refreshRuns(), 1200);
+    return () => window.clearInterval(timer);
+  }, [activeSessionId, refreshRuns, rightTab]);
 
   // Narrow windows need the stage first; rails remain available through the
   // header toggles and open as overlays when explicitly requested.
@@ -419,6 +448,8 @@ export default function App() {
                   title: summary.title,
                   kind: summary.kind ?? t.kind,
                   cwd: summary.cwd ?? t.cwd,
+                  workspaceStatus:
+                    summary.workspace_status ?? t.workspaceStatus ?? "ready",
                 }
               : t,
           );
@@ -430,6 +461,7 @@ export default function App() {
             summary.title || "New session",
             summary.kind ?? "build",
             summary.cwd,
+            summary.workspace_status ?? "ready",
           ),
         ];
       });
@@ -455,6 +487,11 @@ export default function App() {
               title: loaded.title || summary.title,
               kind: loaded.kind ?? summary.kind ?? t.kind,
               cwd: loaded.cwd || summary.cwd || t.cwd,
+              workspaceStatus:
+                loaded.workspace_status ??
+                summary.workspace_status ??
+                t.workspaceStatus ??
+                "ready",
               completionEvidence: restoredCompletion?.evidence ?? null,
               completionTurnId: restoredCompletion?.turn_id ?? null,
               transcript: interrupted
@@ -472,20 +509,35 @@ export default function App() {
             };
           }),
         );
-        if (loaded.cwd) projectCwdHintRef.current = loaded.cwd;
+        if (loaded.cwd && loaded.workspace_status === "ready") {
+          projectCwdHintRef.current = loaded.cwd;
+        }
         setStatus((st) =>
           st
             ? {
                 ...st,
                 active_session: loaded.id,
-                project_cwd: loaded.cwd || st.project_cwd,
+                project_cwd:
+                  loaded.workspace_status === "ready"
+                    ? loaded.cwd || st.project_cwd
+                    : st.project_cwd,
               }
             : st,
         );
         // #152: show historical subagent summary after reopen (host loads from disk).
         setSubagents(await api.subagentsList());
-      } catch {
-        /* offline / empty */
+      } catch (error) {
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.id === summary.id
+              ? {
+                  ...t,
+                  workspaceStatus: summary.workspace_status ?? t.workspaceStatus,
+                  activity: errorActivity(String(error)),
+                }
+              : t,
+          ),
+        );
       }
     },
     [],
@@ -547,7 +599,6 @@ export default function App() {
       if (s.kind === "chat" || s.kind === "build") {
         setWorkspaceMode(s.kind);
       }
-      await api.sessionLoad(s.id);
       await openTab(s, true);
       setSessionBrowserOpen(false);
       await refreshSessions();
@@ -861,6 +912,18 @@ export default function App() {
         const updated = await api.pickSessionFolder(sessionId);
         if (!updated) return;
         if (updated.cwd) projectCwdHintRef.current = updated.cwd;
+        setTabs((prev) =>
+          prev.map((tab) =>
+            tab.id === sessionId
+              ? {
+                  ...tab,
+                  cwd: updated.cwd,
+                  workspaceStatus: updated.workspace_status ?? "ready",
+                  activity: idleActivity(),
+                }
+              : tab,
+          ),
+        );
         await refreshSessions();
         await refreshChrome();
         try {
@@ -1770,6 +1833,7 @@ export default function App() {
       if (tab === "tasks") {
         setSubagents(await api.subagentsList());
         setBgTasks(await api.backgroundTasks());
+        await refreshRuns();
       }
       if (tab === "rules") setRules(await api.projectRules());
     } catch (e) {
@@ -2284,6 +2348,7 @@ export default function App() {
                     showClose={docks.length > 1}
                     onClosePane={undockSession}
                     onFocusSession={focusSession}
+                    onSetWorkingDirectory={setWorkingDirectory}
                     cwd={dockTab.cwd ?? sessions.find((s) => s.id === dockTab.id)?.cwd}
                     titlePeers={[
                       ...sessions,
@@ -3027,6 +3092,11 @@ export default function App() {
 
         {rightTab === "tasks" && (
           <>
+            <RunInspector
+              runs={runs}
+              busy={runsBusy}
+              onRefresh={() => void refreshRuns()}
+            />
             <div className="section-title">Multi-agent</div>
             <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 0.5rem" }}>
               Parallel children (explore / general-purpose / plan) — not a flat

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, home_override_serial, set_grokptah_home_override, AgentHost,
-    HostConfig, PermissionDecision, SessionUpdate,
+    HostConfig, PermissionDecision, RunState, SessionUpdate,
 };
 use tokio::time::timeout;
 
@@ -151,6 +151,14 @@ async fn session_lifecycle_prompt_streams_message() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].evidence.status, "unverified");
     let turn_id = history[0].turn_id;
+    let runs = host.list_session_runs(session.id).unwrap();
+    assert_eq!(runs.len(), 1, "Build turn should create one durable run");
+    assert_eq!(runs[0].state, RunState::Completed);
+    assert_eq!(runs[0].client_id.as_deref(), Some("desktop"));
+    assert_eq!(
+        runs[0].aggregates.verification,
+        Some(history[0].evidence.clone())
+    );
     drop(host);
 
     let restored_host = AgentHost::create(HostConfig::default());
@@ -160,6 +168,10 @@ async fn session_lifecycle_prompt_streams_message() {
     assert_eq!(restored.len(), 1);
     assert_eq!(restored[0].turn_id, turn_id);
     assert_eq!(restored[0].evidence.status, "unverified");
+    restored_host.ensure_orchestration_store().unwrap();
+    let restored_runs = restored_host.list_session_runs(session.id).unwrap();
+    assert_eq!(restored_runs.len(), 1);
+    assert_eq!(restored_runs[0].state, RunState::Completed);
 }
 
 #[tokio::test]
@@ -1486,7 +1498,7 @@ async fn rewind_files_isolated_per_session() {
 }
 
 #[tokio::test]
-async fn session_load_rebinds_missing_cwd() {
+async fn session_load_preserves_missing_cwd_without_rebinding() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     let host = AgentHost::create(HostConfig {
@@ -1501,13 +1513,41 @@ async fn session_load_rebinds_missing_cwd() {
         // session_set_cwd only works for existing dirs — set then drop dir
         let live = tempfile::tempdir().unwrap();
         host.session_set_cwd(s.id, live.path()).unwrap();
+        host.set_project_cwd(dir.path()).unwrap();
         drop(live); // delete
     }
-    // Project still open at dir — load should rebind
+    // Project is still open at dir, but loading must preserve the missing
+    // session workspace instead of silently changing repository ownership.
     let sum = host.session_load(s.id).unwrap();
-    assert!(
-        std::path::Path::new(&sum.cwd).is_dir(),
-        "rebound cwd must exist: {}",
-        sum.cwd
+    assert_eq!(sum.workspace_status.as_str(), "missing");
+    assert!(!std::path::Path::new(&sum.cwd).is_dir());
+    assert_eq!(
+        host.status().project_cwd,
+        Some(dir.path().display().to_string())
     );
+}
+
+#[tokio::test]
+async fn missing_build_workspace_blocks_prompt_until_explicit_rebind() {
+    let _iso = IsolatedHome::install();
+    let live = tempfile::tempdir().unwrap();
+    let deleted = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(live.path()).unwrap();
+    let session = host.session_new().unwrap();
+    host.session_set_cwd(session.id, deleted.path()).unwrap();
+    drop(deleted);
+
+    let error = host
+        .session_prompt(session.id, "list files".into())
+        .await
+        .expect_err("deleted workspace must fail closed");
+    assert!(error.to_string().contains("workspace is missing"));
+
+    let rebound = host.session_set_cwd(session.id, live.path()).unwrap();
+    assert_eq!(rebound.workspace_status.as_str(), "ready");
 }

@@ -169,11 +169,45 @@ async fn workspace_mismatch_fail_closed() {
         },
     );
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let listed = orch.list_sessions(&auth).unwrap();
+    assert_eq!(listed["sessions"][0]["workspaceStatus"], "ready");
     let err = orch
         .queue_prompt(&auth, "r", session.id, other.path(), "x".into(), false)
         .await
         .unwrap_err();
     assert_eq!(err.code.as_str(), "workspace_mismatch");
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn missing_session_workspace_is_not_controllable() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    let claimed = ws.path().to_path_buf();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, &claimed).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        EventBus::new(64),
+        OrchStore::open(home.path().join("orch")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([claimed.clone()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    drop(ws);
+
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let err = orch
+        .queue_prompt(&auth, "missing-ws", session.id, &claimed, "x".into(), false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code.as_str(), "workspace_mismatch");
+    assert!(host.session_queue_list(session.id).unwrap().is_empty());
     set_grokptah_home_override(None);
 }
 

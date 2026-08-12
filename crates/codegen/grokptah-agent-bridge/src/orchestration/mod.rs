@@ -8,6 +8,7 @@ mod store;
 mod types;
 
 pub use authz::{canonical_workspace, constant_time_eq, AuthContext, WorkspaceAllowlist};
+pub(crate) use service::apply_run_aggregate;
 pub use service::{OrchestrationConfig, OrchestrationService};
 pub use store::OrchStore;
 pub use types::{

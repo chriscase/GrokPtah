@@ -58,6 +58,10 @@ pub use textutil::{truncate_at_char_boundary, truncate_with_marker};
 
 /// Coding-agent efficiency guidance (system prompt fragment for multi-file / multi-bug turns).
 pub use host_helpers::coding_agent_efficiency_guidance;
+/// Post-cargo tight-budget tool gate helpers (#187 multi_bug burn prevention).
+pub use host_helpers::{
+    is_edit_or_shell_tool, is_post_cargo_explore_only_burn, should_skip_tool_after_cargo_failure,
+};
 
 pub use memory::{
     inject_context as memory_inject_context, list_facts as memory_list_facts,
@@ -65,7 +69,8 @@ pub use memory::{
 };
 
 pub use completion::{
-    CompletionClaims, CompletionEvidence, CompletionObservations, CompletionUsage,
+    enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
+    CompletionUsage,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
@@ -88,7 +93,9 @@ pub use orchestration::{
 };
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use search_engine::{SearchHit, SearchQuery};
-pub use session::{SessionCompletion, SessionKind, SessionSummary, TranscriptEntry};
+pub use session::{
+    SessionCompletion, SessionKind, SessionSummary, TranscriptEntry, WorkspaceStatus,
+};
 pub use spawn_env::{scrub_std_command, scrub_tokio_command, CONTROL_SECRET_ENV_KEYS};
 pub use types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
