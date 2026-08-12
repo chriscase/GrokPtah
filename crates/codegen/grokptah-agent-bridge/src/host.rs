@@ -17,14 +17,14 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     build_agent_messages, build_compact_summary, call_xai_agent_step, call_xai_chat,
-    cargo_test_output_failed, coding_agent_tools, emit_message, emit_thought,
-    filter_tools_edit_and_shell, filter_tools_edit_only, is_incomplete_stop_message,
-    is_round_limit_stop_message, is_true_noop_tool_step, normalize_sandbox_profile,
-    offline_plan_steps, parse_effort_arg, propose_plan_with_model, push_assistant, push_thought,
-    push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
-    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
-    surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
-    IdenticalToolCallRun, McpToolIndex,
+    cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
+    cargo_test_reverify_coaching, coding_agent_tools, emit_message, emit_thought,
+    filter_tools_edit_and_shell, is_incomplete_stop_message, is_round_limit_stop_message,
+    is_true_noop_tool_step, normalize_sandbox_profile, offline_plan_steps, parse_effort_arg,
+    propose_plan_with_model, push_assistant, push_thought, push_tool,
+    recovery_round_limit_stop_message, resolve_turn_max_rounds, round_limit_stop_message,
+    sandbox_blocks_shell, sandbox_is_readonly, surface_rate_limit_or_error, tool_kind,
+    tool_step_signature, tool_web_fetch, AgentStep, IdenticalToolCallRun, McpToolIndex,
 };
 use crate::local_tools;
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
@@ -3890,33 +3890,34 @@ impl AgentHostHandle {
                 }));
             }
 
-            // Budget-aware coaching when max_agent_rounds is tight (#187/#188).
+            // Budget-aware coaching when max_agent_rounds is tight (#187/#188/#223).
             let remaining = if in_recovery_grace {
                 1
             } else {
                 max_rounds.saturating_sub(round) + 1
             };
-            let tools_this_round = if in_recovery_grace {
+            // After any observed cargo failure under a tight budget, stop burning
+            // steps on list/grep/read — force edit + shell until cargo is green.
+            let force_edit_shell =
+                max_rounds <= 8 && (in_recovery_grace || remaining == 1 || test_failure_needs_edit);
+            let tools_this_round = if force_edit_shell {
+                let coach = if in_recovery_grace {
+                    "TEST RECOVERY: the model budget ended with unresolved cargo test failures (or edits that were not re-verified). Use failures and source already in context. In this one bounded recovery step: apply any remaining fixes with write_files and re-run cargo test. Do not stop at a diagnosis or claim success without a green cargo test."
+                } else if test_failure_needs_edit {
+                    "BUDGET: cargo test has failed and is not green yet. Exploration tools are disabled. Fix ALL failing tests with write_files / apply_patch (every implicated module) and re-run cargo test now. Do not list/grep/read further."
+                } else {
+                    "BUDGET: FINAL model step. Exploration tools are disabled. Use only write_files / write_file / apply_patch / run_terminal_cmd. Apply ALL remaining fixes in one batch (every failing test / complete rename including re-exports) and run cargo test now. For renames: change type identifiers only — never rewrite user-facing / PRODUCT_LABEL string literals."
+                };
                 messages.push(serde_json::json!({
                     "role": "system",
-                    "content": "TEST RECOVERY: the model budget ended with an unresolved cargo test failure. Use the reported failures and source already in context, then apply all required edits now. This is one bounded recovery step; do not stop at a diagnosis or claim success without editing.",
+                    "content": coach,
                 }));
-                // The model has already received a concrete failing test report.
-                // Make this one recovery boundary an edit boundary so it cannot
-                // spend the bounded grace step on another exploratory read.
-                filter_tools_edit_only(&tools)
-            } else if max_rounds <= 8 && remaining == 1 {
-                messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": "BUDGET: FINAL model step. Exploration tools are disabled. Use only write_files / write_file / apply_patch / run_terminal_cmd. Apply all remaining fixes and run cargo test now.",
-                }));
-                // Restrict tool surface on the last step so the model cannot burn the step on list/grep/read.
                 filter_tools_edit_and_shell(&tools)
             } else {
                 if max_rounds <= 8 && remaining <= 2 {
                     messages.push(serde_json::json!({
                         "role": "system",
-                        "content": "BUDGET: only 2 model steps left including this one. Prefer dense multi-tool edits (write_files) + cargo test over list/grep/read.",
+                        "content": "BUDGET: only 2 model steps left including this one. Prefer dense multi-tool edits (write_files for every implicated file) + cargo test over list/grep/read. Batch independent bugs; for renames preserve string literals.",
                     }));
                 }
                 tools.clone()
@@ -3962,7 +3963,15 @@ impl AgentHostHandle {
                     if let Some(r) = reasoning.as_deref() {
                         push_thought(self, session_id, r);
                     }
-                    if max_rounds <= 8 && test_failure_needs_edit && round <= max_rounds {
+                    if max_rounds <= 8 && test_failure_needs_edit {
+                        if in_recovery_grace {
+                            // Recovery already spent — do not accept a success claim
+                            // while cargo is still unresolved (#187).
+                            let msg = "Stopped after recovery step with unresolved cargo test failures. Ask me to continue with the failing tests and source still in context.".to_string();
+                            emit_message(event_tx, session_id, &msg);
+                            push_assistant(self, session_id, &msg);
+                            return Ok(msg);
+                        }
                         messages.push(serde_json::json!({
                             "role": "assistant",
                             "content": text,
@@ -3972,7 +3981,7 @@ impl AgentHostHandle {
                         }
                         messages.push(serde_json::json!({
                             "role": "system",
-                            "content": "TEST RECOVERY is incomplete. Do not provide a final answer yet. Apply the code edits required by the failing tests.",
+                            "content": "TEST RECOVERY is incomplete. Do not provide a final answer yet. Apply the code edits required by ALL failing tests, then re-run cargo test until green.",
                         }));
                         continue;
                     }
@@ -4108,7 +4117,23 @@ impl AgentHostHandle {
                         } else {
                             content
                         };
-                        if output.is_ok()
+                        // Under tight budgets, only clear the post-failure gate when cargo is
+                        // green again. Clearing on edit alone allowed final answers without a
+                        // re-run (#187 verified=false despite oracle pass via external check).
+                        if max_rounds <= 8 && tc.name == "run_terminal_cmd" {
+                            if cargo_test_output_failed(&content) {
+                                test_failure_needs_edit = true;
+                                messages.push(serde_json::json!({
+                                    "role": "system",
+                                    "content": cargo_test_failure_coaching(&content),
+                                }));
+                            } else if cargo_test_output_passed(&content) {
+                                test_failure_needs_edit = false;
+                            }
+                        }
+                        if max_rounds <= 8
+                            && test_failure_needs_edit
+                            && output.is_ok()
                             && matches!(
                                 tc.name.as_str(),
                                 "write_files" | "write_file" | "apply_patch"
@@ -4116,16 +4141,9 @@ impl AgentHostHandle {
                             && !content.starts_with("ERROR:")
                             && !content.starts_with("DENIED")
                         {
-                            test_failure_needs_edit = false;
-                        }
-                        if max_rounds <= 8
-                            && tc.name == "run_terminal_cmd"
-                            && cargo_test_output_failed(&content)
-                        {
-                            test_failure_needs_edit = true;
                             messages.push(serde_json::json!({
                                 "role": "system",
-                                "content": "cargo test reported failures. Continue diagnosing as needed, but apply code edits for ALL failing tests before providing a final answer.",
+                                "content": cargo_test_reverify_coaching(),
                             }));
                         }
                         messages.push(serde_json::json!({

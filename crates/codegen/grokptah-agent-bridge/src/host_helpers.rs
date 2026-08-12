@@ -153,23 +153,139 @@ pub fn cargo_test_output_failed(output: &str) -> bool {
         || (nonzero_exit && (lower.contains("cargo") || lower.contains("test")))
 }
 
-/// Efficiency / multi-step guidance shared by the coding-agent system prompt (#187/#188).
+/// Pull distinct failing test names from cargo output for coaching (#187).
+///
+/// Handles common shapes:
+/// - `test path::name ... FAILED`
+/// - `failures:\n    path::name`
+///
+/// Caps the list so coaching stays short under tight budgets.
+pub fn summarize_cargo_test_failures(output: &str) -> String {
+    let mut names: Vec<String> = Vec::new();
+    let mut in_failures = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("failures:") {
+            in_failures = true;
+            continue;
+        }
+        if in_failures {
+            if trimmed.is_empty()
+                || trimmed.starts_with("test result:")
+                || trimmed.starts_with("error:")
+                || trimmed.starts_with("----")
+            {
+                in_failures = false;
+                continue;
+            }
+            // Skip assertion detail blocks that start with the test name + stdout.
+            if trimmed.contains("---") {
+                continue;
+            }
+            let name = trimmed
+                .strip_prefix("test ")
+                .unwrap_or(trimmed)
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(':');
+            if !name.is_empty()
+                && name.contains("::")
+                && !names.iter().any(|existing| existing == name)
+            {
+                names.push(name.to_string());
+            }
+            continue;
+        }
+        // Live line: `test foo::bar ... FAILED`
+        if let Some(rest) = trimmed.strip_prefix("test ") {
+            let lower = rest.to_ascii_lowercase();
+            if lower.contains("failed") {
+                if let Some(name) = rest.split_whitespace().next() {
+                    if !names.iter().any(|existing| existing == name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    const MAX: usize = 8;
+    if names.is_empty() {
+        return String::new();
+    }
+    let total = names.len();
+    names.truncate(MAX);
+    let joined = names.join(", ");
+    if total > MAX {
+        format!("{joined}, … (+{} more)", total - MAX)
+    } else {
+        joined
+    }
+}
+
+/// True when tool output looks like a successful `cargo test` run.
+pub fn cargo_test_output_passed(output: &str) -> bool {
+    if cargo_test_output_failed(output) {
+        return false;
+    }
+    let lower = output.to_ascii_lowercase();
+    lower.contains("test result: ok")
+        || (lower.contains("0 failed") && lower.contains("test result:"))
+        || (lower.contains("(exit 0)")
+            && (lower.contains("cargo")
+                || lower.contains("test result")
+                || lower.contains("passed")))
+}
+
+/// Coaching injected after a cargo-test failure under a tight budget (#187).
+pub fn cargo_test_failure_coaching(output: &str) -> String {
+    let summary = summarize_cargo_test_failures(output);
+    if summary.is_empty() {
+        "cargo test reported failures. Treat the full output as the bug list (docs may omit some). \
+         In this or the next step, fix ALL failing tests with one `write_files` / multi-file `apply_patch` \
+         batch across every implicated module, then re-run `cargo test`. Do not stop after a single fix \
+         and do not give a final answer until cargo test is green."
+            .into()
+    } else {
+        format!(
+            "cargo test reported failures ({summary}). Treat that full list as the work — docs may \
+             mention only one bug. Fix ALL of them in one `write_files` / multi-file `apply_patch` \
+             batch across every implicated module, then re-run `cargo test`. Do not stop after a single \
+             fix and do not give a final answer until cargo test is green."
+        )
+    }
+}
+
+/// Coaching after edits that still need a green cargo re-run (#187 verified signal).
+pub fn cargo_test_reverify_coaching() -> &'static str {
+    "Edits applied, but cargo test has not passed yet after the failure. Re-run `cargo test` now \
+     in this step (or the next). Do not give a final answer until the re-run is green. \
+     If any tests still fail, batch the remaining fixes with write_files and re-test."
+}
+
+/// Efficiency / multi-step guidance shared by the coding-agent system prompt (#187/#188/#223).
 pub fn coding_agent_efficiency_guidance() -> &'static str {
     "\
 ## Turn budget (critical)\n\
 You MAY emit **multiple tool calls in one assistant step** — use that. Prefer 1–3 dense steps over many exploratory steps.\n\
 \n\
 ### When the user asks to fix tests / make cargo test pass\n\
-1. FIRST step: run `cargo test` — then in the **same** step apply fixes for **all** failures via `write_files` or multi-file `apply_patch`.\n\
-2. Do **not** spend extra steps re-listing the tree after you know failing tests.\n\
-3. Do **not** stop after fixing only the bug mentioned in README if other tests still fail.\n\
-4. Prefer finishing with `cargo test` when feasible.\n\
+1. FIRST step: run `cargo test` — collect **every** failing test (not just the first).\n\
+2. Same step when possible: apply fixes for **all** failures via one `write_files` or multi-file `apply_patch` \
+across every implicated module. Independent bugs in separate files must be fixed together.\n\
+3. Do **not** trust README/docs as a complete bug list — tests are authoritative.\n\
+4. Do **not** stop after fixing only the documented bug if other tests still fail.\n\
+5. Do **not** spend extra steps re-listing the tree after you know failing tests.\n\
+6. Prefer finishing with `cargo test` when feasible.\n\
 \n\
 ### When the user asks for a type/symbol rename across the crate\n\
-1. In **one** step: bulk rename with `run_terminal_cmd` (e.g. find+sed/perl on src/**/*.rs) and/or `write_files` for every changed module including `lib.rs` re-exports.\n\
-2. Same step: ensure public aliases (`pub use`, compat wrappers) compile — never leave half-renamed APIs.\n\
-3. Same or next step only: `cargo test`.\n\
-4. Avoid 3+ rounds of list_dir/grep/read before the first edit.\n\
+1. Prefer `write_files` (or careful multi-hunk `apply_patch`) that rewrites each module with the new type name — \
+**do not** run a blind whole-tree `sed`/`perl -pi` that rewrites string literals.\n\
+2. **Preserve user-facing / telemetry string literals** (e.g. `PRODUCT_LABEL`, constants whose *value* must stay \
+the old name). Rename the **type/identifier** only; leave string-literal contents like OldName untouched when the task says so.\n\
+3. Same step: update `lib.rs` re-exports (`pub use`) and all type references — never leave half-renamed APIs.\n\
+4. Same or next step only: `cargo test` and confirm the preserved label still matches exactly.\n\
+5. Avoid 3+ rounds of list_dir/grep/read before the first edit.\n\
 \n\
 Prefer `write_files` over serial `write_file` when 2+ files change. Prefer multi-block `apply_patch` for search/replace across files.\n\
 \n\
@@ -179,6 +295,7 @@ When the task is complete, give a concise handoff with:\n\
 2. The changed files (relative paths), or explicitly say that no files changed.\n\
 3. Verification commands and observed results, or explicitly say what was not run.\n\
 4. Remaining risks, blockers, or follow-up work.\n\
+Example shape: `Completed. Changed src/a.rs, src/b.rs. cargo test passed (N tests).`\n\
 Never claim a test, build, or file change that you did not actually observe.\n\
 "
 }
@@ -400,6 +517,11 @@ pub(crate) fn filter_tools_edit_and_shell(tools: &serde_json::Value) -> serde_js
 }
 
 /// Restrict a bounded recovery boundary to tools that can change source files.
+///
+/// Retained for stricter edit-only recovery modes and unit tests; the default
+/// post-budget recovery path uses [`filter_tools_edit_and_shell`] so cargo can
+/// be re-run after fixes (#187).
+#[allow(dead_code)]
 pub(crate) fn filter_tools_edit_only(tools: &serde_json::Value) -> serde_json::Value {
     let Some(arr) = tools.as_array() else {
         return tools.clone();
@@ -844,6 +966,8 @@ pub(crate) fn is_round_limit_stop_message(text: &str) -> bool {
 pub(crate) fn is_incomplete_stop_message(text: &str) -> bool {
     is_round_limit_stop_message(text)
         || (text.starts_with("Stopped after ") && text.contains("without making progress"))
+        || (text.starts_with("Stopped after recovery step")
+            && text.contains("unresolved cargo test"))
 }
 
 pub(crate) fn offline_plan_steps(goal: &str) -> Vec<String> {
@@ -1764,6 +1888,24 @@ mod efficiency_tests {
             g.contains("half-renamed") || g.contains("pub use"),
             "rename completeness"
         );
+        // #187: multi-bug batching under tight budgets
+        assert!(
+            g.contains("every") && g.contains("failing"),
+            "must collect all failures"
+        );
+        assert!(
+            g.contains("tests are authoritative"),
+            "docs are incomplete bug lists"
+        );
+        // #223: preserve telemetry / product label strings on rename
+        assert!(
+            g.contains("PRODUCT_LABEL") && g.contains("string literal"),
+            "rename must preserve string literals"
+        );
+        assert!(
+            g.contains("blind") && g.contains("sed"),
+            "must warn against blind whole-tree rewrites"
+        );
     }
 
     #[test]
@@ -1779,6 +1921,55 @@ mod efficiency_tests {
         assert!(!cargo_test_output_failed(
             "test result: ok. 2 passed; 0 failed; 0 ignored"
         ));
+    }
+
+    #[test]
+    fn summarize_cargo_test_failures_lists_distinct_names() {
+        let out = "\
+running 3 tests
+test math::clamp_u8_bounds ... FAILED
+test parse::pair_csv ... FAILED
+test text::title_case_words ... FAILED
+
+failures:
+
+---- math::clamp_u8_bounds stdout ----
+assertion failed
+
+failures:
+    math::clamp_u8_bounds
+    parse::pair_csv
+    text::title_case_words
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored
+";
+        let summary = summarize_cargo_test_failures(out);
+        assert!(summary.contains("math::clamp_u8_bounds"), "{summary}");
+        assert!(summary.contains("parse::pair_csv"), "{summary}");
+        assert!(summary.contains("text::title_case_words"), "{summary}");
+        let coach = cargo_test_failure_coaching(out);
+        assert!(coach.contains("math::clamp_u8_bounds"), "{coach}");
+        assert!(coach.contains("write_files"), "{coach}");
+        assert!(coach.contains("ALL"), "{coach}");
+    }
+
+    #[test]
+    fn cargo_test_failure_coaching_without_names_still_batches() {
+        let coach = cargo_test_failure_coaching("error: test failed, to rerun pass `--lib`");
+        assert!(coach.contains("write_files"), "{coach}");
+        assert!(coach.contains("ALL failing tests"), "{coach}");
+    }
+
+    #[test]
+    fn cargo_test_output_passed_requires_green_markers() {
+        assert!(cargo_test_output_passed(
+            "test result: ok. 3 passed; 0 failed; 0 ignored\n(exit 0)"
+        ));
+        assert!(!cargo_test_output_passed(
+            "test result: FAILED. 0 passed; 2 failed\n(exit 101)"
+        ));
+        assert!(!cargo_test_output_passed("wrote src/lib.rs"));
+        assert!(cargo_test_reverify_coaching().contains("Re-run"));
     }
 
     #[test]
