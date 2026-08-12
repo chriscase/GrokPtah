@@ -1,6 +1,8 @@
 //! Bounded soak + failure-injection against desktop control bootstrap.
 //! Drives `start_control_from_env` + independent Node TCP client (no theater).
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -10,19 +12,14 @@ use grokptah_agent_bridge::orchestration::{
     safe_id_filename, OrchStore, RunBounds, RunRecord, RunState,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, start_control_from_env, AgentHost,
-    HostConfig, McpControlClient, SessionKind, SessionUpdate,
+    set_grokptah_home_override, start_control_from_env, AgentHost, HostConfig, McpControlClient,
+    SessionKind, SessionUpdate,
 };
 use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
 
-fn restore_env(key: &str, prev: Option<String>) {
-    match prev {
-        Some(v) => std::env::set_var(key, v),
-        None => std::env::remove_var(key),
-    }
-}
+use common::ProcessEnvGuard;
 
 fn dir_size_bytes(path: &std::path::Path) -> u64 {
     if !path.exists() {
@@ -87,8 +84,8 @@ async fn ensure_npm(sdk_dir: &std::path::Path) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::await_holding_lock)]
 async fn soak_bootstrap_capacity_429_and_timeout_504() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
-    let _guard = home_override_serial();
+    let mut env = ProcessEnvGuard::new();
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
     let home = tempdir().unwrap();
     let ws = tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".grokptah")).unwrap();
@@ -102,44 +99,18 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     host.set_project_cwd(ws.path()).unwrap();
 
     let token = format!("cap-{}", Uuid::new_v4());
-    let prev = [
-        (
-            "GROKPTAH_CONTROL_TOKEN",
-            std::env::var("GROKPTAH_CONTROL_TOKEN").ok(),
-        ),
-        (
-            "GROKPTAH_CONTROL_PORT",
-            std::env::var("GROKPTAH_CONTROL_PORT").ok(),
-        ),
-        (
-            "GROKPTAH_CONTROL_WORKSPACES",
-            std::env::var("GROKPTAH_CONTROL_WORKSPACES").ok(),
-        ),
-        (
-            "GROKPTAH_CONTROL_MAX_CONCURRENT",
-            std::env::var("GROKPTAH_CONTROL_MAX_CONCURRENT").ok(),
-        ),
-        (
-            "GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS",
-            std::env::var("GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS").ok(),
-        ),
-        (
-            "GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS",
-            std::env::var("GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS").ok(),
-        ),
-    ];
-    std::env::set_var("GROKPTAH_CONTROL_TOKEN", &token);
-    std::env::set_var("GROKPTAH_CONTROL_PORT", "0");
-    std::env::set_var("GROKPTAH_CONTROL_WORKSPACES", ws.path().as_os_str());
+    env.set("GROKPTAH_CONTROL_TOKEN", &token);
+    env.set("GROKPTAH_CONTROL_PORT", "0");
+    env.set("GROKPTAH_CONTROL_WORKSPACES", ws.path().as_os_str());
 
     let sdk_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_sdk_interop");
     ensure_npm(&sdk_dir).await;
     let pid = std::process::id();
 
     // --- 429: inject holds permits without timing out first ---
-    std::env::set_var("GROKPTAH_CONTROL_MAX_CONCURRENT", "2");
-    std::env::set_var("GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS", "5000");
-    std::env::set_var("GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS", "400");
+    env.set("GROKPTAH_CONTROL_MAX_CONCURRENT", "2");
+    env.set("GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS", "5000");
+    env.set("GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS", "400");
     let srv = start_control_from_env(host.clone())
         .await
         .expect("bootstrap capacity");
@@ -164,9 +135,9 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     srv.stop_and_wait().await;
 
     // --- 504: inject > request timeout ---
-    std::env::set_var("GROKPTAH_CONTROL_MAX_CONCURRENT", "4");
-    std::env::set_var("GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS", "80");
-    std::env::set_var("GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS", "500");
+    env.set("GROKPTAH_CONTROL_MAX_CONCURRENT", "4");
+    env.set("GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS", "80");
+    env.set("GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS", "500");
     let srv2 = start_control_from_env(host.clone())
         .await
         .expect("bootstrap timeout");
@@ -189,12 +160,6 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
     assert_eq!(r504["checks"]["requestTimeout504"], true);
     srv2.stop_and_wait().await;
 
-    for (k, v) in prev {
-        restore_env(k, v);
-    }
-    std::env::remove_var("GROKPTAH_CONTROL_MAX_CONCURRENT");
-    std::env::remove_var("GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS");
-    std::env::remove_var("GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS");
     set_grokptah_home_override(None);
 }
 
@@ -202,13 +167,13 @@ async fn soak_bootstrap_capacity_429_and_timeout_504() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::await_holding_lock)]
 async fn soak_desktop_bootstrap_node_campaign() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let mut env = ProcessEnvGuard::new();
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
     // Ensure production defaults (no inject delay).
-    std::env::remove_var("GROKPTAH_CONTROL_MAX_CONCURRENT");
-    std::env::remove_var("GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS");
-    std::env::remove_var("GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS");
+    env.remove("GROKPTAH_CONTROL_MAX_CONCURRENT");
+    env.remove("GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS");
+    env.remove("GROKPTAH_CONTROL_INJECT_WORK_DELAY_MS");
 
-    let _guard = home_override_serial();
     let home = tempdir().unwrap();
     let ws = tempdir().unwrap();
     let _ = Command::new("git")
@@ -234,12 +199,9 @@ async fn soak_desktop_bootstrap_node_campaign() {
     }
 
     let token = format!("soak-token-{}", Uuid::new_v4());
-    let prev_token = std::env::var("GROKPTAH_CONTROL_TOKEN").ok();
-    let prev_port = std::env::var("GROKPTAH_CONTROL_PORT").ok();
-    let prev_ws = std::env::var("GROKPTAH_CONTROL_WORKSPACES").ok();
-    std::env::set_var("GROKPTAH_CONTROL_TOKEN", &token);
-    std::env::set_var("GROKPTAH_CONTROL_PORT", "0");
-    std::env::set_var("GROKPTAH_CONTROL_WORKSPACES", ws.path().as_os_str());
+    env.set("GROKPTAH_CONTROL_TOKEN", &token);
+    env.set("GROKPTAH_CONTROL_PORT", "0");
+    env.set("GROKPTAH_CONTROL_WORKSPACES", ws.path().as_os_str());
 
     let wall0 = Instant::now();
     let pid = std::process::id();
@@ -478,7 +440,7 @@ async fn soak_desktop_bootstrap_node_campaign() {
     assert!(!handoff.is_error);
     assert_eq!(handoff.structured["state"], "completed");
 
-    // Marker file from the offline write should still exist on disk.
+    // Marker file from offline write should exist on disk.
     assert!(
         ws.path().join("soak_marker.txt").is_file(),
         "offline write must leave soak_marker.txt"
@@ -486,9 +448,6 @@ async fn soak_desktop_bootstrap_node_campaign() {
     srv2.stop_and_wait().await;
     drop(host2);
 
-    restore_env("GROKPTAH_CONTROL_TOKEN", prev_token);
-    restore_env("GROKPTAH_CONTROL_PORT", prev_port);
-    restore_env("GROKPTAH_CONTROL_WORKSPACES", prev_ws);
     set_grokptah_home_override(None);
 }
 
@@ -496,8 +455,8 @@ async fn soak_desktop_bootstrap_node_campaign() {
 #[test]
 #[allow(clippy::await_holding_lock)]
 fn soak_restart_recovery_matrix() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
-    let _guard = home_override_serial();
+    let mut env = ProcessEnvGuard::new();
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
     let home = tempdir().unwrap();
     let ws = tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".grokptah")).unwrap();
