@@ -416,6 +416,35 @@ DELETE /mcp  mcp-session-id: S → 204
 In-tree Rust helper: `McpControlClient` (`mcp_control_client.rs`).
 Independent Node harness: `tests/mcp_sdk_interop/run_conformance.mjs`.
 
+The Rust helper also exposes the coordinator-neutral live channel. After
+`initialize`, construct an exact `RunScope` and call
+`open_event_stream(scope, last_event_id)`. Consume
+`McpEventStream::next_notification()` until it returns `None`:
+
+```rust
+let scope = RunScope { session_id, workspace, run_id };
+let mut live = client.open_event_stream(scope.clone(), None).await?;
+while let Some(frame) = live.next_notification().await? {
+    match frame.notification {
+        LiveNotification::Event(event) => observe(event),
+        LiveNotification::Recovery(recovery) => {
+            // Poll ptah_get_events from recovery.after_seq before reconnecting.
+            recover_from_durable_events(recovery).await?;
+            break;
+        }
+        LiveNotification::Unknown { method, .. } => record_unknown(method),
+    }
+}
+let mut resumed = client
+    .open_event_stream(scope, live.last_event_id())
+    .await?;
+```
+
+The client validates the response content type, exact run scope, SSE sequence
+IDs, JSON-RPC shape, and bounded frame size. It does not retry silently: a
+recovery notification or transport error must be handled by the coordinator,
+and the durable `ptah_get_events` tool remains authoritative.
+
 ## Security boundaries
 
 | Boundary | Behavior |
