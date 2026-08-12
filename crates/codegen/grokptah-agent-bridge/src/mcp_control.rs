@@ -421,6 +421,8 @@ struct EmptyArgs {}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
     run_id: String,
 }
 
@@ -460,6 +462,8 @@ struct DiscardArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EventsArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
     run_id: String,
     #[serde(default)]
     after_seq: u64,
@@ -932,15 +936,21 @@ fn tool_input_schema(name: &str) -> Value {
         | "ptah_get_handoff"
         | "ptah_review_run" => json!({
             "type": "object",
-            "required": ["run_id"],
+            "required": ["session_id", "workspace", "run_id"],
             "additionalProperties": false,
-            "properties": { "run_id": run_id }
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id
+            }
         }),
         "ptah_get_events" => json!({
             "type": "object",
-            "required": ["run_id"],
+            "required": ["session_id", "workspace", "run_id"],
             "additionalProperties": false,
             "properties": {
+                "session_id": session,
+                "workspace": workspace,
                 "run_id": run_id,
                 "after_seq": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500}
@@ -1132,12 +1142,12 @@ async fn dispatch_tool(
         "ptah_get_run" => {
             let args: RunArgs = parse_value(args)?;
             require_nonempty(&args.run_id, "run_id")?;
-            orch.get_run(auth, &args.run_id)
+            orch.get_run_scoped(auth, args.session_id, &args.workspace, &args.run_id)
         }
         "ptah_get_progress" => {
             let args: RunArgs = parse_value(args)?;
             require_nonempty(&args.run_id, "run_id")?;
-            orch.get_progress(auth, &args.run_id)
+            orch.get_progress_scoped(auth, args.session_id, &args.workspace, &args.run_id)
         }
         "ptah_get_events" => {
             let args: EventsArgs = parse_value(args)?;
@@ -1148,37 +1158,34 @@ async fn dispatch_tool(
                     "limit must be between 1 and 500",
                 ));
             }
-            orch.get_events(auth, Some(&args.run_id), args.after_seq, args.limit)
+            orch.get_events_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
+                args.after_seq,
+                args.limit,
+            )
         }
         "ptah_get_changes" => {
             let args: RunArgs = parse_value(args)?;
             require_nonempty(&args.run_id, "run_id")?;
-            orch.get_changes(auth, &args.run_id)
+            orch.get_changes_scoped(auth, args.session_id, &args.workspace, &args.run_id)
         }
         "ptah_get_test_results" => {
             let args: RunArgs = parse_value(args)?;
             require_nonempty(&args.run_id, "run_id")?;
-            orch.get_test_results(auth, &args.run_id)
+            orch.get_test_results_scoped(auth, args.session_id, &args.workspace, &args.run_id)
         }
         "ptah_get_handoff" => {
             let args: RunArgs = parse_value(args)?;
             require_nonempty(&args.run_id, "run_id")?;
-            orch.get_handoff(auth, &args.run_id)
+            orch.get_handoff_scoped(auth, args.session_id, &args.workspace, &args.run_id)
         }
         "ptah_review_run" => {
             let args: RunArgs = parse_value(args)?;
             require_nonempty(&args.run_id, "run_id")?;
-            let run = orch
-                .store()
-                .load_run(&args.run_id)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-                .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
-            orch.review_run(
-                auth,
-                run.session_id,
-                PathBuf::from(&run.workspace).as_path(),
-                &args.run_id,
-            )
+            orch.review_run(auth, args.session_id, &args.workspace, &args.run_id)
         }
         "ptah_submit_task" => {
             let args: SubmitArgs = parse_value(args)?;
@@ -1473,6 +1480,26 @@ mod tests {
         }
         for f in FORBIDDEN_TOOLS {
             assert!(!names.contains(f));
+        }
+        for name in [
+            "ptah_get_run",
+            "ptah_get_progress",
+            "ptah_get_events",
+            "ptah_get_changes",
+            "ptah_get_test_results",
+            "ptah_get_handoff",
+            "ptah_review_run",
+        ] {
+            let schema = tool_input_schema(name);
+            let required = schema["required"]
+                .as_array()
+                .expect("scoped read schema required list");
+            for key in ["session_id", "workspace", "run_id"] {
+                assert!(
+                    required.iter().any(|item| item == key),
+                    "{name} missing {key}"
+                );
+            }
         }
     }
 }

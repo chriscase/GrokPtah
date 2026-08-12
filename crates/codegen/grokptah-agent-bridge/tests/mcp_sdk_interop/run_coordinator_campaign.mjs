@@ -40,6 +40,15 @@ const checks = {};
 const steps = [];
 let requestNumber = 0;
 let mcpSession = null;
+const scopedReadTools = new Set([
+  "ptah_get_run",
+  "ptah_get_progress",
+  "ptah_get_events",
+  "ptah_get_changes",
+  "ptah_get_test_results",
+  "ptah_get_handoff",
+  "ptah_review_run",
+]);
 
 function log(...args) {
   console.error("[coordinator-campaign]", ...args);
@@ -87,18 +96,26 @@ async function mcpFetch(method, params, { id, sessionId = mcpSession, notificati
 }
 
 async function call(name, args, id) {
+  const scopedArgs =
+    scopedReadTools.has(name) && args?.run_id && !args.session_id
+      ? { ...args, session_id: hostSessionId, workspace }
+      : args;
   return mcpFetch(
     "tools/call",
-    { name, arguments: args },
+    { name, arguments: scopedArgs },
     { id: id ?? ++requestNumber }
   );
 }
 
-async function pollTerminal(runId, timeoutMs = 15_000) {
+async function pollTerminal(
+  runId,
+  timeoutMs = 15_000,
+  scope = { session_id: hostSessionId, workspace }
+) {
   const started = Date.now();
   let last = null;
   while (Date.now() - started < timeoutMs) {
-    const response = await call("ptah_get_run", { run_id: runId });
+    const response = await call("ptah_get_run", { ...scope, run_id: runId });
     last = structured(response.json);
     if (
       ["completed", "failed", "cancelled", "interrupted", "limit_reached"].includes(
@@ -229,6 +246,30 @@ try {
     sharedTerminal?.state
   );
   if (sharedRunId) {
+    const missingReadScope = await mcpFetch("tools/call", {
+      name: "ptah_get_run",
+      arguments: { run_id: sharedRunId },
+    });
+    record("readMissingScopeFailClosed", missingReadScope.status >= 400, {
+      status: missingReadScope.status,
+    });
+    const foreignReadScope = await call("ptah_get_run", {
+      session_id: otherSessionId,
+      workspace,
+      run_id: sharedRunId,
+    });
+    record("readCrossSessionFailClosed", foreignReadScope.status >= 400, {
+      status: foreignReadScope.status,
+    });
+    const wrongWorkspaceRead = await call("ptah_get_run", {
+      session_id: hostSessionId,
+      workspace: discardWorkspace,
+      run_id: sharedRunId,
+    });
+    record("readCrossWorkspaceFailClosed", wrongWorkspaceRead.status >= 400, {
+      status: wrongWorkspaceRead.status,
+    });
+
     const sharedReplay = await call("ptah_submit_task", {
       request_id: `${prefix}-shared-submit`,
       session_id: hostSessionId,
@@ -498,7 +539,12 @@ try {
   });
   const discardRun = structured(discardSubmit.json);
   const discardRunId = discardRun?.runId;
-  const discardTerminal = discardRunId ? await pollTerminal(discardRunId) : null;
+  const discardTerminal = discardRunId
+    ? await pollTerminal(discardRunId, 15_000, {
+        session_id: discardSessionId,
+        workspace: discardWorkspace,
+      })
+    : null;
   const discardResponse = discardRunId
     ? await call("ptah_discard_run", {
         request_id: `${prefix}-discard-run`,
@@ -508,7 +554,11 @@ try {
       })
     : { status: 0, json: null };
   const discardedState = discardRunId
-    ? await call("ptah_get_run", { run_id: discardRunId })
+    ? await call("ptah_get_run", {
+        session_id: discardSessionId,
+        workspace: discardWorkspace,
+        run_id: discardRunId,
+      })
     : { status: 0, json: null };
   const discarded = structured(discardedState.json);
   record(

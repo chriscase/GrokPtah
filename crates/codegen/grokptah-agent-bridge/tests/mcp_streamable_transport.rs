@@ -73,6 +73,146 @@ async fn streamable_compat_client_session_and_tools() {
     set_grokptah_home_override(None);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn run_reads_require_exact_session_and_workspace_scope() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (_home, _lock, host, ws, orch) = setup();
+    let owner = host.session_new_kind(SessionKind::Build).unwrap();
+    let other = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(owner.id, ws.path()).unwrap();
+    host.session_set_cwd(other.id, ws.path()).unwrap();
+    let outside = tempdir().unwrap();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), "stream-token-200");
+    client.initialize().await.unwrap();
+
+    let submitted = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "read-scope-submit",
+                "session_id": owner.id,
+                "workspace": ws.path().display().to_string(),
+                "prompt": "list files"
+            }),
+        )
+        .await
+        .unwrap();
+    let run_id = submitted.structured["runId"].as_str().unwrap().to_string();
+
+    assert!(client
+        .call_tool("ptah_get_run", json!({ "run_id": run_id }))
+        .await
+        .is_err());
+    assert!(client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": other.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            }),
+        )
+        .await
+        .is_err());
+    assert!(client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": owner.id,
+                "workspace": outside.path().display().to_string(),
+                "run_id": run_id
+            }),
+        )
+        .await
+        .is_err());
+    let valid = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": owner.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!valid.is_error);
+
+    let scoped_tools = [
+        "ptah_get_run",
+        "ptah_get_progress",
+        "ptah_get_events",
+        "ptah_get_changes",
+        "ptah_get_test_results",
+        "ptah_get_handoff",
+        "ptah_review_run",
+    ];
+    for name in scoped_tools {
+        assert!(
+            client
+                .call_tool(name, json!({ "run_id": run_id }))
+                .await
+                .is_err(),
+            "{name} accepted missing caller scope"
+        );
+        let args = if name == "ptah_get_events" {
+            json!({
+                "session_id": other.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id,
+                "after_seq": 0,
+                "limit": 50
+            })
+        } else {
+            json!({
+                "session_id": other.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            })
+        };
+        assert!(
+            client.call_tool(name, args).await.is_err(),
+            "{name} accepted a foreign session"
+        );
+    }
+    for name in [
+        "ptah_get_run",
+        "ptah_get_progress",
+        "ptah_get_events",
+        "ptah_get_changes",
+        "ptah_get_test_results",
+        "ptah_get_handoff",
+    ] {
+        let args = if name == "ptah_get_events" {
+            json!({
+                "session_id": owner.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id,
+                "after_seq": 0,
+                "limit": 50
+            })
+        } else {
+            json!({
+                "session_id": owner.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            })
+        };
+        let result = client.call_tool(name, args).await.unwrap();
+        assert!(
+            !result.is_error,
+            "owner read failed for {name}: {:?}",
+            result.raw
+        );
+    }
+
+    srv.stop_and_wait().await;
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn unauthenticated_and_oversized_fail_closed() {
@@ -794,14 +934,28 @@ async fn http_submit_allow_queue_and_cancel_queued_run() {
     assert_eq!(queued.structured["state"], "queued");
     assert_eq!(queued.structured["queuedPosition"], 1);
     let visible_queued = client
-        .call_tool("ptah_get_run", json!({ "run_id": queued_run_id }))
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": queued_session.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": queued_run_id
+            }),
+        )
         .await
         .unwrap();
     assert!(!visible_queued.is_error);
     assert_eq!(visible_queued.structured["state"], "queued");
     assert_eq!(visible_queued.structured["queuePosition"], 1);
     let progress_queued = client
-        .call_tool("ptah_get_progress", json!({ "run_id": queued_run_id }))
+        .call_tool(
+            "ptah_get_progress",
+            json!({
+                "session_id": queued_session.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": queued_run_id
+            }),
+        )
         .await
         .unwrap();
     assert!(!progress_queued.is_error);
@@ -833,7 +987,14 @@ async fn http_submit_allow_queue_and_cancel_queued_run() {
     assert_eq!(cancelled.structured["teardownComplete"], true);
     assert_eq!(cancelled.structured["state"], "cancelled");
     let visible_cancelled = client
-        .call_tool("ptah_get_run", json!({ "run_id": queued_run_id }))
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": queued_session.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": queued_run_id
+            }),
+        )
         .await
         .unwrap();
     assert_eq!(visible_cancelled.structured["state"], "cancelled");
@@ -879,7 +1040,14 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
     let mut state = String::new();
     for _ in 0..40 {
         let run = client
-            .call_tool("ptah_get_run", json!({ "run_id": run_id }))
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session.id,
+                    "workspace": ws.path().display().to_string(),
+                    "run_id": run_id
+                }),
+            )
             .await
             .unwrap();
         assert!(!run.is_error);
@@ -910,7 +1078,13 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
     let events = client
         .call_tool(
             "ptah_get_events",
-            json!({ "run_id": run_id, "after_seq": 0, "limit": 50 }),
+            json!({
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id,
+                "after_seq": 0,
+                "limit": 50
+            }),
         )
         .await
         .unwrap();
@@ -932,7 +1106,14 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
     }
 
     let handoff = client
-        .call_tool("ptah_get_handoff", json!({ "run_id": run_id }))
+        .call_tool(
+            "ptah_get_handoff",
+            json!({
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            }),
+        )
         .await
         .unwrap();
     assert!(
@@ -1067,7 +1248,14 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
 
     for _ in 0..80 {
         let run = client
-            .call_tool("ptah_get_run", json!({ "run_id": retry_id }))
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session.id,
+                    "workspace": ws.path().display().to_string(),
+                    "run_id": retry_id
+                }),
+            )
             .await
             .unwrap();
         if matches!(
@@ -1156,7 +1344,14 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
     let mut state = String::new();
     for _ in 0..80 {
         let run = client
-            .call_tool("ptah_get_run", json!({ "run_id": run_id }))
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session.id,
+                    "workspace": ws.path().display().to_string(),
+                    "run_id": run_id
+                }),
+            )
             .await
             .unwrap();
         state = run.structured["state"].as_str().unwrap_or_default().into();
@@ -1169,7 +1364,14 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
     assert_eq!(state, "completed");
 
     let review = client
-        .call_tool("ptah_review_run", json!({ "run_id": run_id }))
+        .call_tool(
+            "ptah_review_run",
+            json!({
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            }),
+        )
         .await
         .unwrap();
     assert!(!review.is_error, "review: {:?}", review.raw);
@@ -1198,7 +1400,14 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
         .unwrap()
         .to_string();
     let run_before_tamper = client
-        .call_tool("ptah_get_run", json!({ "run_id": run_id }))
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": run_id
+            }),
+        )
         .await
         .unwrap();
     let isolated_workspace = run_before_tamper.structured["execution"]["executionWorkspace"]
@@ -1418,7 +1627,14 @@ async fn http_cancel_busy_run_reaches_cancelled() {
     let mut final_state = String::new();
     for _ in 0..40 {
         let run = client
-            .call_tool("ptah_get_run", json!({ "run_id": run_id }))
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session.id,
+                    "workspace": ws.path().display().to_string(),
+                    "run_id": run_id
+                }),
+            )
             .await
             .unwrap();
         final_state = run

@@ -154,13 +154,13 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 |------|------|--------------------|
 | `ptah_list_sessions` | read | _(none)_ |
 | `ptah_get_capacity` | read | _(none)_ |
-| `ptah_get_run` | read | `run_id` |
-| `ptah_get_progress` | read | `run_id` |
-| `ptah_get_events` | read | `run_id`, optional `after_seq`, `limit` (1–500) |
-| `ptah_get_changes` | read | `run_id` |
-| `ptah_get_test_results` | read | `run_id` |
-| `ptah_get_handoff` | read | `run_id` |
-| `ptah_review_run` | read | `run_id` (completed isolated run only) |
+| `ptah_get_run` | read | `session_id`, `workspace`, `run_id` |
+| `ptah_get_progress` | read | `session_id`, `workspace`, `run_id` |
+| `ptah_get_events` | read | `session_id`, `workspace`, `run_id`, optional `after_seq`, `limit` (1–500) |
+| `ptah_get_changes` | read | `session_id`, `workspace`, `run_id` |
+| `ptah_get_test_results` | read | `session_id`, `workspace`, `run_id` |
+| `ptah_get_handoff` | read | `session_id`, `workspace`, `run_id` |
+| `ptah_review_run` | read | `session_id`, `workspace`, `run_id` (completed isolated run only) |
 | `ptah_submit_task` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `bounds`, `execution_mode`, `allow_queue` |
 | `ptah_retry_run` | mutate | `request_id`, `session_id`, `workspace`, `run_id`, `prompt`; optional narrower `bounds`, matching `execution_mode`, `allow_queue` |
 | `ptah_approve_run` | mutate | exact run/session/workspace, source and final fingerprints, exact `changed_files`; optional bounded `ttl_ms` |
@@ -186,7 +186,10 @@ Unknown / forbidden tool names return HTTP client error with
 - Only **Build** sessions accept queue / steer / submit / cancel.
 - `workspace` must be on the server **allowlist** and match the session cwd
   (canonicalized; symlink escape outside root → fail closed).
-- Reads are **run-scoped** and allowlist-gated; no global event dump without `run_id`.
+- Reads are **run-scoped and caller-scoped**: every run read and review must
+  include the owning `session_id` and claimed `workspace`, which are
+  canonicalized and matched against the durable run. No global event dump or
+  run lookup by ID alone.
 
 ### Idempotency
 
@@ -290,7 +293,11 @@ coordinator wants a bounded admission queue for capacity or session contention.
 
 ### Events
 
-- `ptah_get_events` requires `run_id`; returns `{ entries, nextCursor, cursorExpired }`.
+- `ptah_get_events` requires the exact owning `session_id`, `workspace`, and
+  `run_id`; returns `{ entries, nextCursor, cursorExpired }`. The server
+  filters the bounded journal to the caller-owned run before applying `limit`,
+  so activity from other sessions cannot advance the run cursor past relevant
+  events.
 - Sequences are monotonic for a run-scoped journal page; expired cursors return
   `cursor_expired` (HTTP 410).
 
@@ -381,7 +388,7 @@ Independent Node harness: `tests/mcp_sdk_interop/run_conformance.mjs`.
 | Tools | Allowlist only; no shell/config/plugin/MCP-admin |
 | Secrets | Control token scrubbed from shell env + shared event bus redaction |
 | Prompts | Reject `!shell` and admin slash commands at orch validation |
-| Cross-run | Cancel/read require ownership |
+| Cross-run | Cancel and every run read/review require exact session + workspace ownership |
 
 ## Deterministic test commands
 

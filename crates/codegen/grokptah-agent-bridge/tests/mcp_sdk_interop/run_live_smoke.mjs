@@ -21,6 +21,15 @@ const url = process.env.GROKPTAH_MCP_URL;
 const token = process.env.GROKPTAH_MCP_TOKEN;
 const hostSessionId = process.env.GROKPTAH_MCP_SESSION_ID;
 const workspace = process.env.GROKPTAH_MCP_WORKSPACE;
+const scopedReadTools = new Set([
+  "ptah_get_run",
+  "ptah_get_progress",
+  "ptah_get_events",
+  "ptah_get_changes",
+  "ptah_get_test_results",
+  "ptah_get_handoff",
+  "ptah_review_run",
+]);
 if (!url || !token || !hostSessionId || !workspace) {
   console.error(
     "GROKPTAH_MCP_URL, GROKPTAH_MCP_TOKEN, GROKPTAH_MCP_SESSION_ID, GROKPTAH_MCP_WORKSPACE required"
@@ -54,9 +63,23 @@ async function mcpFetch(
   params,
   { id = 1, sessionId, notification = false, auth = true, protocolVersion = "2025-11-25" } = {}
 ) {
+  const scopedParams =
+    method === "tools/call" &&
+    scopedReadTools.has(params?.name) &&
+    params?.arguments?.run_id &&
+    !params.arguments.session_id
+      ? {
+          ...params,
+          arguments: {
+            ...params.arguments,
+            session_id: hostSessionId,
+            workspace,
+          },
+        }
+      : params;
   const body = notification
-    ? { jsonrpc: "2.0", method, params }
-    : { jsonrpc: "2.0", id, method, params };
+    ? { jsonrpc: "2.0", method, params: scopedParams }
+    : { jsonrpc: "2.0", id, method, params: scopedParams };
   const headers = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
