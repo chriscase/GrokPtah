@@ -19,16 +19,17 @@ use crate::completion::{
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
-    build_agent_messages, build_compact_summary, call_xai_agent_step, call_xai_chat,
-    cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
+    auto_cargo_reverify_command, build_agent_messages, build_compact_summary, call_xai_agent_step,
+    call_xai_chat, cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
     cargo_test_reverify_coaching, coding_agent_tools, emit_message, emit_thought,
     filter_tools_edit_and_shell, filter_tools_edit_only, is_incomplete_stop_message,
     is_round_limit_stop_message, is_true_noop_tool_step, normalize_sandbox_profile,
     offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
     push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
     resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
-    should_skip_tool_after_cargo_failure, surface_rate_limit_or_error, tool_kind,
-    tool_step_signature, tool_web_fetch, AgentStep, IdenticalToolCallRun, McpToolIndex,
+    should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
+    surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
+    IdenticalToolCallRun, McpToolIndex,
 };
 use crate::local_tools;
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
@@ -3910,9 +3911,10 @@ impl AgentHostHandle {
         let mut stop_continued = false;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
         let mut test_failure_needs_edit = false;
-        // Cargo failures since last successful edit while armed. After 2,
-        // force edit-only so the model cannot thrash cargo under budget (#187).
+        // Cargo failures since last successful edit while armed.
         let mut cargo_fails_since_edit: u32 = 0;
+        // Sticky for the turn: at least one successful edit after cargo went red.
+        let mut had_edit_since_cargo_fail = false;
         let mut recovery_grace = false;
 
         for round in 1..=max_rounds.saturating_add(1) {
@@ -3982,15 +3984,20 @@ impl AgentHostHandle {
             // model cannot thrash shell-only under max_turns=3 (#187 R2).
             let force_edit_shell =
                 max_rounds <= 8 && (in_recovery_grace || remaining == 1 || test_failure_needs_edit);
-            let force_edit_only =
-                max_rounds <= 8 && test_failure_needs_edit && cargo_fails_since_edit >= 2;
+            // While cargo is red and no edit has landed, advertise edit-only so
+            // the model cannot thrash shell. After an edit, restore edit+shell
+            // (host also auto-re-runs cargo after writes).
+            let force_edit_only = max_rounds <= 8
+                && test_failure_needs_edit
+                && !had_edit_since_cargo_fail
+                && !in_recovery_grace;
             let tools_this_round = if force_edit_shell {
                 let coach = if in_recovery_grace {
                     "TEST RECOVERY: the model budget ended with unresolved cargo test failures (or edits that were not re-verified). Use failures and source already in context. In this one bounded recovery step: apply any remaining fixes with write_files and re-run cargo test. Do not stop at a diagnosis or claim success without a green cargo test."
                 } else if force_edit_only {
-                    "BUDGET: cargo test has failed repeatedly without code edits. Shell is disabled this step. Use write_files / write_file / apply_patch to fix ALL failing tests across every implicated module NOW."
+                    "BUDGET: cargo test failed. Shell is disabled until you edit. Use write_files (preferred — every failing module in ONE call) / write_file / apply_patch to fix ALL failures now. cargo test re-runs automatically after your edits."
                 } else if test_failure_needs_edit {
-                    "BUDGET: cargo test has failed and is not green yet. Exploration tools are disabled. Fix ALL failing tests with write_files / apply_patch (every implicated module) and re-run cargo test now. Do not list/grep/read further."
+                    "BUDGET: cargo test has failed and is not green yet. Prefer write_files for remaining fixes; cargo re-runs automatically after edits."
                 } else {
                     "BUDGET: FINAL model step. Exploration tools are disabled. Use only write_files / write_file / apply_patch / run_terminal_cmd. Apply ALL remaining fixes in one batch (every failing test / complete rename including re-exports) and run cargo test now. For renames: change type identifiers only — never rewrite user-facing / PRODUCT_LABEL string literals."
                 };
@@ -3998,7 +4005,7 @@ impl AgentHostHandle {
                     "role": "system",
                     "content": coach,
                 }));
-                if force_edit_only && !in_recovery_grace {
+                if force_edit_only {
                     filter_tools_edit_only(&tools)
                 } else {
                     filter_tools_edit_and_shell(&tools)
@@ -4170,6 +4177,7 @@ impl AgentHostHandle {
                         })).collect::<Vec<_>>(),
                     }));
 
+                    let mut edited_while_needs_reverify = false;
                     for tc in &tool_calls {
                         if cancel.is_cancelled() {
                             break;
@@ -4181,6 +4189,7 @@ impl AgentHostHandle {
                             max_rounds as u32,
                             test_failure_needs_edit,
                             &tc.name,
+                            had_edit_since_cargo_fail,
                         ) {
                             let content = post_cargo_failure_skip_message(&tc.name);
                             messages.push(serde_json::json!({
@@ -4250,6 +4259,8 @@ impl AgentHostHandle {
                             && !content.starts_with("DENIED")
                         {
                             cargo_fails_since_edit = 0;
+                            had_edit_since_cargo_fail = true;
+                            edited_while_needs_reverify = true;
                             messages.push(serde_json::json!({
                                 "role": "system",
                                 "content": cargo_test_reverify_coaching(),
@@ -4258,6 +4269,87 @@ impl AgentHostHandle {
                         messages.push(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": tc.id,
+                            "content": content,
+                        }));
+                    }
+
+                    // Host-driven cargo re-verify after edits while still red
+                    // under tight budgets (#187). Ensures a final write is always
+                    // followed by cargo so verified can go green even when the
+                    // model spends the last step on write_files only.
+                    if should_auto_cargo_reverify_after_edit(
+                        max_rounds as u32,
+                        edited_while_needs_reverify,
+                    ) && !cancel.is_cancelled()
+                    {
+                        let cmd = auto_cargo_reverify_command();
+                        let args = serde_json::json!({ "command": cmd }).to_string();
+                        let reverify_id = format!("auto-reverify-{}", Uuid::new_v4());
+                        let _ = event_tx.send(SessionUpdate::AgentProgress {
+                            session_id,
+                            round: round as u32,
+                            max_rounds: visible_max_rounds as u32,
+                            last_tool: Some("run_terminal_cmd".into()),
+                            detail: format!(
+                                "Auto re-verify `cargo test` after edit (round {round})"
+                            ),
+                        });
+                        // Synthetic assistant tool_call so the wire transcript is coherent.
+                        messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": reverify_id,
+                                "type": "function",
+                                "function": {
+                                    "name": "run_terminal_cmd",
+                                    "arguments": args,
+                                }
+                            }],
+                        }));
+                        let output = self
+                            .dispatch_agent_tool(
+                                session_id,
+                                cwd,
+                                "run_terminal_cmd",
+                                &args,
+                                cancel,
+                                event_tx,
+                                &mcp_index,
+                            )
+                            .await;
+                        let content = match &output {
+                            Ok(s) => s.clone(),
+                            Err(e) => format!("ERROR: {e}"),
+                        };
+                        let content = if content.len() > 24_000 {
+                            let orig_len = content.len();
+                            format!(
+                                "{}…\n(truncated {} bytes)",
+                                crate::textutil::truncate_at_char_boundary(&content, 24_000),
+                                orig_len
+                            )
+                        } else {
+                            content
+                        };
+                        if cargo_test_output_failed(&content) {
+                            test_failure_needs_edit = true;
+                            cargo_fails_since_edit = cargo_fails_since_edit.saturating_add(1);
+                            messages.push(serde_json::json!({
+                                "role": "system",
+                                "content": cargo_test_failure_coaching(&content),
+                            }));
+                        } else if cargo_test_output_passed(&content) {
+                            test_failure_needs_edit = false;
+                            cargo_fails_since_edit = 0;
+                            messages.push(serde_json::json!({
+                                "role": "system",
+                                "content": "Auto re-verify: cargo test passed after edits.",
+                            }));
+                        }
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": reverify_id,
                             "content": content,
                         }));
                     }

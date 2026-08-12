@@ -497,26 +497,59 @@ pub fn is_edit_or_shell_tool(name: &str) -> bool {
     )
 }
 
-/// Skip remaining tool calls in the current model step after cargo failed.
+/// Skip remaining tool calls after cargo failed under a tight budget.
 ///
-/// Under `max_rounds <= 8`, once `test_failure_needs_edit` is armed, only
-/// edit/shell tools may run for the rest of the turn (including later calls
-/// in the same multi-tool assistant step).
+/// - Explore tools are always skipped while cargo is red.
+/// - Shell is skipped until at least one successful edit lands (cargo re-run
+///   is host-driven after edits). This stops cargo-only thrash under max_turns=3.
 pub fn should_skip_tool_after_cargo_failure(
     max_rounds: u32,
     test_failure_needs_edit: bool,
     tool_name: &str,
+    had_edit_since_cargo_fail: bool,
 ) -> bool {
-    max_rounds <= 8 && test_failure_needs_edit && !is_edit_or_shell_tool(tool_name)
+    if max_rounds > 8 || !test_failure_needs_edit {
+        return false;
+    }
+    if !is_edit_or_shell_tool(tool_name) {
+        return true; // explore
+    }
+    // Shell before any edit: skip (host auto-reverify runs cargo after write).
+    tool_name == "run_terminal_cmd" && !had_edit_since_cargo_fail
 }
 
-/// Message returned when an explore tool is skipped mid-batch after cargo fail.
+/// Message returned when a tool is skipped mid-batch after cargo fail.
 pub fn post_cargo_failure_skip_message(tool_name: &str) -> String {
-    format!(
-        "SKIPPED `{tool_name}`: cargo test failed earlier and the turn budget is tight. \
-         Only write_files / write_file / apply_patch / run_terminal_cmd are allowed now. \
-         Fix ALL failing tests in one batch, then re-run cargo test."
-    )
+    if tool_name == "run_terminal_cmd" {
+        format!(
+            "SKIPPED `{tool_name}`: cargo test already failed and no code edits have landed yet. \
+             Use write_files (all failing modules in one call) / write_file / apply_patch now. \
+             cargo test will re-run automatically after your edits."
+        )
+    } else {
+        format!(
+            "SKIPPED `{tool_name}`: cargo test failed earlier and the turn budget is tight. \
+             Only write_files / write_file / apply_patch are allowed until fixes land. \
+             Fix ALL failing tests in one batch; cargo re-runs automatically after edits."
+        )
+    }
+}
+
+/// After a successful edit following cargo failure under a tight budget,
+/// always schedule a cargo re-run so verified signal can go green (#187).
+///
+/// `edited_after_cargo_fail` is sticky for the tool batch once an edit lands
+/// while cargo was known red.
+pub fn should_auto_cargo_reverify_after_edit(
+    max_rounds: u32,
+    edited_after_cargo_fail: bool,
+) -> bool {
+    max_rounds <= 8 && edited_after_cargo_fail
+}
+
+/// Shell command used for host-driven post-edit re-verify under tight budgets.
+pub fn auto_cargo_reverify_command() -> &'static str {
+    "cargo test --manifest-path Cargo.toml --quiet"
 }
 
 /// Detect the R2 multi_bug failure signature: cargo ran, no mutating edit,
@@ -2017,33 +2050,51 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     }
 
     #[test]
-    fn post_cargo_failure_skips_explore_but_allows_edit_and_shell() {
-        // Tight budget + armed failure: list/read/grep/glob blocked mid-batch.
-        assert!(should_skip_tool_after_cargo_failure(3, true, "list_dir"));
-        assert!(should_skip_tool_after_cargo_failure(3, true, "read_file"));
-        assert!(should_skip_tool_after_cargo_failure(3, true, "grep"));
-        assert!(should_skip_tool_after_cargo_failure(3, true, "glob_files"));
-        // Edit + shell remain available so the model can fix and re-verify.
+    fn post_cargo_failure_skips_explore_and_shell_until_edit() {
+        // Tight budget + armed failure, no edit yet: explore + shell blocked.
+        assert!(should_skip_tool_after_cargo_failure(
+            3, true, "list_dir", false
+        ));
+        assert!(should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "read_file",
+            false
+        ));
+        assert!(should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "run_terminal_cmd",
+            false
+        ));
+        // Edits always allowed while red.
         assert!(!should_skip_tool_after_cargo_failure(
             3,
             true,
-            "write_files"
-        ));
-        assert!(!should_skip_tool_after_cargo_failure(3, true, "write_file"));
-        assert!(!should_skip_tool_after_cargo_failure(
-            3,
-            true,
-            "apply_patch"
+            "write_files",
+            false
         ));
         assert!(!should_skip_tool_after_cargo_failure(
             3,
             true,
-            "run_terminal_cmd"
+            "apply_patch",
+            false
         ));
-        // Not armed yet, or loose budget: never skip.
-        assert!(!should_skip_tool_after_cargo_failure(3, false, "list_dir"));
-        assert!(!should_skip_tool_after_cargo_failure(24, true, "list_dir"));
-        let msg = post_cargo_failure_skip_message("list_dir");
+        // After an edit lands, shell is allowed again (model or auto re-verify).
+        assert!(!should_skip_tool_after_cargo_failure(
+            3,
+            true,
+            "run_terminal_cmd",
+            true
+        ));
+        // Not armed / loose budget: never skip.
+        assert!(!should_skip_tool_after_cargo_failure(
+            3, false, "list_dir", false
+        ));
+        assert!(!should_skip_tool_after_cargo_failure(
+            24, true, "list_dir", false
+        ));
+        let msg = post_cargo_failure_skip_message("run_terminal_cmd");
         assert!(msg.contains("SKIPPED"));
         assert!(msg.contains("write_files"));
     }
@@ -2073,6 +2124,14 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
             "run_terminal_cmd",
         ]));
         assert!(!is_post_cargo_explore_only_burn(&[]));
+    }
+
+    #[test]
+    fn auto_cargo_reverify_after_edit_under_tight_budget() {
+        assert!(should_auto_cargo_reverify_after_edit(3, true));
+        assert!(!should_auto_cargo_reverify_after_edit(3, false));
+        assert!(!should_auto_cargo_reverify_after_edit(24, true));
+        assert!(auto_cargo_reverify_command().contains("cargo test"));
     }
 
     #[test]

@@ -105,13 +105,17 @@ Model: **grok-4.5** · identical fixtures/prompts/max_turns · YOLO both sides
 
 #### Residual gaps (honest)
 
-1. **#187 multi_bug** was flaky on full suite baseline-2 (explore-only path). **Hardened** mid-batch explore skip after cargo fail + edit-only thrash gate after 2 cargo fails without edit. Focused live recheck (runs 4–6): **3/3 oracle**, 0 explore-only burns; verified still often false when edit lands last without re-run cargo in-budget.
-2. **Verified signal** not always green when oracle is: long_horizon; post-edit without observed green cargo.
-3. **tool_errors** higher on Ptah than CLI (definition of ≥ when success ties).
-4. **#209** unit-verified on main; no live intentional-noop injection this cycle.
-5. **Do not claim full suite ≥ Grok Build** until multi_bug stays green across two full dual-side baselines after this harden.
+1. **#187 multi_bug** residual after harden:
+   - Mid-batch skip explore **and shell** until an edit lands after cargo fail.
+   - **Host auto cargo re-verify** after successful edit while cargo was red.
+   - Focused live (post-auto-reverify): verified can go true (e.g. runs 11, 16, 18, 22) when multi-file fixes are complete; oracle still flaky when the model under-fixes with partial `write_file` under max_turns=3 (not thrash).
+2. **Verified signal** residual: long_horizon on full baselines; multi_bug when fixes incomplete (tests stay red).
+3. **tool_errors** higher on Ptah than CLI when success ties.
+4. **#209** unit-verified on main; no live intentional-noop injection.
+5. **#223 rename** full dual-side oracle stable both baselines; focused dual-side ≥ CLI.
+6. **Do not claim full suite ≥ Grok Build** — multi_bug still model-variance under max_turns=3.
 
-Evidence: goal scratch `baselines/run1/`, `baselines/run2/`, `multibug-harden/run-{4,5,6}/`.
+Evidence: goal scratch `baselines/run{1,2}/`, `multibug-harden/run-*`.
 
 ### Prior cycle — turn-efficiency (#187/#188)
 
