@@ -1,5 +1,7 @@
 //! Integration tests for #196 orchestration control plane.
 
+mod common;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,20 +10,23 @@ use grokptah_agent_bridge::orchestration::{
     WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    discovered_tool_names, home_override_serial, set_grokptah_home_override, start_control_server,
-    AgentHost, EventBus, HostConfig, SessionKind, SessionUpdate, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    discovered_tool_names, set_grokptah_home_override, start_control_server, AgentHost, EventBus,
+    HostConfig, SessionKind, SessionUpdate, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
 
+use common::ProcessEnvGuard;
+
 /// Serializes home-override + instance-lock across tests (same as bridge lifecycle tests).
-fn setup_home() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
-    let guard = home_override_serial();
+fn setup_home() -> (tempfile::TempDir, ProcessEnvGuard) {
+    let mut guard = ProcessEnvGuard::new();
     let d = tempdir().unwrap();
     let home = d.path().join(".grokptah");
     std::fs::create_dir_all(&home).unwrap();
     set_grokptah_home_override(Some(home));
+    guard.set("GROKPTAH_AGENT_OFFLINE", "1");
     (d, guard)
 }
 
@@ -286,7 +291,7 @@ fn restart_interrupted_no_auto_resume() {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // home_override_serial MutexGuard must span the whole test
+#[allow(clippy::await_holding_lock)] // ProcessEnvGuard must span the whole test
 async fn e2e_mcp_client_valid_and_invalid_token() {
     let (home, _lock) = setup_home();
     let ws = tempdir().unwrap();
@@ -420,8 +425,6 @@ async fn wait_run_terminal(
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn submit_task_reaches_terminal_offline() {
-    let _offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -460,15 +463,11 @@ async fn submit_task_reaches_terminal_offline() {
         .unwrap();
     assert_eq!(again["runId"], run_id);
     set_grokptah_home_override(None);
-    if _offline.is_none() {
-        std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
-    }
 }
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn submit_duration_limit_reached() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -497,7 +496,6 @@ async fn submit_duration_limit_reached() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn submit_session_busy_and_capacity() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -553,7 +551,6 @@ async fn submit_session_busy_and_capacity() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn cancel_isolates_sessions() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -610,7 +607,6 @@ async fn cancel_isolates_sessions() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn steer_via_orchestration_service() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (_home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -661,7 +657,6 @@ async fn steer_via_orchestration_service() {
 
 #[test]
 fn queue_survives_host_restart() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (_home, _lock) = setup_home();
     let ws = tempdir().unwrap();
     let session_id = {
@@ -709,7 +704,6 @@ fn journal_reload_supports_run_scoped_reads() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn capacity_race_against_real_submit_task() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -766,7 +760,6 @@ async fn capacity_race_against_real_submit_task() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn admitted_run_reserves_session_against_desktop_prompt() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -800,7 +793,6 @@ async fn admitted_run_reserves_session_against_desktop_prompt() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn concurrent_same_session_submits_accept_exactly_one() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -852,7 +844,6 @@ async fn concurrent_same_session_submits_accept_exactly_one() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn capacity_is_shared_across_control_service_instances() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -914,7 +905,6 @@ async fn capacity_is_shared_across_control_service_instances() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn agent_progress_is_durable_outside_event_retention() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -961,7 +951,6 @@ async fn agent_progress_is_durable_outside_event_retention() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn submit_round_limit_reached_via_wired_max_rounds() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();

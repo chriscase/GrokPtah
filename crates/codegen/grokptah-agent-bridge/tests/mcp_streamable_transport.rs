@@ -1,6 +1,8 @@
 //! Standards MCP Streamable HTTP transport tests (#200).
 //! Independent SDK interop uses Node `@modelcontextprotocol/sdk` (not McpControlClient).
 
+mod common;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,21 +10,23 @@ use grokptah_agent_bridge::orchestration::{
     OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, start_control_from_env, start_control_server,
+    set_grokptah_home_override, start_control_from_env, start_control_server,
     start_control_server_with, AgentHost, ControlServerLimits, HostConfig, McpControlClient,
     SessionKind, CONTROL_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
 
+use common::ProcessEnvGuard;
+
 fn setup() -> (
     tempfile::TempDir,
-    std::sync::MutexGuard<'static, ()>,
+    ProcessEnvGuard,
     grokptah_agent_bridge::AgentHostHandle,
     tempfile::TempDir,
     std::sync::Arc<OrchestrationService>,
 ) {
-    let guard = home_override_serial();
+    let mut guard = ProcessEnvGuard::new();
     let home = tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".grokptah")).unwrap();
     set_grokptah_home_override(Some(home.path().join(".grokptah")));
@@ -44,6 +48,7 @@ fn setup() -> (
             bounds: RunBounds::default(),
         },
     );
+    guard.set("GROKPTAH_AGENT_OFFLINE", "1");
     (home, guard, host, ws, orch)
 }
 
@@ -747,7 +752,6 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn http_submit_durable_run_events_handoff_and_cancel() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (_home, _lock, host, ws, orch) = setup();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
@@ -901,7 +905,6 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn http_cancel_busy_run_reaches_cancelled() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (_home, _lock, host, ws, orch) = setup();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
@@ -1111,12 +1114,12 @@ async fn http_steer_idle_queues_without_starting_run() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn live_desktop_bootstrap_node_smoke() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
-    let guard = home_override_serial();
+    let mut env = ProcessEnvGuard::new();
     let home = tempdir().unwrap();
     let ws = tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".grokptah")).unwrap();
     set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
 
     let host = AgentHost::create(HostConfig {
         always_approve: true,
@@ -1129,13 +1132,9 @@ async fn live_desktop_bootstrap_node_smoke() {
 
     // Disposable token — never a real credential.
     let token = format!("live-smoke-{}", uuid::Uuid::new_v4());
-    // Isolate env mutations for this process; restore best-effort after.
-    let prev_token = std::env::var("GROKPTAH_CONTROL_TOKEN").ok();
-    let prev_port = std::env::var("GROKPTAH_CONTROL_PORT").ok();
-    let prev_ws = std::env::var("GROKPTAH_CONTROL_WORKSPACES").ok();
-    std::env::set_var("GROKPTAH_CONTROL_TOKEN", &token);
-    std::env::set_var("GROKPTAH_CONTROL_PORT", "0");
-    std::env::set_var("GROKPTAH_CONTROL_WORKSPACES", ws.path().as_os_str());
+    env.set("GROKPTAH_CONTROL_TOKEN", &token);
+    env.set("GROKPTAH_CONTROL_PORT", "0");
+    env.set("GROKPTAH_CONTROL_WORKSPACES", ws.path().as_os_str());
 
     let srv = start_control_from_env(host.clone())
         .await
@@ -1148,12 +1147,12 @@ async fn live_desktop_bootstrap_node_smoke() {
     assert_eq!(srv.token, token);
 
     // Without token the shared bootstrap fails closed (structural desktop path).
-    std::env::remove_var("GROKPTAH_CONTROL_TOKEN");
+    env.remove("GROKPTAH_CONTROL_TOKEN");
     assert!(
         start_control_from_env(host.clone()).await.is_none(),
         "missing GROKPTAH_CONTROL_TOKEN must not start control"
     );
-    std::env::set_var("GROKPTAH_CONTROL_TOKEN", &token);
+    env.set("GROKPTAH_CONTROL_TOKEN", &token);
 
     let url = format!("http://{}/mcp", srv.addr);
     let sdk_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_sdk_interop");
@@ -1196,21 +1195,8 @@ async fn live_desktop_bootstrap_node_smoke() {
     }
 
     srv.stop();
-    // Restore env
-    match prev_token {
-        Some(v) => std::env::set_var("GROKPTAH_CONTROL_TOKEN", v),
-        None => std::env::remove_var("GROKPTAH_CONTROL_TOKEN"),
-    }
-    match prev_port {
-        Some(v) => std::env::set_var("GROKPTAH_CONTROL_PORT", v),
-        None => std::env::remove_var("GROKPTAH_CONTROL_PORT"),
-    }
-    match prev_ws {
-        Some(v) => std::env::set_var("GROKPTAH_CONTROL_WORKSPACES", v),
-        None => std::env::remove_var("GROKPTAH_CONTROL_WORKSPACES"),
-    }
     set_grokptah_home_override(None);
-    drop(guard);
+    drop(env);
 }
 
 /// Desktop wiring must keep delegating to the shared bootstrap (no fork of policy).
