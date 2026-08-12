@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::event_bus::{CursorExpiredError, EventBus};
 use crate::host::AgentHostHandle;
-use crate::session::SessionKind;
+use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{require_workspace_match, AuthContext, WorkspaceAllowlist};
 use super::store::{IdempotencyClaim, OrchStore};
@@ -655,6 +655,7 @@ impl OrchestrationService {
                     "title": s.title,
                     "kind": "build",
                     "cwd": s.cwd,
+                    "workspaceStatus": s.workspace_status.as_str(),
                     "updatedAt": s.updated_at,
                     "busy": busy,
                 })
@@ -926,6 +927,15 @@ impl OrchestrationService {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
                 "only Build sessions are controllable in this slice",
+            ));
+        }
+        if session.workspace_status != WorkspaceStatus::Ready {
+            return Err(OrchError::new(
+                OrchErrorCode::WorkspaceMismatch,
+                format!(
+                    "session workspace is {}: choose a working directory before controlling it",
+                    session.workspace_status.as_str()
+                ),
             ));
         }
         Ok(session)
