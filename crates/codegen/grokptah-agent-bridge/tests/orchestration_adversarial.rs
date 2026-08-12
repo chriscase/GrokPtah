@@ -1,6 +1,8 @@
 //! Adversarial / residual #196 security and durability tests.
 //! Each test drives shipped service/host/store/bus/MCP/spawn code.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,20 +12,22 @@ use grokptah_agent_bridge::orchestration::{
     WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    discovered_tool_names, home_override_serial, set_grokptah_home_override, start_control_server,
-    AgentHost, EventBus, HostConfig, SessionKind, SessionUpdate, CONTROL_SECRET_ENV_KEYS,
-    CONTROL_TOOLS,
+    discovered_tool_names, set_grokptah_home_override, start_control_server, AgentHost, EventBus,
+    HostConfig, SessionKind, SessionUpdate, CONTROL_SECRET_ENV_KEYS, CONTROL_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
 
-fn setup_home() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
-    let guard = home_override_serial();
+use common::ProcessEnvGuard;
+
+fn setup_home() -> (tempfile::TempDir, ProcessEnvGuard) {
+    let mut guard = ProcessEnvGuard::new();
     let d = tempdir().unwrap();
     let home = d.path().join(".grokptah");
     std::fs::create_dir_all(&home).unwrap();
     set_grokptah_home_override(Some(home));
+    guard.set("GROKPTAH_AGENT_OFFLINE", "1");
     (d, guard)
 }
 
@@ -92,7 +96,6 @@ async fn wait_terminal(
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn duration_timeout_kills_shell_no_post_write() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -143,11 +146,10 @@ async fn duration_timeout_kills_shell_no_post_write() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn control_token_absent_from_shell_env() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let token = "env-leak-token-SHOULD-NOT-APPEAR";
-    std::env::set_var("GROKPTAH_CONTROL_TOKEN", token);
-    std::env::set_var("GROKPTAH_CONTROL_PORT", "9999");
-    let (_home, _lock) = setup_home();
+    let (_home, mut env) = setup_home();
+    env.set("GROKPTAH_CONTROL_TOKEN", token);
+    env.set("GROKPTAH_CONTROL_PORT", "9999");
     let host = started_host();
     let ws = tempdir().unwrap();
     host.set_project_cwd(ws.path()).unwrap();
@@ -186,15 +188,12 @@ async fn control_token_absent_from_shell_env() {
             "secret key {k} present in child env"
         );
     }
-    std::env::remove_var("GROKPTAH_CONTROL_TOKEN");
-    std::env::remove_var("GROKPTAH_CONTROL_PORT");
     set_grokptah_home_override(None);
 }
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn reads_require_run_ownership_no_global_events() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -258,7 +257,6 @@ async fn reads_require_run_ownership_no_global_events() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn concurrent_idempotent_submit_single_effect() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -329,7 +327,6 @@ fn bounds_escalation_and_zero_rejected() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn cancel_requires_matching_run_stays_cancelled() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -400,7 +397,6 @@ async fn cancel_requires_matching_run_stays_cancelled() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn non_build_queue_steer_rejected() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -427,7 +423,6 @@ async fn non_build_queue_steer_rejected() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn list_sessions_reports_busy() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -491,7 +486,6 @@ fn typed_schema_has_required_fields() {
 #[allow(clippy::await_holding_lock)]
 async fn mcp_control_client_library_interop() {
     // Shipped McpControlClient: full initialize lifecycle + schema-gated tools/call.
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -548,7 +542,6 @@ async fn mcp_control_client_library_interop() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn journal_rollover_preserves_durable_aggregates() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -643,7 +636,6 @@ async fn journal_rollover_preserves_durable_aggregates() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn duration_deadline_not_starved_by_event_flood() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -694,7 +686,6 @@ async fn duration_deadline_not_starved_by_event_flood() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn control_secret_redacted_on_shared_host_bus() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();
@@ -787,7 +778,6 @@ async fn control_secret_redacted_on_shared_host_bus() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn id_traversal_rejected() {
-    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
     let host = started_host();
     let ws = tempdir().unwrap();

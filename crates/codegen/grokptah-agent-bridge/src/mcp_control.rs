@@ -141,6 +141,10 @@ impl LiveStreamState {
         for entry in page.entries {
             self.queue_entry(entry.seq, entry.ts, entry.update);
         }
+        if self.end_seq.is_some_and(|end_seq| self.last_seq >= end_seq) {
+            self.done = true;
+            self.replay_cursor = None;
+        }
     }
 
     fn queue_entry(&mut self, seq: u64, ts: String, update: SessionUpdate) {

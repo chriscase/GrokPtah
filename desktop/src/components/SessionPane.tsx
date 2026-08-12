@@ -87,6 +87,7 @@ export type SessionPaneProps = {
    */
   onFocusSession: (sessionId: string) => void;
   onClosePane?: (sessionId: string) => void;
+  onSetWorkingDirectory?: (sessionId: string) => void;
   /** Show close control for secondary pane only. */
   showClose?: boolean;
   /** Working directory for title disambiguation (#130). */
@@ -113,6 +114,7 @@ export const SessionPane = memo(function SessionPane({
   bridgeVersion,
   onFocusSession,
   onClosePane,
+  onSetWorkingDirectory,
   showClose,
   cwd,
   titlePeers = [],
@@ -131,6 +133,10 @@ export const SessionPane = memo(function SessionPane({
   const transcript = tab.transcript;
   const rows = useMemo(() => groupTranscript(transcript), [transcript]);
   const multi = (zoneCount ?? 1) > 1;
+  const workspaceUnavailable =
+    tab.kind === "build" &&
+    tab.workspaceStatus != null &&
+    tab.workspaceStatus !== "ready";
 
   const jumpToLatest = useCallback(() => {
     stickRef.current = true;
@@ -196,6 +202,27 @@ export const SessionPane = memo(function SessionPane({
           )}
         </div>
       </header>
+
+      {workspaceUnavailable && (
+        <div className="workspace-warning" role="alert">
+          <div className="workspace-warning-copy">
+            <strong>Workspace unavailable</strong>
+            <span>
+              Saved project is {tab.workspaceStatus?.replaceAll("_", " ")}.
+              No tools or model turns can run until you choose a valid directory.
+            </span>
+          </div>
+          {onSetWorkingDirectory && (
+            <button
+              type="button"
+              className="workspace-warning-action"
+              onClick={() => onSetWorkingDirectory(tab.id)}
+            >
+              Choose folder
+            </button>
+          )}
+        </div>
+      )}
 
       <div
         className="transcript session-pane-transcript"

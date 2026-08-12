@@ -200,6 +200,81 @@ pub(crate) fn build_evidence(
     }
 }
 
+/// Append an evidence-backed trailer when the model final text omits observed
+/// changes or test results. Only reports paths/outcomes actually observed —
+/// never invents work.
+///
+/// Incomplete/limit stop *reasons* are preserved as the leading text; when the
+/// turn still produced edits or test outcomes we still append that evidence so
+/// terminal handoffs remain honest (recovery stops often land after green
+/// cargo but before a prose final).
+pub fn enrich_terminal_handoff(
+    model_text: &str,
+    changed_paths: &[String],
+    tests_passed: Option<bool>,
+    incomplete_stop: bool,
+) -> String {
+    let claims = claims_from_response(Some(model_text));
+    let mut extras: Vec<String> = Vec::new();
+
+    // For incomplete stops, only add evidence that was actually observed —
+    // never invent a "no files changed" claim over a limit-stop reason.
+    let need_changes = !changed_paths.is_empty() && !claims.mentions_changes;
+    if need_changes {
+        const MAX_PATHS: usize = 12;
+        let mut paths: Vec<&str> = changed_paths.iter().map(String::as_str).collect();
+        paths.sort();
+        paths.dedup();
+        let total = paths.len();
+        paths.truncate(MAX_PATHS);
+        let joined = paths.join(", ");
+        if total > MAX_PATHS {
+            extras.push(format!(
+                "Changed files: {joined}, … (+{} more).",
+                total - MAX_PATHS
+            ));
+        } else {
+            extras.push(format!("Changed files: {joined}."));
+        }
+    } else if !incomplete_stop
+        && changed_paths.is_empty()
+        && claims.present
+        && !claims.mentions_changes
+        && !model_text.to_ascii_lowercase().contains("no files changed")
+    {
+        extras.push("No files changed.".into());
+    }
+
+    // Avoid treating "test-recovery" in stop text as a real verification claim.
+    let lower = model_text.to_ascii_lowercase();
+    let has_real_test_claim = claims.mentions_tests
+        && (lower.contains("cargo test")
+            || lower.contains("tests passed")
+            || lower.contains("test passed")
+            || lower.contains("tests failed")
+            || lower.contains("verification"));
+    let need_tests =
+        tests_passed.is_some() && (!has_real_test_claim || !claims.mentions_verification);
+    if need_tests {
+        match tests_passed {
+            Some(true) => extras.push("cargo test passed.".into()),
+            Some(false) => extras.push("cargo test failed (unresolved).".into()),
+            None => {}
+        }
+    }
+
+    if extras.is_empty() {
+        return model_text.to_string();
+    }
+    let trailer = extras.join(" ");
+    let base = model_text.trim();
+    if base.is_empty() {
+        trailer
+    } else {
+        format!("{base}\n\n{trailer}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +290,35 @@ mod tests {
         assert!(claims.mentions_changes);
         assert!(claims.mentions_tests);
         assert!(claims.mentions_verification);
+    }
+
+    #[test]
+    fn enrich_terminal_handoff_fills_missing_change_and_test_claims() {
+        let weak = "Done.";
+        let enriched = enrich_terminal_handoff(
+            weak,
+            &["src/math.rs".into(), "src/parse.rs".into()],
+            Some(true),
+            false,
+        );
+        assert!(enriched.contains("Done."));
+        assert!(enriched.to_ascii_lowercase().contains("changed"));
+        assert!(enriched.contains("src/math.rs"));
+        assert!(enriched.contains("src/parse.rs"));
+        assert!(enriched.to_ascii_lowercase().contains("test"));
+        assert!(enriched.to_ascii_lowercase().contains("passed"));
+        // Incomplete stops keep the stop reason but still report observed work.
+        let stop = "Stopped after 3 tool rounds plus one bounded test-recovery step without a final answer.";
+        let enriched_stop = enrich_terminal_handoff(stop, &["src/a.rs".into()], Some(true), true);
+        assert!(enriched_stop.starts_with("Stopped after"));
+        assert!(enriched_stop.contains("src/a.rs"));
+        assert!(enriched_stop.contains("cargo test passed"));
+        // Already complete handoffs are left alone.
+        let good = "Changed src/lib.rs. cargo test passed.";
+        assert_eq!(
+            enrich_terminal_handoff(good, &["src/lib.rs".into()], Some(true), false),
+            good
+        );
     }
 
     #[test]
