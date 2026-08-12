@@ -1086,6 +1086,187 @@ async fn capacity_is_shared_across_control_service_instances() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn pending_admission_bound_is_shared_across_control_services() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let active = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(active.id, ws.path()).unwrap();
+    let one = orch_for(&host, &home, &ws, 1);
+    let two = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        one.store().clone(),
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 8,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth_one = one.auth_header(Some("Bearer t")).unwrap();
+    let auth_two = two.auth_header(Some("Bearer t")).unwrap();
+    let active_run = one
+        .submit_task(
+            &auth_one,
+            "global-queue-active",
+            active.id,
+            ws.path(),
+            "run sleep 3".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut queued = Vec::new();
+    for index in 0..32 {
+        let session = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+        let (service, auth) = if index % 2 == 0 {
+            (&one, &auth_one)
+        } else {
+            (&two, &auth_two)
+        };
+        let response = service
+            .submit_task_with_execution_mode_and_queue(
+                auth,
+                &format!("global-queue-{index}"),
+                session.id,
+                ws.path(),
+                "list files".into(),
+                None,
+                RunExecutionMode::Shared,
+                true,
+            )
+            .await
+            .unwrap();
+        queued.push((service.clone(), auth.clone(), session.id, response));
+    }
+    assert_eq!(one.get_capacity(&auth_one).unwrap()["queuedRuns"], 32);
+    assert_eq!(two.get_capacity(&auth_two).unwrap()["queuedRuns"], 32);
+
+    let overflow_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(overflow_session.id, ws.path())
+        .unwrap();
+    let overflow = one
+        .submit_task_with_execution_mode_and_queue(
+            &auth_one,
+            "global-queue-overflow",
+            overflow_session.id,
+            ws.path(),
+            "list files".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(overflow.code.as_str(), "capacity_exhausted");
+    assert_eq!(one.get_capacity(&auth_one).unwrap()["queuedRuns"], 32);
+
+    for (service, auth, session_id, response) in queued {
+        service
+            .cancel(
+                &auth,
+                &format!("global-queue-cancel-{session_id}"),
+                session_id,
+                ws.path(),
+                response["runId"].as_str(),
+            )
+            .await
+            .unwrap();
+    }
+    one.cancel(
+        &auth_one,
+        "global-queue-cancel-active",
+        active.id,
+        ws.path(),
+        active_run["runId"].as_str(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(one.get_capacity(&auth_one).unwrap()["queuedRuns"], 0);
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn dropping_control_service_releases_pending_admission_slot() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let active = host.session_new_kind(SessionKind::Build).unwrap();
+    let queued = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(active.id, ws.path()).unwrap();
+    host.session_set_cwd(queued.id, ws.path()).unwrap();
+    let primary = orch_for(&host, &home, &ws, 1);
+    let queued_service = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        primary.store().clone(),
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 8,
+            bounds: RunBounds::default(),
+        },
+    );
+    let primary_auth = primary.auth_header(Some("Bearer t")).unwrap();
+    let queued_auth = queued_service.auth_header(Some("Bearer t")).unwrap();
+    let active_run = primary
+        .submit_task(
+            &primary_auth,
+            "drop-active",
+            active.id,
+            ws.path(),
+            "run sleep 3".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    queued_service
+        .submit_task_with_execution_mode_and_queue(
+            &queued_auth,
+            "drop-queued",
+            queued.id,
+            ws.path(),
+            "list files".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        primary.get_capacity(&primary_auth).unwrap()["queuedRuns"],
+        1
+    );
+    drop(queued_service);
+    assert_eq!(
+        primary.get_capacity(&primary_auth).unwrap()["queuedRuns"],
+        0
+    );
+    primary
+        .cancel(
+            &primary_auth,
+            "drop-cancel",
+            active.id,
+            ws.path(),
+            active_run["runId"].as_str(),
+        )
+        .await
+        .unwrap();
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn agent_progress_is_durable_outside_event_retention() {
     std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();
