@@ -319,6 +319,12 @@ export function RunInspector({
                     <div className="run-progress-detail">{run.progress.detail}</div>
                   </div>
                 )}
+                {run.state === "queued" && (
+                  <div className="run-queue-callout" role="status">
+                    Waiting for an execution slot
+                    {run.queuePosition != null ? ` · position ${run.queuePosition}` : ""}
+                  </div>
+                )}
                 <div className="run-metrics">
                   <span>{run.aggregates.changes.length} files</span>
                   <span>{testLabel(run)}</span>

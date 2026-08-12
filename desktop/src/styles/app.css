@@ -3394,6 +3394,7 @@ button:disabled {
 }
 
 .run-card.state-running { border-left-color: var(--accent); }
+.run-card.state-queued { border-left-color: var(--warning, #e0ad4f); }
 .run-card.state-completed { border-left-color: var(--success, #76c893); }
 .run-card.state-failed,
 .run-card.state-limit_reached { border-left-color: var(--danger, #f07178); }
@@ -3437,6 +3438,7 @@ button:disabled {
 }
 
 .state-running .run-state-dot { background: var(--accent); }
+.state-queued .run-state-dot { background: var(--warning, #e0ad4f); }
 .state-completed .run-state-dot { background: var(--success, #76c893); }
 .state-failed .run-state-dot,
 .state-limit_reached .run-state-dot { background: var(--danger, #f07178); }
@@ -3488,6 +3490,15 @@ button:disabled {
 }
 
 .run-progress-detail {
+  line-height: 1.35;
+}
+
+.run-queue-callout {
+  margin: 0.35rem 0 0.45rem;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid color-mix(in srgb, var(--warning, #e0ad4f) 35%, var(--border-soft));
+  border-radius: var(--radius);
+  color: var(--text);
   line-height: 1.35;
 }
 

@@ -232,6 +232,7 @@ fn restart_interrupted_no_auto_resume() {
         request_id: "q".into(),
         client_id: None,
         state: RunState::Running,
+        queue_position: None,
         bounds: RunBounds::default(),
         prompt_preview: "p".into(),
         start_seq: Some(1),
@@ -251,6 +252,40 @@ fn restart_interrupted_no_auto_resume() {
     let store2 = OrchStore::open(d.path()).unwrap();
     let loaded = store2.load_run("run-x").unwrap().unwrap();
     assert_eq!(loaded.state, RunState::Interrupted);
+}
+
+#[test]
+fn restart_clears_queued_admission_position() {
+    let d = tempdir().unwrap();
+    let store = OrchStore::open(d.path()).unwrap();
+    let run = grokptah_agent_bridge::orchestration::RunRecord {
+        run_id: "queued-restart".into(),
+        session_id: Uuid::new_v4(),
+        workspace: "/w".into(),
+        request_id: "q-restart".into(),
+        client_id: Some("mcp".into()),
+        state: RunState::Queued,
+        queue_position: Some(3),
+        bounds: RunBounds::default(),
+        prompt_preview: "p".into(),
+        start_seq: None,
+        end_seq: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        terminal_result: None,
+        final_response: None,
+        error_code: None,
+        aggregates: Default::default(),
+        progress: None,
+        execution: None,
+        approval: None,
+    };
+    store.save_run(&run).unwrap();
+    drop(store);
+    let reopened = OrchStore::open(d.path()).unwrap();
+    let loaded = reopened.load_run("queued-restart").unwrap().unwrap();
+    assert_eq!(loaded.state, RunState::Interrupted);
+    assert_eq!(loaded.queue_position, None);
 }
 
 #[tokio::test]
@@ -823,6 +858,10 @@ async fn queued_admission_is_bounded_fair_and_cancellable() {
     assert_eq!(queued_b["state"], "queued");
     assert_eq!(queued_same_session["state"], "queued");
     assert_eq!(queued_cancel["state"], "queued");
+    assert_eq!(queued_a["queuedPosition"], 1);
+    assert_eq!(queued_b["queuedPosition"], 2);
+    assert_eq!(queued_same_session["queuedPosition"], 3);
+    assert_eq!(queued_cancel["queuedPosition"], 4);
     let cap = orch.get_capacity(&auth).unwrap();
     assert_eq!(cap["activeRuns"], 1);
     assert_eq!(cap["queuedRuns"], 4);
@@ -843,6 +882,21 @@ async fn queued_admission_is_bounded_fair_and_cancellable() {
     assert_eq!(cancelled["teardownComplete"], true);
     let cap = orch.get_capacity(&auth).unwrap();
     assert_eq!(cap["queuedRuns"], 3);
+    assert_eq!(
+        orch.get_run(&auth, queued_a["runId"].as_str().unwrap())
+            .unwrap()["queuePosition"],
+        1
+    );
+    assert_eq!(
+        orch.get_run(&auth, queued_b["runId"].as_str().unwrap())
+            .unwrap()["queuePosition"],
+        2
+    );
+    assert_eq!(
+        orch.get_run(&auth, queued_same_session["runId"].as_str().unwrap())
+            .unwrap()["queuePosition"],
+        3
+    );
 
     let first_id = first["runId"].as_str().unwrap().to_string();
     let second_id = queued_a["runId"].as_str().unwrap().to_string();
@@ -865,6 +919,10 @@ async fn queued_admission_is_bounded_fair_and_cancellable() {
             .unwrap();
     assert_ne!(third_state, RunState::Queued);
     assert_eq!(same_session_state, RunState::Queued);
+    assert_eq!(
+        orch.get_run(&auth, &same_session_id).unwrap()["queuePosition"],
+        1
+    );
 
     assert_eq!(
         wait_run_terminal(&orch, &auth, &third_id, Duration::from_secs(10)).await,

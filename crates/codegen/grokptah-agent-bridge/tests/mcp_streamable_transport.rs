@@ -792,6 +792,20 @@ async fn http_submit_allow_queue_and_cancel_queued_run() {
     let queued_run_id = queued.structured["runId"].as_str().unwrap().to_string();
     assert_eq!(queued.structured["state"], "queued");
     assert_eq!(queued.structured["queuedPosition"], 1);
+    let visible_queued = client
+        .call_tool("ptah_get_run", json!({ "run_id": queued_run_id }))
+        .await
+        .unwrap();
+    assert!(!visible_queued.is_error);
+    assert_eq!(visible_queued.structured["state"], "queued");
+    assert_eq!(visible_queued.structured["queuePosition"], 1);
+    let progress_queued = client
+        .call_tool("ptah_get_progress", json!({ "run_id": queued_run_id }))
+        .await
+        .unwrap();
+    assert!(!progress_queued.is_error);
+    assert_eq!(progress_queued.structured["state"], "queued");
+    assert_eq!(progress_queued.structured["queuePosition"], 1);
 
     let capacity = client
         .call_tool("ptah_get_capacity", json!({}))
@@ -817,6 +831,12 @@ async fn http_submit_allow_queue_and_cancel_queued_run() {
     assert_eq!(cancelled.structured["wasQueued"], true);
     assert_eq!(cancelled.structured["teardownComplete"], true);
     assert_eq!(cancelled.structured["state"], "cancelled");
+    let visible_cancelled = client
+        .call_tool("ptah_get_run", json!({ "run_id": queued_run_id }))
+        .await
+        .unwrap();
+    assert_eq!(visible_cancelled.structured["state"], "cancelled");
+    assert!(visible_cancelled.structured["queuePosition"].is_null());
 
     srv.stop_and_wait().await;
     set_grokptah_home_override(None);
