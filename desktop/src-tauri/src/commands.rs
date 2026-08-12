@@ -417,6 +417,29 @@ pub async fn session_completion_history(
     run_blocking(move || host.session_completion_history(id).map_err(map_err)).await
 }
 
+/// Read-only durable Build-run history for the requested session.
+#[tauri::command]
+pub async fn run_list(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<grokptah_agent_bridge::RunRecord>, String> {
+    let host = state.host.clone();
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    run_blocking(move || host.list_session_runs(id).map_err(map_err)).await
+}
+
+/// Read one durable Build run, scoped to its owning session.
+#[tauri::command]
+pub async fn run_get(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+) -> Result<Option<grokptah_agent_bridge::RunRecord>, String> {
+    let host = state.host.clone();
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    run_blocking(move || host.get_session_run(id, &run_id).map_err(map_err)).await
+}
+
 #[tauri::command]
 pub fn session_fork(
     state: State<'_, AppState>,

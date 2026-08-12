@@ -8,6 +8,13 @@ This document is the **contract** a coordinator should implement against.
 Deterministic tests that prove it live under
 `crates/codegen/grokptah-agent-bridge/tests/`.
 
+The desktop host owns the durable orchestration store. When the embedded MCP
+server is enabled, it borrows that same in-process ledger, so desktop Build
+runs and coordinator-submitted runs share one run namespace and restart
+recovery policy. A desktop run uses `clientId: "desktop"`; coordinator runs
+retain their caller identity. The MCP read tools remain run-scoped and do not
+expose arbitrary desktop session history.
+
 ## Launch (desktop / production)
 
 The Tauri desktop app starts the control plane only when a token is configured.

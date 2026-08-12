@@ -28,11 +28,10 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::discover::grokptah_home;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    OrchError, OrchErrorCode, OrchStore, OrchestrationConfig, OrchestrationService,
-    WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService, WorkspaceAllowlist,
+    CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 
 /// Max concurrent in-flight MCP requests (post-auth).
@@ -181,7 +180,10 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
         );
         return None;
     }
-    let store = OrchStore::open(grokptah_home().join("orchestration")).ok()?;
+    // The desktop host owns the single durable ledger. Reusing that handle is
+    // important: opening a second store would split desktop and MCP history or
+    // contend on the process-wide lock.
+    let store = host.ensure_orchestration_store().ok()?;
     let orch = OrchestrationService::new(
         host.clone(),
         host.event_bus(),

@@ -1352,7 +1352,7 @@ fn canonical_cmp(a: &Path, b: &Path) -> Result<(), ()> {
 }
 
 /// Incrementally persist run-scoped aggregates so journal rollover cannot erase them.
-fn apply_run_aggregate(
+pub(crate) fn apply_run_aggregate(
     store: &OrchStore,
     run_id: &str,
     session_id: Uuid,

@@ -13,6 +13,7 @@ import {
   type SessionUpdate,
   type SubagentInfo,
   type TranscriptItem,
+  type DurableRun,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
 import {
@@ -27,6 +28,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
 import { PromptQueuePanel } from "./components/PromptQueuePanel";
+import { RunInspector } from "./components/RunInspector";
 import { SubagentCard } from "./components/SubagentCard";
 import {
   appendDeny,
@@ -291,6 +293,8 @@ export default function App() {
   const [skills, setSkills] = useState<any[]>([]);
   const [subagents, setSubagents] = useState<SubagentInfo[]>([]);
   const [bgTasks, setBgTasks] = useState<any[]>([]);
+  const [runs, setRuns] = useState<DurableRun[]>([]);
+  const [runsBusy, setRunsBusy] = useState(false);
   const [hooksPreview, setHooksPreview] = useState<string | null>(null);
   const [rules, setRules] = useState<string[]>([]);
   const [product, setProduct] = useState({
@@ -329,6 +333,28 @@ export default function App() {
   const splitOk = maxDocks >= 2;
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
   const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
+
+  const refreshRuns = useCallback(async () => {
+    if (!activeSessionId) {
+      setRuns([]);
+      return;
+    }
+    setRunsBusy(true);
+    try {
+      setRuns(await api.runList(activeSessionId));
+    } catch (error) {
+      console.warn("durable run refresh failed", error);
+    } finally {
+      setRunsBusy(false);
+    }
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    if (rightTab !== "tasks" || !activeSessionId) return;
+    void refreshRuns();
+    const timer = window.setInterval(() => void refreshRuns(), 1200);
+    return () => window.clearInterval(timer);
+  }, [activeSessionId, refreshRuns, rightTab]);
 
   // Narrow windows need the stage first; rails remain available through the
   // header toggles and open as overlays when explicitly requested.
@@ -1770,6 +1796,7 @@ export default function App() {
       if (tab === "tasks") {
         setSubagents(await api.subagentsList());
         setBgTasks(await api.backgroundTasks());
+        await refreshRuns();
       }
       if (tab === "rules") setRules(await api.projectRules());
     } catch (e) {
@@ -3027,6 +3054,11 @@ export default function App() {
 
         {rightTab === "tasks" && (
           <>
+            <RunInspector
+              runs={runs}
+              busy={runsBusy}
+              onRefresh={() => void refreshRuns()}
+            />
             <div className="section-title">Multi-agent</div>
             <p style={{ fontSize: 11, color: "var(--muted)", margin: "0 0 0.5rem" }}>
               Parallel children (explore / general-purpose / plan) — not a flat

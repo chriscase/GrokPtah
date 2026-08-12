@@ -27,6 +27,9 @@ use crate::host_helpers::{
     IdenticalToolCallRun, McpToolIndex,
 };
 use crate::local_tools;
+use crate::orchestration::{
+    apply_run_aggregate, prompt_preview, OrchStore, RunAggregates, RunBounds, RunRecord, RunState,
+};
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::prompt_queue::{
     format_interjection, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueTakeResult,
@@ -198,6 +201,10 @@ async fn kill_shells(live_shells: local_tools::LiveShellMap, kill_ids: Vec<Uuid>
 pub struct AgentHostHandle {
     pub(crate) inner: Arc<Mutex<Inner>>,
     event_rx_factory: Arc<Mutex<Option<crate::event_bus::EventReceiver>>>,
+    /// One process-owned durable run ledger shared by desktop and MCP.
+    /// It is opened lazily so library users can still construct a host for
+    /// tests that provide their own orchestration store.
+    orchestration_store: Arc<Mutex<Option<OrchStore>>>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
 }
@@ -307,6 +314,7 @@ impl AgentHost {
         AgentHostHandle {
             inner: Arc::new(Mutex::new(inner)),
             event_rx_factory: Arc::new(Mutex::new(Some(event_rx))),
+            orchestration_store: Arc::new(Mutex::new(None)),
             _instance_lock: instance_lock,
         }
     }
@@ -325,6 +333,157 @@ impl AgentHostHandle {
     /// Additional live subscriber (does not steal the primary GUI receiver).
     pub fn subscribe_events(&self) -> crate::event_bus::EventReceiver {
         self.inner.lock().event_tx.subscribe()
+    }
+
+    /// Open the single process-owned durable run ledger on first use.
+    pub fn ensure_orchestration_store(&self) -> Result<OrchStore> {
+        let mut store = self.orchestration_store.lock();
+        if let Some(existing) = store.as_ref() {
+            return Ok(existing.clone());
+        }
+        let opened = OrchStore::open(crate::discover::grokptah_home().join("orchestration"))?;
+        *store = Some(opened.clone());
+        Ok(opened)
+    }
+
+    /// Return the already-open ledger without causing filesystem work.
+    pub fn orchestration_store(&self) -> Option<OrchStore> {
+        self.orchestration_store.lock().clone()
+    }
+
+    /// Read desktop-visible runs for one session. Session scoping prevents a
+    /// local inspector from displaying another workspace's coordinator data.
+    pub fn list_session_runs(&self, session_id: Uuid) -> Result<Vec<RunRecord>> {
+        let store = self.ensure_orchestration_store()?;
+        Ok(store
+            .list_runs()?
+            .into_iter()
+            .filter(|run| run.session_id == session_id)
+            .collect())
+    }
+
+    /// Read one run only when it belongs to the requested session.
+    pub fn get_session_run(&self, session_id: Uuid, run_id: &str) -> Result<Option<RunRecord>> {
+        let store = self.ensure_orchestration_store()?;
+        Ok(store
+            .load_run(run_id)?
+            .filter(|run| run.session_id == session_id))
+    }
+
+    fn begin_desktop_run(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        prompt: &str,
+        max_rounds: Option<u32>,
+        start_seq: u64,
+        turn_id: Uuid,
+    ) -> Option<(String, OrchStore)> {
+        let store = match self.ensure_orchestration_store() {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("[grokptah] desktop run ledger unavailable: {error:#}");
+                return None;
+            }
+        };
+        let run_id = format!("desktop-{turn_id}");
+        let mut bounds = RunBounds::default();
+        if let Some(rounds) = max_rounds {
+            bounds.max_rounds = rounds.max(1);
+        }
+        let now = Utc::now();
+        let run = RunRecord {
+            run_id: run_id.clone(),
+            session_id,
+            workspace: cwd.display().to_string(),
+            request_id: format!("desktop-turn-{turn_id}"),
+            client_id: Some("desktop".into()),
+            state: RunState::Running,
+            bounds,
+            prompt_preview: self
+                .inner
+                .lock()
+                .event_tx
+                .redact_text(&prompt_preview(prompt), 500),
+            start_seq: Some(start_seq),
+            end_seq: None,
+            created_at: now,
+            updated_at: now,
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            aggregates: RunAggregates::default(),
+            progress: None,
+        };
+        if let Err(error) = store.save_run(&run) {
+            eprintln!("[grokptah] desktop run {run_id} start persistence failed: {error:#}");
+            return None;
+        }
+        Some((run_id, store))
+    }
+
+    fn start_desktop_run_aggregator(
+        &self,
+        run_id: &str,
+        session_id: Uuid,
+        store: OrchStore,
+    ) -> tokio::task::JoinHandle<()> {
+        let run_id = run_id.to_string();
+        let mut receiver = self.subscribe_events();
+        tokio::spawn(async move {
+            while let Some(update) = receiver.recv().await {
+                apply_run_aggregate(&store, &run_id, session_id, &update);
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keeps terminal evidence inputs explicit at this boundary.
+    async fn finalize_desktop_run(
+        &self,
+        run_id: &str,
+        store: &OrchStore,
+        session_id: Uuid,
+        end_seq: u64,
+        result: &Result<String>,
+        outcome: &str,
+        evidence: &crate::completion::CompletionEvidence,
+        event_tx: &crate::event_bus::EventBus,
+    ) {
+        let Some(mut run) = store.load_run(run_id).ok().flatten() else {
+            return;
+        };
+        if let Ok(entries) = event_tx.read_range_all(
+            run.start_seq.map(|seq| seq.saturating_sub(1)).unwrap_or(0),
+            Some(end_seq),
+            Some(session_id),
+        ) {
+            for entry in entries {
+                apply_run_aggregate(store, run_id, session_id, &entry.update);
+            }
+            run = store.load_run(run_id).ok().flatten().unwrap_or(run);
+        }
+        run.state = match outcome {
+            "completed" => RunState::Completed,
+            "cancelled" => RunState::Cancelled,
+            "limit_reached" => RunState::LimitReached,
+            _ => RunState::Failed,
+        };
+        run.end_seq = Some(end_seq);
+        run.terminal_result = Some(outcome.into());
+        run.error_code = (outcome != "completed").then(|| outcome.into());
+        run.final_response = match result {
+            Ok(text) => Some(event_tx.redact_text(text, 8_000)),
+            Err(error) => Some(event_tx.redact_text(&error.to_string(), 2_000)),
+        };
+        run.aggregates.usage = evidence.usage.clone();
+        run.aggregates.permissions_requested = evidence.observations.permissions_requested;
+        run.aggregates.permissions_granted = evidence.observations.permissions_granted;
+        run.aggregates.permissions_denied = evidence.observations.permissions_denied;
+        run.aggregates.verification = Some(evidence.clone());
+        run.updated_at = Utc::now();
+        if let Err(error) = store.persist_finalization(&run) {
+            eprintln!("[grokptah] desktop run {run_id} finalization failed: {error:#}");
+        }
     }
 
     /// Persist tiny workspace chrome (tabs / project / model) only.
@@ -2864,6 +3023,14 @@ impl AgentHostHandle {
         let start_seq = event_tx.current_seq();
         let usage_before = self.session_usage_snapshot(session_id);
         let turn_id = Uuid::new_v4();
+        let desktop_run = if kind == SessionKind::Build {
+            self.begin_desktop_run(session_id, &cwd, &prompt, max_rounds, start_seq, turn_id)
+        } else {
+            None
+        };
+        let mut desktop_aggregator = desktop_run.as_ref().map(|(run_id, store)| {
+            self.start_desktop_run_aggregator(run_id, session_id, store.clone())
+        });
         let _ = event_tx.send(SessionUpdate::TurnStarted {
             session_id,
             turn_id,
@@ -2932,8 +3099,18 @@ impl AgentHostHandle {
         let _ = event_tx.send(SessionUpdate::CompletionEvidence {
             session_id,
             turn_id,
-            evidence,
+            evidence: evidence.clone(),
         });
+        if let Some((run_id, store)) = desktop_run.as_ref() {
+            if let Some(aggregator) = desktop_aggregator.take() {
+                aggregator.abort();
+                let _ = aggregator.await;
+            }
+            self.finalize_desktop_run(
+                run_id, store, session_id, end_seq, &result, outcome, &evidence, &event_tx,
+            )
+            .await;
+        }
         let final_result = match result {
             Ok(reply) => {
                 let _ = event_tx.send(SessionUpdate::TurnComplete {
