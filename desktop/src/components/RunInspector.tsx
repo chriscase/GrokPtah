@@ -16,6 +16,8 @@ type RunInspectorProps = {
   onPromote: (runId: string) => Promise<void>;
   onDiscard: (runId: string) => Promise<void>;
   onRetry: (runId: string, prompt: string) => Promise<void>;
+  onSteer: (runId: string, text: string) => Promise<void>;
+  onCancel: (runId: string) => Promise<void>;
   onEvents: (runId: string, afterSeq?: number, limit?: number) => Promise<DurableRunEventPage>;
 };
 
@@ -120,6 +122,8 @@ export function RunInspector({
   onPromote,
   onDiscard,
   onRetry,
+  onSteer,
+  onCancel,
   onEvents,
 }: RunInspectorProps) {
   const [originFilter, setOriginFilter] = useState<"all" | "desktop" | "mcp" | "other">("all");
@@ -131,6 +135,7 @@ export function RunInspector({
   const [eventLoading, setEventLoading] = useState<string | null>(null);
   const [eventErrors, setEventErrors] = useState<Record<string, string>>({});
   const [retryPrompts, setRetryPrompts] = useState<Record<string, string>>({});
+  const [steerPrompts, setSteerPrompts] = useState<Record<string, string>>({});
   const watchValue = watching ?? localWatching;
 
   function setWatchValue(next: boolean) {
@@ -200,6 +205,36 @@ export function RunInspector({
     try {
       await onRetry(runId, prompt);
       setRetryPrompts((current) => ({ ...current, [runId]: "" }));
+      onRefresh();
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setReviewing(null);
+    }
+  }
+
+  async function steer(runId: string) {
+    const text = steerPrompts[runId]?.trim() ?? "";
+    if (!text) return;
+    setReviewing(runId);
+    setActionError(null);
+    try {
+      await onSteer(runId, text);
+      setSteerPrompts((current) => ({ ...current, [runId]: "" }));
+      onRefresh();
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setReviewing(null);
+    }
+  }
+
+  async function cancel(runId: string) {
+    if (!window.confirm("Cancel this MCP-owned run?")) return;
+    setReviewing(runId);
+    setActionError(null);
+    try {
+      await onCancel(runId);
       onRefresh();
     } catch (error) {
       setActionError(String(error));
@@ -380,6 +415,43 @@ export function RunInspector({
                     </button>
                   </div>
                 )}
+                {run.clientId === "mcp" &&
+                  (run.state === "running" || run.state === "queued") && (
+                    <div className="run-control">
+                      <label htmlFor={`steer-prompt-${run.runId}`}>Steering prompt</label>
+                      <textarea
+                        id={`steer-prompt-${run.runId}`}
+                        value={steerPrompts[run.runId] ?? ""}
+                        onChange={(event) =>
+                          setSteerPrompts((current) => ({
+                            ...current,
+                            [run.runId]: event.target.value,
+                          }))
+                        }
+                        placeholder="Guide the current turn at its next safe boundary"
+                        rows={2}
+                        disabled={reviewing === run.runId}
+                      />
+                      <div className="run-actions">
+                        <button
+                          type="button"
+                          className="composer-chip"
+                          onClick={() => void steer(run.runId)}
+                          disabled={reviewing === run.runId || !(steerPrompts[run.runId] ?? "").trim()}
+                        >
+                          {reviewing === run.runId ? "Sending…" : "Steer now"}
+                        </button>
+                        <button
+                          type="button"
+                          className="composer-chip quiet"
+                          onClick={() => void cancel(run.runId)}
+                          disabled={reviewing === run.runId}
+                        >
+                          Cancel run
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 {run.retryOf && (
                   <div className="run-callout" role="status">
                     Explicit retry of interrupted run {run.retryOf}

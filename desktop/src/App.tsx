@@ -3207,6 +3207,14 @@ export default function App() {
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runRetry(activeSessionId, runId, prompt);
               }}
+              onSteer={async (runId, text) => {
+                if (!activeSessionId) throw new Error("No active session");
+                await api.runSteer(activeSessionId, runId, text);
+              }}
+              onCancel={async (runId) => {
+                if (!activeSessionId) throw new Error("No active session");
+                await api.runCancel(activeSessionId, runId);
+              }}
               onEvents={(runId, afterSeq = 0, limit = 80) => {
                 if (!activeSessionId) return Promise.reject(new Error("No active session"));
                 return api.runEvents(activeSessionId, runId, afterSeq, limit);

@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, JournalPage,
     McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
-    PromptQueueRunNextResult, PromptQueueTakeResult, RunExecutionMode, RunReview, SearchHit,
-    SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo, SteeringReceipt,
-    SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    PromptQueueRunNextResult, PromptQueueTakeResult, RunExecutionMode, RunReview, RunState,
+    SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
+    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -16,6 +16,28 @@ use crate::AppState;
 
 fn map_err(e: impl ToString) -> String {
     e.to_string()
+}
+
+fn desktop_mcp_orchestration(
+    state: &AppState,
+) -> Result<
+    (
+        std::sync::Arc<grokptah_agent_bridge::OrchestrationService>,
+        String,
+    ),
+    String,
+> {
+    let control = state
+        .control
+        .lock()
+        .map_err(|_| "MCP control state is unavailable".to_string())?;
+    let server = control
+        .as_ref()
+        .ok_or_else(|| "MCP control plane is not running".to_string())?;
+    if server.token.is_empty() {
+        return Err("MCP control authentication is unavailable".into());
+    }
+    Ok((server.orchestration_service(), server.token.clone()))
 }
 
 /// Run a blocking host/FS/git call off the UI thread (#137).
@@ -526,19 +548,7 @@ pub async fn run_retry(
     prompt: String,
 ) -> Result<String, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    let (orch, token) = {
-        let control = state
-            .control
-            .lock()
-            .map_err(|_| "MCP control state is unavailable".to_string())?;
-        let server = control
-            .as_ref()
-            .ok_or_else(|| "MCP control plane is not running".to_string())?;
-        (server.orchestration_service(), server.token.clone())
-    };
-    if token.is_empty() {
-        return Err("MCP control authentication is unavailable".into());
-    }
+    let (orch, token) = desktop_mcp_orchestration(&state)?;
     let auth = orch
         .auth_header(Some(&format!("Bearer {token}")))
         .map_err(map_err)?;
@@ -572,6 +582,82 @@ pub async fn run_retry(
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| "retry did not return a run id".into())
+}
+
+/// Deliver a non-cancelling steering prompt to the selected MCP-owned turn.
+#[tauri::command]
+pub async fn run_steer(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    text: String,
+) -> Result<(), String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let (orch, token) = desktop_mcp_orchestration(&state)?;
+    let auth = orch
+        .auth_header(Some(&format!("Bearer {token}")))
+        .map_err(map_err)?;
+    let session = state.host.session_load(session_id).map_err(map_err)?;
+    if session.cwd.is_empty() {
+        return Err("the session has no workspace".into());
+    }
+    let source = state
+        .host
+        .get_session_run(session_id, &run_id)
+        .map_err(map_err)?
+        .ok_or_else(|| "unknown run for this session".to_string())?;
+    if source.client_id.as_deref() != Some("mcp") {
+        return Err("desktop steering is limited to MCP-owned runs".into());
+    }
+    if !matches!(source.state, RunState::Running | RunState::Queued) {
+        return Err("only active or queued MCP runs can be steered".into());
+    }
+    orch.steer(
+        &auth,
+        &Uuid::new_v4().to_string(),
+        session_id,
+        &PathBuf::from(&session.cwd),
+        text,
+    )
+    .await
+    .map_err(map_err)?;
+    Ok(())
+}
+
+/// Cancel one MCP-owned run using the shared transactional cancellation path.
+#[tauri::command]
+pub async fn run_cancel(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+) -> Result<(), String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let (orch, token) = desktop_mcp_orchestration(&state)?;
+    let auth = orch
+        .auth_header(Some(&format!("Bearer {token}")))
+        .map_err(map_err)?;
+    let session = state.host.session_load(session_id).map_err(map_err)?;
+    if session.cwd.is_empty() {
+        return Err("the session has no workspace".into());
+    }
+    let source = state
+        .host
+        .get_session_run(session_id, &run_id)
+        .map_err(map_err)?
+        .ok_or_else(|| "unknown run for this session".to_string())?;
+    if source.client_id.as_deref() != Some("mcp") {
+        return Err("desktop cancellation is limited to MCP-owned runs".into());
+    }
+    orch.cancel(
+        &auth,
+        &Uuid::new_v4().to_string(),
+        session_id,
+        &PathBuf::from(&session.cwd),
+        Some(&run_id),
+    )
+    .await
+    .map_err(map_err)?;
+    Ok(())
 }
 
 #[tauri::command]

@@ -3,7 +3,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DurableRun, DurableRunEventPage, RunReview } from "../lib/protocol";
 import { RunInspector } from "./RunInspector";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 function run(overrides: Partial<DurableRun> = {}): DurableRun {
   return {
@@ -84,6 +87,8 @@ const actions = {
   onPromote: vi.fn(async () => undefined),
   onDiscard: vi.fn(async () => undefined),
   onRetry: vi.fn(async () => undefined),
+  onSteer: vi.fn(async () => undefined),
+  onCancel: vi.fn(async () => undefined),
   onEvents: vi.fn(async () => eventPage),
 };
 
@@ -204,6 +209,39 @@ describe("RunInspector", () => {
       "Continue by checking the test failure",
     );
     await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
+  });
+
+  it("steers without cancelling and confirms MCP cancellation", async () => {
+    const onRefresh = vi.fn();
+    const onSteer = vi.fn(async () => undefined);
+    const onCancel = vi.fn(async () => undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(
+      <RunInspector
+        runs={[run({ state: "running", clientId: "mcp", runId: "mcp-running" })]}
+        onRefresh={onRefresh}
+        {...actions}
+        onSteer={onSteer}
+        onCancel={onCancel}
+      />,
+    );
+
+    const steerButton = screen.getByRole("button", { name: "Steer now" });
+    expect(steerButton).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Steering prompt"), {
+      target: { value: "Keep the current plan and verify the tests" },
+    });
+    expect(steerButton).not.toBeDisabled();
+    fireEvent.click(steerButton);
+    expect(onSteer).toHaveBeenCalledWith(
+      "mcp-running",
+      "Keep the current plan and verify the tests",
+    );
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+    expect(onCancel).toHaveBeenCalledWith("mcp-running");
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(2));
   });
 
   it("reviews an isolated run before enabling promotion", async () => {

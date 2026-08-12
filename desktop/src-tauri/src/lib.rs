@@ -100,6 +100,8 @@ pub fn run() {
             commands::run_promote,
             commands::run_discard,
             commands::run_retry,
+            commands::run_steer,
+            commands::run_cancel,
             commands::session_fork,
             commands::session_rewind,
             commands::session_compact,
