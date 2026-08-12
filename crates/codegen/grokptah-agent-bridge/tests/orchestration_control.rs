@@ -283,6 +283,7 @@ fn restart_interrupted_no_auto_resume() {
         aggregates: Default::default(),
         progress: None,
         execution: None,
+        approval: None,
     };
     store.save_run(&run).unwrap();
     drop(store);

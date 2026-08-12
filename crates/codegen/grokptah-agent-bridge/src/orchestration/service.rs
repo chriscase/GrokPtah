@@ -135,6 +135,10 @@ impl OrchestrationService {
         store: OrchStore,
         mut config: OrchestrationConfig,
     ) -> Arc<Self> {
+        host.install_orchestration_store(store.clone());
+        // The host owns the process-wide ledger. If desktop bootstrap opened
+        // it first, use that same handle instead of creating a split history.
+        let store = host.ensure_orchestration_store().unwrap_or(store);
         // Register control bearer (and any future secrets) on the *shared* host bus
         // so durable journal redaction covers the shipped desktop path.
         if !config.bearer_token.is_empty() {
@@ -683,6 +687,359 @@ impl OrchestrationService {
         Ok(session)
     }
 
+    fn authorize_run_request(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<RunRecord, OrchError> {
+        let run = self.load_authorized_run(run_id)?;
+        if run.session_id != session_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "run does not belong to the requested session",
+            ));
+        }
+        let session = self.require_build_session(session_id)?;
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        if claimed.display().to_string() != run.workspace {
+            return Err(OrchError::new(
+                OrchErrorCode::WorkspaceMismatch,
+                "run workspace does not match the requested workspace",
+            ));
+        }
+        Ok(run)
+    }
+
+    fn isolated_review(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<(RunRecord, crate::run_promotion::RunReview), OrchError> {
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        if run.state != RunState::Completed {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "only completed runs can be reviewed",
+            ));
+        }
+        let Some(execution) = run.execution.as_ref() else {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "run used shared execution and has no isolated diff",
+            ));
+        };
+        if execution.mode != RunExecutionMode::IsolatedWorktree
+            || execution.promotion_state != PromotionState::Ready
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "isolated run is not ready for review",
+            ));
+        }
+        let review = self
+            .host
+            .inspect_run(session_id, run_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+        if execution.final_fingerprint.as_deref() != Some(review.fingerprint.as_str()) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "isolated worktree fingerprint changed; review is stale",
+            ));
+        }
+        Ok((run, review))
+    }
+
+    pub fn review_run(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (run, review) = self.isolated_review(session_id, workspace, run_id)?;
+        Ok(json!({
+            "runId": run.run_id,
+            "sessionId": run.session_id,
+            "sourceFingerprint": run.execution.as_ref().map(|e| e.source_fingerprint.clone()),
+            "finalFingerprint": review.fingerprint,
+            "changedFiles": review.changed_files,
+            "diff": review.diff,
+            "diffTruncated": review.diff_truncated,
+            "promotionState": run.execution.as_ref().map(|e| e.promotion_state),
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keeps the approval scope explicit at the control boundary.
+    pub async fn approve_run(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        source_fingerprint: String,
+        final_fingerprint: String,
+        changed_files: Vec<ChangeRecord>,
+        ttl_ms: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        const DEFAULT_TTL_MS: u64 = 5 * 60 * 1_000;
+        const MAX_TTL_MS: u64 = 15 * 60 * 1_000;
+        let tool = "ptah_approve_run";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "runId": run_id,
+            "sourceFingerprint": source_fingerprint,
+            "finalFingerprint": final_fingerprint,
+            "changedFiles": changed_files,
+            "ttlMs": ttl_ms,
+        });
+        let phash = hash_payload(&payload);
+        let fail = |svc: &Self, error: OrchError| {
+            svc.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&workspace.display().to_string()),
+                &error,
+            );
+            error
+        };
+        let ttl = ttl_ms.unwrap_or(DEFAULT_TTL_MS);
+        if ttl == 0 || ttl > MAX_TTL_MS {
+            return Err(fail(
+                self,
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "ttl_ms must be between 1 and 900000",
+                ),
+            ));
+        }
+        let run = match self.authorize_run_request(session_id, workspace, run_id) {
+            Ok(run) => run,
+            Err(error) => return Err(fail(self, error)),
+        };
+        let mut lease = match self
+            .begin_idempotency(
+                tool,
+                request_id,
+                &phash,
+                session_id,
+                Path::new(&run.workspace),
+            )
+            .await
+        {
+            Ok(IdempotencyStart::Replay(value)) => return Ok(value),
+            Ok(IdempotencyStart::Perform(lease)) => lease,
+            Err(error) => return Err(error),
+        };
+        let (run, review) = match self.isolated_review(session_id, workspace, run_id) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(run_id.to_string()),
+                    session_id,
+                    Path::new(&run.workspace),
+                    error,
+                ))
+            }
+        };
+        let Some(execution) = run.execution.as_ref() else {
+            unreachable!("isolated_review guarantees execution");
+        };
+        if source_fingerprint != execution.source_fingerprint
+            || final_fingerprint != review.fingerprint
+            || changed_files != review.changed_files
+        {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(run_id.to_string()),
+                session_id,
+                Path::new(&run.workspace),
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "approval scope does not match the current reviewed diff",
+                ),
+            ));
+        }
+        if let Some(existing) = run.approval.as_ref() {
+            if existing.expires_at > Utc::now() {
+                let error = OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "an unexpired approval already exists for this run",
+                );
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(run_id.to_string()),
+                    session_id,
+                    Path::new(&run.workspace),
+                    error,
+                ));
+            }
+        }
+        let issued_at = Utc::now();
+        let approval = RunApproval {
+            approval_id: Uuid::new_v4().to_string(),
+            run_id: run_id.to_string(),
+            session_id,
+            workspace: run.workspace.clone(),
+            source_fingerprint,
+            final_fingerprint,
+            changed_files,
+            issued_at,
+            expires_at: issued_at + chrono::Duration::milliseconds(ttl as i64),
+        };
+        let response = json!({
+            "runId": run_id,
+            "sessionId": session_id,
+            "approvalId": approval.approval_id,
+            "expiresAt": approval.expires_at,
+            "sourceFingerprint": approval.source_fingerprint,
+            "finalFingerprint": approval.final_fingerprint,
+            "changedFiles": approval.changed_files,
+        });
+        let updated = self.store.update_run(run_id, |current| {
+            current.approval = Some(approval.clone());
+            current.updated_at = Utc::now();
+            Ok(())
+        });
+        let updated = match updated {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(anyhow::anyhow!("run disappeared while approving")),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = updated {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(run_id.to_string()),
+                session_id,
+                Path::new(&run.workspace),
+                OrchError::new(OrchErrorCode::Internal, error.to_string()),
+            ));
+        }
+        if let Err(error) = lease.complete(Some(run_id.to_string()), response.clone()) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(run_id.to_string()),
+                session_id,
+                Path::new(&run.workspace),
+                error,
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn promote_run(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        approval_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_promote_run";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "runId": run_id,
+            "approvalId": approval_id,
+        });
+        let phash = hash_payload(&payload);
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let mut lease = match self
+            .begin_idempotency(
+                tool,
+                request_id,
+                &phash,
+                session_id,
+                Path::new(&run.workspace),
+            )
+            .await?
+        {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let promoted =
+            match self
+                .host
+                .promote_run_with_approval(session_id, run_id, Some(approval_id))
+            {
+                Ok(run) => run,
+                Err(error) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        Some(run_id.to_string()),
+                        session_id,
+                        Path::new(&run.workspace),
+                        OrchError::new(OrchErrorCode::Conflict, error.to_string()),
+                    ))
+                }
+            };
+        let response = serde_json::to_value(promoted)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        lease.complete(Some(run_id.to_string()), response.clone())?;
+        Ok(response)
+    }
+
+    pub async fn discard_run(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_discard_run";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "runId": run_id,
+        });
+        let phash = hash_payload(&payload);
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        if !run.state.is_terminal() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "only terminal runs can be discarded",
+            ));
+        }
+        let mut lease = match self
+            .begin_idempotency(
+                tool,
+                request_id,
+                &phash,
+                session_id,
+                Path::new(&run.workspace),
+            )
+            .await?
+        {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let discarded = match self.host.discard_run(session_id, run_id) {
+            Ok(run) => run,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(run_id.to_string()),
+                    session_id,
+                    Path::new(&run.workspace),
+                    OrchError::new(OrchErrorCode::Conflict, error.to_string()),
+                ))
+            }
+        };
+        let response = serde_json::to_value(discarded)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        lease.complete(Some(run_id.to_string()), response.clone())?;
+        Ok(response)
+    }
+
     // ── mutations ──────────────────────────────────────────────────────
 
     pub async fn submit_task(
@@ -694,6 +1051,29 @@ impl OrchestrationService {
         prompt: String,
         bounds_json: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.submit_task_with_execution_mode(
+            auth,
+            request_id,
+            session_id,
+            workspace,
+            prompt,
+            bounds_json,
+            RunExecutionMode::Shared,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keeps bounded submission policy explicit at the control boundary.
+    pub async fn submit_task_with_execution_mode(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        prompt: String,
+        bounds_json: Option<serde_json::Value>,
+        execution_mode: RunExecutionMode,
+    ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
         let tool = "ptah_submit_task";
         let payload = json!({
@@ -701,6 +1081,7 @@ impl OrchestrationService {
             "workspace": workspace.display().to_string(),
             "prompt": prompt,
             "bounds": bounds_json,
+            "executionMode": execution_mode,
         });
         let phash = hash_payload(&payload);
 
@@ -792,6 +1173,7 @@ impl OrchestrationService {
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,
+            approval: None,
         };
         if let Err(e) = self.store.save_run(&run) {
             self.host.release_turn_reservation(session_id, &run_id);
@@ -805,6 +1187,7 @@ impl OrchestrationService {
             "sessionId": session_id,
             "state": RunState::Running,
             "requestId": request_id,
+            "executionMode": execution_mode,
         });
         if let Err(e) = lease.complete(Some(run_id.clone()), response.clone()) {
             let _ = self.store.update_run(&run_id, |r| {
@@ -853,11 +1236,13 @@ impl OrchestrationService {
                 host: host.clone(),
                 run_id: rid.clone(),
             };
-            let prompt_fut = host.session_prompt_reserved_with_max_rounds(
+            let prompt_fut = host.session_prompt_reserved_with_max_rounds_for_run(
                 session_id,
                 prompt_owned,
                 Some(max_rounds.max(1)),
                 &rid,
+                &rid,
+                execution_mode,
             );
             tokio::pin!(prompt_fut);
             let deadline = tokio::time::sleep(std::time::Duration::from_millis(max_ms.max(1)));
@@ -960,6 +1345,43 @@ impl OrchestrationService {
                     candidate.aggregates.usage.clone(),
                     matches!(candidate.state, RunState::Cancelled | RunState::Interrupted),
                 ));
+            }
+            // External isolated runs do not pass through the desktop
+            // finalizer. Capture the same final fingerprint and changed-file
+            // set here so review and approval remain valid after restart.
+            if let Some(execution) = candidate.execution.as_mut() {
+                if execution.mode == RunExecutionMode::IsolatedWorktree {
+                    if candidate.state == RunState::Completed {
+                        match crate::run_promotion::snapshot(
+                            Path::new(&execution.execution_workspace),
+                            &execution.base_revision,
+                        ) {
+                            Ok(snapshot) => {
+                                execution.final_fingerprint = Some(snapshot.fingerprint);
+                                execution.promotion_state = PromotionState::Ready;
+                                if !snapshot.changed_files.is_empty() {
+                                    candidate.aggregates.changes = snapshot.changed_files;
+                                }
+                            }
+                            Err(error) => {
+                                execution.promotion_state = PromotionState::Conflicted;
+                                candidate.error_code = Some("promotion_conflict".into());
+                                let _ = store.enqueue_audit(AuditEntry {
+                                    ts: Utc::now(),
+                                    tool: "run_finalization".into(),
+                                    request_id: None,
+                                    session_id: Some(session_id),
+                                    workspace: Some(candidate.workspace.clone()),
+                                    outcome: "promotion_conflict".into(),
+                                    error_code: Some("promotion_conflict".into()),
+                                    detail: bus.redact_text(&error.to_string(), 500),
+                                });
+                            }
+                        }
+                    } else {
+                        execution.promotion_state = PromotionState::Conflicted;
+                    }
+                }
             }
             let mut attempt = 0u32;
             loop {

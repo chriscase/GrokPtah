@@ -299,6 +299,7 @@ export default function App() {
   const [bgTasks, setBgTasks] = useState<any[]>([]);
   const [runs, setRuns] = useState<DurableRun[]>([]);
   const [runsBusy, setRunsBusy] = useState(false);
+  const [runsWatching, setRunsWatching] = useState(true);
   const [hooksPreview, setHooksPreview] = useState<string | null>(null);
   const [rules, setRules] = useState<string[]>([]);
   const [product, setProduct] = useState({
@@ -386,9 +387,10 @@ export default function App() {
   useEffect(() => {
     if (rightTab !== "tasks" || !activeSessionId) return;
     void refreshRuns();
+    if (!runsWatching) return;
     const timer = window.setInterval(() => void refreshRuns(), 1200);
     return () => window.clearInterval(timer);
-  }, [activeSessionId, refreshRuns, rightTab]);
+  }, [activeSessionId, refreshRuns, rightTab, runsWatching]);
 
   // Narrow windows need the stage first; rails remain available through the
   // header toggles and open as overlays when explicitly requested.
@@ -3170,6 +3172,8 @@ export default function App() {
             <RunInspector
               runs={runs}
               busy={runsBusy}
+              watching={runsWatching}
+              onWatchingChange={setRunsWatching}
               onRefresh={() => void refreshRuns()}
               onReview={(runId) => {
                 if (!activeSessionId) return Promise.reject(new Error("No active session"));

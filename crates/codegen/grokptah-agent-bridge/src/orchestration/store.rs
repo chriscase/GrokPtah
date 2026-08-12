@@ -632,6 +632,7 @@ mod tests {
             aggregates: Default::default(),
             progress: None,
             execution: None,
+            approval: None,
         }
     }
 
@@ -658,6 +659,7 @@ mod tests {
             aggregates: Default::default(),
             progress: None,
             execution: None,
+            approval: None,
         };
         store.save_run(&run).unwrap();
         drop(store);
@@ -689,6 +691,7 @@ mod tests {
             aggregates: Default::default(),
             progress: None,
             execution: None,
+            approval: None,
         };
         store.save_run(&run).unwrap();
         let clone = store.clone();
@@ -784,6 +787,7 @@ mod tests {
             aggregates: Default::default(),
             progress: None,
             execution: None,
+            approval: None,
         };
         store.save_run(&run).unwrap();
         store

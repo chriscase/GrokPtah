@@ -76,7 +76,7 @@ describe("RunInspector", () => {
     expect(screen.getByText("1/1 tests passed")).toBeTruthy();
     expect(screen.getByText("Verification: verified")).toBeTruthy();
     expect(screen.getByText("Handoff")).toBeTruthy();
-    expect(screen.getByText("Desktop")).toBeTruthy();
+    expect(screen.getByText("Desktop", { selector: ".run-origin" })).toBeTruthy();
   });
 
   it("labels coordinator-owned runs", () => {
@@ -88,7 +88,31 @@ describe("RunInspector", () => {
       />,
     );
 
-    expect(screen.getByText("MCP coordinator")).toBeTruthy();
+    expect(screen.getByText("MCP coordinator", { selector: ".run-origin" })).toBeTruthy();
+  });
+
+  it("filters by origin and controls live watching", () => {
+    const onWatchingChange = vi.fn();
+    render(
+      <RunInspector
+        runs={[
+          run({ runId: "desktop-run", promptPreview: "Desktop task", clientId: "desktop" }),
+          run({ runId: "mcp-run", promptPreview: "Coordinator task", clientId: "mcp" }),
+        ]}
+        watching
+        onWatchingChange={onWatchingChange}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Filter task runs by source"), {
+      target: { value: "mcp" },
+    });
+    expect(screen.queryByText("Desktop task")).toBeNull();
+    expect(screen.getByText("Coordinator task")).toBeTruthy();
+    fireEvent.click(screen.getByLabelText("Watch live updates"));
+    expect(onWatchingChange).toHaveBeenCalledWith(false);
   });
 
   it("makes an interrupted run actionable and refreshable", () => {

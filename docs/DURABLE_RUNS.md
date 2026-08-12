@@ -44,9 +44,12 @@ Promotion is deliberately explicit and review-gated:
    workspace.
 
 Dirty source workspaces, source changes during execution, changed isolated
-worktrees, protected metadata paths, and promotion conflicts fail closed. A
-run cannot be promoted through the MCP surface yet; this slice intentionally
-keeps that control desktop-only until the coordinator contract is extended.
+worktrees, protected metadata paths, and promotion conflicts fail closed. MCP
+coordinators can review, approve, promote, or discard an isolated run through
+the bounded control tools. Approval is short-lived and bound to the run,
+session, workspace, source and final fingerprints, and exact changed-file set;
+the promotion path revalidates all of those constraints immediately before
+applying the change.
 
 ## Coordinator visibility
 

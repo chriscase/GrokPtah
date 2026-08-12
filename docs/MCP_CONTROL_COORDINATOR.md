@@ -143,7 +143,11 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_get_changes` | read | `run_id` |
 | `ptah_get_test_results` | read | `run_id` |
 | `ptah_get_handoff` | read | `run_id` |
-| `ptah_submit_task` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `bounds` |
+| `ptah_review_run` | read | `run_id` (completed isolated run only) |
+| `ptah_submit_task` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `bounds`, `execution_mode` |
+| `ptah_approve_run` | mutate | exact run/session/workspace, source and final fingerprints, exact `changed_files`; optional bounded `ttl_ms` |
+| `ptah_promote_run` | mutate | `request_id`, exact run/session/workspace, `approval_id` |
+| `ptah_discard_run` | mutate | `request_id`, exact run/session/workspace |
 | `ptah_queue_prompt` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `priority` |
 | `ptah_steer` | mutate | `request_id`, `session_id`, `workspace`, `text` |
 | `ptah_cancel` | mutate | `request_id`, `session_id`, `workspace`, `run_id` |
@@ -186,6 +190,24 @@ Mutating tools take `request_id`:
 - `ptah_queue_prompt` enqueues follow-ups; durable across host restart when the
   host session store reloads from the same GrokPtah home.
 - Priority flag moves to front; combine rules live in host `prompt_queue`.
+
+### Isolated review and promotion
+
+- `ptah_submit_task` uses shared execution by default. A Build coordinator may
+  explicitly request `execution_mode: "isolated_worktree"` for one run.
+- An isolated MCP run owns one managed Git worktree and stores its execution
+  metadata on the same durable run record used by the desktop. It must not
+  create a duplicate desktop run.
+- `ptah_review_run` returns a bounded diff, exact source/final fingerprints,
+  and the exact changed-file records for a completed isolated run.
+- `ptah_approve_run` persists a short-lived approval bound to the run, session,
+  workspace, fingerprints, and exact changed-file set.
+- `ptah_promote_run` revalidates approval expiry, ownership, fingerprints,
+  current source/worktree state, managed paths, and symlinks immediately before
+  applying the diff. Stale, mismatched, replayed, or cross-session approvals
+  fail closed.
+- `ptah_discard_run` removes a terminal isolated worktree without modifying the
+  source workspace.
 
 ### Cancel
 

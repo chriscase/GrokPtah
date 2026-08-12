@@ -3329,6 +3329,38 @@ button:disabled {
   height: 24px;
 }
 
+.run-inspector-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin: 0 0 0.55rem;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.run-inspector-filter,
+.run-inspector-watch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.run-inspector-filter select {
+  min-width: 8rem;
+  max-width: 100%;
+  padding: 0.18rem 0.3rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+}
+
+.run-inspector-watch input {
+  accent-color: var(--accent);
+}
+
 .run-inspector-empty {
   color: var(--muted);
   line-height: 1.4;

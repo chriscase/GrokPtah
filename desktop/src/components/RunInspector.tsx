@@ -4,6 +4,8 @@ import type { DurableRun, RunReview } from "../lib/protocol";
 type RunInspectorProps = {
   runs: DurableRun[];
   busy?: boolean;
+  watching?: boolean;
+  onWatchingChange?: (watching: boolean) => void;
   onRefresh: () => void;
   onReview: (runId: string) => Promise<RunReview>;
   onPromote: (runId: string) => Promise<void>;
@@ -47,14 +49,31 @@ function runOriginLabel(run: DurableRun): string {
 export function RunInspector({
   runs,
   busy,
+  watching,
+  onWatchingChange,
   onRefresh,
   onReview,
   onPromote,
   onDiscard,
 }: RunInspectorProps) {
+  const [originFilter, setOriginFilter] = useState<"all" | "desktop" | "mcp" | "other">("all");
+  const [localWatching, setLocalWatching] = useState(true);
   const [reviewing, setReviewing] = useState<string | null>(null);
   const [reviews, setReviews] = useState<Record<string, RunReview>>({});
   const [actionError, setActionError] = useState<string | null>(null);
+  const watchValue = watching ?? localWatching;
+
+  function setWatchValue(next: boolean) {
+    setLocalWatching(next);
+    onWatchingChange?.(next);
+  }
+
+  const visibleRuns = runs.filter((run) => {
+    if (originFilter === "all") return true;
+    if (originFilter === "mcp") return run.clientId === "mcp";
+    if (originFilter === "desktop") return run.clientId === "desktop";
+    return run.clientId !== "mcp" && run.clientId !== "desktop";
+  });
 
   async function review(runId: string) {
     setReviewing(runId);
@@ -124,13 +143,44 @@ export function RunInspector({
         </button>
       </div>
 
+      <div className="run-inspector-controls">
+        <label className="run-inspector-filter">
+          <span>Source</span>
+          <select
+            aria-label="Filter task runs by source"
+            value={originFilter}
+            onChange={(event) =>
+              setOriginFilter(event.target.value as typeof originFilter)
+            }
+          >
+            <option value="all">All sources</option>
+            <option value="desktop">Desktop</option>
+            <option value="mcp">MCP coordinator</option>
+            <option value="other">Other</option>
+          </select>
+        </label>
+        <label className="run-inspector-watch">
+          <input
+            type="checkbox"
+            aria-label="Watch live updates"
+            checked={watchValue}
+            onChange={(event) => setWatchValue(event.target.checked)}
+          />
+          <span>Watch live</span>
+        </label>
+      </div>
+
       {runs.length === 0 ? (
         <div className="panel-block run-inspector-empty">
           No durable Build runs for this session yet.
         </div>
+      ) : visibleRuns.length === 0 ? (
+        <div className="panel-block run-inspector-empty">
+          No runs match this source filter.
+        </div>
       ) : (
         <div className="run-list">
-          {runs.map((run) => {
+          {visibleRuns.map((run) => {
             const verification = run.aggregates.verification;
             return (
               <article className={`run-card state-${run.state}`} key={run.runId}>

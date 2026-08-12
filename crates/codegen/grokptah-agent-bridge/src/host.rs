@@ -228,6 +228,29 @@ fn canonical_session_workspace(
     Ok(source)
 }
 
+fn validate_run_approval(
+    run: &RunRecord,
+    approval: &crate::orchestration::RunApproval,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
+    let execution = run
+        .execution
+        .as_ref()
+        .ok_or_else(|| anyhow!("run has no isolated execution"))?;
+    if approval.run_id != run.run_id
+        || approval.session_id != run.session_id
+        || approval.workspace != run.workspace
+        || approval.source_fingerprint != execution.source_fingerprint
+        || approval.final_fingerprint != execution.final_fingerprint.as_deref().unwrap_or_default()
+    {
+        bail!("approval scope does not match the current run");
+    }
+    if now >= approval.expires_at {
+        bail!("approval has expired");
+    }
+    Ok(())
+}
+
 /// Shared handle used by Tauri state and tests.
 #[derive(Clone)]
 pub struct AgentHostHandle {
@@ -242,6 +265,12 @@ pub struct AgentHostHandle {
     reviewed_runs: Arc<Mutex<HashSet<String>>>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalRunContext {
+    pub run_id: String,
+    pub execution_mode: RunExecutionMode,
 }
 
 pub struct AgentHost;
@@ -383,6 +412,17 @@ impl AgentHostHandle {
         Ok(opened)
     }
 
+    /// Install a store supplied by the orchestration service when the host has
+    /// not opened one yet. This keeps library/test construction and the
+    /// desktop bootstrap on one durable ledger rather than silently splitting
+    /// external and desktop run records.
+    pub(crate) fn install_orchestration_store(&self, store: OrchStore) {
+        let mut current = self.orchestration_store.lock();
+        if current.is_none() {
+            *current = Some(store);
+        }
+    }
+
     /// Return the already-open ledger without causing filesystem work.
     pub fn orchestration_store(&self) -> Option<OrchStore> {
         self.orchestration_store.lock().clone()
@@ -409,6 +449,21 @@ impl AgentHostHandle {
 
     /// Read the bounded Git diff for an isolated terminal run.
     pub fn review_run(&self, session_id: Uuid, run_id: &str) -> Result<RunReview> {
+        self.review_run_internal(session_id, run_id, true)
+    }
+
+    /// Inspect an isolated run without granting the desktop-only in-memory
+    /// promotion marker. External coordinators must use durable approval.
+    pub(crate) fn inspect_run(&self, session_id: Uuid, run_id: &str) -> Result<RunReview> {
+        self.review_run_internal(session_id, run_id, false)
+    }
+
+    fn review_run_internal(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+        mark_reviewed: bool,
+    ) -> Result<RunReview> {
         let store = self.ensure_orchestration_store()?;
         let run = store
             .load_run(run_id)?
@@ -444,7 +499,9 @@ impl AgentHostHandle {
             });
             bail!("isolated worktree changed after the run; promotion is blocked");
         }
-        self.reviewed_runs.lock().insert(run_id.to_string());
+        if mark_reviewed {
+            self.reviewed_runs.lock().insert(run_id.to_string());
+        }
         Ok(review)
     }
 
@@ -452,6 +509,18 @@ impl AgentHostHandle {
     /// source workspace. Repeated calls are idempotent when the final
     /// fingerprint is already present in the source workspace.
     pub fn promote_run(&self, session_id: Uuid, run_id: &str) -> Result<RunRecord> {
+        self.promote_run_with_approval(session_id, run_id, None)
+    }
+
+    /// Promote a run using a persisted, exact-scope approval. Unlike the
+    /// desktop-only review marker, this survives restart and is revalidated
+    /// against the current worktree immediately before Git is changed.
+    pub fn promote_run_with_approval(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+        approval_id: Option<&str>,
+    ) -> Result<RunRecord> {
         self.with_promotion_lock(run_id, || {
             let store = self.ensure_orchestration_store()?;
             let mut run = store
@@ -468,13 +537,28 @@ impl AgentHostHandle {
             if execution.mode != RunExecutionMode::IsolatedWorktree {
                 bail!("run used shared execution and cannot be promoted");
             }
+            let durable_approval = run.approval.clone();
+            if let Some(requested_id) = approval_id {
+                let approval = durable_approval
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("run has no persisted approval"))?;
+                if approval.approval_id != requested_id {
+                    bail!("approval does not belong to this run");
+                }
+            }
+            if let Some(approval) = durable_approval.as_ref() {
+                validate_run_approval(&run, approval, Utc::now())?;
+            }
             if execution.promotion_state == PromotionState::Promoted {
                 return Ok(run);
             }
             if execution.promotion_state != PromotionState::Ready {
                 bail!("isolated run is not ready for promotion");
             }
-            if !self.reviewed_runs.lock().contains(run_id) {
+            if let Some(approval) = durable_approval.as_ref() {
+                validate_run_approval(&run, approval, Utc::now())?;
+            }
+            if !self.reviewed_runs.lock().contains(run_id) && durable_approval.is_none() {
                 bail!("review the isolated run before promotion");
             }
             let source =
@@ -487,6 +571,17 @@ impl AgentHostHandle {
                 &source,
                 Path::new(&execution.execution_workspace),
             )?;
+            if let Some(approval) = durable_approval.as_ref() {
+                let current_review = run_promotion::review(
+                    Path::new(&execution.execution_workspace),
+                    &execution.base_revision,
+                )?;
+                if current_review.fingerprint != approval.final_fingerprint
+                    || current_review.changed_files != approval.changed_files
+                {
+                    bail!("isolated worktree changed after approval; review it again");
+                }
+            }
             let result = run_promotion::promote(
                 &source,
                 Path::new(&execution.execution_workspace),
@@ -615,6 +710,7 @@ impl AgentHostHandle {
             aggregates: RunAggregates::default(),
             progress: None,
             execution,
+            approval: None,
         };
         if let Err(error) = store.save_run(&run) {
             eprintln!("[grokptah] desktop run {run_id} start persistence failed: {error:#}");
@@ -3219,7 +3315,7 @@ impl AgentHostHandle {
         prompt: String,
         max_rounds: Option<u32>,
     ) -> Result<String> {
-        self.session_prompt_inner(session_id, prompt, max_rounds, None)
+        self.session_prompt_inner(session_id, prompt, max_rounds, None, None)
             .await
     }
 
@@ -3231,8 +3327,33 @@ impl AgentHostHandle {
         max_rounds: Option<u32>,
         owner: &str,
     ) -> Result<String> {
-        self.session_prompt_inner(session_id, prompt, max_rounds, Some(owner))
+        self.session_prompt_inner(session_id, prompt, max_rounds, Some(owner), None)
             .await
+    }
+
+    /// Start a reserved turn under a durable run identity owned by an
+    /// external coordinator. The host must not create a second desktop run
+    /// for this turn; the coordinator's record remains the source of truth.
+    pub async fn session_prompt_reserved_with_max_rounds_for_run(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+        owner: &str,
+        run_id: &str,
+        execution_mode: RunExecutionMode,
+    ) -> Result<String> {
+        self.session_prompt_inner(
+            session_id,
+            prompt,
+            max_rounds,
+            Some(owner),
+            Some(ExternalRunContext {
+                run_id: run_id.to_string(),
+                execution_mode,
+            }),
+        )
+        .await
     }
 
     async fn session_prompt_inner(
@@ -3241,6 +3362,7 @@ impl AgentHostHandle {
         prompt: String,
         max_rounds: Option<u32>,
         reservation_owner: Option<&str>,
+        external_run: Option<ExternalRunContext>,
     ) -> Result<String> {
         self.ensure_transcript_loaded(session_id)?;
         self.ensure_build_workspace_ready(session_id)?;
@@ -3311,28 +3433,72 @@ impl AgentHostHandle {
         let start_seq = event_tx.current_seq();
         let usage_before = self.session_usage_snapshot(session_id);
         let turn_id = Uuid::new_v4();
-        let run_execution =
-            if kind == SessionKind::Build && execution_mode == RunExecutionMode::IsolatedWorktree {
-                let run_id = format!("desktop-{turn_id}");
-                let prepared = run_promotion::prepare(&cwd, &run_id)?;
-                Some(RunExecution {
-                    mode: RunExecutionMode::IsolatedWorktree,
-                    source_workspace: cwd.display().to_string(),
-                    execution_workspace: prepared.cwd.display().to_string(),
-                    base_revision: prepared.base_revision,
-                    source_fingerprint: prepared.source_fingerprint,
-                    final_fingerprint: None,
-                    promotion_state: PromotionState::Preparing,
-                    promoted_at: None,
-                })
-            } else {
-                None
+        let requested_execution_mode = external_run
+            .as_ref()
+            .map(|run| run.execution_mode)
+            .unwrap_or(execution_mode);
+        if external_run.is_some()
+            && requested_execution_mode != RunExecutionMode::Shared
+            && kind != SessionKind::Build
+        {
+            bail!("isolated external execution is available only for Build sessions");
+        }
+        let run_execution = if kind == SessionKind::Build
+            && requested_execution_mode == RunExecutionMode::IsolatedWorktree
+        {
+            let run_id = external_run
+                .as_ref()
+                .map(|run| run.run_id.clone())
+                .unwrap_or_else(|| format!("desktop-{turn_id}"));
+            let prepared = run_promotion::prepare(&cwd, &run_id)?;
+            let execution = RunExecution {
+                mode: RunExecutionMode::IsolatedWorktree,
+                source_workspace: cwd.display().to_string(),
+                execution_workspace: prepared.cwd.display().to_string(),
+                base_revision: prepared.base_revision,
+                source_fingerprint: prepared.source_fingerprint,
+                final_fingerprint: None,
+                promotion_state: PromotionState::Preparing,
+                promoted_at: None,
             };
+            if let Some(external) = external_run.as_ref() {
+                let store = match self.ensure_orchestration_store() {
+                    Ok(store) => store,
+                    Err(error) => {
+                        let _ =
+                            run_promotion::discard(&cwd, Path::new(&execution.execution_workspace));
+                        return Err(error);
+                    }
+                };
+                let updated = match store.update_run(&external.run_id, |run| {
+                    if run.session_id != session_id {
+                        bail!("external run session does not match turn session");
+                    }
+                    run.execution = Some(execution.clone());
+                    run.updated_at = Utc::now();
+                    Ok(())
+                }) {
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        let _ =
+                            run_promotion::discard(&cwd, Path::new(&execution.execution_workspace));
+                        return Err(error);
+                    }
+                };
+                if updated.is_none() {
+                    let _ = run_promotion::discard(&cwd, Path::new(&execution.execution_workspace));
+                    bail!("external run disappeared before execution could be attached");
+                }
+            }
+            Some(execution)
+        } else {
+            None
+        };
         let execution_cwd = run_execution
             .as_ref()
             .map(|execution| PathBuf::from(&execution.execution_workspace))
             .unwrap_or_else(|| cwd.clone());
-        let desktop_run = if kind == SessionKind::Build {
+        let desktop_run = if external_run.is_none() && kind == SessionKind::Build {
             self.begin_desktop_run(
                 session_id,
                 &cwd,

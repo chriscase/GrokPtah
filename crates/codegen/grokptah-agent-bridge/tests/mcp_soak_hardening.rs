@@ -433,6 +433,7 @@ fn soak_restart_recovery_matrix() {
         aggregates: Default::default(),
         progress: None,
         execution: None,
+        approval: None,
     };
     let fin_safe = safe_id_filename(&partial_id).unwrap();
     std::fs::write(

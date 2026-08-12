@@ -293,11 +293,28 @@ pub struct RunProgress {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeRecord {
     pub path: String,
     pub summary: String,
+}
+
+/// A persisted, narrowly scoped authorization to promote one reviewed run.
+/// This is intentionally attached to the run so restart recovery cannot lose
+/// the review boundary or silently fall back to process-local state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunApproval {
+    pub approval_id: String,
+    pub run_id: String,
+    pub session_id: Uuid,
+    pub workspace: String,
+    pub source_fingerprint: String,
+    pub final_fingerprint: String,
+    pub changed_files: Vec<ChangeRecord>,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +354,9 @@ pub struct RunRecord {
     /// Optional isolated execution and promotion metadata.
     #[serde(default)]
     pub execution: Option<RunExecution>,
+    /// Optional persisted approval for an exact isolated-run review.
+    #[serde(default)]
+    pub approval: Option<RunApproval>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -540,7 +560,11 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_get_changes",
     "ptah_get_test_results",
     "ptah_get_handoff",
+    "ptah_review_run",
     "ptah_submit_task",
+    "ptah_approve_run",
+    "ptah_promote_run",
+    "ptah_discard_run",
     "ptah_queue_prompt",
     "ptah_steer",
     "ptah_cancel",
