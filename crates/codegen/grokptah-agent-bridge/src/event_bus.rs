@@ -98,8 +98,14 @@ struct SequencedUpdate {
 
 impl EventReceiver {
     pub async fn recv(&mut self) -> Option<SessionUpdate> {
+        self.recv_with_seq().await.map(|(_, update)| update)
+    }
+
+    /// Receive the next redacted update together with its durable journal
+    /// sequence. Transport adapters use this to assign resumable event IDs.
+    pub async fn recv_with_seq(&mut self) -> Option<(u64, SessionUpdate)> {
         loop {
-            match self.try_recv() {
+            match self.try_recv_with_seq() {
                 Ok(update) => return Some(update),
                 Err(broadcast::error::TryRecvError::Closed) => return None,
                 Err(broadcast::error::TryRecvError::Lagged(_)) => unreachable!(),
@@ -137,13 +143,21 @@ impl EventReceiver {
     }
 
     pub fn try_recv(&mut self) -> Result<SessionUpdate, broadcast::error::TryRecvError> {
+        self.try_recv_with_seq().map(|(_, update)| update)
+    }
+
+    pub fn try_recv_with_seq(
+        &mut self,
+    ) -> Result<(u64, SessionUpdate), broadcast::error::TryRecvError> {
         if let Some(gap) = self.take_gap_notice() {
-            return Ok(gap);
+            // A gap has no durable sequence of its own. The transport must
+            // turn this into an explicit recovery signal, never a fake event.
+            return Ok((0, gap));
         }
         self.fill_stream();
         self.fill_critical();
         if let Some(gap) = self.take_gap_notice() {
-            return Ok(gap);
+            return Ok((0, gap));
         }
 
         let take_stream = match (&self.pending_stream, &self.pending_critical) {
@@ -163,7 +177,8 @@ impl EventReceiver {
         } else {
             self.pending_critical.take()
         };
-        Ok(next.expect("a pending event was selected").update)
+        let next = next.expect("a pending event was selected");
+        Ok((next.seq, next.update))
     }
 
     fn fill_stream(&mut self) {
@@ -1079,6 +1094,26 @@ mod tests {
                 _ => panic!("wrong variant"),
             }
         }
+    }
+
+    #[test]
+    fn sequenced_receiver_exposes_durable_event_ids() {
+        let bus = EventBus::new(8);
+        let mut receiver = bus.subscribe();
+        let sid = Uuid::new_v4();
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "first".into(),
+        });
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "second".into(),
+        });
+
+        let (first_seq, _) = receiver.try_recv_with_seq().unwrap();
+        let (second_seq, _) = receiver.try_recv_with_seq().unwrap();
+        assert!(first_seq > 0);
+        assert_eq!(second_seq, first_seq + 1);
     }
 
     #[tokio::test]

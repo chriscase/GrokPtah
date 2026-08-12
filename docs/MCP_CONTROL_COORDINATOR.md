@@ -123,6 +123,36 @@ Unset in production. When set, `start_control_from_env` applies them:
 - Stale `mcp-session-id` after DELETE → client error (fail closed).
 - Reconnect = new `initialize` (new session id); durable **runs** survive process restart when the same GrokPtah home + orch store is reused; in-memory MCP sessions do not.
 
+### Optional live run events
+
+After a run has started, a coordinator may open a scoped SSE stream on the same
+MCP endpoint:
+
+```text
+GET /mcp?session_id=<Build session>&workspace=<canonical workspace>&run_id=<run>
+Authorization: Bearer <token>
+mcp-session-id: <transport session>
+Accept: text/event-stream
+```
+
+The server first replays the durable run journal, then follows live EventBus
+updates. Each event is an MCP `notifications/ptah_event` JSON-RPC notification
+with `sessionId`, `workspace`, `runId`, `seq`, `ts`, and typed `update` fields.
+The SSE `id` is the durable sequence and can be sent back as `Last-Event-ID`
+on reconnect. The stream is authorized against the exact session/workspace/run
+triple and is independently bounded to 32 concurrent streams. The unscoped GET
+path remains a one-shot protocol keep-alive for clients that do not request a
+run stream.
+
+If the bounded live receiver or durable replay detects a gap, the server emits
+`notifications/ptah_recovery` with `afterSeq` and `pollTool: "ptah_get_events"`
+and closes the stream. Coordinators must use the cursor-based tool to recover
+before reconnecting; a gap is never silently treated as a successful stream.
+Runs that are still queued do not have an event range yet and return a
+structured conflict. Poll `ptah_get_progress` and open the stream after
+`startSeq` is present. A terminal run closes the stream after its terminal
+event has been delivered.
+
 ## Transport
 
 | Property | Value |
@@ -136,13 +166,13 @@ Unset in production. When set, `start_control_from_env` applies them:
 | Request timeout | Default **120 s** → HTTP **504** + `data.code=timeout` |
 | MCP sessions | Header `mcp-session-id`; hard cap **256** (LRU eviction) |
 | Protocol versions | `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`, `2024-10-07` |
-| Content | JSON responses preferred; GET may open a minimal SSE keep-alive |
+| Content | JSON responses preferred; scoped GET may open a bounded SSE run stream |
 
 ### Health (unauthenticated, loopback)
 
 ```http
 GET /health
-→ 200 {"ok":true,"transport":"mcp-streamable-http","maxConcurrent":32,"sessions":N,...}
+→ 200 {"ok":true,"transport":"mcp-streamable-http","maxConcurrent":32,"maxLiveStreams":32,"sessions":N,...}
 ```
 
 ### Lifecycle
@@ -409,6 +439,7 @@ cargo clippy --all-targets -- -D warnings
 # Focused transport + orch
 cargo test --test mcp_streamable_transport -- --test-threads=1
 cargo test --test mcp_coordinator_campaign -- --test-threads=1
+cargo test --test mcp_live_events -- --test-threads=1
 cargo test --test orchestration_control --test orchestration_adversarial -- --test-threads=1
 
 # Full bridge

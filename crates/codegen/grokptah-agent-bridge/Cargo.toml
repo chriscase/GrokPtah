@@ -33,7 +33,7 @@ open = "5"
 fs2 = "0.4"
 dunce = "1"
 # #196: loopback MCP control transport (quarantined from monorepo rmcp stack)
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 tower = "0.5"
 http-body-util = "0.1"
 
