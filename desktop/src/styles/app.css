@@ -3532,6 +3532,27 @@ button:disabled {
   text-transform: capitalize;
 }
 
+.run-approval {
+  padding: 0.3rem 0.4rem;
+  border-radius: var(--radius);
+  line-height: 1.35;
+}
+
+.run-approval.is-active {
+  color: var(--success, #76c893);
+  background: rgba(118, 200, 147, 0.08);
+}
+
+.run-approval.is-expired {
+  color: var(--warning, #e0ad4f);
+  background: rgba(224, 173, 79, 0.08);
+}
+
+.run-promotion-conflict {
+  color: var(--danger, #f07178);
+  background: rgba(240, 113, 120, 0.08);
+}
+
 .run-actions {
   display: flex;
   flex-wrap: wrap;

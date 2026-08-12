@@ -13,6 +13,7 @@ type RunInspectorProps = {
   onWatchingChange?: (watching: boolean) => void;
   onRefresh: () => void;
   onReview: (runId: string) => Promise<RunReview>;
+  onApprove: (runId: string) => Promise<void>;
   onPromote: (runId: string) => Promise<void>;
   onDiscard: (runId: string) => Promise<void>;
   onRetry: (runId: string, prompt: string) => Promise<void>;
@@ -119,6 +120,7 @@ export function RunInspector({
   onWatchingChange,
   onRefresh,
   onReview,
+  onApprove,
   onPromote,
   onDiscard,
   onRetry,
@@ -173,6 +175,19 @@ export function RunInspector({
         delete next[runId];
         return next;
       });
+      onRefresh();
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setReviewing(null);
+    }
+  }
+
+  async function approve(runId: string) {
+    setReviewing(runId);
+    setActionError(null);
+    try {
+      await onApprove(runId);
       onRefresh();
     } catch (error) {
       setActionError(String(error));
@@ -331,6 +346,9 @@ export function RunInspector({
             const verification = run.aggregates.verification;
             const eventPage = eventPages[run.runId];
             const eventError = eventErrors[run.runId];
+            const approvalExpiry = run.approval ? Date.parse(run.approval.expiresAt) : NaN;
+            const approvalActive = Number.isFinite(approvalExpiry) && approvalExpiry > Date.now();
+            const requiresDurableApproval = run.clientId === "mcp";
             return (
               <article className={`run-card state-${run.state}`} key={run.runId}>
                 <div className="run-card-heading">
@@ -520,17 +538,51 @@ export function RunInspector({
                       <div className="run-promotion-status">
                         Isolated · {run.execution.promotionState.replaceAll("_", " ")}
                       </div>
-                      <div className="run-actions">
-                        <button
-                          type="button"
-                          className="composer-chip"
-                          onClick={() => void review(run.runId)}
-                          disabled={reviewing === run.runId}
+                      {run.approval && (
+                        <div
+                          className={`run-approval ${approvalActive ? "is-active" : "is-expired"}`}
+                          role="status"
                         >
-                          {reviewing === run.runId ? "Reviewing…" : "Review diff"}
-                        </button>
+                          {approvalActive
+                            ? `Approval active until ${timeLabel(run.approval.expiresAt)}`
+                            : "Approval expired · review and approve again"}
+                        </div>
+                      )}
+                      {run.execution.promotionState === "conflicted" && (
+                        <div className="run-callout run-promotion-conflict" role="alert">
+                          Promotion blocked because the isolated workspace changed after review.
+                          Discard this run and start a fresh isolated attempt.
+                        </div>
+                      )}
+                      <div className="run-actions">
+                        {run.execution.promotionState === "ready" && (
+                          <button
+                            type="button"
+                            className="composer-chip"
+                            onClick={() => void review(run.runId)}
+                            disabled={reviewing === run.runId}
+                          >
+                            {reviewing === run.runId ? "Reviewing…" : "Review diff"}
+                          </button>
+                        )}
+                        {requiresDurableApproval &&
+                          run.execution.promotionState === "ready" &&
+                          reviews[run.runId] &&
+                          !approvalActive && (
+                            <button
+                              type="button"
+                              className="composer-chip on"
+                              onClick={() => void approve(run.runId)}
+                              disabled={reviewing === run.runId}
+                            >
+                              {reviewing === run.runId
+                                ? "Approving…"
+                                : "Approve for promotion"}
+                            </button>
+                          )}
                         {run.execution.promotionState === "ready" &&
-                          reviews[run.runId] && (
+                          reviews[run.runId] &&
+                          (!requiresDurableApproval || approvalActive) && (
                             <button
                               type="button"
                               className="composer-chip on"

@@ -170,6 +170,8 @@ export const api = {
     invoke<DurableRunEventPage>("run_events", { sessionId, runId, afterSeq, limit }),
   runReview: (sessionId: string, runId: string) =>
     invoke<RunReview>("run_review", { sessionId, runId }),
+  runApprove: (sessionId: string, runId: string, ttlMs?: number) =>
+    invoke<DurableRun>("run_approve", { sessionId, runId, ttlMs }),
   runPromote: (sessionId: string, runId: string) =>
     invoke<DurableRun>("run_promote", { sessionId, runId }),
   runDiscard: (sessionId: string, runId: string) =>
