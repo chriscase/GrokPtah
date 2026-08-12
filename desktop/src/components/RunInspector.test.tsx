@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DurableRun, RunReview } from "../lib/protocol";
+import type { DurableRun, DurableRunEventPage, RunReview } from "../lib/protocol";
 import { RunInspector } from "./RunInspector";
 
 afterEach(cleanup);
@@ -60,10 +60,30 @@ const review: RunReview = {
   fingerprint: "abc123",
 };
 
+const eventPage: DurableRunEventPage = {
+  entries: [
+    {
+      seq: 4,
+      ts: "2026-08-11T12:00:04Z",
+      update: {
+        type: "agent_progress",
+        session_id: "session-1",
+        round: 2,
+        max_rounds: 8,
+        last_tool: "write_files",
+        detail: "Updated src/lib.rs",
+      },
+    },
+  ],
+  nextCursor: 4,
+  cursorExpired: false,
+};
+
 const actions = {
   onReview: vi.fn(async () => review),
   onPromote: vi.fn(async () => undefined),
   onDiscard: vi.fn(async () => undefined),
+  onEvents: vi.fn(async () => eventPage),
 };
 
 describe("RunInspector", () => {
@@ -154,5 +174,38 @@ describe("RunInspector", () => {
     expect(await screen.findByText(/1 changed files/)).toBeTruthy();
     expect(screen.getByText("Promote reviewed changes")).toBeTruthy();
     expect(screen.getByText(/diff --git/)).toBeTruthy();
+  });
+
+  it("replays and paginates a durable run timeline", async () => {
+    const onEvents = vi
+      .fn()
+      .mockResolvedValueOnce(eventPage)
+      .mockResolvedValueOnce({ ...eventPage, entries: [], nextCursor: null });
+    render(
+      <RunInspector runs={[run()]} onRefresh={vi.fn()} {...actions} onEvents={onEvents} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Replay events" }));
+    expect(await screen.findByText(/Round 2\/8/)).toBeTruthy();
+    expect(onEvents).toHaveBeenCalledWith("desktop-run-1", 0, 80);
+
+    fireEvent.click(screen.getByRole("button", { name: "Load more events" }));
+    expect(await screen.findByText(/Run timeline · 1 events/)).toBeTruthy();
+    expect(onEvents).toHaveBeenLastCalledWith("desktop-run-1", 4, 80);
+  });
+
+  it("reports honest cursor expiry without hiding durable summaries", async () => {
+    const onEvents = vi.fn(async () => ({
+      entries: [],
+      nextCursor: null,
+      cursorExpired: true,
+    }));
+    render(
+      <RunInspector runs={[run()]} onRefresh={vi.fn()} {...actions} onEvents={onEvents} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Replay events" }));
+    expect(await screen.findByText(/Older events are no longer retained/)).toBeTruthy();
+    expect(screen.getByText("Handoff")).toBeTruthy();
   });
 });

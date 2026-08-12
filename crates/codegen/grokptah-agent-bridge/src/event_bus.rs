@@ -599,7 +599,7 @@ fn bound_update_size(update: SessionUpdate) -> SessionUpdate {
 #[derive(Debug)]
 pub struct CursorExpiredError;
 
-fn session_id_of(u: &SessionUpdate) -> Option<uuid::Uuid> {
+pub(crate) fn session_id_of(u: &SessionUpdate) -> Option<uuid::Uuid> {
     use SessionUpdate::*;
     match u {
         AgentMessageChunk { session_id, .. }
