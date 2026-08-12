@@ -12,17 +12,23 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::completion::{build_evidence, observe_updates, CompletionObservations, CompletionUsage};
+use crate::completion::{
+    build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
+    CompletionUsage,
+};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
-    build_agent_messages, build_compact_summary, call_xai_agent_step, call_xai_chat,
-    cargo_test_output_failed, coding_agent_tools, emit_message, emit_thought,
-    filter_tools_edit_and_shell, filter_tools_edit_only, is_incomplete_stop_message,
-    is_round_limit_stop_message, is_true_noop_tool_step, normalize_sandbox_profile,
-    offline_plan_steps, parse_effort_arg, propose_plan_with_model, push_assistant, push_thought,
-    push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
-    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    auto_cargo_reverify_command, build_agent_messages, build_compact_summary, call_xai_agent_step,
+    call_xai_chat, cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
+    cargo_test_reverify_coaching, coding_agent_tools, count_cargo_test_failures, emit_message,
+    emit_thought, filter_tools_batch_edit_only, filter_tools_edit_and_shell,
+    filter_tools_edit_only, is_incomplete_stop_message, is_round_limit_stop_message,
+    is_true_noop_tool_step, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
+    offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
+    push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
+    resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
     IdenticalToolCallRun, McpToolIndex,
 };
@@ -36,7 +42,10 @@ use crate::prompt_queue::{
     SessionPromptQueue, SteeringReceipt,
 };
 use crate::search_engine::{self, SearchHit, SearchQuery};
-use crate::session::{Session, SessionCompletion, SessionKind, SessionSummary, TranscriptEntry};
+use crate::session::{
+    workspace_status, Session, SessionCompletion, SessionKind, SessionSummary, TranscriptEntry,
+    WorkspaceStatus,
+};
 use crate::session_store::{self, WorkspaceChrome};
 use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
@@ -720,31 +729,13 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("unknown session"))?;
             (s.kind, s.cwd.clone())
         };
-        // #167: rebind cwd when the stored path moved (project open or host project).
-        if kind == SessionKind::Build {
-            if !cwd.is_dir() {
-                let rebind = {
-                    let g = self.inner.lock();
-                    g.project_cwd
-                        .clone()
-                        .filter(|p| p.is_dir())
-                        .or_else(|| std::env::current_dir().ok().filter(|p| p.is_dir()))
-                };
-                if let Some(new_cwd) = rebind {
-                    let mut g = self.inner.lock();
-                    if let Some(s) = g.sessions.get_mut(&id) {
-                        s.cwd = new_cwd.clone();
-                        s.updated_at = Utc::now();
-                    }
-                    drop(g);
-                    self.persist_session_meta_only(id);
-                    let _ = self.set_project_cwd(&new_cwd);
-                }
-            } else {
-                let current = self.inner.lock().project_cwd.clone();
-                if current.as_ref() != Some(&cwd) {
-                    let _ = self.set_project_cwd(&cwd);
-                }
+        // A missing session workspace is recoverable, not permission to run in
+        // whichever project happens to be open. Rebinding is explicit through
+        // session_set_cwd, normally driven by the desktop folder picker.
+        if kind == SessionKind::Build && workspace_status(&cwd) == WorkspaceStatus::Ready {
+            let current = self.inner.lock().project_cwd.clone();
+            if current.as_ref() != Some(&cwd) {
+                let _ = self.set_project_cwd(&cwd);
             }
         }
         let summary = {
@@ -1880,6 +1871,24 @@ impl AgentHostHandle {
         }
     }
 
+    /// Replace the most recent assistant transcript entry (used when evidence-
+    /// backed handoff enrichment extends a weak model final).
+    fn replace_last_assistant_text(&self, session_id: Uuid, text: &str) {
+        let mut g = self.inner.lock();
+        if let Some(session) = g.sessions.get_mut(&session_id) {
+            if let Some(entry) = session
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.role == "assistant")
+            {
+                entry.text = text.to_string();
+            } else {
+                session.transcript.push(TranscriptEntry::assistant(text));
+            }
+        }
+    }
+
     pub fn subagents(&self) -> Vec<SubagentInfo> {
         self.inner.lock().subagents.clone()
     }
@@ -2957,6 +2966,7 @@ impl AgentHostHandle {
         reservation_owner: Option<&str>,
     ) -> Result<String> {
         self.ensure_transcript_loaded(session_id)?;
+        self.ensure_build_workspace_ready(session_id)?;
         let (cwd, model, effort, plan_mode, kind, cancel, event_tx) = {
             let mut g = self.inner.lock();
             if !g.running {
@@ -3056,23 +3066,78 @@ impl AgentHostHandle {
 
         let cancelled = cancel.is_cancelled();
         let end_seq = event_tx.current_seq();
-        let observations = match event_tx.read_range_all(start_seq, Some(end_seq), Some(session_id))
-        {
-            Ok(entries) => {
-                let updates = entries
-                    .iter()
-                    .map(|entry| &entry.update)
-                    .collect::<Vec<_>>();
-                observe_updates(&updates)
+        let (observations, mut changed_paths, tests_passed) =
+            match event_tx.read_range_all(start_seq, Some(end_seq), Some(session_id)) {
+                Ok(entries) => {
+                    let updates = entries
+                        .iter()
+                        .map(|entry| &entry.update)
+                        .collect::<Vec<_>>();
+                    let observations = observe_updates(&updates);
+                    let mut paths = Vec::new();
+                    for update in &updates {
+                        if let SessionUpdate::FileEdit { path, .. } = update {
+                            if !paths.iter().any(|p: &String| p == path) {
+                                paths.push(path.clone());
+                            }
+                        }
+                    }
+                    let tests_passed = if observations.tests_observed == 0 {
+                        None
+                    } else if observations.tests_failed > 0 || observations.tests_incomplete > 0 {
+                        Some(false)
+                    } else if observations.tests_passed > 0 {
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    (observations, paths, tests_passed)
+                }
+                Err(_) => (CompletionObservations::default(), Vec::new(), None),
+            };
+        // Fall back to host-recorded edits when the journal page expired or
+        // FileEdit events were filtered out of the turn window.
+        if changed_paths.is_empty() {
+            let g = self.inner.lock();
+            for path in &g.edited_files {
+                if !changed_paths.iter().any(|p| p == path) {
+                    changed_paths.push(path.clone());
+                }
             }
-            Err(_) => CompletionObservations::default(),
-        };
+        }
         let usage_after = self.session_usage_snapshot(session_id);
         let usage = CompletionUsage {
             prompt_tokens: usage_after.0.saturating_sub(usage_before.0),
             completion_tokens: usage_after.1.saturating_sub(usage_before.1),
             total_tokens: usage_after.2.saturating_sub(usage_before.2),
             requests: usage_after.3.saturating_sub(usage_before.3),
+        };
+        // Enrich weak model finals with observed paths/test outcomes so the
+        // terminal handoff and transcript always report what actually happened.
+        let result = match result {
+            Ok(reply) => {
+                let incomplete = is_incomplete_stop_message(&reply);
+                let enriched =
+                    enrich_terminal_handoff(&reply, &changed_paths, tests_passed, incomplete);
+                if enriched != reply {
+                    // Always rewrite the last assistant line so transcript
+                    // consumers (live_eval handoff) see the evidence trailer.
+                    self.replace_last_assistant_text(session_id, &enriched);
+                    // Append-only JSONL cannot mutate prior lines — rewrite so
+                    // disk reload agrees with memory.
+                    self.persist_session_rewrite(session_id);
+                    let trailer = enriched
+                        .strip_prefix(reply.trim())
+                        .map(str::trim_start)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("");
+                    if !trailer.is_empty() {
+                        emit_message(&event_tx, session_id, trailer);
+                    }
+                }
+                Ok(enriched)
+            }
+            Err(e) => Err(e),
         };
         let outcome = if cancelled {
             "cancelled"
@@ -3146,6 +3211,28 @@ impl AgentHostHandle {
         let _ = self.persist_prompt_queue(session_id);
         busy_guard.armed = false;
         final_result
+    }
+
+    fn ensure_build_workspace_ready(&self, session_id: Uuid) -> Result<()> {
+        let (kind, cwd) = {
+            let g = self.inner.lock();
+            let session = g
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            (session.kind, session.cwd.clone())
+        };
+        if kind == SessionKind::Build {
+            match workspace_status(&cwd) {
+                WorkspaceStatus::Ready => {}
+                status => bail!(
+                    "session workspace is {}: {}; choose a working directory before sending a prompt",
+                    status.as_str(),
+                    cwd.display()
+                ),
+            }
+        }
+        Ok(())
     }
 
     fn persist_prompt_queue(&self, session_id: Uuid) -> Result<()> {
@@ -4010,6 +4097,12 @@ impl AgentHostHandle {
         let mut stop_continued = false;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
         let mut test_failure_needs_edit = false;
+        // Cargo failures since last successful edit while armed.
+        let mut cargo_fails_since_edit: u32 = 0;
+        // Sticky for the turn: at least one successful edit after cargo went red.
+        let mut had_edit_since_cargo_fail = false;
+        // Distinct failing tests from the last cargo failure (multi-bug batching).
+        let mut last_failure_count: u32 = 0;
         let mut recovery_grace = false;
 
         for round in 1..=max_rounds.saturating_add(1) {
@@ -4067,33 +4160,72 @@ impl AgentHostHandle {
                 }));
             }
 
-            // Budget-aware coaching when max_agent_rounds is tight (#187/#188).
+            // Budget-aware coaching when max_agent_rounds is tight (#187/#188/#223).
             let remaining = if in_recovery_grace {
                 1
             } else {
                 max_rounds.saturating_sub(round) + 1
             };
-            let tools_this_round = if in_recovery_grace {
+            // After any observed cargo failure under a tight budget, stop burning
+            // steps on list/grep/read — force edit + shell until cargo is green.
+            // After repeated cargo fails without an edit, force edit-only so the
+            // model cannot thrash shell-only under max_turns=3 (#187 R2).
+            let force_edit_shell =
+                max_rounds <= 8 && (in_recovery_grace || remaining == 1 || test_failure_needs_edit);
+            // While cargo is red and no edit has landed, advertise edit-only so
+            // the model cannot thrash shell. After an edit, restore edit+shell
+            // (host also auto-re-runs cargo after writes). With 2+ failures,
+            // drop serial write_file so multi-module write_files is forced.
+            let force_edit_only = max_rounds <= 8
+                && test_failure_needs_edit
+                && !had_edit_since_cargo_fail
+                && !in_recovery_grace;
+            let multi_failure_batch = last_failure_count >= 2;
+            let tools_this_round = if force_edit_shell {
+                let coach = if in_recovery_grace {
+                    if multi_failure_batch {
+                        format!(
+                            "TEST RECOVERY: {last_failure_count} independent cargo failures remain. \
+                             Use ONE write_files call covering every implicated module (not serial \
+                             write_file), then cargo will re-verify. Do not stop at a diagnosis."
+                        )
+                    } else {
+                        "TEST RECOVERY: the model budget ended with unresolved cargo test failures (or edits that were not re-verified). Use failures and source already in context. In this one bounded recovery step: apply any remaining fixes with write_files and re-run cargo test. Do not stop at a diagnosis or claim success without a green cargo test.".into()
+                    }
+                } else if force_edit_only && multi_failure_batch {
+                    format!(
+                        "BUDGET: {last_failure_count} independent test failures. Shell and serial \
+                         write_file are disabled. Use ONE write_files (or multi-file apply_patch) \
+                         fixing ALL modules now. cargo re-runs automatically after edits."
+                    )
+                } else if force_edit_only {
+                    "BUDGET: cargo test failed. Shell is disabled until you edit. Use write_files (preferred — every failing module in ONE call) / write_file / apply_patch to fix ALL failures now. cargo test re-runs automatically after your edits.".into()
+                } else if test_failure_needs_edit && multi_failure_batch {
+                    format!(
+                        "BUDGET: {last_failure_count} independent failures still open. Prefer ONE \
+                         write_files batch for remaining modules; cargo re-runs after edits."
+                    )
+                } else if test_failure_needs_edit {
+                    "BUDGET: cargo test has failed and is not green yet. Prefer write_files for remaining fixes; cargo re-runs automatically after edits.".into()
+                } else {
+                    "BUDGET: FINAL model step. Exploration tools are disabled. Use only write_files / write_file / apply_patch / run_terminal_cmd. Apply ALL remaining fixes in one batch (every failing test / complete rename including re-exports) and run cargo test now. For renames: change type identifiers only — never rewrite user-facing / PRODUCT_LABEL string literals.".into()
+                };
                 messages.push(serde_json::json!({
                     "role": "system",
-                    "content": "TEST RECOVERY: the model budget ended with an unresolved cargo test failure. Use the reported failures and source already in context, then apply all required edits now. This is one bounded recovery step; do not stop at a diagnosis or claim success without editing.",
+                    "content": coach,
                 }));
-                // The model has already received a concrete failing test report.
-                // Make this one recovery boundary an edit boundary so it cannot
-                // spend the bounded grace step on another exploratory read.
-                filter_tools_edit_only(&tools)
-            } else if max_rounds <= 8 && remaining == 1 {
-                messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": "BUDGET: FINAL model step. Exploration tools are disabled. Use only write_files / write_file / apply_patch / run_terminal_cmd. Apply all remaining fixes and run cargo test now.",
-                }));
-                // Restrict tool surface on the last step so the model cannot burn the step on list/grep/read.
-                filter_tools_edit_and_shell(&tools)
+                if force_edit_only && multi_failure_batch {
+                    filter_tools_batch_edit_only(&tools)
+                } else if force_edit_only {
+                    filter_tools_edit_only(&tools)
+                } else {
+                    filter_tools_edit_and_shell(&tools)
+                }
             } else {
                 if max_rounds <= 8 && remaining <= 2 {
                     messages.push(serde_json::json!({
                         "role": "system",
-                        "content": "BUDGET: only 2 model steps left including this one. Prefer dense multi-tool edits (write_files) + cargo test over list/grep/read.",
+                        "content": "BUDGET: only 2 model steps left including this one. Prefer dense multi-tool edits (write_files for every implicated file) + cargo test over list/grep/read. Batch independent bugs; for renames preserve string literals.",
                     }));
                 }
                 tools.clone()
@@ -4139,7 +4271,15 @@ impl AgentHostHandle {
                     if let Some(r) = reasoning.as_deref() {
                         push_thought(self, session_id, r);
                     }
-                    if max_rounds <= 8 && test_failure_needs_edit && round <= max_rounds {
+                    if max_rounds <= 8 && test_failure_needs_edit {
+                        if in_recovery_grace {
+                            // Recovery already spent — do not accept a success claim
+                            // while cargo is still unresolved (#187).
+                            let msg = "Stopped after recovery step with unresolved cargo test failures. Ask me to continue with the failing tests and source still in context.".to_string();
+                            emit_message(event_tx, session_id, &msg);
+                            push_assistant(self, session_id, &msg);
+                            return Ok(msg);
+                        }
                         messages.push(serde_json::json!({
                             "role": "assistant",
                             "content": text,
@@ -4149,7 +4289,7 @@ impl AgentHostHandle {
                         }
                         messages.push(serde_json::json!({
                             "role": "system",
-                            "content": "TEST RECOVERY is incomplete. Do not provide a final answer yet. Apply the code edits required by the failing tests.",
+                            "content": "TEST RECOVERY is incomplete. Do not provide a final answer yet. Apply the code edits required by ALL failing tests, then re-run cargo test until green.",
                         }));
                         continue;
                     }
@@ -4248,9 +4388,27 @@ impl AgentHostHandle {
                         })).collect::<Vec<_>>(),
                     }));
 
+                    let mut edited_while_needs_reverify = false;
                     for tc in &tool_calls {
                         if cancel.is_cancelled() {
                             break;
+                        }
+                        // Mid-batch gate (#187): once cargo has failed under a
+                        // tight budget, do not burn remaining calls in this step
+                        // (or later steps) on list/read/grep/glob exploration.
+                        if should_skip_tool_after_cargo_failure(
+                            max_rounds as u32,
+                            test_failure_needs_edit,
+                            &tc.name,
+                            had_edit_since_cargo_fail,
+                        ) {
+                            let content = post_cargo_failure_skip_message(&tc.name);
+                            messages.push(serde_json::json!({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": content,
+                            }));
+                            continue;
                         }
                         let _ = event_tx.send(SessionUpdate::AgentProgress {
                             session_id,
@@ -4285,7 +4443,32 @@ impl AgentHostHandle {
                         } else {
                             content
                         };
-                        if output.is_ok()
+                        // Under tight budgets, only clear the post-failure gate when cargo is
+                        // green again. Clearing on edit alone allowed final answers without a
+                        // re-run (#187 verified=false despite oracle pass via external check).
+                        if max_rounds <= 8 && tc.name == "run_terminal_cmd" {
+                            if cargo_test_output_failed(&content) {
+                                test_failure_needs_edit = true;
+                                cargo_fails_since_edit = cargo_fails_since_edit.saturating_add(1);
+                                let n = count_cargo_test_failures(&content);
+                                if n > 0 {
+                                    last_failure_count = n;
+                                } else {
+                                    last_failure_count = last_failure_count.max(1);
+                                }
+                                messages.push(serde_json::json!({
+                                    "role": "system",
+                                    "content": cargo_test_failure_coaching(&content),
+                                }));
+                            } else if cargo_test_output_passed(&content) {
+                                test_failure_needs_edit = false;
+                                cargo_fails_since_edit = 0;
+                                last_failure_count = 0;
+                            }
+                        }
+                        if max_rounds <= 8
+                            && test_failure_needs_edit
+                            && output.is_ok()
                             && matches!(
                                 tc.name.as_str(),
                                 "write_files" | "write_file" | "apply_patch"
@@ -4293,21 +4476,113 @@ impl AgentHostHandle {
                             && !content.starts_with("ERROR:")
                             && !content.starts_with("DENIED")
                         {
-                            test_failure_needs_edit = false;
-                        }
-                        if max_rounds <= 8
-                            && tc.name == "run_terminal_cmd"
-                            && cargo_test_output_failed(&content)
-                        {
-                            test_failure_needs_edit = true;
+                            cargo_fails_since_edit = 0;
+                            had_edit_since_cargo_fail = true;
+                            edited_while_needs_reverify = true;
+                            if last_failure_count >= 2 && tc.name == "write_file" {
+                                messages.push(serde_json::json!({
+                                    "role": "system",
+                                    "content": multi_failure_partial_edit_coaching(last_failure_count),
+                                }));
+                            }
                             messages.push(serde_json::json!({
                                 "role": "system",
-                                "content": "cargo test reported failures. Continue diagnosing as needed, but apply code edits for ALL failing tests before providing a final answer.",
+                                "content": cargo_test_reverify_coaching(),
                             }));
                         }
                         messages.push(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": tc.id,
+                            "content": content,
+                        }));
+                    }
+
+                    // Host-driven cargo re-verify after edits while still red
+                    // under tight budgets (#187). Ensures a final write is always
+                    // followed by cargo so verified can go green even when the
+                    // model spends the last step on write_files only.
+                    if should_auto_cargo_reverify_after_edit(
+                        max_rounds as u32,
+                        edited_while_needs_reverify,
+                    ) && !cancel.is_cancelled()
+                    {
+                        let cmd = auto_cargo_reverify_command();
+                        let args = serde_json::json!({ "command": cmd }).to_string();
+                        let reverify_id = format!("auto-reverify-{}", Uuid::new_v4());
+                        let _ = event_tx.send(SessionUpdate::AgentProgress {
+                            session_id,
+                            round: round as u32,
+                            max_rounds: visible_max_rounds as u32,
+                            last_tool: Some("run_terminal_cmd".into()),
+                            detail: format!(
+                                "Auto re-verify `cargo test` after edit (round {round})"
+                            ),
+                        });
+                        // Synthetic assistant tool_call so the wire transcript is coherent.
+                        messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": reverify_id,
+                                "type": "function",
+                                "function": {
+                                    "name": "run_terminal_cmd",
+                                    "arguments": args,
+                                }
+                            }],
+                        }));
+                        let output = self
+                            .dispatch_agent_tool(
+                                session_id,
+                                cwd,
+                                "run_terminal_cmd",
+                                &args,
+                                cancel,
+                                event_tx,
+                                &mcp_index,
+                            )
+                            .await;
+                        let content = match &output {
+                            Ok(s) => s.clone(),
+                            Err(e) => format!("ERROR: {e}"),
+                        };
+                        let content = if content.len() > 24_000 {
+                            let orig_len = content.len();
+                            format!(
+                                "{}…\n(truncated {} bytes)",
+                                crate::textutil::truncate_at_char_boundary(&content, 24_000),
+                                orig_len
+                            )
+                        } else {
+                            content
+                        };
+                        if cargo_test_output_failed(&content) {
+                            test_failure_needs_edit = true;
+                            cargo_fails_since_edit = cargo_fails_since_edit.saturating_add(1);
+                            let n = count_cargo_test_failures(&content);
+                            if n > 0 {
+                                last_failure_count = n;
+                            } else {
+                                last_failure_count = last_failure_count.max(1);
+                            }
+                            // Partial multi-file fix: require another batch edit.
+                            had_edit_since_cargo_fail = false;
+                            messages.push(serde_json::json!({
+                                "role": "system",
+                                "content": cargo_test_failure_coaching(&content),
+                            }));
+                        } else if cargo_test_output_passed(&content) {
+                            test_failure_needs_edit = false;
+                            cargo_fails_since_edit = 0;
+                            last_failure_count = 0;
+                            messages.push(serde_json::json!({
+                                "role": "system",
+                                "content": "Auto re-verify: cargo test passed after edits.",
+                            }));
+                        }
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": reverify_id,
                             "content": content,
                         }));
                     }
