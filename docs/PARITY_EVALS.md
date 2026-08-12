@@ -68,7 +68,7 @@ Live (manual): Build mode should stream assistant tokens mid-step; Stop cancels 
 
 Live network is **not** a CI gate (ADR / non-goals).
 
-## Reliability evidence (live runner schema 2)
+## Reliability evidence (live runner schema 3)
 
 `examples/live_eval.rs` writes a machine-readable report for every task. The
 report is intentionally stronger than a success boolean while remaining safe
@@ -88,9 +88,11 @@ to retain:
   correctness failures from weak handoffs and workspace-boundary findings.
 
 Reports use relative paths and omit file contents and absolute workspace paths.
-The structured oracle remains the correctness gate; evidence fields make a
-passing oracle auditable instead of treating it as proof that the whole turn
-was complete, safe, and well handed off.
+The structured oracle remains the compatibility `success` gate. The stricter
+`verified` field requires oracle success, a terminal turn, no failed test
+command, and no safety finding. Evidence fields make a passing oracle
+auditable instead of treating it as proof that the whole turn was complete,
+safe, and well handed off. The run-level summary reports both counts.
 
 ## Tool inventory
 
