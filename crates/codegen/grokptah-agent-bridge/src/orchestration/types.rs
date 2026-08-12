@@ -336,7 +336,7 @@ pub struct RunRecord {
     pub request_id: String,
     pub client_id: Option<String>,
     pub state: RunState,
-    /// One-based position in the bounded process-local admission queue.
+    /// One-based position in the bounded host-global admission queue.
     /// Cleared when the run starts, is cancelled, or is interrupted on restart.
     #[serde(default)]
     pub queue_position: Option<usize>,

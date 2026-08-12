@@ -25,9 +25,6 @@ const MAX_PENDING_ADMISSIONS: usize = 32;
 #[derive(Default)]
 struct AdmissionQueueState {
     pending: VecDeque<PendingRun>,
-    /// Prefer a different session when one is available, while preserving
-    /// FIFO order within each session.
-    last_started_session: Option<Uuid>,
 }
 
 struct PendingRun {
@@ -206,18 +203,32 @@ impl OrchestrationService {
             return;
         };
         let mut events = self.host.subscribe_events();
+        let wakeup = self.host.orchestration_wakeup();
         let service_ref = self.self_ref.clone();
         let watcher = runtime.spawn(async move {
-            while let Some(update) = events.recv().await {
-                if matches!(
-                    update,
-                    crate::events::SessionUpdate::TurnComplete { .. }
-                        | crate::events::SessionUpdate::Error { .. }
-                ) {
-                    let Some(service) = service_ref.upgrade() else {
-                        break;
-                    };
-                    service.pump_pending();
+            loop {
+                tokio::select! {
+                    update = events.recv() => {
+                        let Some(update) = update else {
+                            break;
+                        };
+                        if matches!(
+                            update,
+                            crate::events::SessionUpdate::TurnComplete { .. }
+                                | crate::events::SessionUpdate::Error { .. }
+                        ) {
+                            let Some(service) = service_ref.upgrade() else {
+                                break;
+                            };
+                            service.pump_pending();
+                        }
+                    }
+                    _ = wakeup.notified() => {
+                        let Some(service) = service_ref.upgrade() else {
+                            break;
+                        };
+                        service.pump_pending();
+                    }
                 }
             }
         });
@@ -339,20 +350,22 @@ impl OrchestrationService {
         self.pump_pending();
     }
 
-    /// Keep the durable records aligned with the process-local scheduler. The
+    /// Keep the durable records aligned with the host-global scheduler. The
     /// prompt itself remains in memory by design; this metadata is only for
     /// honest operator/coordinator visibility while the run is pending.
     fn sync_pending_positions(&self) {
-        let positions: Vec<(String, usize)> = {
+        let run_ids: Vec<String> = {
             let queue = self.pending_admissions.lock();
             queue
                 .pending
                 .iter()
-                .enumerate()
-                .map(|(index, pending)| (pending.run_id.clone(), index + 1))
+                .map(|pending| pending.run_id.clone())
                 .collect()
         };
-        for (run_id, position) in positions {
+        for run_id in run_ids {
+            let Some(position) = self.host.orchestration_pending_position(&run_id) else {
+                continue;
+            };
             if let Err(error) = self.store.update_run(&run_id, |run| {
                 if run.state == RunState::Queued {
                     run.queue_position = Some(position);
@@ -386,13 +399,15 @@ impl OrchestrationService {
         }
         let run_id = pending.run_id.clone();
         self.host
-            .reserve_orchestration_queue_slot(&run_id)
+            .reserve_orchestration_queue_slot(&run_id, pending.session_id)
             .map_err(|error| OrchError::new(OrchErrorCode::CapacityExhausted, error.to_string()))?;
         queue.pending.push_back(pending);
-        let position = queue.pending.len();
         drop(queue);
         self.sync_pending_positions();
-        Ok(position)
+        Ok(self
+            .host
+            .orchestration_pending_position(&run_id)
+            .unwrap_or(1))
     }
 
     fn remove_pending(&self, run_id: &str) -> bool {
@@ -408,43 +423,37 @@ impl OrchestrationService {
         removed
     }
 
-    /// Choose the oldest eligible task, preferring a session different from
-    /// the last started one when possible. Earlier tasks from the same session
-    /// remain ahead of later tasks, preventing same-session leapfrogging.
-    fn next_pending_index(&self, queue: &AdmissionQueueState) -> Option<usize> {
-        let eligible = queue
-            .pending
-            .iter()
-            .enumerate()
-            .filter(|(index, pending)| {
-                !self.host.session_busy(pending.session_id)
-                    && !queue
-                        .pending
-                        .range(..*index)
-                        .any(|prior| prior.session_id == pending.session_id)
-            })
-            .collect::<Vec<_>>();
-        eligible
-            .iter()
-            .find(|(_, pending)| Some(pending.session_id) != queue.last_started_session)
-            .or_else(|| eligible.first())
-            .map(|(index, _)| *index)
-    }
-
-    /// Promote as many queued tasks as the shared host capacity allows.
+    /// Promote as many queued tasks as the shared host capacity allows. The
+    /// host atomically chooses the globally fair run and reserves its active
+    /// turn, so two embedded control services cannot both select conflicting
+    /// queue heads.
     fn pump_pending(&self) {
         loop {
             if self.host.orchestration_active_count() >= self.host.orchestration_capacity_limit() {
                 return;
             }
+            let candidates: Vec<(String, Uuid)> = {
+                let queue = self.pending_admissions.lock();
+                queue
+                    .pending
+                    .iter()
+                    .map(|pending| (pending.run_id.clone(), pending.session_id))
+                    .collect()
+            };
+            let Some((run_id, _session_id)) =
+                candidates.into_iter().find(|(run_id, session_id)| {
+                    self.host.claim_orchestration_pending(run_id, *session_id)
+                })
+            else {
+                return;
+            };
             let pending = {
                 let mut queue = self.pending_admissions.lock();
-                let Some(index) = self.next_pending_index(&queue) else {
-                    return;
+                let Some(index) = queue.pending.iter().position(|p| p.run_id == run_id) else {
+                    self.host.release_orchestration_turn(&run_id);
+                    continue;
                 };
-                let pending = queue.pending.remove(index).expect("pending index exists");
-                queue.last_started_session = Some(pending.session_id);
-                pending
+                queue.pending.remove(index).expect("pending index exists")
             };
             self.clear_queue_position(&pending.run_id);
             self.sync_pending_positions();
@@ -452,26 +461,12 @@ impl OrchestrationService {
             // Cancellation can win after the task left the queue but before
             // promotion. Treat terminal records as a normal, safe skip.
             let Some(current) = self.store.load_run(&pending.run_id).ok().flatten() else {
-                self.host.release_orchestration_queue_slot(&pending.run_id);
+                self.host.release_orchestration_turn(&pending.run_id);
                 continue;
             };
             if current.state != RunState::Queued {
-                self.host.release_orchestration_queue_slot(&pending.run_id);
+                self.host.release_orchestration_turn(&pending.run_id);
                 continue;
-            }
-
-            if let Err(error) = self.try_reserve_capacity(&pending.run_id, pending.session_id) {
-                let mut queue = self.pending_admissions.lock();
-                queue.pending.push_front(pending);
-                drop(queue);
-                self.sync_pending_positions();
-                if !matches!(
-                    error.code,
-                    OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted
-                ) {
-                    eprintln!("[grokptah] queued run admission failed: {error}");
-                }
-                return;
             }
 
             let start_seq = self.bus.next_seq();
@@ -486,13 +481,21 @@ impl OrchestrationService {
                 Ok(())
             });
             match transitioned {
-                Ok(Some(run)) => {
-                    self.host.release_orchestration_queue_slot(&pending.run_id);
-                    self.spawn_run(run, pending.prompt, pending.execution_mode)
-                }
+                Ok(Some(run)) => self.spawn_run(run, pending.prompt, pending.execution_mode),
                 Ok(None) | Err(_) => {
-                    self.host.release_orchestration_queue_slot(&pending.run_id);
                     self.host.release_orchestration_turn(&pending.run_id);
+                    if let Err(error) = self
+                        .host
+                        .reserve_orchestration_queue_slot(&pending.run_id, pending.session_id)
+                    {
+                        eprintln!("[grokptah] queued run could not be re-registered: {error}");
+                    } else {
+                        let mut queue = self.pending_admissions.lock();
+                        queue.pending.push_front(pending);
+                        drop(queue);
+                        self.sync_pending_positions();
+                        return;
+                    }
                 }
             }
         }
@@ -696,7 +699,8 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self.load_authorized_run(run_id)?;
+        let mut run = self.load_authorized_run(run_id)?;
+        self.refresh_queue_position(&mut run);
         serde_json::to_value(run)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
@@ -706,7 +710,8 @@ impl OrchestrationService {
         _auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self.load_authorized_run(run_id)?;
+        let mut run = self.load_authorized_run(run_id)?;
+        self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
         Ok(json!({
             "runId": run.run_id,
@@ -723,6 +728,14 @@ impl OrchestrationService {
             "terminalResult": run.terminal_result,
             "errorCode": run.error_code,
         }))
+    }
+
+    fn refresh_queue_position(&self, run: &mut RunRecord) {
+        run.queue_position = if run.state == RunState::Queued {
+            self.host.orchestration_pending_position(&run.run_id)
+        } else {
+            None
+        };
     }
 
     pub fn get_events(
