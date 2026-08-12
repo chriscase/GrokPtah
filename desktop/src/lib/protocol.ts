@@ -244,6 +244,11 @@ export interface PermissionRequest {
 }
 
 export type SessionKind = "build" | "chat";
+export type WorkspaceStatus =
+  | "ready"
+  | "missing"
+  | "inaccessible"
+  | "not_directory";
 
 export interface SessionSummary {
   id: string;
@@ -259,6 +264,7 @@ export interface SessionSummary {
   archived_at?: string | null;
   kind?: SessionKind;
   execution_mode?: RunExecutionMode;
+  workspace_status?: WorkspaceStatus;
 }
 
 export interface SearchHit {
@@ -298,6 +304,8 @@ export interface SessionTab {
   kind: SessionKind;
   /** Last known working directory for this tab, including when hidden by the mode filter. */
   cwd?: string;
+  /** Backend-owned workspace health; non-ready states require explicit recovery. */
+  workspaceStatus?: WorkspaceStatus;
   transcript: TranscriptItem[];
   busy: boolean;
   plan: { steps: string[]; status: string } | null;
