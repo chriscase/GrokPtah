@@ -102,6 +102,8 @@ export interface DurableRun {
   requestId: string;
   clientId?: string | null;
   state: DurableRunState;
+  /** One-based position while waiting in the bounded MCP admission queue. */
+  queuePosition?: number | null;
   bounds: {
     maxPromptBytes: number;
     maxRounds: number;

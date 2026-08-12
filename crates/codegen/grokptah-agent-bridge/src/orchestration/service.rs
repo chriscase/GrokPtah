@@ -333,6 +333,43 @@ impl OrchestrationService {
         self.pending_admissions.lock().pending.len()
     }
 
+    /// Keep the durable records aligned with the process-local scheduler. The
+    /// prompt itself remains in memory by design; this metadata is only for
+    /// honest operator/coordinator visibility while the run is pending.
+    fn sync_pending_positions(&self) {
+        let positions: Vec<(String, usize)> = {
+            let queue = self.pending_admissions.lock();
+            queue
+                .pending
+                .iter()
+                .enumerate()
+                .map(|(index, pending)| (pending.run_id.clone(), index + 1))
+                .collect()
+        };
+        for (run_id, position) in positions {
+            if let Err(error) = self.store.update_run(&run_id, |run| {
+                if run.state == RunState::Queued {
+                    run.queue_position = Some(position);
+                    run.updated_at = Utc::now();
+                }
+                Ok(())
+            }) {
+                eprintln!("[grokptah] queued run position persistence failed: {error}");
+            }
+        }
+    }
+
+    fn clear_queue_position(&self, run_id: &str) {
+        if let Err(error) = self.store.update_run(run_id, |run| {
+            if run.queue_position.take().is_some() {
+                run.updated_at = Utc::now();
+            }
+            Ok(())
+        }) {
+            eprintln!("[grokptah] queued run position clear failed: {error}");
+        }
+    }
+
     fn enqueue_pending(&self, pending: PendingRun) -> Result<usize, OrchError> {
         let mut queue = self.pending_admissions.lock();
         if queue.pending.len() >= MAX_PENDING_ADMISSIONS {
@@ -342,14 +379,22 @@ impl OrchestrationService {
             ));
         }
         queue.pending.push_back(pending);
-        Ok(queue.pending.len())
+        let position = queue.pending.len();
+        drop(queue);
+        self.sync_pending_positions();
+        Ok(position)
     }
 
     fn remove_pending(&self, run_id: &str) -> bool {
         let mut queue = self.pending_admissions.lock();
         let before = queue.pending.len();
         queue.pending.retain(|pending| pending.run_id != run_id);
-        before != queue.pending.len()
+        let removed = before != queue.pending.len();
+        drop(queue);
+        if removed {
+            self.sync_pending_positions();
+        }
+        removed
     }
 
     /// Choose the oldest eligible task, preferring a session different from
@@ -390,6 +435,8 @@ impl OrchestrationService {
                 queue.last_started_session = Some(pending.session_id);
                 pending
             };
+            self.clear_queue_position(&pending.run_id);
+            self.sync_pending_positions();
 
             // Cancellation can win after the task left the queue but before
             // promotion. Treat terminal records as a normal, safe skip.
@@ -403,6 +450,8 @@ impl OrchestrationService {
             if let Err(error) = self.try_reserve_capacity(&pending.run_id, pending.session_id) {
                 let mut queue = self.pending_admissions.lock();
                 queue.pending.push_front(pending);
+                drop(queue);
+                self.sync_pending_positions();
                 if !matches!(
                     error.code,
                     OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted
@@ -418,6 +467,7 @@ impl OrchestrationService {
                     anyhow::bail!("queued run is no longer pending");
                 }
                 run.state = RunState::Running;
+                run.queue_position = None;
                 run.start_seq = Some(start_seq);
                 run.updated_at = Utc::now();
                 Ok(())
@@ -646,6 +696,7 @@ impl OrchestrationService {
             "runId": run.run_id,
             "sessionId": run.session_id,
             "state": run.state,
+            "queuePosition": run.queue_position,
             "busy": busy,
             "startSeq": run.start_seq,
             "endSeq": run.end_seq,
@@ -1363,6 +1414,7 @@ impl OrchestrationService {
             } else {
                 RunState::Running
             },
+            queue_position: None,
             bounds: bounds.clone(),
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),
             start_seq,
@@ -1397,6 +1449,7 @@ impl OrchestrationService {
                 Err(error) => {
                     let _ = self.store.update_run(&run_id, |current| {
                         current.state = RunState::Failed;
+                        current.queue_position = None;
                         current.terminal_result = Some("failed".into());
                         current.error_code = Some(error.code.as_str().into());
                         current.updated_at = Utc::now();
@@ -1970,6 +2023,7 @@ impl OrchestrationService {
                 ));
             }
             current.state = RunState::Cancelled;
+            current.queue_position = None;
             current.updated_at = Utc::now();
             current.end_seq = None;
             current.terminal_result = Some("cancelled".into());

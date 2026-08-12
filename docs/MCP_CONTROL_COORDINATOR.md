@@ -200,6 +200,11 @@ coordinator wants a bounded admission queue for capacity or session contention.
   `capacity_exhausted` (HTTP 429 at the transport boundary).
 - A queued response has `state: "queued"` and a one-based `queuedPosition`;
   `ptah_get_capacity` reports `queuedRuns` and `queueLimit`.
+- The durable run record also exposes the current optional `queuePosition`.
+  It is updated as earlier work is cancelled or admitted, cleared when the run
+  starts, and shown by the desktop Task runs inspector. Treat it as live
+  visibility, not a reservation: the run state is authoritative if a race is
+  observed.
 - Queued runs have durable `RunState::Queued` records and remain visible through
   `ptah_get_run`, `ptah_get_progress`, and the handoff/read tools.
 - Admission preserves FIFO order for each session and prefers a different

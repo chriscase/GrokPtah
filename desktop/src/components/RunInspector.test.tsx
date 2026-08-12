@@ -112,6 +112,19 @@ describe("RunInspector", () => {
     expect(screen.getByText("MCP coordinator", { selector: ".run-origin" })).toBeTruthy();
   });
 
+  it("shows the durable admission position for queued coordinator work", () => {
+    render(
+      <RunInspector
+        runs={[run({ state: "queued", clientId: "mcp", queuePosition: 2 })]}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByText("Queued")).toBeTruthy();
+    expect(screen.getByRole("status")).toHaveTextContent("Waiting for an execution slot · position 2");
+  });
+
   it("filters by origin and controls live watching", () => {
     const onWatchingChange = vi.fn();
     render(

@@ -454,6 +454,7 @@ impl OrchStore {
         for mut run in self.list_runs()? {
             if matches!(run.state, RunState::Queued | RunState::Running) {
                 run.state = RunState::Interrupted;
+                run.queue_position = None;
                 run.updated_at = Utc::now();
                 run.terminal_result = Some("interrupted".into());
                 run.error_code = Some("interrupted".into());
@@ -620,6 +621,7 @@ mod tests {
             request_id: format!("req-{run_id}"),
             client_id: None,
             state: RunState::Completed,
+            queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
             start_seq: Some(1),
@@ -647,6 +649,7 @@ mod tests {
             request_id: "req1".into(),
             client_id: None,
             state: RunState::Running,
+            queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
             start_seq: Some(1),
@@ -679,6 +682,7 @@ mod tests {
             request_id: "req2".into(),
             client_id: None,
             state: RunState::Running,
+            queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
             start_seq: Some(1),
@@ -775,6 +779,7 @@ mod tests {
             request_id: "req-tx".into(),
             client_id: None,
             state: RunState::Running,
+            queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
             start_seq: Some(1),
