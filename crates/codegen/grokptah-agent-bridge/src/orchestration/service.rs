@@ -73,6 +73,16 @@ impl Drop for OrchestrationService {
         if let Some(watcher) = self.scheduler_watcher.get_mut().take() {
             watcher.abort();
         }
+        let pending = self
+            .pending_admissions
+            .get_mut()
+            .pending
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>();
+        for run_id in pending {
+            self.host.release_orchestration_queue_slot(&run_id);
+        }
     }
 }
 
@@ -329,10 +339,6 @@ impl OrchestrationService {
         self.pump_pending();
     }
 
-    fn pending_count(&self) -> usize {
-        self.pending_admissions.lock().pending.len()
-    }
-
     /// Keep the durable records aligned with the process-local scheduler. The
     /// prompt itself remains in memory by design; this metadata is only for
     /// honest operator/coordinator visibility while the run is pending.
@@ -378,6 +384,10 @@ impl OrchestrationService {
                 format!("bounded admission queue is full ({MAX_PENDING_ADMISSIONS} pending runs)"),
             ));
         }
+        let run_id = pending.run_id.clone();
+        self.host
+            .reserve_orchestration_queue_slot(&run_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::CapacityExhausted, error.to_string()))?;
         queue.pending.push_back(pending);
         let position = queue.pending.len();
         drop(queue);
@@ -392,6 +402,7 @@ impl OrchestrationService {
         let removed = before != queue.pending.len();
         drop(queue);
         if removed {
+            self.host.release_orchestration_queue_slot(run_id);
             self.sync_pending_positions();
         }
         removed
@@ -441,9 +452,11 @@ impl OrchestrationService {
             // Cancellation can win after the task left the queue but before
             // promotion. Treat terminal records as a normal, safe skip.
             let Some(current) = self.store.load_run(&pending.run_id).ok().flatten() else {
+                self.host.release_orchestration_queue_slot(&pending.run_id);
                 continue;
             };
             if current.state != RunState::Queued {
+                self.host.release_orchestration_queue_slot(&pending.run_id);
                 continue;
             }
 
@@ -473,8 +486,12 @@ impl OrchestrationService {
                 Ok(())
             });
             match transitioned {
-                Ok(Some(run)) => self.spawn_run(run, pending.prompt, pending.execution_mode),
+                Ok(Some(run)) => {
+                    self.host.release_orchestration_queue_slot(&pending.run_id);
+                    self.spawn_run(run, pending.prompt, pending.execution_mode)
+                }
                 Ok(None) | Err(_) => {
+                    self.host.release_orchestration_queue_slot(&pending.run_id);
                     self.host.release_orchestration_turn(&pending.run_id);
                 }
             }
@@ -647,7 +664,7 @@ impl OrchestrationService {
     pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
         let max = self.host.orchestration_capacity_limit();
         let active = self.host.orchestration_active_count();
-        let queued = self.pending_admissions.lock().pending.len();
+        let queued = self.host.orchestration_pending_count();
         let event_error = self
             .bus
             .last_persistence_error()
@@ -1383,7 +1400,7 @@ impl OrchestrationService {
         // Give older queued work first claim on any newly available capacity.
         self.pump_pending();
         let run_id = Uuid::new_v4().to_string();
-        let queue_ahead = self.pending_count() > 0;
+        let queue_ahead = self.host.orchestration_pending_count() > 0;
         let mut queued = false;
         if allow_queue && queue_ahead {
             queued = true;

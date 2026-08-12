@@ -146,6 +146,8 @@ pub(crate) struct Inner {
     turn_reservations: HashMap<Uuid, String>,
     /// Host-global orchestration admissions shared by every control service.
     orchestration_admissions: HashMap<String, Uuid>,
+    /// Host-global bounded pending admissions shared by every control service.
+    orchestration_pending_admissions: HashSet<String>,
     /// One authoritative ceiling shared by every control service on this host.
     orchestration_admission_limit: usize,
     /// Authoritative follow-up queue plus non-cancelling steering inbox.
@@ -367,6 +369,7 @@ impl AgentHost {
             turn_cancels: HashMap::new(),
             turn_reservations: HashMap::new(),
             orchestration_admissions: HashMap::new(),
+            orchestration_pending_admissions: HashSet::new(),
             orchestration_admission_limit: usize::MAX,
             prompt_queues,
             turn_max_rounds: HashMap::new(),
@@ -1187,6 +1190,34 @@ impl AgentHostHandle {
 
     pub fn orchestration_active_count(&self) -> usize {
         self.inner.lock().orchestration_admissions.len()
+    }
+
+    /// Reserve one process-wide pending-admission slot. Keeping this ledger on
+    /// the host prevents multiple embedded control services from multiplying
+    /// their local queue limits into an unbounded prompt store.
+    pub fn reserve_orchestration_queue_slot(&self, run_id: &str) -> Result<()> {
+        const MAX_PENDING_ADMISSIONS: usize = 32;
+        let mut g = self.inner.lock();
+        if g.orchestration_pending_admissions.contains(run_id) {
+            return Ok(());
+        }
+        if g.orchestration_pending_admissions.len() >= MAX_PENDING_ADMISSIONS {
+            bail!("bounded admission queue is full ({MAX_PENDING_ADMISSIONS} pending runs)");
+        }
+        g.orchestration_pending_admissions
+            .insert(run_id.to_string());
+        Ok(())
+    }
+
+    pub fn release_orchestration_queue_slot(&self, run_id: &str) -> bool {
+        self.inner
+            .lock()
+            .orchestration_pending_admissions
+            .remove(run_id)
+    }
+
+    pub fn orchestration_pending_count(&self) -> usize {
+        self.inner.lock().orchestration_pending_admissions.len()
     }
 
     pub fn configure_orchestration_capacity(&self, limit: usize) -> usize {

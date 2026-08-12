@@ -196,7 +196,8 @@ Mutating tools take `request_id`:
 `ptah_submit_task` is fail-fast by default. Set `allow_queue: true` when the
 coordinator wants a bounded admission queue for capacity or session contention.
 
-- The queue holds at most **32** pending task runs. A full queue returns
+- The host holds at most **32** pending task runs process-wide, even when more
+  than one embedded control service shares the host. A full queue returns
   `capacity_exhausted` (HTTP 429 at the transport boundary).
 - A queued response has `state: "queued"` and a one-based `queuedPosition`;
   `ptah_get_capacity` reports `queuedRuns` and `queueLimit`.
