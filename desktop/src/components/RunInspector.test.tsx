@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DurableRun } from "../lib/protocol";
+import type { DurableRun, RunReview } from "../lib/protocol";
 import { RunInspector } from "./RunInspector";
 
 afterEach(cleanup);
@@ -53,9 +53,22 @@ function run(overrides: Partial<DurableRun> = {}): DurableRun {
   };
 }
 
+const review: RunReview = {
+  changedFiles: [{ path: "src/lib.rs", summary: "changed in isolated run" }],
+  diff: "diff --git a/src/lib.rs b/src/lib.rs\n+changed",
+  diffTruncated: false,
+  fingerprint: "abc123",
+};
+
+const actions = {
+  onReview: vi.fn(async () => review),
+  onPromote: vi.fn(async () => undefined),
+  onDiscard: vi.fn(async () => undefined),
+};
+
 describe("RunInspector", () => {
   it("shows durable status, evidence, and bounded handoff", () => {
-    render(<RunInspector runs={[run()]} onRefresh={vi.fn()} />);
+    render(<RunInspector runs={[run()]} onRefresh={vi.fn()} {...actions} />);
 
     expect(screen.getByText("Completed")).toBeTruthy();
     expect(screen.getByText("Fix the failing test")).toBeTruthy();
@@ -71,6 +84,7 @@ describe("RunInspector", () => {
       <RunInspector
         runs={[run({ state: "interrupted", errorCode: "interrupted" })]}
         onRefresh={onRefresh}
+        {...actions}
       />,
     );
 
@@ -78,5 +92,28 @@ describe("RunInspector", () => {
     expect(screen.getByText(/stopped after restart/i)).toBeTruthy();
     fireEvent.click(screen.getByLabelText("Refresh task runs"));
     expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("reviews an isolated run before enabling promotion", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(<RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} />);
+
+    expect(screen.getByText(/Isolated · ready/)).toBeTruthy();
+    expect(screen.queryByText("Promote reviewed changes")).toBeNull();
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByText(/1 changed files/)).toBeTruthy();
+    expect(screen.getByText("Promote reviewed changes")).toBeTruthy();
+    expect(screen.getByText(/diff --git/)).toBeTruthy();
   });
 });

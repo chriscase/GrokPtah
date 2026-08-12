@@ -74,6 +74,47 @@ impl RunBounds {
     }
 }
 
+/// How a Build turn is allowed to touch the user's workspace.
+///
+/// Shared execution preserves the historical behavior. Isolated worktrees are
+/// opt-in and are the only mode that can later be promoted through the
+/// explicit review flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunExecutionMode {
+    #[default]
+    Shared,
+    IsolatedWorktree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionState {
+    #[default]
+    NotApplicable,
+    Preparing,
+    Ready,
+    Promoted,
+    Conflicted,
+    Discarded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunExecution {
+    pub mode: RunExecutionMode,
+    pub source_workspace: String,
+    pub execution_workspace: String,
+    pub base_revision: String,
+    pub source_fingerprint: String,
+    #[serde(default)]
+    pub final_fingerprint: Option<String>,
+    #[serde(default)]
+    pub promotion_state: PromotionState,
+    #[serde(default)]
+    pub promoted_at: Option<DateTime<Utc>>,
+}
+
 /// Merge caller bounds under server ceilings. Caller may only narrow.
 /// Missing fields use the ceiling. Zero / overflow rejected.
 pub fn merge_bounds(
@@ -293,6 +334,9 @@ pub struct RunRecord {
     /// Latest attributable progress, independent of journal retention.
     #[serde(default)]
     pub progress: Option<RunProgress>,
+    /// Optional isolated execution and promotion metadata.
+    #[serde(default)]
+    pub execution: Option<RunExecution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

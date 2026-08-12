@@ -3429,6 +3429,48 @@ button:disabled {
   line-height: 1.35;
 }
 
+.run-promotion {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border-soft);
+}
+
+.run-promotion-status {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: capitalize;
+}
+
+.run-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.run-review {
+  min-width: 0;
+}
+
+.run-review summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.run-review pre {
+  max-height: 260px;
+  margin: 0.35rem 0 0;
+  padding: 0.5rem;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-input);
+  color: var(--text);
+  font: 10px/1.45 var(--font-mono, ui-monospace, monospace);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .run-metrics {
   justify-content: flex-start;
   flex-wrap: wrap;

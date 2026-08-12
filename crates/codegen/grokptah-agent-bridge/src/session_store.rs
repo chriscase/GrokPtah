@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::discover::{ensure_home, grokptah_home};
+use crate::orchestration::RunExecutionMode;
 use crate::session::{Session, TranscriptEntry};
 use crate::types::{EffortLevel, SubagentIsolationPreference};
 
@@ -114,6 +115,8 @@ pub struct SessionMeta {
     pub archived_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub kind: crate::session::SessionKind,
+    #[serde(default)]
+    pub execution_mode: RunExecutionMode,
     #[serde(default)]
     pub completion_history: Vec<crate::session::SessionCompletion>,
 }
@@ -455,6 +458,7 @@ impl SessionMeta {
             archived: s.archived,
             archived_at: s.archived_at,
             kind: s.kind,
+            execution_mode: s.execution_mode,
             completion_history: s.completion_history.clone(),
         }
     }
@@ -481,6 +485,7 @@ impl SessionMeta {
             archived: self.archived,
             archived_at: self.archived_at,
             kind: self.kind,
+            execution_mode: self.execution_mode,
             completion_history: self.completion_history,
             transcript_loaded: false,
             // Until load_transcript, treat disk as authoritative length.

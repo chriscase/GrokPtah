@@ -31,6 +31,7 @@ mod project_context;
 mod prompt_combine;
 mod prompt_queue;
 pub mod reliability_eval;
+mod run_promotion;
 mod search_engine;
 mod session;
 mod session_store;
@@ -88,10 +89,11 @@ pub use mcp_control_client::{ListedTool, McpControlClient};
 pub use mcp_runtime::list_mcp_tools;
 pub use orchestration::{
     is_recognized_test_command, merge_bounds, prompt_preview, safe_id_filename, OrchStore,
-    OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState, WorkspaceAllowlist,
-    CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    OrchestrationConfig, OrchestrationService, PromotionState, RunBounds, RunExecution,
+    RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 pub use permission::{PermissionDecision, PermissionRequest};
+pub use run_promotion::RunReview;
 pub use search_engine::{SearchHit, SearchQuery};
 pub use session::{
     SessionCompletion, SessionKind, SessionSummary, TranscriptEntry, WorkspaceStatus,

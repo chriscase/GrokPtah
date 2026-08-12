@@ -788,6 +788,7 @@ impl OrchestrationService {
             error_code: None,
             aggregates: RunAggregates::default(),
             progress: None,
+            execution: None,
         };
         if let Err(e) = self.store.save_run(&run) {
             self.host.release_turn_reservation(session_id, &run_id);
