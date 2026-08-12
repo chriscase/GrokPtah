@@ -125,6 +125,20 @@ describe("RunInspector", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Waiting for an execution slot · position 2");
   });
 
+  it("labels explicit post-restart retries", () => {
+    render(
+      <RunInspector
+        runs={[run({ retryOf: "interrupted-source" })]}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Explicit retry of interrupted run interrupted-source",
+    );
+  });
+
   it("filters by origin and controls live watching", () => {
     const onWatchingChange = vi.fn();
     render(

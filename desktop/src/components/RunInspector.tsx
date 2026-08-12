@@ -335,6 +335,11 @@ export function RunInspector({
                     This run stopped after restart. Review it before starting a linked retry.
                   </div>
                 )}
+                {run.retryOf && (
+                  <div className="run-callout" role="status">
+                    Explicit retry of interrupted run {run.retryOf}
+                  </div>
+                )}
                 {run.errorCode && run.state !== "interrupted" && (
                   <div className="run-error" role="status">
                     {run.errorCode.replaceAll("_", " ")}

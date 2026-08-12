@@ -102,6 +102,8 @@ export interface DurableRun {
   requestId: string;
   clientId?: string | null;
   state: DurableRunState;
+  /** Source run for an explicit post-restart replacement. */
+  retryOf?: string | null;
   /** One-based position while waiting in the bounded MCP admission queue. */
   queuePosition?: number | null;
   bounds: {

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use grokptah_agent_bridge::orchestration::{
     hash_payload, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunExecutionMode, RunState, WorkspaceAllowlist,
+    RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     discovered_tool_names, set_grokptah_home_override, start_control_server, AgentHost, EventBus,
@@ -271,6 +271,7 @@ fn restart_interrupted_no_auto_resume() {
         request_id: "q".into(),
         client_id: None,
         state: RunState::Running,
+        retry_of: None,
         queue_position: None,
         bounds: RunBounds::default(),
         prompt_preview: "p".into(),
@@ -304,6 +305,7 @@ fn restart_clears_queued_admission_position() {
         request_id: "q-restart".into(),
         client_id: Some("mcp".into()),
         state: RunState::Queued,
+        retry_of: None,
         queue_position: Some(3),
         bounds: RunBounds::default(),
         prompt_preview: "p".into(),
@@ -325,6 +327,147 @@ fn restart_clears_queued_admission_position() {
     let loaded = reopened.load_run("queued-restart").unwrap().unwrap();
     assert_eq!(loaded.state, RunState::Interrupted);
     assert_eq!(loaded.queue_position, None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 2);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let source_id = "interrupted-source";
+    orch.store()
+        .save_run(&RunRecord {
+            run_id: source_id.into(),
+            session_id: session.id,
+            workspace: dunce::canonicalize(ws.path())
+                .unwrap()
+                .display()
+                .to_string(),
+            request_id: "source-request".into(),
+            client_id: Some("mcp".into()),
+            state: RunState::Interrupted,
+            retry_of: None,
+            queue_position: None,
+            bounds: RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 2,
+                max_duration_ms: 30_000,
+            },
+            prompt_preview: "previous attempt".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            terminal_result: Some("interrupted".into()),
+            final_response: None,
+            error_code: Some("interrupted".into()),
+            aggregates: Default::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        })
+        .unwrap();
+
+    let first = orch
+        .retry_run(
+            &auth,
+            "retry-request",
+            session.id,
+            ws.path(),
+            source_id,
+            "list files after restart".into(),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["sourceRunId"], source_id);
+    assert_eq!(first["retryOf"], source_id);
+    let retry_id = first["runId"].as_str().unwrap().to_string();
+    assert_eq!(
+        orch.get_run(&auth, &retry_id).unwrap()["retryOf"],
+        source_id
+    );
+    assert_eq!(
+        wait_run_terminal(&orch, &auth, &retry_id, Duration::from_secs(10)).await,
+        RunState::Completed
+    );
+
+    let widened_bounds = orch
+        .retry_run(
+            &auth,
+            "retry-widened-bounds",
+            session.id,
+            ws.path(),
+            source_id,
+            "retry must remain bounded".into(),
+            Some(json!({"maxRounds": 3})),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(widened_bounds.code.as_str(), "invalid_request");
+
+    let replay = orch
+        .retry_run(
+            &auth,
+            "retry-request",
+            session.id,
+            ws.path(),
+            source_id,
+            "list files after restart".into(),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, first);
+    let conflict = orch
+        .retry_run(
+            &auth,
+            "retry-request",
+            session.id,
+            ws.path(),
+            source_id,
+            "different replacement".into(),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code.as_str(), "conflict");
+
+    let other = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(other.id, ws.path()).unwrap();
+    let cross_session = orch
+        .retry_run(
+            &auth,
+            "retry-cross-session",
+            other.id,
+            ws.path(),
+            source_id,
+            "must not cross ownership".into(),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(cross_session.code.as_str(), "forbidden_scope");
+
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
 
 #[tokio::test]

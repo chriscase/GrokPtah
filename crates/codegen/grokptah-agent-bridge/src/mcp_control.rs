@@ -477,6 +477,22 @@ struct SubmitArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RetryArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+    prompt: String,
+    #[serde(default)]
+    bounds: Option<Value>,
+    #[serde(default)]
+    execution_mode: Option<RunExecutionMode>,
+    #[serde(default)]
+    allow_queue: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QueueArgs {
     request_id: String,
     session_id: Uuid,
@@ -945,6 +961,29 @@ fn tool_input_schema(name: &str) -> Value {
                 }
             }
         }),
+        "ptah_retry_run" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "run_id", "prompt"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id,
+                "prompt": {"type": "string", "minLength": 1},
+                "bounds": bounds,
+                "execution_mode": {
+                    "type": "string",
+                    "enum": ["shared", "isolated_worktree"],
+                    "description": "Optional explicit mode; it must match the interrupted source run."
+                },
+                "allow_queue": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, queue behind bounded capacity/session contention instead of failing fast."
+                }
+            }
+        }),
         "ptah_approve_run" => json!({
             "type": "object",
             "required": [
@@ -1140,6 +1179,23 @@ async fn dispatch_tool(
                 &args.request_id,
                 args.session_id,
                 &args.workspace,
+                args.prompt,
+                args.bounds,
+                args.execution_mode,
+                args.allow_queue,
+            )
+            .await
+        }
+        "ptah_retry_run" => {
+            let args: RetryArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.run_id, "run_id")?;
+            orch.retry_run(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
                 args.prompt,
                 args.bounds,
                 args.execution_mode,

@@ -421,6 +421,7 @@ fn soak_restart_recovery_matrix() {
         request_id: format!("req-{partial_id}"),
         client_id: None,
         state: RunState::Completed,
+        retry_of: None,
         queue_position: None,
         bounds: RunBounds::default(),
         prompt_preview: "partial".into(),

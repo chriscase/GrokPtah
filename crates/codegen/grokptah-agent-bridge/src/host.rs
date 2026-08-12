@@ -750,6 +750,7 @@ impl AgentHostHandle {
             request_id: format!("desktop-turn-{turn_id}"),
             client_id: Some("desktop".into()),
             state: RunState::Running,
+            retry_of: None,
             queue_position: None,
             bounds,
             prompt_preview: self
