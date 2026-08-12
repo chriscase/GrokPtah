@@ -1038,7 +1038,9 @@ button:disabled {
 
 .stream-md-live {
   display: block;
+  width: 100%;
   min-width: 0;
+  max-width: 100%;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1064,7 +1066,9 @@ button:disabled {
 
 /* Word-level beam spans — inherit proportional prose font */
 .stream-text {
-  display: inline;
+  display: block;
+  max-width: 100%;
+  min-width: 0;
   font-family: var(--font);
 }
 
@@ -1788,6 +1792,18 @@ button:disabled {
   padding: 0.4rem 0.6rem;
   background: var(--bg-elevated);
   word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Live buffers must own a full-width line box while their text is changing.
+ * Inline children inside a flex item can briefly collapse to min-content during
+ * rapid React updates, which is the left-crushed flash seen in live output. */
+.bubble.assistant > .stream-md,
+.bubble.thought > .stream-text {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .bubble-role {
@@ -4753,6 +4769,7 @@ button:disabled {
 
 /* Jump to latest when user scrolled up mid-stream (#123) */
 .jump-to-latest-slot {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4762,6 +4779,8 @@ button:disabled {
   border-top: 1px solid var(--border-soft);
   background: var(--bg);
   z-index: 10;
+  isolation: isolate;
+  box-shadow: 0 -8px 14px rgba(0, 0, 0, 0.14);
 }
 .jump-to-latest {
   position: static;

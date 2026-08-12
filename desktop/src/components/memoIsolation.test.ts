@@ -98,10 +98,14 @@ describe("render isolation (#122)", () => {
 describe("jump to latest (#123)", () => {
   it("SessionPane includes jump-to-latest control", () => {
     const src = readFileSync(join(root, "SessionPane.tsx"), "utf8");
+    const css = readFileSync(join(root, "..", "styles", "app.css"), "utf8");
     expect(src).toMatch(/jump-to-latest/);
     expect(src).toMatch(/jump-to-latest-slot/);
     expect(src).toMatch(/Jump to latest/);
     expect(src).toMatch(/showJump/);
+    expect(css).toMatch(
+      /\.jump-to-latest-slot \{[\s\S]*position: relative;[\s\S]*isolation: isolate;/,
+    );
   });
 });
 

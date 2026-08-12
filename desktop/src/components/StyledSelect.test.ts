@@ -85,6 +85,62 @@ describe("StyledSelect (#126)", () => {
     expect(menu).toHaveStyle({ position: "fixed", bottom: "72px" });
   });
 
+  it("clamps a wide menu to the visible viewport edge", () => {
+    const originalWidth = window.innerWidth;
+    const originalHeight = window.innerHeight;
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 320,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 640,
+    });
+    vi.spyOn(
+      HTMLButtonElement.prototype,
+      "getBoundingClientRect",
+    ).mockReturnValue({
+      top: 140,
+      bottom: 164,
+      left: 300,
+      right: 332,
+      width: 32,
+      height: 24,
+      x: 300,
+      y: 140,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    try {
+      render(
+        createElement(StyledSelect, {
+          "aria-label": "Model",
+          value: "grok-build",
+          options: [
+            { value: "grok-build", label: "Grok Build" },
+            { value: "grok-4.5", label: "Grok 4.5" },
+          ],
+          onChange: vi.fn(),
+        }),
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Model" }));
+      expect(screen.getByRole("listbox")).toHaveStyle({
+        left: "152px",
+        width: "160px",
+      });
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: originalWidth,
+      });
+      Object.defineProperty(window, "innerHeight", {
+        configurable: true,
+        value: originalHeight,
+      });
+    }
+  });
+
   it("portals menus outside clipped composer shells", () => {
     render(
       createElement(
