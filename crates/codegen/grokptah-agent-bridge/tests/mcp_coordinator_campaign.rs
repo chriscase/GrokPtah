@@ -7,8 +7,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState,
+    WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
@@ -62,10 +64,13 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
     host.start().unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, workspace.path()).unwrap();
+    let interrupted_run_id = "coordinator-interrupted-source";
+    let store = OrchStore::open(home.path().join("orch")).unwrap();
+    service_store_seed(&store, interrupted_run_id, session.id, workspace.path());
     let service = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        OrchStore::open(home.path().join("orch")).unwrap(),
+        store,
         OrchestrationConfig {
             bearer_token: "coordinator-campaign-token".into(),
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
@@ -83,6 +88,7 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
         .env("GROKPTAH_MCP_TOKEN", "coordinator-campaign-token")
         .env("GROKPTAH_MCP_SESSION_ID", session.id.to_string())
         .env("GROKPTAH_MCP_WORKSPACE", workspace.path())
+        .env("GROKPTAH_MCP_INTERRUPTED_RUN_ID", interrupted_run_id)
         .output()
         .await
         .expect("spawn reference coordinator harness");
@@ -110,6 +116,7 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
         "queueIdempotency",
         "sessionReconnectFailClosed",
         "durableReadAfterReconnect",
+        "explicitRestartRetry",
     ] {
         assert_eq!(
             report["checks"][check], true,
@@ -127,4 +134,44 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
         Some(value) => std::env::set_var("GROKPTAH_AGENT_OFFLINE", value),
         None => std::env::remove_var("GROKPTAH_AGENT_OFFLINE"),
     }
+}
+
+fn service_store_seed(
+    store: &OrchStore,
+    run_id: &str,
+    session_id: uuid::Uuid,
+    workspace: &std::path::Path,
+) {
+    store
+        .save_run(&RunRecord {
+            run_id: run_id.into(),
+            session_id,
+            workspace: dunce::canonicalize(workspace)
+                .unwrap()
+                .display()
+                .to_string(),
+            request_id: "coordinator-interrupted-request".into(),
+            client_id: Some("mcp".into()),
+            state: RunState::Interrupted,
+            retry_of: None,
+            queue_position: None,
+            bounds: RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 6,
+                max_duration_ms: 30_000,
+            },
+            prompt_preview: "previous coordinator attempt".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            terminal_result: Some("interrupted".into()),
+            final_response: None,
+            error_code: Some("interrupted".into()),
+            aggregates: Default::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        })
+        .unwrap();
 }

@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState,
+    WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_from_env, start_control_server,
@@ -1003,6 +1004,108 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
     client.close_session().await.unwrap();
     srv.stop();
     set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (_home, _lock, host, ws, orch) = setup();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let source_id = "http-interrupted-source";
+    orch.store()
+        .save_run(&RunRecord {
+            run_id: source_id.into(),
+            session_id: session.id,
+            workspace: dunce::canonicalize(ws.path())
+                .unwrap()
+                .display()
+                .to_string(),
+            request_id: "http-source-request".into(),
+            client_id: Some("mcp".into()),
+            state: RunState::Interrupted,
+            retry_of: None,
+            queue_position: None,
+            bounds: RunBounds {
+                max_prompt_bytes: 10_000,
+                max_rounds: 6,
+                max_duration_ms: 30_000,
+            },
+            prompt_preview: "previous attempt".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            terminal_result: Some("interrupted".into()),
+            final_response: None,
+            error_code: Some("interrupted".into()),
+            aggregates: Default::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        })
+        .unwrap();
+
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), "stream-token-200");
+    client.initialize().await.unwrap();
+    let listed = client.list_tools().await.unwrap();
+    assert!(listed.iter().any(|tool| tool.name == "ptah_retry_run"));
+
+    let retry_args = json!({
+        "request_id": "http-retry-1",
+        "session_id": session.id.to_string(),
+        "workspace": ws.path().display().to_string(),
+        "run_id": source_id,
+        "prompt": "resume with a fresh bounded prompt"
+    });
+    let first = client
+        .call_tool("ptah_retry_run", retry_args.clone())
+        .await
+        .unwrap();
+    assert!(!first.is_error, "retry: {:?}", first.raw);
+    assert_eq!(first.structured["sourceRunId"], source_id);
+    assert_eq!(first.structured["retryOf"], source_id);
+    let retry_id = first.structured["runId"].as_str().unwrap().to_string();
+
+    for _ in 0..80 {
+        let run = client
+            .call_tool("ptah_get_run", json!({ "run_id": retry_id }))
+            .await
+            .unwrap();
+        if matches!(
+            run.structured["state"].as_str(),
+            Some("completed" | "failed" | "cancelled" | "interrupted" | "limit_reached")
+        ) {
+            assert_eq!(run.structured["retryOf"], source_id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let replay = client
+        .call_tool("ptah_retry_run", retry_args)
+        .await
+        .unwrap();
+    assert_eq!(replay.structured, first.structured);
+    assert!(client
+        .call_tool(
+            "ptah_retry_run",
+            json!({
+                "request_id": "http-retry-1",
+                "session_id": session.id.to_string(),
+                "workspace": ws.path().display().to_string(),
+                "run_id": source_id,
+                "prompt": "different retry must conflict"
+            }),
+        )
+        .await
+        .is_err());
+
+    srv.stop_and_wait().await;
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

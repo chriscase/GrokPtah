@@ -19,6 +19,7 @@ const url = process.env.GROKPTAH_MCP_URL;
 const token = process.env.GROKPTAH_MCP_TOKEN;
 const hostSessionId = process.env.GROKPTAH_MCP_SESSION_ID;
 const workspace = process.env.GROKPTAH_MCP_WORKSPACE;
+const interruptedRunId = process.env.GROKPTAH_MCP_INTERRUPTED_RUN_ID;
 if (!url || !token || !hostSessionId || !workspace) {
   console.error(
     "GROKPTAH_MCP_URL, GROKPTAH_MCP_TOKEN, GROKPTAH_MCP_SESSION_ID, GROKPTAH_MCP_WORKSPACE required"
@@ -160,6 +161,7 @@ try {
         "ptah_get_capacity",
         "ptah_get_events",
         "ptah_submit_task",
+        "ptah_retry_run",
         "ptah_queue_prompt",
         "ptah_steer",
         "ptah_cancel",
@@ -259,6 +261,47 @@ try {
       first: sequences[0],
       last: sequences.at(-1),
     });
+  }
+
+  // Restart recovery is explicit: the source was durably marked interrupted
+  // before this coordinator connected, so no model turn can resume silently.
+  if (interruptedRunId) {
+    const retryArgs = {
+      request_id: `${prefix}-retry-interrupted`,
+      session_id: hostSessionId,
+      workspace,
+      run_id: interruptedRunId,
+      prompt: "continue with a fresh bounded recovery prompt",
+    };
+    const retry = await call("ptah_retry_run", retryArgs);
+    const retryState = structured(retry.json);
+    const retryRunId = retryState?.runId;
+    const retryTerminal = retryRunId ? await pollTerminal(retryRunId) : null;
+    const replay = await call("ptah_retry_run", retryArgs);
+    const conflict = await call("ptah_retry_run", {
+      ...retryArgs,
+      prompt: "a different retry payload must conflict",
+    });
+    record(
+      "explicitRestartRetry",
+      retry.status === 200 &&
+        retryState?.sourceRunId === interruptedRunId &&
+        retryState?.retryOf === interruptedRunId &&
+        typeof retryRunId === "string" &&
+        ["completed", "failed", "cancelled", "interrupted", "limit_reached"].includes(
+          retryTerminal?.state
+        ) &&
+        replay.status === 200 &&
+        JSON.stringify(structured(replay.json)) === JSON.stringify(retryState) &&
+        (conflict.status >= 400 || !!conflict.json?.error),
+      {
+        sourceRunId: interruptedRunId,
+        retryRunId,
+        state: retryTerminal?.state,
+        replayStatus: replay.status,
+        conflictStatus: conflict.status,
+      }
+    );
   }
 
   // A busy run accepts steering without being cancelled, then responds to an
