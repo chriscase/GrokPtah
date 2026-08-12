@@ -1,8 +1,10 @@
 import { memo } from "react";
+import type { PromptQueueEntry, PromptQueueState } from "../lib/promptQueue";
 import type { SessionTab } from "../lib/protocol";
 
 export type FleetStripProps = {
   tabs: SessionTab[];
+  queues?: PromptQueueState;
   activeSessionId: string | null;
   /** Session ids currently docked as stage columns */
   zoneIds: string[];
@@ -12,9 +14,21 @@ export type FleetStripProps = {
   onHide?: () => void;
 };
 
-function phaseLabel(t: SessionTab): string {
+export function queueSummary(entries: PromptQueueEntry[]): string[] {
+  const steeringCount = entries.filter(
+    (entry) =>
+      entry.source === "steer_now" || entry.source === "steering_deferred",
+  ).length;
+  const summary: string[] = [];
+  if (entries.length > 0) summary.push(`${entries.length} queued`);
+  if (steeringCount > 0) summary.push(`${steeringCount} steer`);
+  return summary;
+}
+
+function phaseLabel(t: SessionTab, queues: PromptQueueState = {}): string {
   if (t.needsPermission) return "needs you";
-  const fleetBits: string[] = [];
+  const queueEntries = queues[t.id] ?? [];
+  const fleetBits: string[] = queueSummary(queueEntries);
   if (t.runningSubagents && t.runningSubagents > 0) {
     fleetBits.push(
       t.runningSubagents === 1
@@ -47,6 +61,7 @@ function phaseLabel(t: SessionTab): string {
  */
 export const FleetStrip = memo(function FleetStrip({
   tabs,
+  queues,
   activeSessionId,
   zoneIds,
   canSplit,
@@ -86,9 +101,10 @@ export const FleetStrip = memo(function FleetStrip({
               data-session-id={t.id}
               data-running-subagents={t.runningSubagents ?? 0}
               data-total-tokens={t.totalTokens ?? 0}
+              data-queue-count={queues?.[t.id]?.length ?? 0}
               aria-pressed={isPrimary}
               aria-current={isPrimary ? "true" : undefined}
-              aria-label={`${t.title}: ${phaseLabel(t)}${
+              aria-label={`${t.title}: ${phaseLabel(t, queues)}${
                 t.runningSubagents
                   ? `, ${t.runningSubagents} subagent${t.runningSubagents === 1 ? "" : "s"}`
                   : ""
@@ -142,7 +158,7 @@ export const FleetStrip = memo(function FleetStrip({
                   </span>
                 ) : null}
               </span>
-              <span className="fleet-card-phase">{phaseLabel(t)}</span>
+              <span className="fleet-card-phase">{phaseLabel(t, queues)}</span>
             </button>
           );
         })}

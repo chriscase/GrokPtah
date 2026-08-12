@@ -265,6 +265,7 @@ export default function App() {
     queueFor,
   } = useComposerQueue(activeSessionId);
   const queueDrainsRef = useRef<Set<string>>(new Set());
+  const queueSyncInFlightRef = useRef<Set<string>>(new Set());
   const [ctxMenu, setCtxMenu] = useState<ContextMenuState | null>(null);
   /** FIFO of tool permission prompts — concurrent requests must not clobber (#141). */
   const [permissionQueue, setPermissionQueue] = useState<PermissionRequest[]>(
@@ -341,6 +342,27 @@ export default function App() {
   const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
   const runOriginSyncInFlight = useRef(false);
 
+  const syncOpenQueues = useCallback(
+    async (sessionIds: string[]) => {
+      const ids = [...new Set(sessionIds)].filter(
+        (sessionId) => !queueSyncInFlightRef.current.has(sessionId),
+      );
+      ids.forEach((sessionId) => queueSyncInFlightRef.current.add(sessionId));
+      await Promise.all(
+        ids.map(async (sessionId) => {
+          try {
+            await syncQueue(sessionId, () => api.sessionQueueList(sessionId));
+          } catch (error) {
+            console.warn("prompt queue refresh failed", error);
+          } finally {
+            queueSyncInFlightRef.current.delete(sessionId);
+          }
+        }),
+      );
+    },
+    [syncQueue],
+  );
+
   const refreshRuns = useCallback(async () => {
     if (!activeSessionId) {
       setRuns([]);
@@ -409,11 +431,14 @@ export default function App() {
   useEffect(() => {
     if (openSessionIds.length === 0) return;
     const timer = window.setInterval(
-      () => void syncRunOrigins(openSessionIds),
+      () => {
+        void syncRunOrigins(openSessionIds);
+        void syncOpenQueues(openSessionIds);
+      },
       2_000,
     );
     return () => window.clearInterval(timer);
-  }, [openSessionIds, syncRunOrigins]);
+  }, [openSessionIds, syncOpenQueues, syncRunOrigins]);
 
   useEffect(() => {
     if (rightTab !== "tasks" || !activeSessionId) return;
@@ -899,19 +924,16 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Bridge-owned queues survive process restart; hydrate the visible session
-  // whenever focus changes. The hook rejects stale responses from an older
-  // tab switch or queue mutation.
+  // Bridge-owned queues survive process restart; hydrate every open session so
+  // the Live rail can expose background MCP queue and steering state. The
+  // hook rejects stale responses from an older tab switch or queue mutation.
   useEffect(() => {
-    if (!workspaceRestored || !activeSessionId) return;
-    const sessionId = activeSessionId;
-    void syncQueue(sessionId, () => api.sessionQueueList(sessionId)).catch(
-      (error) => console.warn("prompt queue restore failed", error),
-    );
+    if (!workspaceRestored || openSessionIds.length === 0) return;
+    void syncOpenQueues(openSessionIds);
     return () => {
-      invalidateQueue(sessionId);
+      openSessionIds.forEach((sessionId) => invalidateQueue(sessionId));
     };
-  }, [activeSessionId, invalidateQueue, syncQueue, workspaceRestored]);
+  }, [invalidateQueue, openSessionIds, syncOpenQueues, workspaceRestored]);
 
   // Persist tab *ids* only (not per-token transcript rewrites).
   // Depending on full `tabs` re-wrote workspace.json on every stream chunk.
@@ -2443,6 +2465,7 @@ export default function App() {
         {!liveHidden && tabs.length > 0 && (
             <FleetStrip
               tabs={tabs}
+              queues={promptQueues}
               activeSessionId={activeSessionId}
               zoneIds={docks}
               canSplit={splitOk}
