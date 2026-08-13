@@ -4009,7 +4009,8 @@ button:disabled {
 
 .settings-field select,
 .settings-field input[type="password"],
-.settings-field input[type="text"] {
+.settings-field input[type="text"],
+.settings-field input[type="url"] {
   background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -4168,6 +4169,57 @@ button:disabled {
   font-size: 12px;
 }
 
+.settings-inline-warning {
+  margin: 0 0 1rem;
+  padding: 0.55rem 0.65rem;
+  border-left: 3px solid var(--danger);
+  background: var(--overlay-faint);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.settings-provider-models {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0 0 0.8rem;
+  max-height: 190px;
+  overflow-y: auto;
+}
+
+.settings-provider-models button {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 0.6rem;
+  border-color: var(--border-soft);
+  background: var(--overlay-faint);
+  text-align: left;
+}
+
+.settings-provider-models button.active {
+  border-color: var(--accent-dim);
+  background: var(--accent-bg);
+}
+
+.settings-provider-models span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.settings-provider-models small {
+  color: var(--muted);
+  font-size: 10.5px;
+  text-align: right;
+}
+
+.settings-provider-actions {
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+
 .settings-about-list {
   margin: 0;
   padding-left: 1.1rem;
@@ -4193,6 +4245,14 @@ button:disabled {
   }
   .settings-rules {
     grid-template-columns: 1fr;
+  }
+  .settings-provider-models button {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  .settings-provider-models small {
+    text-align: left;
   }
 }
 

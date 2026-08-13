@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, JournalPage,
     McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
-    PromptQueueRunNextResult, PromptQueueTakeResult, RunExecutionMode, RunReview, RunState,
-    SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
-    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    PromptQueueRunNextResult, PromptQueueTakeResult, ProviderDeadlineClass, ProviderProfileUpdate,
+    ProviderQualificationReport, RunExecutionMode, RunReview, RunState, SearchHit, SearchQuery,
+    SessionCompletion, SessionKind, SessionSummary, SkillInfo, SteeringReceipt, SubagentInfo,
+    TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -1100,6 +1101,69 @@ pub fn set_gateway_config(
     state
         .host
         .set_gateway_config(provider_id, base_url, api_key)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+// Tauri maps this stable, flat JavaScript payload into named command arguments.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_provider_profile(
+    state: State<'_, AppState>,
+    provider_id: String,
+    label: String,
+    base_url: String,
+    model_id: String,
+    deadline_class: ProviderDeadlineClass,
+    effort_options: Vec<String>,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    state
+        .host
+        .upsert_provider_profile(ProviderProfileUpdate {
+            provider_id,
+            label,
+            base_url,
+            model_id,
+            deadline_class,
+            effort_options,
+            api_key,
+        })
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn discover_provider_models(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<Vec<ModelInfo>, String> {
+    state
+        .host
+        .discover_provider_models(&provider_id)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn qualify_provider_model(
+    state: State<'_, AppState>,
+    provider_id: String,
+    model_id: String,
+) -> Result<ProviderQualificationReport, String> {
+    state
+        .host
+        .qualify_provider_model(&provider_id, &model_id)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn delete_provider_profile(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<(), String> {
+    state
+        .host
+        .delete_provider_profile(&provider_id)
         .map_err(map_err)
 }
 

@@ -13,6 +13,7 @@ import type {
   RunExecutionMode,
   RunReview,
   WorkspaceUiState,
+  ProviderQualificationReport,
 } from "./protocol";
 import type {
   PromptQueueEntry,
@@ -294,6 +295,33 @@ export const api = {
       baseUrl,
       apiKey: apiKey ?? null,
     }),
+  upsertProviderProfile: (
+    providerId: string,
+    label: string,
+    baseUrl: string,
+    modelId: string,
+    deadlineClass: "interactive" | "standard" | "extended",
+    effortOptions: string[],
+    apiKey?: string | null,
+  ) =>
+    invoke<void>("upsert_provider_profile", {
+      providerId,
+      label,
+      baseUrl,
+      modelId,
+      deadlineClass,
+      effortOptions,
+      apiKey: apiKey ?? null,
+    }),
+  discoverProviderModels: (providerId: string) =>
+    invoke<ModelInfo[]>("discover_provider_models", { providerId }),
+  qualifyProviderModel: (providerId: string, modelId: string) =>
+    invoke<ProviderQualificationReport>("qualify_provider_model", {
+      providerId,
+      modelId,
+    }),
+  deleteProviderProfile: (providerId: string) =>
+    invoke<void>("delete_provider_profile", { providerId }),
   projectRules: () => invoke<string[]>("project_rules"),
   setPlanMode: (sessionId: string, enabled: boolean) =>
     invoke<void>("set_plan_mode", { sessionId, enabled }),
