@@ -482,6 +482,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "cc",
  "chrono",
  "dirs",
  "dunce",

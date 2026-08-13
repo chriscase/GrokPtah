@@ -15,11 +15,16 @@ pub enum ComputerErrorCode {
     InvalidRequest,
     InvalidState,
     Unauthorized,
+    PermissionRequired,
+    PermissionDenied,
+    PermissionRevoked,
+    UnsupportedPlatform,
     ForbiddenTarget,
     ForbiddenAction,
     SensitiveSurface,
     StaleObservation,
     TargetChanged,
+    TargetClosed,
     LimitReached,
     Conflict,
     Pending,
@@ -749,6 +754,15 @@ pub trait ComputerBackend: Send + Sync + std::fmt::Debug {
         observation: &ComputerObservation,
         action: &ComputerAction,
     ) -> ComputerResult<ActionOutcome>;
+
+    /// Returns only process-owned evidence for the exact run and opaque asset ID.
+    async fn read_evidence(
+        &self,
+        _run_id: &str,
+        _asset_id: &str,
+    ) -> ComputerResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
 
     async fn cancel(&self, run_id: &str) -> ComputerResult<()>;
 }

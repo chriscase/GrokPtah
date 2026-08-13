@@ -54,6 +54,14 @@ observation, allowed action class, and run budget all agree. It does not yet sol
 screen redaction, prompt-injection interpretation, or platform-specific target attestation; those
 remain release blockers in later issues.
 
+## macOS read-only slice (#269)
+
+The first native slice uses a runtime-loaded ScreenCaptureKit shim plus Accessibility semantic
+snapshots behind the same platform-neutral backend. Settings exposes non-prompting status, explicit
+per-permission requests, bounded window discovery, and one-shot read-only previews. It does not
+register a model action or MCP tool. See [Computer Use on macOS](COMPUTER_USE_MACOS.md) for the
+privacy boundary, packaging requirements, and disposable smoke fixture.
+
 ## Deliberate non-goals of the foundation
 
 - no ScreenCaptureKit, Accessibility, Windows UI Automation, or Linux portal adapter;

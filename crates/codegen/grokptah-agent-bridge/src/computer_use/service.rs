@@ -4,6 +4,7 @@ use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::policy::ComputerPolicy;
@@ -39,6 +40,46 @@ impl ComputerUseService {
 
     pub fn get_run(&self, run_id: &str) -> ComputerResult<Option<ComputerRun>> {
         self.store.load_run(run_id)
+    }
+
+    pub async fn read_current_evidence(
+        &self,
+        run_id: &str,
+        asset_id: &str,
+    ) -> ComputerResult<Vec<u8>> {
+        validate_id("run_id", run_id)?;
+        validate_id("asset_id", asset_id)?;
+        let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        let evidence = run
+            .current_observation
+            .as_ref()
+            .and_then(|observation| observation.screenshot.as_ref())
+            .filter(|evidence| evidence.asset_id == asset_id)
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "evidence is not attached to the current observation",
+                )
+            })?;
+        let bytes = self
+            .backend
+            .read_evidence(run_id, asset_id)
+            .await?
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::BackendUnavailable,
+                    "current observation evidence is unavailable",
+                )
+            })?;
+        if bytes.len() as u64 != evidence.byte_len
+            || format!("{:x}", Sha256::digest(&bytes)) != evidence.content_sha256
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "computer-use evidence failed integrity validation",
+            ));
+        }
+        Ok(bytes)
     }
 
     pub fn create_run(
@@ -608,9 +649,19 @@ mod tests {
         action_calls: AtomicUsize,
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct EvidenceBackend {
         inner: SimulatorBackend,
+        bytes: parking_lot::Mutex<Vec<u8>>,
+    }
+
+    impl Default for EvidenceBackend {
+        fn default() -> Self {
+            Self {
+                inner: SimulatorBackend::new(),
+                bytes: parking_lot::Mutex::new(b"ok".to_vec()),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -626,16 +677,27 @@ mod tests {
             limits: &ComputerUseLimits,
         ) -> ComputerResult<ComputerObservation> {
             let mut observation = self.inner.observe(run_id, target, limits).await?;
+            let bytes = self.bytes.lock();
             observation.screenshot = Some(EvidenceRef {
-                content_sha256: "a".repeat(64),
+                content_sha256: format!("{:x}", Sha256::digest(&*bytes)),
                 media_type: "image/png".into(),
-                byte_len: 2,
+                byte_len: bytes.len() as u64,
                 width: 800,
                 height: 600,
                 redacted: true,
                 asset_id: "simulated-redacted-evidence".into(),
             });
             Ok(observation)
+        }
+
+        async fn read_evidence(
+            &self,
+            _run_id: &str,
+            _asset_id: &str,
+        ) -> ComputerResult<Option<Vec<u8>>> {
+            // Deliberately permissive fake: the service must enforce current
+            // run/asset scope and integrity independently of its backend.
+            Ok(Some(self.bytes.lock().clone()))
         }
 
         async fn act(
@@ -973,6 +1035,58 @@ mod tests {
         assert_eq!(terminal.state, ComputerRunState::LimitReached);
         assert!(terminal.current_observation.is_none());
         assert!(terminal.grant.unwrap().revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn evidence_read_requires_current_asset_and_validates_backend_bytes() {
+        let dir = tempdir().unwrap();
+        let backend = Arc::new(EvidenceBackend::default());
+        let service = ComputerUseService::new(
+            backend.clone(),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        );
+        let run = service
+            .create_run(
+                "create-evidence-read",
+                Uuid::new_v4(),
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize("grant-evidence-read", &run.run_id, run.version, grant(&run))
+            .unwrap();
+        let observation = service
+            .observe("observe-evidence-read", &run.run_id, run.version)
+            .await
+            .unwrap();
+        let evidence = observation.screenshot.unwrap();
+
+        assert_eq!(
+            service
+                .read_current_evidence(&run.run_id, &evidence.asset_id)
+                .await
+                .unwrap(),
+            b"ok"
+        );
+        assert_eq!(
+            service
+                .read_current_evidence(&run.run_id, "not-current")
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+
+        *backend.bytes.lock() = b"no".to_vec();
+        assert_eq!(
+            service
+                .read_current_evidence(&run.run_id, &evidence.asset_id)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::BackendFailure
+        );
     }
 
     #[tokio::test]

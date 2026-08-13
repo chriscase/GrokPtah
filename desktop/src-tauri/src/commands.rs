@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use grokptah_agent_bridge::{
-    desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, JournalPage,
-    McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
+    desktop_auto_update_enabled, AuthState, BackgroundTask, ComputerPermission,
+    ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
+    JournalPage, McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
     PromptQueueRunNextResult, PromptQueueTakeResult, RunExecutionMode, RunReview, RunState,
     SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
     SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
@@ -64,6 +65,47 @@ pub fn agent_stop(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub fn agent_status(state: State<'_, AppState>) -> grokptah_agent_bridge::AgentStatus {
     state.host.status()
+}
+
+#[tauri::command]
+pub fn computer_use_status(state: State<'_, AppState>) -> ComputerPlatformStatus {
+    state.computer_use.status()
+}
+
+#[tauri::command]
+pub async fn computer_use_request_permission(
+    state: State<'_, AppState>,
+    permission: String,
+) -> Result<ComputerPermissionStatus, String> {
+    let permission = match permission.as_str() {
+        "screen_recording" => ComputerPermission::ScreenRecording,
+        "accessibility" => ComputerPermission::Accessibility,
+        _ => return Err("Unknown Computer Use permission".into()),
+    };
+    state.computer_use.request_permission(permission).await
+}
+
+#[tauri::command]
+pub async fn computer_use_list_targets(
+    state: State<'_, AppState>,
+) -> Result<Vec<ComputerTargetCandidate>, String> {
+    state.computer_use.list_targets().await
+}
+
+#[tauri::command]
+pub async fn computer_use_observe_once(
+    state: State<'_, AppState>,
+    selection_token: String,
+) -> Result<crate::computer_use::ObservationPreview, String> {
+    let owner_session_id = state
+        .host
+        .status()
+        .active_session
+        .ok_or_else(|| "Open a session before observing another application".to_string())?;
+    state
+        .computer_use
+        .observe_once(&selection_token, owner_session_id)
+        .await
 }
 
 #[tauri::command]
@@ -942,10 +984,7 @@ pub async fn create_worktree(
 }
 
 #[tauri::command]
-pub async fn remove_worktree(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<String, String> {
+pub async fn remove_worktree(state: State<'_, AppState>, path: String) -> Result<String, String> {
     let host = state.host.clone();
     run_blocking(move || host.remove_worktree(&path).map_err(map_err)).await
 }
@@ -1021,16 +1060,12 @@ pub fn cancel_subagent(state: State<'_, AppState>, id: String) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn list_agents(
-    state: State<'_, AppState>,
-) -> Vec<grokptah_agent_bridge::AgentDef> {
+pub fn list_agents(state: State<'_, AppState>) -> Vec<grokptah_agent_bridge::AgentDef> {
     state.host.list_agents()
 }
 
 #[tauri::command]
-pub fn list_personas(
-    state: State<'_, AppState>,
-) -> Vec<grokptah_agent_bridge::PersonaDef> {
+pub fn list_personas(state: State<'_, AppState>) -> Vec<grokptah_agent_bridge::PersonaDef> {
     state.host.list_personas()
 }
 

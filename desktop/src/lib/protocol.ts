@@ -388,6 +388,70 @@ export interface AuthState {
   method?: string | null;
 }
 
+export type ComputerPermissionStatus =
+  | "unsupported"
+  | "missing"
+  | "prompt_pending"
+  | "denied"
+  | "granted"
+  | "revoked"
+  | "restricted";
+
+export interface ComputerPlatformStatus {
+  platformId: string;
+  available: boolean;
+  minimumOsVersion?: string | null;
+  screenRecording: ComputerPermissionStatus;
+  accessibility: ComputerPermissionStatus;
+  detail?: string | null;
+}
+
+export interface ComputerTargetCandidate {
+  selectionToken: string;
+  target: {
+    appId: string;
+    windowId: string;
+    generation: number;
+    displayName: string;
+    sensitivity: string;
+  };
+  geometry: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    scaleFactor: number;
+  };
+  onScreen: boolean;
+  active: boolean;
+  minimized: boolean;
+}
+
+export interface ComputerObservationPreview {
+  observation: {
+    observationId: string;
+    sequence: number;
+    target: ComputerTargetCandidate["target"];
+    elements: Array<{
+      elementId: string;
+      role: string;
+      label?: string | null;
+      value?: string | null;
+      sensitivity: string;
+    }>;
+    elementsTruncated: boolean;
+    screenshot?: {
+      contentSha256: string;
+      byteLen: number;
+      width: number;
+      height: number;
+      redacted: boolean;
+      assetId: string;
+    } | null;
+  };
+  imageDataUrl?: string | null;
+}
+
 export type SubagentExecutionMode =
   | "unknown"
   | "worktree"
