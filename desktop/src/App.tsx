@@ -867,12 +867,21 @@ export default function App() {
           return `${prev.trimEnd()}\n${block}`;
         });
       }
-      applyUpdate(u, setTabs, setPermissionQueue);
+      applyUpdate(u, setTabs, setPermissionQueue, (queueUpdate) => {
+        // MCP and desktop mutations share this bridge event. Applying the
+        // snapshot directly avoids a second request racing the coordinator's
+        // newer queue version.
+        dispatchQueue({
+          type: "replace",
+          sessionId: queueUpdate.session_id,
+          entries: queueUpdate.entries,
+        });
+      });
       if (u.type === "turn_started" || u.type === "turn_complete") {
         void syncRunOrigins([u.session_id]);
       }
     });
-  }, [syncRunOrigins]);
+  }, [dispatchQueue, syncRunOrigins]);
 
   // Restore sessions + open tabs from disk (desktop-app durability).
   useEffect(() => {
@@ -3720,6 +3729,9 @@ function applyUpdate(
   setPermissionQueue: React.Dispatch<
     React.SetStateAction<PermissionRequest[]>
   >,
+  onPromptQueueChanged?: (
+    update: Extract<SessionUpdate, { type: "prompt_queue_changed" }>,
+  ) => void,
 ) {
   const sid = sessionIdOf(u);
   if (!sid && u.type !== "permission_required") return;
@@ -3947,6 +3959,28 @@ function applyUpdate(
             label: "Steering",
             detail: "Guidance delivered at a safe step",
             live: true,
+          },
+        ),
+      );
+      break;
+    case "prompt_queue_changed":
+      onPromptQueueChanged?.(u);
+      withTab(sid!, (tab) =>
+        withActivity(
+          { ...tab, unseen: true },
+          {
+            phase:
+              u.action === "steer_now" && u.disposition === "pending"
+                ? "streaming"
+                : "queued",
+            label:
+              u.action === "steer_now"
+                ? u.disposition === "pending"
+                  ? "Steering pending"
+                  : "Steering queued"
+                : "Queue updated",
+            detail: `${u.origin === "mcp" ? "MCP" : "Desktop"} · ${u.action.replaceAll("_", " ")}`,
+            live: tab.busy || (u.disposition === "pending"),
           },
         ),
       );

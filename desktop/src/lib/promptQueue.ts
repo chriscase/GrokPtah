@@ -1,8 +1,10 @@
 export type PromptQueueKind = "prompt" | "command";
 export type PromptQueueSource =
   | "composer"
+  | "control"
   | "steer_now"
   | "steering_deferred"
+  | "steering_delivery_recovery"
   | "desktop";
 
 export type PromptQueueEntry = {
@@ -150,6 +152,7 @@ export type PromptQueueTakeResult = {
 export type PromptQueueRunNextResult = {
   entries: PromptQueueEntry[];
   cancelled_active: boolean;
+  changed_entry?: PromptQueueEntry;
 };
 
 export type SteeringReceipt = {

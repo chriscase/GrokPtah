@@ -4,6 +4,7 @@ use uuid::Uuid;
 use crate::completion::CompletionEvidence;
 
 use crate::permission::PermissionRequest;
+use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,5 +146,16 @@ pub enum SessionUpdate {
         session_id: Uuid,
         steering_id: String,
         text: String,
+    },
+    /// Durable queue snapshot after a desktop or MCP queue mutation. The
+    /// changed entry is retained when a steering action leaves the durable
+    /// queue so consumers can render its pending disposition immediately.
+    PromptQueueChanged {
+        session_id: Uuid,
+        entries: Vec<PromptQueueEntry>,
+        action: String,
+        origin: String,
+        changed_entry: Option<PromptQueueEntry>,
+        disposition: Option<SteeringDisposition>,
     },
 }

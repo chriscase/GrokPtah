@@ -111,6 +111,8 @@ function eventLabel(update: SessionUpdate): string {
       return `Rate limited · ${compactEventText(update.message)}`;
     case "steering_injected":
       return `Steering delivered · ${compactEventText(update.text)}`;
+    case "prompt_queue_changed":
+      return `${update.origin === "mcp" ? "MCP" : "Desktop"} queue · ${update.action.replace(/_/g, " ")}${update.disposition ? ` · ${update.disposition}` : ""}`;
   }
 }
 

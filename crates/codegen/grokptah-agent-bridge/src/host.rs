@@ -45,7 +45,7 @@ use crate::orchestration::{
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::prompt_queue::{
     format_interjection, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueTakeResult,
-    SessionPromptQueue, SteeringReceipt,
+    SessionPromptQueue, SteeringDisposition, SteeringReceipt,
 };
 use crate::run_promotion::{self, RunReview};
 use crate::search_engine::{self, SearchHit, SearchQuery};
@@ -3790,7 +3790,20 @@ impl AgentHostHandle {
         source: &str,
         owner: Option<String>,
     ) -> Result<Vec<PromptQueueEntry>> {
-        let list = {
+        self.session_queue_add_with_source_receipt(session_id, text, priority, source, owner)
+            .map(|(entries, _)| entries)
+    }
+
+    pub fn session_queue_add_with_source_receipt(
+        &self,
+        session_id: Uuid,
+        text: String,
+        priority: bool,
+        source: &str,
+        owner: Option<String>,
+    ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry)> {
+        let origin = owner.clone().unwrap_or_else(|| source.to_string());
+        let (list, changed_entry) = {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&session_id) {
                 bail!("unknown session");
@@ -3800,14 +3813,22 @@ impl AgentHostHandle {
                 .get(&session_id)
                 .cloned()
                 .unwrap_or_default();
-            next.add_with_owner(text, source, priority, owner)?;
+            let changed_entry = next.add_with_owner(text, source, priority, owner)?;
             session_store::save_prompt_queue(session_id, &next)
                 .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
             let list = next.list();
             g.prompt_queues.insert(session_id, next);
-            list
+            (list, changed_entry)
         };
-        Ok(list)
+        self.emit_prompt_queue_changed(
+            session_id,
+            list.clone(),
+            "queued",
+            origin,
+            Some(changed_entry.clone()),
+            None,
+        );
+        Ok((list, changed_entry))
     }
 
     pub fn session_queue_edit(
@@ -3817,16 +3838,35 @@ impl AgentHostHandle {
         version: u64,
         text: String,
     ) -> Result<Vec<PromptQueueEntry>> {
-        let list = {
+        self.session_queue_edit_with_origin(session_id, entry_id, version, text, "desktop")
+    }
+
+    pub fn session_queue_edit_with_origin(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        version: u64,
+        text: String,
+        origin: &str,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        let (list, changed_entry) = {
             let mut g = self.inner.lock();
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-            queue.edit(entry_id, version, text)?;
-            queue.list()
+            let changed_entry = queue.edit(entry_id, version, text)?;
+            (queue.list(), changed_entry)
         };
         let _ = self.persist_prompt_queue(session_id);
+        self.emit_prompt_queue_changed(
+            session_id,
+            list.clone(),
+            "edited",
+            origin.to_string(),
+            Some(changed_entry),
+            None,
+        );
         Ok(list)
     }
 
@@ -3835,20 +3875,72 @@ impl AgentHostHandle {
         session_id: Uuid,
         entry_id: &str,
     ) -> Result<Vec<PromptQueueEntry>> {
-        let list = {
+        self.session_queue_remove_with_origin(session_id, entry_id, "desktop")
+    }
+
+    pub fn session_queue_remove_with_origin(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        origin: &str,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        self.session_queue_remove_with_origin_and_version(session_id, entry_id, origin, None)
+    }
+
+    pub fn session_queue_remove_with_origin_and_version(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        origin: &str,
+        expected_version: Option<u64>,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        self.session_queue_remove_with_origin_and_version_receipt(
+            session_id,
+            entry_id,
+            origin,
+            expected_version,
+        )
+        .map(|(entries, _)| entries)
+    }
+
+    pub fn session_queue_remove_with_origin_and_version_receipt(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        origin: &str,
+        expected_version: Option<u64>,
+    ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry)> {
+        let (list, changed_entry) = {
             let mut g = self.inner.lock();
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-            queue.remove(entry_id)?;
-            queue.list()
+            queue.check_version(entry_id, expected_version)?;
+            let changed_entry = queue.remove(entry_id)?;
+            (queue.list(), changed_entry)
         };
         let _ = self.persist_prompt_queue(session_id);
-        Ok(list)
+        self.emit_prompt_queue_changed(
+            session_id,
+            list.clone(),
+            "removed",
+            origin.to_string(),
+            Some(changed_entry.clone()),
+            None,
+        );
+        Ok((list, changed_entry))
     }
 
     pub fn session_queue_clear(&self, session_id: Uuid) -> Result<Vec<PromptQueueEntry>> {
+        self.session_queue_clear_with_origin(session_id, "desktop")
+    }
+
+    pub fn session_queue_clear_with_origin(
+        &self,
+        session_id: Uuid,
+        origin: &str,
+    ) -> Result<Vec<PromptQueueEntry>> {
         {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&session_id) {
@@ -3857,6 +3949,14 @@ impl AgentHostHandle {
             g.prompt_queues.entry(session_id).or_default().clear();
         }
         let _ = self.persist_prompt_queue(session_id);
+        self.emit_prompt_queue_changed(
+            session_id,
+            Vec::new(),
+            "cleared",
+            origin.to_string(),
+            None,
+            None,
+        );
         Ok(Vec::new())
     }
 
@@ -3866,16 +3966,49 @@ impl AgentHostHandle {
         entry_id: &str,
         to_index: usize,
     ) -> Result<Vec<PromptQueueEntry>> {
-        let list = {
+        self.session_queue_move_with_origin(session_id, entry_id, to_index, "desktop")
+    }
+
+    pub fn session_queue_move_with_origin(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        to_index: usize,
+        origin: &str,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        self.session_queue_move_with_origin_and_version(
+            session_id, entry_id, to_index, origin, None,
+        )
+    }
+
+    pub fn session_queue_move_with_origin_and_version(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        to_index: usize,
+        origin: &str,
+        expected_version: Option<u64>,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        let (list, changed_entry) = {
             let mut g = self.inner.lock();
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+            queue.check_version(entry_id, expected_version)?;
+            let changed_entry = queue.list().into_iter().find(|entry| entry.id == entry_id);
             queue.move_to(entry_id, to_index)?;
-            queue.list()
+            (queue.list(), changed_entry)
         };
         let _ = self.persist_prompt_queue(session_id);
+        self.emit_prompt_queue_changed(
+            session_id,
+            list.clone(),
+            "reordered",
+            origin.to_string(),
+            changed_entry.clone(),
+            None,
+        );
         Ok(list)
     }
 
@@ -3898,6 +4031,16 @@ impl AgentHostHandle {
         };
         if result.batch.is_some() {
             let _ = self.persist_prompt_queue(session_id);
+            if let Some(batch) = result.batch.as_ref() {
+                self.emit_prompt_queue_changed(
+                    session_id,
+                    result.entries.clone(),
+                    "delivered",
+                    "desktop".into(),
+                    batch.entries.first().cloned(),
+                    None,
+                );
+            }
         }
         Ok(result)
     }
@@ -3907,27 +4050,76 @@ impl AgentHostHandle {
         session_id: Uuid,
         entry_id: &str,
     ) -> Result<PromptQueueRunNextResult> {
-        let active = {
+        self.session_queue_run_next_with_origin(session_id, entry_id, "desktop")
+    }
+
+    pub fn session_queue_run_next_with_origin(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        origin: &str,
+    ) -> Result<PromptQueueRunNextResult> {
+        self.session_queue_run_next_with_origin_and_version(session_id, entry_id, origin, None)
+    }
+
+    pub fn session_queue_run_next_with_origin_and_version(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        origin: &str,
+        expected_version: Option<u64>,
+    ) -> Result<PromptQueueRunNextResult> {
+        let (changed_entry, active) = {
             let mut g = self.inner.lock();
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
-            queue.run_next(entry_id)?;
-            g.turn_cancels.contains_key(&session_id)
+            queue.check_version(entry_id, expected_version)?;
+            let changed_entry = queue.run_next(entry_id)?;
+            (changed_entry, g.turn_cancels.contains_key(&session_id))
         };
         let _ = self.persist_prompt_queue(session_id);
         let cancelled_active = active && self.cancel_turn(Some(session_id)).is_ok();
-        Ok(PromptQueueRunNextResult {
+        let result = PromptQueueRunNextResult {
             entries: self.session_queue_list(session_id)?,
             cancelled_active,
-        })
+            changed_entry: changed_entry.clone(),
+        };
+        self.emit_prompt_queue_changed(
+            session_id,
+            result.entries.clone(),
+            "run_next",
+            origin.to_string(),
+            Some(changed_entry),
+            None,
+        );
+        Ok(result)
     }
 
     pub fn session_queue_steer_entry(
         &self,
         session_id: Uuid,
         entry_id: &str,
+    ) -> Result<SteeringReceipt> {
+        self.session_queue_steer_entry_with_origin(session_id, entry_id, "desktop")
+    }
+
+    pub fn session_queue_steer_entry_with_origin(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        origin: &str,
+    ) -> Result<SteeringReceipt> {
+        self.session_queue_steer_entry_with_origin_and_version(session_id, entry_id, origin, None)
+    }
+
+    pub fn session_queue_steer_entry_with_origin_and_version(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        origin: &str,
+        expected_version: Option<u64>,
     ) -> Result<SteeringReceipt> {
         let receipt = {
             let mut g = self.inner.lock();
@@ -3941,9 +4133,18 @@ impl AgentHostHandle {
                 .prompt_queues
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
+            queue.check_version(entry_id, expected_version)?;
             queue.steer_queued(entry_id, can_inject)?
         };
         let _ = self.persist_prompt_queue(session_id);
+        self.emit_prompt_queue_changed(
+            session_id,
+            receipt.entries.clone(),
+            "steer_now",
+            origin.to_string(),
+            Some(receipt.entry.clone()),
+            Some(receipt.disposition),
+        );
         Ok(receipt)
     }
 
@@ -3957,6 +4158,7 @@ impl AgentHostHandle {
         text: String,
         owner: Option<String>,
     ) -> Result<SteeringReceipt> {
+        let origin = owner.clone().unwrap_or_else(|| "desktop".into());
         let receipt = {
             let mut g = self.inner.lock();
             let is_build = g
@@ -3976,6 +4178,14 @@ impl AgentHostHandle {
             g.prompt_queues.insert(session_id, next);
             receipt
         };
+        self.emit_prompt_queue_changed(
+            session_id,
+            receipt.entries.clone(),
+            "steer_now",
+            origin,
+            Some(receipt.entry.clone()),
+            Some(receipt.disposition),
+        );
         Ok(receipt)
     }
 
@@ -4437,16 +4647,28 @@ impl AgentHostHandle {
 
         // Keep the turn busy through the terminal event. A waiter observing an
         // idle session therefore knows model work and terminal fan-out ended.
-        {
+        let deferred = {
             let mut g = self.inner.lock();
             g.turn_cancels.remove(&session_id);
             g.turn_max_rounds.remove(&session_id);
             g.prompt_queues
                 .entry(session_id)
                 .or_default()
-                .defer_pending_steering();
-        }
+                .defer_pending_steering()
+        };
         let _ = self.persist_prompt_queue(session_id);
+        if deferred > 0 {
+            if let Ok(entries) = self.session_queue_list(session_id) {
+                self.emit_prompt_queue_changed(
+                    session_id,
+                    entries,
+                    "deferred",
+                    "bridge".into(),
+                    None,
+                    Some(SteeringDisposition::Queued),
+                );
+            }
+        }
         busy_guard.armed = false;
         final_result
     }
@@ -4486,6 +4708,26 @@ impl AgentHostHandle {
                 .map_err(|e| anyhow!("persist prompt queue: {e}"))?;
         }
         Ok(())
+    }
+
+    fn emit_prompt_queue_changed(
+        &self,
+        session_id: Uuid,
+        entries: Vec<PromptQueueEntry>,
+        action: &str,
+        origin: String,
+        changed_entry: Option<PromptQueueEntry>,
+        disposition: Option<SteeringDisposition>,
+    ) {
+        let event_tx = self.inner.lock().event_tx.clone();
+        let _ = event_tx.send(SessionUpdate::PromptQueueChanged {
+            session_id,
+            entries,
+            action: action.into(),
+            origin,
+            changed_entry,
+            disposition,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4999,6 +5241,14 @@ impl AgentHostHandle {
                 session_id,
                 steering_id: entry.id.clone(),
                 text: entry.text.clone(),
+            });
+            let _ = event_tx.send(SessionUpdate::PromptQueueChanged {
+                session_id,
+                entries: self.session_queue_list(session_id).unwrap_or_default(),
+                action: "delivered".into(),
+                origin: entry.owner.clone().unwrap_or_else(|| "bridge".into()),
+                changed_entry: Some(entry.clone()),
+                disposition: Some(SteeringDisposition::Pending),
             });
         }
         entries

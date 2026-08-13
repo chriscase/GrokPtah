@@ -1,6 +1,7 @@
 /** Typed client mirror of bridge SessionUpdate + Tauri commands. */
 
 import type { ActivityState } from "./activity";
+import type { PromptQueueEntry } from "./promptQueue";
 
 export type ToolCallKind = "read" | "edit" | "search" | "execute" | "think" | "other";
 export type ToolCallStatus =
@@ -256,6 +257,15 @@ export type SessionUpdate =
       session_id: string;
       message: string;
       retry_after_ms?: number | null;
+    }
+  | {
+      type: "prompt_queue_changed";
+      session_id: string;
+      entries: PromptQueueEntry[];
+      action: string;
+      origin: string;
+      changed_entry?: PromptQueueEntry | null;
+      disposition?: "pending" | "queued" | null;
     }
   | {
       type: "steering_injected";

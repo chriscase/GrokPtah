@@ -56,6 +56,7 @@ pub struct PromptQueueTakeResult {
 pub struct PromptQueueRunNextResult {
     pub entries: Vec<PromptQueueEntry>,
     pub cancelled_active: bool,
+    pub changed_entry: PromptQueueEntry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +158,24 @@ impl SessionPromptQueue {
         entry.kind = classify_kind(&entry.text).into();
         entry.version += 1;
         Ok(entry.clone())
+    }
+
+    pub fn check_version(&self, id: &str, version: Option<u64>) -> Result<()> {
+        let Some(version) = version else {
+            return Ok(());
+        };
+        let entry = self
+            .queued
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown queued prompt {id}"))?;
+        if entry.version != version {
+            bail!(
+                "stale queued prompt version for {id}: expected {}, got {version}",
+                entry.version
+            );
+        }
+        Ok(())
     }
 
     pub fn remove(&mut self, id: &str) -> Result<PromptQueueEntry> {

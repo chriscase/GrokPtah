@@ -588,6 +588,7 @@ fn is_critical_update(update: &SessionUpdate) -> bool {
             | SessionUpdate::ShellSessionEnded { .. }
             | SessionUpdate::FileEdit { .. }
             | SessionUpdate::RateLimited { .. }
+            | SessionUpdate::PromptQueueChanged { .. }
     )
 }
 
@@ -635,7 +636,8 @@ pub(crate) fn session_id_of(u: &SessionUpdate) -> Option<uuid::Uuid> {
         | FileEdit { session_id, .. }
         | AgentProgress { session_id, .. }
         | RateLimited { session_id, .. }
-        | SteeringInjected { session_id, .. } => Some(*session_id),
+        | SteeringInjected { session_id, .. }
+        | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
     }
 }
@@ -922,6 +924,30 @@ pub fn redact_update_with_secrets(
         }
         SessionUpdate::SteeringInjected { text, .. } => {
             *text = scrub_text(text, control_secrets, 2_000);
+        }
+        SessionUpdate::PromptQueueChanged {
+            entries,
+            changed_entry,
+            action,
+            origin,
+            ..
+        } => {
+            for entry in entries {
+                entry.text = scrub_text(&entry.text, control_secrets, 4_000);
+                entry.source = scrub_text(&entry.source, control_secrets, 200);
+                if let Some(owner) = entry.owner.as_mut() {
+                    *owner = scrub_text(owner, control_secrets, 200);
+                }
+            }
+            if let Some(entry) = changed_entry {
+                entry.text = scrub_text(&entry.text, control_secrets, 4_000);
+                entry.source = scrub_text(&entry.source, control_secrets, 200);
+                if let Some(owner) = entry.owner.as_mut() {
+                    *owner = scrub_text(owner, control_secrets, 200);
+                }
+            }
+            *action = scrub_text(action, control_secrets, 100);
+            *origin = scrub_text(origin, control_secrets, 100);
         }
         SessionUpdate::PermissionRequired { request, .. } => {
             request.detail = redact_json(&request.detail, control_secrets);
@@ -1303,6 +1329,48 @@ mod tests {
             assert_eq!(input["path"], "a.rs");
         } else {
             panic!("variant");
+        }
+    }
+
+    #[test]
+    fn redact_prompt_queue_snapshot_without_losing_state() {
+        let sid = Uuid::new_v4();
+        let mut entry = crate::prompt_queue::PromptQueueEntry::new(
+            "use ctl-token-abc123 only as a test",
+            "control",
+            false,
+        )
+        .unwrap();
+        entry.owner = Some("ctl-token-abc123".into());
+        let update = SessionUpdate::PromptQueueChanged {
+            session_id: sid,
+            entries: vec![entry.clone()],
+            action: "queued".into(),
+            origin: "mcp-secret-origin".into(),
+            changed_entry: Some(entry),
+            disposition: None,
+        };
+        let redacted = redact_update_with_secrets(update, &["ctl-token-abc123".into()]);
+        match redacted {
+            SessionUpdate::PromptQueueChanged {
+                entries,
+                changed_entry,
+                action,
+                origin,
+                ..
+            } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].id, changed_entry.as_ref().unwrap().id);
+                assert!(!entries[0].text.contains("ctl-token-abc123"));
+                assert!(!entries[0]
+                    .owner
+                    .as_deref()
+                    .unwrap()
+                    .contains("ctl-token-abc123"));
+                assert_eq!(action, "queued");
+                assert_eq!(origin, "mcp-secret-origin");
+            }
+            _ => panic!("wrong variant"),
         }
     }
 

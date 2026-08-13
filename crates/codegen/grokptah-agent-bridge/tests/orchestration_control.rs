@@ -151,6 +151,124 @@ async fn idempotency_conflict_and_replay() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn mcp_queue_controls_are_scoped_versioned_and_replay_safe() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    let first = orch
+        .queue_prompt(
+            &auth,
+            "queue-seed-1",
+            session.id,
+            ws.path(),
+            "first queued prompt".into(),
+            false,
+        )
+        .await
+        .unwrap();
+    let first_entry = first["entries"][0].clone();
+    let first_id = first_entry["id"].as_str().unwrap();
+    let first_version = first_entry["version"].as_u64().unwrap();
+    let mut events = host.event_bus().subscribe();
+
+    let edited = orch
+        .edit_queue(
+            &auth,
+            "queue-edit-1",
+            session.id,
+            ws.path(),
+            first_id,
+            first_version,
+            "edited queued prompt".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edited["actionId"], "queue-edit-1");
+    assert_eq!(edited["origin"], "mcp");
+    assert_eq!(edited["entry"]["version"], 1);
+
+    let replay = orch
+        .edit_queue(
+            &auth,
+            "queue-edit-1",
+            session.id,
+            ws.path(),
+            first_id,
+            first_version,
+            "edited queued prompt".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, edited);
+    assert_eq!(host.session_queue_list(session.id).unwrap().len(), 1);
+
+    let stale = orch
+        .edit_queue(
+            &auth,
+            "queue-edit-stale",
+            session.id,
+            ws.path(),
+            first_id,
+            first_version,
+            "must not apply".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code.as_str(), "stale_version");
+    assert_eq!(
+        host.session_queue_list(session.id).unwrap()[0].text,
+        "edited queued prompt"
+    );
+
+    let event = events.try_recv().expect("queue mutation event");
+    match event {
+        SessionUpdate::PromptQueueChanged {
+            action,
+            origin,
+            changed_entry: Some(entry),
+            ..
+        } => {
+            assert_eq!(action, "edited");
+            assert_eq!(origin, "mcp");
+            assert_eq!(entry.text, "edited queued prompt");
+        }
+        other => panic!("unexpected queue event: {other:?}"),
+    }
+
+    let listed = orch.get_queue(&auth, session.id, ws.path()).unwrap();
+    assert_eq!(listed["entries"].as_array().unwrap().len(), 1);
+    let steered = orch
+        .steer_queued(
+            &auth,
+            "queue-steer-1",
+            session.id,
+            ws.path(),
+            first_id,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(steered["action"], "steer_now");
+    assert_eq!(steered["disposition"], "queued");
+    assert_eq!(steered["entry"]["source"], "steering_deferred");
+    assert_eq!(host.session_queue_list(session.id).unwrap().len(), 1);
+
+    let outside = tempdir().unwrap();
+    let denied = orch
+        .get_queue(&auth, session.id, outside.path())
+        .unwrap_err();
+    assert_eq!(denied.code.as_str(), "workspace_mismatch");
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn workspace_mismatch_fail_closed() {
     let (home, _lock) = setup_home();
     let host = started_host();

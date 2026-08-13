@@ -204,7 +204,14 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_approve_run` | mutate | exact run/session/workspace, source and final fingerprints, exact `changed_files`; optional bounded `ttl_ms` |
 | `ptah_promote_run` | mutate | `request_id`, exact run/session/workspace, `approval_id` |
 | `ptah_discard_run` | mutate | `request_id`, exact run/session/workspace |
+| `ptah_get_queue` | read | `session_id`, `workspace` |
 | `ptah_queue_prompt` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `priority` |
+| `ptah_edit_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `version`, `text` |
+| `ptah_remove_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`; optional `expected_version` |
+| `ptah_reorder_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `to_index`; optional `expected_version` |
+| `ptah_clear_queue` | mutate | `request_id`, `session_id`, `workspace` |
+| `ptah_run_next` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`; optional `expected_version` |
+| `ptah_steer_queued` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`; optional `expected_version` |
 | `ptah_steer` | mutate | `request_id`, `session_id`, `workspace`, `text` |
 | `ptah_cancel` | mutate | `request_id`, `session_id`, `workspace`, `run_id` |
 
@@ -262,8 +269,31 @@ Mutating tools take `request_id`:
 
 ### Queue
 
+- `ptah_get_queue` returns the authenticated session's durable queued entries;
+  it never returns another session's queue or a queue outside the workspace
+  allowlist.
 - `ptah_queue_prompt` enqueues follow-ups; durable across host restart when the
-  host session store reloads from the same GrokPtah home.
+  host session store reloads from the same GrokPtah home. Its receipt includes
+  `actionId`, `origin`, `action`, `disposition`, `actionVersion`, `entry`, and
+  the complete post-action `entries` snapshot.
+- `ptah_edit_queue` requires the current entry `version`; a stale version is a
+  conflict and does not change the entry. `ptah_remove_queue`,
+  `ptah_reorder_queue`, `ptah_run_next`, and `ptah_steer_queued` accept an
+  optional `expected_version` for the same compare-and-set behavior.
+- `ptah_reorder_queue` changes ordering without changing entry versions.
+  `ptah_run_next` promotes an entry and may explicitly cancel an active turn;
+  it is distinct from `ptah_steer`, which never cancels. `ptah_steer_queued`
+  turns one queued entry into a safe-boundary steering action: it reports
+  `pending` during a Build turn and `queued` while idle.
+- `ptah_clear_queue` removes all durable queued entries for the scoped session.
+- Every queue mutation is idempotent by `request_id`, and all mutation
+  receipts use the same action identity/origin/snapshot shape so a coordinator
+  can reconcile retries without guessing whether an action committed.
+- Queue changes are also emitted as redacted `prompt_queue_changed` session
+  events with the post-action snapshot. Delivery, deferral, and desktop
+  composer consumption are journaled as state transitions, allowing a GUI or
+  coordinator that reconnects to recover the same queue view without replaying
+  a prompt.
 - Priority flag moves to front; combine rules live in host `prompt_queue`.
 
 ### Bounded task admission
