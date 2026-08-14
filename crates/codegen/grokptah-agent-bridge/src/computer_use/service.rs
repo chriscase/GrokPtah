@@ -104,9 +104,7 @@ impl ComputerUseService {
             stored_runs: runs.len() as u32,
             active_runs: runs.iter().filter(|run| !run.state.is_terminal()).count() as u32,
             session_runs: session_runs.clone().count() as u32,
-            session_active_runs: session_runs
-                .filter(|run| !run.state.is_terminal())
-                .count() as u32,
+            session_active_runs: session_runs.filter(|run| !run.state.is_terminal()).count() as u32,
         })
     }
 
@@ -1724,19 +1722,63 @@ mod tests {
         let projection = service
             .project_owned_run(owner, &run.run_id, Utc::now())
             .unwrap();
-        let encoded = serde_json::to_string(&projection).unwrap();
-        for element in &observation.elements {
-            assert!(
-                !encoded.contains(&element.element_id),
-                "element ids are observation-scoped capabilities and must not be projected"
-            );
-            if let Some(label) = &element.label {
-                assert!(!encoded.contains(label.as_str()));
-            }
-            if let Some(value) = &element.value {
-                assert!(!encoded.contains(value.as_str()));
+        let encoded = serde_json::to_value(&projection).unwrap();
+
+        // Compare against string *values* only. A raw substring scan over the
+        // whole document also matches JSON keys, so a short label such as
+        // "Name" would false-positive against the `displayName` key.
+        fn string_values(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(text) => out.push(text.clone()),
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|item| string_values(item, out))
+                }
+                serde_json::Value::Object(map) => {
+                    map.values().for_each(|item| string_values(item, out))
+                }
+                _ => {}
             }
         }
+        let mut values = Vec::new();
+        string_values(&encoded, &mut values);
+
+        for element in &observation.elements {
+            for projected in &values {
+                assert!(
+                    !projected.contains(&element.element_id),
+                    "element ids are observation-scoped capabilities and must not be projected"
+                );
+                if let Some(label) = &element.label {
+                    assert_ne!(projected, label, "observed labels must not be projected");
+                }
+                if let Some(value) = &element.value {
+                    assert_ne!(projected, value, "observed values must not be projected");
+                }
+            }
+        }
+
+        // Pin the exact observation key set so a future field addition cannot
+        // quietly widen what a coordinator observes.
+        let observation_keys: BTreeSet<&str> = encoded["observation"]
+            .as_object()
+            .expect("observation is projected")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            observation_keys,
+            BTreeSet::from([
+                "observationId",
+                "sequence",
+                "capturedAt",
+                "elementCount",
+                "elementsTruncated",
+                "sensitivity",
+                "hasScreenshot",
+                "screenshotRedacted",
+                "stale",
+            ])
+        );
         assert_eq!(
             projection.observation.as_ref().unwrap().element_count,
             observation.elements.len() as u32
@@ -1782,7 +1824,10 @@ mod tests {
         assert!(recovered.terminal);
         assert!(!recovered.agent_active);
         assert!(recovered.control_epoch > 0);
-        assert!(recovered.grant.is_none(), "authority must not survive restart");
+        assert!(
+            recovered.grant.is_none(),
+            "authority must not survive restart"
+        );
         assert!(recovered.observation.is_none());
 
         // Durable events survive the restart and stay replayable from the start.
