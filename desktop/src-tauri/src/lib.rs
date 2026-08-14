@@ -66,6 +66,7 @@ pub fn run() {
             commands::computer_use_observe_once,
             commands::computer_use_cockpit_snapshot,
             commands::computer_use_cockpit_start_simulator,
+            commands::computer_use_cockpit_start_native,
             commands::computer_use_cockpit_refresh,
             commands::computer_use_cockpit_stage_action,
             commands::computer_use_cockpit_approve,

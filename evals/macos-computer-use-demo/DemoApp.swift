@@ -2,6 +2,9 @@ import AppKit
 
 final class DemoDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
+    private var normalField: NSTextField!
+    private var priority: NSPopUpButton!
+    private var status: NSTextField!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let frame = NSRect(x: 0, y: 0, width: 720, height: 520)
@@ -18,19 +21,33 @@ final class DemoDelegate: NSObject, NSApplicationDelegate {
         content.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = content
 
-        let heading = NSTextField(labelWithString: "Read-only observation fixture")
+        let heading = NSTextField(labelWithString: "Semantic action fixture")
         heading.font = .systemFont(ofSize: 22, weight: .semibold)
 
         let normalLabel = NSTextField(labelWithString: "Project label")
-        let normalField = NSTextField(string: "public-demo-value")
+        normalField = NSTextField(string: "public-demo-value")
         normalField.placeholderString = "Visible demo text"
+        normalField.setAccessibilityLabel("Project label")
 
         let secureLabel = NSTextField(labelWithString: "Demo password")
         let secureField = NSSecureTextField(string: "fixture-secret-never-export")
         secureField.placeholderString = "Secure demo text"
 
-        let action = NSButton(title: "Fixture action", target: nil, action: nil)
+        priority = NSPopUpButton()
+        priority.addItems(withTitles: ["Low", "Normal", "High"])
+        priority.selectItem(withTitle: "Normal")
+        priority.setAccessibilityLabel("Priority")
+
+        let action = NSButton(
+            title: "Submit fixture",
+            target: self,
+            action: #selector(submitFixture)
+        )
         action.bezelStyle = .rounded
+        action.setAccessibilityLabel("Submit fixture")
+
+        status = NSTextField(labelWithString: "Not submitted")
+        status.setAccessibilityLabel("Fixture status")
 
         let longText = (1...40).map { "Accessible demo row \($0)" }.joined(separator: "\n")
         let textView = NSTextView()
@@ -43,7 +60,8 @@ final class DemoDelegate: NSObject, NSApplicationDelegate {
         scroll.borderType = .bezelBorder
 
         let stack = NSStackView(views: [
-            heading, normalLabel, normalField, secureLabel, secureField, action, scroll,
+            heading, normalLabel, normalField, secureLabel, secureField, priority, action, status,
+            scroll,
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -64,6 +82,12 @@ final class DemoDelegate: NSObject, NSApplicationDelegate {
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func submitFixture() {
+        let label = normalField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bounded = String(label.prefix(128))
+        status.stringValue = "Submitted \(bounded) at \(priority.titleOfSelectedItem ?? "Normal")"
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

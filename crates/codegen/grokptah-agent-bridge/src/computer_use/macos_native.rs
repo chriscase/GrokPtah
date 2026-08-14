@@ -5,19 +5,20 @@ use std::time::{Duration as StdDuration, Instant};
 use async_trait::async_trait;
 use chrono::Utc;
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::macos_observation::{
-    MacNativeIdentity, MacObservationSource, RawMacObservation, RawMacSemanticAction,
-    RawMacSemanticNode, RawMacTarget,
+    MacNativeIdentity, MacObservationSource, RawMacActionRequest, RawMacObservation,
+    RawMacSemanticAction, RawMacSemanticNode, RawMacTarget,
 };
 use super::platform::{ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus};
 use super::types::{
-    ComputerError, ComputerErrorCode, ComputerResult, ComputerUseLimits, ObservationGeometry,
-    Sensitivity,
+    ActionOutcome, ComputerAction, ComputerError, ComputerErrorCode, ComputerResult,
+    ComputerUseLimits, ObservationGeometry, Sensitivity,
 };
 
 const PERMISSION_PROMPT_GRACE: StdDuration = StdDuration::from_secs(60);
+const MAX_NATIVE_ACTION_REQUEST_BYTES: usize = 64 * 1024;
 
 #[repr(C)]
 struct NativeResult {
@@ -46,6 +47,7 @@ unsafe extern "C" {
         max_dimension: u32,
         max_png_bytes: u64,
     ) -> NativeResult;
+    fn gpt_macos_act(request_bytes: *const u8, request_len: usize) -> NativeResult;
     fn gpt_macos_result_free(result: *mut NativeResult);
 }
 
@@ -222,6 +224,26 @@ impl MacObservationSource for NativeMacObservationSource {
         .await
         .map_err(join_error)?
     }
+
+    async fn act(
+        &self,
+        identity: &MacNativeIdentity,
+        request: &RawMacActionRequest,
+    ) -> ComputerResult<ActionOutcome> {
+        let encoded = encode_action_request(identity, request)?;
+        tokio::task::spawn_blocking(move || {
+            let native = unsafe { gpt_macos_act(encoded.as_ptr(), encoded.len()) };
+            let output = copy_native_result(native)?;
+            serde_json::from_slice(&output.json).map_err(|_| {
+                ComputerError::new(
+                    ComputerErrorCode::BackendFailure,
+                    "macOS action outcome was malformed",
+                )
+            })
+        })
+        .await
+        .map_err(join_error)?
+    }
 }
 
 struct OwnedNativeResult {
@@ -262,6 +284,8 @@ fn native_error_code(status: i32) -> ComputerErrorCode {
         4 => ComputerErrorCode::TargetChanged,
         5 => ComputerErrorCode::SensitiveSurface,
         6 => ComputerErrorCode::LimitReached,
+        8 => ComputerErrorCode::InvalidRequest,
+        9 => ComputerErrorCode::ForbiddenAction,
         _ => ComputerErrorCode::BackendFailure,
     }
 }
@@ -374,6 +398,125 @@ struct NativeNode {
     actions: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeActionEnvelope<'a> {
+    window_id: u32,
+    process_id: i32,
+    bundle_id: &'a str,
+    expected_frame: ObservationGeometry,
+    element_index: Option<usize>,
+    expected_element: Option<NativeExpectedElement<'a>>,
+    action: NativeActionPayload<'a>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeExpectedElement<'a> {
+    role: &'a str,
+    subrole: Option<&'a str>,
+    label: Option<&'a str>,
+    value: Option<&'a str>,
+    frame: Option<ObservationGeometry>,
+    enabled: bool,
+    sensitivity: Sensitivity,
+    required_action: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeActionPayload<'a> {
+    kind: &'static str,
+    text: Option<&'a str>,
+    delta_x: Option<i32>,
+    delta_y: Option<i32>,
+}
+
+fn encode_action_request(
+    identity: &MacNativeIdentity,
+    request: &RawMacActionRequest,
+) -> ComputerResult<Vec<u8>> {
+    identity.validate()?;
+    request.target_frame.validate()?;
+    let (kind, text, delta_x, delta_y, required_action) = match &request.action {
+        ComputerAction::ActivateTarget => ("activate", None, None, None, None),
+        ComputerAction::Invoke { .. } => ("invoke", None, None, None, Some("invoke")),
+        ComputerAction::SetValue { text, .. } => (
+            "set_value",
+            Some(text.as_str()),
+            None,
+            None,
+            Some("set_value"),
+        ),
+        ComputerAction::Select { .. } => ("select", None, None, None, Some("select")),
+        ComputerAction::Scroll {
+            delta_x, delta_y, ..
+        } => (
+            "scroll",
+            None,
+            Some(*delta_x),
+            Some(*delta_y),
+            Some("scroll"),
+        ),
+        ComputerAction::KeyChord { .. }
+        | ComputerAction::PointerClick { .. }
+        | ComputerAction::Wait { .. } => {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "native macOS dispatch accepts semantic Accessibility actions only",
+            ))
+        }
+    };
+    let expected_element = match (&request.expected_element, required_action) {
+        (Some(element), Some(required_action)) => Some(NativeExpectedElement {
+            role: &element.role,
+            subrole: element.subrole.as_deref(),
+            label: element.label.as_deref(),
+            value: element.value.as_deref(),
+            frame: element.frame,
+            enabled: element.enabled,
+            sensitivity: element.sensitivity,
+            required_action,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "native macOS action element binding is incomplete",
+            ))
+        }
+    };
+    if expected_element.is_some() != request.element_index.is_some() {
+        return Err(ComputerError::new(
+            ComputerErrorCode::InvalidRequest,
+            "native macOS action element index does not match its attestation",
+        ));
+    }
+    let envelope = NativeActionEnvelope {
+        window_id: identity.window_id,
+        process_id: identity.process_id,
+        bundle_id: &identity.bundle_id,
+        expected_frame: request.target_frame,
+        element_index: request.element_index,
+        expected_element,
+        action: NativeActionPayload {
+            kind,
+            text,
+            delta_x,
+            delta_y,
+        },
+    };
+    let encoded = serde_json::to_vec(&envelope)
+        .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
+    if encoded.len() > MAX_NATIVE_ACTION_REQUEST_BYTES {
+        return Err(ComputerError::new(
+            ComputerErrorCode::LimitReached,
+            "native macOS action request exceeds its hard byte limit",
+        ));
+    }
+    Ok(encoded)
+}
+
 impl TryFrom<NativeNode> for RawMacSemanticNode {
     type Error = ComputerError;
 
@@ -440,20 +583,26 @@ mod tests {
     }
 
     #[test]
-    fn read_only_native_shim_has_no_input_emission_api() {
+    fn native_shim_exposes_semantic_accessibility_without_raw_input() {
         let shim = include_str!("macos_native_shim.m");
         for forbidden in [
             "CGEventCreate",
             "CGEventPost",
             "CGWarpMouseCursorPosition",
-            "AXUIElementPerformAction",
-            "AXUIElementSetAttributeValue",
+            "CGAssociateMouseAndMouseCursorPosition",
+            "NSPasteboard",
+            "NSAppleScript",
+            "kCGKeyboardEventKeycode",
         ] {
             assert!(
                 !shim.contains(forbidden),
                 "native shim contains {forbidden}"
             );
         }
+        assert!(shim.contains("gpt_macos_act"));
+        assert!(shim.contains("AXUIElementPerformAction"));
+        assert!(shim.contains("AXUIElementSetAttributeValue"));
+        assert!(shim.contains("GPTTargetIsFocused"));
         assert!(shim.contains("visited.count >= maxNodes"));
         assert!(shim.contains("childrenError != kAXErrorNoValue"));
     }

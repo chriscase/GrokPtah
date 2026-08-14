@@ -15,6 +15,14 @@ const target = {
   sensitivity: "none",
 };
 
+const nativeTarget = {
+  appId: "com.chriscase.grokptah.computer-use-demo",
+  windowId: "macos-window-42",
+  generation: 7,
+  displayName: "GrokPtah Computer Use Demo",
+  sensitivity: "none",
+};
+
 function observedRun(
   sequence: number,
   name = "",
@@ -100,6 +108,70 @@ function observedRun(
   };
 }
 
+function nativeObservedRun(sequence: number, name = "public-demo-value", submittedValue = false): ComputerRun {
+  const observationId = `native-observation-${sequence}`;
+  return {
+    ...observedRun(sequence, name, submittedValue),
+    target: nativeTarget,
+    currentObservation: {
+      observationId,
+      sequence,
+      capturedAt: new Date().toISOString(),
+      target: nativeTarget,
+      elements: [
+        {
+          elementId: `${observationId}-element-3`,
+          role: "AXTextField",
+          label: "Project label",
+          value: name,
+          enabled: true,
+          focused: false,
+          sensitivity: "none",
+          actions: ["set_value"],
+        },
+        {
+          elementId: `${observationId}-element-7`,
+          role: "AXPopUpButton",
+          label: "Priority",
+          value: "Normal",
+          enabled: true,
+          focused: false,
+          sensitivity: "none",
+          actions: ["select"],
+        },
+        {
+          elementId: `${observationId}-element-8`,
+          role: "AXButton",
+          label: "Submit fixture",
+          enabled: true,
+          focused: false,
+          sensitivity: "none",
+          actions: ["invoke"],
+        },
+        {
+          elementId: `${observationId}-element-9`,
+          role: "AXStaticText",
+          label: submittedValue ? `Submitted ${name} at Normal` : "Not submitted",
+          enabled: true,
+          focused: false,
+          sensitivity: "none",
+          actions: [],
+        },
+        {
+          elementId: `${observationId}-element-12`,
+          role: "AXScrollArea",
+          label: "Accessible demo rows",
+          enabled: true,
+          focused: false,
+          sensitivity: "none",
+          actions: ["scroll"],
+        },
+      ],
+      elementsTruncated: false,
+    },
+  };
+}
+
 const backend = {
   backendId: "deterministic_simulator",
   observe: true,
@@ -107,6 +179,11 @@ const backend = {
   textEntry: true,
   keyChords: false,
   pointerFallback: false,
+};
+
+const nativeBackend = {
+  ...backend,
+  backendId: "macos_accessibility_semantic",
 };
 
 let current: ComputerCockpitSnapshot = {
@@ -135,7 +212,16 @@ function pausedAfter(action: ComputerAction): ComputerRun {
     ? { ...run.grant, usesRemaining: 0, revokedAt: new Date().toISOString() }
     : null;
   run.lastOutcome = {
-    summary: action.type === "set_value" ? "set demo name" : "submitted demo form",
+    summary:
+      action.type === "set_value"
+        ? "set visible demo text"
+        : action.type === "activate_target"
+          ? "activated the authorized application"
+          : action.type === "invoke"
+            ? "invoked the selected element"
+            : action.type === "select"
+              ? "selected the chosen value"
+              : "scrolled the selected element into view",
     expectedPostconditionMet: true,
   };
   run.audit = [
@@ -152,7 +238,33 @@ function pausedAfter(action: ComputerAction): ComputerRun {
 }
 
 api.computerUseCockpitSnapshot = async () => structuredClone(current);
-api.computerUseCockpitStartSimulator = async () => setRun(observedRun(1));
+api.computerUseStatus = async () => ({
+  platformId: "macos",
+  available: true,
+  minimumOsVersion: "13.0",
+  screenRecording: "granted",
+  accessibility: "granted",
+  detail: null,
+});
+api.computerUseRequestPermission = async () => "granted";
+api.computerUseListTargets = async () => [
+  {
+    selectionToken: "story-native-selection",
+    target: nativeTarget,
+    geometry: { x: 180, y: 120, width: 720, height: 520, scaleFactor: 2 },
+    onScreen: true,
+    active: true,
+    minimized: false,
+  },
+];
+api.computerUseCockpitStartSimulator = async () => {
+  current = { ...current, backend };
+  return setRun(observedRun(1));
+};
+api.computerUseCockpitStartNative = async () => {
+  current = { ...current, backend: nativeBackend };
+  return setRun(nativeObservedRun(1));
+};
 api.computerUseCockpitStageAction = async (
   _sessionId,
   runId,
@@ -168,11 +280,20 @@ api.computerUseCockpitStageAction = async (
       runId,
       runVersion: expectedVersion,
       observationId,
-      targetLabel: target.displayName,
+      targetLabel: current.run?.target.displayName ?? target.displayName,
       action,
       actionSummary:
-        action.type === "set_value" ? "Enter visible text in Name" : "Invoke Submit",
-      risk: action.type === "set_value" ? "Text entry" : "Semantic action",
+        action.type === "set_value"
+          ? "Enter visible text in Project label"
+          : action.type === "activate_target"
+            ? "Bring the authorized application to the foreground"
+            : `Stage ${action.type.replaceAll("_", " ")}`,
+      risk:
+        action.type === "set_value"
+          ? "Text entry"
+          : action.type === "activate_target"
+            ? "Application focus"
+            : "Semantic action",
       createdAt: new Date().toISOString(),
     },
   };
@@ -185,7 +306,11 @@ api.computerUseCockpitDiscardApproval = async () => {
   return structuredClone(current);
 };
 api.computerUseCockpitRefresh = async () =>
-  setRun(observedRun((current.run?.actionCount ?? 0) + 1, currentName, submitted));
+  setRun(
+    current.run?.target.appId === nativeTarget.appId
+      ? nativeObservedRun((current.run?.actionCount ?? 0) + 1, currentName || "public-demo-value", submitted)
+      : observedRun((current.run?.actionCount ?? 0) + 1, currentName, submitted),
+  );
 api.computerUseCockpitPause = async () => {
   const run = structuredClone(current.run!);
   run.state = "paused";

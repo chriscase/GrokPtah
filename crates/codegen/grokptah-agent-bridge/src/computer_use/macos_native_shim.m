@@ -30,6 +30,8 @@ enum {
     GPT_MAC_SENSITIVE = 5,
     GPT_MAC_LIMIT_REACHED = 6,
     GPT_MAC_BACKEND_FAILURE = 7,
+    GPT_MAC_INVALID_REQUEST = 8,
+    GPT_MAC_FORBIDDEN_ACTION = 9,
 };
 
 static const NSUInteger GPT_MAX_AX_DEPTH = 32;
@@ -660,6 +662,424 @@ static BOOL GPTFrameMatches(CGRect first, CGRect second) {
            fabs(first.origin.y - second.origin.y) <= 2.0 &&
            fabs(first.size.width - second.size.width) <= 2.0 &&
            fabs(first.size.height - second.size.height) <= 2.0;
+}
+
+static BOOL GPTReadFrame(NSDictionary *dictionary, CGRect *frame) {
+    if (![dictionary isKindOfClass:[NSDictionary class]]) {
+        return NO;
+    }
+    NSNumber *x = dictionary[@"x"];
+    NSNumber *y = dictionary[@"y"];
+    NSNumber *width = dictionary[@"width"];
+    NSNumber *height = dictionary[@"height"];
+    if (![x isKindOfClass:[NSNumber class]] || ![y isKindOfClass:[NSNumber class]] ||
+        ![width isKindOfClass:[NSNumber class]] || ![height isKindOfClass:[NSNumber class]]) {
+        return NO;
+    }
+    CGRect decoded = CGRectMake(x.doubleValue, y.doubleValue, width.doubleValue, height.doubleValue);
+    if (!isfinite(decoded.origin.x) || !isfinite(decoded.origin.y) ||
+        !isfinite(decoded.size.width) || !isfinite(decoded.size.height) ||
+        decoded.size.width <= 0.0 || decoded.size.height <= 0.0) {
+        return NO;
+    }
+    *frame = decoded;
+    return YES;
+}
+
+static BOOL GPTNullableStringsEqual(id expected, NSString *actual) {
+    if (expected == nil || expected == [NSNull null]) {
+        return actual == nil || actual.length == 0;
+    }
+    return [expected isKindOfClass:[NSString class]] && [actual isEqualToString:expected];
+}
+
+static BOOL GPTStringContainsNull(NSString *value) {
+    unichar nullCharacter = 0;
+    NSString *nullString = [NSString stringWithCharacters:&nullCharacter length:1];
+    return [value rangeOfString:nullString].location != NSNotFound;
+}
+
+static BOOL GPTTargetIsFocused(pid_t processID, NSString *bundleID, AXUIElementRef window) {
+    NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+    if (frontmost == nil || frontmost.processIdentifier != processID ||
+        ![frontmost.bundleIdentifier isEqualToString:bundleID]) {
+        return NO;
+    }
+    AXUIElementRef application = AXUIElementCreateApplication(processID);
+    if (application == NULL) {
+        return NO;
+    }
+    CFTypeRef focusedValue = NULL;
+    AXError focusedError = AXUIElementCopyAttributeValue(
+        application, kAXFocusedWindowAttribute, &focusedValue);
+    CFRelease(application);
+    BOOL matches = focusedError == kAXErrorSuccess && focusedValue != NULL &&
+                   CFGetTypeID(focusedValue) == AXUIElementGetTypeID() &&
+                   CFEqual(focusedValue, window);
+    if (focusedValue != NULL) {
+        CFRelease(focusedValue);
+    }
+    return matches;
+}
+
+static AXUIElementRef GPTCopyAXElementAtIndexRecursive(
+    AXUIElementRef element,
+    NSUInteger depth,
+    NSUInteger targetIndex,
+    NSUInteger *nextIndex,
+    NSMutableSet<NSValue *> *visited,
+    BOOL *truncated) {
+    if (depth > GPT_MAX_AX_DEPTH || visited.count >= 10000) {
+        *truncated = YES;
+        return NULL;
+    }
+    NSValue *identity = [NSValue valueWithPointer:(const void *)element];
+    if ([visited containsObject:identity]) {
+        return NULL;
+    }
+    [visited addObject:identity];
+
+    NSString *role = GPTCopyAXString(element, kAXRoleAttribute);
+    if (role.length > 0) {
+        if (*nextIndex == targetIndex) {
+            CFRetain(element);
+            return element;
+        }
+        *nextIndex += 1;
+    }
+
+    CFTypeRef childrenValue = NULL;
+    AXError childrenError =
+        AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, &childrenValue);
+    AXUIElementRef found = NULL;
+    if (childrenError == kAXErrorSuccess && childrenValue != NULL &&
+        CFGetTypeID(childrenValue) == CFArrayGetTypeID()) {
+        CFArrayRef children = (CFArrayRef)childrenValue;
+        for (CFIndex index = 0; index < CFArrayGetCount(children) && found == NULL; index++) {
+            found = GPTCopyAXElementAtIndexRecursive(
+                (AXUIElementRef)CFArrayGetValueAtIndex(children, index),
+                depth + 1,
+                targetIndex,
+                nextIndex,
+                visited,
+                truncated);
+        }
+    } else if ((childrenError != kAXErrorNoValue &&
+                childrenError != kAXErrorAttributeUnsupported) ||
+               childrenError == kAXErrorSuccess) {
+        *truncated = YES;
+    }
+    if (childrenValue != NULL) {
+        CFRelease(childrenValue);
+    }
+    return found;
+}
+
+static AXUIElementRef GPTCopyAXElementAtIndex(
+    AXUIElementRef window,
+    NSUInteger targetIndex,
+    BOOL *truncated) {
+    NSUInteger nextIndex = 0;
+    NSMutableSet<NSValue *> *visited = [NSMutableSet set];
+    return GPTCopyAXElementAtIndexRecursive(
+        window, 0, targetIndex, &nextIndex, visited, truncated);
+}
+
+static BOOL GPTElementMatchesAttestation(
+    AXUIElementRef element,
+    NSDictionary *expected,
+    NSString *requiredAction) {
+    NSString *role = GPTCopyAXString(element, kAXRoleAttribute);
+    NSString *subrole = GPTCopyAXString(element, kAXSubroleAttribute);
+    NSString *label = GPTAXLabel(element);
+    NSString *value = GPTCopyAXScalarDescription(element, kAXValueAttribute);
+    NSString *expectedRole = expected[@"role"];
+    NSString *expectedSensitivity = expected[@"sensitivity"];
+    NSNumber *expectedEnabled = expected[@"enabled"];
+    if (![expectedRole isKindOfClass:[NSString class]] ||
+        ![expectedSensitivity isEqualToString:@"none"] ||
+        ![expectedEnabled isKindOfClass:[NSNumber class]] || !expectedEnabled.boolValue ||
+        ![role isEqualToString:expectedRole] ||
+        !GPTNullableStringsEqual(expected[@"subrole"], subrole) ||
+        !GPTNullableStringsEqual(expected[@"label"], label) ||
+        !GPTNullableStringsEqual(expected[@"value"], value)) {
+        return NO;
+    }
+    BOOL secure = [role localizedCaseInsensitiveContainsString:@"secure"] ||
+                  [subrole localizedCaseInsensitiveContainsString:@"secure"];
+    NSNumber *enabled = GPTCopyAXBool(element, kAXEnabledAttribute);
+    if (secure || (enabled != nil && !enabled.boolValue)) {
+        return NO;
+    }
+    id expectedFrameValue = expected[@"frame"];
+    CGRect currentFrame = CGRectZero;
+    if (expectedFrameValue == nil || expectedFrameValue == [NSNull null]) {
+        if (GPTCopyAXFrame(element, &currentFrame)) {
+            return NO;
+        }
+    } else {
+        CGRect expectedFrame = CGRectZero;
+        if (!GPTReadFrame(expectedFrameValue, &expectedFrame) ||
+            !GPTCopyAXFrame(element, &currentFrame) ||
+            !GPTFrameMatches(expectedFrame, currentFrame)) {
+            return NO;
+        }
+    }
+    return [GPTAXActions(element, role) containsObject:requiredAction];
+}
+
+static AXError GPTPerformNamedAction(AXUIElementRef element, CFStringRef preferred) {
+    CFArrayRef actionNames = NULL;
+    AXError listError = AXUIElementCopyActionNames(element, &actionNames);
+    if (listError != kAXErrorSuccess || actionNames == NULL) {
+        if (actionNames != NULL) {
+            CFRelease(actionNames);
+        }
+        return listError == kAXErrorSuccess ? kAXErrorActionUnsupported : listError;
+    }
+    NSArray *actions = (__bridge NSArray *)actionNames;
+    CFStringRef selected = NULL;
+    if ([actions containsObject:(__bridge NSString *)preferred]) {
+        selected = preferred;
+    } else if ([actions containsObject:(__bridge NSString *)kAXPressAction]) {
+        selected = kAXPressAction;
+    } else if ([actions containsObject:(__bridge NSString *)kAXConfirmAction]) {
+        selected = kAXConfirmAction;
+    } else if ([actions containsObject:(__bridge NSString *)kAXShowMenuAction]) {
+        selected = kAXShowMenuAction;
+    }
+    AXError result = selected == NULL ? kAXErrorActionUnsupported
+                                      : AXUIElementPerformAction(element, selected);
+    CFRelease(actionNames);
+    return result;
+}
+
+static GPTMacNativeResult GPTActionResult(NSString *summary, id postcondition) {
+    return GPTJSONResult(
+        @{
+            @"summary" : summary,
+            @"expectedPostconditionMet" : postcondition ?: [NSNull null],
+        },
+        nil);
+}
+
+GPTMacNativeResult gpt_macos_act(const uint8_t *requestBytes, size_t requestLength) {
+    @autoreleasepool {
+        if (requestBytes == NULL || requestLength == 0 || requestLength > 64 * 1024) {
+            return GPTErrorResult(GPT_MAC_INVALID_REQUEST, @"invalid macOS action request size");
+        }
+        if (!gpt_macos_observation_supported()) {
+            return GPTErrorResult(GPT_MAC_UNSUPPORTED, @"macOS 14 or later is required");
+        }
+        if (!CGPreflightScreenCaptureAccess() || !AXIsProcessTrusted()) {
+            return GPTErrorResult(
+                GPT_MAC_PERMISSION_REQUIRED,
+                @"Screen Recording and Accessibility permissions are required");
+        }
+        NSData *requestData = [NSData dataWithBytes:requestBytes length:requestLength];
+        NSError *jsonError = nil;
+        id decoded = [NSJSONSerialization JSONObjectWithData:requestData options:0 error:&jsonError];
+        if (![decoded isKindOfClass:[NSDictionary class]]) {
+            return GPTErrorResult(GPT_MAC_INVALID_REQUEST, @"malformed macOS action request");
+        }
+        NSDictionary *request = decoded;
+        NSNumber *windowNumber = request[@"windowId"];
+        NSNumber *processNumber = request[@"processId"];
+        NSString *bundleID = request[@"bundleId"];
+        NSDictionary *action = request[@"action"];
+        NSString *kind = [action isKindOfClass:[NSDictionary class]] ? action[@"kind"] : nil;
+        CGRect expectedFrame = CGRectZero;
+        if (![windowNumber isKindOfClass:[NSNumber class]] || windowNumber.unsignedIntValue == 0 ||
+            ![processNumber isKindOfClass:[NSNumber class]] || processNumber.intValue <= 0 ||
+            ![bundleID isKindOfClass:[NSString class]] || bundleID.length == 0 ||
+            bundleID.length > 256 || GPTDeniedBundle(bundleID) ||
+            ![action isKindOfClass:[NSDictionary class]] ||
+            ![kind isKindOfClass:[NSString class]] ||
+            !GPTReadFrame(request[@"expectedFrame"], &expectedFrame)) {
+            return GPTErrorResult(GPT_MAC_INVALID_REQUEST, @"invalid macOS action binding");
+        }
+        NSSet<NSString *> *allowedKinds = [NSSet setWithArray:@[
+            @"activate", @"invoke", @"set_value", @"select", @"scroll",
+        ]];
+        if (![allowedKinds containsObject:kind]) {
+            return GPTErrorResult(GPT_MAC_FORBIDDEN_ACTION, @"unsupported macOS semantic action");
+        }
+
+        if (@available(macOS 14.0, *)) {
+            pid_t processID = processNumber.intValue;
+            uint32_t windowID = windowNumber.unsignedIntValue;
+            SCShareableContent *content = GPTShareableContent();
+            SCWindow *window = GPTFindWindow(content, windowID, processID, bundleID);
+            if (window == nil) {
+                return GPTErrorResult(GPT_MAC_TARGET_CLOSED, @"selected macOS window closed");
+            }
+            if (!window.isOnScreen && !window.isActive) {
+                return GPTErrorResult(
+                    GPT_MAC_TARGET_CLOSED, @"selected macOS window is minimized or hidden");
+            }
+            if (!GPTFrameMatches(expectedFrame, window.frame)) {
+                return GPTErrorResult(
+                    GPT_MAC_TARGET_CHANGED, @"selected macOS window geometry changed");
+            }
+            AXUIElementRef axWindow = GPTCopyMatchingAXWindow(processID, window.frame);
+            if (axWindow == NULL) {
+                return GPTErrorResult(
+                    GPT_MAC_TARGET_CHANGED,
+                    @"selected macOS window has no exact Accessibility match");
+            }
+
+            if ([kind isEqualToString:@"activate"]) {
+                if (request[@"elementIndex"] != [NSNull null] ||
+                    request[@"expectedElement"] != [NSNull null]) {
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_INVALID_REQUEST, @"activation must not carry an element");
+                }
+                NSRunningApplication *application =
+                    [NSRunningApplication runningApplicationWithProcessIdentifier:processID];
+                BOOL requested = application != nil &&
+                    [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+                BOOL focused = NO;
+                for (NSUInteger attempt = 0; requested && attempt < 40; attempt++) {
+                    if (GPTTargetIsFocused(processID, bundleID, axWindow)) {
+                        focused = YES;
+                        break;
+                    }
+                    [NSThread sleepForTimeInterval:0.025];
+                }
+                CFRelease(axWindow);
+                return focused
+                    ? GPTActionResult(@"Activated the authorized macOS target", @YES)
+                    : GPTErrorResult(
+                          GPT_MAC_TARGET_CHANGED,
+                          @"authorized macOS target did not become focused");
+            }
+
+            NSNumber *elementIndex = request[@"elementIndex"];
+            NSDictionary *expectedElement = request[@"expectedElement"];
+            NSString *requiredAction = [expectedElement isKindOfClass:[NSDictionary class]]
+                ? expectedElement[@"requiredAction"]
+                : nil;
+            if (![elementIndex isKindOfClass:[NSNumber class]] ||
+                elementIndex.unsignedIntegerValue >= 10000 ||
+                ![expectedElement isKindOfClass:[NSDictionary class]] ||
+                ![requiredAction isKindOfClass:[NSString class]] ||
+                ![requiredAction isEqualToString:kind] ||
+                !GPTTargetIsFocused(processID, bundleID, axWindow)) {
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_TARGET_CHANGED,
+                    @"authorized macOS target lost exact focus before dispatch");
+            }
+            BOOL traversalTruncated = NO;
+            AXUIElementRef element = GPTCopyAXElementAtIndex(
+                axWindow, elementIndex.unsignedIntegerValue, &traversalTruncated);
+            if (element == NULL || traversalTruncated ||
+                !GPTElementMatchesAttestation(element, expectedElement, requiredAction)) {
+                if (element != NULL) {
+                    CFRelease(element);
+                }
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_TARGET_CHANGED,
+                    @"macOS element changed since the approved observation");
+            }
+            if (!GPTTargetIsFocused(processID, bundleID, axWindow)) {
+                CFRelease(element);
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_TARGET_CHANGED,
+                    @"authorized macOS target lost focus at dispatch boundary");
+            }
+
+            AXError actionError = kAXErrorActionUnsupported;
+            id postcondition = [NSNull null];
+            NSString *summary = @"Completed a semantic macOS action";
+            if ([kind isEqualToString:@"set_value"]) {
+                NSString *text = action[@"text"];
+                if (![text isKindOfClass:[NSString class]] ||
+                    [text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 4096 ||
+                    GPTStringContainsNull(text)) {
+                    CFRelease(element);
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_INVALID_REQUEST, @"invalid macOS text entry payload");
+                }
+                Boolean settable = false;
+                AXError settableError = AXUIElementIsAttributeSettable(
+                    element, kAXValueAttribute, &settable);
+                actionError = settableError == kAXErrorSuccess && settable
+                    ? AXUIElementSetAttributeValue(
+                          element, kAXValueAttribute, (__bridge CFTypeRef)text)
+                    : kAXErrorAttributeUnsupported;
+                NSString *updated = actionError == kAXErrorSuccess
+                    ? GPTCopyAXScalarDescription(element, kAXValueAttribute)
+                    : nil;
+                postcondition = @(actionError == kAXErrorSuccess &&
+                                  [updated isEqualToString:text]);
+                summary = @"Set visible text on the authorized macOS element";
+            } else if ([kind isEqualToString:@"invoke"]) {
+                actionError = GPTPerformNamedAction(element, kAXPressAction);
+                summary = @"Invoked the authorized macOS element";
+            } else if ([kind isEqualToString:@"select"]) {
+                Boolean selectedSettable = false;
+                AXError selectedError = AXUIElementIsAttributeSettable(
+                    element, kAXSelectedAttribute, &selectedSettable);
+                if (selectedError == kAXErrorSuccess && selectedSettable) {
+                    actionError = AXUIElementSetAttributeValue(
+                        element, kAXSelectedAttribute, kCFBooleanTrue);
+                    NSNumber *selected = actionError == kAXErrorSuccess
+                        ? GPTCopyAXBool(element, kAXSelectedAttribute)
+                        : nil;
+                    postcondition = @(selected.boolValue);
+                } else {
+                    actionError = GPTPerformNamedAction(element, kAXPressAction);
+                }
+                summary = @"Selected the authorized macOS element";
+            } else if ([kind isEqualToString:@"scroll"]) {
+                NSNumber *deltaX = action[@"deltaX"];
+                NSNumber *deltaY = action[@"deltaY"];
+                if (![deltaX isKindOfClass:[NSNumber class]] ||
+                    ![deltaY isKindOfClass:[NSNumber class]] ||
+                    (deltaX.intValue == 0 && deltaY.intValue == 0) ||
+                    llabs(deltaX.longLongValue) > 10000 ||
+                    llabs(deltaY.longLongValue) > 10000) {
+                    CFRelease(element);
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_INVALID_REQUEST, @"invalid semantic scroll request");
+                }
+                actionError = AXUIElementPerformAction(element, CFSTR("AXScrollToVisible"));
+                summary = @"Scrolled the authorized macOS element into view";
+            }
+
+            CFRelease(element);
+            if (actionError != kAXErrorSuccess) {
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_BACKEND_FAILURE, @"macOS rejected the semantic action");
+            }
+            if ([postcondition isKindOfClass:[NSNumber class]] &&
+                ![postcondition boolValue]) {
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_BACKEND_FAILURE,
+                    @"macOS action postcondition could not be verified");
+            }
+            BOOL focusPreserved = GPTTargetIsFocused(processID, bundleID, axWindow);
+            CFRelease(axWindow);
+            SCWindow *afterWindow = GPTFindWindow(
+                GPTShareableContent(), windowID, processID, bundleID);
+            if (!focusPreserved || afterWindow == nil ||
+                !GPTFrameMatches(expectedFrame, afterWindow.frame)) {
+                return GPTErrorResult(
+                    GPT_MAC_TARGET_CHANGED,
+                    @"authorized macOS target changed after action dispatch");
+            }
+            return GPTActionResult(summary, postcondition);
+        }
+        return GPTErrorResult(GPT_MAC_UNSUPPORTED, @"macOS 14 or later is required");
+    }
 }
 
 GPTMacNativeResult gpt_macos_observe(

@@ -1,8 +1,9 @@
 # Computer Use
 
 Computer Use is tracked by epic [#267](https://github.com/chriscase/GrokPtah/issues/267).
-It is intentionally staged: the first slice is a platform-neutral safety kernel and simulator,
-not a model tool and not native desktop automation.
+It is intentionally staged. The safety kernel, simulator, desktop operator cockpit, native macOS
+observation, and the first semantic macOS action slice share one bounded run contract. Computer
+Use is still locally operated and is not yet exposed as a model tool or MCP mutation surface.
 
 ## Safety boundary
 
@@ -54,21 +55,24 @@ observation, allowed action class, and run budget all agree. It does not yet sol
 screen redaction, prompt-injection interpretation, or platform-specific target attestation; those
 remain release blockers in later issues.
 
-## macOS read-only slice (#269)
+## macOS observation and semantic action slices (#269, #270)
 
-The first native slice uses a runtime-loaded ScreenCaptureKit shim plus Accessibility semantic
-snapshots behind the same platform-neutral backend. Settings exposes non-prompting status, explicit
-per-permission requests, bounded window discovery, and one-shot read-only previews. It does not
-register a model action or MCP tool. See [Computer Use on macOS](COMPUTER_USE_MACOS.md) for the
-privacy boundary, packaging requirements, and disposable smoke fixture.
+The native adapter uses a runtime-loaded ScreenCaptureKit shim plus Accessibility semantic
+snapshots behind the same platform-neutral backend. The Computer Run cockpit exposes
+non-prompting status, explicit per-permission requests, bounded window discovery, exact scope
+review, one-use approvals, evidence and audit visibility, pause, Stop, Take over, and
+non-cancelling steering. Native actions are limited to activation, Accessibility invoke, visible
+value entry, selection, and semantic scrolling. Every mutation requires a fresh observation and
+local one-use grant. It does not register a model action or MCP tool. See
+[Computer Use on macOS](COMPUTER_USE_MACOS.md) for the privacy boundary, dispatch attestation,
+packaging requirements, and disposable smoke fixture.
 
-## Deliberate non-goals of the foundation
+## Deliberate non-goals of the current desktop slice
 
-- no ScreenCaptureKit, Accessibility, Windows UI Automation, or Linux portal adapter;
-- no Tauri command or desktop UI;
+- no Windows UI Automation or Linux portal adapter;
 - no Build-agent tool or automatic model invocation;
 - no MCP Computer Run surface;
-- no raw arbitrary keyboard, pointer, or shell endpoint;
+- no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell endpoint;
 - no background or unattended grant;
 - no cross-application target switching inside a run.
 
