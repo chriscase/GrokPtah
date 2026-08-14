@@ -67,9 +67,10 @@ const PAUSED: ComputerActivityState = {
 
 const OPERATOR_TAKEOVER: ComputerActivityState = {
   id: "operator_takeover",
+  // Deliberately a summary: the dedicated takeover panel owns the full
+  // explanation, and repeating it here would show the same sentence twice.
   label: "You have taken over",
-  detail:
-    "You hold control. This run cannot be reauthorized after takeover — start a new Computer Run to hand control back.",
+  detail: "You hold control of this run. The agent cannot act on it again.",
   tone: "held",
   controllable: false,
   absorbing: true,

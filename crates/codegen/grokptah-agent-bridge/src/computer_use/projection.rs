@@ -283,7 +283,8 @@ pub(super) fn project_events(
     // A cursor is expired when it points strictly below the oldest retained
     // sequence. `after_seq == start_seq - 1` is exact continuity, not a gap.
     let cursor_expired = match (after_seq, range) {
-        (Some(after), Some(range)) => after + 1 < range.start_seq,
+        // `after_seq` is caller-supplied, so saturate rather than overflow.
+        (Some(after), Some(range)) => after.saturating_add(1) < range.start_seq,
         // With nothing retained there is nothing to prove continuity against,
         // so an unanchored cursor is treated as still valid and simply empty.
         _ => false,
