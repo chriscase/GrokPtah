@@ -76,9 +76,11 @@ pub use completion::{
 };
 pub use computer_use::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
-    ComputerCapabilities, ComputerError, ComputerErrorCode, ComputerObservation, ComputerPolicy,
-    ComputerRun, ComputerRunState, ComputerStore, ComputerTarget, ComputerUseLimits,
-    ComputerUseService, GrantIssuer, SimulatorBackend,
+    ComputerCapabilities, ComputerError, ComputerErrorCode, ComputerObservation,
+    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerPolicy, ComputerRun, ComputerRunState, ComputerStore,
+    ComputerTarget, ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
+    MacOsObservationPlatform, SimulatorBackend,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,

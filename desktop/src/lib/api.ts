@@ -2,6 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
   AuthState,
+  ComputerObservationPreview,
+  ComputerPermissionStatus,
+  ComputerPlatformStatus,
+  ComputerTargetCandidate,
   ModelInfo,
   SearchHit,
   SessionCompletionRecord,
@@ -25,6 +29,20 @@ export const api = {
   agentStart: () => invoke<void>("agent_start"),
   agentStop: () => invoke<void>("agent_stop"),
   agentStatus: () => invoke<AgentStatus>("agent_status"),
+  computerUseStatus: () =>
+    invoke<ComputerPlatformStatus>("computer_use_status"),
+  computerUseRequestPermission: (
+    permission: "screen_recording" | "accessibility",
+  ) =>
+    invoke<ComputerPermissionStatus>("computer_use_request_permission", {
+      permission,
+    }),
+  computerUseListTargets: () =>
+    invoke<ComputerTargetCandidate[]>("computer_use_list_targets"),
+  computerUseObserveOnce: (selectionToken: string) =>
+    invoke<ComputerObservationPreview>("computer_use_observe_once", {
+      selectionToken,
+    }),
   setProjectCwd: (path: string) => invoke<string>("set_project_cwd", { path }),
   pickProjectFolder: () => invoke<string | null>("pick_project_folder"),
   sessionNew: () => invoke<SessionSummary>("session_new"),

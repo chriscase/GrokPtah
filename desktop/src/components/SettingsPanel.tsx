@@ -1,6 +1,13 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
-import type { AuthState, ModelInfo } from "../lib/protocol";
+import type {
+  AuthState,
+  ComputerObservationPreview,
+  ComputerPermissionStatus,
+  ComputerPlatformStatus,
+  ComputerTargetCandidate,
+  ModelInfo,
+} from "../lib/protocol";
 import { StyledSelect } from "./StyledSelect";
 import { effortForModel, effortOptionsForModel } from "../lib/modelOptions";
 import {
@@ -65,8 +72,16 @@ export function SettingsPanel({
   const [gatewayKey, setGatewayKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [computerStatus, setComputerStatus] =
+    useState<ComputerPlatformStatus | null>(null);
+  const [computerTargets, setComputerTargets] = useState<
+    ComputerTargetCandidate[]
+  >([]);
+  const [computerPreview, setComputerPreview] =
+    useState<ComputerObservationPreview | null>(null);
+  const computerRequestEpoch = useRef(0);
   const [section, setSection] = useState<
-    "defaults" | "permissions" | "appearance" | "auth" | "about"
+    "defaults" | "permissions" | "computer" | "appearance" | "auth" | "about"
   >("defaults");
 
   const refresh = useCallback(async () => {
@@ -85,6 +100,22 @@ export function SettingsPanel({
     void refresh();
     setNotice(null);
   }, [open, refresh]);
+
+  const refreshComputerUse = useCallback(async () => {
+    setComputerStatus(await api.computerUseStatus());
+  }, []);
+
+  useEffect(() => {
+    if (!open || section !== "computer") return;
+    void refreshComputerUse().catch((error) => setNotice(String(error)));
+  }, [open, refreshComputerUse, section]);
+
+  useEffect(() => {
+    if (open && section === "computer") return;
+    computerRequestEpoch.current += 1;
+    setComputerTargets([]);
+    setComputerPreview(null);
+  }, [open, section]);
 
   useEffect(() => {
     if (!open) return;
@@ -107,6 +138,30 @@ export function SettingsPanel({
       if (okMsg) setNotice(okMsg);
     } catch (e) {
       setNotice(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyComputer<T>(
+    fn: (isCurrent: () => boolean) => Promise<T>,
+    okMsg?: string,
+  ) {
+    const requestEpoch = computerRequestEpoch.current;
+    const isCurrent = () => computerRequestEpoch.current === requestEpoch;
+    setBusy(true);
+    setNotice(null);
+    try {
+      const result = await fn(isCurrent);
+      if (!isCurrent()) return undefined;
+      const status = await api.computerUseStatus();
+      if (!isCurrent()) return undefined;
+      setComputerStatus(status);
+      if (okMsg) setNotice(okMsg);
+      return result;
+    } catch (error) {
+      if (isCurrent()) setNotice(String(error));
+      return undefined;
     } finally {
       setBusy(false);
     }
@@ -158,6 +213,7 @@ export function SettingsPanel({
               [
                 ["defaults", "Defaults"],
                 ["permissions", "Permissions"],
+                ["computer", "Computer Use"],
                 ["appearance", "Appearance"],
                 ["auth", "Auth"],
                 ["about", "About"],
@@ -393,6 +449,160 @@ export function SettingsPanel({
                     </button>
                   </div>
                 </div>
+              </section>
+            )}
+
+            {section === "computer" && (
+              <section className="settings-section computer-use-settings">
+                <h2>Computer Use</h2>
+                <p className="settings-lead">
+                  Read-only macOS observation. Captures require a fresh local
+                  window selection; keyboard and pointer control are disabled.
+                </p>
+
+                {computerStatus ? (
+                  <div className="computer-permission-list">
+                    {(
+                      [
+                        [
+                          "Screen Recording",
+                          "screen_recording",
+                          computerStatus.screenRecording,
+                        ],
+                        [
+                          "Accessibility",
+                          "accessibility",
+                          computerStatus.accessibility,
+                        ],
+                      ] as const
+                    ).map(([label, permission, status]) => (
+                      <div className="computer-permission-row" key={permission}>
+                        <div>
+                          <strong>{label}</strong>
+                          <span>{computerPermissionLabel(status)}</span>
+                        </div>
+                        {status !== "granted" && status !== "unsupported" && (
+                          <button
+                            type="button"
+                            disabled={busy || !computerStatus.available}
+                            onClick={() =>
+                              void applyComputer(async () => {
+                                setComputerTargets([]);
+                                setComputerPreview(null);
+                                await api.computerUseRequestPermission(
+                                  permission,
+                                );
+                              }, `${label} request opened`)
+                            }
+                          >
+                            Request
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="settings-hint">Checking availability...</div>
+                )}
+
+                {computerStatus?.detail && (
+                  <div className="settings-hint is-warning">
+                    {computerStatus.detail}
+                  </div>
+                )}
+
+                <div className="computer-use-actions">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void applyComputer(() => Promise.resolve())}
+                  >
+                    Refresh status
+                  </button>
+                  <button
+                    type="button"
+                    disabled={
+                      busy ||
+                      computerStatus?.screenRecording !== "granted" ||
+                      computerStatus?.accessibility !== "granted"
+                    }
+                    onClick={() =>
+                      void applyComputer(async (isCurrent) => {
+                        setComputerPreview(null);
+                        const targets = await api.computerUseListTargets();
+                        if (isCurrent()) setComputerTargets(targets);
+                      }, "Window list refreshed")
+                    }
+                  >
+                    Find windows
+                  </button>
+                </div>
+
+                {computerTargets.length > 0 && (
+                  <div
+                    className="computer-target-list"
+                    aria-label="Available windows"
+                  >
+                    {computerTargets.map((candidate, index) => (
+                      <div
+                        className="computer-target-row"
+                        key={candidate.selectionToken}
+                      >
+                        <div>
+                          <strong>{candidate.target.displayName}</strong>
+                          <span>
+                            Window {index + 1} ·{" "}
+                            {Math.round(candidate.geometry.width)} ×{" "}
+                            {Math.round(candidate.geometry.height)}
+                            {candidate.active ? " · active" : ""}
+                            {candidate.minimized ? " · minimized" : ""}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={
+                            busy || candidate.minimized || !candidate.onScreen
+                          }
+                          onClick={() =>
+                            void applyComputer(async (isCurrent) => {
+                              const preview = await api.computerUseObserveOnce(
+                                candidate.selectionToken,
+                              );
+                              if (isCurrent()) setComputerPreview(preview);
+                            }, "Read-only observation complete")
+                          }
+                        >
+                          Observe once
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {computerPreview && (
+                  <div className="computer-preview" aria-live="polite">
+                    <div className="computer-preview-meta">
+                      <strong>
+                        {computerPreview.observation.target.displayName}
+                      </strong>
+                      <span>
+                        {computerPreview.observation.elements.length} accessible
+                        elements
+                      </span>
+                    </div>
+                    {computerPreview.imageDataUrl ? (
+                      <img
+                        src={computerPreview.imageDataUrl}
+                        alt={`Redacted observation of ${computerPreview.observation.target.displayName}`}
+                      />
+                    ) : (
+                      <div className="computer-preview-withheld">
+                        Image withheld because privacy redaction could not be
+                        fully verified.
+                      </div>
+                    )}
+                  </div>
+                )}
               </section>
             )}
 
@@ -676,6 +886,25 @@ function AppearanceSection({
       </div>
     </section>
   );
+}
+
+function computerPermissionLabel(status: ComputerPermissionStatus): string {
+  switch (status) {
+    case "granted":
+      return "Granted";
+    case "prompt_pending":
+      return "Waiting for macOS";
+    case "revoked":
+      return "Revoked";
+    case "denied":
+      return "Denied";
+    case "restricted":
+      return "Restricted";
+    case "unsupported":
+      return "Unavailable";
+    default:
+      return "Not granted";
+  }
 }
 
 function SettingsGlyph() {

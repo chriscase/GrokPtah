@@ -1,6 +1,7 @@
 //! GrokPtah Tauri backend — thin adapters over grokptah-agent-bridge.
 
 mod commands;
+mod computer_use;
 mod event_forward;
 mod pty_host;
 
@@ -14,6 +15,7 @@ pub struct AppState {
     pub pty: pty_host::PtyHub,
     /// Loopback MCP control plane (#196); optional when token not configured.
     pub control: Mutex<Option<ControlServerHandle>>,
+    pub computer_use: computer_use::DesktopComputerUse,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -30,6 +32,7 @@ pub fn run() {
             host: host.clone(),
             pty: pty_host::PtyHub::new(),
             control: Mutex::new(None),
+            computer_use: computer_use::DesktopComputerUse::new(),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -57,6 +60,10 @@ pub fn run() {
             commands::agent_start,
             commands::agent_stop,
             commands::agent_status,
+            commands::computer_use_status,
+            commands::computer_use_request_permission,
+            commands::computer_use_list_targets,
+            commands::computer_use_observe_once,
             commands::set_project_cwd,
             commands::pick_project_folder,
             commands::session_new,

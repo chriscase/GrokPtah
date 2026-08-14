@@ -5,6 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 description = "In-process agent host for GrokPtah desktop (ACP-shaped sessions, streaming, permissions)"
 authors = ["GrokPtah"]
+build = "build.rs"
 
 # Own workspace root (excluded from monorepo root Cargo.toml).
 [workspace]
@@ -39,6 +40,9 @@ http-body-util = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "test-util"] }
