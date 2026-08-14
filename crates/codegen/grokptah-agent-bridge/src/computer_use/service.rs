@@ -346,6 +346,12 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidState,
+                        "operator takeover is absorbing; create a new computer run",
+                    ));
+                }
                 run.transition(ComputerRunState::Paused)?;
                 revoke_authority(run);
                 run.set_control_disposition(ComputerControlDisposition::Paused);
@@ -1087,6 +1093,18 @@ mod tests {
         );
         assert_eq!(persisted.state, ComputerRunState::Paused);
         assert!(persisted.control_epoch > run.control_epoch);
+
+        let error = service
+            .pause("pause-after-takeover", &run.run_id, taken_over.version)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::InvalidState);
+        let persisted = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            persisted.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
+        assert_eq!(persisted.version, taken_over.version);
     }
 
     #[tokio::test]
