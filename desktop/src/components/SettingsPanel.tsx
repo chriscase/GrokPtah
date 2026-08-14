@@ -7,6 +7,8 @@ import type {
   ComputerPlatformStatus,
   ComputerTargetCandidate,
   ModelInfo,
+  ProviderProfileSummary,
+  QualificationCheck,
 } from "../lib/protocol";
 import { StyledSelect } from "./StyledSelect";
 import { effortForModel, effortOptionsForModel } from "../lib/modelOptions";
@@ -50,6 +52,8 @@ type SettingsSnap = {
   gatewayProviderId?: string;
   gatewayBaseUrl?: string;
   gatewayApiKeySet?: boolean;
+  gatewayProfiles?: ProviderProfileSummary[];
+  gatewayMigrationPending?: boolean;
 };
 
 /**
@@ -68,7 +72,13 @@ export function SettingsPanel({
   const [snap, setSnap] = useState<SettingsSnap>({});
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [gatewayProvider, setGatewayProvider] = useState("");
+  const [gatewayLabel, setGatewayLabel] = useState("");
   const [gatewayBase, setGatewayBase] = useState("");
+  const [gatewayModel, setGatewayModel] = useState("");
+  const [gatewayDeadline, setGatewayDeadline] = useState<
+    "interactive" | "standard" | "extended"
+  >("standard");
+  const [gatewayEffort, setGatewayEffort] = useState("");
   const [gatewayKey, setGatewayKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -88,12 +98,34 @@ export function SettingsPanel({
     try {
       const s = (await api.settingsSnapshot()) as SettingsSnap;
       setSnap(s);
-      setGatewayProvider(String(s.gatewayProviderId ?? ""));
-      setGatewayBase(String(s.gatewayBaseUrl ?? ""));
+      const profiles = s.gatewayProfiles ?? [];
+      const providerId = String(
+        s.gatewayProviderId ?? profiles[0]?.id ?? "",
+      );
+      const profile = profiles.find((item) => item.id === providerId);
+      const activeModel = models.find(
+        (model) => model.id === s.model && model.provider_id === providerId,
+      );
+      setGatewayProvider(providerId);
+      setGatewayLabel(profile?.label ?? providerId);
+      setGatewayBase(profile?.baseUrl ?? String(s.gatewayBaseUrl ?? ""));
+      setGatewayModel(
+        activeModel?.wire_model_id ?? profile?.models[0]?.id ?? "",
+      );
+      setGatewayEffort(
+        profile?.models
+          .find(
+            (model) =>
+              model.id ===
+              (activeModel?.wire_model_id ?? profile?.models[0]?.id),
+          )
+          ?.effortOptions.join(", ") ?? "",
+      );
+      setGatewayDeadline(profile?.deadlineClass ?? "standard");
     } catch (e) {
       setNotice(String(e));
     }
-  }, []);
+  }, [models]);
 
   useEffect(() => {
     if (!open) return;
@@ -173,6 +205,98 @@ export function SettingsPanel({
       : (models[0]?.id ?? snap.model ?? "grok-build");
   const effortOptions = effortOptionsForModel(models, modelValue);
   const currentEffort = effortForModel(models, modelValue, snap.effort);
+  const gatewayProfiles = snap.gatewayProfiles ?? [];
+  const selectedGateway = gatewayProfiles.find(
+    (profile) => profile.id === gatewayProvider,
+  );
+
+  function selectGatewayProfile(providerId: string) {
+    if (providerId === "__new__") {
+      setGatewayProvider("");
+      setGatewayLabel("");
+      setGatewayBase("");
+      setGatewayModel("");
+      setGatewayEffort("");
+      setGatewayDeadline("standard");
+      setGatewayKey("");
+      return;
+    }
+    const profile = gatewayProfiles.find((item) => item.id === providerId);
+    setGatewayProvider(providerId);
+    setGatewayLabel(profile?.label ?? providerId);
+    setGatewayBase(profile?.baseUrl ?? "");
+    setGatewayModel(profile?.models[0]?.id ?? "");
+    setGatewayEffort(profile?.models[0]?.effortOptions.join(", ") ?? "");
+    setGatewayDeadline(profile?.deadlineClass ?? "standard");
+    setGatewayKey("");
+  }
+
+  async function saveGatewayProfile(discover: boolean) {
+    const providerId = gatewayProvider.trim();
+    const label = gatewayLabel.trim() || providerId;
+    const baseUrl = gatewayBase.trim();
+    const modelId = gatewayModel;
+    await apply(async () => {
+      await api.upsertProviderProfile(
+        providerId,
+        label,
+        baseUrl,
+        modelId,
+        gatewayDeadline,
+        gatewayEffort
+          .split(",")
+          .map((value) => value.trim().toLowerCase())
+          .filter(Boolean),
+        gatewayKey.trim() || null,
+      );
+      setGatewayKey("");
+      if (discover) await api.discoverProviderModels(providerId);
+    }, discover ? "Provider saved and models discovered" : "Provider saved");
+  }
+
+  async function qualifyGatewayModel() {
+    const providerId = gatewayProvider.trim();
+    const modelId = gatewayModel;
+    setBusy(true);
+    setNotice(null);
+    try {
+      await api.upsertProviderProfile(
+        providerId,
+        gatewayLabel.trim() || providerId,
+        gatewayBase.trim(),
+        modelId,
+        gatewayDeadline,
+        gatewayEffort
+          .split(",")
+          .map((value) => value.trim().toLowerCase())
+          .filter(Boolean),
+        gatewayKey.trim() || null,
+      );
+      setGatewayKey("");
+      const report = await api.qualifyProviderModel(providerId, modelId);
+      await refresh();
+      onChromeChange();
+      if (report.codingReady) {
+        setNotice("Qualified for chat and multi-round coding tools");
+      } else {
+        const checks: Array<[string, QualificationCheck]> = [
+          ["chat", report.basicGeneration],
+          ["native tools", report.nativeToolCall],
+          ["tool continuation", report.toolResultContinuation],
+          ["streaming", report.streaming],
+        ];
+        const failures = checks
+          .filter(([, check]) => check.status !== "pass")
+          .map(([label, check]) => `${label}: ${check.detail}`)
+          .join("; ");
+        setNotice(`Discussion only. ${failures}`);
+      }
+    } catch (error) {
+      setNotice(String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <div
@@ -693,25 +817,61 @@ export function SettingsPanel({
                   style={{ marginTop: "1.25rem" }}
                 >
                   <span className="settings-field-label">
-                    Corporate gateway (OpenAI-compatible) (#169)
+                    Model providers
                   </span>
                   <p className="settings-lead" style={{ marginTop: 0 }}>
-                    Optional base URL + Bearer for locked-down proxies. Does{" "}
-                    <strong>not</strong> replace xAI login when{" "}
-                    <code>XAI_API_KEY</code> or OIDC is present. Env vars
-                    override this file. Stored in{" "}
-                    <code>~/.grokptah/gateway.json</code>.
+                    Connect OpenAI-compatible gateways without changing xAI
+                    login. Each profile has its own key and exact model IDs;
+                    keys are stored in the OS keychain.
                   </p>
+
+                  {snap.gatewayMigrationPending && (
+                    <div className="settings-inline-warning" role="status">
+                      A legacy gateway key still needs migration. Save its
+                      profile with a replacement key before adding another.
+                    </div>
+                  )}
+
                   <label className="settings-field">
-                    <span className="settings-field-label">
-                      Provider id (optional)
-                    </span>
+                    <span className="settings-field-label">Provider profile</span>
+                    <StyledSelect
+                      disabled={busy}
+                      value={selectedGateway ? selectedGateway.id : "__new__"}
+                      options={[
+                        ...gatewayProfiles.map((profile) => ({
+                          value: profile.id,
+                          label: `${profile.label}${profile.managedByEnv ? " (environment)" : ""}`,
+                        })),
+                        { value: "__new__", label: "Add provider profile" },
+                      ]}
+                      onChange={selectGatewayProfile}
+                    />
+                  </label>
+
+                  <label className="settings-field">
+                    <span className="settings-field-label">Profile ID</span>
                     <input
                       data-testid="gateway-provider-id"
                       type="text"
-                      placeholder="corp"
+                      placeholder="company-gateway"
                       value={gatewayProvider}
+                      disabled={busy || Boolean(selectedGateway)}
                       onChange={(e) => setGatewayProvider(e.target.value)}
+                    />
+                    <span className="settings-hint">
+                      Stable local name; lowercase letters, numbers, dots,
+                      dashes, and underscores.
+                    </span>
+                  </label>
+                  <label className="settings-field">
+                    <span className="settings-field-label">Display name</span>
+                    <input
+                      data-testid="gateway-label"
+                      type="text"
+                      placeholder="Company AI gateway"
+                      value={gatewayLabel}
+                      disabled={busy || selectedGateway?.managedByEnv}
+                      onChange={(e) => setGatewayLabel(e.target.value)}
                     />
                   </label>
                   <label className="settings-field">
@@ -721,45 +881,188 @@ export function SettingsPanel({
                       type="url"
                       placeholder="https://gateway.example/v1"
                       value={gatewayBase}
+                      disabled={busy || selectedGateway?.managedByEnv}
                       onChange={(e) => setGatewayBase(e.target.value)}
                     />
                   </label>
                   <label className="settings-field">
+                    <span className="settings-field-label">Model ID</span>
+                    <input
+                      data-testid="gateway-model-id"
+                      type="text"
+                      placeholder="model-id-from-your-gateway"
+                      value={gatewayModel}
+                      disabled={busy || selectedGateway?.managedByEnv}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setGatewayModel(value);
+                        const model = selectedGateway?.models.find(
+                          (item) => item.id === value,
+                        );
+                        setGatewayEffort(model?.effortOptions.join(", ") ?? "");
+                      }}
+                    />
+                    <span className="settings-hint">
+                      Enter an exact ID, or save one ID and use Discover models.
+                    </span>
+                  </label>
+                  <label className="settings-field">
                     <span className="settings-field-label">
-                      Gateway API key
-                      {snap.gatewayApiKeySet ? " (saved)" : ""}
+                      Supported effort values (optional)
+                    </span>
+                    <input
+                      data-testid="gateway-effort-options"
+                      type="text"
+                      placeholder="low, medium, high"
+                      value={gatewayEffort}
+                      disabled={busy || selectedGateway?.managedByEnv}
+                      onChange={(event) => setGatewayEffort(event.target.value)}
+                    />
+                    <span className="settings-hint">
+                      Declare only values documented by this exact gateway and
+                      model. The default omits effort entirely.
+                    </span>
+                  </label>
+                  <label className="settings-field">
+                    <span className="settings-field-label">Request budget</span>
+                    <StyledSelect
+                      disabled={busy || selectedGateway?.managedByEnv}
+                      value={gatewayDeadline}
+                      options={[
+                        { value: "interactive", label: "Interactive" },
+                        { value: "standard", label: "Standard" },
+                        { value: "extended", label: "Extended" },
+                      ]}
+                      onChange={(value) =>
+                        setGatewayDeadline(
+                          value as "interactive" | "standard" | "extended",
+                        )
+                      }
+                    />
+                    <span className="settings-hint">
+                      Bounded timeout class for this gateway; slower local or
+                      queued models may need Extended.
+                    </span>
+                  </label>
+                  <label className="settings-field">
+                    <span className="settings-field-label">
+                      Provider API key
+                      {selectedGateway?.credentialSet ? " (saved)" : ""}
                     </span>
                     <input
                       data-testid="gateway-api-key"
                       type="password"
                       placeholder={
-                        snap.gatewayApiKeySet ? "•••• (leave blank to keep)" : "sk-…"
+                        selectedGateway?.credentialSet
+                          ? "Saved (leave blank to keep)"
+                          : "Provider key"
                       }
                       value={gatewayKey}
+                      disabled={busy || selectedGateway?.managedByEnv}
                       onChange={(e) => setGatewayKey(e.target.value)}
                       autoComplete="off"
                     />
                   </label>
-                  <div className="modal-actions" style={{ marginTop: "0.5rem" }}>
+
+                  {selectedGateway && selectedGateway.models.length > 0 && (
+                    <div className="settings-provider-models">
+                      {selectedGateway.models.map((model) => (
+                        <button
+                          key={model.id}
+                          type="button"
+                          className={gatewayModel === model.id ? "active" : ""}
+                          onClick={() => {
+                            setGatewayModel(model.id);
+                            setGatewayEffort(model.effortOptions.join(", "));
+                          }}
+                          disabled={busy}
+                        >
+                          <span>{model.displayName}</span>
+                          <small>
+                            {model.capabilitySource === "unknown"
+                              ? "Not qualified"
+                              : [
+                                  model.supportsTools ? "Tools" : "Chat",
+                                  model.supportsStream ? "Streaming" : null,
+                                  model.effortOptions.length > 0
+                                    ? `Effort: ${model.effortOptions.join(", ")}`
+                                    : null,
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ")}
+                          </small>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="modal-actions settings-provider-actions">
                     <button
                       type="button"
                       className="primary"
                       data-testid="gateway-save"
-                      disabled={busy}
-                      onClick={() =>
-                        void apply(async () => {
-                          await api.setGatewayConfig(
-                            gatewayProvider.trim(),
-                            gatewayBase.trim(),
-                            gatewayKey.trim() || null,
-                          );
-                          setGatewayKey("");
-                        }, "Gateway settings saved")
+                      disabled={
+                        busy ||
+                        selectedGateway?.managedByEnv ||
+                        !gatewayProvider.trim() ||
+                        !gatewayBase.trim() ||
+                        !gatewayModel.trim()
                       }
+                      onClick={() => void saveGatewayProfile(false)}
                     >
-                      Save gateway
+                      Save provider
                     </button>
+                    <button
+                      type="button"
+                      data-testid="gateway-discover"
+                      disabled={
+                        busy ||
+                        selectedGateway?.managedByEnv ||
+                        !gatewayProvider.trim() ||
+                        !gatewayBase.trim() ||
+                        !gatewayModel.trim()
+                      }
+                      onClick={() => void saveGatewayProfile(true)}
+                    >
+                      Discover models
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="gateway-qualify"
+                      disabled={
+                        busy ||
+                        selectedGateway?.managedByEnv ||
+                        !gatewayProvider.trim() ||
+                        !gatewayBase.trim() ||
+                        !gatewayModel.trim()
+                      }
+                      onClick={() => void qualifyGatewayModel()}
+                    >
+                      Qualify model
+                    </button>
+                    {selectedGateway && !selectedGateway.managedByEnv && (
+                      <button
+                        type="button"
+                        className="danger"
+                        data-testid="gateway-delete"
+                        disabled={busy}
+                        onClick={() =>
+                          void apply(
+                            () => api.deleteProviderProfile(selectedGateway.id),
+                            "Provider removed",
+                          )
+                        }
+                      >
+                        Remove
+                      </button>
+                    )}
                   </div>
+                  {selectedGateway?.managedByEnv && (
+                    <span className="settings-hint">
+                      This profile is managed by environment variables. Change
+                      those variables to edit or remove it.
+                    </span>
+                  )}
                 </div>
               </section>
             )}

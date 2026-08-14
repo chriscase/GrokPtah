@@ -31,12 +31,15 @@ mod process_tree;
 mod project_context;
 mod prompt_combine;
 mod prompt_queue;
+mod provider_discovery;
+mod provider_qualification;
 pub mod reliability_eval;
 mod run_promotion;
 mod search_engine;
 mod session;
 mod session_store;
 mod spawn_env;
+mod sse;
 mod ssrf;
 mod textutil;
 mod todo_list;
@@ -47,12 +50,21 @@ pub use agents_personas::{
     discover_agents, discover_personas, resolve_agent, resolve_persona, AgentDef, PersonaDef,
 };
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
-pub use gateway_config::{load as load_gateway_config, save as save_gateway_config, GatewayConfig};
+pub use gateway_config::{
+    load as load_gateway_config, model_selection_key, parse_model_selection,
+    save as save_gateway_config, CapabilitySource, GatewayConfig, ModelCapabilities,
+    ModelSelection, ProviderDeadlineClass, ProviderDialect, ProviderKind, ProviderModel,
+    ProviderProfile, ProviderProfileUpdate,
+};
 pub use isolation::prepare_isolation_cwd;
 pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};
 pub use prompt_queue::{
     PromptQueueBatch, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueTakeResult,
     SteeringDisposition, SteeringReceipt,
+};
+pub use provider_discovery::{discover_profile_models, parse_compatible_model_catalog};
+pub use provider_qualification::{
+    qualify_provider_model, ProviderQualificationReport, QualificationCheck, QualificationStatus,
 };
 pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
 

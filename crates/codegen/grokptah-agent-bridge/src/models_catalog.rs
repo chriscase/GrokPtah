@@ -118,6 +118,12 @@ pub fn load_catalog() -> Vec<CatalogModel> {
                 info: ModelInfo {
                     id: (*id).to_string(),
                     display_name: (*name).to_string(),
+                    provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
+                    provider_label: "xAI / Grok Build".into(),
+                    wire_model_id: (*id).to_string(),
+                    supports_tools: true,
+                    supports_stream: true,
+                    capability_source: "declared".into(),
                     supports_effort: *effort,
                     effort_options: effort_options(*effort, &[]),
                 },
@@ -233,6 +239,12 @@ fn read_models_cache() -> Option<Vec<CatalogModel>> {
             info: ModelInfo {
                 id: id.clone(),
                 display_name: display,
+                provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
+                provider_label: "xAI / Grok Build".into(),
+                wire_model_id: wire.clone(),
+                supports_tools: true,
+                supports_stream: true,
+                capability_source: "declared".into(),
                 supports_effort: entry.info.supports_reasoning_effort
                     || !entry.info.reasoning_efforts.is_empty(),
                 effort_options: effort_options(
@@ -274,6 +286,12 @@ mod tests {
                 info: ModelInfo {
                     id: "grok-2".into(),
                     display_name: "Grok 2".into(),
+                    provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
+                    provider_label: "xAI / Grok Build".into(),
+                    wire_model_id: "grok-2".into(),
+                    supports_tools: true,
+                    supports_stream: true,
+                    capability_source: "declared".into(),
                     supports_effort: false,
                     effort_options: vec![],
                 },
@@ -284,6 +302,12 @@ mod tests {
                 info: ModelInfo {
                     id: "grok-4.5".into(),
                     display_name: "Grok 4.5".into(),
+                    provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
+                    provider_label: "xAI / Grok Build".into(),
+                    wire_model_id: "grok-4.5".into(),
+                    supports_tools: true,
+                    supports_stream: true,
+                    capability_source: "declared".into(),
                     supports_effort: true,
                     effort_options: effort_options(true, &[]),
                 },

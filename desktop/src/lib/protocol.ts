@@ -378,8 +378,48 @@ export type TranscriptItem =
 export interface ModelInfo {
   id: string;
   display_name: string;
+  provider_id?: string;
+  provider_label?: string;
+  wire_model_id?: string;
+  supports_tools?: boolean;
+  supports_stream?: boolean;
+  capability_source?: "declared" | "measured" | "unknown" | string;
   supports_effort: boolean;
   effort_options?: string[];
+}
+
+export interface ProviderModelSummary {
+  id: string;
+  displayName: string;
+  supportsTools: boolean;
+  supportsStream: boolean;
+  effortOptions: string[];
+  capabilitySource: "declared" | "measured" | "unknown";
+}
+
+export interface ProviderProfileSummary {
+  id: string;
+  label: string;
+  baseUrl: string;
+  deadlineClass: "interactive" | "standard" | "extended";
+  credentialSet: boolean;
+  managedByEnv: boolean;
+  models: ProviderModelSummary[];
+}
+
+export interface QualificationCheck {
+  status: "pass" | "degraded" | "fail";
+  detail: string;
+}
+
+export interface ProviderQualificationReport {
+  providerId: string;
+  modelId: string;
+  basicGeneration: QualificationCheck;
+  nativeToolCall: QualificationCheck;
+  toolResultContinuation: QualificationCheck;
+  streaming: QualificationCheck;
+  codingReady: boolean;
 }
 
 export interface AuthState {
