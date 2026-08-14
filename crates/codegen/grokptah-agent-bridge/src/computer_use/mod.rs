@@ -14,6 +14,7 @@ mod macos_observation;
 mod platform;
 mod policy;
 mod projection;
+mod reads;
 mod service;
 mod simulator;
 mod store;
@@ -30,6 +31,16 @@ pub use projection::{
     ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection, ComputerTargetSummary,
     ObservationSummary, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
+pub use reads::ComputerRunReads;
+
+/// Canonical string form of a workspace path for the durable Computer Run
+/// binding. This is the same canonicalization the control plane applies to a
+/// caller-claimed workspace, so binding equality is an exact string compare.
+pub fn canonical_workspace_string(path: &std::path::Path) -> Option<String> {
+    crate::orchestration::canonical_workspace(path)
+        .ok()
+        .map(|canonical| canonical.display().to_string())
+}
 
 #[cfg(target_os = "macos")]
 mod macos_native;

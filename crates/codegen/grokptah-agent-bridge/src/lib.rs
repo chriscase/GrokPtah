@@ -90,14 +90,15 @@ pub use completion::{
 };
 pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
 pub use computer_use::{
-    project_run_at, ActionClass, ActionGrant, ActionGrantSummary, ActionOutcome, ComputerAction,
-    ComputerAuditEntry, ComputerBackend, ComputerCapabilities, ComputerControlDisposition,
-    ComputerError, ComputerErrorCode, ComputerObservation, ComputerObservationPlatform,
-    ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerPolicy,
-    ComputerRun, ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange,
-    ComputerRunProgress, ComputerRunProjection, ComputerRunState, ComputerStore, ComputerTarget,
-    ComputerTargetCandidate, ComputerTargetSummary, ComputerUseLimits, ComputerUseService,
-    GrantIssuer, MacOsObservationPlatform, ObservationSummary, SemanticAction, SimulatorBackend,
+    canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
+    ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend, ComputerCapabilities,
+    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
+    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerPolicy, ComputerRun, ComputerRunCapacity, ComputerRunEventPage,
+    ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection, ComputerRunReads,
+    ComputerRunState, ComputerStore, ComputerTarget, ComputerTargetCandidate,
+    ComputerTargetSummary, ComputerUseLimits, ComputerUseService, GrantIssuer,
+    MacOsObservationPlatform, ObservationSummary, SemanticAction, SimulatorBackend,
     DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
 pub use discover::{

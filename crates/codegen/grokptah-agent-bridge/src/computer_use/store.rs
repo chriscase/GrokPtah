@@ -10,8 +10,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::types::{
-    validate_id, ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerResult,
-    ComputerRun, ComputerRunState,
+    validate_id, validate_workspace, ComputerControlDisposition, ComputerError, ComputerErrorCode,
+    ComputerResult, ComputerRun, ComputerRunState,
 };
 
 const MAX_RECEIPTS: usize = 2_048;
@@ -280,6 +280,16 @@ impl ComputerStore {
                 ComputerErrorCode::Interrupted,
                 "computer run interrupted by process restart; explicit reauthorization required",
             ));
+            // The interruption must be visible in the durable journal itself,
+            // not only on the run record, so a coordinator replaying events
+            // sees why the run ended (#286).
+            run.record_audit(
+                "recover",
+                "interrupted",
+                None,
+                None,
+                Some(ComputerErrorCode::Interrupted),
+            );
             atomic_write_json(&path, &run).map_err(internal_error)?;
         }
         Ok(())
@@ -365,6 +375,7 @@ impl ComputerStore {
 
 fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
     validate_id("run_id", &run.run_id)?;
+    validate_workspace(run.workspace.as_deref())?;
     if let Some(parent_run_id) = &run.parent_run_id {
         validate_id("parent_run_id", parent_run_id)?;
     }
@@ -574,7 +585,8 @@ mod tests {
         {
             let store = ComputerStore::open(dir.path()).unwrap();
             let mut run =
-                ComputerRun::new(Uuid::new_v4(), target(), ComputerUseLimits::default()).unwrap();
+                ComputerRun::new(Uuid::new_v4(), None, target(), ComputerUseLimits::default())
+                    .unwrap();
             run_id = run.run_id.clone();
             let now = Utc::now();
             run.grant = Some(ActionGrant {
@@ -601,6 +613,10 @@ mod tests {
         assert!(recovered.control_epoch > 0);
         assert!(recovered.grant.is_none());
         assert!(recovered.current_observation.is_none());
+        let last = recovered.audit.last().expect("recovery is journaled");
+        assert_eq!(last.operation, "recover");
+        assert_eq!(last.disposition, "interrupted");
+        assert_eq!(last.error_code, Some(ComputerErrorCode::Interrupted));
     }
 
     #[test]
@@ -649,7 +665,8 @@ mod tests {
         {
             let store = ComputerStore::open(dir.path()).unwrap();
             let run =
-                ComputerRun::new(Uuid::new_v4(), target(), ComputerUseLimits::default()).unwrap();
+                ComputerRun::new(Uuid::new_v4(), None, target(), ComputerUseLimits::default())
+                    .unwrap();
             store.save_run(&run).unwrap();
             fs::rename(
                 store.run_path(&run.run_id).unwrap(),

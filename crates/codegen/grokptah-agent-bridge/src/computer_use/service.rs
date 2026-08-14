@@ -161,6 +161,7 @@ impl ComputerUseService {
         &self,
         request_id: &str,
         owner_session_id: Uuid,
+        workspace: Option<String>,
         target: ComputerTarget,
         limits: ComputerUseLimits,
     ) -> ComputerResult<ComputerRun> {
@@ -168,6 +169,7 @@ impl ComputerUseService {
         limits.validate()?;
         let payload = json!({
             "ownerSessionId": owner_session_id,
+            "workspace": workspace.as_deref(),
             "target": target,
             "limits": limits,
         });
@@ -176,7 +178,7 @@ impl ComputerUseService {
         }
         let result = (|| {
             self.store.can_create_run()?;
-            let mut run = ComputerRun::new(owner_session_id, target, limits)?;
+            let mut run = ComputerRun::new(owner_session_id, workspace, target, limits)?;
             run.record_audit("create_run", "accepted", None, None, None);
             self.store.save_run(&run)?;
             Ok(run)
@@ -951,6 +953,7 @@ mod tests {
             .create_run(
                 "create-1",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 ComputerUseLimits::default(),
             )
@@ -1025,6 +1028,7 @@ mod tests {
             .create_run(
                 "create-conflict",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1074,6 +1078,7 @@ mod tests {
             .create_run(
                 "create-pause",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1105,6 +1110,7 @@ mod tests {
             .create_run(
                 "create-takeover",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1135,6 +1141,7 @@ mod tests {
             .create_run(
                 "create-takeover-fence",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1189,6 +1196,7 @@ mod tests {
             .create_run(
                 "create-denied",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1274,6 +1282,7 @@ mod tests {
             .create_run(
                 "create-evidence-limit",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 limits,
             )
@@ -1309,6 +1318,7 @@ mod tests {
             .create_run(
                 "create-evidence-read",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1356,6 +1366,7 @@ mod tests {
             .create_run(
                 "create-duration-limit",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1392,6 +1403,7 @@ mod tests {
             .create_run(
                 "create-one-use",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1441,6 +1453,7 @@ mod tests {
             .create_run(
                 "create-race",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1506,6 +1519,7 @@ mod tests {
             .create_run(
                 "create-cancel-race",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1568,6 +1582,7 @@ mod tests {
             .create_run(
                 "create-scope",
                 owner,
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1624,6 +1639,7 @@ mod tests {
             .create_run(
                 "create-mine",
                 owner,
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1632,6 +1648,7 @@ mod tests {
             .create_run(
                 "create-theirs",
                 other,
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1665,6 +1682,7 @@ mod tests {
             .create_run(
                 "create-parity",
                 owner,
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1703,6 +1721,7 @@ mod tests {
             .create_run(
                 "create-redaction",
                 owner,
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1799,6 +1818,7 @@ mod tests {
                 .create_run(
                     "create-restart",
                     owner,
+                    None,
                     SimulatorBackend::demo_target(),
                     Default::default(),
                 )
