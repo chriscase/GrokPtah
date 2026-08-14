@@ -117,6 +117,9 @@ describe("Computer Use settings", () => {
     expect(mocks.requestPermission).not.toHaveBeenCalled();
     expect(mocks.listTargets).not.toHaveBeenCalled();
     expect(mocks.observeOnce).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/Codex Computer Use and Terminal grants do not grant GrokPtah access/),
+    ).toBeTruthy();
 
     fireEvent.click(screen.getAllByText("Request")[0]);
     await waitFor(() =>

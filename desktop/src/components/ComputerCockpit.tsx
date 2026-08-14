@@ -413,6 +413,13 @@ export function ComputerCockpit({
                   Refresh
                 </button>
               </div>
+              {platformStatus && !nativePermissionsReady && (
+                <p className="settings-hint is-warning">
+                  These grants apply to this GrokPtah installation. Codex Computer Use and Terminal
+                  grants do not grant GrokPtah access; enable both for GrokPtah in macOS Privacy &amp;
+                  Security, then restart GrokPtah and refresh.
+                </p>
+              )}
               <button
                 type="button"
                 disabled={busy || !nativePermissionsReady}

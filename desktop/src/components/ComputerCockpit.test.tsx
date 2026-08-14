@@ -257,6 +257,11 @@ describe("ComputerCockpit", () => {
     fireEvent.click(await screen.findByRole("button", { name: "macOS app" }));
     const findTargets = screen.getByRole("button", { name: "Find eligible windows" });
     expect(findTargets).toBeDisabled();
+    expect(
+      await screen.findByText(
+        /Codex Computer Use and Terminal grants do not grant GrokPtah access/,
+      ),
+    ).toBeTruthy();
     fireEvent.click(
       await screen.findByRole("button", {
         name: "Request Screen Recording permission",
