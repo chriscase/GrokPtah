@@ -191,14 +191,13 @@ impl ProviderProfile {
     }
 
     pub fn upsert_model(&mut self, mut model: ProviderModel) {
-        model.id = model.id.trim().to_string();
         model.display_name = model.display_name.trim().to_string();
         if model.display_name.is_empty() {
             model.display_name = model.id.clone();
         }
         if let Some(existing) = self.models.iter_mut().find(|item| item.id == model.id) {
             *existing = model;
-        } else if !model.id.is_empty() {
+        } else if !model.id.trim().is_empty() {
             self.models.push(model);
         }
         self.models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -300,8 +299,7 @@ impl GatewayConfig {
             profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
             let mut model_ids = BTreeSet::new();
             profile.models.retain_mut(|model| {
-                model.id = model.id.trim().to_string();
-                if model.id.is_empty() || !model_ids.insert(model.id.clone()) {
+                if model.id.trim().is_empty() || !model_ids.insert(model.id.clone()) {
                     return false;
                 }
                 model.display_name = model.display_name.trim().to_string();
@@ -728,6 +726,34 @@ mod tests {
             parse_model_selection(&opaque).unwrap().model_id,
             " Team/Code:Cheap "
         );
+    }
+
+    #[test]
+    fn opaque_model_ids_preserve_bytes_through_profile_persistence() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        fs::create_dir_all(&home).unwrap();
+        set_grokptah_home_override(Some(home));
+
+        let opaque_id = " Team/Code:Cheap/日本語 ";
+        let mut profile =
+            ProviderProfile::openai_compatible("corp", "Corporate", "https://gw.example/v1");
+        profile.upsert_model(ProviderModel::unqualified(opaque_id));
+        let mut config = GatewayConfig::default();
+        config.upsert_profile(profile).unwrap();
+        save(&config).unwrap();
+
+        let loaded = load_for_update().unwrap();
+        assert_eq!(loaded.profile("corp").unwrap().models[0].id, opaque_id);
+        assert_eq!(
+            parse_model_selection(&model_selection_key("corp", opaque_id))
+                .unwrap()
+                .model_id,
+            opaque_id
+        );
+
+        set_grokptah_home_override(None);
     }
 
     #[test]

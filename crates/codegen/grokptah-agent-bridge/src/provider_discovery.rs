@@ -175,7 +175,7 @@ pub fn parse_compatible_model_catalog(body: &[u8]) -> Result<Vec<ProviderModel>>
                     .or_else(|| item.get("name").and_then(serde_json::Value::as_str))
                     .or_else(|| item.get("model").and_then(serde_json::Value::as_str))
             });
-            let Some(id) = id.filter(|id| !id.is_empty()) else {
+            let Some(id) = id.filter(|id| !id.trim().is_empty()) else {
                 continue;
             };
             if seen.insert(id.to_string()) {
@@ -202,6 +202,13 @@ mod tests {
             assert_eq!(models.len(), 1);
             assert_eq!(models[0].id, "Team/Code:Cheap");
         }
+
+        let models = parse_compatible_model_catalog(
+            r#"{"data":[{"id":" Team/Code:Cheap/日本語 "},{"id":"   "}]}"#.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, " Team/Code:Cheap/日本語 ");
     }
 
     #[test]
