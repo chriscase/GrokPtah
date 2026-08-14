@@ -1,6 +1,7 @@
 //! GrokPtah Tauri backend — thin adapters over grokptah-agent-bridge.
 
 mod commands;
+mod computer_use;
 mod event_forward;
 mod pty_host;
 
@@ -14,6 +15,7 @@ pub struct AppState {
     pub pty: pty_host::PtyHub,
     /// Loopback MCP control plane (#196); optional when token not configured.
     pub control: Mutex<Option<ControlServerHandle>>,
+    pub computer_use: computer_use::DesktopComputerUse,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -30,6 +32,7 @@ pub fn run() {
             host: host.clone(),
             pty: pty_host::PtyHub::new(),
             control: Mutex::new(None),
+            computer_use: computer_use::DesktopComputerUse::new(),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -57,6 +60,24 @@ pub fn run() {
             commands::agent_start,
             commands::agent_stop,
             commands::agent_status,
+            commands::computer_use_status,
+            commands::computer_use_request_permission,
+            commands::computer_use_list_targets,
+            commands::computer_use_observe_once,
+            commands::computer_use_cockpit_snapshot,
+            commands::computer_use_cockpit_agent_eligibility,
+            commands::computer_use_cockpit_qualify_agent,
+            commands::computer_use_cockpit_propose_agent_action,
+            commands::computer_use_cockpit_cancel_agent,
+            commands::computer_use_cockpit_start_simulator,
+            commands::computer_use_cockpit_start_native,
+            commands::computer_use_cockpit_refresh,
+            commands::computer_use_cockpit_stage_action,
+            commands::computer_use_cockpit_approve,
+            commands::computer_use_cockpit_discard_approval,
+            commands::computer_use_cockpit_pause,
+            commands::computer_use_cockpit_take_over,
+            commands::computer_use_cockpit_stop,
             commands::set_project_cwd,
             commands::pick_project_folder,
             commands::session_new,
@@ -155,6 +176,10 @@ pub fn run() {
             commands::set_permission_mode,
             commands::set_allow_deny_rules,
             commands::set_gateway_config,
+            commands::upsert_provider_profile,
+            commands::discover_provider_models,
+            commands::qualify_provider_model,
+            commands::delete_provider_profile,
             commands::project_rules,
             commands::set_plan_mode,
             commands::accept_plan,

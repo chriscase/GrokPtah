@@ -1,6 +1,15 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
-import type { AuthState, ModelInfo } from "../lib/protocol";
+import type {
+  AuthState,
+  ComputerObservationPreview,
+  ComputerPermissionStatus,
+  ComputerPlatformStatus,
+  ComputerTargetCandidate,
+  ModelInfo,
+  ProviderProfileSummary,
+  QualificationCheck,
+} from "../lib/protocol";
 import { StyledSelect } from "./StyledSelect";
 import { effortForModel, effortOptionsForModel } from "../lib/modelOptions";
 import {
@@ -43,6 +52,8 @@ type SettingsSnap = {
   gatewayProviderId?: string;
   gatewayBaseUrl?: string;
   gatewayApiKeySet?: boolean;
+  gatewayProfiles?: ProviderProfileSummary[];
+  gatewayMigrationPending?: boolean;
 };
 
 /**
@@ -61,30 +72,82 @@ export function SettingsPanel({
   const [snap, setSnap] = useState<SettingsSnap>({});
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [gatewayProvider, setGatewayProvider] = useState("");
+  const [gatewayLabel, setGatewayLabel] = useState("");
   const [gatewayBase, setGatewayBase] = useState("");
+  const [gatewayModel, setGatewayModel] = useState("");
+  const [gatewayDeadline, setGatewayDeadline] = useState<
+    "interactive" | "standard" | "extended"
+  >("standard");
+  const [gatewayEffort, setGatewayEffort] = useState("");
   const [gatewayKey, setGatewayKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [computerStatus, setComputerStatus] =
+    useState<ComputerPlatformStatus | null>(null);
+  const [computerTargets, setComputerTargets] = useState<
+    ComputerTargetCandidate[]
+  >([]);
+  const [computerPreview, setComputerPreview] =
+    useState<ComputerObservationPreview | null>(null);
+  const computerRequestEpoch = useRef(0);
   const [section, setSection] = useState<
-    "defaults" | "permissions" | "appearance" | "auth" | "about"
+    "defaults" | "permissions" | "computer" | "appearance" | "auth" | "about"
   >("defaults");
 
   const refresh = useCallback(async () => {
     try {
       const s = (await api.settingsSnapshot()) as SettingsSnap;
       setSnap(s);
-      setGatewayProvider(String(s.gatewayProviderId ?? ""));
-      setGatewayBase(String(s.gatewayBaseUrl ?? ""));
+      const profiles = s.gatewayProfiles ?? [];
+      const providerId = String(
+        s.gatewayProviderId ?? profiles[0]?.id ?? "",
+      );
+      const profile = profiles.find((item) => item.id === providerId);
+      const activeModel = models.find(
+        (model) => model.id === s.model && model.provider_id === providerId,
+      );
+      setGatewayProvider(providerId);
+      setGatewayLabel(profile?.label ?? providerId);
+      setGatewayBase(profile?.baseUrl ?? String(s.gatewayBaseUrl ?? ""));
+      setGatewayModel(
+        activeModel?.wire_model_id ?? profile?.models[0]?.id ?? "",
+      );
+      setGatewayEffort(
+        profile?.models
+          .find(
+            (model) =>
+              model.id ===
+              (activeModel?.wire_model_id ?? profile?.models[0]?.id),
+          )
+          ?.effortOptions.join(", ") ?? "",
+      );
+      setGatewayDeadline(profile?.deadlineClass ?? "standard");
     } catch (e) {
       setNotice(String(e));
     }
-  }, []);
+  }, [models]);
 
   useEffect(() => {
     if (!open) return;
     void refresh();
     setNotice(null);
   }, [open, refresh]);
+
+  const refreshComputerUse = useCallback(async () => {
+    setComputerStatus(await api.computerUseStatus());
+  }, []);
+
+  useEffect(() => {
+    if (!open || section !== "computer") return;
+    void refreshComputerUse().catch((error) => setNotice(String(error)));
+  }, [open, refreshComputerUse, section]);
+
+  useEffect(() => {
+    if (open && section === "computer") return;
+    computerRequestEpoch.current += 1;
+    setComputerTargets([]);
+    setComputerPreview(null);
+  }, [open, section]);
 
   useEffect(() => {
     if (!open) return;
@@ -112,12 +175,134 @@ export function SettingsPanel({
     }
   }
 
+  async function applyComputer<T>(
+    fn: (isCurrent: () => boolean) => Promise<T>,
+    okMsg?: string,
+  ) {
+    const requestEpoch = computerRequestEpoch.current;
+    const isCurrent = () => computerRequestEpoch.current === requestEpoch;
+    setBusy(true);
+    setNotice(null);
+    try {
+      const result = await fn(isCurrent);
+      if (!isCurrent()) return undefined;
+      const status = await api.computerUseStatus();
+      if (!isCurrent()) return undefined;
+      setComputerStatus(status);
+      if (okMsg) setNotice(okMsg);
+      return result;
+    } catch (error) {
+      if (isCurrent()) setNotice(String(error));
+      return undefined;
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const modelValue =
     models.some((m) => m.id === snap.model)
       ? (snap.model ?? models[0]?.id ?? "grok-build")
       : (models[0]?.id ?? snap.model ?? "grok-build");
   const effortOptions = effortOptionsForModel(models, modelValue);
   const currentEffort = effortForModel(models, modelValue, snap.effort);
+  const gatewayProfiles = snap.gatewayProfiles ?? [];
+  const selectedGateway = gatewayProfiles.find(
+    (profile) => profile.id === gatewayProvider,
+  );
+
+  function selectGatewayProfile(providerId: string) {
+    if (providerId === "__new__") {
+      setGatewayProvider("");
+      setGatewayLabel("");
+      setGatewayBase("");
+      setGatewayModel("");
+      setGatewayEffort("");
+      setGatewayDeadline("standard");
+      setGatewayKey("");
+      return;
+    }
+    const profile = gatewayProfiles.find((item) => item.id === providerId);
+    setGatewayProvider(providerId);
+    setGatewayLabel(profile?.label ?? providerId);
+    setGatewayBase(profile?.baseUrl ?? "");
+    setGatewayModel(profile?.models[0]?.id ?? "");
+    setGatewayEffort(profile?.models[0]?.effortOptions.join(", ") ?? "");
+    setGatewayDeadline(profile?.deadlineClass ?? "standard");
+    setGatewayKey("");
+  }
+
+  async function saveGatewayProfile(discover: boolean) {
+    const providerId = gatewayProvider.trim();
+    const label = gatewayLabel.trim() || providerId;
+    const baseUrl = gatewayBase.trim();
+    const modelId = gatewayModel;
+    await apply(async () => {
+      await api.upsertProviderProfile(
+        providerId,
+        label,
+        baseUrl,
+        modelId,
+        gatewayDeadline,
+        gatewayEffort
+          .split(",")
+          .map((value) => value.trim().toLowerCase())
+          .filter(Boolean),
+        gatewayKey.trim() || null,
+      );
+      setGatewayKey("");
+      if (discover) await api.discoverProviderModels(providerId);
+    }, discover ? "Provider saved and models discovered" : "Provider saved");
+  }
+
+  async function qualifyGatewayModel() {
+    const providerId = gatewayProvider.trim();
+    const modelId = gatewayModel;
+    setBusy(true);
+    setNotice(null);
+    try {
+      await api.upsertProviderProfile(
+        providerId,
+        gatewayLabel.trim() || providerId,
+        gatewayBase.trim(),
+        modelId,
+        gatewayDeadline,
+        gatewayEffort
+          .split(",")
+          .map((value) => value.trim().toLowerCase())
+          .filter(Boolean),
+        gatewayKey.trim() || null,
+      );
+      setGatewayKey("");
+      const report = await api.qualifyProviderModel(providerId, modelId);
+      await refresh();
+      onChromeChange();
+      if (report.codingReady) {
+        setNotice(
+          report.computerUseTier === "semantic_act"
+            ? "Qualified for coding tools and semantic Computer Use"
+            : report.computerUseTier === "observe"
+              ? `Qualified for coding tools and Computer observation only. ${report.staleObservationRecovery.detail}`
+              : `Qualified for coding tools. Computer Use unavailable: ${report.semanticObservation.detail}`,
+        );
+      } else {
+        const checks: Array<[string, QualificationCheck]> = [
+          ["chat", report.basicGeneration],
+          ["native tools", report.nativeToolCall],
+          ["tool continuation", report.toolResultContinuation],
+          ["streaming", report.streaming],
+        ];
+        const failures = checks
+          .filter(([, check]) => check.status !== "pass")
+          .map(([label, check]) => `${label}: ${check.detail}`)
+          .join("; ");
+        setNotice(`Discussion only. ${failures}`);
+      }
+    } catch (error) {
+      setNotice(String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <div
@@ -158,6 +343,7 @@ export function SettingsPanel({
               [
                 ["defaults", "Defaults"],
                 ["permissions", "Permissions"],
+                ["computer", "Computer Use"],
                 ["appearance", "Appearance"],
                 ["auth", "Auth"],
                 ["about", "About"],
@@ -396,6 +582,170 @@ export function SettingsPanel({
               </section>
             )}
 
+            {section === "computer" && (
+              <section className="settings-section computer-use-settings">
+                <h2>Computer Use</h2>
+                <p className="settings-lead">
+                  Read-only macOS observation. Captures require a fresh local
+                  window selection; keyboard and pointer control are disabled.
+                </p>
+
+                {computerStatus ? (
+                  <div className="computer-permission-list">
+                    {(
+                      [
+                        [
+                          "Screen Recording",
+                          "screen_recording",
+                          computerStatus.screenRecording,
+                        ],
+                        [
+                          "Accessibility",
+                          "accessibility",
+                          computerStatus.accessibility,
+                        ],
+                      ] as const
+                    ).map(([label, permission, status]) => (
+                      <div className="computer-permission-row" key={permission}>
+                        <div>
+                          <strong>{label}</strong>
+                          <span>{computerPermissionLabel(status)}</span>
+                        </div>
+                        {status !== "granted" && status !== "unsupported" && (
+                          <button
+                            type="button"
+                            disabled={busy || !computerStatus.available}
+                            onClick={() =>
+                              void applyComputer(async () => {
+                                setComputerTargets([]);
+                                setComputerPreview(null);
+                                await api.computerUseRequestPermission(
+                                  permission,
+                                );
+                              }, `${label} request opened`)
+                            }
+                          >
+                            Request
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="settings-hint">Checking availability...</div>
+                )}
+
+                {computerStatus &&
+                  (computerStatus.screenRecording !== "granted" ||
+                    computerStatus.accessibility !== "granted") && (
+                    <p className="settings-hint is-warning">
+                      macOS grants are per application. Codex Computer Use and Terminal grants do not
+                      grant GrokPtah access; enable both for GrokPtah in Privacy &amp; Security, then
+                      restart GrokPtah and refresh.
+                    </p>
+                  )}
+
+                {computerStatus?.detail && (
+                  <div className="settings-hint is-warning">
+                    {computerStatus.detail}
+                  </div>
+                )}
+
+                <div className="computer-use-actions">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void applyComputer(() => Promise.resolve())}
+                  >
+                    Refresh status
+                  </button>
+                  <button
+                    type="button"
+                    disabled={
+                      busy ||
+                      computerStatus?.screenRecording !== "granted" ||
+                      computerStatus?.accessibility !== "granted"
+                    }
+                    onClick={() =>
+                      void applyComputer(async (isCurrent) => {
+                        setComputerPreview(null);
+                        const targets = await api.computerUseListTargets();
+                        if (isCurrent()) setComputerTargets(targets);
+                      }, "Window list refreshed")
+                    }
+                  >
+                    Find windows
+                  </button>
+                </div>
+
+                {computerTargets.length > 0 && (
+                  <div
+                    className="computer-target-list"
+                    aria-label="Available windows"
+                  >
+                    {computerTargets.map((candidate, index) => (
+                      <div
+                        className="computer-target-row"
+                        key={candidate.selectionToken}
+                      >
+                        <div>
+                          <strong>{candidate.target.displayName}</strong>
+                          <span>
+                            Window {index + 1} ·{" "}
+                            {Math.round(candidate.geometry.width)} ×{" "}
+                            {Math.round(candidate.geometry.height)}
+                            {candidate.active ? " · active" : ""}
+                            {candidate.minimized ? " · minimized" : ""}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={
+                            busy || candidate.minimized || !candidate.onScreen
+                          }
+                          onClick={() =>
+                            void applyComputer(async (isCurrent) => {
+                              const preview = await api.computerUseObserveOnce(
+                                candidate.selectionToken,
+                              );
+                              if (isCurrent()) setComputerPreview(preview);
+                            }, "Read-only observation complete")
+                          }
+                        >
+                          Observe once
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {computerPreview && (
+                  <div className="computer-preview" aria-live="polite">
+                    <div className="computer-preview-meta">
+                      <strong>
+                        {computerPreview.observation.target.displayName}
+                      </strong>
+                      <span>
+                        {computerPreview.observation.elements.length} accessible
+                        elements
+                      </span>
+                    </div>
+                    {computerPreview.imageDataUrl ? (
+                      <img
+                        src={computerPreview.imageDataUrl}
+                        alt={`Redacted observation of ${computerPreview.observation.target.displayName}`}
+                      />
+                    ) : (
+                      <div className="computer-preview-withheld">
+                        Image withheld because privacy redaction could not be
+                        fully verified.
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+            )}
+
             {section === "appearance" && (
               <AppearanceSection
                 busy={busy}
@@ -483,25 +833,61 @@ export function SettingsPanel({
                   style={{ marginTop: "1.25rem" }}
                 >
                   <span className="settings-field-label">
-                    Corporate gateway (OpenAI-compatible) (#169)
+                    Model providers
                   </span>
                   <p className="settings-lead" style={{ marginTop: 0 }}>
-                    Optional base URL + Bearer for locked-down proxies. Does{" "}
-                    <strong>not</strong> replace xAI login when{" "}
-                    <code>XAI_API_KEY</code> or OIDC is present. Env vars
-                    override this file. Stored in{" "}
-                    <code>~/.grokptah/gateway.json</code>.
+                    Connect OpenAI-compatible gateways without changing xAI
+                    login. Each profile has its own key and exact model IDs;
+                    keys are stored in the OS keychain.
                   </p>
+
+                  {snap.gatewayMigrationPending && (
+                    <div className="settings-inline-warning" role="status">
+                      A legacy gateway key still needs migration. Save its
+                      profile with a replacement key before adding another.
+                    </div>
+                  )}
+
                   <label className="settings-field">
-                    <span className="settings-field-label">
-                      Provider id (optional)
-                    </span>
+                    <span className="settings-field-label">Provider profile</span>
+                    <StyledSelect
+                      disabled={busy}
+                      value={selectedGateway ? selectedGateway.id : "__new__"}
+                      options={[
+                        ...gatewayProfiles.map((profile) => ({
+                          value: profile.id,
+                          label: `${profile.label}${profile.managedByEnv ? " (environment)" : ""}`,
+                        })),
+                        { value: "__new__", label: "Add provider profile" },
+                      ]}
+                      onChange={selectGatewayProfile}
+                    />
+                  </label>
+
+                  <label className="settings-field">
+                    <span className="settings-field-label">Profile ID</span>
                     <input
                       data-testid="gateway-provider-id"
                       type="text"
-                      placeholder="corp"
+                      placeholder="company-gateway"
                       value={gatewayProvider}
+                      disabled={busy || Boolean(selectedGateway)}
                       onChange={(e) => setGatewayProvider(e.target.value)}
+                    />
+                    <span className="settings-hint">
+                      Stable local name; lowercase letters, numbers, dots,
+                      dashes, and underscores.
+                    </span>
+                  </label>
+                  <label className="settings-field">
+                    <span className="settings-field-label">Display name</span>
+                    <input
+                      data-testid="gateway-label"
+                      type="text"
+                      placeholder="Company AI gateway"
+                      value={gatewayLabel}
+                      disabled={busy || selectedGateway?.managedByEnv}
+                      onChange={(e) => setGatewayLabel(e.target.value)}
                     />
                   </label>
                   <label className="settings-field">
@@ -511,45 +897,194 @@ export function SettingsPanel({
                       type="url"
                       placeholder="https://gateway.example/v1"
                       value={gatewayBase}
+                      disabled={busy || selectedGateway?.managedByEnv}
                       onChange={(e) => setGatewayBase(e.target.value)}
                     />
                   </label>
                   <label className="settings-field">
+                    <span className="settings-field-label">Model ID</span>
+                    <input
+                      data-testid="gateway-model-id"
+                      type="text"
+                      placeholder="model-id-from-your-gateway"
+                      value={gatewayModel}
+                      disabled={busy || selectedGateway?.managedByEnv}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setGatewayModel(value);
+                        const model = selectedGateway?.models.find(
+                          (item) => item.id === value,
+                        );
+                        setGatewayEffort(model?.effortOptions.join(", ") ?? "");
+                      }}
+                    />
+                    <span className="settings-hint">
+                      Enter an exact ID, or save one ID and use Discover models.
+                    </span>
+                  </label>
+                  <label className="settings-field">
                     <span className="settings-field-label">
-                      Gateway API key
-                      {snap.gatewayApiKeySet ? " (saved)" : ""}
+                      Supported effort values (optional)
+                    </span>
+                    <input
+                      data-testid="gateway-effort-options"
+                      type="text"
+                      placeholder="low, medium, high"
+                      value={gatewayEffort}
+                      disabled={busy || selectedGateway?.managedByEnv}
+                      onChange={(event) => setGatewayEffort(event.target.value)}
+                    />
+                    <span className="settings-hint">
+                      Declare only values documented by this exact gateway and
+                      model. The default omits effort entirely.
+                    </span>
+                  </label>
+                  <label className="settings-field">
+                    <span className="settings-field-label">Request budget</span>
+                    <StyledSelect
+                      disabled={busy || selectedGateway?.managedByEnv}
+                      value={gatewayDeadline}
+                      options={[
+                        { value: "interactive", label: "Interactive" },
+                        { value: "standard", label: "Standard" },
+                        { value: "extended", label: "Extended" },
+                      ]}
+                      onChange={(value) =>
+                        setGatewayDeadline(
+                          value as "interactive" | "standard" | "extended",
+                        )
+                      }
+                    />
+                    <span className="settings-hint">
+                      Bounded timeout class for this gateway; slower local or
+                      queued models may need Extended.
+                    </span>
+                  </label>
+                  <label className="settings-field">
+                    <span className="settings-field-label">
+                      Provider API key
+                      {selectedGateway?.credentialSet ? " (saved)" : ""}
                     </span>
                     <input
                       data-testid="gateway-api-key"
                       type="password"
                       placeholder={
-                        snap.gatewayApiKeySet ? "•••• (leave blank to keep)" : "sk-…"
+                        selectedGateway?.credentialSet
+                          ? "Saved (leave blank to keep)"
+                          : "Provider key"
                       }
                       value={gatewayKey}
+                      disabled={busy || selectedGateway?.managedByEnv}
                       onChange={(e) => setGatewayKey(e.target.value)}
                       autoComplete="off"
                     />
                   </label>
-                  <div className="modal-actions" style={{ marginTop: "0.5rem" }}>
+
+                  {selectedGateway && selectedGateway.models.length > 0 && (
+                    <div className="settings-provider-models">
+                      {selectedGateway.models.map((model) => (
+                        <button
+                          key={model.id}
+                          type="button"
+                          className={gatewayModel === model.id ? "active" : ""}
+                          onClick={() => {
+                            setGatewayModel(model.id);
+                            setGatewayEffort(model.effortOptions.join(", "));
+                          }}
+                          disabled={busy}
+                        >
+                          <span>{model.displayName}</span>
+                          <small>
+                            {model.capabilitySource === "unknown"
+                              ? "Not qualified"
+                              : [
+                                  model.supportsTools ? "Tools" : "Chat",
+                                  model.supportsStream ? "Streaming" : null,
+                                  model.supportsImageInput ? "Images" : null,
+                                  model.computerUseTier === "semantic_act"
+                                    ? "Computer: semantic"
+                                    : model.computerUseTier === "observe"
+                                      ? "Computer: observe"
+                                      : null,
+                                  model.effortOptions.length > 0
+                                    ? `Effort: ${model.effortOptions.join(", ")}`
+                                    : null,
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ")}
+                          </small>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="modal-actions settings-provider-actions">
                     <button
                       type="button"
                       className="primary"
                       data-testid="gateway-save"
-                      disabled={busy}
-                      onClick={() =>
-                        void apply(async () => {
-                          await api.setGatewayConfig(
-                            gatewayProvider.trim(),
-                            gatewayBase.trim(),
-                            gatewayKey.trim() || null,
-                          );
-                          setGatewayKey("");
-                        }, "Gateway settings saved")
+                      disabled={
+                        busy ||
+                        selectedGateway?.managedByEnv ||
+                        !gatewayProvider.trim() ||
+                        !gatewayBase.trim() ||
+                        !gatewayModel.trim()
                       }
+                      onClick={() => void saveGatewayProfile(false)}
                     >
-                      Save gateway
+                      Save provider
                     </button>
+                    <button
+                      type="button"
+                      data-testid="gateway-discover"
+                      disabled={
+                        busy ||
+                        selectedGateway?.managedByEnv ||
+                        !gatewayProvider.trim() ||
+                        !gatewayBase.trim() ||
+                        !gatewayModel.trim()
+                      }
+                      onClick={() => void saveGatewayProfile(true)}
+                    >
+                      Discover models
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="gateway-qualify"
+                      disabled={
+                        busy ||
+                        selectedGateway?.managedByEnv ||
+                        !gatewayProvider.trim() ||
+                        !gatewayBase.trim() ||
+                        !gatewayModel.trim()
+                      }
+                      onClick={() => void qualifyGatewayModel()}
+                    >
+                      Qualify model
+                    </button>
+                    {selectedGateway && !selectedGateway.managedByEnv && (
+                      <button
+                        type="button"
+                        className="danger"
+                        data-testid="gateway-delete"
+                        disabled={busy}
+                        onClick={() =>
+                          void apply(
+                            () => api.deleteProviderProfile(selectedGateway.id),
+                            "Provider removed",
+                          )
+                        }
+                      >
+                        Remove
+                      </button>
+                    )}
                   </div>
+                  {selectedGateway?.managedByEnv && (
+                    <span className="settings-hint">
+                      This profile is managed by environment variables. Change
+                      those variables to edit or remove it.
+                    </span>
+                  )}
                 </div>
               </section>
             )}
@@ -676,6 +1211,25 @@ function AppearanceSection({
       </div>
     </section>
   );
+}
+
+function computerPermissionLabel(status: ComputerPermissionStatus): string {
+  switch (status) {
+    case "granted":
+      return "Granted";
+    case "prompt_pending":
+      return "Waiting for macOS";
+    case "revoked":
+      return "Revoked";
+    case "denied":
+      return "Denied";
+    case "restricted":
+      return "Restricted";
+    case "unsupported":
+      return "Unavailable";
+    default:
+      return "Not granted";
+  }
 }
 
 function SettingsGlyph() {

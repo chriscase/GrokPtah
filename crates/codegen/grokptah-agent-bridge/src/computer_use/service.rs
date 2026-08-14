@@ -4,14 +4,15 @@ use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::policy::ComputerPolicy;
 use super::store::{ComputerStore, MutationClaim};
 use super::types::{
-    validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend, ComputerError,
-    ComputerErrorCode, ComputerObservation, ComputerResult, ComputerRun, ComputerRunState,
-    ComputerTarget, ComputerUseLimits,
+    validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
+    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
+    ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
 };
 
 pub struct ComputerUseService {
@@ -39,6 +40,46 @@ impl ComputerUseService {
 
     pub fn get_run(&self, run_id: &str) -> ComputerResult<Option<ComputerRun>> {
         self.store.load_run(run_id)
+    }
+
+    pub async fn read_current_evidence(
+        &self,
+        run_id: &str,
+        asset_id: &str,
+    ) -> ComputerResult<Vec<u8>> {
+        validate_id("run_id", run_id)?;
+        validate_id("asset_id", asset_id)?;
+        let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        let evidence = run
+            .current_observation
+            .as_ref()
+            .and_then(|observation| observation.screenshot.as_ref())
+            .filter(|evidence| evidence.asset_id == asset_id)
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "evidence is not attached to the current observation",
+                )
+            })?;
+        let bytes = self
+            .backend
+            .read_evidence(run_id, asset_id)
+            .await?
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::BackendUnavailable,
+                    "current observation evidence is unavailable",
+                )
+            })?;
+        if bytes.len() as u64 != evidence.byte_len
+            || format!("{:x}", Sha256::digest(&bytes)) != evidence.content_sha256
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "computer-use evidence failed integrity validation",
+            ));
+        }
+        Ok(bytes)
     }
 
     pub fn create_run(
@@ -90,10 +131,17 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidState,
+                        "operator takeover is absorbing; create a new computer run",
+                    ));
+                }
                 self.policy.authorize_grant(run, &grant, Utc::now())?;
                 run.grant = Some(grant.clone());
                 run.last_error = None;
                 run.transition(ComputerRunState::Ready)?;
+                run.set_control_disposition(ComputerControlDisposition::AgentOwned);
                 run.record_audit("authorize", "granted", None, None, None);
                 Ok(())
             })
@@ -153,7 +201,13 @@ impl ComputerUseService {
                             .and_then(|()| self.policy.authorize_observation_exposure(&observation))
                             .map(|()| observation);
                         match validated {
-                            Ok(observation) => self.commit_observation(run_id, observation),
+                            Ok(observation) => match self.commit_observation(run_id, observation) {
+                                Ok(observation) => Ok(observation),
+                                Err(error) => {
+                                    self.fail_inflight(run_id, "observe", &error)?;
+                                    Err(error)
+                                }
+                            },
                             Err(error) => {
                                 self.fail_inflight(run_id, "observe", &error)?;
                                 Err(error)
@@ -231,6 +285,12 @@ impl ComputerUseService {
                 }
                 self.policy
                     .authorize_action(run, &observation, &action, now)?;
+                if !backend_supports_action(&self.backend.capabilities(), action.class()) {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::ForbiddenAction,
+                        "the backend does not support this action class",
+                    ));
+                }
                 run.transition(ComputerRunState::Acting)?;
                 run.record_audit(
                     "act",
@@ -250,9 +310,12 @@ impl ComputerUseService {
                     .current_observation
                     .clone()
                     .expect("prepared action has an observation");
+                let control_epoch = prepared.control_epoch;
                 let outcome = self.backend.act(run_id, &observation, &action).await;
                 match outcome {
-                    Ok(outcome) => self.commit_action(run_id, &action, &observation, outcome),
+                    Ok(outcome) => {
+                        self.commit_action(run_id, &action, &observation, control_epoch, outcome)
+                    }
                     Err(error) => {
                         self.fail_inflight(run_id, "act", &error)?;
                         Err(error)
@@ -283,8 +346,15 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidState,
+                        "operator takeover is absorbing; create a new computer run",
+                    ));
+                }
                 run.transition(ComputerRunState::Paused)?;
                 revoke_authority(run);
+                run.set_control_disposition(ComputerControlDisposition::Paused);
                 run.record_audit("pause", "paused", None, None, None);
                 Ok(())
             })
@@ -293,6 +363,42 @@ impl ComputerUseService {
             Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
             Err(error) => {
                 self.record_denial(run_id, "pause", None, &error);
+                Err(error)
+            }
+        };
+        self.finish_mutation(request_id, &result)?;
+        result
+    }
+
+    /// Immediately yields control to the local operator. This is deliberately
+    /// distinct from pause in the durable audit trail even though both revoke
+    /// all outstanding authority and cancel backend work.
+    pub async fn take_over(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+    ) -> ComputerResult<ComputerRun> {
+        validate_id("run_id", run_id)?;
+        let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
+        if let Some(replayed) = self.begin_mutation(request_id, "take_over", &payload)? {
+            return replayed;
+        }
+        let taken_over = self
+            .store
+            .update_run(run_id, |run| {
+                ensure_version(run, expected_version)?;
+                run.transition(ComputerRunState::Paused)?;
+                revoke_authority(run);
+                run.set_control_disposition(ComputerControlDisposition::OperatorTakeover);
+                run.record_audit("take_over", "operator_control", None, None, None);
+                Ok(())
+            })
+            .and_then(|run| run.ok_or_else(unknown_run));
+        let result = match taken_over {
+            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Err(error) => {
+                self.record_denial(run_id, "take_over", None, &error);
                 Err(error)
             }
         };
@@ -312,6 +418,7 @@ impl ComputerUseService {
                 if !run.state.is_terminal() {
                     run.transition(ComputerRunState::Cancelled)?;
                     revoke_authority(run);
+                    run.set_control_disposition(ComputerControlDisposition::Stopped);
                     run.record_audit("cancel", "cancelled", None, None, None);
                 }
                 Ok(())
@@ -428,15 +535,27 @@ impl ComputerUseService {
         run_id: &str,
         action: &ComputerAction,
         observation: &ComputerObservation,
+        control_epoch: u64,
         outcome: ActionOutcome,
     ) -> ComputerResult<ActionOutcome> {
+        let mut uncertain_error = None;
         self.store
             .update_run(run_id, |run| {
-                if run.state != ComputerRunState::Acting {
-                    return Err(ComputerError::new(
+                if run.state != ComputerRunState::Acting || run.control_epoch != control_epoch {
+                    let error = ComputerError::new(
                         ComputerErrorCode::UncertainOutcome,
                         "action completed after the run was cancelled or superseded",
-                    ));
+                    );
+                    run.last_error = Some(error.clone());
+                    run.record_audit(
+                        "act",
+                        "uncertain_outcome",
+                        Some(action.class()),
+                        Some(observation.observation_id.clone()),
+                        Some(error.code),
+                    );
+                    uncertain_error = Some(error);
+                    return Ok(());
                 }
                 run.action_count = run.action_count.saturating_add(1);
                 if let Some(grant) = &mut run.grant {
@@ -457,6 +576,7 @@ impl ComputerUseService {
                 } else if grant_exhausted {
                     run.transition(ComputerRunState::Paused)?;
                     revoke_authority(run);
+                    run.set_control_disposition(ComputerControlDisposition::Paused);
                 } else {
                     run.transition(ComputerRunState::Ready)?;
                 }
@@ -470,6 +590,9 @@ impl ComputerUseService {
                 Ok(())
             })?
             .ok_or_else(unknown_run)?;
+        if let Some(error) = uncertain_error {
+            return Err(error);
+        }
         Ok(outcome)
     }
 
@@ -487,6 +610,9 @@ impl ComputerUseService {
                 run.last_error = Some(error.clone());
                 run.transition(ComputerRunState::Failed)?;
                 revoke_authority(run);
+                if error.code == ComputerErrorCode::UncertainOutcome {
+                    run.set_control_disposition(ComputerControlDisposition::UncertainOutcome);
+                }
                 run.record_audit(
                     operation,
                     "failed",
@@ -570,6 +696,18 @@ fn ensure_version(run: &ComputerRun, expected_version: u64) -> ComputerResult<()
     Ok(())
 }
 
+fn backend_supports_action(
+    capabilities: &super::types::ComputerCapabilities,
+    action_class: super::types::ActionClass,
+) -> bool {
+    match action_class {
+        super::types::ActionClass::Semantic => capabilities.semantic_actions,
+        super::types::ActionClass::TextEntry => capabilities.text_entry,
+        super::types::ActionClass::KeyChord => capabilities.key_chords,
+        super::types::ActionClass::PointerFallback => capabilities.pointer_fallback,
+    }
+}
+
 fn revoke_authority(run: &mut ComputerRun) {
     if let Some(grant) = &mut run.grant {
         grant.revoked_at.get_or_insert_with(Utc::now);
@@ -608,9 +746,19 @@ mod tests {
         action_calls: AtomicUsize,
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct EvidenceBackend {
         inner: SimulatorBackend,
+        bytes: parking_lot::Mutex<Vec<u8>>,
+    }
+
+    impl Default for EvidenceBackend {
+        fn default() -> Self {
+            Self {
+                inner: SimulatorBackend::new(),
+                bytes: parking_lot::Mutex::new(b"ok".to_vec()),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -626,16 +774,27 @@ mod tests {
             limits: &ComputerUseLimits,
         ) -> ComputerResult<ComputerObservation> {
             let mut observation = self.inner.observe(run_id, target, limits).await?;
+            let bytes = self.bytes.lock();
             observation.screenshot = Some(EvidenceRef {
-                content_sha256: "a".repeat(64),
+                content_sha256: format!("{:x}", Sha256::digest(&*bytes)),
                 media_type: "image/png".into(),
-                byte_len: 2,
+                byte_len: bytes.len() as u64,
                 width: 800,
                 height: 600,
                 redacted: true,
                 asset_id: "simulated-redacted-evidence".into(),
             });
             Ok(observation)
+        }
+
+        async fn read_evidence(
+            &self,
+            _run_id: &str,
+            _asset_id: &str,
+        ) -> ComputerResult<Option<Vec<u8>>> {
+            // Deliberately permissive fake: the service must enforce current
+            // run/asset scope and integrity independently of its backend.
+            Ok(Some(self.bytes.lock().clone()))
         }
 
         async fn act(
@@ -852,12 +1011,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(paused.state, ComputerRunState::Paused);
+        assert_eq!(
+            paused.control_disposition,
+            ComputerControlDisposition::Paused
+        );
         assert!(paused.grant.unwrap().revoked_at.is_some());
         let error = service
             .observe("observe-paused", &run.run_id, paused.version)
             .await
             .unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::InvalidState);
+    }
+
+    #[tokio::test]
+    async fn take_over_revokes_authority_and_is_distinct_in_audit() {
+        let (_backend, service) = service();
+        let run = service
+            .create_run(
+                "create-takeover",
+                Uuid::new_v4(),
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize("grant-takeover", &run.run_id, run.version, grant(&run))
+            .unwrap();
+        let taken_over = service
+            .take_over("takeover-1", &run.run_id, run.version)
+            .await
+            .unwrap();
+
+        assert_eq!(taken_over.state, ComputerRunState::Paused);
+        assert_eq!(
+            taken_over.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
+        assert!(taken_over.grant.unwrap().revoked_at.is_some());
+        assert!(taken_over.audit.iter().any(|entry| {
+            entry.operation == "take_over" && entry.disposition == "operator_control"
+        }));
+    }
+
+    #[tokio::test]
+    async fn operator_takeover_is_an_absorbing_control_fence() {
+        let (_backend, service) = service();
+        let run = service
+            .create_run(
+                "create-takeover-fence",
+                Uuid::new_v4(),
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "grant-takeover-fence",
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let taken_over = service
+            .take_over("takeover-fence", &run.run_id, run.version)
+            .await
+            .unwrap();
+
+        let error = service
+            .authorize(
+                "stale-authorize-after-takeover",
+                &run.run_id,
+                taken_over.version,
+                grant(&taken_over),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::InvalidState);
+        let persisted = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            persisted.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
+        assert_eq!(persisted.state, ComputerRunState::Paused);
+        assert!(persisted.control_epoch > run.control_epoch);
+
+        let error = service
+            .pause("pause-after-takeover", &run.run_id, taken_over.version)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::InvalidState);
+        let persisted = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            persisted.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
+        assert_eq!(persisted.version, taken_over.version);
     }
 
     #[tokio::test]
@@ -976,6 +1223,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evidence_read_requires_current_asset_and_validates_backend_bytes() {
+        let dir = tempdir().unwrap();
+        let backend = Arc::new(EvidenceBackend::default());
+        let service = ComputerUseService::new(
+            backend.clone(),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        );
+        let run = service
+            .create_run(
+                "create-evidence-read",
+                Uuid::new_v4(),
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize("grant-evidence-read", &run.run_id, run.version, grant(&run))
+            .unwrap();
+        let observation = service
+            .observe("observe-evidence-read", &run.run_id, run.version)
+            .await
+            .unwrap();
+        let evidence = observation.screenshot.unwrap();
+
+        assert_eq!(
+            service
+                .read_current_evidence(&run.run_id, &evidence.asset_id)
+                .await
+                .unwrap(),
+            b"ok"
+        );
+        assert_eq!(
+            service
+                .read_current_evidence(&run.run_id, "not-current")
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+
+        *backend.bytes.lock() = b"no".to_vec();
+        assert_eq!(
+            service
+                .read_current_evidence(&run.run_id, &evidence.asset_id)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::BackendFailure
+        );
+    }
+
+    #[tokio::test]
     async fn duration_limit_is_committed_and_revokes_authority() {
         let (_backend, service) = service();
         let run = service
@@ -1047,6 +1346,10 @@ mod tests {
             .unwrap();
         let paused = service.get_run(&run.run_id).unwrap().unwrap();
         assert_eq!(paused.state, ComputerRunState::Paused);
+        assert_eq!(
+            paused.control_disposition,
+            ComputerControlDisposition::Paused
+        );
         assert!(paused.current_observation.is_none());
         assert!(paused.grant.unwrap().revoked_at.is_some());
     }
@@ -1161,11 +1464,23 @@ mod tests {
 
         let cancelled = service.cancel("cancel-race", &run.run_id).await.unwrap();
         assert_eq!(cancelled.state, ComputerRunState::Cancelled);
+        assert_eq!(
+            cancelled.control_disposition,
+            ComputerControlDisposition::Stopped
+        );
         let error = action.await.unwrap().unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::UncertainOutcome);
         let persisted = service.get_run(&run.run_id).unwrap().unwrap();
         assert_eq!(persisted.state, ComputerRunState::Cancelled);
         assert_eq!(persisted.action_count, 0);
         assert!(persisted.current_observation.is_none());
+        assert_eq!(
+            persisted.last_error.as_ref().map(|error| error.code),
+            Some(ComputerErrorCode::UncertainOutcome)
+        );
+        assert!(persisted
+            .audit
+            .iter()
+            .any(|entry| entry.disposition == "uncertain_outcome"));
     }
 }

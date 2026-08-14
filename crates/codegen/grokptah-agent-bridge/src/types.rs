@@ -2,11 +2,38 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
+    /// Collision-safe selection value persisted by the desktop.
     pub id: String,
     pub display_name: String,
+    #[serde(default = "default_xai_provider_id")]
+    pub provider_id: String,
+    #[serde(default = "default_xai_provider_label")]
+    pub provider_label: String,
+    #[serde(default)]
+    pub wire_model_id: String,
+    #[serde(default)]
+    pub supports_tools: bool,
+    #[serde(default)]
+    pub supports_stream: bool,
+    #[serde(default)]
+    pub supports_image_input: bool,
+    #[serde(default)]
+    pub computer_use_tier: String,
+    #[serde(default)]
+    pub computer_capability_source: String,
+    #[serde(default)]
+    pub capability_source: String,
     pub supports_effort: bool,
     /// Canonical effort values accepted by this model, in UI order.
     pub effort_options: Vec<String>,
+}
+
+fn default_xai_provider_id() -> String {
+    "xai".into()
+}
+
+fn default_xai_provider_label() -> String {
+    "xAI / Grok Build".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

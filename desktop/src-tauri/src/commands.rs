@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
 use grokptah_agent_bridge::{
-    desktop_auto_update_enabled, AuthState, BackgroundTask, EffortLevel, JournalPage,
-    McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
-    PromptQueueRunNextResult, PromptQueueTakeResult, RunExecutionMode, RunReview, RunState,
-    SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
-    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    desktop_auto_update_enabled, AuthState, BackgroundTask, ComputerAction, ComputerPermission,
+    ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
+    JournalPage, McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
+    PromptQueueRunNextResult, PromptQueueTakeResult, ProviderDeadlineClass, ProviderProfileUpdate,
+    ProviderQualificationReport, RunExecutionMode, RunReview, RunState, SearchHit, SearchQuery,
+    SessionCompletion, SessionKind, SessionSummary, SkillInfo, SteeringReceipt, SubagentInfo,
+    TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -64,6 +66,266 @@ pub fn agent_stop(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub fn agent_status(state: State<'_, AppState>) -> grokptah_agent_bridge::AgentStatus {
     state.host.status()
+}
+
+#[tauri::command]
+pub fn computer_use_status(state: State<'_, AppState>) -> ComputerPlatformStatus {
+    state.computer_use.status()
+}
+
+#[tauri::command]
+pub async fn computer_use_request_permission(
+    state: State<'_, AppState>,
+    permission: String,
+) -> Result<ComputerPermissionStatus, String> {
+    let permission = match permission.as_str() {
+        "screen_recording" => ComputerPermission::ScreenRecording,
+        "accessibility" => ComputerPermission::Accessibility,
+        _ => return Err("Unknown Computer Use permission".into()),
+    };
+    state.computer_use.request_permission(permission).await
+}
+
+#[tauri::command]
+pub async fn computer_use_list_targets(
+    state: State<'_, AppState>,
+) -> Result<Vec<ComputerTargetCandidate>, String> {
+    state.computer_use.list_targets().await
+}
+
+#[tauri::command]
+pub async fn computer_use_observe_once(
+    state: State<'_, AppState>,
+    selection_token: String,
+) -> Result<crate::computer_use::ObservationPreview, String> {
+    let owner_session_id = state
+        .host
+        .status()
+        .active_session
+        .ok_or_else(|| "Open a session before observing another application".to_string())?;
+    state
+        .computer_use
+        .observe_once(&selection_token, owner_session_id)
+        .await
+}
+
+fn computer_owner(state: &AppState, session_id: &str) -> Result<Uuid, String> {
+    let owner = Uuid::parse_str(session_id).map_err(map_err)?;
+    state
+        .host
+        .list_all_sessions()
+        .iter()
+        .any(|session| session.id == owner)
+        .then_some(owner)
+        .ok_or_else(|| "Computer Use requires an existing local session".to_string())
+}
+
+#[tauri::command]
+pub fn computer_use_cockpit_snapshot(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .cockpit_snapshot(computer_owner(&state, &session_id)?)
+}
+
+#[tauri::command]
+pub fn computer_use_cockpit_agent_eligibility(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<grokptah_agent_bridge::ComputerAgentEligibility, String> {
+    state
+        .host
+        .computer_agent_eligibility(computer_owner(&state, &session_id)?)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_qualify_agent(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<grokptah_agent_bridge::ComputerAgentEligibility, String> {
+    state
+        .host
+        .qualify_computer_agent(computer_owner(&state, &session_id)?)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_propose_agent_action(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    expected_version: u64,
+    observation_id: String,
+    objective: String,
+) -> Result<crate::computer_use::ComputerAgentProposalResult, String> {
+    let owner = computer_owner(&state, &session_id)?;
+    let observation = state.computer_use.model_proposal_context(
+        owner,
+        &run_id,
+        expected_version,
+        &observation_id,
+    )?;
+    let proposal = state
+        .host
+        .propose_computer_action(owner, &objective, &observation)
+        .await
+        .map_err(map_err)?;
+    state
+        .computer_use
+        .apply_model_proposal(owner, &run_id, expected_version, &observation_id, proposal)
+        .await
+}
+
+#[tauri::command]
+pub fn computer_use_cockpit_cancel_agent(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<bool, String> {
+    Ok(state
+        .host
+        .cancel_computer_agent(computer_owner(&state, &session_id)?))
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_start_simulator(
+    state: State<'_, AppState>,
+    session_id: String,
+    reviewed_target_app_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .start_simulator(
+            computer_owner(&state, &session_id)?,
+            &reviewed_target_app_id,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_start_native(
+    state: State<'_, AppState>,
+    session_id: String,
+    selection_token: String,
+    reviewed_target_app_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .start_native(
+            computer_owner(&state, &session_id)?,
+            &selection_token,
+            &reviewed_target_app_id,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_refresh(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    expected_version: u64,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .refresh_simulator(
+            computer_owner(&state, &session_id)?,
+            &run_id,
+            expected_version,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_stage_action(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    expected_version: u64,
+    observation_id: String,
+    action: ComputerAction,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .stage_simulator_action(
+            computer_owner(&state, &session_id)?,
+            &run_id,
+            expected_version,
+            &observation_id,
+            action,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_approve(
+    state: State<'_, AppState>,
+    session_id: String,
+    approval_id: String,
+    request_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .approve_simulator_action(
+            computer_owner(&state, &session_id)?,
+            &approval_id,
+            &request_id,
+        )
+        .await
+}
+
+#[tauri::command]
+pub fn computer_use_cockpit_discard_approval(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .discard_simulator_approval(computer_owner(&state, &session_id)?)
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_pause(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    expected_version: u64,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    let owner = computer_owner(&state, &session_id)?;
+    state.host.cancel_computer_agent(owner);
+    state
+        .computer_use
+        .pause_simulator(owner, &run_id, expected_version)
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_take_over(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    expected_version: u64,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    let owner = computer_owner(&state, &session_id)?;
+    state.host.cancel_computer_agent(owner);
+    state
+        .computer_use
+        .take_over_simulator(owner, &run_id, expected_version)
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_stop(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    let owner = computer_owner(&state, &session_id)?;
+    state.host.cancel_computer_agent(owner);
+    state.computer_use.stop_simulator(owner, &run_id).await
 }
 
 #[tauri::command]
@@ -942,10 +1204,7 @@ pub async fn create_worktree(
 }
 
 #[tauri::command]
-pub async fn remove_worktree(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<String, String> {
+pub async fn remove_worktree(state: State<'_, AppState>, path: String) -> Result<String, String> {
     let host = state.host.clone();
     run_blocking(move || host.remove_worktree(&path).map_err(map_err)).await
 }
@@ -1021,16 +1280,12 @@ pub fn cancel_subagent(state: State<'_, AppState>, id: String) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn list_agents(
-    state: State<'_, AppState>,
-) -> Vec<grokptah_agent_bridge::AgentDef> {
+pub fn list_agents(state: State<'_, AppState>) -> Vec<grokptah_agent_bridge::AgentDef> {
     state.host.list_agents()
 }
 
 #[tauri::command]
-pub fn list_personas(
-    state: State<'_, AppState>,
-) -> Vec<grokptah_agent_bridge::PersonaDef> {
+pub fn list_personas(state: State<'_, AppState>) -> Vec<grokptah_agent_bridge::PersonaDef> {
     state.host.list_personas()
 }
 
@@ -1100,6 +1355,69 @@ pub fn set_gateway_config(
     state
         .host
         .set_gateway_config(provider_id, base_url, api_key)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+// Tauri maps this stable, flat JavaScript payload into named command arguments.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_provider_profile(
+    state: State<'_, AppState>,
+    provider_id: String,
+    label: String,
+    base_url: String,
+    model_id: String,
+    deadline_class: ProviderDeadlineClass,
+    effort_options: Vec<String>,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    state
+        .host
+        .upsert_provider_profile(ProviderProfileUpdate {
+            provider_id,
+            label,
+            base_url,
+            model_id,
+            deadline_class,
+            effort_options,
+            api_key,
+        })
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn discover_provider_models(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<Vec<ModelInfo>, String> {
+    state
+        .host
+        .discover_provider_models(&provider_id)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn qualify_provider_model(
+    state: State<'_, AppState>,
+    provider_id: String,
+    model_id: String,
+) -> Result<ProviderQualificationReport, String> {
+    state
+        .host
+        .qualify_provider_model(&provider_id, &model_id)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn delete_provider_profile(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<(), String> {
+    state
+        .host
+        .delete_provider_profile(&provider_id)
         .map_err(map_err)
 }
 

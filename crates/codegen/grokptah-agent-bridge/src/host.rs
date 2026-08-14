@@ -16,6 +16,10 @@ use crate::completion::{
     build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
     CompletionUsage,
 };
+use crate::computer_agent::{
+    propose_semantic_action, qualify_semantic_model, resolve_computer_eligibility,
+    ComputerAgentEligibility, ComputerAgentProposal,
+};
 use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
@@ -118,6 +122,11 @@ struct OrchestrationPendingAdmission {
     sequence: u64,
 }
 
+#[derive(Debug, Clone)]
+struct SessionComputerQualification {
+    route_fingerprint: String,
+}
+
 pub(crate) struct Inner {
     running: bool,
     project_cwd: Option<PathBuf>,
@@ -151,6 +160,13 @@ pub(crate) struct Inner {
     /// Per-session turn cancellation so multiple sessions can run concurrently
     /// (Claude Code–style parallel build sessions).
     turn_cancels: HashMap<Uuid, CancellationToken>,
+    /// Explicit, short-lived model qualification/proposal calls from the
+    /// Computer cockpit. These are independent from Build turns and always
+    /// cancelled by local Stop/Take over.
+    computer_agent_operations: HashMap<Uuid, (String, CancellationToken)>,
+    /// Session-local measured authority for built-in/provider routes that do
+    /// not have a durable provider-profile capability record. Restart clears it.
+    computer_agent_qualifications: HashMap<(Uuid, String), SessionComputerQualification>,
     /// Short-lived orchestration admission reservations. These close the gap
     /// between accepting a run and polling its async prompt future.
     turn_reservations: HashMap<Uuid, String>,
@@ -197,6 +213,12 @@ struct TurnBusyGuard {
     armed: bool,
 }
 
+struct ComputerAgentBusyGuard {
+    host: AgentHostHandle,
+    session_id: Uuid,
+    operation_id: String,
+}
+
 impl Drop for TurnBusyGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -212,6 +234,19 @@ impl Drop for TurnBusyGuard {
                 .recover_pending_steering();
         }
         let _ = self.host.persist_prompt_queue(self.session_id);
+    }
+}
+
+impl Drop for ComputerAgentBusyGuard {
+    fn drop(&mut self) {
+        let mut inner = self.host.inner.lock();
+        if inner
+            .computer_agent_operations
+            .get(&self.session_id)
+            .is_some_and(|(operation_id, _)| operation_id == &self.operation_id)
+        {
+            inner.computer_agent_operations.remove(&self.session_id);
+        }
     }
 }
 
@@ -324,11 +359,49 @@ impl AgentHost {
         let plugins = crate::discover::discover_plugins();
         let skills = crate::discover::discover_skills(project_cwd.as_deref());
         // Prefer persisted model; fall back to HostConfig / catalog default.
-        let model = if !chrome.model.is_empty() {
+        let mut model = if !chrome.model.is_empty() {
             chrome.model.clone()
         } else {
             config.default_model.clone()
         };
+        // The v1 gateway applied one corporate base to the global model. Keep
+        // that user's route on upgrade, but encode the provider identity so
+        // credentials and endpoints can no longer be selected independently.
+        let provider_config = crate::gateway_config::load();
+        let legacy_or_env_route = !provider_config.base_url.trim().is_empty()
+            || provider_config
+                .active_profile_id
+                .as_deref()
+                .and_then(|id| provider_config.profile(id))
+                .is_some_and(|profile| profile.managed_by_env);
+        if legacy_or_env_route && !model.starts_with(crate::gateway_config::MODEL_SELECTION_PREFIX)
+        {
+            if let Some(profile_id) = provider_config.active_profile_id.as_deref() {
+                model = crate::gateway_config::model_selection_key(profile_id, &model);
+            }
+        }
+        let mut effort = chrome.effort;
+        if let Ok(selection) = crate::gateway_config::parse_model_selection(&model) {
+            if selection.provider_id != crate::gateway_config::XAI_PROVIDER_ID {
+                let supports_current_effort = provider_config
+                    .profile(&selection.provider_id)
+                    .and_then(|profile| {
+                        profile
+                            .models
+                            .iter()
+                            .find(|item| item.id == selection.model_id)
+                    })
+                    .is_some_and(|item| {
+                        item.capabilities
+                            .effort_options
+                            .iter()
+                            .any(|value| value == effort.as_str())
+                    });
+                if !supports_current_effort {
+                    effort = EffortLevel::None;
+                }
+            }
+        }
         let mut open_tab_ids = chrome.open_tab_ids.clone();
         // Drop tab ids that no longer exist.
         open_tab_ids.retain(|id| sessions.contains_key(id));
@@ -359,7 +432,7 @@ impl AgentHost {
             always_allowed_tools: HashSet::new(),
             max_agent_rounds: config.max_agent_rounds,
             model,
-            effort: chrome.effort,
+            effort,
             auth,
             sandbox_profile: if chrome.sandbox_profile.is_empty() {
                 "workspace-write".into()
@@ -384,6 +457,8 @@ impl AgentHost {
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
+            computer_agent_operations: HashMap::new(),
+            computer_agent_qualifications: HashMap::new(),
             turn_reservations: HashMap::new(),
             orchestration_admissions: HashMap::new(),
             orchestration_pending_admissions: HashMap::new(),
@@ -423,6 +498,209 @@ impl AgentHostHandle {
     /// Additional live subscriber (does not steal the primary GUI receiver).
     pub fn subscribe_events(&self) -> crate::event_bus::EventReceiver {
         self.inner.lock().event_tx.subscribe()
+    }
+
+    /// Current model authority for the local Computer cockpit. Unknown models
+    /// remain manual-only unless a durable provider profile or this process's
+    /// explicit simulator qualification grants semantic authority.
+    pub fn computer_agent_eligibility(&self, session_id: Uuid) -> Result<ComputerAgentEligibility> {
+        let (model, _) = self.selected_computer_model(session_id)?;
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
+            return Ok(resolved.eligibility);
+        }
+        let qualified = self
+            .inner
+            .lock()
+            .computer_agent_qualifications
+            .get(&(session_id, model.clone()))
+            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+        if qualified {
+            return Ok(ComputerAgentEligibility {
+                model,
+                tier: crate::gateway_config::ComputerUseTier::SemanticAct,
+                source: "session_measured".into(),
+            });
+        }
+        Ok(resolved.eligibility)
+    }
+
+    /// Run the selected model against two deterministic simulator frames. No
+    /// proposed action executes, and success is scoped to this exact route for
+    /// the current process unless the provider profile already has a durable
+    /// measured capability.
+    pub async fn qualify_computer_agent(
+        &self,
+        session_id: Uuid,
+    ) -> Result<ComputerAgentEligibility> {
+        let (operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
+        let (model, effort) = self.selected_computer_model(session_id)?;
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
+            return Ok(resolved.eligibility);
+        }
+        qualify_semantic_model(&credentials, &model, effort, &cancel)
+            .await
+            .context("selected model did not pass bounded Computer qualification")?;
+        if cancel.is_cancelled() {
+            bail!("Computer model qualification was cancelled");
+        }
+        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
+        {
+            let mut inner = self.inner.lock();
+            if inner
+                .computer_agent_operations
+                .get(&session_id)
+                .is_none_or(|(current, _)| current != &operation_id)
+            {
+                bail!("Computer model qualification was superseded");
+            }
+            inner.computer_agent_qualifications.insert(
+                (session_id, model.clone()),
+                SessionComputerQualification {
+                    route_fingerprint: resolved.route_fingerprint,
+                },
+            );
+        }
+        Ok(ComputerAgentEligibility {
+            model,
+            tier: crate::gateway_config::ComputerUseTier::SemanticAct,
+            source: "session_measured".into(),
+        })
+    }
+
+    /// Ask the selected, qualified model for one bounded semantic proposal.
+    /// This method cannot dispatch an OS action.
+    pub async fn propose_computer_action(
+        &self,
+        session_id: Uuid,
+        objective: &str,
+        observation: &crate::computer_use::ComputerObservation,
+    ) -> Result<ComputerAgentProposal> {
+        let (_operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
+        let (model, effort) = self.selected_computer_model(session_id)?;
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        let durable_authority =
+            resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct;
+        let session_authority = self
+            .inner
+            .lock()
+            .computer_agent_qualifications
+            .get(&(session_id, model.clone()))
+            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+        if !durable_authority && !session_authority {
+            bail!("selected model is not qualified for semantic Computer actions");
+        }
+        let proposal = propose_semantic_action(
+            &credentials,
+            &model,
+            effort,
+            objective,
+            observation,
+            &cancel,
+        )
+        .await
+        .context("selected model did not return a valid bounded Computer proposal")?;
+        if cancel.is_cancelled() {
+            bail!("Computer model proposal was cancelled");
+        }
+        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
+        Ok(proposal)
+    }
+
+    /// Local Stop/Take over cancellation. It does not share the Build-turn
+    /// token, so cancelling Computer inference never cancels unrelated coding.
+    pub fn cancel_computer_agent(&self, session_id: Uuid) -> bool {
+        let token = self
+            .inner
+            .lock()
+            .computer_agent_operations
+            .remove(&session_id)
+            .map(|(_, token)| token);
+        if let Some(token) = token {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn invalidate_computer_agent_authority(&self) {
+        let tokens = {
+            let mut inner = self.inner.lock();
+            inner.computer_agent_qualifications.clear();
+            inner
+                .computer_agent_operations
+                .drain()
+                .map(|(_, (_, token))| token)
+                .collect::<Vec<_>>()
+        };
+        for token in tokens {
+            token.cancel();
+        }
+    }
+
+    fn selected_computer_model(&self, session_id: Uuid) -> Result<(String, EffortLevel)> {
+        let inner = self.inner.lock();
+        if !inner.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        Ok((inner.model.clone(), inner.effort))
+    }
+
+    fn begin_computer_agent_operation(
+        &self,
+        session_id: Uuid,
+    ) -> Result<(String, CancellationToken, ComputerAgentBusyGuard)> {
+        let operation_id = Uuid::new_v4().to_string();
+        let cancel = CancellationToken::new();
+        {
+            let mut inner = self.inner.lock();
+            if !inner.sessions.contains_key(&session_id) {
+                bail!("unknown session");
+            }
+            if inner.computer_agent_operations.contains_key(&session_id) {
+                bail!("a Computer model request is already running for this session");
+            }
+            inner
+                .computer_agent_operations
+                .insert(session_id, (operation_id.clone(), cancel.clone()));
+        }
+        let guard = ComputerAgentBusyGuard {
+            host: self.clone(),
+            session_id,
+            operation_id: operation_id.clone(),
+        };
+        Ok((operation_id, cancel, guard))
+    }
+
+    fn ensure_computer_route_unchanged(
+        &self,
+        session_id: Uuid,
+        expected_model: &str,
+        expected_route: &str,
+    ) -> Result<()> {
+        let (current_model, _) = self.selected_computer_model(session_id)?;
+        if current_model != expected_model {
+            bail!("selected model changed while the Computer request was running");
+        }
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&current_model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let current = resolve_computer_eligibility(&credentials, &current_model)?;
+        if current.route_fingerprint != expected_route {
+            bail!("provider route changed while the Computer request was running");
+        }
+        Ok(())
     }
 
     /// Shared wake-up for every embedded orchestration scheduler.
@@ -1024,6 +1302,7 @@ impl AgentHostHandle {
     }
 
     pub fn stop(&self) -> Result<()> {
+        self.invalidate_computer_agent_authority();
         let mut g = self.inner.lock();
         for (_, c) in g.turn_cancels.drain() {
             c.cancel();
@@ -1453,6 +1732,7 @@ impl AgentHostHandle {
     }
 
     pub fn session_delete(&self, id: Uuid) -> Result<()> {
+        self.cancel_computer_agent(id);
         {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&id) {
@@ -1462,6 +1742,8 @@ impl AgentHostHandle {
                 bail!("cannot delete a session with an active turn — stop it first");
             }
             g.sessions.remove(&id);
+            g.computer_agent_qualifications
+                .retain(|(session_id, _), _| *session_id != id);
             g.prompt_queues.remove(&id);
             g.open_tab_ids.retain(|t| *t != id);
             if g.active_session == Some(id) {
@@ -1896,7 +2178,9 @@ impl AgentHostHandle {
 
         let quality = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
             None
-        } else if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
+        } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+        {
             let blob = build_compact_summary(&leaving);
             let prompt = format!(
                 "Summarize this coding-agent conversation for future turns. \
@@ -2053,6 +2337,10 @@ impl AgentHostHandle {
     }
 
     pub fn set_model(&self, model: String) {
+        let changed = self.inner.lock().model != model;
+        if changed {
+            self.invalidate_computer_agent_authority();
+        }
         self.inner.lock().model = model;
         self.persist_chrome();
     }
@@ -2166,11 +2454,63 @@ impl AgentHostHandle {
     }
 
     pub fn models(&self) -> Vec<ModelInfo> {
-        // Live catalog from Grok Build's models_cache.json + builtins (grok-build, …).
-        crate::models_catalog::load_catalog()
+        let selected = self.inner.lock().model.clone();
+        let mut models: Vec<ModelInfo> = crate::models_catalog::load_catalog()
             .into_iter()
             .map(|m| m.info)
-            .collect()
+            .collect();
+        let selected = crate::gateway_config::parse_model_selection(&selected).ok();
+        let config = crate::gateway_config::load();
+        for profile in &config.profiles {
+            let mut profile_models = profile.models.clone();
+            if profile_models.is_empty() {
+                if let Some(selection) = selected
+                    .as_ref()
+                    .filter(|selection| selection.provider_id == profile.id)
+                {
+                    let mut legacy = crate::gateway_config::ProviderModel::unqualified(
+                        selection.model_id.clone(),
+                    );
+                    if config.has_pending_legacy_secret() || profile.managed_by_env {
+                        legacy.capabilities.tools = true;
+                        legacy.capabilities.stream = true;
+                        legacy.capabilities.parallel_tool_calls = true;
+                        legacy.capabilities.source =
+                            crate::gateway_config::CapabilitySource::Declared;
+                    }
+                    profile_models.push(legacy);
+                }
+            }
+            for provider_model in profile_models {
+                let capabilities = &provider_model.capabilities;
+                models.push(ModelInfo {
+                    id: crate::gateway_config::model_selection_key(&profile.id, &provider_model.id),
+                    display_name: format!("{} · {}", provider_model.display_name, profile.label),
+                    provider_id: profile.id.clone(),
+                    provider_label: profile.label.clone(),
+                    wire_model_id: provider_model.id,
+                    supports_tools: capabilities.tools,
+                    supports_stream: capabilities.stream,
+                    supports_image_input: capabilities.image_input,
+                    computer_use_tier: capabilities.effective_computer_use_tier().as_str().into(),
+                    computer_capability_source: match capabilities.computer_capability_source {
+                        crate::gateway_config::CapabilitySource::Declared => "declared",
+                        crate::gateway_config::CapabilitySource::Measured => "measured",
+                        crate::gateway_config::CapabilitySource::Unknown => "unknown",
+                    }
+                    .into(),
+                    capability_source: match capabilities.source {
+                        crate::gateway_config::CapabilitySource::Declared => "declared",
+                        crate::gateway_config::CapabilitySource::Measured => "measured",
+                        crate::gateway_config::CapabilitySource::Unknown => "unknown",
+                    }
+                    .into(),
+                    supports_effort: !capabilities.effort_options.is_empty(),
+                    effort_options: capabilities.effort_options.clone(),
+                });
+            }
+        }
+        models
     }
 
     pub fn auth_state(&self) -> AuthState {
@@ -3027,6 +3367,11 @@ impl AgentHostHandle {
         }
         let g = self.inner.lock();
         let gw = crate::gateway_config::load();
+        let active_gateway = gw
+            .active_profile_id
+            .as_deref()
+            .and_then(|id| gw.profile(id))
+            .or_else(|| gw.profiles.first());
         let (subagent_isolation, subagent_isolation_managed_by_env) =
             effective_subagent_isolation(g.subagent_isolation);
         serde_json::json!({
@@ -3045,9 +3390,46 @@ impl AgentHostHandle {
             "denyRules": g.deny_rules,
             "autoUpdateEnabled": crate::desktop_auto_update_enabled(),
             // Corporate gateway (#169) — env overrides still win at resolve time.
-            "gatewayProviderId": gw.provider_id,
-            "gatewayBaseUrl": gw.base_url,
-            "gatewayApiKeySet": !gw.api_key.trim().is_empty(),
+            "gatewayProviderId": active_gateway.map(|profile| profile.id.as_str()).unwrap_or(""),
+            "gatewayBaseUrl": active_gateway.map(|profile| profile.base_url.as_str()).unwrap_or(""),
+            "gatewayApiKeySet": active_gateway
+                .is_some_and(|profile| {
+                    profile.credential_ref.as_deref().is_some_and(|reference| {
+                        crate::auth_store::provider_credential_is_set(
+                            &profile.id,
+                            profile.managed_by_env,
+                            reference,
+                        )
+                    })
+                })
+                || gw.has_pending_legacy_secret(),
+            "gatewayProfiles": gw.profiles.iter().map(|profile| serde_json::json!({
+                "id": profile.id,
+                "label": profile.label,
+                "baseUrl": profile.base_url,
+                "deadlineClass": profile.deadline_class,
+                "credentialSet": profile.credential_ref.as_deref()
+                    .is_some_and(|reference| crate::auth_store::provider_credential_is_set(
+                        &profile.id,
+                        profile.managed_by_env,
+                        reference,
+                    ))
+                    || (gw.has_pending_legacy_secret()
+                        && gw.active_profile_id.as_deref() == Some(profile.id.as_str())),
+                "managedByEnv": profile.managed_by_env,
+                "models": profile.models.iter().map(|model| serde_json::json!({
+                    "id": model.id,
+                    "displayName": model.display_name,
+                    "supportsTools": model.capabilities.tools,
+                    "supportsStream": model.capabilities.stream,
+                    "supportsImageInput": model.capabilities.image_input,
+                    "computerUseTier": model.capabilities.effective_computer_use_tier(),
+                    "computerCapabilitySource": model.capabilities.computer_capability_source,
+                    "effortOptions": model.capabilities.effort_options,
+                    "capabilitySource": model.capabilities.source,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "gatewayMigrationPending": gw.has_pending_legacy_secret(),
         })
     }
 
@@ -3058,16 +3440,204 @@ impl AgentHostHandle {
         base_url: String,
         api_key: Option<String>,
     ) -> Result<()> {
-        let mut cfg = crate::gateway_config::load();
-        cfg.provider_id = provider_id.trim().to_string();
-        cfg.base_url = base_url.trim().to_string();
-        if let Some(k) = api_key {
-            let t = k.trim();
-            if !t.is_empty() {
-                cfg.api_key = t.to_string();
-            }
+        let provider_id = if provider_id.trim().is_empty() {
+            "corporate".to_string()
+        } else {
+            crate::gateway_config::normalized_profile_id(&provider_id)
+                .map_err(anyhow::Error::msg)?
+        };
+        crate::gateway_config::validate_base_url(&base_url).map_err(anyhow::Error::msg)?;
+        let mut cfg = crate::gateway_config::load_for_update().context("read provider profiles")?;
+        let current_selection = {
+            let g = self.inner.lock();
+            crate::gateway_config::parse_model_selection(&g.model).ok()
+        };
+        let current_model_id = current_selection
+            .as_ref()
+            .filter(|selection| {
+                selection.provider_id == provider_id
+                    || selection.provider_id == crate::gateway_config::XAI_PROVIDER_ID
+            })
+            .map(|selection| selection.model_id.clone())
+            .unwrap_or_else(|| "model-id".into());
+        let mut profile = cfg.profile(&provider_id).cloned().unwrap_or_else(|| {
+            crate::gateway_config::ProviderProfile::openai_compatible(
+                provider_id.clone(),
+                provider_id.clone(),
+                base_url.clone(),
+            )
+        });
+        profile.set_base_url(&base_url);
+        if !profile
+            .models
+            .iter()
+            .any(|model| model.id == current_model_id)
+        {
+            profile.upsert_model(crate::gateway_config::ProviderModel::unqualified(
+                current_model_id.clone(),
+            ));
         }
+        if let Some(key) = api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            profile.credential_ref = Some(
+                crate::auth_store::store_provider_api_key(&provider_id, key)
+                    .map_err(anyhow::Error::msg)?,
+            );
+            cfg.clear_legacy_fields();
+        } else if cfg.has_pending_legacy_secret() {
+            bail!("legacy gateway credential must be migrated or replaced before saving");
+        }
+        cfg.upsert_profile(profile).map_err(anyhow::Error::msg)?;
+        cfg.active_profile_id = Some(provider_id.clone());
         crate::gateway_config::save(&cfg).map_err(|e| anyhow!("save gateway.json: {e}"))?;
+        self.invalidate_computer_agent_authority();
+        self.set_model(crate::gateway_config::model_selection_key(
+            &provider_id,
+            &current_model_id,
+        ));
+        self.set_effort(EffortLevel::None);
+        Ok(())
+    }
+
+    pub fn upsert_provider_profile(
+        &self,
+        update: crate::gateway_config::ProviderProfileUpdate,
+    ) -> Result<()> {
+        let crate::gateway_config::ProviderProfileUpdate {
+            provider_id,
+            label,
+            base_url,
+            model_id,
+            deadline_class,
+            effort_options,
+            api_key,
+        } = update;
+        let provider_id = crate::gateway_config::normalized_profile_id(&provider_id)
+            .map_err(anyhow::Error::msg)?;
+        crate::gateway_config::validate_base_url(&base_url).map_err(anyhow::Error::msg)?;
+        if model_id.trim().is_empty() {
+            bail!("model id is required; use Discover or enter the gateway's exact id");
+        }
+        let mut config =
+            crate::gateway_config::load_for_update().context("read provider profiles")?;
+        if config.has_pending_legacy_secret()
+            && config.active_profile_id.as_deref() != Some(provider_id.as_str())
+        {
+            bail!("migrate or remove the legacy gateway profile before adding another profile");
+        }
+        let mut profile = config.profile(&provider_id).cloned().unwrap_or_else(|| {
+            crate::gateway_config::ProviderProfile::openai_compatible(
+                provider_id.clone(),
+                label.clone(),
+                base_url.clone(),
+            )
+        });
+        profile.label = label.trim().to_string();
+        if profile.label.is_empty() {
+            profile.label = provider_id.clone();
+        }
+        profile.set_base_url(&base_url);
+        profile.deadline_class = deadline_class;
+        if let Some(model) = profile.models.iter_mut().find(|model| model.id == model_id) {
+            model.capabilities.effort_options = effort_options.clone();
+            if !model.capabilities.effort_options.is_empty()
+                && model.capabilities.source == crate::gateway_config::CapabilitySource::Unknown
+            {
+                model.capabilities.source = crate::gateway_config::CapabilitySource::Declared;
+            }
+        } else {
+            let mut model = crate::gateway_config::ProviderModel::unqualified(&model_id);
+            model.capabilities.effort_options = effort_options.clone();
+            if !model.capabilities.effort_options.is_empty() {
+                model.capabilities.source = crate::gateway_config::CapabilitySource::Declared;
+            }
+            profile.upsert_model(model);
+        }
+        if let Some(key) = api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            profile.credential_ref = Some(
+                crate::auth_store::store_provider_api_key(&provider_id, key)
+                    .map_err(anyhow::Error::msg)?,
+            );
+            config.clear_legacy_fields();
+        } else if config.has_pending_legacy_secret() {
+            bail!(
+                "use the legacy profile once to migrate its credential, or enter a replacement key"
+            );
+        }
+        config.upsert_profile(profile).map_err(anyhow::Error::msg)?;
+        config.active_profile_id = Some(provider_id.clone());
+        crate::gateway_config::save(&config).context("save provider profile")?;
+        self.invalidate_computer_agent_authority();
+        self.set_model(crate::gateway_config::model_selection_key(
+            &provider_id,
+            &model_id,
+        ));
+        let current_effort = self.inner.lock().effort;
+        if current_effort != EffortLevel::None
+            && !effort_options
+                .iter()
+                .any(|value| value == current_effort.as_str())
+        {
+            self.set_effort(EffortLevel::None);
+        }
+        Ok(())
+    }
+
+    pub async fn discover_provider_models(&self, provider_id: &str) -> Result<Vec<ModelInfo>> {
+        crate::provider_discovery::discover_profile_models(provider_id).await?;
+        Ok(self
+            .models()
+            .into_iter()
+            .filter(|model| model.provider_id == provider_id)
+            .collect())
+    }
+
+    pub async fn qualify_provider_model(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<crate::provider_qualification::ProviderQualificationReport> {
+        crate::provider_qualification::qualify_provider_model(provider_id, model_id).await
+    }
+
+    pub fn delete_provider_profile(&self, provider_id: &str) -> Result<()> {
+        let provider_id = crate::gateway_config::normalized_profile_id(provider_id)
+            .map_err(anyhow::Error::msg)?;
+        let mut config =
+            crate::gateway_config::load_for_update().context("read provider profiles")?;
+        if config
+            .profile(&provider_id)
+            .is_some_and(|profile| profile.managed_by_env)
+        {
+            bail!("environment-managed profiles are removed by unsetting their base URL variable");
+        }
+        let profile = config
+            .remove_profile(&provider_id)
+            .ok_or_else(|| anyhow!("unknown provider profile `{provider_id}`"))?;
+        if config.has_pending_legacy_secret() {
+            config.clear_legacy_fields();
+        }
+        crate::gateway_config::save(&config).context("remove provider profile")?;
+        self.invalidate_computer_agent_authority();
+
+        if let Some(reference) = profile.credential_ref.as_deref() {
+            crate::auth_store::delete_provider_credential(&profile.id, reference)
+                .map_err(anyhow::Error::msg)?;
+        }
+        let selected_model = self.inner.lock().model.clone();
+        let selected_provider = crate::gateway_config::parse_model_selection(&selected_model)
+            .ok()
+            .map(|selection| selection.provider_id);
+        if selected_provider.as_deref() == Some(provider_id.as_str()) {
+            self.set_model(crate::models_catalog::resolve_default_model());
+        }
         Ok(())
     }
 
@@ -3956,7 +4526,10 @@ impl AgentHostHandle {
                     .ok_or_else(|| anyhow!("unknown session"))?;
                 (api_context_messages(s), s.compacted_summary.clone())
             };
-            let reply = if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
+            let reply = if let Some(creds) =
+                crate::auth_store::resolve_wire_credentials_for_model(model)
+                    .map_err(anyhow::Error::msg)?
+            {
                 match call_xai_chat(
                     &creds,
                     model,
@@ -3995,7 +4568,9 @@ impl AgentHostHandle {
                 .to_string();
             let steps = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
                 offline_plan_steps(&goal)
-            } else if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
+            } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(model)
+                .map_err(anyhow::Error::msg)?
+            {
                 match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
                     Ok(s) if !s.is_empty() => s,
                     Ok(_) => offline_plan_steps(&goal),
@@ -4300,7 +4875,9 @@ impl AgentHostHandle {
         }
 
         // ── Real multi-step coding agent (tool-calling loop) ─────────────
-        let Some(creds) = crate::auth_store::resolve_wire_credentials() else {
+        let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(model)
+            .map_err(anyhow::Error::msg)?
+        else {
             let msg = format!(
                 "{}\n\nYou said: {}\nProject: {}\nModel: {} · effort: {}",
                 crate::auth_store::auth_help_message(),
@@ -5317,8 +5894,11 @@ impl AgentHostHandle {
         event_tx: &crate::event_bus::EventBus,
         mcp_index: &McpToolIndex,
     ) -> Result<String> {
-        let args: serde_json::Value =
-            serde_json::from_str(arguments_json).unwrap_or_else(|_| serde_json::json!({}));
+        let args: serde_json::Value = serde_json::from_str(arguments_json)
+            .context("model returned malformed tool arguments")?;
+        if !args.is_object() {
+            bail!("model tool arguments must be a JSON object");
+        }
 
         // Namespaced MCP tools
         if let Some((server, tool)) = mcp_index.get(name) {
@@ -5992,8 +6572,10 @@ impl AgentHostHandle {
         // Online: optional short model summary of findings
         let mut summary = parts.join("\n\n");
         if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none() {
-            if let Some(creds) = crate::auth_store::resolve_wire_credentials() {
-                let model = self.inner.lock().model.clone();
+            let model = self.inner.lock().model.clone();
+            if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(&model)
+                .map_err(anyhow::Error::msg)?
+            {
                 let ask = format!(
                     "You are a read-only explore agent. Summarize findings for the parent agent.\n\
                      Query: {query}\n\nFindings:\n{}",
@@ -6271,13 +6853,19 @@ impl AgentHostHandle {
         }
 
         // Online: short multi-tool agent loop under child cancel.
-        let creds = match crate::auth_store::resolve_wire_credentials() {
-            Some(c) => c,
-            None => {
+        let creds = match crate::auth_store::resolve_wire_credentials_for_model(
+            &self.inner.lock().model.clone(),
+        ) {
+            Err(error) => {
+                self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(error));
+                return;
+            }
+            Ok(None) => {
                 let msg = "GP subagent: no credentials";
                 self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(msg.into()));
                 return;
             }
+            Ok(Some(c)) => c,
         };
         let model = self.inner.lock().model.clone();
         let effort = self.inner.lock().effort;
@@ -7315,5 +7903,56 @@ fn effective_subagent_isolation(
     match override_mode {
         Some(mode) => (mode, true),
         None => (configured, false),
+    }
+}
+
+#[cfg(test)]
+mod computer_agent_host_tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_computer_authority_is_session_scoped_and_model_changes_revoke_it() {
+        let _serial = crate::home_override_serial();
+        let home = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(home.path().to_path_buf()));
+
+        let host = AgentHost::create(HostConfig::default());
+        host.start().unwrap();
+        let first = host.session_new().unwrap();
+        let second = host.session_new().unwrap();
+        let model = host.inner.lock().model.clone();
+        host.inner.lock().computer_agent_qualifications.insert(
+            (first.id, model.clone()),
+            SessionComputerQualification {
+                route_fingerprint: "route-a".into(),
+            },
+        );
+
+        {
+            let inner = host.inner.lock();
+            assert!(inner
+                .computer_agent_qualifications
+                .contains_key(&(first.id, model.clone())));
+            assert!(!inner
+                .computer_agent_qualifications
+                .contains_key(&(second.id, model.clone())));
+        }
+
+        let (_operation_id, token, guard) = host
+            .begin_computer_agent_operation(first.id)
+            .expect("first request should reserve the session");
+        assert!(host.begin_computer_agent_operation(first.id).is_err());
+        host.set_model("different-model".into());
+        assert!(token.is_cancelled());
+        assert!(host.inner.lock().computer_agent_qualifications.is_empty());
+        drop(guard);
+        let (_operation_id, restarted_token, _guard) = host
+            .begin_computer_agent_operation(first.id)
+            .expect("model change should release the old reservation");
+        host.stop().unwrap();
+        assert!(restarted_token.is_cancelled());
+
+        drop(host);
+        crate::set_grokptah_home_override(None);
     }
 }

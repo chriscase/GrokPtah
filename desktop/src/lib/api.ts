@@ -2,6 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
   AuthState,
+  ComputerObservationPreview,
+  ComputerAgentEligibility,
+  ComputerAgentProposalResult,
+  ComputerAction,
+  ComputerCockpitSnapshot,
+  ComputerPermissionStatus,
+  ComputerPlatformStatus,
+  ComputerTargetCandidate,
   ModelInfo,
   SearchHit,
   SessionCompletionRecord,
@@ -13,6 +21,7 @@ import type {
   RunExecutionMode,
   RunReview,
   WorkspaceUiState,
+  ProviderQualificationReport,
 } from "./protocol";
 import type {
   PromptQueueEntry,
@@ -25,6 +34,129 @@ export const api = {
   agentStart: () => invoke<void>("agent_start"),
   agentStop: () => invoke<void>("agent_stop"),
   agentStatus: () => invoke<AgentStatus>("agent_status"),
+  computerUseStatus: () =>
+    invoke<ComputerPlatformStatus>("computer_use_status"),
+  computerUseRequestPermission: (
+    permission: "screen_recording" | "accessibility",
+  ) =>
+    invoke<ComputerPermissionStatus>("computer_use_request_permission", {
+      permission,
+    }),
+  computerUseListTargets: () =>
+    invoke<ComputerTargetCandidate[]>("computer_use_list_targets"),
+  computerUseObserveOnce: (selectionToken: string) =>
+    invoke<ComputerObservationPreview>("computer_use_observe_once", {
+      selectionToken,
+    }),
+  computerUseCockpitSnapshot: (sessionId: string) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_snapshot", {
+      sessionId,
+    }),
+  computerUseCockpitAgentEligibility: (sessionId: string) =>
+    invoke<ComputerAgentEligibility>("computer_use_cockpit_agent_eligibility", {
+      sessionId,
+    }),
+  computerUseCockpitQualifyAgent: (sessionId: string) =>
+    invoke<ComputerAgentEligibility>("computer_use_cockpit_qualify_agent", {
+      sessionId,
+    }),
+  computerUseCockpitProposeAgentAction: (
+    sessionId: string,
+    runId: string,
+    expectedVersion: number,
+    observationId: string,
+    objective: string,
+  ) =>
+    invoke<ComputerAgentProposalResult>("computer_use_cockpit_propose_agent_action", {
+      sessionId,
+      runId,
+      expectedVersion,
+      observationId,
+      objective,
+    }),
+  computerUseCockpitCancelAgent: (sessionId: string) =>
+    invoke<boolean>("computer_use_cockpit_cancel_agent", { sessionId }),
+  computerUseCockpitStartSimulator: (
+    sessionId: string,
+    reviewedTargetAppId: string,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_start_simulator", {
+      sessionId,
+      reviewedTargetAppId,
+    }),
+  computerUseCockpitStartNative: (
+    sessionId: string,
+    selectionToken: string,
+    reviewedTargetAppId: string,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_start_native", {
+      sessionId,
+      selectionToken,
+      reviewedTargetAppId,
+    }),
+  computerUseCockpitRefresh: (
+    sessionId: string,
+    runId: string,
+    expectedVersion: number,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_refresh", {
+      sessionId,
+      runId,
+      expectedVersion,
+    }),
+  computerUseCockpitStageAction: (
+    sessionId: string,
+    runId: string,
+    expectedVersion: number,
+    observationId: string,
+    action: ComputerAction,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_stage_action", {
+      sessionId,
+      runId,
+      expectedVersion,
+      observationId,
+      action,
+    }),
+  computerUseCockpitApprove: (
+    sessionId: string,
+    approvalId: string,
+    requestId: string,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_approve", {
+      sessionId,
+      approvalId,
+      requestId,
+    }),
+  computerUseCockpitDiscardApproval: (sessionId: string) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_discard_approval", {
+      sessionId,
+    }),
+  computerUseCockpitPause: (
+    sessionId: string,
+    runId: string,
+    expectedVersion: number,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_pause", {
+      sessionId,
+      runId,
+      expectedVersion,
+    }),
+  computerUseCockpitTakeOver: (
+    sessionId: string,
+    runId: string,
+    expectedVersion: number,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_take_over", {
+      sessionId,
+      runId,
+      expectedVersion,
+    }),
+  computerUseCockpitStop: (sessionId: string, runId: string) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_stop", {
+      sessionId,
+      runId,
+    }),
   setProjectCwd: (path: string) => invoke<string>("set_project_cwd", { path }),
   pickProjectFolder: () => invoke<string | null>("pick_project_folder"),
   sessionNew: () => invoke<SessionSummary>("session_new"),
@@ -294,6 +426,33 @@ export const api = {
       baseUrl,
       apiKey: apiKey ?? null,
     }),
+  upsertProviderProfile: (
+    providerId: string,
+    label: string,
+    baseUrl: string,
+    modelId: string,
+    deadlineClass: "interactive" | "standard" | "extended",
+    effortOptions: string[],
+    apiKey?: string | null,
+  ) =>
+    invoke<void>("upsert_provider_profile", {
+      providerId,
+      label,
+      baseUrl,
+      modelId,
+      deadlineClass,
+      effortOptions,
+      apiKey: apiKey ?? null,
+    }),
+  discoverProviderModels: (providerId: string) =>
+    invoke<ModelInfo[]>("discover_provider_models", { providerId }),
+  qualifyProviderModel: (providerId: string, modelId: string) =>
+    invoke<ProviderQualificationReport>("qualify_provider_model", {
+      providerId,
+      modelId,
+    }),
+  deleteProviderProfile: (providerId: string) =>
+    invoke<void>("delete_provider_profile", { providerId }),
   projectRules: () => invoke<string[]>("project_rules"),
   setPlanMode: (sessionId: string, enabled: boolean) =>
     invoke<void>("set_plan_mode", { sessionId, enabled }),

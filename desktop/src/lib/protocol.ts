@@ -378,14 +378,250 @@ export type TranscriptItem =
 export interface ModelInfo {
   id: string;
   display_name: string;
+  provider_id?: string;
+  provider_label?: string;
+  wire_model_id?: string;
+  supports_tools?: boolean;
+  supports_stream?: boolean;
+  supports_image_input?: boolean;
+  computer_use_tier?: ComputerUseTier;
+  computer_capability_source?: "declared" | "measured" | "unknown" | string;
+  capability_source?: "declared" | "measured" | "unknown" | string;
   supports_effort: boolean;
   effort_options?: string[];
 }
+
+export interface ProviderModelSummary {
+  id: string;
+  displayName: string;
+  supportsTools: boolean;
+  supportsStream: boolean;
+  supportsImageInput: boolean;
+  computerUseTier: ComputerUseTier;
+  computerCapabilitySource: "declared" | "measured" | "unknown";
+  effortOptions: string[];
+  capabilitySource: "declared" | "measured" | "unknown";
+}
+
+export interface ProviderProfileSummary {
+  id: string;
+  label: string;
+  baseUrl: string;
+  deadlineClass: "interactive" | "standard" | "extended";
+  credentialSet: boolean;
+  managedByEnv: boolean;
+  models: ProviderModelSummary[];
+}
+
+export interface QualificationCheck {
+  status: "pass" | "degraded" | "fail";
+  detail: string;
+}
+
+export interface ProviderQualificationReport {
+  providerId: string;
+  modelId: string;
+  basicGeneration: QualificationCheck;
+  nativeToolCall: QualificationCheck;
+  toolResultContinuation: QualificationCheck;
+  streaming: QualificationCheck;
+  codingReady: boolean;
+  semanticObservation: QualificationCheck;
+  staleObservationRecovery: QualificationCheck;
+  computerUseTier: ComputerUseTier;
+}
+
+export type ComputerUseTier =
+  | "none"
+  | "observe"
+  | "semantic_act"
+  | "visual_fallback_act";
 
 export interface AuthState {
   signed_in: boolean;
   display_name?: string | null;
   method?: string | null;
+}
+
+export type ComputerPermissionStatus =
+  | "unsupported"
+  | "missing"
+  | "prompt_pending"
+  | "denied"
+  | "granted"
+  | "revoked"
+  | "restricted";
+
+export interface ComputerPlatformStatus {
+  platformId: string;
+  available: boolean;
+  minimumOsVersion?: string | null;
+  screenRecording: ComputerPermissionStatus;
+  accessibility: ComputerPermissionStatus;
+  detail?: string | null;
+}
+
+export interface ComputerTargetCandidate {
+  selectionToken: string;
+  target: {
+    appId: string;
+    windowId: string;
+    generation: number;
+    displayName: string;
+    sensitivity: string;
+  };
+  geometry: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    scaleFactor: number;
+  };
+  onScreen: boolean;
+  active: boolean;
+  minimized: boolean;
+}
+
+export interface ComputerObservationPreview {
+  observation: {
+    observationId: string;
+    sequence: number;
+    target: ComputerTargetCandidate["target"];
+    elements: Array<{
+      elementId: string;
+      role: string;
+      label?: string | null;
+      value?: string | null;
+      sensitivity: string;
+    }>;
+    elementsTruncated: boolean;
+    screenshot?: {
+      contentSha256: string;
+      byteLen: number;
+      width: number;
+      height: number;
+      redacted: boolean;
+      assetId: string;
+    } | null;
+  };
+  imageDataUrl?: string | null;
+}
+
+export type ComputerAction =
+  | { type: "activate_target" }
+  | { type: "invoke"; element_id: string }
+  | { type: "set_value"; element_id: string; text: string }
+  | { type: "select"; element_id: string }
+  | {
+      type: "scroll";
+      element_id: string;
+      delta_x: number;
+      delta_y: number;
+    };
+
+export interface ComputerSemanticElement {
+  elementId: string;
+  role: string;
+  label?: string | null;
+  value?: string | null;
+  enabled: boolean;
+  focused: boolean;
+  sensitivity: string;
+  actions: string[];
+}
+
+export interface ComputerRun {
+  runId: string;
+  ownerSessionId: string;
+  target: ComputerTargetCandidate["target"];
+  state: string;
+  controlDisposition?:
+    | "agent_owned"
+    | "paused"
+    | "operator_takeover"
+    | "stopped"
+    | "interrupted"
+    | "uncertain_outcome"
+    | string;
+  controlEpoch?: number;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string | null;
+  endedAt?: string | null;
+  limits: {
+    maxActions: number;
+    maxDurationSecs: number;
+  };
+  actionCount: number;
+  currentObservation?: {
+    observationId: string;
+    sequence: number;
+    capturedAt: string;
+    target: ComputerTargetCandidate["target"];
+    elements: ComputerSemanticElement[];
+    elementsTruncated: boolean;
+  } | null;
+  grant?: {
+    grantId: string;
+    expiresAt: string;
+    usesRemaining?: number | null;
+    revokedAt?: string | null;
+    actionClasses: string[];
+  } | null;
+  lastOutcome?: {
+    summary: string;
+    expectedPostconditionMet?: boolean | null;
+  } | null;
+  lastError?: { code: string; message: string } | null;
+  audit: Array<{
+    sequence: number;
+    at: string;
+    operation: string;
+    disposition: string;
+    actionClass?: string | null;
+    observationId?: string | null;
+    errorCode?: string | null;
+  }>;
+}
+
+export interface PendingComputerApproval {
+  approvalId: string;
+  ownerSessionId: string;
+  runId: string;
+  runVersion: number;
+  observationId: string;
+  targetLabel: string;
+  action: ComputerAction;
+  actionSummary: string;
+  risk: string;
+  createdAt: string;
+}
+
+export interface ComputerCockpitSnapshot {
+  backend: {
+    backendId: string;
+    observe: boolean;
+    semanticActions: boolean;
+    textEntry: boolean;
+    keyChords: boolean;
+    pointerFallback: boolean;
+  };
+  origin: "desktop" | "mcp" | string;
+  run?: ComputerRun | null;
+  pendingApproval?: PendingComputerApproval | null;
+}
+
+export interface ComputerAgentEligibility {
+  model: string;
+  tier: ComputerUseTier;
+  source: string;
+}
+
+export interface ComputerAgentProposalResult {
+  snapshot: ComputerCockpitSnapshot;
+  summary: string;
+  completed: boolean;
 }
 
 export type SubagentExecutionMode =

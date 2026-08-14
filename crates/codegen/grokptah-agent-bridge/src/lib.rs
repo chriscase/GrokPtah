@@ -6,6 +6,7 @@
 mod agents_personas;
 mod auth_store;
 mod completion;
+mod computer_agent;
 pub mod computer_use;
 mod discover;
 pub mod eval_oracle;
@@ -31,12 +32,15 @@ mod process_tree;
 mod project_context;
 mod prompt_combine;
 mod prompt_queue;
+mod provider_discovery;
+mod provider_qualification;
 pub mod reliability_eval;
 mod run_promotion;
 mod search_engine;
 mod session;
 mod session_store;
 mod spawn_env;
+mod sse;
 mod ssrf;
 mod textutil;
 mod todo_list;
@@ -47,12 +51,21 @@ pub use agents_personas::{
     discover_agents, discover_personas, resolve_agent, resolve_persona, AgentDef, PersonaDef,
 };
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
-pub use gateway_config::{load as load_gateway_config, save as save_gateway_config, GatewayConfig};
+pub use gateway_config::{
+    load as load_gateway_config, model_selection_key, parse_model_selection,
+    save as save_gateway_config, CapabilitySource, ComputerUseTier, GatewayConfig,
+    ModelCapabilities, ModelSelection, ProviderDeadlineClass, ProviderDialect, ProviderKind,
+    ProviderModel, ProviderProfile, ProviderProfileUpdate,
+};
 pub use isolation::prepare_isolation_cwd;
 pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};
 pub use prompt_queue::{
     PromptQueueBatch, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueTakeResult,
     SteeringDisposition, SteeringReceipt,
+};
+pub use provider_discovery::{discover_profile_models, parse_compatible_model_catalog};
+pub use provider_qualification::{
+    qualify_provider_model, ProviderQualificationReport, QualificationCheck, QualificationStatus,
 };
 pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
 
@@ -74,11 +87,14 @@ pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
     CompletionUsage,
 };
+pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
 pub use computer_use::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
-    ComputerCapabilities, ComputerError, ComputerErrorCode, ComputerObservation, ComputerPolicy,
-    ComputerRun, ComputerRunState, ComputerStore, ComputerTarget, ComputerUseLimits,
-    ComputerUseService, GrantIssuer, SimulatorBackend,
+    ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
+    ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerPolicy, ComputerRun, ComputerRunState, ComputerStore,
+    ComputerTarget, ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
+    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,

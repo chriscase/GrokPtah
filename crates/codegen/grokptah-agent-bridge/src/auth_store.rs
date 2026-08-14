@@ -26,6 +26,7 @@ use crate::types::AuthState;
 const SERVICE: &str = "grokptah-desktop";
 const ACCOUNT_API_KEY: &str = "xai-api-key";
 const ACCOUNT_DISPLAY: &str = "display-name";
+const PROVIDER_KEYCHAIN_PREFIX: &str = "keychain:";
 
 /// Header value required by cli-chat-proxy nginx auth (matches xai-grok-cli).
 pub const XAI_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
@@ -96,8 +97,10 @@ fn detect_installed_grok_version() -> Option<String> {
     Some(rest.to_string())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WireCredentials {
+    /// Provider profile that owns this credential. Request routing must match it.
+    pub provider_id: String,
     /// Bearer token (OIDC JWT `key` from auth.json, or API key).
     pub bearer: String,
     /// When true, send CLI OIDC headers (not bare API key).
@@ -129,18 +132,19 @@ pub fn auth_json_path() -> PathBuf {
     grok_home().join("auth.json")
 }
 
-/// Best credential for outbound chat API calls.
+/// Best credential for the built-in xAI profile.
 ///
-/// Order (must not break default xAI path — #169):
-/// 1. `XAI_API_KEY`
-/// 2. Keyring API key
-/// 3. Corporate/OpenAI-compatible: `GROKPTAH_API_KEY` / `OPENAI_API_KEY`
-/// 4. Rotating token command (#170): `GROKPTAH_TOKEN_COMMAND`
-/// 5. Grok Build OIDC session (`~/.grok/auth.json`)
+/// Compatible providers use [`resolve_wire_credentials_for_model`] so an xAI
+/// credential can never be combined with a corporate endpoint.
 pub fn resolve_wire_credentials() -> Option<WireCredentials> {
+    resolve_xai_credentials()
+}
+
+fn resolve_xai_credentials() -> Option<WireCredentials> {
     if let Ok(key) = std::env::var("XAI_API_KEY") {
         if !key.is_empty() {
             return Some(WireCredentials {
+                provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
                 bearer: key,
                 oidc_token_auth: false,
                 display_name: "env:XAI_API_KEY".into(),
@@ -165,6 +169,7 @@ pub fn resolve_wire_credentials() -> Option<WireCredentials> {
                     .and_then(|e| e.get_password().ok())
                     .unwrap_or_else(|| "API key".into());
                 return Some(WireCredentials {
+                    provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
                     bearer: key,
                     oidc_token_auth: false,
                     display_name: name,
@@ -182,55 +187,15 @@ pub fn resolve_wire_credentials() -> Option<WireCredentials> {
             }
         }
     }
-    // Corporate / OpenAI-compatible gateway keys (#169) — only when xAI key absent.
-    for (env_name, label) in [
-        ("GROKPTAH_API_KEY", "env:GROKPTAH_API_KEY"),
-        ("OPENAI_API_KEY", "env:OPENAI_API_KEY"),
-    ] {
-        if let Ok(key) = std::env::var(env_name) {
-            if !key.is_empty() {
-                return Some(WireCredentials {
-                    bearer: key,
-                    oidc_token_auth: false,
-                    display_name: label.into(),
-                    method: "api_key".into(),
-                    user_id: None,
-                    team_id: None,
-                    auth_scope: None,
-                    refresh_token: None,
-                    oidc_issuer: None,
-                    oidc_client_id: None,
-                    principal_type: None,
-                    principal_id: None,
-                    expires_at: None,
-                });
-            }
-        }
-    }
-    // Settings UI gateway.json key (#169) when env keys absent.
-    if let Some(key) = crate::gateway_config::file_api_key() {
-        return Some(WireCredentials {
-            bearer: key,
-            oidc_token_auth: false,
-            display_name: "gateway.json".into(),
-            method: "api_key".into(),
-            user_id: None,
-            team_id: None,
-            auth_scope: None,
-            refresh_token: None,
-            oidc_issuer: None,
-            oidc_client_id: None,
-            principal_type: None,
-            principal_id: None,
-            expires_at: None,
-        });
-    }
-    // Rotating token helper (#170): command prints a short-lived bearer to stdout.
+    // The rotating xAI token helper is intentionally part of the xAI profile.
+    // Compatible-provider token helpers must be explicit profile references;
+    // otherwise a command's token could be attached to the wrong endpoint.
     if let Ok(cmd) = std::env::var("GROKPTAH_TOKEN_COMMAND") {
         let cmd = cmd.trim();
         if !cmd.is_empty() {
             if let Some(tok) = run_token_command(cmd) {
                 return Some(WireCredentials {
+                    provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
                     bearer: tok,
                     oidc_token_auth: false,
                     display_name: "token_command".into(),
@@ -249,6 +214,233 @@ pub fn resolve_wire_credentials() -> Option<WireCredentials> {
         }
     }
     load_grok_build_session()
+}
+
+/// Opaque keychain reference stored in a provider profile.
+pub fn provider_keychain_ref(profile_id: &str) -> Result<String, String> {
+    let profile_id = crate::gateway_config::normalized_profile_id(profile_id)?;
+    Ok(format!(
+        "{PROVIDER_KEYCHAIN_PREFIX}provider/{profile_id}/api-key"
+    ))
+}
+
+fn keychain_account_from_ref(reference: &str) -> Result<&str, String> {
+    let account = reference
+        .strip_prefix(PROVIDER_KEYCHAIN_PREFIX)
+        .ok_or_else(|| "unsupported provider credential reference".to_string())?;
+    if account.is_empty() || account.len() > 128 || account.contains(['\0', '\n', '\r']) {
+        return Err("invalid provider credential reference".into());
+    }
+    Ok(account)
+}
+
+/// Store and read back a provider secret before returning its durable reference.
+pub fn store_provider_api_key(profile_id: &str, api_key: &str) -> Result<String, String> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err("provider API key is empty".into());
+    }
+    let reference = provider_keychain_ref(profile_id)?;
+    let account = keychain_account_from_ref(&reference)?;
+    let entry = Entry::new(SERVICE, account).map_err(|error| error.to_string())?;
+    entry
+        .set_password(api_key)
+        .map_err(|error| format!("store provider credential: {error}"))?;
+    let verified = entry
+        .get_password()
+        .map_err(|error| format!("verify provider credential: {error}"))?;
+    if verified != api_key {
+        return Err("provider credential verification failed".into());
+    }
+    Ok(reference)
+}
+
+fn read_provider_credential(reference: &str) -> Result<String, String> {
+    if let Some(variable) = reference.strip_prefix("env:") {
+        if variable.is_empty()
+            || !variable
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err("invalid provider environment credential reference".into());
+        }
+        return std::env::var(variable)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                format!("provider credential environment variable {variable} is unset")
+            });
+    }
+    let account = keychain_account_from_ref(reference)?;
+    Entry::new(SERVICE, account)
+        .map_err(|error| error.to_string())?
+        .get_password()
+        .map_err(|error| format!("read provider credential: {error}"))
+        .and_then(|value| {
+            if value.trim().is_empty() {
+                Err("provider credential is empty".into())
+            } else {
+                Ok(value)
+            }
+        })
+}
+
+fn validate_provider_credential_ref(
+    profile_id: &str,
+    managed_by_env: bool,
+    reference: &str,
+) -> Result<(), String> {
+    if reference.starts_with("env:") {
+        let expected = match profile_id {
+            "env-grokptah" if managed_by_env => "env:GROKPTAH_API_KEY",
+            "env-openai" if managed_by_env => "env:OPENAI_API_KEY",
+            _ => {
+                return Err("environment credential reference is not owned by this profile".into())
+            }
+        };
+        if reference != expected {
+            return Err("environment credential reference does not match its profile".into());
+        }
+        return Ok(());
+    }
+    if reference != provider_keychain_ref(profile_id)? {
+        return Err("keychain credential reference does not match its provider profile".into());
+    }
+    Ok(())
+}
+
+pub fn provider_credential_is_set(profile_id: &str, managed_by_env: bool, reference: &str) -> bool {
+    validate_provider_credential_ref(profile_id, managed_by_env, reference).is_ok()
+        && read_provider_credential(reference).is_ok()
+}
+
+pub fn delete_provider_credential(profile_id: &str, reference: &str) -> Result<(), String> {
+    validate_provider_credential_ref(profile_id, false, reference)?;
+    if reference.starts_with("env:") {
+        return Ok(());
+    }
+    let account = keychain_account_from_ref(reference)?;
+    let entry = Entry::new(SERVICE, account).map_err(|error| error.to_string())?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("delete provider credential: {error}")),
+    }
+}
+
+fn compatible_credentials(profile_id: &str, reference: &str, bearer: String) -> WireCredentials {
+    WireCredentials {
+        provider_id: profile_id.to_string(),
+        bearer,
+        oidc_token_auth: false,
+        display_name: profile_id.to_string(),
+        method: if reference.starts_with("env:") {
+            "provider_env"
+        } else {
+            "provider_keychain"
+        }
+        .into(),
+        user_id: None,
+        team_id: None,
+        auth_scope: None,
+        refresh_token: None,
+        oidc_issuer: None,
+        oidc_client_id: None,
+        principal_type: None,
+        principal_id: None,
+        expires_at: None,
+    }
+}
+
+fn migrate_legacy_provider_credential<F>(
+    config: &mut crate::gateway_config::GatewayConfig,
+    profile: &crate::gateway_config::ProviderProfile,
+    store_verified: F,
+) -> Result<Option<WireCredentials>, String>
+where
+    F: FnOnce(&str, &str) -> Result<String, String>,
+{
+    if !config.has_pending_legacy_secret()
+        || config.active_profile_id.as_deref() != Some(profile.id.as_str())
+    {
+        return Ok(None);
+    }
+
+    let legacy_secret = config.api_key.clone();
+    let reference = store_verified(&profile.id, &legacy_secret)?;
+    let mut migrated = config.clone();
+    migrated
+        .profile_mut(&profile.id)
+        .ok_or_else(|| "provider profile disappeared during migration".to_string())?
+        .credential_ref = Some(reference.clone());
+    migrated.clear_legacy_fields();
+    crate::gateway_config::save(&migrated)
+        .map_err(|error| format!("finalize provider credential migration: {error}"))?;
+    *config = migrated;
+    Ok(Some(compatible_credentials(
+        &profile.id,
+        &reference,
+        legacy_secret,
+    )))
+}
+
+/// Resolve the credential owned by the model's exact provider profile.
+///
+/// A pending v1 plaintext key is migrated only on use: the keychain write is
+/// read back first, then config is atomically rewritten without the plaintext.
+/// Any failure leaves the original file untouched and returns an error.
+pub fn resolve_wire_credentials_for_model(
+    model_selection: &str,
+) -> Result<Option<WireCredentials>, String> {
+    let selection = crate::gateway_config::parse_model_selection(model_selection)?;
+    if selection.provider_id == crate::gateway_config::XAI_PROVIDER_ID {
+        return Ok(resolve_xai_credentials());
+    }
+
+    resolve_provider_credentials(&selection.provider_id, Some(&selection.model_id))
+}
+
+pub fn resolve_provider_credentials(
+    provider_id: &str,
+    legacy_model_id: Option<&str>,
+) -> Result<Option<WireCredentials>, String> {
+    let provider_id = crate::gateway_config::normalized_profile_id(provider_id)?;
+
+    let mut config = crate::gateway_config::load_for_update()
+        .map_err(|error| format!("read provider profiles: {error}"))?;
+    if config.has_pending_legacy_secret() {
+        let profile = config
+            .profile_mut(&provider_id)
+            .ok_or_else(|| format!("unknown provider profile `{provider_id}`"))?;
+        if let Some(model_id) = legacy_model_id
+            .filter(|model_id| !profile.models.iter().any(|model| model.id == **model_id))
+        {
+            let mut legacy_model = crate::gateway_config::ProviderModel::unqualified(model_id);
+            // Preserve the only behavior the v1 gateway exposed. This is
+            // migration evidence, not a claim about newly added models.
+            legacy_model.capabilities.tools = true;
+            legacy_model.capabilities.stream = true;
+            legacy_model.capabilities.parallel_tool_calls = true;
+            legacy_model.capabilities.source = crate::gateway_config::CapabilitySource::Declared;
+            profile.upsert_model(legacy_model);
+        }
+    }
+    let profile = config
+        .profile(&provider_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown provider profile `{provider_id}`"))?;
+
+    if let Some(credentials) =
+        migrate_legacy_provider_credential(&mut config, &profile, store_provider_api_key)?
+    {
+        return Ok(Some(credentials));
+    }
+
+    let Some(reference) = profile.credential_ref.as_deref() else {
+        return Ok(None);
+    };
+    validate_provider_credential_ref(&profile.id, profile.managed_by_env, reference)?;
+    let bearer = read_provider_credential(reference)?;
+    Ok(Some(compatible_credentials(&profile.id, reference, bearer)))
 }
 
 fn run_token_command(cmd: &str) -> Option<String> {
@@ -316,6 +508,7 @@ fn load_grok_build_session() -> Option<WireCredentials> {
             .map(|t| t.with_timezone(&Utc));
         let expired = expires_at.is_some_and(|t| t < Utc::now());
         let candidate = WireCredentials {
+            provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
             bearer: key.to_string(),
             oidc_token_auth: oidc || mode != "api_key",
             display_name: display,
@@ -614,4 +807,156 @@ pub fn auth_help_message() -> String {
          • export XAI_API_KEY=...",
         path.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discover::{home_override_serial, set_grokptah_home_override};
+    use crate::gateway_config::{
+        model_selection_key, GatewayConfig, ProviderModel, ProviderProfile,
+    };
+
+    fn expect_credential_error(result: Result<Option<WireCredentials>, String>) -> String {
+        match result {
+            Ok(_) => panic!("credential operation unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn credentials_are_bound_to_the_selected_provider_profile() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        fs::create_dir_all(&home).unwrap();
+        set_grokptah_home_override(Some(home));
+        unsafe {
+            std::env::set_var("GROKPTAH_API_BASE", "https://a.example/v1");
+            std::env::set_var("GROKPTAH_API_KEY", "synthetic-a");
+            std::env::set_var("OPENAI_BASE_URL", "https://b.example/v1");
+            std::env::set_var("OPENAI_API_KEY", "synthetic-b");
+            std::env::set_var("XAI_API_KEY", "synthetic-xai");
+        }
+
+        let a =
+            resolve_wire_credentials_for_model(&model_selection_key("env-grokptah", "code-model"))
+                .unwrap()
+                .unwrap();
+        let b =
+            resolve_wire_credentials_for_model(&model_selection_key("env-openai", "code-model"))
+                .unwrap()
+                .unwrap();
+        let xai = resolve_wire_credentials_for_model("grok-4.5")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (a.provider_id.as_str(), a.bearer.as_str()),
+            ("env-grokptah", "synthetic-a")
+        );
+        assert_eq!(
+            (b.provider_id.as_str(), b.bearer.as_str()),
+            ("env-openai", "synthetic-b")
+        );
+        assert_eq!(
+            (xai.provider_id.as_str(), xai.bearer.as_str()),
+            ("xai", "synthetic-xai")
+        );
+
+        let mismatch = crate::host_helpers::resolve_model_target(
+            &a,
+            &model_selection_key("env-openai", "code-model"),
+        )
+        .unwrap_err();
+        assert!(mismatch
+            .to_string()
+            .contains("provider credential mismatch"));
+
+        unsafe {
+            std::env::remove_var("GROKPTAH_API_BASE");
+            std::env::remove_var("GROKPTAH_API_KEY");
+            std::env::remove_var("OPENAI_BASE_URL");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("XAI_API_KEY");
+        }
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn crafted_cross_profile_references_fail_closed() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        fs::create_dir_all(&home).unwrap();
+        set_grokptah_home_override(Some(home));
+
+        let mut config = GatewayConfig::default();
+        let mut profile = ProviderProfile::openai_compatible("corp-a", "A", "https://a.example/v1");
+        profile.credential_ref = Some("keychain:provider/corp-b/api-key".into());
+        profile.upsert_model(ProviderModel::unqualified("model"));
+        config.upsert_profile(profile).unwrap();
+        crate::gateway_config::save(&config).unwrap();
+        let error = expect_credential_error(resolve_provider_credentials("corp-a", Some("model")));
+        assert!(error.contains("does not match"));
+
+        let mut config = crate::gateway_config::load_for_update().unwrap();
+        config.profile_mut("corp-a").unwrap().credential_ref = Some("env:XAI_API_KEY".into());
+        crate::gateway_config::save(&config).unwrap();
+        let error = expect_credential_error(resolve_provider_credentials("corp-a", Some("model")));
+        assert!(error.contains("not owned"));
+
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn legacy_migration_retains_the_only_secret_on_failure_and_is_idempotent() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        fs::create_dir_all(&home).unwrap();
+        let config_path = home.join("gateway.json");
+        fs::write(
+            &config_path,
+            r#"{"provider_id":"legacy-corp","base_url":"https://legacy.example/v1","api_key":"synthetic-legacy-secret"}"#,
+        )
+        .unwrap();
+        set_grokptah_home_override(Some(home));
+
+        let mut config = crate::gateway_config::load_for_update().unwrap();
+        let profile = config.profile("legacy-corp").unwrap().clone();
+        let error = expect_credential_error(migrate_legacy_provider_credential(
+            &mut config,
+            &profile,
+            |_, _| Err("protected store unavailable".into()),
+        ));
+        assert!(error.contains("protected store unavailable"));
+        assert!(config.has_pending_legacy_secret());
+        assert!(fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("synthetic-legacy-secret"));
+
+        let migrated = migrate_legacy_provider_credential(&mut config, &profile, |id, secret| {
+            assert_eq!(id, "legacy-corp");
+            assert_eq!(secret, "synthetic-legacy-secret");
+            Ok("keychain:provider/legacy-corp/api-key".into())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(migrated.provider_id, "legacy-corp");
+        assert_eq!(migrated.bearer, "synthetic-legacy-secret");
+        let raw = fs::read_to_string(&config_path).unwrap();
+        assert!(!raw.contains("synthetic-legacy-secret"));
+        assert!(!raw.contains("api_key"));
+        assert!(raw.contains("keychain:provider/legacy-corp/api-key"));
+
+        assert!(
+            migrate_legacy_provider_credential(&mut config, &profile, |_, _| {
+                panic!("idempotent migration must not write the protected store twice")
+            })
+            .unwrap()
+            .is_none()
+        );
+
+        set_grokptah_home_override(None);
+    }
 }
