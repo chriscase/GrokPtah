@@ -22,6 +22,7 @@ import {
   ContextMenu,
   type ContextMenuState,
 } from "./components/ContextMenu";
+import { ComputerCockpit } from "./components/ComputerCockpit";
 import { FleetStrip } from "./components/FleetStrip";
 import { SearchPanel } from "./components/SearchPanel";
 import { SessionBrowser } from "./components/SessionBrowser";
@@ -82,6 +83,10 @@ import { useComposerQueue } from "./lib/useComposerQueue";
 import { findTabOfKind, kindForTab } from "./lib/sessionTab";
 
 type WorkspaceMode = "build" | "chat";
+
+function titleCaseComputerState(value: string) {
+  return value.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
 
 type RightTab =
   | "files"
@@ -341,6 +346,8 @@ export default function App() {
   const maxDocks = useMaxDocks(stageRef, layoutDensity);
   const splitOk = maxDocks >= 2;
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
+  const [computerOpen, setComputerOpen] = useState(false);
+  const [computerRunState, setComputerRunState] = useState<string | null>(null);
   const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
   const runsRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
   const runsRefreshInFlight = useRef<{ sessionId: string; request: number } | null>(null);
@@ -2037,6 +2044,25 @@ export default function App() {
             >
               Live
             </button>
+            <button
+              type="button"
+              className={`chrome-toggle ${computerOpen ? "is-on" : ""}`}
+              aria-pressed={computerOpen}
+              title="Open Computer Run cockpit"
+              onClick={() => setComputerOpen((open) => !open)}
+            >
+              {computerRunState &&
+                ![
+                  "completed",
+                  "failed",
+                  "cancelled",
+                  "interrupted",
+                  "limit_reached",
+                ].includes(computerRunState) && (
+                  <span className="computer-chrome-dot" aria-hidden />
+                )}
+              Computer
+            </button>
           </div>
           <button type="button" onClick={() => void openProject()}>
             Open folder
@@ -2149,6 +2175,19 @@ export default function App() {
             Chats
           </button>
         </div>
+        <button
+          type="button"
+          className={`computer-mode-entry ${computerOpen ? "active" : ""}`}
+          aria-pressed={computerOpen}
+          onClick={() => setComputerOpen(true)}
+        >
+          <span>Computer Run</span>
+          <small>
+            {computerRunState
+              ? titleCaseComputerState(computerRunState)
+              : "Off"}
+          </small>
+        </button>
         <div className="sidebar-actions">
           <button
             type="button"
@@ -2261,7 +2300,7 @@ export default function App() {
       </aside>
 
       <main
-        className={`main density-${layoutDensity} ${
+        className={`main density-${layoutDensity} ${computerOpen ? "computer-open" : ""} ${
           docks.length > 1 ? "is-split" : ""
         }`}
       >
@@ -2370,6 +2409,34 @@ export default function App() {
               </button>
             )}
           </div>
+        )}
+        {computerOpen && (
+          <ComputerCockpit
+            sessionId={activeSessionId}
+            sessionTitle={activeTab?.title ?? activeSummary?.title}
+            model={status?.model ?? "unknown"}
+            effort={status?.effort ?? "unknown"}
+            sessionBusy={busy}
+            onClose={() => setComputerOpen(false)}
+            onRunState={setComputerRunState}
+            onSteer={async (text) => {
+              if (!activeSessionId) {
+                throw new Error("Select a session before steering");
+              }
+              const requestVersion = invalidateQueue(activeSessionId);
+              const receipt = await api.sessionSteer(activeSessionId, text);
+              if (isCurrentQueueRequest(activeSessionId, requestVersion)) {
+                dispatchQueue({
+                  type: "replace",
+                  sessionId: activeSessionId,
+                  entries: receipt.entries,
+                });
+              }
+              return receipt.disposition === "pending"
+                ? "Steering will apply at the next safe step."
+                : "Priority prompt preserved for the next turn.";
+            }}
+          />
         )}
         {activeIsBuild && activeSessionId && (
           <div className="session-cwd-bar">

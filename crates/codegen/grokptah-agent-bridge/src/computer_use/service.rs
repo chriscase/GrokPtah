@@ -341,6 +341,41 @@ impl ComputerUseService {
         result
     }
 
+    /// Immediately yields control to the local operator. This is deliberately
+    /// distinct from pause in the durable audit trail even though both revoke
+    /// all outstanding authority and cancel backend work.
+    pub async fn take_over(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+    ) -> ComputerResult<ComputerRun> {
+        validate_id("run_id", run_id)?;
+        let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
+        if let Some(replayed) = self.begin_mutation(request_id, "take_over", &payload)? {
+            return replayed;
+        }
+        let taken_over = self
+            .store
+            .update_run(run_id, |run| {
+                ensure_version(run, expected_version)?;
+                run.transition(ComputerRunState::Paused)?;
+                revoke_authority(run);
+                run.record_audit("take_over", "operator_control", None, None, None);
+                Ok(())
+            })
+            .and_then(|run| run.ok_or_else(unknown_run));
+        let result = match taken_over {
+            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Err(error) => {
+                self.record_denial(run_id, "take_over", None, &error);
+                Err(error)
+            }
+        };
+        self.finish_mutation(request_id, &result)?;
+        result
+    }
+
     pub async fn cancel(&self, request_id: &str, run_id: &str) -> ComputerResult<ComputerRun> {
         validate_id("run_id", run_id)?;
         let payload = json!({ "runId": run_id });
@@ -920,6 +955,32 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::InvalidState);
+    }
+
+    #[tokio::test]
+    async fn take_over_revokes_authority_and_is_distinct_in_audit() {
+        let (_backend, service) = service();
+        let run = service
+            .create_run(
+                "create-takeover",
+                Uuid::new_v4(),
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize("grant-takeover", &run.run_id, run.version, grant(&run))
+            .unwrap();
+        let taken_over = service
+            .take_over("takeover-1", &run.run_id, run.version)
+            .await
+            .unwrap();
+
+        assert_eq!(taken_over.state, ComputerRunState::Paused);
+        assert!(taken_over.grant.unwrap().revoked_at.is_some());
+        assert!(taken_over.audit.iter().any(|entry| {
+            entry.operation == "take_over" && entry.disposition == "operator_control"
+        }));
     }
 
     #[tokio::test]

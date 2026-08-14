@@ -3,6 +3,8 @@ import type {
   AgentStatus,
   AuthState,
   ComputerObservationPreview,
+  ComputerAction,
+  ComputerCockpitSnapshot,
   ComputerPermissionStatus,
   ComputerPlatformStatus,
   ComputerTargetCandidate,
@@ -42,6 +44,81 @@ export const api = {
   computerUseObserveOnce: (selectionToken: string) =>
     invoke<ComputerObservationPreview>("computer_use_observe_once", {
       selectionToken,
+    }),
+  computerUseCockpitSnapshot: (sessionId: string) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_snapshot", {
+      sessionId,
+    }),
+  computerUseCockpitStartSimulator: (
+    sessionId: string,
+    reviewedTargetAppId: string,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_start_simulator", {
+      sessionId,
+      reviewedTargetAppId,
+    }),
+  computerUseCockpitRefresh: (
+    sessionId: string,
+    runId: string,
+    expectedVersion: number,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_refresh", {
+      sessionId,
+      runId,
+      expectedVersion,
+    }),
+  computerUseCockpitStageAction: (
+    sessionId: string,
+    runId: string,
+    expectedVersion: number,
+    observationId: string,
+    action: ComputerAction,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_stage_action", {
+      sessionId,
+      runId,
+      expectedVersion,
+      observationId,
+      action,
+    }),
+  computerUseCockpitApprove: (
+    sessionId: string,
+    approvalId: string,
+    requestId: string,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_approve", {
+      sessionId,
+      approvalId,
+      requestId,
+    }),
+  computerUseCockpitDiscardApproval: (sessionId: string) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_discard_approval", {
+      sessionId,
+    }),
+  computerUseCockpitPause: (
+    sessionId: string,
+    runId: string,
+    expectedVersion: number,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_pause", {
+      sessionId,
+      runId,
+      expectedVersion,
+    }),
+  computerUseCockpitTakeOver: (
+    sessionId: string,
+    runId: string,
+    expectedVersion: number,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_take_over", {
+      sessionId,
+      runId,
+      expectedVersion,
+    }),
+  computerUseCockpitStop: (sessionId: string, runId: string) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_stop", {
+      sessionId,
+      runId,
     }),
   setProjectCwd: (path: string) => invoke<string>("set_project_cwd", { path }),
   pickProjectFolder: () => invoke<string | null>("pick_project_folder"),
