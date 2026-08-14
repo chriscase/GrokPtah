@@ -28,6 +28,9 @@ parking_lot = "0.12"
 portable-pty = "0.8"
 base64 = "0.22"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lib]
 name = "grokptah_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

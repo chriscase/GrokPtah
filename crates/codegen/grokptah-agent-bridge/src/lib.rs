@@ -80,7 +80,7 @@ pub use computer_use::{
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerPolicy, ComputerRun, ComputerRunState, ComputerStore,
     ComputerTarget, ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SimulatorBackend,
+    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,

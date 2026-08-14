@@ -452,6 +452,94 @@ export interface ComputerObservationPreview {
   imageDataUrl?: string | null;
 }
 
+export type ComputerAction =
+  | { type: "invoke"; element_id: string }
+  | { type: "set_value"; element_id: string; text: string };
+
+export interface ComputerSemanticElement {
+  elementId: string;
+  role: string;
+  label?: string | null;
+  value?: string | null;
+  enabled: boolean;
+  focused: boolean;
+  sensitivity: string;
+  actions: string[];
+}
+
+export interface ComputerRun {
+  runId: string;
+  ownerSessionId: string;
+  target: ComputerTargetCandidate["target"];
+  state: string;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string | null;
+  endedAt?: string | null;
+  limits: {
+    maxActions: number;
+    maxDurationSecs: number;
+  };
+  actionCount: number;
+  currentObservation?: {
+    observationId: string;
+    sequence: number;
+    capturedAt: string;
+    target: ComputerTargetCandidate["target"];
+    elements: ComputerSemanticElement[];
+    elementsTruncated: boolean;
+  } | null;
+  grant?: {
+    grantId: string;
+    expiresAt: string;
+    usesRemaining?: number | null;
+    revokedAt?: string | null;
+    actionClasses: string[];
+  } | null;
+  lastOutcome?: {
+    summary: string;
+    expectedPostconditionMet?: boolean | null;
+  } | null;
+  lastError?: { code: string; message: string } | null;
+  audit: Array<{
+    sequence: number;
+    at: string;
+    operation: string;
+    disposition: string;
+    actionClass?: string | null;
+    observationId?: string | null;
+    errorCode?: string | null;
+  }>;
+}
+
+export interface PendingComputerApproval {
+  approvalId: string;
+  ownerSessionId: string;
+  runId: string;
+  runVersion: number;
+  observationId: string;
+  targetLabel: string;
+  action: ComputerAction;
+  actionSummary: string;
+  risk: string;
+  createdAt: string;
+}
+
+export interface ComputerCockpitSnapshot {
+  backend: {
+    backendId: string;
+    observe: boolean;
+    semanticActions: boolean;
+    textEntry: boolean;
+    keyChords: boolean;
+    pointerFallback: boolean;
+  };
+  origin: "desktop" | "mcp" | string;
+  run?: ComputerRun | null;
+  pendingApproval?: PendingComputerApproval | null;
+}
+
 export type SubagentExecutionMode =
   | "unknown"
   | "worktree"

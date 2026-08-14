@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use grokptah_agent_bridge::{
-    desktop_auto_update_enabled, AuthState, BackgroundTask, ComputerPermission,
+    desktop_auto_update_enabled, AuthState, BackgroundTask, ComputerAction, ComputerPermission,
     ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
     JournalPage, McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
     PromptQueueRunNextResult, PromptQueueTakeResult, RunExecutionMode, RunReview, RunState,
@@ -105,6 +105,153 @@ pub async fn computer_use_observe_once(
     state
         .computer_use
         .observe_once(&selection_token, owner_session_id)
+        .await
+}
+
+fn computer_owner(state: &AppState, session_id: &str) -> Result<Uuid, String> {
+    let owner = Uuid::parse_str(session_id).map_err(map_err)?;
+    state
+        .host
+        .list_all_sessions()
+        .iter()
+        .any(|session| session.id == owner)
+        .then_some(owner)
+        .ok_or_else(|| "Computer Use requires an existing local session".to_string())
+}
+
+#[tauri::command]
+pub fn computer_use_cockpit_snapshot(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .cockpit_snapshot(computer_owner(&state, &session_id)?)
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_start_simulator(
+    state: State<'_, AppState>,
+    session_id: String,
+    reviewed_target_app_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .start_simulator(
+            computer_owner(&state, &session_id)?,
+            &reviewed_target_app_id,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_refresh(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    expected_version: u64,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .refresh_simulator(
+            computer_owner(&state, &session_id)?,
+            &run_id,
+            expected_version,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_stage_action(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    expected_version: u64,
+    observation_id: String,
+    action: ComputerAction,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .stage_simulator_action(
+            computer_owner(&state, &session_id)?,
+            &run_id,
+            expected_version,
+            &observation_id,
+            action,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_approve(
+    state: State<'_, AppState>,
+    session_id: String,
+    approval_id: String,
+    request_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .approve_simulator_action(
+            computer_owner(&state, &session_id)?,
+            &approval_id,
+            &request_id,
+        )
+        .await
+}
+
+#[tauri::command]
+pub fn computer_use_cockpit_discard_approval(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .discard_simulator_approval(computer_owner(&state, &session_id)?)
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_pause(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    expected_version: u64,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .pause_simulator(
+            computer_owner(&state, &session_id)?,
+            &run_id,
+            expected_version,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_take_over(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    expected_version: u64,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .take_over_simulator(
+            computer_owner(&state, &session_id)?,
+            &run_id,
+            expected_version,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_stop(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .stop_simulator(computer_owner(&state, &session_id)?, &run_id)
         .await
 }
 
