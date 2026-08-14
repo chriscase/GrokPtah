@@ -32,7 +32,7 @@ Every capability is **shipped**, **via shell**, or **explicitly deferred**. Noth
 | kill_task / task_output | background task cancel + shell cancel | **shipped** (partial) | Via Tasks panel / `cancel_background_task` / turn cancel — not full Build IDs |
 | notifications | desktop OS notifications | **deferred** | Track under residual; no ship issue yet |
 | notebook | — | **deferred** | Not planned in bridge |
-| browser / computer use | — | **deferred** | Out of scope for thin loop |
+| browser / computer use | — | **deferred** | Safety foundation in #267/#268; no native adapter or Build tool is shipped yet ([design](COMPUTER_USE.md)) |
 | image_gen | — | **deferred** | Desktop may use separate Imagine path |
 | semantic search | — | **deferred** | Grep + glob only |
 | git specialized tools | shell | **via shell** | Use `run_terminal_cmd` |

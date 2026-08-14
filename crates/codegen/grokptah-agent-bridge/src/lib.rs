@@ -6,6 +6,7 @@
 mod agents_personas;
 mod auth_store;
 mod completion;
+pub mod computer_use;
 mod discover;
 pub mod eval_oracle;
 pub mod eval_report;
@@ -72,6 +73,12 @@ pub use memory::{
 pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
     CompletionUsage,
+};
+pub use computer_use::{
+    ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
+    ComputerCapabilities, ComputerError, ComputerErrorCode, ComputerObservation, ComputerPolicy,
+    ComputerRun, ComputerRunState, ComputerStore, ComputerTarget, ComputerUseLimits,
+    ComputerUseService, GrantIssuer, SimulatorBackend,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
