@@ -134,6 +134,11 @@ bool gpt_macos_request_accessibility(void) {
 }
 
 static SCShareableContent *GPTShareableContent(void) API_AVAILABLE(macos(14.0)) {
+    // The bridge smoke can run as a non-AppKit CLI; the packaged desktop app
+    // already has NSApplication initialized, so this is a no-op there.
+    if (NSApp == nil) {
+        (void)NSApplicationLoad();
+    }
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     __block SCShareableContent *captured = nil;
     Class shareableContentClass = NSClassFromString(@"SCShareableContent");
@@ -188,7 +193,8 @@ static NSDictionary *GPTFrameDictionary(CGRect frame) {
 static BOOL GPTUsableWindow(SCWindow *window) API_AVAILABLE(macos(14.0)) {
     SCRunningApplication *application = window.owningApplication;
     CGRect frame = window.frame;
-    return application != nil && !GPTDeniedBundle(application.bundleIdentifier) &&
+    return application != nil && application.bundleIdentifier.length > 0 &&
+           !GPTDeniedBundle(application.bundleIdentifier) &&
            window.windowID != 0 && window.windowLayer == 0 && isfinite(frame.origin.x) &&
            isfinite(frame.origin.y) && isfinite(frame.size.width) &&
            isfinite(frame.size.height) && frame.size.width >= 4.0 &&
@@ -208,7 +214,8 @@ static NSDictionary *GPTWindowDictionary(SCWindow *window) API_AVAILABLE(macos(1
         @"frame" : GPTFrameDictionary(window.frame),
         @"onScreen" : @(onScreen),
         @"active" : @(active),
-        @"minimized" : @(!onScreen && !active),
+        // Box the expression as BOOL so NSJSONSerialization emits JSON true/false.
+        @"minimized" : @((BOOL)(!onScreen && !active)),
     };
 }
 
@@ -279,7 +286,7 @@ static NSNumber *GPTCopyAXBool(AXUIElementRef element, CFStringRef attribute) {
     }
     NSNumber *result = nil;
     if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
-        result = @(CFBooleanGetValue((CFBooleanRef)value));
+        result = @((BOOL)CFBooleanGetValue((CFBooleanRef)value));
     }
     CFRelease(value);
     return result;
@@ -855,15 +862,18 @@ static AXError GPTPerformNamedAction(AXUIElementRef element, CFStringRef preferr
 }
 
 static GPTMacNativeResult GPTActionResult(NSString *summary, id postcondition) {
+    id normalizedPostcondition = postcondition == nil || postcondition == [NSNull null]
+        ? [NSNull null]
+        : @((BOOL)[postcondition boolValue]);
     return GPTJSONResult(
         @{
             @"summary" : summary,
-            @"expectedPostconditionMet" : postcondition ?: [NSNull null],
+            @"expectedPostconditionMet" : normalizedPostcondition,
         },
         nil);
 }
 
-GPTMacNativeResult gpt_macos_act(const uint8_t *requestBytes, size_t requestLength) {
+static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t requestLength) {
     @autoreleasepool {
         if (requestBytes == NULL || requestLength == 0 || requestLength > 64 * 1024) {
             return GPTErrorResult(GPT_MAC_INVALID_REQUEST, @"invalid macOS action request size");
@@ -1031,7 +1041,7 @@ GPTMacNativeResult gpt_macos_act(const uint8_t *requestBytes, size_t requestLeng
                     NSNumber *selected = actionError == kAXErrorSuccess
                         ? GPTCopyAXBool(element, kAXSelectedAttribute)
                         : nil;
-                    postcondition = @(selected.boolValue);
+                    postcondition = @((BOOL)selected.boolValue);
                 } else {
                     actionError = GPTPerformNamedAction(element, kAXPressAction);
                 }
@@ -1079,6 +1089,17 @@ GPTMacNativeResult gpt_macos_act(const uint8_t *requestBytes, size_t requestLeng
             return GPTActionResult(summary, postcondition);
         }
         return GPTErrorResult(GPT_MAC_UNSUPPORTED, @"macOS 14 or later is required");
+    }
+}
+
+GPTMacNativeResult gpt_macos_act(const uint8_t *requestBytes, size_t requestLength) {
+    @try {
+        return GPTActImpl(requestBytes, requestLength);
+    } @catch (NSException *exception) {
+        (void)exception;
+        return GPTErrorResult(
+            GPT_MAC_BACKEND_FAILURE,
+            @"macOS semantic action raised an Objective-C exception");
     }
 }
 
@@ -1176,7 +1197,7 @@ GPTMacNativeResult gpt_macos_observe(
                 @"pixelHeight" : @(pixelHeight),
                 @"privacyRedacted" : @YES,
                 @"nodes" : nodes,
-                @"nodesTruncated" : @(nodesTruncated),
+                @"nodesTruncated" : @((BOOL)nodesTruncated),
                 @"sensitivity" : @"none",
             };
             return GPTJSONResult(observation, png);

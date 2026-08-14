@@ -34,7 +34,9 @@ async fn main() -> anyhow::Result<()> {
         .list_targets()
         .await?
         .into_iter()
-        .find(|candidate| candidate.target.app_id == DEMO_BUNDLE_ID)
+        .find(|candidate| {
+            candidate.target.app_id == DEMO_BUNDLE_ID && candidate.on_screen && !candidate.minimized
+        })
         .ok_or_else(|| anyhow::anyhow!("repository Computer Use demo window is not running"))?;
     let backend = platform.bind_target(&candidate.selection_token).await?;
     let temp = tempfile::tempdir()?;
