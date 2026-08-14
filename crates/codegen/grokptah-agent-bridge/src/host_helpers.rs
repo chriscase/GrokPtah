@@ -1364,33 +1364,291 @@ pub(crate) fn build_agent_messages(
     messages
 }
 
-pub(crate) fn resolve_api_base(
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedModelTarget {
+    pub base_url: String,
+    pub wire_model: String,
+    pub dialect: crate::gateway_config::ProviderDialect,
+    pub capabilities: crate::gateway_config::ModelCapabilities,
+    pub deadline_class: crate::gateway_config::ProviderDeadlineClass,
+}
+
+pub(crate) fn resolve_model_target(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
-) -> (String, String) {
-    let entry = crate::models_catalog::lookup(model);
-    let model_id = entry
-        .as_ref()
-        .map(|e| e.wire_model.as_str())
-        .unwrap_or(model)
-        .to_string();
-    // Explicit base overrides (gateway #169): env, then gateway.json, then defaults.
-    // OIDC default path is unchanged when none of these are set.
-    let explicit_base = crate::gateway_config::effective_base_url();
-    let base = if let Some(env) = explicit_base {
-        env
-    } else if creds.oidc_token_auth {
-        entry
+) -> Result<ResolvedModelTarget> {
+    let selection =
+        crate::gateway_config::parse_model_selection(model).map_err(anyhow::Error::msg)?;
+    if selection.provider_id != creds.provider_id {
+        bail!(
+            "provider credential mismatch: model belongs to `{}`, credential belongs to `{}`",
+            selection.provider_id,
+            creds.provider_id
+        );
+    }
+
+    if selection.provider_id == crate::gateway_config::XAI_PROVIDER_ID {
+        let entry = crate::models_catalog::lookup(&selection.model_id);
+        let wire_model = entry
             .as_ref()
-            .and_then(|e| e.base_url.clone())
-            .filter(|u| u.contains("cli-chat-proxy") || u.contains("x.ai"))
-            .unwrap_or_else(|| "https://cli-chat-proxy.grok.com/v1".into())
-    } else if let Some(u) = entry.as_ref().and_then(|e| e.base_url.clone()) {
-        u
-    } else {
-        "https://api.x.ai/v1".into()
+            .map(|item| item.wire_model.clone())
+            .unwrap_or(selection.model_id);
+        let base_url = if let Ok(value) = std::env::var("XAI_API_BASE") {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            if creds.oidc_token_auth {
+                entry
+                    .as_ref()
+                    .and_then(|item| item.base_url.clone())
+                    .filter(|url| url.contains("cli-chat-proxy") || url.contains("x.ai"))
+                    .unwrap_or_else(|| "https://cli-chat-proxy.grok.com/v1".into())
+            } else {
+                entry
+                    .as_ref()
+                    .and_then(|item| item.base_url.clone())
+                    .unwrap_or_else(|| "https://api.x.ai/v1".into())
+            }
+        });
+        let effort_options = entry
+            .as_ref()
+            .map(|item| item.info.effort_options.clone())
+            .unwrap_or_default();
+        return Ok(ResolvedModelTarget {
+            base_url,
+            wire_model,
+            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
+            capabilities: crate::gateway_config::ModelCapabilities {
+                chat: true,
+                tools: true,
+                stream: true,
+                parallel_tool_calls: true,
+                effort_options,
+                source: crate::gateway_config::CapabilitySource::Declared,
+                qualification_schema: None,
+                ..crate::gateway_config::ModelCapabilities::default()
+            },
+            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
+        });
+    }
+
+    let config = crate::gateway_config::load();
+    let profile = config
+        .profile(&selection.provider_id)
+        .ok_or_else(|| anyhow!("unknown provider profile `{}`", selection.provider_id))?;
+    let provider_model = profile
+        .models
+        .iter()
+        .find(|item| item.id == selection.model_id)
+        .cloned()
+        .or_else(|| {
+            if profile.managed_by_env {
+                let mut model =
+                    crate::gateway_config::ProviderModel::unqualified(selection.model_id.clone());
+                model.capabilities.tools = true;
+                model.capabilities.stream = true;
+                model.capabilities.parallel_tool_calls = true;
+                model.capabilities.source = crate::gateway_config::CapabilitySource::Declared;
+                Some(model)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "model `{}` is not registered on provider `{}`",
+                selection.model_id,
+                profile.id
+            )
+        })?;
+    Ok(ResolvedModelTarget {
+        base_url: profile.base_url.clone(),
+        wire_model: provider_model.id,
+        dialect: profile.dialect,
+        capabilities: provider_model.capabilities,
+        deadline_class: profile.deadline_class,
+    })
+}
+
+fn apply_effort_to_agent_body(
+    body: &mut serde_json::Value,
+    target: &ResolvedModelTarget,
+    effort: EffortLevel,
+) -> Result<()> {
+    if matches!(effort, EffortLevel::None) {
+        return Ok(());
+    }
+    match target.dialect {
+        crate::gateway_config::ProviderDialect::XaiChatCompletions => {
+            // Preserve the existing Grok Build/cli-chat-proxy contract.
+            body["effort"] = serde_json::Value::String(effort.as_str().into());
+            body["reasoning"] = serde_json::json!({ "effort": effort.as_str() });
+            Ok(())
+        }
+        crate::gateway_config::ProviderDialect::OpenAiChatCompletions => {
+            if !target
+                .capabilities
+                .effort_options
+                .iter()
+                .any(|value| value == effort.as_str())
+            {
+                bail!(
+                    "reasoning effort `{}` is not qualified for this provider/model; choose none{}",
+                    effort.as_str(),
+                    if target.capabilities.effort_options.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " or one of {}",
+                            target.capabilities.effort_options.join(", ")
+                        )
+                    }
+                );
+            }
+            body["reasoning_effort"] = serde_json::Value::String(effort.as_str().to_string());
+            Ok(())
+        }
+    }
+}
+
+#[derive(Default)]
+struct AgentSseAccumulator {
+    content: String,
+    reasoning: String,
+    streamed_any: bool,
+    saw_data: bool,
+    tool_calls: std::collections::BTreeMap<u32, (String, String, String)>,
+}
+
+fn apply_agent_sse_line<F, G>(
+    line: &str,
+    acc: &mut AgentSseAccumulator,
+    on_delta: &mut F,
+    on_thought: &mut G,
+) -> Result<bool>
+where
+    F: FnMut(&str),
+    G: FnMut(&str),
+{
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+        return Ok(false);
+    }
+    let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+        return Ok(false);
     };
-    (base, model_id)
+    if data.is_empty() {
+        return Ok(false);
+    }
+    acc.saw_data = true;
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+    let value: serde_json::Value = serde_json::from_str(data)
+        .map_err(|error| anyhow!("malformed provider SSE JSON: {error}"))?;
+    let delta = if value["choices"][0]["delta"].is_object() {
+        &value["choices"][0]["delta"]
+    } else if value["choices"][0]["message"].is_object() {
+        &value["choices"][0]["message"]
+    } else {
+        return Ok(false);
+    };
+
+    if let Some(content) = delta["content"].as_str().filter(|text| !text.is_empty()) {
+        acc.content.push_str(content);
+        acc.streamed_any = true;
+        on_delta(content);
+    }
+    if let Some(reasoning) = delta["reasoning_content"]
+        .as_str()
+        .filter(|text| !text.is_empty())
+    {
+        acc.reasoning.push_str(reasoning);
+        on_thought(reasoning);
+    }
+    if let Some(tool_calls) = delta["tool_calls"].as_array() {
+        for tool_call in tool_calls {
+            let index = tool_call["index"].as_u64().unwrap_or(0) as u32;
+            let entry = acc
+                .tool_calls
+                .entry(index)
+                .or_insert_with(|| (String::new(), String::new(), String::new()));
+            if let Some(id) = tool_call["id"].as_str().filter(|id| !id.is_empty()) {
+                entry.0 = id.to_string();
+            }
+            if let Some(name) = tool_call["function"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+            {
+                entry.1.push_str(name);
+            }
+            match &tool_call["function"]["arguments"] {
+                serde_json::Value::String(arguments) => entry.2.push_str(arguments),
+                other if !other.is_null() => entry.2.push_str(&other.to_string()),
+                _ => {}
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn read_bounded_response_body(
+    response: reqwest::Response,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    let mut body = crate::sse::BoundedBodyAccumulator::new();
+    let mut stream = response.bytes_stream();
+    loop {
+        let chunk = tokio::select! {
+            chunk = stream.next() => chunk,
+            _ = cancel.cancelled() => bail!("cancelled"),
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        body.push(&chunk.map_err(|error| anyhow!("provider response body: {error}"))?)?;
+    }
+    body.finish()
+}
+
+fn finish_streamed_tool_calls(
+    tool_calls: std::collections::BTreeMap<u32, (String, String, String)>,
+    stream_completed: bool,
+) -> Result<Vec<AgentToolCall>> {
+    if !tool_calls.is_empty() && !stream_completed {
+        bail!("provider stream ended before completing its tool call response");
+    }
+    let mut finished = Vec::new();
+    for (id, name, arguments) in tool_calls.into_values() {
+        if id.is_empty() || name.is_empty() {
+            bail!("provider returned an incomplete streamed tool call");
+        }
+        let parsed_arguments: serde_json::Value = serde_json::from_str(&arguments)
+            .map_err(|error| anyhow!("provider returned malformed tool arguments: {error}"))?;
+        if !parsed_arguments.is_object() {
+            bail!("provider tool arguments must be a JSON object");
+        }
+        finished.push(AgentToolCall {
+            id,
+            name,
+            arguments,
+        });
+    }
+    Ok(finished)
+}
+
+fn ensure_stream_completed(saw_data: bool, stream_completed: bool) -> Result<()> {
+    if saw_data && !stream_completed {
+        bail!("provider stream disconnected before its completion marker");
+    }
+    Ok(())
 }
 
 /// Stream one chat/completions step (tools + tokens).
@@ -1412,10 +1670,20 @@ where
     G: FnMut(&str),
 {
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
-    let (base, model_id) = resolve_api_base(&creds, model);
+    let target = resolve_model_target(&creds, model)?;
+    if !target.capabilities.tools {
+        bail!(
+            "provider model `{}` is not qualified for coding tools; use Chat or qualify native tool calling first",
+            target.wire_model
+        );
+    }
+    let base = target.base_url.clone();
+    let model_id = target.wire_model.clone();
+    let request_timeout = target.deadline_class.agent_timeout();
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
+        .timeout(request_timeout)
         .connect_timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!(
             "grok/{} (GrokPtah)",
             crate::auth_store::client_version_header()
@@ -1428,12 +1696,9 @@ where
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",
-        "stream": true
+        "stream": target.capabilities.stream
     });
-    if !matches!(effort, EffortLevel::None) {
-        body["effort"] = serde_json::Value::String(effort.as_str().into());
-        body["reasoning"] = serde_json::json!({ "effort": effort.as_str() });
-    }
+    apply_effort_to_agent_body(&mut body, &target, effort)?;
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
     let mut last_err = None::<String>;
@@ -1442,11 +1707,13 @@ where
             bail!("cancelled");
         }
         let send_once = |c: &crate::auth_store::WireCredentials| {
-            let req = client
+            let mut req = client
                 .post(&url)
                 .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream")
-                .header("x-grok-effort", effort.as_str());
+                .header("Accept", "text/event-stream");
+            if target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions {
+                req = req.header("x-grok-effort", effort.as_str());
+            }
             let req = crate::auth_store::apply_auth_headers(req, c, &base);
             req.json(&body)
         };
@@ -1458,7 +1725,21 @@ where
         let mut resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
-                last_err = Some(format!("request error: {e}"));
+                last_err = Some(
+                    if target.dialect
+                        == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
+                    {
+                        if e.is_timeout() {
+                            "configured provider request timed out".into()
+                        } else if e.is_connect() {
+                            "configured provider could not connect".into()
+                        } else {
+                            "configured provider request failed".into()
+                        }
+                    } else {
+                        format!("request error: {e}")
+                    },
+                );
                 if attempt < 3 {
                     tokio::time::sleep(std::time::Duration::from_millis(400 * (1 << attempt)))
                         .await;
@@ -1479,7 +1760,9 @@ where
                     };
                 }
                 Err(e) => {
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = read_bounded_response_body(resp, cancel)
+                        .await
+                        .unwrap_or_default();
                     bail!(
                         "HTTP 401 (refresh failed: {e}): {}",
                         text.chars().take(400).collect::<String>()
@@ -1493,10 +1776,20 @@ where
             || status.is_server_error()
             || status == reqwest::StatusCode::REQUEST_TIMEOUT
         {
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_bounded_response_body(resp, cancel)
+                .await
+                .unwrap_or_default();
             let clipped: String = text.chars().take(400).collect();
+            let compatible =
+                target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
             last_err = Some(if status.as_u16() == 429 {
-                format!("HTTP 429 rate limited (will retry): {clipped}")
+                if compatible {
+                    "configured provider rate limited the request (HTTP 429)".into()
+                } else {
+                    format!("HTTP 429 rate limited (will retry): {clipped}")
+                }
+            } else if compatible {
+                format!("configured provider returned HTTP {status}")
             } else {
                 format!("HTTP {status}: {clipped}")
             });
@@ -1508,9 +1801,27 @@ where
         }
 
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_bounded_response_body(resp, cancel)
+                .await
+                .unwrap_or_default();
+            // Some compatible gateways support native tools but reject the
+            // optional tool_choice field. Retry once without that foreign
+            // field before changing the streaming contract.
+            if status.as_u16() == 400
+                && target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
+                && body.get("tool_choice").is_some()
+            {
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("tool_choice");
+                }
+                last_err = Some("HTTP 400 (will retry without tool_choice)".into());
+                continue;
+            }
             // Some proxies reject stream+tools — fall back to non-stream once.
-            if attempt == 0 && status.as_u16() == 400 {
+            if attempt < 2
+                && status.as_u16() == 400
+                && body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
+            {
                 body["stream"] = serde_json::Value::Bool(false);
                 last_err = Some(format!(
                     "HTTP {status} (will retry non-stream): {}",
@@ -1518,15 +1829,27 @@ where
                 ));
                 continue;
             }
+            if target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
+                bail!("configured provider returned HTTP {status}");
+            }
             bail!(
                 "HTTP {status}: {}",
                 text.chars().take(800).collect::<String>()
             );
         }
 
-        // Non-stream JSON body (fallback path)
+        // Non-stream JSON body (fallback path). Some compatible gateways also
+        // return this shape despite accepting `stream=true`.
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
-            let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
+            let raw = read_bounded_response_body(resp, cancel).await?;
+            let v: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
             // Note: session usage is accumulated in the turn loop when available.
             let _ = v.get("usage"); // kept for future wire-through of session_id
             return parse_agent_step_from_message(
@@ -1536,16 +1859,24 @@ where
                 &mut on_thought,
             );
         }
+        if content_type.contains("application/json") {
+            let raw = read_bounded_response_body(resp, cancel).await?;
+            let value: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
+            return parse_agent_step_from_message(
+                &value["choices"][0]["message"],
+                false,
+                &mut on_delta,
+                &mut on_thought,
+            );
+        }
 
         // SSE stream path — cancel kills the body read promptly.
         let mut stream = resp.bytes_stream();
-        let mut line_buf = String::new();
-        let mut content = String::new();
-        let mut reasoning = String::new();
-        let mut streamed_any = false;
-        // index → partial tool call
-        let mut tc_map: std::collections::BTreeMap<u32, (String, String, String)> =
-            std::collections::BTreeMap::new();
+        let mut decoder = crate::sse::SseLineDecoder::new();
+        let mut full_body = crate::sse::BoundedBodyAccumulator::new();
+        let mut acc = AgentSseAccumulator::default();
+        let mut done = false;
 
         loop {
             let chunk = tokio::select! {
@@ -1559,122 +1890,65 @@ where
                 break;
             };
             let bytes = chunk.map_err(|e| anyhow!("stream: {e}"))?;
-            line_buf.push_str(&String::from_utf8_lossy(&bytes));
-
-            while let Some(nl) = line_buf.find('\n') {
-                let mut line = line_buf[..nl].to_string();
-                line_buf = line_buf[nl + 1..].to_string();
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-                let line = line.trim();
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let data = data.trim();
-                if data == "[DONE]" {
-                    line_buf.clear();
-                    // force outer break
-                    line_buf.push_str("__DONE__");
+            if !acc.saw_data {
+                full_body.push(&bytes)?;
+            }
+            for line in decoder.push(&bytes)? {
+                if apply_agent_sse_line(&line, &mut acc, &mut on_delta, &mut on_thought)? {
+                    done = true;
                     break;
                 }
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
-                    continue;
-                };
-                // Prefer delta (stream) but accept full message (some gateways)
-                let delta = if v["choices"][0]["delta"].is_object() {
-                    &v["choices"][0]["delta"]
-                } else if v["choices"][0]["message"].is_object() {
-                    &v["choices"][0]["message"]
-                } else {
-                    continue;
-                };
-
-                if let Some(c) = delta["content"].as_str() {
-                    if !c.is_empty() {
-                        content.push_str(c);
-                        streamed_any = true;
-                        on_delta(c);
-                    }
-                }
-                if let Some(r) = delta["reasoning_content"].as_str() {
-                    if !r.is_empty() {
-                        reasoning.push_str(r);
-                        on_thought(r);
-                    }
-                }
-                if let Some(arr) = delta["tool_calls"].as_array() {
-                    for tc in arr {
-                        let idx = tc["index"].as_u64().unwrap_or(0) as u32;
-                        let entry = tc_map
-                            .entry(idx)
-                            .or_insert_with(|| (String::new(), String::new(), String::new()));
-                        if let Some(id) = tc["id"].as_str() {
-                            if !id.is_empty() {
-                                entry.0 = id.to_string();
-                            }
-                        }
-                        if let Some(name) = tc["function"]["name"].as_str() {
-                            if !name.is_empty() {
-                                entry.1.push_str(name);
-                            }
-                        }
-                        match &tc["function"]["arguments"] {
-                            serde_json::Value::String(s) => entry.2.push_str(s),
-                            other if !other.is_null() => entry.2.push_str(&other.to_string()),
-                            _ => {}
-                        }
-                    }
-                }
             }
-            if line_buf == "__DONE__" {
+            if done {
                 break;
             }
         }
 
-        let mut tool_calls = Vec::new();
-        for (id, name, arguments) in tc_map.into_values() {
-            if name.is_empty() {
-                continue;
+        if !done {
+            if let Some(trailing) = decoder.finish()? {
+                done = apply_agent_sse_line(&trailing, &mut acc, &mut on_delta, &mut on_thought)?;
             }
-            tool_calls.push(AgentToolCall {
-                id: if id.is_empty() {
-                    Uuid::new_v4().to_string()
-                } else {
-                    id
-                },
-                name,
-                arguments,
-            });
+        }
+        if !acc.saw_data {
+            let raw = full_body.finish()?;
+            let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|error| {
+                anyhow!("provider returned neither SSE nor valid JSON: {error}")
+            })?;
+            return parse_agent_step_from_message(
+                &value["choices"][0]["message"],
+                false,
+                &mut on_delta,
+                &mut on_thought,
+            );
         }
 
-        let reasoning_opt = if reasoning.trim().is_empty() {
+        ensure_stream_completed(acc.saw_data, done)?;
+        let tool_calls = finish_streamed_tool_calls(acc.tool_calls, done)?;
+
+        let reasoning_opt = if acc.reasoning.trim().is_empty() {
             None
         } else {
-            Some(reasoning)
+            Some(acc.reasoning)
         };
 
         if !tool_calls.is_empty() {
-            let content_opt = if content.trim().is_empty() {
+            let content_opt = if acc.content.trim().is_empty() {
                 None
             } else {
-                Some(content)
+                Some(acc.content)
             };
             return Ok(AgentStep::ToolCalls {
                 content: content_opt,
                 tool_calls,
-                streamed: streamed_any,
+                streamed: acc.streamed_any,
                 reasoning: reasoning_opt,
             });
         }
 
-        if !content.trim().is_empty() {
+        if !acc.content.trim().is_empty() {
             return Ok(AgentStep::Final {
-                text: content,
-                streamed: streamed_any,
+                text: acc.content,
+                streamed: acc.streamed_any,
                 reasoning: reasoning_opt,
             });
         }
@@ -1699,6 +1973,232 @@ where
     );
 }
 
+#[cfg(test)]
+mod compatible_stream_tests {
+    use std::convert::Infallible;
+    use std::time::Duration;
+
+    use axum::body::{Body, Bytes};
+    use axum::http::{header, Response, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use futures::StreamExt;
+
+    use super::*;
+
+    fn compatible_credentials(provider_id: &str) -> crate::auth_store::WireCredentials {
+        crate::auth_store::WireCredentials {
+            provider_id: provider_id.into(),
+            bearer: "synthetic-test-key".into(),
+            oidc_token_auth: false,
+            display_name: "Synthetic gateway".into(),
+            method: "test".into(),
+            user_id: None,
+            team_id: None,
+            auth_scope: None,
+            refresh_token: None,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            principal_type: None,
+            principal_id: None,
+            expires_at: None,
+        }
+    }
+
+    fn install_compatible_profile(home: &std::path::Path, base_url: &str) -> String {
+        crate::discover::set_grokptah_home_override(Some(home.to_path_buf()));
+        let mut config = crate::gateway_config::GatewayConfig::default();
+        let mut profile = crate::gateway_config::ProviderProfile::openai_compatible(
+            "cancel-test",
+            "Cancellation test",
+            base_url,
+        );
+        let mut model = crate::gateway_config::ProviderModel::unqualified("test-model");
+        model.capabilities.tools = true;
+        model.capabilities.stream = true;
+        model.capabilities.source = crate::gateway_config::CapabilitySource::Measured;
+        model.capabilities.qualification_schema =
+            Some(crate::gateway_config::CAPABILITY_QUALIFICATION_SCHEMA.into());
+        profile.upsert_model(model);
+        config.upsert_profile(profile).unwrap();
+        crate::gateway_config::save(&config).unwrap();
+        crate::gateway_config::model_selection_key("cancel-test", "test-model")
+    }
+
+    #[test]
+    fn fragmented_parallel_tool_calls_assemble_without_utf8_corruption() {
+        let wire = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"café 日本語 \",",
+            "\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"read_\",\"arguments\":\"{\\\"pa\"}},",
+            "{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"list_\",\"arguments\":\"{\\\"de\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"function\":{\"name\":\"file\",\"arguments\":\"th\\\":\\\"x\\\"}\"}},",
+            "{\"index\":1,\"function\":{\"name\":\"files\",\"arguments\":\"pth\\\":1}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut decoder = crate::sse::SseLineDecoder::new();
+        let mut acc = AgentSseAccumulator::default();
+        let mut rendered = String::new();
+        let mut thought = String::new();
+        let mut done = false;
+        for byte in wire.as_bytes() {
+            for line in decoder.push(std::slice::from_ref(byte)).unwrap() {
+                done |= apply_agent_sse_line(
+                    &line,
+                    &mut acc,
+                    &mut |text| rendered.push_str(text),
+                    &mut |text| thought.push_str(text),
+                )
+                .unwrap();
+            }
+        }
+        assert!(done);
+        assert_eq!(rendered, "café 日本語 ");
+        let calls = finish_streamed_tool_calls(acc.tool_calls, done).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, r#"{"path":"x"}"#);
+        assert_eq!(calls[1].name, "list_files");
+        assert_eq!(calls[1].arguments, r#"{"depth":1}"#);
+    }
+
+    #[test]
+    fn malformed_sse_and_partial_tool_calls_fail_closed() {
+        let mut acc = AgentSseAccumulator::default();
+        assert!(
+            apply_agent_sse_line("data: {not-json}", &mut acc, &mut |_| {}, &mut |_| {})
+                .unwrap_err()
+                .to_string()
+                .contains("malformed")
+        );
+
+        let mut calls = std::collections::BTreeMap::new();
+        calls.insert(
+            0,
+            ("call".into(), "write_files".into(), "{\"files\":".into()),
+        );
+        assert!(finish_streamed_tool_calls(calls.clone(), true).is_err());
+        assert!(finish_streamed_tool_calls(calls, false).is_err());
+        assert!(ensure_stream_completed(true, false).is_err());
+        assert!(ensure_stream_completed(false, false).is_ok());
+    }
+
+    #[test]
+    fn malformed_non_stream_tool_calls_fail_before_dispatch() {
+        for message in [
+            serde_json::json!({"tool_calls": [{
+                "function": {"name": "list_dir", "arguments": "{}"}
+            }]}),
+            serde_json::json!({"tool_calls": [{
+                "id": "call-1",
+                "function": {"name": "list_dir", "arguments": "{"}
+            }]}),
+            serde_json::json!({"tool_calls": [{
+                "id": "call-1",
+                "function": {"name": "list_dir", "arguments": []}
+            }]}),
+        ] {
+            assert!(
+                parse_agent_step_from_message(&message, false, &mut |_| {}, &mut |_| {},).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_compatible_stream_cancels_promptly() {
+        let _lock = crate::discover::home_override_serial();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let app = Router::new().route(
+                    "/v1/chat/completions",
+                    post(|| async {
+                        let first = futures::stream::once(async {
+                            Ok::<_, Infallible>(Bytes::from_static(
+                                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                            ))
+                        });
+                        let stalled =
+                            futures::stream::pending::<std::result::Result<Bytes, Infallible>>();
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from_stream(first.chain(stalled)))
+                            .unwrap()
+                    }),
+                );
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let temp = tempfile::tempdir().unwrap();
+                let model =
+                    install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
+                let credentials = compatible_credentials("cancel-test");
+                let cancel = CancellationToken::new();
+                let cancel_after_delta = cancel.clone();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    call_xai_agent_step(
+                        &credentials,
+                        &model,
+                        EffortLevel::None,
+                        &[serde_json::json!({"role": "user", "content": "synthetic"})],
+                        &serde_json::json!([]),
+                        &cancel,
+                        move |_| cancel_after_delta.cancel(),
+                        |_| {},
+                    ),
+                )
+                .await
+                .expect("cancellation must stop a stalled response");
+                let error = match result {
+                    Ok(_) => panic!("cancelled stalled response unexpectedly succeeded"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains("cancelled"));
+                server.abort();
+            });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn compatible_transport_errors_redact_the_private_endpoint() {
+        let _lock = crate::discover::home_override_serial();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                drop(listener);
+                let temp = tempfile::tempdir().unwrap();
+                let model =
+                    install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
+                let result = call_xai_chat(
+                    &compatible_credentials("cancel-test"),
+                    &model,
+                    &[("user".into(), "synthetic".into())],
+                    None,
+                    temp.path(),
+                    SessionKind::Chat,
+                )
+                .await;
+                let error = match result {
+                    Ok(_) => panic!("closed compatible endpoint unexpectedly responded"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(error.contains("configured provider"));
+                assert!(!error.contains(&address.to_string()));
+            });
+        crate::discover::set_grokptah_home_override(None);
+    }
+}
+
 pub(crate) fn parse_agent_step_from_message<F, G>(
     msg: &serde_json::Value,
     streamed: bool,
@@ -1713,14 +2213,30 @@ where
         if !arr.is_empty() {
             let mut tool_calls = Vec::new();
             for tc in arr {
-                let id = tc["id"].as_str().unwrap_or("call").to_string();
-                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                let id = tc["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| anyhow!("provider returned a tool call without an id"))?
+                    .to_string();
+                let name = tc["function"]["name"]
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| anyhow!("provider returned a tool call without a name"))?
+                    .to_string();
                 let arguments = match &tc["function"]["arguments"] {
                     serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Object(_) => tc["function"]["arguments"].to_string(),
+                    serde_json::Value::Null => {
+                        bail!("provider returned a tool call without arguments")
+                    }
                     other => other.to_string(),
                 };
-                if name.is_empty() {
-                    continue;
+                let parsed_arguments: serde_json::Value = serde_json::from_str(&arguments)
+                    .map_err(|error| {
+                        anyhow!("provider returned malformed tool arguments: {error}")
+                    })?;
+                if !parsed_arguments.is_object() {
+                    bail!("provider tool arguments must be a JSON object");
                 }
                 tool_calls.push(AgentToolCall {
                     id,
@@ -1728,28 +2244,26 @@ where
                     arguments,
                 });
             }
-            if !tool_calls.is_empty() {
-                let content = msg["content"].as_str().map(|s| s.to_string());
-                let has_content = content.as_ref().is_some_and(|c| !c.is_empty());
-                if let Some(ref c) = content {
-                    if !c.is_empty() && !streamed {
-                        on_delta(c);
-                    }
+            let content = msg["content"].as_str().map(|s| s.to_string());
+            let has_content = content.as_ref().is_some_and(|c| !c.is_empty());
+            if let Some(ref c) = content {
+                if !c.is_empty() && !streamed {
+                    on_delta(c);
                 }
-                let reasoning = msg["reasoning_content"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        on_thought(s);
-                        s.to_string()
-                    });
-                return Ok(AgentStep::ToolCalls {
-                    content,
-                    tool_calls,
-                    streamed: streamed || has_content,
-                    reasoning,
-                });
             }
+            let reasoning = msg["reasoning_content"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    on_thought(s);
+                    s.to_string()
+                });
+            return Ok(AgentStep::ToolCalls {
+                content,
+                tool_calls,
+                streamed: streamed || has_content,
+                reasoning,
+            });
         }
     }
 
@@ -1879,7 +2393,15 @@ pub(crate) async fn call_xai_chat(
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
 
     // Shared base resolution (#169 gateway envs + OIDC default path).
-    let (base, model_id) = resolve_api_base(&creds, model);
+    let target = resolve_model_target(&creds, model)?;
+    if !target.capabilities.chat {
+        bail!("provider model `{}` is not chat-capable", target.wire_model);
+    }
+    let base = target.base_url;
+    let model_id = target.wire_model;
+    let request_timeout = target.deadline_class.chat_timeout();
+    let is_compatible =
+        target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
     let system = match kind {
         SessionKind::Chat => "You are Grok, a helpful, witty AI assistant in GrokPtah. \
              This is a regular conversation — not a coding-agent build session. \
@@ -1892,8 +2414,9 @@ pub(crate) async fn call_xai_chat(
         ),
     };
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(request_timeout)
         .connect_timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!(
             "grok/{} (GrokPtah)",
             crate::auth_store::client_version_header()
@@ -1961,10 +2484,16 @@ pub(crate) async fn call_xai_chat(
         } else {
             "network"
         };
-        anyhow!(
-            "request error ({kind}) for {url}: {e}. \
-             Check network, VPN, and that cli-chat-proxy is reachable."
-        )
+        if is_compatible {
+            anyhow!(
+                "configured provider request failed ({kind}); check its connection and request budget"
+            )
+        } else {
+            anyhow!(
+                "request error ({kind}) for {url}: {e}. \
+                 Check network, VPN, and that cli-chat-proxy is reachable."
+            )
+        }
     })?;
 
     // One retry after OIDC refresh on 401 (expired access token is common).
@@ -1978,7 +2507,9 @@ pub(crate) async fn call_xai_chat(
                     .map_err(|e| anyhow!("request error after refresh for {url}: {e}"))?;
             }
             Err(e) => {
-                let text = resp.text().await.unwrap_or_default();
+                let text = read_bounded_response_body(resp, &CancellationToken::new())
+                    .await
+                    .unwrap_or_default();
                 let clipped: String = text.chars().take(400).collect();
                 bail!(
                     "HTTP 401 Unauthorized (refresh also failed: {e}). \
@@ -1990,11 +2521,18 @@ pub(crate) async fn call_xai_chat(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        if is_compatible {
+            bail!("configured provider returned HTTP {status}");
+        }
+        let text = read_bounded_response_body(resp, &CancellationToken::new())
+            .await
+            .unwrap_or_default();
         let clipped: String = text.chars().take(800).collect();
         bail!("HTTP {status}: {clipped}");
     }
-    let v: serde_json::Value = resp.json().await.map_err(|e| anyhow!("json: {e}"))?;
+    let raw = read_bounded_response_body(resp, &CancellationToken::new()).await?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| anyhow!("provider JSON: {error}"))?;
     // chat/completions shape
     if let Some(content) = v["choices"][0]["message"]["content"].as_str() {
         if !content.is_empty() {

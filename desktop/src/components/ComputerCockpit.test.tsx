@@ -295,6 +295,20 @@ describe("ComputerCockpit", () => {
     expect(mocks.approve).toHaveBeenCalledTimes(1);
   });
 
+  it("shows measured model eligibility without expanding local approval", async () => {
+    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    render(
+      <ComputerCockpit
+        {...props}
+        computerUseTier="semantic_act"
+        computerCapabilitySource="measured"
+      />,
+    );
+
+    expect(await screen.findByText("Semantic Act · measured")).toBeTruthy();
+    expect(screen.getByText("One action authorized")).toBeTruthy();
+  });
+
   it("discards a stale response after the owning session changes", async () => {
     let resolveOld: (value: ComputerCockpitSnapshot) => void = () => {};
     mocks.snapshot

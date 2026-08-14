@@ -378,9 +378,64 @@ export type TranscriptItem =
 export interface ModelInfo {
   id: string;
   display_name: string;
+  provider_id?: string;
+  provider_label?: string;
+  wire_model_id?: string;
+  supports_tools?: boolean;
+  supports_stream?: boolean;
+  supports_image_input?: boolean;
+  computer_use_tier?: ComputerUseTier;
+  computer_capability_source?: "declared" | "measured" | "unknown" | string;
+  capability_source?: "declared" | "measured" | "unknown" | string;
   supports_effort: boolean;
   effort_options?: string[];
 }
+
+export interface ProviderModelSummary {
+  id: string;
+  displayName: string;
+  supportsTools: boolean;
+  supportsStream: boolean;
+  supportsImageInput: boolean;
+  computerUseTier: ComputerUseTier;
+  computerCapabilitySource: "declared" | "measured" | "unknown";
+  effortOptions: string[];
+  capabilitySource: "declared" | "measured" | "unknown";
+}
+
+export interface ProviderProfileSummary {
+  id: string;
+  label: string;
+  baseUrl: string;
+  deadlineClass: "interactive" | "standard" | "extended";
+  credentialSet: boolean;
+  managedByEnv: boolean;
+  models: ProviderModelSummary[];
+}
+
+export interface QualificationCheck {
+  status: "pass" | "degraded" | "fail";
+  detail: string;
+}
+
+export interface ProviderQualificationReport {
+  providerId: string;
+  modelId: string;
+  basicGeneration: QualificationCheck;
+  nativeToolCall: QualificationCheck;
+  toolResultContinuation: QualificationCheck;
+  streaming: QualificationCheck;
+  codingReady: boolean;
+  semanticObservation: QualificationCheck;
+  staleObservationRecovery: QualificationCheck;
+  computerUseTier: ComputerUseTier;
+}
+
+export type ComputerUseTier =
+  | "none"
+  | "observe"
+  | "semantic_act"
+  | "visual_fallback_act";
 
 export interface AuthState {
   signed_in: boolean;

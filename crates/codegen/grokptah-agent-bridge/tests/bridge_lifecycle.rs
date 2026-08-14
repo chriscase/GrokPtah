@@ -6,10 +6,18 @@
 #![allow(clippy::while_let_loop)] // event-drain loops are clearer as loop+match
 
 use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::Arc,
+};
 
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::post;
+use axum::{Json, Router};
 use grokptah_agent_bridge::{
-    desktop_auto_update_enabled, home_override_serial, set_grokptah_home_override, AgentHost,
-    HostConfig, PermissionDecision, RunState, SessionUpdate,
+    desktop_auto_update_enabled, home_override_serial, model_selection_key,
+    set_grokptah_home_override, AgentHost, HostConfig, PermissionDecision, RunState, SessionUpdate,
 };
 use tokio::time::timeout;
 
@@ -47,6 +55,102 @@ impl Drop for IsolatedHome {
             std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
         }
     }
+}
+
+struct CompatibleHome {
+    _tmp: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl CompatibleHome {
+    fn install(base_url: &str) -> Self {
+        let lock = home_override_serial();
+        let tmp = tempfile::tempdir().expect("isolated compatible home");
+        let home = tmp.path().join(".grokptah");
+        std::fs::create_dir_all(home.join("sessions")).expect("sessions dir");
+        set_grokptah_home_override(Some(home));
+        unsafe {
+            std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+            std::env::set_var("GROKPTAH_API_BASE", base_url);
+            std::env::set_var("GROKPTAH_API_KEY", "synthetic-compatible-key");
+        }
+        Self {
+            _tmp: tmp,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for CompatibleHome {
+    fn drop(&mut self) {
+        set_grokptah_home_override(None);
+        unsafe {
+            std::env::remove_var("GROKPTAH_API_BASE");
+            std::env::remove_var("GROKPTAH_API_KEY");
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CompatibleGatewayState {
+    requests: Arc<AtomicUsize>,
+    saw_write_result: Arc<AtomicBool>,
+    saw_test_result: Arc<AtomicBool>,
+}
+
+async fn compatible_gateway(
+    State(state): State<CompatibleGatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        != Some("Bearer synthetic-compatible-key")
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let messages = body["messages"].as_array().ok_or(StatusCode::BAD_REQUEST)?;
+    let request = state.requests.fetch_add(1, Ordering::SeqCst);
+    let message = match request {
+        0 => serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "call-write",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": "{\"path\":\"provider-proof.txt\",\"content\":\"compatible agent wrote this\\n\"}"
+                }
+            }]
+        }),
+        1 => {
+            let saw_result = messages.iter().any(|message| {
+                message["role"] == "tool" && message["tool_call_id"] == "call-write"
+            });
+            state.saw_write_result.store(saw_result, Ordering::SeqCst);
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-test",
+                    "type": "function",
+                    "function": {
+                        "name": "run_terminal_cmd",
+                        "arguments": "{\"command\":\"test -f provider-proof.txt && grep -q 'compatible agent' provider-proof.txt\"}"
+                    }
+                }]
+            })
+        }
+        2 => {
+            let saw_result = messages
+                .iter()
+                .any(|message| message["role"] == "tool" && message["tool_call_id"] == "call-test");
+            state.saw_test_result.store(saw_result, Ordering::SeqCst);
+            serde_json::json!({"content": "Implemented and verified the disposable task."})
+        }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    Ok(Json(serde_json::json!({"choices": [{"message": message}]})))
 }
 
 async fn drain_until_turn_complete(
@@ -172,6 +276,63 @@ async fn session_lifecycle_prompt_streams_message() {
     let restored_runs = restored_host.list_session_runs(session.id).unwrap();
     assert_eq!(restored_runs.len(), 1);
     assert_eq!(restored_runs[0].state, RunState::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compatible_model_completes_a_multi_round_edit_and_test_task() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = CompatibleGatewayState {
+        requests: Arc::new(AtomicUsize::new(0)),
+        saw_write_result: Arc::new(AtomicBool::new(false)),
+        saw_test_result: Arc::new(AtomicBool::new(false)),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(compatible_gateway))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let _iso = CompatibleHome::install(&format!("http://{address}/v1"));
+    let workspace = tempfile::tempdir().unwrap();
+
+    let host = AgentHost::create(HostConfig::default());
+    let mut events = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(workspace.path()).unwrap();
+    host.set_always_approve(true);
+    host.set_model(model_selection_key("env-grokptah", "synthetic-cheap-code"));
+    let session = host.session_new().unwrap();
+
+    timeout(
+        Duration::from_secs(10),
+        host.session_prompt(
+            session.id,
+            "Create the requested proof file and verify it exists.".into(),
+        ),
+    )
+    .await
+    .expect("compatible model turn timed out")
+    .unwrap();
+    let updates = drain_until_turn_complete(&mut events).await;
+
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("provider-proof.txt")).unwrap(),
+        "compatible agent wrote this\n"
+    );
+    assert_eq!(state.requests.load(Ordering::SeqCst), 3);
+    assert!(state.saw_write_result.load(Ordering::SeqCst));
+    assert!(state.saw_test_result.load(Ordering::SeqCst));
+    assert!(updates.iter().any(|update| matches!(
+        update,
+        SessionUpdate::TurnComplete {
+            cancelled: false,
+            ..
+        }
+    )));
+
+    host.stop().unwrap();
+    server.abort();
 }
 
 #[tokio::test]

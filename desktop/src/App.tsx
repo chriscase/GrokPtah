@@ -541,6 +541,7 @@ export default function App() {
     [models, status?.model],
   );
   const currentEffort = effortForModel(models, status?.model, status?.effort);
+  const currentModelInfo = models.find((model) => model.id === status?.model);
   const activeTabKind = kindForTab(activeTab, sessions, workspaceMode);
   const activeIsBuild = activeTabKind === "build";
   const activeCwd = activeSummary?.cwd || activeTab?.cwd;
@@ -2416,6 +2417,10 @@ export default function App() {
             sessionTitle={activeTab?.title ?? activeSummary?.title}
             model={status?.model ?? "unknown"}
             effort={status?.effort ?? "unknown"}
+            computerUseTier={currentModelInfo?.computer_use_tier ?? "none"}
+            computerCapabilitySource={
+              currentModelInfo?.computer_capability_source ?? "unknown"
+            }
             sessionBusy={busy}
             onClose={() => setComputerOpen(false)}
             onRunState={setComputerRunState}
