@@ -277,7 +277,13 @@ export function SettingsPanel({
       await refresh();
       onChromeChange();
       if (report.codingReady) {
-        setNotice("Qualified for chat and multi-round coding tools");
+        setNotice(
+          report.computerUseTier === "semantic_act"
+            ? "Qualified for coding tools and semantic Computer Use"
+            : report.computerUseTier === "observe"
+              ? `Qualified for coding tools and Computer observation only. ${report.staleObservationRecovery.detail}`
+              : `Qualified for coding tools. Computer Use unavailable: ${report.semanticObservation.detail}`,
+        );
       } else {
         const checks: Array<[string, QualificationCheck]> = [
           ["chat", report.basicGeneration],
@@ -984,6 +990,12 @@ export function SettingsPanel({
                               : [
                                   model.supportsTools ? "Tools" : "Chat",
                                   model.supportsStream ? "Streaming" : null,
+                                  model.supportsImageInput ? "Images" : null,
+                                  model.computerUseTier === "semantic_act"
+                                    ? "Computer: semantic"
+                                    : model.computerUseTier === "observe"
+                                      ? "Computer: observe"
+                                      : null,
                                   model.effortOptions.length > 0
                                     ? `Effort: ${model.effortOptions.join(", ")}`
                                     : null,

@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { SettingsPanel } from "./SettingsPanel";
 import { api } from "../lib/api";
@@ -27,6 +27,9 @@ const profile = {
       displayName: "Team/Code:Cheap",
       supportsTools: false,
       supportsStream: false,
+      supportsImageInput: false,
+      computerUseTier: "none" as const,
+      computerCapabilitySource: "unknown" as const,
       effortOptions: ["low"],
       capabilitySource: "unknown" as const,
     },
@@ -52,8 +55,13 @@ describe("provider profile settings (#278)", () => {
       toolResultContinuation: { status: "fail", detail: "Not attempted" },
       streaming: { status: "degraded", detail: "JSON response" },
       codingReady: false,
+      semanticObservation: { status: "fail", detail: "Not attempted" },
+      staleObservationRecovery: { status: "fail", detail: "Not attempted" },
+      computerUseTier: "none",
     });
   });
+
+  afterEach(cleanup);
 
   it("shows no secret and preserves an opaque manual model id through qualification", async () => {
     render(
@@ -96,5 +104,38 @@ describe("provider profile settings (#278)", () => {
     expect(await screen.findByText(/Discussion only/)).toHaveTextContent(
       /native tools: No native tool call/,
     );
+  });
+
+  it("reports semantic Computer eligibility only after stale-frame recovery", async () => {
+    vi.mocked(api.qualifyProviderModel).mockResolvedValue({
+      providerId: profile.id,
+      modelId: profile.models[0].id,
+      basicGeneration: { status: "pass", detail: "Basic generation passed" },
+      nativeToolCall: { status: "pass", detail: "Native tool call passed" },
+      toolResultContinuation: { status: "pass", detail: "Continuation passed" },
+      streaming: { status: "pass", detail: "Streaming passed" },
+      codingReady: true,
+      semanticObservation: { status: "pass", detail: "Exact element selected" },
+      staleObservationRecovery: { status: "pass", detail: "Replacement frame used" },
+      computerUseTier: "semantic_act",
+    });
+    render(
+      <SettingsPanel
+        open
+        onClose={() => {}}
+        models={[]}
+        auth={{ signed_in: false }}
+        onAuthChange={() => {}}
+        onChromeChange={() => {}}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Auth" }));
+    await screen.findByTestId("settings-gateway");
+    fireEvent.click(screen.getByTestId("gateway-qualify"));
+
+    expect(
+      await screen.findByText("Qualified for coding tools and semantic Computer Use"),
+    ).toBeTruthy();
   });
 });

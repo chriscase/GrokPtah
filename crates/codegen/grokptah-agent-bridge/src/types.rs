@@ -16,6 +16,12 @@ pub struct ModelInfo {
     #[serde(default)]
     pub supports_stream: bool,
     #[serde(default)]
+    pub supports_image_input: bool,
+    #[serde(default)]
+    pub computer_use_tier: String,
+    #[serde(default)]
+    pub computer_capability_source: String,
+    #[serde(default)]
     pub capability_source: String,
     pub supports_effort: bool,
     /// Canonical effort values accepted by this model, in UI order.

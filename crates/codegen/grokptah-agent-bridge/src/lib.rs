@@ -52,9 +52,9 @@ pub use agents_personas::{
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
 pub use gateway_config::{
     load as load_gateway_config, model_selection_key, parse_model_selection,
-    save as save_gateway_config, CapabilitySource, GatewayConfig, ModelCapabilities,
-    ModelSelection, ProviderDeadlineClass, ProviderDialect, ProviderKind, ProviderModel,
-    ProviderProfile, ProviderProfileUpdate,
+    save as save_gateway_config, CapabilitySource, ComputerUseTier, GatewayConfig,
+    ModelCapabilities, ModelSelection, ProviderDeadlineClass, ProviderDialect, ProviderKind,
+    ProviderModel, ProviderProfile, ProviderProfileUpdate,
 };
 pub use isolation::prepare_isolation_cwd;
 pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};

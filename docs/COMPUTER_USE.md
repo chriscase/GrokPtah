@@ -92,3 +92,10 @@ can be evaluated in tiers: coding tools, observation interpretation, semantic ac
 and visual fallback. A cheaper model may perform coding or testing without being authorized for
 computer actions; [#272](https://github.com/chriscase/GrokPtah/issues/272) owns that conformance
 matrix and role routing.
+
+The first opt-in provider probe uses only the deterministic simulator. Unknown and built-in catalog
+models receive `none` until their exact provider/model pair is measured. Selecting the exact safe
+element qualifies `observe`; recovering from a stale-frame tool error against a replacement
+observation qualifies `semantic_act`. Image input and `visual_fallback_act` remain unqualified. A
+qualified tier controls future model tool discovery only; it never replaces the cockpit's exact
+target review, one-use local grant, reobservation, or native dispatch checks.

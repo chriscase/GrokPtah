@@ -32,12 +32,27 @@ provider. It never reads the active workspace. The probe checks:
 - basic chat generation;
 - a real native call to an inert, side-effect-free tool;
 - continuation after an inert tool result;
+- exact semantic selection from a deterministic local Computer Use simulator snapshot containing
+  hostile observed text;
+- stale-observation recovery bound to a replacement simulator frame;
 - byte-safe streaming.
 
 Tool-shaped prose does not count as tool support. A model is enabled for the
 coding loop only after native tool calling and tool-result continuation pass.
 Models that pass chat but fail tools remain available for discussions. Measured
 capabilities are tied to the exact profile, endpoint, and model ID.
+
+Computer capability is independent of coding capability and defaults to `none`. A successful exact
+semantic selection qualifies `observe`; only successful stale-frame recovery qualifies
+`semantic_act`. `visual_fallback_act` additionally requires measured image-input support and is not
+granted by this first probe. No model name, ordinary tool result, effort setting, or blanket desktop
+permission manufactures Computer authority. The operator cockpit remains usable manually and shows
+the selected model's measured tier; local one-use approval is still required for every action.
+
+The Computer probe never executes the proposed action, reads a workspace, captures a real window,
+or stores provider credentials in its report. It sends only repository-defined simulator metadata
+and fixed synthetic strings. Changing the endpoint or qualification schema immediately resets
+measured Computer authority to `none`.
 
 Effort is omitted by default for compatible models. Add only values documented
 for that exact provider/model pair. Unsupported explicit values fail before a

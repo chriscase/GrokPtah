@@ -17,6 +17,9 @@ pub const PROVIDER_CONFIG_VERSION: u32 = 2;
 pub const XAI_PROVIDER_ID: &str = "xai";
 pub const MODEL_SELECTION_PREFIX: &str = "ptah.model.v1:";
 pub const CAPABILITY_QUALIFICATION_SCHEMA: &str = "grokptah.provider-qualification.v1";
+pub const COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA: &str = "grokptah.computer-qualification.v1";
+pub const MAX_QUALIFIED_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp"];
 
 fn current_version() -> u32 {
     PROVIDER_CONFIG_VERSION
@@ -89,6 +92,41 @@ pub enum CapabilitySource {
     Unknown,
 }
 
+/// Maximum Computer Use authority qualified for one exact provider/model.
+/// Unknown and legacy profiles deserialize to `None` and receive no tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerUseTier {
+    #[default]
+    None,
+    Observe,
+    SemanticAct,
+    VisualFallbackAct,
+}
+
+impl ComputerUseTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Observe => "observe",
+            Self::SemanticAct => "semantic_act",
+            Self::VisualFallbackAct => "visual_fallback_act",
+        }
+    }
+
+    pub fn allows_observation(self) -> bool {
+        self >= Self::Observe
+    }
+
+    pub fn allows_semantic_action(self) -> bool {
+        self >= Self::SemanticAct
+    }
+
+    pub fn allows_visual_fallback(self) -> bool {
+        self >= Self::VisualFallbackAct
+    }
+}
+
 /// Capabilities for one exact provider/model pair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
@@ -100,6 +138,18 @@ pub struct ModelCapabilities {
     pub stream: bool,
     #[serde(default)]
     pub parallel_tool_calls: bool,
+    #[serde(default)]
+    pub image_input: bool,
+    #[serde(default)]
+    pub image_media_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_image_bytes: Option<u64>,
+    #[serde(default)]
+    pub computer_use_tier: ComputerUseTier,
+    #[serde(default)]
+    pub computer_capability_source: CapabilitySource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_qualification_schema: Option<String>,
     #[serde(default)]
     pub effort_options: Vec<String>,
     #[serde(default)]
@@ -115,10 +165,34 @@ impl Default for ModelCapabilities {
             tools: false,
             stream: false,
             parallel_tool_calls: false,
+            image_input: false,
+            image_media_types: Vec::new(),
+            max_image_bytes: None,
+            computer_use_tier: ComputerUseTier::None,
+            computer_capability_source: CapabilitySource::Unknown,
+            computer_qualification_schema: None,
             effort_options: Vec::new(),
             source: CapabilitySource::Unknown,
             qualification_schema: None,
         }
+    }
+}
+
+impl ModelCapabilities {
+    /// Returns only authority supported by a coherent, source-attributed
+    /// capability record. Callers must use this value for tool discovery.
+    pub fn effective_computer_use_tier(&self) -> ComputerUseTier {
+        if !self.tools || self.computer_capability_source == CapabilitySource::Unknown {
+            return ComputerUseTier::None;
+        }
+        if self.computer_use_tier == ComputerUseTier::VisualFallbackAct
+            && (!self.image_input
+                || self.image_media_types.is_empty()
+                || self.max_image_bytes.is_none())
+        {
+            return ComputerUseTier::SemanticAct;
+        }
+        self.computer_use_tier
     }
 }
 
@@ -211,6 +285,12 @@ impl ProviderProfile {
                     let effort_options = model.capabilities.effort_options.clone();
                     model.capabilities = ModelCapabilities::default();
                     model.capabilities.effort_options = effort_options;
+                } else if model.capabilities.computer_capability_source
+                    == CapabilitySource::Measured
+                {
+                    model.capabilities.computer_use_tier = ComputerUseTier::None;
+                    model.capabilities.computer_capability_source = CapabilitySource::Unknown;
+                    model.capabilities.computer_qualification_schema = None;
                 }
             }
         }
@@ -307,6 +387,7 @@ impl GatewayConfig {
                     model.display_name = model.id.clone();
                 }
                 normalize_effort_options(&mut model.capabilities.effort_options);
+                normalize_image_capabilities(&mut model.capabilities);
                 if model.capabilities.source == CapabilitySource::Measured
                     && model.capabilities.qualification_schema.as_deref()
                         != Some(CAPABILITY_QUALIFICATION_SCHEMA)
@@ -314,6 +395,14 @@ impl GatewayConfig {
                     let effort_options = model.capabilities.effort_options.clone();
                     model.capabilities = ModelCapabilities::default();
                     model.capabilities.effort_options = effort_options;
+                }
+                if model.capabilities.computer_capability_source == CapabilitySource::Measured
+                    && model.capabilities.computer_qualification_schema.as_deref()
+                        != Some(COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA)
+                {
+                    model.capabilities.computer_use_tier = ComputerUseTier::None;
+                    model.capabilities.computer_capability_source = CapabilitySource::Unknown;
+                    model.capabilities.computer_qualification_schema = None;
                 }
                 true
             });
@@ -529,6 +618,25 @@ fn normalize_effort_options(options: &mut Vec<String>) {
         .filter(|value| accepted.contains(**value))
         .map(|value| (*value).to_string())
         .collect();
+}
+
+fn normalize_image_capabilities(capabilities: &mut ModelCapabilities) {
+    capabilities.image_media_types = capabilities
+        .image_media_types
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| ALLOWED_IMAGE_MEDIA_TYPES.contains(&value.as_str()))
+        .collect();
+    capabilities.image_media_types.sort();
+    capabilities.image_media_types.dedup();
+    let valid_bound = capabilities
+        .max_image_bytes
+        .is_some_and(|bytes| bytes > 0 && bytes <= MAX_QUALIFIED_IMAGE_BYTES);
+    if !capabilities.image_input || capabilities.image_media_types.is_empty() || !valid_bound {
+        capabilities.image_input = false;
+        capabilities.image_media_types.clear();
+        capabilities.max_image_bytes = None;
+    }
 }
 
 fn path() -> PathBuf {
@@ -804,6 +912,10 @@ mod tests {
         model.capabilities.stream = true;
         model.capabilities.source = CapabilitySource::Measured;
         model.capabilities.qualification_schema = Some(CAPABILITY_QUALIFICATION_SCHEMA.into());
+        model.capabilities.computer_use_tier = ComputerUseTier::SemanticAct;
+        model.capabilities.computer_capability_source = CapabilitySource::Measured;
+        model.capabilities.computer_qualification_schema =
+            Some(COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA.into());
         model.capabilities.effort_options = vec!["low".into()];
         profile.upsert_model(model);
 
@@ -814,6 +926,10 @@ mod tests {
             CapabilitySource::Unknown
         );
         assert_eq!(profile.models[0].capabilities.effort_options, vec!["low"]);
+        assert_eq!(
+            profile.models[0].capabilities.computer_use_tier,
+            ComputerUseTier::None
+        );
 
         profile.models[0].capabilities.tools = true;
         profile.models[0].capabilities.source = CapabilitySource::Measured;
@@ -826,6 +942,88 @@ mod tests {
             config.profiles[0].models[0].capabilities.source,
             CapabilitySource::Unknown
         );
+    }
+
+    #[test]
+    fn unknown_models_have_no_computer_authority() {
+        let model = ProviderModel::unqualified("unknown-model");
+        assert_eq!(model.capabilities.computer_use_tier, ComputerUseTier::None);
+        assert!(!model.capabilities.computer_use_tier.allows_observation());
+        assert!(!model.capabilities.image_input);
+    }
+
+    #[test]
+    fn stale_computer_qualification_never_retains_action_authority() {
+        let mut model = ProviderModel::unqualified("qualified-on-old-schema");
+        model.capabilities.source = CapabilitySource::Declared;
+        model.capabilities.tools = true;
+        model.capabilities.computer_use_tier = ComputerUseTier::SemanticAct;
+        model.capabilities.computer_capability_source = CapabilitySource::Measured;
+        model.capabilities.computer_qualification_schema = Some("old-computer-schema".into());
+        let mut profile =
+            ProviderProfile::openai_compatible("corp", "Corp", "https://gw.example/v1");
+        profile.upsert_model(model);
+        let mut config = GatewayConfig::default();
+        config.profiles.push(profile);
+
+        config.normalize();
+
+        let capabilities = &config.profiles[0].models[0].capabilities;
+        assert!(capabilities.tools, "coding declaration remains independent");
+        assert_eq!(capabilities.computer_use_tier, ComputerUseTier::None);
+        assert_eq!(
+            capabilities.computer_capability_source,
+            CapabilitySource::Unknown
+        );
+    }
+
+    #[test]
+    fn effective_tier_fails_closed_for_incoherent_profile_claims() {
+        let mut capabilities = ModelCapabilities {
+            computer_use_tier: ComputerUseTier::VisualFallbackAct,
+            ..ModelCapabilities::default()
+        };
+        assert_eq!(
+            capabilities.effective_computer_use_tier(),
+            ComputerUseTier::None
+        );
+        capabilities.tools = true;
+        capabilities.computer_capability_source = CapabilitySource::Declared;
+        assert_eq!(
+            capabilities.effective_computer_use_tier(),
+            ComputerUseTier::SemanticAct,
+            "visual fallback requires explicit image input support"
+        );
+        capabilities.image_input = true;
+        capabilities.image_media_types = vec!["image/png".into()];
+        capabilities.max_image_bytes = Some(1024);
+        assert_eq!(
+            capabilities.effective_computer_use_tier(),
+            ComputerUseTier::VisualFallbackAct
+        );
+    }
+
+    #[test]
+    fn image_capabilities_are_bounded_and_allowlisted() {
+        let mut capabilities = ModelCapabilities {
+            image_input: true,
+            image_media_types: vec![
+                " IMAGE/PNG ".into(),
+                "image/svg+xml".into(),
+                "image/png".into(),
+            ],
+            max_image_bytes: Some(MAX_QUALIFIED_IMAGE_BYTES),
+            ..ModelCapabilities::default()
+        };
+        normalize_image_capabilities(&mut capabilities);
+        assert!(capabilities.image_input);
+        assert_eq!(capabilities.image_media_types, vec!["image/png"]);
+
+        capabilities.max_image_bytes = Some(MAX_QUALIFIED_IMAGE_BYTES + 1);
+        normalize_image_capabilities(&mut capabilities);
+        assert!(!capabilities.image_input);
+        assert!(capabilities.image_media_types.is_empty());
+        assert!(capabilities.max_image_bytes.is_none());
     }
 
     #[test]

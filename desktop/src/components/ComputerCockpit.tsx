@@ -17,6 +17,8 @@ type ComputerCockpitProps = {
   sessionTitle?: string;
   model: string;
   effort: string;
+  computerUseTier?: string;
+  computerCapabilitySource?: string;
   sessionBusy: boolean;
   onClose: () => void;
   onSteer: (text: string) => Promise<string>;
@@ -62,6 +64,8 @@ export function ComputerCockpit({
   sessionTitle,
   model,
   effort,
+  computerUseTier = "none",
+  computerCapabilitySource = "unknown",
   sessionBusy,
   onClose,
   onSteer,
@@ -531,6 +535,14 @@ export function ComputerCockpit({
                 <div><dt>Backend</dt><dd>{snapshot.backend.backendId}</dd></div>
                 <div><dt>Origin</dt><dd>{titleCase(snapshot.origin)}</dd></div>
                 <div><dt>Agent model</dt><dd>{model} · {effort}</dd></div>
+                <div>
+                  <dt>Agent access</dt>
+                  <dd>
+                    {computerUseTier === "none"
+                      ? "Manual only · not qualified"
+                      : `${titleCase(computerUseTier)} · ${computerCapabilitySource}`}
+                  </dd>
+                </div>
                 <div><dt>Grant expires</dt><dd>{grantActive && run.grant ? new Date(run.grant.expiresAt).toLocaleTimeString() : "Revoked"}</dd></div>
                 <div><dt>Pointer fallback</dt><dd>Disabled</dd></div>
               </dl>

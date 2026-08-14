@@ -1433,6 +1433,7 @@ pub(crate) fn resolve_model_target(
                 effort_options,
                 source: crate::gateway_config::CapabilitySource::Declared,
                 qualification_schema: None,
+                ..crate::gateway_config::ModelCapabilities::default()
             },
             deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
         });

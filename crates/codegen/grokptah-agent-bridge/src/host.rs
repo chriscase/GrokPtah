@@ -2243,6 +2243,14 @@ impl AgentHostHandle {
                     wire_model_id: provider_model.id,
                     supports_tools: capabilities.tools,
                     supports_stream: capabilities.stream,
+                    supports_image_input: capabilities.image_input,
+                    computer_use_tier: capabilities.effective_computer_use_tier().as_str().into(),
+                    computer_capability_source: match capabilities.computer_capability_source {
+                        crate::gateway_config::CapabilitySource::Declared => "declared",
+                        crate::gateway_config::CapabilitySource::Measured => "measured",
+                        crate::gateway_config::CapabilitySource::Unknown => "unknown",
+                    }
+                    .into(),
                     capability_source: match capabilities.source {
                         crate::gateway_config::CapabilitySource::Declared => "declared",
                         crate::gateway_config::CapabilitySource::Measured => "measured",
@@ -3166,6 +3174,9 @@ impl AgentHostHandle {
                     "displayName": model.display_name,
                     "supportsTools": model.capabilities.tools,
                     "supportsStream": model.capabilities.stream,
+                    "supportsImageInput": model.capabilities.image_input,
+                    "computerUseTier": model.capabilities.effective_computer_use_tier(),
+                    "computerCapabilitySource": model.capabilities.computer_capability_source,
                     "effortOptions": model.capabilities.effort_options,
                     "capabilitySource": model.capabilities.source,
                 })).collect::<Vec<_>>(),
