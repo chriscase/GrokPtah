@@ -462,6 +462,23 @@ pub enum ComputerRunState {
     LimitReached,
 }
 
+/// Durable operator-control disposition layered on top of the lifecycle state.
+///
+/// `Paused` is intentionally not enough to describe ownership: a paused run
+/// may be resumed by a fresh local grant, while an operator takeover must not
+/// be revived by a stale approval or reconnect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerControlDisposition {
+    #[default]
+    AgentOwned,
+    Paused,
+    OperatorTakeover,
+    Stopped,
+    Interrupted,
+    UncertainOutcome,
+}
+
 impl ComputerRunState {
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -603,6 +620,12 @@ pub struct ComputerRun {
     pub campaign_id: Option<String>,
     pub target: ComputerTarget,
     pub state: ComputerRunState,
+    /// Durable ownership/control state exposed to GUI and MCP projections.
+    #[serde(default)]
+    pub control_disposition: ComputerControlDisposition,
+    /// Monotonic fence incremented by pause, takeover, stop, and recovery.
+    #[serde(default)]
+    pub control_epoch: u64,
     pub version: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -634,6 +657,8 @@ impl ComputerRun {
             campaign_id: None,
             target,
             state: ComputerRunState::AwaitingAuthorization,
+            control_disposition: ComputerControlDisposition::AgentOwned,
+            control_epoch: 0,
             version: 1,
             created_at: now,
             updated_at: now,
@@ -673,6 +698,14 @@ impl ComputerRun {
             }),
             error_code,
         });
+    }
+
+    pub fn set_control_disposition(&mut self, disposition: ComputerControlDisposition) {
+        if self.control_disposition != disposition {
+            self.control_disposition = disposition;
+            self.control_epoch = self.control_epoch.saturating_add(1);
+            self.updated_at = Utc::now();
+        }
     }
 
     pub fn transition(&mut self, next: ComputerRunState) -> ComputerResult<()> {

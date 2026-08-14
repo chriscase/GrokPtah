@@ -10,9 +10,9 @@ use uuid::Uuid;
 use super::policy::ComputerPolicy;
 use super::store::{ComputerStore, MutationClaim};
 use super::types::{
-    validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend, ComputerError,
-    ComputerErrorCode, ComputerObservation, ComputerResult, ComputerRun, ComputerRunState,
-    ComputerTarget, ComputerUseLimits,
+    validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
+    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
+    ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
 };
 
 pub struct ComputerUseService {
@@ -131,10 +131,17 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidState,
+                        "operator takeover is absorbing; create a new computer run",
+                    ));
+                }
                 self.policy.authorize_grant(run, &grant, Utc::now())?;
                 run.grant = Some(grant.clone());
                 run.last_error = None;
                 run.transition(ComputerRunState::Ready)?;
+                run.set_control_disposition(ComputerControlDisposition::AgentOwned);
                 run.record_audit("authorize", "granted", None, None, None);
                 Ok(())
             })
@@ -303,9 +310,12 @@ impl ComputerUseService {
                     .current_observation
                     .clone()
                     .expect("prepared action has an observation");
+                let control_epoch = prepared.control_epoch;
                 let outcome = self.backend.act(run_id, &observation, &action).await;
                 match outcome {
-                    Ok(outcome) => self.commit_action(run_id, &action, &observation, outcome),
+                    Ok(outcome) => {
+                        self.commit_action(run_id, &action, &observation, control_epoch, outcome)
+                    }
                     Err(error) => {
                         self.fail_inflight(run_id, "act", &error)?;
                         Err(error)
@@ -336,8 +346,15 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidState,
+                        "operator takeover is absorbing; create a new computer run",
+                    ));
+                }
                 run.transition(ComputerRunState::Paused)?;
                 revoke_authority(run);
+                run.set_control_disposition(ComputerControlDisposition::Paused);
                 run.record_audit("pause", "paused", None, None, None);
                 Ok(())
             })
@@ -373,6 +390,7 @@ impl ComputerUseService {
                 ensure_version(run, expected_version)?;
                 run.transition(ComputerRunState::Paused)?;
                 revoke_authority(run);
+                run.set_control_disposition(ComputerControlDisposition::OperatorTakeover);
                 run.record_audit("take_over", "operator_control", None, None, None);
                 Ok(())
             })
@@ -400,6 +418,7 @@ impl ComputerUseService {
                 if !run.state.is_terminal() {
                     run.transition(ComputerRunState::Cancelled)?;
                     revoke_authority(run);
+                    run.set_control_disposition(ComputerControlDisposition::Stopped);
                     run.record_audit("cancel", "cancelled", None, None, None);
                 }
                 Ok(())
@@ -516,15 +535,27 @@ impl ComputerUseService {
         run_id: &str,
         action: &ComputerAction,
         observation: &ComputerObservation,
+        control_epoch: u64,
         outcome: ActionOutcome,
     ) -> ComputerResult<ActionOutcome> {
+        let mut uncertain_error = None;
         self.store
             .update_run(run_id, |run| {
-                if run.state != ComputerRunState::Acting {
-                    return Err(ComputerError::new(
+                if run.state != ComputerRunState::Acting || run.control_epoch != control_epoch {
+                    let error = ComputerError::new(
                         ComputerErrorCode::UncertainOutcome,
                         "action completed after the run was cancelled or superseded",
-                    ));
+                    );
+                    run.last_error = Some(error.clone());
+                    run.record_audit(
+                        "act",
+                        "uncertain_outcome",
+                        Some(action.class()),
+                        Some(observation.observation_id.clone()),
+                        Some(error.code),
+                    );
+                    uncertain_error = Some(error);
+                    return Ok(());
                 }
                 run.action_count = run.action_count.saturating_add(1);
                 if let Some(grant) = &mut run.grant {
@@ -545,6 +576,7 @@ impl ComputerUseService {
                 } else if grant_exhausted {
                     run.transition(ComputerRunState::Paused)?;
                     revoke_authority(run);
+                    run.set_control_disposition(ComputerControlDisposition::Paused);
                 } else {
                     run.transition(ComputerRunState::Ready)?;
                 }
@@ -558,6 +590,9 @@ impl ComputerUseService {
                 Ok(())
             })?
             .ok_or_else(unknown_run)?;
+        if let Some(error) = uncertain_error {
+            return Err(error);
+        }
         Ok(outcome)
     }
 
@@ -575,6 +610,9 @@ impl ComputerUseService {
                 run.last_error = Some(error.clone());
                 run.transition(ComputerRunState::Failed)?;
                 revoke_authority(run);
+                if error.code == ComputerErrorCode::UncertainOutcome {
+                    run.set_control_disposition(ComputerControlDisposition::UncertainOutcome);
+                }
                 run.record_audit(
                     operation,
                     "failed",
@@ -973,6 +1011,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(paused.state, ComputerRunState::Paused);
+        assert_eq!(
+            paused.control_disposition,
+            ComputerControlDisposition::Paused
+        );
         assert!(paused.grant.unwrap().revoked_at.is_some());
         let error = service
             .observe("observe-paused", &run.run_id, paused.version)
@@ -1001,10 +1043,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(taken_over.state, ComputerRunState::Paused);
+        assert_eq!(
+            taken_over.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
         assert!(taken_over.grant.unwrap().revoked_at.is_some());
         assert!(taken_over.audit.iter().any(|entry| {
             entry.operation == "take_over" && entry.disposition == "operator_control"
         }));
+    }
+
+    #[tokio::test]
+    async fn operator_takeover_is_an_absorbing_control_fence() {
+        let (_backend, service) = service();
+        let run = service
+            .create_run(
+                "create-takeover-fence",
+                Uuid::new_v4(),
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "grant-takeover-fence",
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let taken_over = service
+            .take_over("takeover-fence", &run.run_id, run.version)
+            .await
+            .unwrap();
+
+        let error = service
+            .authorize(
+                "stale-authorize-after-takeover",
+                &run.run_id,
+                taken_over.version,
+                grant(&taken_over),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::InvalidState);
+        let persisted = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            persisted.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
+        assert_eq!(persisted.state, ComputerRunState::Paused);
+        assert!(persisted.control_epoch > run.control_epoch);
+
+        let error = service
+            .pause("pause-after-takeover", &run.run_id, taken_over.version)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::InvalidState);
+        let persisted = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            persisted.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
+        assert_eq!(persisted.version, taken_over.version);
     }
 
     #[tokio::test]
@@ -1246,6 +1346,10 @@ mod tests {
             .unwrap();
         let paused = service.get_run(&run.run_id).unwrap().unwrap();
         assert_eq!(paused.state, ComputerRunState::Paused);
+        assert_eq!(
+            paused.control_disposition,
+            ComputerControlDisposition::Paused
+        );
         assert!(paused.current_observation.is_none());
         assert!(paused.grant.unwrap().revoked_at.is_some());
     }
@@ -1360,11 +1464,23 @@ mod tests {
 
         let cancelled = service.cancel("cancel-race", &run.run_id).await.unwrap();
         assert_eq!(cancelled.state, ComputerRunState::Cancelled);
+        assert_eq!(
+            cancelled.control_disposition,
+            ComputerControlDisposition::Stopped
+        );
         let error = action.await.unwrap().unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::UncertainOutcome);
         let persisted = service.get_run(&run.run_id).unwrap().unwrap();
         assert_eq!(persisted.state, ComputerRunState::Cancelled);
         assert_eq!(persisted.action_count, 0);
         assert!(persisted.current_observation.is_none());
+        assert_eq!(
+            persisted.last_error.as_ref().map(|error| error.code),
+            Some(ComputerErrorCode::UncertainOutcome)
+        );
+        assert!(persisted
+            .audit
+            .iter()
+            .any(|entry| entry.disposition == "uncertain_outcome"));
     }
 }

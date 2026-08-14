@@ -90,8 +90,8 @@ pub use completion::{
 pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
 pub use computer_use::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
-    ComputerCapabilities, ComputerError, ComputerErrorCode, ComputerObservation,
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
+    ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerPolicy, ComputerRun, ComputerRunState, ComputerStore,
     ComputerTarget, ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
     MacOsObservationPlatform, SemanticAction, SimulatorBackend,

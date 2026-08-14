@@ -66,6 +66,8 @@ function run(state = "ready"): ComputerRun {
       sensitivity: "none",
     },
     state,
+    controlDisposition: state === "paused" ? "paused" : "agent_owned",
+    controlEpoch: state === "paused" ? 1 : 0,
     version: state === "paused" ? 5 : 3,
     createdAt: "2026-08-13T10:00:00Z",
     updatedAt: "2026-08-13T10:00:01Z",
@@ -322,6 +324,21 @@ describe("ComputerCockpit", () => {
 
     expect(await screen.findByText("Semantic Act · Measured")).toBeTruthy();
     expect(screen.getByText("One action authorized")).toBeTruthy();
+  });
+
+  it("does not offer reauthorization after operator takeover", async () => {
+    mocks.snapshot.mockResolvedValue(
+      snapshot({
+        ...run("paused"),
+        controlDisposition: "operator_takeover",
+        controlEpoch: 2,
+      }),
+    );
+    render(<ComputerCockpit {...props} />);
+
+    expect(await screen.findByText("Take over active")).toBeTruthy();
+    expect(screen.getByText(/cannot be reauthorized after takeover/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reauthorize and observe" })).toBeNull();
   });
 
   it("qualifies an unknown model before offering agent proposals", async () => {

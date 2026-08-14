@@ -43,6 +43,12 @@ error codes. They do not retain action payloads, typed text, screenshots, applic
 window titles, credentials, or arbitrary model content. Evidence references are opaque IDs and
 hashes rather than filesystem paths.
 
+The durable run projection also exposes `controlDisposition` and `controlEpoch`. A paused run
+can be explicitly reauthorized, but `operator_takeover` is an absorbing local-control fence:
+stale approvals and reconnects cannot return authority to the agent, and a new Computer Run is
+required. Stop records `stopped`; restart recovery records `interrupted`; a late mutation whose
+receipt cannot be trusted records `uncertain_outcome` without replaying the action.
+
 ## Threat model
 
 See [Computer Use Threat Model and Release Gate](COMPUTER_USE_THREAT_MODEL.md) for the current

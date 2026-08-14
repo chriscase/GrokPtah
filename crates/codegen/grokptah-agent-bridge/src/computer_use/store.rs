@@ -10,7 +10,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::types::{
-    validate_id, ComputerError, ComputerErrorCode, ComputerResult, ComputerRun, ComputerRunState,
+    validate_id, ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerResult,
+    ComputerRun, ComputerRunState,
 };
 
 const MAX_RUN_RECORDS: usize = 256;
@@ -266,6 +267,7 @@ impl ComputerStore {
                 continue;
             }
             run.state = ComputerRunState::Interrupted;
+            run.set_control_disposition(ComputerControlDisposition::Interrupted);
             run.version = run.version.saturating_add(1);
             run.updated_at = Utc::now();
             run.ended_at = Some(run.updated_at);
@@ -384,6 +386,15 @@ fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
         return Err(invalid_record());
     }
     if run.state.is_terminal() != run.ended_at.is_some() {
+        return Err(invalid_record());
+    }
+    if (run.control_disposition == ComputerControlDisposition::OperatorTakeover
+        && run.state != ComputerRunState::Paused)
+        || (run.control_disposition == ComputerControlDisposition::Interrupted
+            && run.state != ComputerRunState::Interrupted)
+        || (run.control_disposition == ComputerControlDisposition::Stopped
+            && !run.state.is_terminal())
+    {
         return Err(invalid_record());
     }
     if let Some(observation) = &run.current_observation {
@@ -580,6 +591,11 @@ mod tests {
         let store = ComputerStore::open(dir.path()).unwrap();
         let recovered = store.load_run(&run_id).unwrap().unwrap();
         assert_eq!(recovered.state, ComputerRunState::Interrupted);
+        assert_eq!(
+            recovered.control_disposition,
+            ComputerControlDisposition::Interrupted
+        );
+        assert!(recovered.control_epoch > 0);
         assert!(recovered.grant.is_none());
         assert!(recovered.current_observation.is_none());
     }
