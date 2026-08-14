@@ -902,7 +902,7 @@ mod tests {
 
     use async_trait::async_trait;
     use grokptah_agent_bridge::computer_use::{ObservationGeometry, SemanticElement, Sensitivity};
-    use grokptah_agent_bridge::{ActionOutcome, ComputerBackend, ComputerTarget};
+    use grokptah_agent_bridge::{ActionOutcome, ComputerBackend, ComputerStore, ComputerTarget};
 
     use super::*;
 
@@ -1047,8 +1047,21 @@ mod tests {
         }
     }
 
+    /// Host fixture with its persist directories bound under the disposable
+    /// fixture directory. The process-global home override is serialized and
+    /// restored so parallel tests never touch the real user home.
+    fn test_host(dir: &std::path::Path) -> AgentHostHandle {
+        let _guard = grokptah_agent_bridge::home_override_serial();
+        grokptah_agent_bridge::set_grokptah_home_override(Some(dir.join(".grokptah")));
+        let host = grokptah_agent_bridge::AgentHost::create(Default::default());
+        grokptah_agent_bridge::set_grokptah_home_override(None);
+        host
+    }
+
     fn test_desktop() -> (tempfile::TempDir, DesktopComputerUse) {
         let dir = tempfile::tempdir().unwrap();
+        // Tests deliberately open an isolated store in the fixture directory;
+        // production `new()` must borrow the host's shared handle instead.
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
         let simulator = Arc::new(ComputerUseService::new(
             Arc::new(SimulatorBackend::new()),
@@ -1057,6 +1070,7 @@ mod tests {
         (
             dir,
             DesktopComputerUse {
+                host: test_host(dir.path()),
                 platform: None,
                 store: Some(store),
                 initialization_error: None,

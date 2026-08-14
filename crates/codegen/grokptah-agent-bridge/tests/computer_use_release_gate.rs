@@ -173,6 +173,7 @@ fn fixture(
         .create_run(
             "release-gate-create",
             Uuid::new_v4(),
+            None,
             target(),
             Default::default(),
         )
@@ -337,4 +338,53 @@ async fn unsupported_pointer_fallback_never_reaches_backend() {
         service.get_run(&run.run_id).unwrap().unwrap().state,
         ComputerRunState::Ready
     );
+}
+
+/// The MCP control plane exposes exactly four read-only Computer Run tools.
+/// Any additional computer-prefixed tool — a mutation, an evidence or
+/// screenshot fetch, raw input, or admin control — must consciously widen
+/// this snapshot rather than slip in silently (#271 read-only slice).
+#[test]
+fn mcp_surface_exposes_only_the_scoped_computer_read_tools() {
+    use grokptah_agent_bridge::{CONTROL_TOOLS, FORBIDDEN_TOOLS};
+
+    let computer_tools: Vec<&str> = CONTROL_TOOLS
+        .iter()
+        .copied()
+        .filter(|name| name.contains("computer"))
+        .collect();
+    assert_eq!(
+        computer_tools,
+        vec![
+            "ptah_list_computer_runs",
+            "ptah_get_computer_run",
+            "ptah_get_computer_run_events",
+            "ptah_get_computer_capacity",
+        ]
+    );
+    for forbidden_fragment in [
+        "submit_computer",
+        "computer_action",
+        "computer_act",
+        "computer_pause",
+        "computer_cancel",
+        "computer_take_over",
+        "computer_grant",
+        "computer_approve",
+        "computer_evidence",
+        "computer_screenshot",
+        "computer_observe",
+        "computer_input",
+        "computer_shell",
+    ] {
+        assert!(
+            !CONTROL_TOOLS
+                .iter()
+                .any(|name| name.contains(forbidden_fragment)),
+            "{forbidden_fragment} must not be reachable through the control plane"
+        );
+    }
+    for forbidden in FORBIDDEN_TOOLS {
+        assert!(!CONTROL_TOOLS.contains(forbidden));
+    }
 }

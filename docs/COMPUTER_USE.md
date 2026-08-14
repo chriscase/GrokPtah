@@ -79,6 +79,23 @@ An unknown run and a run owned by another session return the **identical** `unau
 error, so a scoped read cannot be used as a run-existence oracle. Traversal-shaped and empty
 run ids fail the same way rather than surfacing a distinct validation error.
 
+### Workspace binding and the MCP read surface
+
+Every Computer Run now carries a **durable workspace binding**: the owning session's
+canonical project cwd, stamped at creation, preserved verbatim through restart recovery,
+and never rewritten. The authenticated loopback control plane exposes four read-only
+tools over this contract — `ptah_list_computer_runs`, `ptah_get_computer_run`,
+`ptah_get_computer_run_events`, and `ptah_get_computer_capacity` — each requiring the
+owning `session_id` plus the claimed allowlisted workspace, which must equal the run's
+binding exactly. A run without a binding (created before the field existed) is invisible
+to MCP: authorization fails closed rather than inferring a workspace from current process
+state. Cross-workspace, cross-session, unbound, unknown, and traversal-shaped reads all
+collapse into the same `unauthorized`/`forbidden_scope` failure. The desktop and the
+control plane share one `ComputerStore` handle through `AgentHost::ensure_computer_store`
+because the ledger holds an exclusive file lock. No mutation, grant, evidence byte, or
+screenshot crosses MCP; see `docs/MCP_CONTROL_COORDINATOR.md` for the wire contract and
+the independent live smoke.
+
 ### Event cursors and gaps
 
 Event pages are derived from the durable audit journal, which is a bounded ring. Sequences are
