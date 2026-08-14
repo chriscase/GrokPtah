@@ -7,7 +7,8 @@ use grokptah_agent_bridge::{
     grokptah_home, ActionClass, ActionGrant, ComputerAction, ComputerAgentProposal,
     ComputerCapabilities, ComputerError, ComputerObservation, ComputerObservationPlatform,
     ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun,
-    ComputerRunState, ComputerStore, ComputerTargetCandidate, ComputerUseLimits,
+    ComputerRunProjection, ComputerRunState, ComputerStore, ComputerTargetCandidate,
+    ComputerUseLimits,
     ComputerUseService, GrantIssuer, MacOsObservationPlatform, SemanticAction, SimulatorBackend,
 };
 use serde::Serialize;
@@ -43,6 +44,13 @@ pub struct PendingComputerApproval {
 pub struct ComputerCockpitSnapshot {
     pub backend: ComputerCapabilities,
     pub origin: String,
+    /// Authoritative run view. This is the identical serialized projection a
+    /// coordinator surface receives, so the cockpit and an external observer
+    /// cannot disagree about state, control disposition, epoch, or progress.
+    pub projection: Option<ComputerRunProjection>,
+    /// Local-only detail. It carries observed element labels and values needed
+    /// to render an approval and must never cross the MCP boundary; the
+    /// projection above is what does.
     pub run: Option<ComputerRun>,
     pub pending_approval: Option<PendingComputerApproval>,
 }
@@ -279,6 +287,9 @@ impl DesktopComputerUse {
         Ok(ComputerCockpitSnapshot {
             backend,
             origin: "desktop".into(),
+            projection: run
+                .as_ref()
+                .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now())),
             run,
             pending_approval,
         })

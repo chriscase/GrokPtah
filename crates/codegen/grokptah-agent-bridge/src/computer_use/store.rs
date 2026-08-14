@@ -14,7 +14,6 @@ use super::types::{
     ComputerRun, ComputerRunState,
 };
 
-const MAX_RUN_RECORDS: usize = 256;
 const MAX_RECEIPTS: usize = 2_048;
 const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const TERMINAL_RUN_AGE: Duration = Duration::days(30);
@@ -62,6 +61,10 @@ pub(crate) enum MutationClaim {
 }
 
 impl ComputerStore {
+    /// Durable ledger ceiling, surfaced so capacity reads report the same
+    /// bound the store actually enforces in [`Self::can_create_run`].
+    pub const MAX_RUN_RECORDS: usize = 256;
+
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
@@ -133,7 +136,7 @@ impl ComputerStore {
 
     pub(crate) fn can_create_run(&self) -> ComputerResult<()> {
         let count = self.list_runs()?.len();
-        if count >= MAX_RUN_RECORDS {
+        if count >= Self::MAX_RUN_RECORDS {
             return Err(ComputerError::new(
                 ComputerErrorCode::LimitReached,
                 "computer-use run record limit reached",
@@ -313,7 +316,7 @@ impl ComputerStore {
         for (index, (path, run)) in runs.into_iter().enumerate() {
             let expired = run.state.is_terminal()
                 && now.signed_duration_since(run.updated_at) > TERMINAL_RUN_AGE;
-            if run.state.is_terminal() && (index >= MAX_RUN_RECORDS || expired) {
+            if run.state.is_terminal() && (index >= Self::MAX_RUN_RECORDS || expired) {
                 fs::remove_file(path).map_err(internal_error)?;
             }
         }

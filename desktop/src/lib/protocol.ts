@@ -598,6 +598,84 @@ export interface PendingComputerApproval {
   createdAt: string;
 }
 
+export type ComputerControlDisposition =
+  | "agent_owned"
+  | "paused"
+  | "operator_takeover"
+  | "stopped"
+  | "interrupted"
+  | "uncertain_outcome";
+
+/**
+ * Authoritative Computer Run view. This mirrors the Rust
+ * `ComputerRunProjection` exactly: it is the same serialized payload an
+ * external coordinator receives, so the cockpit cannot disagree with an
+ * outside observer about run state, control disposition, or epoch.
+ *
+ * Observed element labels, values, and evidence tokens are deliberately
+ * absent — those stay on `ComputerRun`, which is local-only.
+ */
+export interface ComputerRunProjection {
+  runId: string;
+  ownerSessionId: string;
+  parentRunId?: string | null;
+  campaignId?: string | null;
+  target: {
+    appId: string;
+    windowId: string;
+    generation: number;
+    displayName: string;
+    sensitivity: string;
+  };
+  state: string;
+  controlDisposition: ComputerControlDisposition | string;
+  controlEpoch: number;
+  version: number;
+  /** True only while the backend is mid-observation or mid-action. */
+  agentActive: boolean;
+  terminal: boolean;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string | null;
+  endedAt?: string | null;
+  progress: {
+    actionCount: number;
+    maxActions: number;
+    evidenceBytes: number;
+    maxEvidenceBytes: number;
+    elapsedMillis?: number | null;
+    maxDurationSecs: number;
+    durationExceeded: boolean;
+  };
+  grant?: {
+    grantId: string;
+    actionClasses: string[];
+    issuedBy: string;
+    issuedAt: string;
+    expiresAt: string;
+    usesRemaining?: number | null;
+    revoked: boolean;
+    expired: boolean;
+  } | null;
+  observation?: {
+    observationId: string;
+    sequence: number;
+    capturedAt: string;
+    elementCount: number;
+    elementsTruncated: boolean;
+    sensitivity: string;
+    hasScreenshot: boolean;
+    screenshotRedacted?: boolean | null;
+    stale: boolean;
+  } | null;
+  lastOutcome?: {
+    summary: string;
+    expectedPostconditionMet?: boolean | null;
+  } | null;
+  lastError?: { code: string; message: string } | null;
+  eventRange?: { startSeq: number; endSeq: number } | null;
+}
+
 export interface ComputerCockpitSnapshot {
   backend: {
     backendId: string;
@@ -608,6 +686,9 @@ export interface ComputerCockpitSnapshot {
     pointerFallback: boolean;
   };
   origin: "desktop" | "mcp" | string;
+  /** Authoritative projection; prefer this over `run` for status rendering. */
+  projection?: ComputerRunProjection | null;
+  /** Local-only detail retained for approval rendering. */
   run?: ComputerRun | null;
   pendingApproval?: PendingComputerApproval | null;
 }
