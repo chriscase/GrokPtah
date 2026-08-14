@@ -4,12 +4,12 @@ use std::sync::Arc;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
-    grokptah_home, ActionClass, ActionGrant, ComputerAction, ComputerAgentProposal,
-    ComputerCapabilities, ComputerError, ComputerObservation, ComputerObservationPlatform,
-    ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun,
-    ComputerRunProjection, ComputerRunState, ComputerStore, ComputerTargetCandidate,
-    ComputerUseLimits,
-    ComputerUseService, GrantIssuer, MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
+    ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
+    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
+    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
+    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -64,8 +64,9 @@ pub struct ComputerAgentProposalResult {
 }
 
 pub struct DesktopComputerUse {
+    host: AgentHostHandle,
     platform: Option<Arc<dyn ComputerObservationPlatform>>,
-    store: Option<ComputerStore>,
+    store: Option<grokptah_agent_bridge::ComputerStore>,
     initialization_error: Option<String>,
     operation: Mutex<()>,
     selections: std::sync::Mutex<HashMap<String, grokptah_agent_bridge::ComputerTarget>>,
@@ -76,9 +77,12 @@ pub struct DesktopComputerUse {
 }
 
 impl DesktopComputerUse {
-    pub fn new() -> Self {
+    pub fn new(host: &AgentHostHandle) -> Self {
         let (platform, platform_error) = native_platform();
-        let (store, store_error) = match ComputerStore::open(grokptah_home().join("computer-use")) {
+        // The durable ledger holds an exclusive file lock, so the desktop and
+        // the embedded MCP control plane must share the host's single handle
+        // rather than each opening their own store.
+        let (store, store_error) = match host.ensure_computer_store() {
             Ok(store) => (Some(store), None),
             Err(error) => (
                 None,
@@ -92,6 +96,7 @@ impl DesktopComputerUse {
             ))
         });
         Self {
+            host: host.clone(),
             platform,
             store,
             initialization_error: platform_error.or(store_error),
@@ -102,6 +107,19 @@ impl DesktopComputerUse {
             simulator_operation: Mutex::new(()),
             pending_approval: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Durable workspace binding for a new run: the owning session's canonical
+    /// project cwd. `None` (no session, empty cwd, or a path that cannot be
+    /// canonicalized) keeps the run fully usable from the desktop but
+    /// invisible to workspace-scoped MCP reads, which fail closed on an
+    /// absent binding rather than inferring one from process state.
+    fn session_workspace(&self, owner_session_id: Uuid) -> Option<String> {
+        let session = self.host.session_load(owner_session_id).ok()?;
+        if session.cwd.is_empty() {
+            return None;
+        }
+        canonical_workspace_string(std::path::Path::new(&session.cwd))
     }
 
     pub fn status(&self) -> ComputerPlatformStatus {
@@ -190,6 +208,7 @@ impl DesktopComputerUse {
             .create_run(
                 &Uuid::new_v4().to_string(),
                 owner_session_id,
+                self.session_workspace(owner_session_id),
                 target,
                 limits,
             )
@@ -321,6 +340,7 @@ impl DesktopComputerUse {
             .create_run(
                 &Uuid::new_v4().to_string(),
                 owner_session_id,
+                self.session_workspace(owner_session_id),
                 target,
                 limits,
             )
@@ -379,6 +399,7 @@ impl DesktopComputerUse {
             .create_run(
                 &Uuid::new_v4().to_string(),
                 owner_session_id,
+                self.session_workspace(owner_session_id),
                 target,
                 limits,
             )

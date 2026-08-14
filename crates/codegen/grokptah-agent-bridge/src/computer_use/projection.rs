@@ -343,7 +343,7 @@ mod tests {
     }
 
     fn run() -> ComputerRun {
-        ComputerRun::new(Uuid::new_v4(), target(), ComputerUseLimits::default()).unwrap()
+        ComputerRun::new(Uuid::new_v4(), None, target(), ComputerUseLimits::default()).unwrap()
     }
 
     fn observation_with_secrets(target: &ComputerTarget) -> ComputerObservation {
@@ -513,6 +513,42 @@ mod tests {
         let continuous = project_events(&run, Some(range.start_seq - 1), 100);
         assert!(!continuous.cursor_expired);
         assert_eq!(continuous.entries.len(), 5);
+    }
+
+    #[test]
+    fn event_entries_serialize_only_the_pinned_audit_keys() {
+        let mut run = run();
+        run.record_audit(
+            "create_run",
+            "accepted",
+            Some(ActionClass::Semantic),
+            Some("obs-1".into()),
+            Some(ComputerErrorCode::Interrupted),
+        );
+        let page = project_events(&run, None, 10);
+        let encoded = serde_json::to_value(&page).unwrap();
+        let keys: BTreeSet<&str> = encoded["entries"][0]
+            .as_object()
+            .expect("entry is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // Event pages are the other coordinator-visible payload, so the exact
+        // serialized audit-entry key set is pinned the same way the
+        // observation keys are: a future field addition must consciously
+        // widen this list rather than silently widen what MCP observes.
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "sequence",
+                "at",
+                "operation",
+                "disposition",
+                "actionClass",
+                "observationId",
+                "errorCode",
+            ])
+        );
     }
 
     #[test]
