@@ -16,6 +16,10 @@ use crate::completion::{
     build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
     CompletionUsage,
 };
+use crate::computer_agent::{
+    propose_semantic_action, qualify_semantic_model, resolve_computer_eligibility,
+    ComputerAgentEligibility, ComputerAgentProposal,
+};
 use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
@@ -118,6 +122,11 @@ struct OrchestrationPendingAdmission {
     sequence: u64,
 }
 
+#[derive(Debug, Clone)]
+struct SessionComputerQualification {
+    route_fingerprint: String,
+}
+
 pub(crate) struct Inner {
     running: bool,
     project_cwd: Option<PathBuf>,
@@ -151,6 +160,13 @@ pub(crate) struct Inner {
     /// Per-session turn cancellation so multiple sessions can run concurrently
     /// (Claude Code–style parallel build sessions).
     turn_cancels: HashMap<Uuid, CancellationToken>,
+    /// Explicit, short-lived model qualification/proposal calls from the
+    /// Computer cockpit. These are independent from Build turns and always
+    /// cancelled by local Stop/Take over.
+    computer_agent_operations: HashMap<Uuid, (String, CancellationToken)>,
+    /// Session-local measured authority for built-in/provider routes that do
+    /// not have a durable provider-profile capability record. Restart clears it.
+    computer_agent_qualifications: HashMap<(Uuid, String), SessionComputerQualification>,
     /// Short-lived orchestration admission reservations. These close the gap
     /// between accepting a run and polling its async prompt future.
     turn_reservations: HashMap<Uuid, String>,
@@ -197,6 +213,12 @@ struct TurnBusyGuard {
     armed: bool,
 }
 
+struct ComputerAgentBusyGuard {
+    host: AgentHostHandle,
+    session_id: Uuid,
+    operation_id: String,
+}
+
 impl Drop for TurnBusyGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -212,6 +234,19 @@ impl Drop for TurnBusyGuard {
                 .recover_pending_steering();
         }
         let _ = self.host.persist_prompt_queue(self.session_id);
+    }
+}
+
+impl Drop for ComputerAgentBusyGuard {
+    fn drop(&mut self) {
+        let mut inner = self.host.inner.lock();
+        if inner
+            .computer_agent_operations
+            .get(&self.session_id)
+            .is_some_and(|(operation_id, _)| operation_id == &self.operation_id)
+        {
+            inner.computer_agent_operations.remove(&self.session_id);
+        }
     }
 }
 
@@ -422,6 +457,8 @@ impl AgentHost {
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
+            computer_agent_operations: HashMap::new(),
+            computer_agent_qualifications: HashMap::new(),
             turn_reservations: HashMap::new(),
             orchestration_admissions: HashMap::new(),
             orchestration_pending_admissions: HashMap::new(),
@@ -461,6 +498,209 @@ impl AgentHostHandle {
     /// Additional live subscriber (does not steal the primary GUI receiver).
     pub fn subscribe_events(&self) -> crate::event_bus::EventReceiver {
         self.inner.lock().event_tx.subscribe()
+    }
+
+    /// Current model authority for the local Computer cockpit. Unknown models
+    /// remain manual-only unless a durable provider profile or this process's
+    /// explicit simulator qualification grants semantic authority.
+    pub fn computer_agent_eligibility(&self, session_id: Uuid) -> Result<ComputerAgentEligibility> {
+        let (model, _) = self.selected_computer_model(session_id)?;
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
+            return Ok(resolved.eligibility);
+        }
+        let qualified = self
+            .inner
+            .lock()
+            .computer_agent_qualifications
+            .get(&(session_id, model.clone()))
+            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+        if qualified {
+            return Ok(ComputerAgentEligibility {
+                model,
+                tier: crate::gateway_config::ComputerUseTier::SemanticAct,
+                source: "session_measured".into(),
+            });
+        }
+        Ok(resolved.eligibility)
+    }
+
+    /// Run the selected model against two deterministic simulator frames. No
+    /// proposed action executes, and success is scoped to this exact route for
+    /// the current process unless the provider profile already has a durable
+    /// measured capability.
+    pub async fn qualify_computer_agent(
+        &self,
+        session_id: Uuid,
+    ) -> Result<ComputerAgentEligibility> {
+        let (operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
+        let (model, effort) = self.selected_computer_model(session_id)?;
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
+            return Ok(resolved.eligibility);
+        }
+        qualify_semantic_model(&credentials, &model, effort, &cancel)
+            .await
+            .context("selected model did not pass bounded Computer qualification")?;
+        if cancel.is_cancelled() {
+            bail!("Computer model qualification was cancelled");
+        }
+        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
+        {
+            let mut inner = self.inner.lock();
+            if inner
+                .computer_agent_operations
+                .get(&session_id)
+                .is_none_or(|(current, _)| current != &operation_id)
+            {
+                bail!("Computer model qualification was superseded");
+            }
+            inner.computer_agent_qualifications.insert(
+                (session_id, model.clone()),
+                SessionComputerQualification {
+                    route_fingerprint: resolved.route_fingerprint,
+                },
+            );
+        }
+        Ok(ComputerAgentEligibility {
+            model,
+            tier: crate::gateway_config::ComputerUseTier::SemanticAct,
+            source: "session_measured".into(),
+        })
+    }
+
+    /// Ask the selected, qualified model for one bounded semantic proposal.
+    /// This method cannot dispatch an OS action.
+    pub async fn propose_computer_action(
+        &self,
+        session_id: Uuid,
+        objective: &str,
+        observation: &crate::computer_use::ComputerObservation,
+    ) -> Result<ComputerAgentProposal> {
+        let (_operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
+        let (model, effort) = self.selected_computer_model(session_id)?;
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        let durable_authority =
+            resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct;
+        let session_authority = self
+            .inner
+            .lock()
+            .computer_agent_qualifications
+            .get(&(session_id, model.clone()))
+            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+        if !durable_authority && !session_authority {
+            bail!("selected model is not qualified for semantic Computer actions");
+        }
+        let proposal = propose_semantic_action(
+            &credentials,
+            &model,
+            effort,
+            objective,
+            observation,
+            &cancel,
+        )
+        .await
+        .context("selected model did not return a valid bounded Computer proposal")?;
+        if cancel.is_cancelled() {
+            bail!("Computer model proposal was cancelled");
+        }
+        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
+        Ok(proposal)
+    }
+
+    /// Local Stop/Take over cancellation. It does not share the Build-turn
+    /// token, so cancelling Computer inference never cancels unrelated coding.
+    pub fn cancel_computer_agent(&self, session_id: Uuid) -> bool {
+        let token = self
+            .inner
+            .lock()
+            .computer_agent_operations
+            .remove(&session_id)
+            .map(|(_, token)| token);
+        if let Some(token) = token {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn invalidate_computer_agent_authority(&self) {
+        let tokens = {
+            let mut inner = self.inner.lock();
+            inner.computer_agent_qualifications.clear();
+            inner
+                .computer_agent_operations
+                .drain()
+                .map(|(_, (_, token))| token)
+                .collect::<Vec<_>>()
+        };
+        for token in tokens {
+            token.cancel();
+        }
+    }
+
+    fn selected_computer_model(&self, session_id: Uuid) -> Result<(String, EffortLevel)> {
+        let inner = self.inner.lock();
+        if !inner.sessions.contains_key(&session_id) {
+            bail!("unknown session");
+        }
+        Ok((inner.model.clone(), inner.effort))
+    }
+
+    fn begin_computer_agent_operation(
+        &self,
+        session_id: Uuid,
+    ) -> Result<(String, CancellationToken, ComputerAgentBusyGuard)> {
+        let operation_id = Uuid::new_v4().to_string();
+        let cancel = CancellationToken::new();
+        {
+            let mut inner = self.inner.lock();
+            if !inner.sessions.contains_key(&session_id) {
+                bail!("unknown session");
+            }
+            if inner.computer_agent_operations.contains_key(&session_id) {
+                bail!("a Computer model request is already running for this session");
+            }
+            inner
+                .computer_agent_operations
+                .insert(session_id, (operation_id.clone(), cancel.clone()));
+        }
+        let guard = ComputerAgentBusyGuard {
+            host: self.clone(),
+            session_id,
+            operation_id: operation_id.clone(),
+        };
+        Ok((operation_id, cancel, guard))
+    }
+
+    fn ensure_computer_route_unchanged(
+        &self,
+        session_id: Uuid,
+        expected_model: &str,
+        expected_route: &str,
+    ) -> Result<()> {
+        let (current_model, _) = self.selected_computer_model(session_id)?;
+        if current_model != expected_model {
+            bail!("selected model changed while the Computer request was running");
+        }
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&current_model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let current = resolve_computer_eligibility(&credentials, &current_model)?;
+        if current.route_fingerprint != expected_route {
+            bail!("provider route changed while the Computer request was running");
+        }
+        Ok(())
     }
 
     /// Shared wake-up for every embedded orchestration scheduler.
@@ -1062,6 +1302,7 @@ impl AgentHostHandle {
     }
 
     pub fn stop(&self) -> Result<()> {
+        self.invalidate_computer_agent_authority();
         let mut g = self.inner.lock();
         for (_, c) in g.turn_cancels.drain() {
             c.cancel();
@@ -1491,6 +1732,7 @@ impl AgentHostHandle {
     }
 
     pub fn session_delete(&self, id: Uuid) -> Result<()> {
+        self.cancel_computer_agent(id);
         {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&id) {
@@ -1500,6 +1742,8 @@ impl AgentHostHandle {
                 bail!("cannot delete a session with an active turn — stop it first");
             }
             g.sessions.remove(&id);
+            g.computer_agent_qualifications
+                .retain(|(session_id, _), _| *session_id != id);
             g.prompt_queues.remove(&id);
             g.open_tab_ids.retain(|t| *t != id);
             if g.active_session == Some(id) {
@@ -2093,6 +2337,10 @@ impl AgentHostHandle {
     }
 
     pub fn set_model(&self, model: String) {
+        let changed = self.inner.lock().model != model;
+        if changed {
+            self.invalidate_computer_agent_authority();
+        }
         self.inner.lock().model = model;
         self.persist_chrome();
     }
@@ -3245,6 +3493,7 @@ impl AgentHostHandle {
         cfg.upsert_profile(profile).map_err(anyhow::Error::msg)?;
         cfg.active_profile_id = Some(provider_id.clone());
         crate::gateway_config::save(&cfg).map_err(|e| anyhow!("save gateway.json: {e}"))?;
+        self.invalidate_computer_agent_authority();
         self.set_model(crate::gateway_config::model_selection_key(
             &provider_id,
             &current_model_id,
@@ -3325,6 +3574,7 @@ impl AgentHostHandle {
         config.upsert_profile(profile).map_err(anyhow::Error::msg)?;
         config.active_profile_id = Some(provider_id.clone());
         crate::gateway_config::save(&config).context("save provider profile")?;
+        self.invalidate_computer_agent_authority();
         self.set_model(crate::gateway_config::model_selection_key(
             &provider_id,
             &model_id,
@@ -3375,6 +3625,7 @@ impl AgentHostHandle {
             config.clear_legacy_fields();
         }
         crate::gateway_config::save(&config).context("remove provider profile")?;
+        self.invalidate_computer_agent_authority();
 
         if let Some(reference) = profile.credential_ref.as_deref() {
             crate::auth_store::delete_provider_credential(&profile.id, reference)
@@ -7652,5 +7903,56 @@ fn effective_subagent_isolation(
     match override_mode {
         Some(mode) => (mode, true),
         None => (configured, false),
+    }
+}
+
+#[cfg(test)]
+mod computer_agent_host_tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_computer_authority_is_session_scoped_and_model_changes_revoke_it() {
+        let _serial = crate::home_override_serial();
+        let home = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(home.path().to_path_buf()));
+
+        let host = AgentHost::create(HostConfig::default());
+        host.start().unwrap();
+        let first = host.session_new().unwrap();
+        let second = host.session_new().unwrap();
+        let model = host.inner.lock().model.clone();
+        host.inner.lock().computer_agent_qualifications.insert(
+            (first.id, model.clone()),
+            SessionComputerQualification {
+                route_fingerprint: "route-a".into(),
+            },
+        );
+
+        {
+            let inner = host.inner.lock();
+            assert!(inner
+                .computer_agent_qualifications
+                .contains_key(&(first.id, model.clone())));
+            assert!(!inner
+                .computer_agent_qualifications
+                .contains_key(&(second.id, model.clone())));
+        }
+
+        let (_operation_id, token, guard) = host
+            .begin_computer_agent_operation(first.id)
+            .expect("first request should reserve the session");
+        assert!(host.begin_computer_agent_operation(first.id).is_err());
+        host.set_model("different-model".into());
+        assert!(token.is_cancelled());
+        assert!(host.inner.lock().computer_agent_qualifications.is_empty());
+        drop(guard);
+        let (_operation_id, restarted_token, _guard) = host
+            .begin_computer_agent_operation(first.id)
+            .expect("model change should release the old reservation");
+        host.stop().unwrap();
+        assert!(restarted_token.is_cancelled());
+
+        drop(host);
+        crate::set_grokptah_home_override(None);
     }
 }

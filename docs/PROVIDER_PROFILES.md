@@ -49,6 +49,12 @@ granted by this first probe. No model name, ordinary tool result, effort setting
 permission manufactures Computer authority. The operator cockpit remains usable manually and shows
 the selected model's measured tier; local one-use approval is still required for every action.
 
+Built-in xAI models follow the same behavioral proof. Because they are not backed by a mutable local
+provider profile, the user starts **Verify model for this session** in the Computer cockpit. A pass
+grants only process-local proposal authority for the exact resolved route and model; it is cleared by
+restart or route/model change. Provider-profile qualification remains the durable path for compatible
+gateways. Neither path executes its simulator proposal.
+
 The Computer probe never executes the proposed action, reads a workspace, captures a real window,
 or stores provider credentials in its report. It sends only repository-defined simulator metadata
 and fixed synthetic strings. Changing the endpoint or qualification schema immediately resets

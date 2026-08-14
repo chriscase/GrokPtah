@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type {
   ComputerAction,
+  ComputerAgentEligibility,
   ComputerCockpitSnapshot,
   ComputerPermissionStatus,
   ComputerPlatformStatus,
@@ -24,6 +25,9 @@ type ComputerCockpitProps = {
   onSteer: (text: string) => Promise<string>;
   onRunState?: (state: string | null) => void;
 };
+
+const DEFAULT_AGENT_OBJECTIVE =
+  "Enter Ada Lovelace in the Name field, then submit the form.";
 
 function titleCase(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
@@ -78,6 +82,9 @@ export function ComputerCockpit({
   const [platformStatus, setPlatformStatus] = useState<ComputerPlatformStatus | null>(null);
   const [scopeReviewed, setScopeReviewed] = useState(false);
   const [name, setName] = useState("Ada Lovelace");
+  const [objective, setObjective] = useState(DEFAULT_AGENT_OBJECTIVE);
+  const [agentEligibility, setAgentEligibility] = useState<ComputerAgentEligibility | null>(null);
+  const [agentBusy, setAgentBusy] = useState(false);
   const [steerText, setSteerText] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -95,6 +102,9 @@ export function ComputerCockpit({
     setError(null);
     setNotice(null);
     setBusy(false);
+    setAgentBusy(false);
+    setAgentEligibility(null);
+    setObjective(DEFAULT_AGENT_OBJECTIVE);
     if (!sessionId) {
       onRunState?.(null);
       return;
@@ -111,6 +121,17 @@ export function ComputerCockpit({
         setError(String(reason));
         onRunState?.(null);
       });
+    void api
+      .computerUseCockpitAgentEligibility(sessionId)
+      .then((eligibility) => {
+        if (requestEpoch.current === epoch) setAgentEligibility(eligibility);
+      })
+      .catch(() => {
+        // The durable model capability passed as props remains authoritative.
+      });
+    return () => {
+      void api.computerUseCockpitCancelAgent(sessionId).catch(() => {});
+    };
   }, [sessionId, onRunState]);
 
   const apply = async (
@@ -151,6 +172,57 @@ export function ComputerCockpit({
   const nativePermissionsReady =
     platformStatus?.screenRecording === "granted" &&
     platformStatus.accessibility === "granted";
+  const effectiveAgentTier =
+    agentEligibility?.model === model ? agentEligibility.tier : computerUseTier;
+  const effectiveAgentSource =
+    agentEligibility?.model === model ? agentEligibility.source : computerCapabilitySource;
+
+  const qualifyAgent = async () => {
+    if (!sessionId) return;
+    const epoch = requestEpoch.current;
+    setAgentBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const eligibility = await api.computerUseCockpitQualifyAgent(sessionId);
+      if (requestEpoch.current !== epoch) return;
+      setAgentEligibility(eligibility);
+      setNotice(`${eligibility.model} passed the semantic simulator check.`);
+    } catch (reason) {
+      if (requestEpoch.current === epoch) setError(String(reason));
+    } finally {
+      if (requestEpoch.current === epoch) setAgentBusy(false);
+    }
+  };
+
+  const proposeAgentAction = async () => {
+    if (!sessionId || !run || !observation || !objective.trim()) return;
+    const epoch = requestEpoch.current;
+    setAgentBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await api.computerUseCockpitProposeAgentAction(
+        sessionId,
+        run.runId,
+        run.version,
+        observation.observationId,
+        objective.trim(),
+      );
+      if (requestEpoch.current !== epoch) return;
+      setSnapshot(result.snapshot);
+      onRunState?.(result.snapshot.run?.state ?? null);
+      setNotice(
+        result.completed
+          ? `Model marked the run complete: ${result.summary}`
+          : `Model proposal ready for review: ${result.summary}`,
+      );
+    } catch (reason) {
+      if (requestEpoch.current === epoch) setError(String(reason));
+    } finally {
+      if (requestEpoch.current === epoch) setAgentBusy(false);
+    }
+  };
 
   const refreshNativeStatus = async () => {
     const epoch = requestEpoch.current;
@@ -538,9 +610,9 @@ export function ComputerCockpit({
                 <div>
                   <dt>Agent access</dt>
                   <dd>
-                    {computerUseTier === "none"
+                    {effectiveAgentTier === "none"
                       ? "Manual only · not qualified"
-                      : `${titleCase(computerUseTier)} · ${computerCapabilitySource}`}
+                      : `${titleCase(effectiveAgentTier)} · ${titleCase(effectiveAgentSource)}`}
                   </dd>
                 </div>
                 <div><dt>Grant expires</dt><dd>{grantActive && run.grant ? new Date(run.grant.expiresAt).toLocaleTimeString() : "Revoked"}</dd></div>
@@ -558,7 +630,43 @@ export function ComputerCockpit({
 
           {run.state === "ready" && observation && !approval && (
             <div className="computer-proposal">
-              <div><span className="computer-section-label">Next action</span><h2>Stage for approval</h2></div>
+              <div className="computer-agent-proposal">
+                <div>
+                  <span className="computer-section-label">Agent objective</span>
+                  <h2>Propose one action</h2>
+                </div>
+                <label>
+                  Objective
+                  <textarea
+                    rows={2}
+                    maxLength={4096}
+                    value={objective}
+                    onChange={(event) => setObjective(event.target.value)}
+                  />
+                </label>
+                <div className="computer-agent-actions">
+                  {effectiveAgentTier === "semantic_act" ||
+                  effectiveAgentTier === "visual_fallback_act" ? (
+                    <button
+                      type="button"
+                      className="primary"
+                      disabled={busy || agentBusy || !objective.trim()}
+                      onClick={() => void proposeAgentAction()}
+                    >
+                      {agentBusy ? "Waiting for model" : "Propose next action"}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={busy || agentBusy}
+                      onClick={() => void qualifyAgent()}
+                    >
+                      {agentBusy ? "Checking model" : "Verify model for this session"}
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div><span className="computer-section-label">Manual action</span><h2>Stage for approval</h2></div>
               {nameElement && (
                 <label>
                   Visible text for {nameElement.label ?? nameElement.role}

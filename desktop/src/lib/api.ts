@@ -3,6 +3,8 @@ import type {
   AgentStatus,
   AuthState,
   ComputerObservationPreview,
+  ComputerAgentEligibility,
+  ComputerAgentProposalResult,
   ComputerAction,
   ComputerCockpitSnapshot,
   ComputerPermissionStatus,
@@ -50,6 +52,30 @@ export const api = {
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_snapshot", {
       sessionId,
     }),
+  computerUseCockpitAgentEligibility: (sessionId: string) =>
+    invoke<ComputerAgentEligibility>("computer_use_cockpit_agent_eligibility", {
+      sessionId,
+    }),
+  computerUseCockpitQualifyAgent: (sessionId: string) =>
+    invoke<ComputerAgentEligibility>("computer_use_cockpit_qualify_agent", {
+      sessionId,
+    }),
+  computerUseCockpitProposeAgentAction: (
+    sessionId: string,
+    runId: string,
+    expectedVersion: number,
+    observationId: string,
+    objective: string,
+  ) =>
+    invoke<ComputerAgentProposalResult>("computer_use_cockpit_propose_agent_action", {
+      sessionId,
+      runId,
+      expectedVersion,
+      observationId,
+      objective,
+    }),
+  computerUseCockpitCancelAgent: (sessionId: string) =>
+    invoke<boolean>("computer_use_cockpit_cancel_agent", { sessionId }),
   computerUseCockpitStartSimulator: (
     sessionId: string,
     reviewedTargetAppId: string,

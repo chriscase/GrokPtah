@@ -2,8 +2,9 @@
 //!
 //! The safety kernel remains provider-neutral. Native adapters must implement
 //! [`ComputerBackend`] and pass through the policy/state layer. The first macOS
-//! adapter exposes local read-only observation; model, action, and MCP surfaces
-//! remain deliberately absent.
+//! adapter exposes local consented observation and bounded semantic actions.
+//! Model proposals live above this module so provider behavior cannot weaken
+//! the state machine or policy boundary; MCP mutations remain absent.
 
 mod macos_observation;
 mod platform;
