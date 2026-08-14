@@ -194,6 +194,7 @@ let current: ComputerCockpitSnapshot = {
 };
 let currentName = "";
 let submitted = false;
+let agentQualified = false;
 
 function setRun(run: ComputerRun | null): ComputerCockpitSnapshot {
   current = { ...current, run, pendingApproval: null };
@@ -238,6 +239,20 @@ function pausedAfter(action: ComputerAction): ComputerRun {
 }
 
 api.computerUseCockpitSnapshot = async () => structuredClone(current);
+api.computerUseCockpitAgentEligibility = async () => ({
+  model: "grok-4.5",
+  tier: agentQualified ? "semantic_act" : "none",
+  source: agentQualified ? "session_measured" : "unknown",
+});
+api.computerUseCockpitQualifyAgent = async () => {
+  agentQualified = true;
+  return {
+    model: "grok-4.5",
+    tier: "semantic_act",
+    source: "session_measured",
+  };
+};
+api.computerUseCockpitCancelAgent = async () => false;
 api.computerUseStatus = async () => ({
   platformId: "macos",
   available: true,
@@ -272,6 +287,12 @@ api.computerUseCockpitStageAction = async (
   observationId,
   action,
 ) => {
+  const actionElementLabel =
+    "element_id" in action
+      ? current.run?.currentObservation?.elements.find(
+          (element) => element.elementId === action.element_id,
+        )?.label
+      : null;
   current = {
     ...current,
     pendingApproval: {
@@ -284,7 +305,7 @@ api.computerUseCockpitStageAction = async (
       action,
       actionSummary:
         action.type === "set_value"
-          ? "Enter visible text in Project label"
+          ? `Enter visible text in ${actionElementLabel ?? "the selected field"}`
           : action.type === "activate_target"
             ? "Bring the authorized application to the foreground"
             : `Stage ${action.type.replaceAll("_", " ")}`,
@@ -298,6 +319,29 @@ api.computerUseCockpitStageAction = async (
     },
   };
   return structuredClone(current);
+};
+api.computerUseCockpitProposeAgentAction = async (
+  sessionId,
+  runId,
+  expectedVersion,
+  observationId,
+) => {
+  const elementId = current.run?.currentObservation?.elements.find(
+    (element) => element.actions.includes("set_value"),
+  )?.elementId;
+  if (!elementId) throw new Error("No visible text field is available");
+  const snapshot = await api.computerUseCockpitStageAction(
+    sessionId,
+    runId,
+    expectedVersion,
+    observationId,
+    { type: "set_value", element_id: elementId, text: "Ada Lovelace" },
+  );
+  return {
+    snapshot,
+    summary: "Enter the requested name in the visible field",
+    completed: false,
+  };
 };
 api.computerUseCockpitApprove = async () =>
   setRun(pausedAfter(current.pendingApproval!.action));

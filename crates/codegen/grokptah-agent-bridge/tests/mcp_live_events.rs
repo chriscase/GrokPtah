@@ -14,14 +14,17 @@ use grokptah_agent_bridge::{
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
-fn setup() -> (
+type HomeGuard = std::sync::MutexGuard<'static, ()>;
+
+fn setup_with_guard(
+    guard: HomeGuard,
+) -> (
     tempfile::TempDir,
-    std::sync::MutexGuard<'static, ()>,
+    HomeGuard,
     grokptah_agent_bridge::AgentHostHandle,
     tempfile::TempDir,
     Arc<OrchestrationService>,
 ) {
-    let guard = home_override_serial();
     let home = tempdir().unwrap();
     set_grokptah_home_override(Some(home.path().join(".grokptah")));
     let workspace = tempdir().unwrap();
@@ -65,7 +68,9 @@ async fn wait_terminal(
     workspace: &std::path::Path,
     run_id: &str,
 ) -> Value {
-    for _ in 0..80 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_state = None;
+    while tokio::time::Instant::now() < deadline {
         let run = client
             .call_tool(
                 "ptah_get_run",
@@ -77,15 +82,16 @@ async fn wait_terminal(
             )
             .await
             .unwrap();
+        last_state = run.structured["state"].as_str().map(str::to_owned);
         if matches!(
-            run.structured["state"].as_str(),
+            last_state.as_deref(),
             Some("completed" | "failed" | "cancelled" | "interrupted" | "limit_reached")
         ) {
             return run.structured;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("run did not reach a terminal state: {run_id}");
+    panic!("run did not reach a terminal state: {run_id}; last state: {last_state:?}");
 }
 
 async fn first_chunk(response: reqwest::Response) -> String {
@@ -110,9 +116,10 @@ fn event_id(frame: &str) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
+    let guard = home_override_serial();
     let previous_offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
     std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
-    let (_home, _lock, host, workspace, orch) = setup();
+    let (_home, _lock, host, workspace, orch) = setup_with_guard(guard);
     let owner = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(owner.id, workspace.path()).unwrap();
     let other = host.session_new_kind(SessionKind::Build).unwrap();
@@ -229,9 +236,10 @@ async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn reusable_client_reconnects_from_last_live_event() {
+    let guard = home_override_serial();
     let previous_offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
     std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
-    let (_home, _lock, host, workspace, orch) = setup();
+    let (_home, _lock, host, workspace, orch) = setup_with_guard(guard);
     let owner = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(owner.id, workspace.path()).unwrap();
     let server = start_control_server(orch, 0).await.unwrap();
@@ -303,9 +311,10 @@ async fn reusable_client_reconnects_from_last_live_event() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn live_get_delivers_events_while_a_run_is_still_active() {
+    let guard = home_override_serial();
     let previous_offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
     std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
-    let (_home, _lock, host, workspace, orch) = setup();
+    let (_home, _lock, host, workspace, orch) = setup_with_guard(guard);
     let owner = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(owner.id, workspace.path()).unwrap();
     let server = start_control_server(orch, 0).await.unwrap();

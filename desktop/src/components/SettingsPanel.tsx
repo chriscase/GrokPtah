@@ -635,6 +635,16 @@ export function SettingsPanel({
                   <div className="settings-hint">Checking availability...</div>
                 )}
 
+                {computerStatus &&
+                  (computerStatus.screenRecording !== "granted" ||
+                    computerStatus.accessibility !== "granted") && (
+                    <p className="settings-hint is-warning">
+                      macOS grants are per application. Codex Computer Use and Terminal grants do not
+                      grant GrokPtah access; enable both for GrokPtah in Privacy &amp; Security, then
+                      restart GrokPtah and refresh.
+                    </p>
+                  )}
+
                 {computerStatus?.detail && (
                   <div className="settings-hint is-warning">
                     {computerStatus.detail}

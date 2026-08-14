@@ -5,6 +5,10 @@ import type { ComputerCockpitSnapshot, ComputerRun } from "../lib/protocol";
 
 const mocks = vi.hoisted(() => ({
   snapshot: vi.fn(),
+  eligibility: vi.fn(),
+  qualifyAgent: vi.fn(),
+  proposeAgent: vi.fn(),
+  cancelAgent: vi.fn(),
   status: vi.fn(),
   requestPermission: vi.fn(),
   targets: vi.fn(),
@@ -22,6 +26,10 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../lib/api", () => ({
   api: {
     computerUseCockpitSnapshot: mocks.snapshot,
+    computerUseCockpitAgentEligibility: mocks.eligibility,
+    computerUseCockpitQualifyAgent: mocks.qualifyAgent,
+    computerUseCockpitProposeAgentAction: mocks.proposeAgent,
+    computerUseCockpitCancelAgent: mocks.cancelAgent,
     computerUseStatus: mocks.status,
     computerUseRequestPermission: mocks.requestPermission,
     computerUseListTargets: mocks.targets,
@@ -145,6 +153,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   props.onSteer.mockResolvedValue("Priority prompt preserved.");
   mocks.snapshot.mockResolvedValue(snapshot());
+  mocks.eligibility.mockRejectedValue(new Error("No persisted eligibility"));
+  mocks.cancelAgent.mockResolvedValue(false);
   mocks.status.mockResolvedValue({
     platformId: "macos",
     available: true,
@@ -247,6 +257,11 @@ describe("ComputerCockpit", () => {
     fireEvent.click(await screen.findByRole("button", { name: "macOS app" }));
     const findTargets = screen.getByRole("button", { name: "Find eligible windows" });
     expect(findTargets).toBeDisabled();
+    expect(
+      await screen.findByText(
+        /Codex Computer Use and Terminal grants do not grant GrokPtah access/,
+      ),
+    ).toBeTruthy();
     fireEvent.click(
       await screen.findByRole("button", {
         name: "Request Screen Recording permission",
@@ -305,8 +320,83 @@ describe("ComputerCockpit", () => {
       />,
     );
 
-    expect(await screen.findByText("Semantic Act · measured")).toBeTruthy();
+    expect(await screen.findByText("Semantic Act · Measured")).toBeTruthy();
     expect(screen.getByText("One action authorized")).toBeTruthy();
+  });
+
+  it("qualifies an unknown model before offering agent proposals", async () => {
+    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.qualifyAgent.mockResolvedValue({
+      model: "grok-4.5",
+      tier: "semantic_act",
+      source: "session_measured",
+    });
+    render(<ComputerCockpit {...props} />);
+
+    const qualify = await screen.findByRole("button", {
+      name: "Verify model for this session",
+    });
+    fireEvent.click(qualify);
+
+    expect(await screen.findByText("Semantic Act · Session Measured")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Propose next action" })).toBeEnabled();
+  });
+
+  it("stages one model proposal for the existing local approval", async () => {
+    const active = snapshot(run());
+    mocks.snapshot.mockResolvedValue(active);
+    mocks.proposeAgent.mockResolvedValue({
+      snapshot: {
+        ...active,
+        pendingApproval: {
+          approvalId: "approval-model",
+          ownerSessionId: "session-1",
+          runId: "run-1",
+          runVersion: 3,
+          observationId: "observation-1",
+          targetLabel: "Computer Use Simulator",
+          action: {
+            type: "set_value",
+            element_id: "observation-1-name",
+            text: "Ada Lovelace",
+          },
+          actionSummary: "Enter visible text in Name",
+          risk: "Text entry",
+          createdAt: "2026-08-13T10:00:02Z",
+        },
+      },
+      summary: "Enter the requested visible name",
+      completed: false,
+    });
+    render(<ComputerCockpit {...props} computerUseTier="semantic_act" computerCapabilitySource="measured" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Propose next action" }));
+
+    await waitFor(() =>
+      expect(mocks.proposeAgent).toHaveBeenCalledWith(
+        "session-1",
+        "run-1",
+        3,
+        "observation-1",
+        "Enter Ada Lovelace in the Name field, then submit the form.",
+      ),
+    );
+    expect(await screen.findByRole("dialog", { name: "Approve Computer Use action" })).toBeTruthy();
+    expect(screen.getByText("Enter the requested visible name", { exact: false })).toBeTruthy();
+  });
+
+  it("keeps Stop available while model inference is pending", async () => {
+    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.proposeAgent.mockReturnValue(new Promise(() => {}));
+    mocks.stop.mockResolvedValue(snapshot(run("cancelled")));
+    render(<ComputerCockpit {...props} computerUseTier="semantic_act" computerCapabilitySource="measured" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Propose next action" }));
+    expect(await screen.findByRole("button", { name: "Waiting for model" })).toBeDisabled();
+    const stop = screen.getByRole("button", { name: "Stop" });
+    expect(stop).toBeEnabled();
+    fireEvent.click(stop);
+    await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("session-1", "run-1"));
   });
 
   it("discards a stale response after the owning session changes", async () => {
@@ -330,6 +420,35 @@ describe("ComputerCockpit", () => {
       expect(screen.queryByText("Frame 1")).toBeNull();
       expect(screen.getByText("Owned by Other build")).toBeTruthy();
     });
+  });
+
+  it("does not carry a model objective into another session", async () => {
+    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    const view = render(
+      <ComputerCockpit
+        {...props}
+        computerUseTier="semantic_act"
+        computerCapabilitySource="measured"
+      />,
+    );
+    const objective = await screen.findByRole("textbox", { name: "Objective" });
+    fireEvent.change(objective, { target: { value: "Session-private objective" } });
+    expect(objective).toHaveValue("Session-private objective");
+
+    view.rerender(
+      <ComputerCockpit
+        {...props}
+        sessionId="session-2"
+        sessionTitle="Other build"
+        computerUseTier="semantic_act"
+        computerCapabilitySource="measured"
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Objective" })).toHaveValue(
+        "Enter Ada Lovelace in the Name field, then submit the form.",
+      ),
+    );
   });
 
   it("keeps steering non-cancelling and session-bound", async () => {

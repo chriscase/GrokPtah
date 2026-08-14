@@ -605,5 +605,11 @@ mod tests {
         assert!(shim.contains("GPTTargetIsFocused"));
         assert!(shim.contains("visited.count >= maxNodes"));
         assert!(shim.contains("childrenError != kAXErrorNoValue"));
+        assert!(shim.contains("NSApplicationLoad"));
+        assert!(shim.contains("application.bundleIdentifier.length > 0"));
+        assert!(shim.contains("@((BOOL)(!onScreen && !active))"));
+        assert!(shim.contains("@((BOOL)nodesTruncated)"));
+        assert!(shim.contains("@((BOOL)CFBooleanGetValue"));
+        assert!(shim.contains("GPTActImpl"));
     }
 }

@@ -4643,6 +4643,36 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.computer-agent-proposal {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.45fr) minmax(280px, 1.25fr) auto;
+  width: 100%;
+  gap: 0.8rem;
+  align-items: end;
+  padding-bottom: 0.8rem;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.computer-agent-proposal > label {
+  display: grid;
+  gap: 0.25rem;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.computer-agent-proposal textarea {
+  width: 100%;
+  min-height: 54px;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.computer-agent-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
 .computer-proposal > label {
   display: grid;
   flex: 1 1 240px;
@@ -4652,6 +4682,7 @@ button:disabled {
 }
 
 .computer-proposal input,
+.computer-agent-proposal textarea,
 .computer-steer textarea {
   width: 100%;
   box-sizing: border-box;
@@ -4751,6 +4782,16 @@ button:disabled {
 
   .computer-approval dl {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .computer-agent-proposal {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .computer-agent-actions,
+  .computer-agent-actions button {
+    width: 100%;
   }
 }
 

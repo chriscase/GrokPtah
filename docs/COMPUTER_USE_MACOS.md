@@ -121,3 +121,23 @@ For an opt-in bridge-level smoke against the same fixture, set `GROKPTAH_LIVE_CO
 run `cargo run --example macos_computer_use_actions` from the bridge crate. It never prompts for
 permissions and exits unless the existing Screen Recording and Accessibility grants are already
 visible to that process.
+
+### Isolated packaged-app inspection
+
+When inspecting a packaged GrokPtah GUI in a disposable run, set `GROKPTAH_HOME` explicitly before
+launching the app. Do not rely on `HOME` alone: macOS home-directory resolution can ignore that
+variable, which would let a smoke process read the normal user's session store.
+
+```sh
+SMOKE_HOME=$(mktemp -d "${TMPDIR:-/tmp}/grokptah-packaged-smoke.XXXXXX")
+mkdir -p "$SMOKE_HOME/.grokptah"
+HOME="$SMOKE_HOME" \
+GROKPTAH_HOME="$SMOKE_HOME/.grokptah" \
+GROKPTAH_AGENT_OFFLINE=1 \
+  GrokPtah.app/Contents/MacOS/grokptah-desktop
+```
+
+Use a stable, uniquely identified app process for GUI inspection and confirm that no other
+GrokPtah process is running first. Keep the temporary home bounded and remove only that exact
+directory after the process exits. This boundary isolates session metadata and credentials; it
+does not grant either macOS permission or bypass the local Computer Run consent flow.

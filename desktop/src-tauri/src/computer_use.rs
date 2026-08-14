@@ -4,11 +4,11 @@ use std::sync::Arc;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
-    grokptah_home, ActionClass, ActionGrant, ComputerAction, ComputerCapabilities, ComputerError,
-    ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerRun, ComputerRunState, ComputerStore, ComputerTargetCandidate,
-    ComputerUseLimits, ComputerUseService, GrantIssuer, MacOsObservationPlatform, SemanticAction,
-    SimulatorBackend,
+    grokptah_home, ActionClass, ActionGrant, ComputerAction, ComputerAgentProposal,
+    ComputerCapabilities, ComputerError, ComputerObservation, ComputerObservationPlatform,
+    ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun,
+    ComputerRunState, ComputerStore, ComputerTargetCandidate, ComputerUseLimits,
+    ComputerUseService, GrantIssuer, MacOsObservationPlatform, SemanticAction, SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -45,6 +45,14 @@ pub struct ComputerCockpitSnapshot {
     pub origin: String,
     pub run: Option<ComputerRun>,
     pub pending_approval: Option<PendingComputerApproval>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerAgentProposalResult {
+    pub snapshot: ComputerCockpitSnapshot,
+    pub summary: String,
+    pub completed: bool,
 }
 
 pub struct DesktopComputerUse {
@@ -415,6 +423,23 @@ impl DesktopComputerUse {
         action: ComputerAction,
     ) -> Result<ComputerCockpitSnapshot, String> {
         let _guard = self.simulator_operation.lock().await;
+        self.stage_action_locked(
+            owner_session_id,
+            run_id,
+            expected_version,
+            observation_id,
+            action,
+        )
+    }
+
+    fn stage_action_locked(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
+    ) -> Result<ComputerCockpitSnapshot, String> {
         let (_service, run) = self.owned_service(owner_session_id, run_id)?;
         if run.version != expected_version {
             return Err("The proposed action is based on a stale Computer Run".into());
@@ -454,6 +479,85 @@ impl DesktopComputerUse {
         });
         drop(pending);
         self.cockpit_snapshot(owner_session_id)
+    }
+
+    pub fn model_proposal_context(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+    ) -> Result<ComputerObservation, String> {
+        if self
+            .pending_approval
+            .lock()
+            .map_err(|_| "Computer Use approval state is unavailable".to_string())?
+            .is_some()
+        {
+            return Err("Resolve or discard the current Computer Use approval first".into());
+        }
+        let (_service, run) = self.owned_service(owner_session_id, run_id)?;
+        if run.version != expected_version || run.state != ComputerRunState::Ready {
+            return Err("The Computer Run changed before the model request started".into());
+        }
+        run.current_observation
+            .filter(|observation| observation.observation_id == observation_id)
+            .ok_or_else(|| {
+                "The Computer observation changed before the model request started".into()
+            })
+    }
+
+    pub async fn apply_model_proposal(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        proposal: ComputerAgentProposal,
+    ) -> Result<ComputerAgentProposalResult, String> {
+        let _guard = self.simulator_operation.lock().await;
+        if proposal.observation_id() != observation_id {
+            return Err("The model proposal does not match the requested observation".into());
+        }
+        match proposal {
+            ComputerAgentProposal::Action {
+                action, summary, ..
+            } => {
+                let snapshot = self.stage_action_locked(
+                    owner_session_id,
+                    run_id,
+                    expected_version,
+                    observation_id,
+                    action,
+                )?;
+                Ok(ComputerAgentProposalResult {
+                    snapshot,
+                    summary,
+                    completed: false,
+                })
+            }
+            ComputerAgentProposal::Complete { summary, .. } => {
+                let (service, run) = self.owned_service(owner_session_id, run_id)?;
+                if run.version != expected_version
+                    || run.state != ComputerRunState::Ready
+                    || run
+                        .current_observation
+                        .as_ref()
+                        .map(|observation| observation.observation_id.as_str())
+                        != Some(observation_id)
+                {
+                    return Err("The Computer Run changed while the model was responding".into());
+                }
+                service
+                    .complete(&Uuid::new_v4().to_string(), run_id, expected_version)
+                    .map_err(|error| error.to_string())?;
+                Ok(ComputerAgentProposalResult {
+                    snapshot: self.cockpit_snapshot(owner_session_id)?,
+                    summary,
+                    completed: true,
+                })
+            }
+        }
     }
 
     pub async fn approve_simulator_action(
@@ -1017,6 +1121,88 @@ mod tests {
             .await
             .unwrap();
         assert!(refreshed.run.unwrap().current_observation.is_some());
+    }
+
+    #[tokio::test]
+    async fn model_proposal_is_revalidated_and_staged_without_dispatch() {
+        let (_dir, desktop) = test_desktop();
+        let owner = Uuid::new_v4();
+        let target = SimulatorBackend::demo_target();
+        let started = desktop
+            .start_simulator(owner, &target.app_id)
+            .await
+            .unwrap();
+        let run = started.run.unwrap();
+        let observation = run.current_observation.as_ref().unwrap();
+        let result = desktop
+            .apply_model_proposal(
+                owner,
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                ComputerAgentProposal::Action {
+                    observation_id: observation.observation_id.clone(),
+                    action: ComputerAction::SetValue {
+                        element_id: format!("{}-name", observation.observation_id),
+                        text: "Ada Lovelace".into(),
+                    },
+                    summary: "Enter the visible name".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!result.completed);
+        assert!(result.snapshot.pending_approval.is_some());
+        assert_eq!(result.snapshot.run.unwrap().action_count, 0);
+
+        let stale = desktop
+            .apply_model_proposal(
+                owner,
+                &run.run_id,
+                run.version,
+                "stale-observation",
+                ComputerAgentProposal::Action {
+                    observation_id: "stale-observation".into(),
+                    action: ComputerAction::ActivateTarget,
+                    summary: "stale".into(),
+                },
+            )
+            .await;
+        assert!(stale.is_err());
+    }
+
+    #[tokio::test]
+    async fn model_completion_only_revokes_authority_on_exact_current_frame() {
+        let (_dir, desktop) = test_desktop();
+        let owner = Uuid::new_v4();
+        let target = SimulatorBackend::demo_target();
+        let started = desktop
+            .start_simulator(owner, &target.app_id)
+            .await
+            .unwrap();
+        let run = started.run.unwrap();
+        let observation = run.current_observation.as_ref().unwrap();
+        let result = desktop
+            .apply_model_proposal(
+                owner,
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                ComputerAgentProposal::Complete {
+                    observation_id: observation.observation_id.clone(),
+                    summary: "The visible objective is complete".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.completed);
+        let completed = result.snapshot.run.unwrap();
+        assert_eq!(completed.state, ComputerRunState::Completed);
+        assert!(completed
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.revoked_at.is_some()));
+        assert_eq!(completed.action_count, 0);
     }
 
     #[tokio::test]

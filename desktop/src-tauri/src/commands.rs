@@ -131,6 +131,66 @@ pub fn computer_use_cockpit_snapshot(
 }
 
 #[tauri::command]
+pub fn computer_use_cockpit_agent_eligibility(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<grokptah_agent_bridge::ComputerAgentEligibility, String> {
+    state
+        .host
+        .computer_agent_eligibility(computer_owner(&state, &session_id)?)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_qualify_agent(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<grokptah_agent_bridge::ComputerAgentEligibility, String> {
+    state
+        .host
+        .qualify_computer_agent(computer_owner(&state, &session_id)?)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_propose_agent_action(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    expected_version: u64,
+    observation_id: String,
+    objective: String,
+) -> Result<crate::computer_use::ComputerAgentProposalResult, String> {
+    let owner = computer_owner(&state, &session_id)?;
+    let observation = state.computer_use.model_proposal_context(
+        owner,
+        &run_id,
+        expected_version,
+        &observation_id,
+    )?;
+    let proposal = state
+        .host
+        .propose_computer_action(owner, &objective, &observation)
+        .await
+        .map_err(map_err)?;
+    state
+        .computer_use
+        .apply_model_proposal(owner, &run_id, expected_version, &observation_id, proposal)
+        .await
+}
+
+#[tauri::command]
+pub fn computer_use_cockpit_cancel_agent(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<bool, String> {
+    Ok(state
+        .host
+        .cancel_computer_agent(computer_owner(&state, &session_id)?))
+}
+
+#[tauri::command]
 pub async fn computer_use_cockpit_start_simulator(
     state: State<'_, AppState>,
     session_id: String,
@@ -234,13 +294,11 @@ pub async fn computer_use_cockpit_pause(
     run_id: String,
     expected_version: u64,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    let owner = computer_owner(&state, &session_id)?;
+    state.host.cancel_computer_agent(owner);
     state
         .computer_use
-        .pause_simulator(
-            computer_owner(&state, &session_id)?,
-            &run_id,
-            expected_version,
-        )
+        .pause_simulator(owner, &run_id, expected_version)
         .await
 }
 
@@ -251,13 +309,11 @@ pub async fn computer_use_cockpit_take_over(
     run_id: String,
     expected_version: u64,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    let owner = computer_owner(&state, &session_id)?;
+    state.host.cancel_computer_agent(owner);
     state
         .computer_use
-        .take_over_simulator(
-            computer_owner(&state, &session_id)?,
-            &run_id,
-            expected_version,
-        )
+        .take_over_simulator(owner, &run_id, expected_version)
         .await
 }
 
@@ -267,10 +323,9 @@ pub async fn computer_use_cockpit_stop(
     session_id: String,
     run_id: String,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
-    state
-        .computer_use
-        .stop_simulator(computer_owner(&state, &session_id)?, &run_id)
-        .await
+    let owner = computer_owner(&state, &session_id)?;
+    state.host.cancel_computer_agent(owner);
+    state.computer_use.stop_simulator(owner, &run_id).await
 }
 
 #[tauri::command]

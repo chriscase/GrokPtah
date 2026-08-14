@@ -6,6 +6,7 @@
 mod agents_personas;
 mod auth_store;
 mod completion;
+mod computer_agent;
 pub mod computer_use;
 mod discover;
 pub mod eval_oracle;
@@ -86,6 +87,7 @@ pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
     CompletionUsage,
 };
+pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
 pub use computer_use::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
     ComputerCapabilities, ComputerError, ComputerErrorCode, ComputerObservation,

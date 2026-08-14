@@ -2,8 +2,9 @@
 
 Computer Use is tracked by epic [#267](https://github.com/chriscase/GrokPtah/issues/267).
 It is intentionally staged. The safety kernel, simulator, desktop operator cockpit, native macOS
-observation, and the first semantic macOS action slice share one bounded run contract. Computer
-Use is still locally operated and is not yet exposed as a model tool or MCP mutation surface.
+observation, and the first semantic macOS action slice share one bounded run contract. A selected,
+qualified model can now propose one semantic action at a time, but only the local cockpit can stage
+and approve it. Computer Use is not exposed as an MCP mutation surface.
 
 ## Safety boundary
 
@@ -55,6 +56,40 @@ observation, allowed action class, and run budget all agree. It does not yet sol
 screen redaction, prompt-injection interpretation, or platform-specific target attestation; those
 remain release blockers in later issues.
 
+### Model proposal boundary
+
+The cockpit's model loop is deliberately narrower than the native action backend:
+
+1. The local user starts a run, reviews its exact target, grants bounded authority, and observes it.
+2. An unknown built-in model must pass an explicit two-frame simulator qualification for that
+   session. Durable compatible-provider qualification is tied to the exact profile, endpoint, and
+   model. Restarting, changing model, or changing route removes session-measured authority.
+3. The model receives the local objective and a bounded semantic observation. It does not receive
+   screenshot locators, host paths, grants, approval tokens, credentials, or native dispatch tools.
+4. It must return exactly one typed proposal for the current observation. Malformed, parallel,
+   stale, sensitive, disabled, unadvertised, raw-input, shell, clipboard, and coordinate proposals
+   fail closed.
+5. GrokPtah revalidates the session, route, run version, observation, and proposal after inference.
+   An action becomes the same visible one-use local approval used by manual cockpit actions. It does
+   not execute automatically.
+6. A `complete` response may only mark the exact current run complete and revoke authority; it
+   cannot contain or cause an OS mutation. **Stop** and **Take over** cancel Computer inference and
+   invalidate late responses without cancelling an unrelated Build turn.
+
+The opt-in `computer_agent_live` example exercises the real selected model against only the
+deterministic simulator. Its report is redacted and explicitly records that no action executed.
+
+| Adversarial condition | Fail-closed behavior |
+|---|---|
+| Prompt injection in observed labels or values | Content is marked untrusted; only the fixed proposal schema is accepted |
+| Stale frame or invented element/action | Exact observation ID, enabled element, sensitivity, and advertised action are rechecked |
+| Cross-session qualification reuse | Ephemeral authority is keyed to the exact session and model |
+| Model or provider-route change | In-flight inference is cancelled and ephemeral authority is cleared |
+| Duplicate/concurrent model requests | One Computer model operation may run per session |
+| Stop, Take over, or run change during inference | The request is cancelled; any late proposal fails run/version/observation revalidation |
+| Completion with hidden action arguments | Unknown or action-bearing completion fields are rejected |
+| Valid action proposal | It is staged visibly and still requires the same local one-use approval as a manual action |
+
 ## macOS observation and semantic action slices (#269, #270)
 
 The native adapter uses a runtime-loaded ScreenCaptureKit shim plus Accessibility semantic
@@ -70,7 +105,7 @@ packaging requirements, and disposable smoke fixture.
 ## Deliberate non-goals of the current desktop slice
 
 - no Windows UI Automation or Linux portal adapter;
-- no Build-agent tool or automatic model invocation;
+- no unattended or continuously autonomous model invocation;
 - no MCP Computer Run surface;
 - no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell endpoint;
 - no background or unattended grant;
@@ -94,8 +129,9 @@ computer actions; [#272](https://github.com/chriscase/GrokPtah/issues/272) owns 
 matrix and role routing.
 
 The first opt-in provider probe uses only the deterministic simulator. Unknown and built-in catalog
-models receive `none` until their exact provider/model pair is measured. Selecting the exact safe
-element qualifies `observe`; recovering from a stale-frame tool error against a replacement
-observation qualifies `semantic_act`. Image input and `visual_fallback_act` remain unqualified. A
-qualified tier controls future model tool discovery only; it never replaces the cockpit's exact
-target review, one-use local grant, reobservation, or native dispatch checks.
+models receive `none` until explicitly measured. A built-in model may earn process-local
+`semantic_act` authority for the current session by selecting the exact safe element and recovering
+from a stale-frame tool error against a replacement observation. Compatible-provider qualification
+persists the same measured tier for its exact route. Image input and `visual_fallback_act` remain
+unqualified. A qualified tier permits proposals only; it never replaces the cockpit's exact target
+review, one-use local grant, reobservation, or native dispatch checks.

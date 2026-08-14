@@ -603,6 +603,18 @@ export interface ComputerCockpitSnapshot {
   pendingApproval?: PendingComputerApproval | null;
 }
 
+export interface ComputerAgentEligibility {
+  model: string;
+  tier: ComputerUseTier;
+  source: string;
+}
+
+export interface ComputerAgentProposalResult {
+  snapshot: ComputerCockpitSnapshot;
+  summary: string;
+  completed: boolean;
+}
+
 export type SubagentExecutionMode =
   | "unknown"
   | "worktree"
