@@ -145,6 +145,23 @@ pub async fn computer_use_cockpit_start_simulator(
 }
 
 #[tauri::command]
+pub async fn computer_use_cockpit_start_native(
+    state: State<'_, AppState>,
+    session_id: String,
+    selection_token: String,
+    reviewed_target_app_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .start_native(
+            computer_owner(&state, &session_id)?,
+            &selection_token,
+            &reviewed_target_app_id,
+        )
+        .await
+}
+
+#[tauri::command]
 pub async fn computer_use_cockpit_refresh(
     state: State<'_, AppState>,
     session_id: String,

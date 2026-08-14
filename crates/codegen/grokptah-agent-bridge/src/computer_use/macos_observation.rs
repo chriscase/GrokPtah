@@ -114,6 +114,14 @@ pub(crate) struct RawMacObservation {
     pub sensitivity: Sensitivity,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RawMacActionRequest {
+    pub target_frame: ObservationGeometry,
+    pub element_index: Option<usize>,
+    pub expected_element: Option<RawMacSemanticNode>,
+    pub action: ComputerAction,
+}
+
 #[async_trait]
 pub(crate) trait MacObservationSource: Send + Sync + std::fmt::Debug {
     fn status(&self) -> ComputerPlatformStatus;
@@ -133,6 +141,12 @@ pub(crate) trait MacObservationSource: Send + Sync + std::fmt::Debug {
         identity: &MacNativeIdentity,
         limits: &ComputerUseLimits,
     ) -> ComputerResult<RawMacObservation>;
+
+    async fn act(
+        &self,
+        identity: &MacNativeIdentity,
+        request: &RawMacActionRequest,
+    ) -> ComputerResult<ActionOutcome>;
 }
 
 #[derive(Debug, Clone)]
@@ -277,9 +291,19 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
             observation_gate: tokio::sync::Mutex::new(()),
             last_capture_started: Mutex::new(None),
             cancellation_epoch: AtomicU64::new(0),
+            action_gate: tokio::sync::Mutex::new(()),
+            action_snapshot: Mutex::new(None),
             evidence: EvidenceVault::default(),
         }))
     }
+}
+
+#[derive(Debug, Clone)]
+struct MacActionSnapshot {
+    observation_id: String,
+    target_frame: ObservationGeometry,
+    nodes: Vec<RawMacSemanticNode>,
+    nodes_truncated: bool,
 }
 
 #[derive(Debug)]
@@ -291,6 +315,8 @@ struct MacOsObservationBackend {
     observation_gate: tokio::sync::Mutex<()>,
     last_capture_started: Mutex<Option<Instant>>,
     cancellation_epoch: AtomicU64,
+    action_gate: tokio::sync::Mutex<()>,
+    action_snapshot: Mutex<Option<MacActionSnapshot>>,
     evidence: EvidenceVault,
 }
 
@@ -298,10 +324,10 @@ struct MacOsObservationBackend {
 impl ComputerBackend for MacOsObservationBackend {
     fn capabilities(&self) -> ComputerCapabilities {
         ComputerCapabilities {
-            backend_id: "macos_read_only_observation".into(),
+            backend_id: "macos_accessibility_semantic".into(),
             observe: true,
-            semantic_actions: false,
-            text_entry: false,
+            semantic_actions: true,
+            text_entry: true,
             key_chords: false,
             pointer_fallback: false,
         }
@@ -342,25 +368,109 @@ impl ComputerBackend for MacOsObservationBackend {
                 "macOS observation target identity changed",
             ));
         }
-        normalize_observation(
+        let action_snapshot = MacActionSnapshot {
+            observation_id: String::new(),
+            target_frame: raw.frame,
+            nodes: raw.nodes.clone(),
+            nodes_truncated: raw.nodes_truncated,
+        };
+        let observation = normalize_observation(
             run_id,
             &self.target,
             raw,
             limits,
             &self.sequence,
             &self.evidence,
-        )
+        )?;
+        if self.cancellation_epoch.load(Ordering::SeqCst) != epoch {
+            self.evidence.remove_run(run_id);
+            return Err(ComputerError::new(
+                ComputerErrorCode::Interrupted,
+                "macOS observation was cancelled",
+            ));
+        }
+        *self.action_snapshot.lock() = Some(MacActionSnapshot {
+            observation_id: observation.observation_id.clone(),
+            ..action_snapshot
+        });
+        Ok(observation)
     }
 
     async fn act(
         &self,
         _run_id: &str,
-        _observation: &ComputerObservation,
-        _action: &ComputerAction,
+        observation: &ComputerObservation,
+        action: &ComputerAction,
     ) -> ComputerResult<ActionOutcome> {
-        Err(ComputerError::new(
-            ComputerErrorCode::ForbiddenAction,
-            "macOS observation adapter is read-only",
+        if observation.target != self.target || observation.sensitivity.is_hard_denied() {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenTarget,
+                "macOS action is bound to a different or sensitive target",
+            ));
+        }
+        if observation.elements_truncated {
+            return Err(ComputerError::new(
+                ComputerErrorCode::SensitiveSurface,
+                "macOS semantic tree was truncated; action dispatch is denied",
+            ));
+        }
+        let _action_guard = self.action_gate.lock().await;
+        let epoch = self.cancellation_epoch.load(Ordering::SeqCst);
+        let snapshot = self
+            .action_snapshot
+            .lock()
+            .clone()
+            .filter(|snapshot| snapshot.observation_id == observation.observation_id)
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Conflict,
+                    "macOS action observation is stale",
+                )
+            })?;
+        if let Err(error) = require_platform_ready(&self.source.status()) {
+            *self.action_snapshot.lock() = None;
+            return Err(error);
+        }
+        if snapshot.nodes_truncated {
+            return Err(ComputerError::new(
+                ComputerErrorCode::SensitiveSurface,
+                "macOS native semantic walk was truncated; action dispatch is denied",
+            ));
+        }
+        let (element_index, expected_element) =
+            action_element(snapshot.nodes.as_slice(), observation, action)?;
+        let request = RawMacActionRequest {
+            target_frame: snapshot.target_frame,
+            element_index,
+            expected_element,
+            action: action.clone(),
+        };
+        if self.cancellation_epoch.load(Ordering::SeqCst) != epoch {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Interrupted,
+                "macOS action was cancelled before dispatch",
+            ));
+        }
+        // Consume the attestation before crossing the native mutation
+        // boundary. A target or postcondition error after dispatch is an
+        // uncertain physical outcome and must never make this frame reusable.
+        *self.action_snapshot.lock() = None;
+        let outcome = self.source.act(&self.native_identity, &request).await?;
+        if self.cancellation_epoch.load(Ordering::SeqCst) != epoch {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Interrupted,
+                "macOS action completion lost to local takeover",
+            ));
+        }
+        if outcome.expected_postcondition_met == Some(false) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "macOS action postcondition was not verified",
+            ));
+        }
+        Ok(ActionOutcome::bounded(
+            outcome.summary,
+            outcome.expected_postcondition_met,
         ))
     }
 
@@ -369,10 +479,91 @@ impl ComputerBackend for MacOsObservationBackend {
     }
 
     async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
+        let _action_guard = self.action_gate.lock().await;
         self.cancellation_epoch.fetch_add(1, Ordering::SeqCst);
+        *self.action_snapshot.lock() = None;
         self.evidence.remove_run(run_id);
         Ok(())
     }
+}
+
+fn action_element(
+    raw_nodes: &[RawMacSemanticNode],
+    observation: &ComputerObservation,
+    action: &ComputerAction,
+) -> ComputerResult<(Option<usize>, Option<RawMacSemanticNode>)> {
+    if matches!(action, ComputerAction::ActivateTarget) {
+        return Ok((None, None));
+    }
+    let element_id = match action {
+        ComputerAction::ActivateTarget => unreachable!("activation returned above"),
+        ComputerAction::Invoke { element_id }
+        | ComputerAction::SetValue { element_id, .. }
+        | ComputerAction::Select { element_id } => element_id,
+        ComputerAction::Scroll {
+            element_id: Some(element_id),
+            ..
+        } => element_id,
+        ComputerAction::Scroll {
+            element_id: None, ..
+        } => {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "macOS semantic scroll requires an observed element",
+            ))
+        }
+        ComputerAction::KeyChord { .. }
+        | ComputerAction::PointerClick { .. }
+        | ComputerAction::Wait { .. } => {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "macOS native backend accepts semantic Accessibility actions only",
+            ))
+        }
+    };
+    let exposed = observation.element(element_id).ok_or_else(|| {
+        ComputerError::new(
+            ComputerErrorCode::Conflict,
+            "macOS action element is absent from the current observation",
+        )
+    })?;
+    if !exposed.enabled || exposed.sensitivity.is_hard_denied() {
+        return Err(ComputerError::new(
+            ComputerErrorCode::SensitiveSurface,
+            "macOS action element is disabled or sensitive",
+        ));
+    }
+    let prefix = format!("{}-element-", observation.observation_id);
+    let element_index = element_id
+        .strip_prefix(&prefix)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|index| *index < raw_nodes.len())
+        .ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "macOS action element identity is malformed or stale",
+            )
+        })?;
+    let raw = raw_nodes[element_index].clone();
+    let required = match action {
+        ComputerAction::Invoke { .. } => RawMacSemanticAction::Invoke,
+        ComputerAction::SetValue { .. } => RawMacSemanticAction::SetValue,
+        ComputerAction::Select { .. } => RawMacSemanticAction::Select,
+        ComputerAction::Scroll { .. } => RawMacSemanticAction::Scroll,
+        _ => unreachable!("non-element actions returned above"),
+    };
+    if raw.sensitivity.is_hard_denied()
+        || !raw.enabled
+        || !raw.actions.contains(&required)
+        || raw.role != exposed.role
+        || raw.label != exposed.label
+    {
+        return Err(ComputerError::new(
+            ComputerErrorCode::Conflict,
+            "macOS raw element no longer matches the exposed observation",
+        ));
+    }
+    Ok((Some(element_index), Some(raw)))
 }
 
 fn normalize_observation(
@@ -738,6 +929,9 @@ mod tests {
         pixel_dimensions: Mutex<(u32, u32)>,
         list_error: Mutex<Option<ComputerErrorCode>>,
         observation_error: Mutex<Option<ComputerErrorCode>>,
+        action_error: Mutex<Option<ComputerErrorCode>>,
+        action_postcondition: Mutex<Option<bool>>,
+        action_requests: Mutex<Vec<RawMacActionRequest>>,
     }
 
     impl FixtureSource {
@@ -764,6 +958,9 @@ mod tests {
                 pixel_dimensions: Mutex::new((1, 1)),
                 list_error: Mutex::new(None),
                 observation_error: Mutex::new(None),
+                action_error: Mutex::new(None),
+                action_postcondition: Mutex::new(None),
+                action_requests: Mutex::new(Vec::new()),
             }
         }
     }
@@ -870,6 +1067,51 @@ mod tests {
                 ],
                 nodes_truncated: *self.nodes_truncated.lock(),
                 sensitivity: Sensitivity::None,
+            })
+        }
+
+        async fn act(
+            &self,
+            identity: &MacNativeIdentity,
+            request: &RawMacActionRequest,
+        ) -> ComputerResult<ActionOutcome> {
+            if let Some(code) = *self.action_error.lock() {
+                return Err(ComputerError::new(code, "fixture action failed"));
+            }
+            let targets = self.targets.lock();
+            let target = targets
+                .iter()
+                .find(|target| &target.identity == identity)
+                .ok_or_else(|| {
+                    ComputerError::new(ComputerErrorCode::TargetChanged, "fixture target changed")
+                })?;
+            if target.frame != request.target_frame
+                || (!matches!(&request.action, ComputerAction::ActivateTarget) && !target.active)
+            {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::TargetChanged,
+                    "fixture target geometry or focus changed",
+                ));
+            }
+            drop(targets);
+            self.action_requests.lock().push(request.clone());
+            if let Some(postcondition) = *self.action_postcondition.lock() {
+                return Ok(ActionOutcome::bounded(
+                    "Fixture postcondition result",
+                    Some(postcondition),
+                ));
+            }
+            Ok(match &request.action {
+                ComputerAction::ActivateTarget => {
+                    ActionOutcome::bounded("Activated fixture target", Some(true))
+                }
+                ComputerAction::SetValue { .. } | ComputerAction::Select { .. } => {
+                    ActionOutcome::bounded("Verified fixture mutation", Some(true))
+                }
+                ComputerAction::Invoke { .. } | ComputerAction::Scroll { .. } => {
+                    ActionOutcome::bounded("Completed fixture semantic action", None)
+                }
+                _ => unreachable!("backend rejects non-semantic actions before source dispatch"),
             })
         }
     }
@@ -1192,9 +1434,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_backend_rejects_every_action_path() {
+    async fn semantic_backend_binds_actions_to_exact_fresh_elements() {
         let source = Arc::new(FixtureSource::granted());
-        let platform = MacOsObservationPlatform::with_source(source);
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let backend = platform
+            .bind_target(&candidate.selection_token)
+            .await
+            .unwrap();
+        let first = backend
+            .observe("run", &candidate.target, &Default::default())
+            .await
+            .unwrap();
+        let activated = backend
+            .act("run", &first, &ComputerAction::ActivateTarget)
+            .await
+            .unwrap();
+        assert_eq!(activated.expected_postcondition_met, Some(true));
+
+        let second = backend
+            .observe("run", &candidate.target, &Default::default())
+            .await
+            .unwrap();
+        let element_id = second.elements[0].element_id.clone();
+        backend
+            .act(
+                "run",
+                &second,
+                &ComputerAction::Invoke {
+                    element_id: element_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let requests = source.action_requests.lock();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].element_index, Some(0));
+            assert_eq!(
+                requests[1]
+                    .expected_element
+                    .as_ref()
+                    .unwrap()
+                    .label
+                    .as_deref(),
+                Some("Continue")
+            );
+        }
+
+        assert_eq!(
+            backend
+                .act("run", &second, &ComputerAction::Invoke { element_id },)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Conflict
+        );
+        assert!(backend.capabilities().semantic_actions);
+        assert!(backend.capabilities().text_entry);
+        assert!(!backend.capabilities().pointer_fallback);
+    }
+
+    #[tokio::test]
+    async fn truncated_tree_and_nonsemantic_input_never_reach_native_dispatch() {
+        let source = Arc::new(FixtureSource::granted());
+        *source.nodes_truncated.lock() = true;
+        let platform = MacOsObservationPlatform::with_source(source.clone());
         let candidate = platform.list_targets().await.unwrap().remove(0);
         let backend = platform
             .bind_target(&candidate.selection_token)
@@ -1210,9 +1515,170 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code,
+            ComputerErrorCode::SensitiveSurface
+        );
+        assert!(source.action_requests.lock().is_empty());
+
+        let semantic_source = Arc::new(FixtureSource::granted());
+        let semantic_platform = MacOsObservationPlatform::with_source(semantic_source.clone());
+        let semantic_candidate = semantic_platform.list_targets().await.unwrap().remove(0);
+        let semantic_backend = semantic_platform
+            .bind_target(&semantic_candidate.selection_token)
+            .await
+            .unwrap();
+        let semantic_observation = semantic_backend
+            .observe(
+                "semantic-run",
+                &semantic_candidate.target,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            semantic_backend
+                .act(
+                    "semantic-run",
+                    &semantic_observation,
+                    &ComputerAction::Wait { millis: 1 },
+                )
+                .await
+                .unwrap_err()
+                .code,
             ComputerErrorCode::ForbiddenAction
         );
-        assert!(!backend.capabilities().semantic_actions);
-        assert!(!backend.capabilities().pointer_fallback);
+        assert!(semantic_source.action_requests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_postcondition_consumes_native_observation() {
+        let source = Arc::new(FixtureSource::granted());
+        *source.action_postcondition.lock() = Some(false);
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let backend = platform
+            .bind_target(&candidate.selection_token)
+            .await
+            .unwrap();
+        let observation = backend
+            .observe("run", &candidate.target, &Default::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend
+                .act("run", &observation, &ComputerAction::ActivateTarget)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::BackendFailure
+        );
+        assert_eq!(
+            backend
+                .act("run", &observation, &ComputerAction::ActivateTarget)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Conflict
+        );
+        assert_eq!(source.action_requests.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn permission_revocation_at_dispatch_consumes_the_native_observation() {
+        let source = Arc::new(FixtureSource::granted());
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let backend = platform
+            .bind_target(&candidate.selection_token)
+            .await
+            .unwrap();
+        let observation = backend
+            .observe("run", &candidate.target, &Default::default())
+            .await
+            .unwrap();
+        source.status.lock().accessibility = ComputerPermissionStatus::Revoked;
+
+        assert_eq!(
+            backend
+                .act("run", &observation, &ComputerAction::ActivateTarget)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::PermissionRevoked
+        );
+        source.status.lock().accessibility = ComputerPermissionStatus::Granted;
+        assert_eq!(
+            backend
+                .act("run", &observation, &ComputerAction::ActivateTarget)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Conflict
+        );
+        assert!(source.action_requests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn geometry_and_focus_drift_fail_before_native_input_and_consume_the_frame() {
+        let source = Arc::new(FixtureSource::granted());
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let backend = platform
+            .bind_target(&candidate.selection_token)
+            .await
+            .unwrap();
+        let observation = backend
+            .observe("run", &candidate.target, &Default::default())
+            .await
+            .unwrap();
+        let element_id = observation.elements[0].element_id.clone();
+        source.targets.lock()[0].frame.x += 10.0;
+
+        assert_eq!(
+            backend
+                .act(
+                    "run",
+                    &observation,
+                    &ComputerAction::Invoke {
+                        element_id: element_id.clone(),
+                    },
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::TargetChanged
+        );
+        assert_eq!(
+            backend
+                .act("run", &observation, &ComputerAction::Invoke { element_id },)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Conflict
+        );
+        assert!(source.action_requests.lock().is_empty());
+
+        source.targets.lock()[0].frame.x -= 10.0;
+        let focused = backend
+            .observe("run", &candidate.target, &Default::default())
+            .await
+            .unwrap();
+        let focused_element = focused.elements[0].element_id.clone();
+        source.targets.lock()[0].active = false;
+        assert_eq!(
+            backend
+                .act(
+                    "run",
+                    &focused,
+                    &ComputerAction::Invoke {
+                        element_id: focused_element,
+                    },
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::TargetChanged
+        );
+        assert!(source.action_requests.lock().is_empty());
     }
 }

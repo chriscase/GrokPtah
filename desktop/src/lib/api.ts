@@ -57,6 +57,16 @@ export const api = {
       sessionId,
       reviewedTargetAppId,
     }),
+  computerUseCockpitStartNative: (
+    sessionId: string,
+    selectionToken: string,
+    reviewedTargetAppId: string,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_start_native", {
+      sessionId,
+      selectionToken,
+      reviewedTargetAppId,
+    }),
   computerUseCockpitRefresh: (
     sessionId: string,
     runId: string,

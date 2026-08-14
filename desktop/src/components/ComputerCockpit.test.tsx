@@ -5,7 +5,11 @@ import type { ComputerCockpitSnapshot, ComputerRun } from "../lib/protocol";
 
 const mocks = vi.hoisted(() => ({
   snapshot: vi.fn(),
+  status: vi.fn(),
+  requestPermission: vi.fn(),
+  targets: vi.fn(),
   start: vi.fn(),
+  startNative: vi.fn(),
   refresh: vi.fn(),
   stage: vi.fn(),
   approve: vi.fn(),
@@ -18,7 +22,11 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../lib/api", () => ({
   api: {
     computerUseCockpitSnapshot: mocks.snapshot,
+    computerUseStatus: mocks.status,
+    computerUseRequestPermission: mocks.requestPermission,
+    computerUseListTargets: mocks.targets,
     computerUseCockpitStartSimulator: mocks.start,
+    computerUseCockpitStartNative: mocks.startNative,
     computerUseCockpitRefresh: mocks.refresh,
     computerUseCockpitStageAction: mocks.stage,
     computerUseCockpitApprove: mocks.approve,
@@ -137,6 +145,16 @@ beforeEach(() => {
   vi.clearAllMocks();
   props.onSteer.mockResolvedValue("Priority prompt preserved.");
   mocks.snapshot.mockResolvedValue(snapshot());
+  mocks.status.mockResolvedValue({
+    platformId: "macos",
+    available: true,
+    minimumOsVersion: "13.0",
+    screenRecording: "granted",
+    accessibility: "granted",
+    detail: null,
+  });
+  mocks.requestPermission.mockResolvedValue("granted");
+  mocks.targets.mockResolvedValue([]);
 });
 
 afterEach(cleanup);
@@ -163,6 +181,81 @@ describe("ComputerCockpit", () => {
         "com.grokptah.computer-use-simulator",
       ),
     );
+  });
+
+  it("binds a native run to the exact locally selected window", async () => {
+    mocks.targets.mockResolvedValue([
+      {
+        selectionToken: "selection-1",
+        target: {
+          appId: "com.example.fixture",
+          windowId: "macos-window-42",
+          generation: 7,
+          displayName: "Disposable Fixture",
+          sensitivity: "none",
+        },
+        geometry: { x: 0, y: 0, width: 720, height: 520, scaleFactor: 1 },
+        onScreen: true,
+        active: true,
+        minimized: false,
+      },
+    ]);
+    mocks.startNative.mockResolvedValue(snapshot(run()));
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "macOS app" }));
+    const findTargets = screen.getByRole("button", { name: "Find eligible windows" });
+    await waitFor(() => expect(findTargets).toBeEnabled());
+    fireEvent.click(findTargets);
+    fireEvent.click(await screen.findByRole("radio", { name: /Disposable Fixture/ }));
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "I reviewed this exact target and one-action scope",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start Computer Run" }));
+
+    await waitFor(() =>
+      expect(mocks.startNative).toHaveBeenCalledWith(
+        "session-1",
+        "selection-1",
+        "com.example.fixture",
+      ),
+    );
+  });
+
+  it("blocks native discovery until required permissions are granted", async () => {
+    mocks.status
+      .mockResolvedValueOnce({
+        platformId: "macos",
+        available: true,
+        minimumOsVersion: "13.0",
+        screenRecording: "missing",
+        accessibility: "granted",
+        detail: "Screen Recording is required before window discovery.",
+      })
+      .mockResolvedValueOnce({
+        platformId: "macos",
+        available: true,
+        minimumOsVersion: "13.0",
+        screenRecording: "granted",
+        accessibility: "granted",
+        detail: null,
+      });
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "macOS app" }));
+    const findTargets = screen.getByRole("button", { name: "Find eligible windows" });
+    expect(findTargets).toBeDisabled();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Request Screen Recording permission",
+      }),
+    );
+
+    await waitFor(() => expect(findTargets).toBeEnabled());
+    expect(mocks.requestPermission).toHaveBeenCalledWith("screen_recording");
+    expect(mocks.targets).not.toHaveBeenCalled();
   });
 
   it("shows an exact one-use approval and requires reauthorization after action", async () => {

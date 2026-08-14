@@ -1,15 +1,17 @@
 # Computer Use on macOS
 
-The first native Computer Use adapter is read-only and requires macOS 14 or later. GrokPtah
-itself keeps its macOS 11 minimum: ScreenCaptureKit is loaded from its fixed system-framework path
-only on a supported OS, and every native entry point checks runtime availability before use.
+The first native Computer Use adapter observes one exact window and performs a deliberately small
+set of semantic Accessibility actions on macOS 14 or later. GrokPtah itself keeps its macOS 11
+minimum: ScreenCaptureKit is loaded from its fixed system-framework path only on a supported OS,
+and every native entry point checks runtime availability before use.
 
 ## Consent and selection
 
 Ordinary startup calls only the non-prompting Screen Recording and Accessibility preflight APIs.
-The desktop exposes separate **Request** buttons under Settings > Computer Use. Window discovery
-and capture are separate, explicit local actions. No target is selected from a model prompt, MCP
-request, remembered native window ID, or application title.
+The Computer Run cockpit exposes separate **Request** buttons before native window discovery.
+Discovery, exact-window selection, scope review, and run start are separate, explicit local
+actions. No target is selected from a model prompt, MCP request, remembered native window ID, or
+application title.
 
 The picker returns one-use, two-minute selection tokens for at most 128 windows. Binding consumes
 the token and revalidates the exact ScreenCaptureKit window ID, process ID, and bundle ID. The
@@ -19,7 +21,8 @@ snapshot, including when the new discovery fails.
 
 Permission states remain distinct: missing, prompt pending, denied, granted, revoked, restricted,
 and unsupported. A first macOS grant may require restarting the app before the preflight API sees
-the new state. Revocation fails subsequent discovery or observation closed.
+the new state. Revocation fails subsequent discovery, observation, or action closed. Native
+discovery remains disabled until both required permissions report `granted`.
 
 ## Observation boundary
 
@@ -35,15 +38,37 @@ the new state. Revocation fails subsequent discovery or observation closed.
 - Element IDs are fresh per observation. Old screenshot asset IDs are removed when a new
   observation starts.
 - Captures are serialized and limited to two per second. The native image is capped at 4096 pixels
-  per side and 64 MiB raw; the desktop one-shot flow permits at most 4 MiB encoded evidence.
-- Evidence stays in process memory. The desktop reads it through the current run and exact asset
-  hash, returns one preview, then cancels the run and destroys the backend copy.
+  per side and 64 MiB raw; the desktop one-shot preview permits at most 4 MiB encoded evidence and
+  a bounded native Computer Run permits at most 16 MiB cumulatively.
+- Evidence stays in process memory and is addressed through the current run and exact asset hash.
+  Reobservation rotates the prior asset, and cancel/stop destroys the backend copy. Durable run
+  records contain only bounded metadata, hashes, and opaque asset IDs.
 - Leaving the Computer Use section clears target and preview state. A capture that finishes after
   the section closes is discarded rather than repopulating the next view.
 
 Custom-drawn password controls that do not expose a secure Accessibility role cannot be reliably
 identified by any AX-based redactor. Such applications should not be selected until an adapter or
 application-specific policy can attest their sensitive regions.
+
+## Semantic action boundary
+
+The cockpit can stage `activate target`, Accessibility `invoke`, visible `set value`, `select`, and
+semantic `scroll to visible`. The user sees the exact target, action summary, risk, and visible text
+payload before granting one use. Each successful or uncertain mutation consumes its observation;
+continuing requires a new local authorization and observation.
+
+Immediately before native dispatch, the shim revalidates the exact ScreenCaptureKit window ID,
+process ID, bundle ID, frame, frontmost application, focused AX window, semantic traversal index,
+role, subrole, label, value, enabled state, and supported action. It rechecks target focus and frame
+after dispatch and verifies values where Accessibility exposes a deterministic postcondition.
+Permission revocation, app restart, focus theft, window movement, stale element identity, tree
+truncation, secure controls, or failed postconditions fail closed and consume the frame.
+
+This slice has no `CGEvent` keyboard or pointer path, coordinate fallback, cursor movement,
+clipboard access, AppleScript, secret substitution, automatic approval, unattended mode, model
+Computer tool, or Computer mutation over MCP. Pause, Stop, and Take over revoke authority without
+depending on the model or network; an action that loses the durable completion race cannot commit
+as successful.
 
 ## Packaging and signing
 
@@ -77,15 +102,22 @@ Build and launch the repository-owned fixture:
 ./evals/macos-computer-use-demo/build-and-run.sh
 ```
 
-It creates a temporary signed-by-the-host `.app` with normal text, a secure text field, a button,
-and a scroll area. In GrokPtah, open a session, then use Settings > Computer Use:
+It creates a temporary signed-by-the-host `.app` with normal text, a secure text field, a priority
+selector, an actionable button, a status label, and a scroll area. In GrokPtah, open a disposable
+session and its Computer Run cockpit:
 
 1. Check that opening the section does not prompt.
 2. Use each Request button and complete the macOS prompt locally.
-3. Refresh status, find windows, and choose **GrokPtah Computer Use Demo**.
-4. Observe once. Verify the secure field value is absent and its pixels are blacked out.
-5. Move and resize the fixture, observe again, then minimize and quit it to verify the distinct
-   geometry, target-closed, and hidden-window paths.
+3. Refresh status, find windows, and choose **GrokPtah Computer Use Demo**. Review the exact bundle
+   ID and one-action scope before starting.
+4. Verify the secure field is absent from the semantic snapshot. Stage and approve activation.
+5. Reauthorize and observe, enter a visible bounded project label, and approve once.
+6. Reauthorize and observe, invoke **Submit fixture**, and verify the status contains the label and
+   selected priority.
+7. Move or resize the fixture between observation and approval to verify the action fails closed.
+   Minimize and quit it to verify the distinct hidden-window and target-closed paths.
 
-The adapter has no input-event function. The smoke must not type, click, scroll, or activate the
-fixture through GrokPtah.
+For an opt-in bridge-level smoke against the same fixture, set `GROKPTAH_LIVE_COMPUTER_USE=1` and
+run `cargo run --example macos_computer_use_actions` from the bridge crate. It never prompts for
+permissions and exits unless the existing Screen Recording and Accessibility grants are already
+visible to that process.

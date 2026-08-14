@@ -3,8 +3,11 @@ import { api } from "../lib/api";
 import type {
   ComputerAction,
   ComputerCockpitSnapshot,
+  ComputerPermissionStatus,
+  ComputerPlatformStatus,
   ComputerRun,
   ComputerSemanticElement,
+  ComputerTargetCandidate,
 } from "../lib/protocol";
 
 const SIMULATOR_APP_ID = "com.grokptah.computer-use-simulator";
@@ -30,15 +33,28 @@ function isTerminal(run: ComputerRun) {
   );
 }
 
-function elementByRole(
+function elementByAction(
   run: ComputerRun,
-  role: string,
+  action: string,
 ): ComputerSemanticElement | undefined {
-  return run.currentObservation?.elements.find((element) => element.role === role);
+  return run.currentObservation?.elements.find((element) =>
+    element.actions.includes(action),
+  );
 }
 
 function actionText(action: ComputerAction) {
-  return action.type === "set_value" ? action.text : "Submit";
+  switch (action.type) {
+    case "set_value":
+      return action.text;
+    case "activate_target":
+      return "Activate the authorized application";
+    case "invoke":
+      return "Invoke the selected element";
+    case "select":
+      return "Select the chosen element";
+    case "scroll":
+      return "Scroll the chosen element into view";
+  }
 }
 
 export function ComputerCockpit({
@@ -52,6 +68,10 @@ export function ComputerCockpit({
   onRunState,
 }: ComputerCockpitProps) {
   const [snapshot, setSnapshot] = useState<ComputerCockpitSnapshot | null>(null);
+  const [launchMode, setLaunchMode] = useState<"simulator" | "macos">("simulator");
+  const [nativeTargets, setNativeTargets] = useState<ComputerTargetCandidate[]>([]);
+  const [selectedNativeToken, setSelectedNativeToken] = useState<string | null>(null);
+  const [platformStatus, setPlatformStatus] = useState<ComputerPlatformStatus | null>(null);
   const [scopeReviewed, setScopeReviewed] = useState(false);
   const [name, setName] = useState("Ada Lovelace");
   const [steerText, setSteerText] = useState("");
@@ -65,6 +85,9 @@ export function ComputerCockpit({
     const epoch = ++requestEpoch.current;
     setSnapshot(null);
     setScopeReviewed(false);
+    setNativeTargets([]);
+    setSelectedNativeToken(null);
+    setPlatformStatus(null);
     setError(null);
     setNotice(null);
     setBusy(false);
@@ -108,13 +131,79 @@ export function ComputerCockpit({
 
   const run = snapshot?.run ?? null;
   const observation = run?.currentObservation ?? null;
-  const nameElement = run ? elementByRole(run, "text_field") : undefined;
-  const submitElement = run ? elementByRole(run, "button") : undefined;
-  const statusElement = run ? elementByRole(run, "status") : undefined;
+  const nameElement = run ? elementByAction(run, "set_value") : undefined;
+  const submitElement = run ? elementByAction(run, "invoke") : undefined;
+  const statusElement = observation?.elements.find((element) =>
+    ["status", "AXStaticText"].includes(element.role),
+  );
   const approval = snapshot?.pendingApproval ?? null;
   const grantActive = Boolean(run?.grant && !run.grant.revokedAt);
   const runActive = Boolean(run && !isTerminal(run));
   const timeline = useMemo(() => run?.audit.slice(-12).reverse() ?? [], [run]);
+  const selectedNativeTarget = nativeTargets.find(
+    (candidate) => candidate.selectionToken === selectedNativeToken,
+  );
+  const simulatorRun = run?.target.appId === SIMULATOR_APP_ID;
+  const nativePermissionsReady =
+    platformStatus?.screenRecording === "granted" &&
+    platformStatus.accessibility === "granted";
+
+  const refreshNativeStatus = async () => {
+    const epoch = requestEpoch.current;
+    setBusy(true);
+    setError(null);
+    try {
+      const status = await api.computerUseStatus();
+      if (requestEpoch.current === epoch) setPlatformStatus(status);
+    } catch (reason) {
+      if (requestEpoch.current === epoch) setError(String(reason));
+    } finally {
+      if (requestEpoch.current === epoch) setBusy(false);
+    }
+  };
+
+  const requestNativePermission = async (
+    permission: "screen_recording" | "accessibility",
+  ) => {
+    const epoch = requestEpoch.current;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.computerUseRequestPermission(permission);
+      const status = await api.computerUseStatus();
+      if (requestEpoch.current !== epoch) return;
+      setPlatformStatus(status);
+      setNotice("Permission status refreshed.");
+    } catch (reason) {
+      if (requestEpoch.current === epoch) setError(String(reason));
+    } finally {
+      if (requestEpoch.current === epoch) setBusy(false);
+    }
+  };
+
+  const findNativeTargets = async () => {
+    const epoch = requestEpoch.current;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const targets = await api.computerUseListTargets();
+      if (requestEpoch.current !== epoch) return;
+      const eligible = targets.filter(
+        (candidate) => candidate.onScreen && !candidate.minimized,
+      );
+      setNativeTargets(eligible);
+      setSelectedNativeToken(null);
+      setScopeReviewed(false);
+      setNotice(
+        eligible.length ? "Choose one exact macOS window." : "No eligible windows found.",
+      );
+    } catch (reason) {
+      if (requestEpoch.current === epoch) setError(String(reason));
+    } finally {
+      if (requestEpoch.current === epoch) setBusy(false);
+    }
+  };
 
   const stage = async (action: ComputerAction) => {
     if (!sessionId || !run || !observation) return;
@@ -134,7 +223,11 @@ export function ComputerCockpit({
       <header className="computer-cockpit-header">
         <div>
           <div className="computer-eyebrow">Computer Run</div>
-          <h1>{run?.target.displayName ?? "Simulator"}</h1>
+          <h1>
+            {run?.target.displayName ??
+              selectedNativeTarget?.target.displayName ??
+              (launchMode === "macos" ? "macOS application" : "Simulator")}
+          </h1>
           <div className="computer-owner">
             {sessionTitle ? `Owned by ${sessionTitle}` : "Select a session to continue"}
           </div>
@@ -177,15 +270,127 @@ export function ComputerCockpit({
           <div className="computer-scope-title">
             <div>
               <span className="computer-section-label">Scope review</span>
-              <h2>Computer Use Simulator</h2>
+              <h2>
+                {launchMode === "simulator"
+                  ? "Computer Use Simulator"
+                  : selectedNativeTarget?.target.displayName ?? "macOS application"}
+              </h2>
             </div>
-            <span className="computer-origin">Local simulator</span>
+            <span className="computer-origin">
+              {launchMode === "simulator" ? "Local simulator" : "Native Accessibility"}
+            </span>
           </div>
+          <div className="computer-launch-mode" role="group" aria-label="Computer Run target type">
+            <button
+              type="button"
+              className={launchMode === "simulator" ? "active" : ""}
+              aria-pressed={launchMode === "simulator"}
+              onClick={() => {
+                setLaunchMode("simulator");
+                setScopeReviewed(false);
+              }}
+            >
+              Simulator
+            </button>
+            <button
+              type="button"
+              className={launchMode === "macos" ? "active" : ""}
+              aria-pressed={launchMode === "macos"}
+              onClick={() => {
+                setLaunchMode("macos");
+                setScopeReviewed(false);
+                if (!platformStatus) void refreshNativeStatus();
+              }}
+            >
+              macOS app
+            </button>
+          </div>
+          {launchMode === "macos" && (
+            <div className="computer-native-picker">
+              <div className="computer-native-permissions" aria-label="macOS Computer Use permissions">
+                {(["screenRecording", "accessibility"] as const).map((key) => {
+                  const permission = key === "screenRecording" ? "screen_recording" : "accessibility";
+                  const value: ComputerPermissionStatus | undefined = platformStatus?.[key];
+                  return (
+                    <div key={key}>
+                      <span>{key === "screenRecording" ? "Screen Recording" : "Accessibility"}</span>
+                      <strong>{value ? titleCase(value) : "Checking"}</strong>
+                      {value && value !== "granted" && value !== "unsupported" && (
+                        <button
+                          type="button"
+                          aria-label={`Request ${key === "screenRecording" ? "Screen Recording" : "Accessibility"} permission`}
+                          disabled={busy}
+                          onClick={() => void requestNativePermission(permission)}
+                        >
+                          Request
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+                <button
+                  type="button"
+                  aria-label="Refresh macOS permission status"
+                  disabled={busy}
+                  onClick={() => void refreshNativeStatus()}
+                >
+                  Refresh
+                </button>
+              </div>
+              <button
+                type="button"
+                disabled={busy || !nativePermissionsReady}
+                onClick={() => void findNativeTargets()}
+              >
+                Find eligible windows
+              </button>
+              {nativeTargets.length > 0 && (
+                <div className="computer-native-targets" role="radiogroup" aria-label="macOS target window">
+                  {nativeTargets.map((candidate) => (
+                    <label key={candidate.selectionToken}>
+                      <input
+                        type="radio"
+                        name="computer-native-target"
+                        value={candidate.selectionToken}
+                        checked={selectedNativeToken === candidate.selectionToken}
+                        onChange={() => {
+                          setSelectedNativeToken(candidate.selectionToken);
+                          setScopeReviewed(false);
+                          setNotice(null);
+                        }}
+                      />
+                      <span>
+                        <strong>{candidate.target.displayName}</strong>
+                        <small>
+                          {Math.round(candidate.geometry.width)} x {Math.round(candidate.geometry.height)}
+                          {candidate.active ? " · active" : ""}
+                        </small>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <dl className="computer-scope-grid">
-            <div><dt>Exact target</dt><dd>{SIMULATOR_APP_ID}</dd></div>
+            <div>
+              <dt>Exact target</dt>
+              <dd>
+                {launchMode === "simulator"
+                  ? SIMULATOR_APP_ID
+                  : selectedNativeTarget?.target.appId ?? "Choose a window above"}
+              </dd>
+            </div>
             <div><dt>Allowed input</dt><dd>Semantic invoke and visible text entry</dd></div>
             <div><dt>Grant</dt><dd>One action, then pause</dd></div>
-            <div><dt>Evidence</dt><dd>Semantic demo data; no screen capture</dd></div>
+            <div>
+              <dt>Evidence</dt>
+              <dd>
+                {launchMode === "simulator"
+                  ? "Semantic demo data; no screen capture"
+                  : "Redacted window capture and bounded Accessibility tree"}
+              </dd>
+            </div>
           </dl>
           <label className="computer-scope-check">
             <input
@@ -198,12 +403,31 @@ export function ComputerCockpit({
           <button
             type="button"
             className="primary"
-            disabled={!scopeReviewed || busy}
-            title={!scopeReviewed ? "Review and accept the exact scope first" : undefined}
+            disabled={
+              !scopeReviewed ||
+              busy ||
+              (launchMode === "macos" && !selectedNativeTarget)
+            }
+            title={
+              !scopeReviewed
+                ? "Review and accept the exact scope first"
+                : launchMode === "macos" && !selectedNativeTarget
+                  ? "Choose an exact macOS window first"
+                  : undefined
+            }
             onClick={() =>
               void apply(
-                () => api.computerUseCockpitStartSimulator(sessionId, SIMULATOR_APP_ID),
-                "Simulator observed. No action has run.",
+                () =>
+                  launchMode === "simulator"
+                    ? api.computerUseCockpitStartSimulator(sessionId, SIMULATOR_APP_ID)
+                    : api.computerUseCockpitStartNative(
+                        sessionId,
+                        selectedNativeTarget?.selectionToken ?? "",
+                        selectedNativeTarget?.target.appId ?? "",
+                      ),
+                launchMode === "simulator"
+                  ? "Simulator observed. No action has run."
+                  : "macOS target observed. No action has run.",
               )
             }
           >
@@ -264,17 +488,33 @@ export function ComputerCockpit({
           <div className="computer-cockpit-grid">
             <div className="computer-observation-column">
               <div className="computer-section-heading">
-                <div><span className="computer-section-label">Observation</span><h2>Demo form</h2></div>
+                <div>
+                  <span className="computer-section-label">Observation</span>
+                  <h2>{simulatorRun ? "Demo form" : "Semantic snapshot"}</h2>
+                </div>
                 <span>{observation ? `Frame ${observation.sequence}` : "No live frame"}</span>
               </div>
-              <div className={`computer-demo-surface ${observation ? "is-observed" : ""}`}>
-                <label>
-                  Name
-                  <input value={nameElement?.value ?? ""} readOnly aria-label="Observed demo name" />
-                </label>
-                <button type="button" disabled={!submitElement?.enabled}>Submit</button>
-                <output>{statusElement?.label ?? "Observation unavailable"}</output>
-              </div>
+              {simulatorRun ? (
+                <div className={`computer-demo-surface ${observation ? "is-observed" : ""}`}>
+                  <label>
+                    Name
+                    <input value={nameElement?.value ?? ""} readOnly aria-label="Observed demo name" />
+                  </label>
+                  <button type="button" disabled={!submitElement?.enabled}>Submit</button>
+                  <output>{statusElement?.label ?? "Observation unavailable"}</output>
+                </div>
+              ) : (
+                <div className="computer-native-observation" aria-label="Observed macOS elements">
+                  {(observation?.elements ?? []).slice(0, 48).map((element) => (
+                    <div key={element.elementId}>
+                      <span>{element.role.replace(/^AX/, "")}</span>
+                      <strong>{element.label ?? element.value ?? "Unlabelled element"}</strong>
+                      <small>{element.actions.join(" · ") || "read only"}</small>
+                    </div>
+                  ))}
+                  {!observation?.elements.length && <span>No safe semantic elements exposed.</span>}
+                </div>
+              )}
               <div className="computer-semantic-strip">
                 {(observation?.elements ?? []).map((element) => (
                   <span key={element.elementId} className={element.enabled ? "" : "is-disabled"}>
@@ -307,25 +547,39 @@ export function ComputerCockpit({
           {run.state === "ready" && observation && !approval && (
             <div className="computer-proposal">
               <div><span className="computer-section-label">Next action</span><h2>Stage for approval</h2></div>
-              <label>
-                Visible text
-                <input value={name} maxLength={256} onChange={(event) => setName(event.target.value)} />
-              </label>
+              {nameElement && (
+                <label>
+                  Visible text for {nameElement.label ?? nameElement.role}
+                  <input value={name} maxLength={256} onChange={(event) => setName(event.target.value)} />
+                </label>
+              )}
               <div className="computer-proposal-actions">
-                <button
-                  ref={proposalFocus}
-                  type="button"
-                  disabled={busy || !name.trim() || !nameElement?.enabled}
-                  onClick={() =>
-                    void stage({
-                      type: "set_value",
-                      element_id: nameElement?.elementId ?? "",
-                      text: name.trim(),
-                    })
-                  }
-                >
-                  Stage text entry
-                </button>
+                {!simulatorRun && (
+                  <button
+                    ref={proposalFocus}
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void stage({ type: "activate_target" })}
+                  >
+                    Stage activation
+                  </button>
+                )}
+                {nameElement && (
+                  <button
+                    ref={simulatorRun ? proposalFocus : undefined}
+                    type="button"
+                    disabled={busy || !name.trim() || !nameElement.enabled}
+                    onClick={() =>
+                      void stage({
+                        type: "set_value",
+                        element_id: nameElement.elementId,
+                        text: name.trim(),
+                      })
+                    }
+                  >
+                    Stage text entry
+                  </button>
+                )}
                 <button
                   type="button"
                   disabled={busy || !submitElement?.enabled}
@@ -334,8 +588,39 @@ export function ComputerCockpit({
                     void stage({ type: "invoke", element_id: submitElement?.elementId ?? "" })
                   }
                 >
-                  Stage Submit
+                  Stage {submitElement?.label ?? "Invoke"}
                 </button>
+                {!simulatorRun && observation.elements.some((element) => element.actions.includes("select")) && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      const element = observation.elements.find((item) => item.actions.includes("select"));
+                      if (element) void stage({ type: "select", element_id: element.elementId });
+                    }}
+                  >
+                    Stage Select
+                  </button>
+                )}
+                {!simulatorRun && observation.elements.some((element) => element.actions.includes("scroll")) && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      const element = observation.elements.find((item) => item.actions.includes("scroll"));
+                      if (element) {
+                        void stage({
+                          type: "scroll",
+                          element_id: element.elementId,
+                          delta_x: 0,
+                          delta_y: 480,
+                        });
+                      }
+                    }}
+                  >
+                    Stage Scroll
+                  </button>
+                )}
               </div>
             </div>
           )}

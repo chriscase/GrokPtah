@@ -453,8 +453,16 @@ export interface ComputerObservationPreview {
 }
 
 export type ComputerAction =
+  | { type: "activate_target" }
   | { type: "invoke"; element_id: string }
-  | { type: "set_value"; element_id: string; text: string };
+  | { type: "set_value"; element_id: string; text: string }
+  | { type: "select"; element_id: string }
+  | {
+      type: "scroll";
+      element_id: string;
+      delta_x: number;
+      delta_y: number;
+    };
 
 export interface ComputerSemanticElement {
   elementId: string;

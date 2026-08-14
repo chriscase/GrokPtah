@@ -29,6 +29,7 @@ portable-pty = "0.8"
 base64 = "0.22"
 
 [dev-dependencies]
+async-trait = "0.1"
 tempfile = "3"
 
 [lib]

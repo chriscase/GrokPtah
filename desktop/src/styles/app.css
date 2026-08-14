@@ -4303,6 +4303,127 @@ button:disabled {
   white-space: nowrap;
 }
 
+.computer-launch-mode {
+  display: inline-flex;
+  margin: 0 0 0.8rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.computer-launch-mode button {
+  border: 0;
+  border-right: 1px solid var(--border-soft);
+  border-radius: 0;
+  background: var(--bg-input);
+}
+
+.computer-launch-mode button:last-child {
+  border-right: 0;
+}
+
+.computer-launch-mode button.active {
+  color: var(--accent);
+  background: rgba(45, 212, 168, 0.09);
+}
+
+.computer-native-picker {
+  display: grid;
+  gap: 0.55rem;
+  margin-bottom: 0.8rem;
+}
+
+.computer-native-picker > button {
+  justify-self: start;
+}
+
+.computer-native-permissions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  gap: 0.4rem;
+  align-items: stretch;
+}
+
+.computer-native-permissions > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.25rem 0.5rem;
+  align-items: center;
+  min-width: 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--overlay-soft);
+}
+
+.computer-native-permissions span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.computer-native-permissions strong {
+  color: var(--text);
+  font-size: 10px;
+}
+
+.computer-native-permissions > div > button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.computer-native-permissions > button {
+  align-self: center;
+}
+
+.computer-native-targets {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.4rem;
+  max-height: 190px;
+  overflow: auto;
+}
+
+.computer-native-targets label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  min-width: 0;
+  padding: 0.55rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--overlay-soft);
+  cursor: pointer;
+}
+
+.computer-native-targets label:has(input:checked) {
+  border-color: var(--accent-dim);
+  background: rgba(45, 212, 168, 0.07);
+}
+
+.computer-native-targets input {
+  flex: 0 0 auto;
+  margin-top: 0.15rem;
+}
+
+.computer-native-targets span {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.computer-native-targets strong,
+.computer-native-targets small {
+  overflow-wrap: anywhere;
+}
+
+.computer-native-targets small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
 .computer-risk {
   color: var(--warning, #e0ad4f);
   border-color: rgba(224, 173, 79, 0.4);
@@ -4432,6 +4553,47 @@ button:disabled {
 .computer-demo-surface output {
   color: #9aa3ad;
   font-size: 11px;
+}
+
+.computer-native-observation {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+  min-height: 230px;
+  max-height: 330px;
+  overflow: auto;
+  border: 1px solid rgba(45, 212, 168, 0.35);
+  border-radius: 6px;
+  background: #171b20;
+}
+
+.computer-native-observation > div {
+  display: grid;
+  grid-template-columns: minmax(70px, 0.4fr) minmax(100px, 1fr);
+  gap: 0.2rem 0.55rem;
+  align-content: start;
+  min-width: 0;
+  padding: 0.55rem 0.65rem;
+  border-right: 1px solid #292f36;
+  border-bottom: 1px solid #292f36;
+}
+
+.computer-native-observation span,
+.computer-native-observation small {
+  color: #9aa3ad;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.computer-native-observation strong {
+  min-width: 0;
+  color: #eef1f4;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.computer-native-observation small {
+  grid-column: 1 / -1;
 }
 
 .computer-semantic-strip {
@@ -4612,6 +4774,19 @@ button:disabled {
 
   .computer-scope-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .computer-native-targets,
+  .computer-native-observation {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .computer-native-permissions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .computer-native-permissions > button {
+    justify-self: start;
   }
 }
 
