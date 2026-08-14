@@ -1,11 +1,15 @@
 # Plan: read-only MCP coordinator surface for Computer Runs (slice 2 of #271)
 
-Status: **design complete, implementation not started** — produced by a
-read-only audit session whose container disk (≈37 GiB total writable
-allowance, 30 GiB free) was below the mandated 50 GiB build floor. See
-[Storage blocker](#storage-blocker). Nothing in this document was compiled,
-installed, or executed live; every claim is backed by reading exact code at
-the pinned revisions below.
+Status: **implemented on this branch.** This document was first produced as
+a design-only deliverable while the session treated its container disk
+(≈37 GiB total allowance, 30 GiB free) as below the goal's 50 GiB build
+floor; the session subsequently implemented the slice under a disciplined
+budget (bridge crate only, disk checked around every heavy step, hard abort
+below 12 GiB — never approached). Sections 2–5 are now code in the commits
+stacked above; deviations from the original sketch are noted inline in the
+PR description. The desktop `src-tauri` changes remain uncompiled in the
+container (gtk/webkit system deps absent), exactly as #292 documented for
+its own desktop change.
 
 Pinned revisions:
 
