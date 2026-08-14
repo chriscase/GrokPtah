@@ -194,7 +194,13 @@ impl ComputerUseService {
                             .and_then(|()| self.policy.authorize_observation_exposure(&observation))
                             .map(|()| observation);
                         match validated {
-                            Ok(observation) => self.commit_observation(run_id, observation),
+                            Ok(observation) => match self.commit_observation(run_id, observation) {
+                                Ok(observation) => Ok(observation),
+                                Err(error) => {
+                                    self.fail_inflight(run_id, "observe", &error)?;
+                                    Err(error)
+                                }
+                            },
                             Err(error) => {
                                 self.fail_inflight(run_id, "observe", &error)?;
                                 Err(error)
@@ -272,6 +278,12 @@ impl ComputerUseService {
                 }
                 self.policy
                     .authorize_action(run, &observation, &action, now)?;
+                if !backend_supports_action(&self.backend.capabilities(), action.class()) {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::ForbiddenAction,
+                        "the backend does not support this action class",
+                    ));
+                }
                 run.transition(ComputerRunState::Acting)?;
                 run.record_audit(
                     "act",
@@ -644,6 +656,18 @@ fn ensure_version(run: &ComputerRun, expected_version: u64) -> ComputerResult<()
         ));
     }
     Ok(())
+}
+
+fn backend_supports_action(
+    capabilities: &super::types::ComputerCapabilities,
+    action_class: super::types::ActionClass,
+) -> bool {
+    match action_class {
+        super::types::ActionClass::Semantic => capabilities.semantic_actions,
+        super::types::ActionClass::TextEntry => capabilities.text_entry,
+        super::types::ActionClass::KeyChord => capabilities.key_chords,
+        super::types::ActionClass::PointerFallback => capabilities.pointer_fallback,
+    }
 }
 
 fn revoke_authority(run: &mut ComputerRun) {
