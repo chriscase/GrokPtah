@@ -39,6 +39,10 @@ function isTerminal(run: ComputerRun) {
   );
 }
 
+function hasOperatorTakeover(run: ComputerRun) {
+  return run.controlDisposition === "operator_takeover";
+}
+
 function elementByAction(
   run: ComputerRun,
   action: string,
@@ -798,7 +802,20 @@ export function ComputerCockpit({
             </div>
           )}
 
-          {run.state === "paused" && (
+          {run.state === "paused" && hasOperatorTakeover(run) && (
+            <div className="computer-paused">
+              <div>
+                <span className="computer-section-label">Local operator control</span>
+                <h2>Take over active</h2>
+              </div>
+              <p>
+                This run cannot be reauthorized after takeover. Start a new Computer Run to return
+                control to the agent.
+              </p>
+            </div>
+          )}
+
+          {run.state === "paused" && !hasOperatorTakeover(run) && (
             <div className="computer-paused">
               <div><span className="computer-section-label">Authority revoked</span><h2>Paused</h2></div>
               <button

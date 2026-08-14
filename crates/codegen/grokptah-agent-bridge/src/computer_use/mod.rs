@@ -28,7 +28,8 @@ pub use simulator::SimulatorBackend;
 pub use store::ComputerStore;
 pub use types::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
-    ComputerCapabilities, ComputerError, ComputerErrorCode, ComputerObservation, ComputerRun,
-    ComputerRunState, ComputerTarget, ComputerUseLimits, EvidenceRef, GrantIssuer,
-    ObservationGeometry, PointerButton, SemanticAction, SemanticElement, Sensitivity,
+    ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
+    ComputerObservation, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
+    EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton, SemanticAction, SemanticElement,
+    Sensitivity,
 };

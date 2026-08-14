@@ -535,6 +535,15 @@ export interface ComputerRun {
   ownerSessionId: string;
   target: ComputerTargetCandidate["target"];
   state: string;
+  controlDisposition?:
+    | "agent_owned"
+    | "paused"
+    | "operator_takeover"
+    | "stopped"
+    | "interrupted"
+    | "uncertain_outcome"
+    | string;
+  controlEpoch?: number;
   version: number;
   createdAt: string;
   updatedAt: string;
