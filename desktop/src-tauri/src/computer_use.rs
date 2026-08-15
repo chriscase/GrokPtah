@@ -1067,10 +1067,12 @@ mod tests {
             Arc::new(SimulatorBackend::new()),
             store.clone(),
         ));
+        // Build the host before `dir` moves into the returned tuple.
+        let host = test_host(dir.path());
         (
             dir,
             DesktopComputerUse {
-                host: test_host(dir.path()),
+                host,
                 platform: None,
                 store: Some(store),
                 initialization_error: None,
