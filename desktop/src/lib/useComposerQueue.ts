@@ -7,10 +7,11 @@ import {
   useState,
 } from "react";
 import {
+  emptyPromptQueueState,
   promptQueueReducer,
+  queueEntriesFor,
   type PromptQueueAction,
   type PromptQueueEntry,
-  type PromptQueueState,
 } from "./promptQueue";
 
 export function useComposerQueue(activeSessionId: string | null) {
@@ -20,7 +21,7 @@ export function useComposerQueue(activeSessionId: string | null) {
   const queueRequestVersions = useRef(new Map<string, number>());
   const [queues, dispatchQueue] = useReducer(
     promptQueueReducer,
-    {} as PromptQueueState,
+    emptyPromptQueueState,
   );
 
   const invalidateQueue = useCallback((sessionId: string) => {
@@ -128,6 +129,6 @@ export function useComposerQueue(activeSessionId: string | null) {
     isCurrentQueueRequest,
     syncQueue,
     queueFor: (sessionId: string | null): PromptQueueEntry[] =>
-      sessionId ? (queues[sessionId] ?? []) : [],
+      queueEntriesFor(queues, sessionId),
   };
 }

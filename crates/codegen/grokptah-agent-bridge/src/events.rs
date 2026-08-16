@@ -152,6 +152,11 @@ pub enum SessionUpdate {
     /// queue so consumers can render its pending disposition immediately.
     PromptQueueChanged {
         session_id: Uuid,
+        /// Per-session commit sequence, stamped under the same lock that
+        /// mutated the queue. Publish order can invert relative to commit
+        /// order, so consumers must drop snapshots whose `revision` is not
+        /// greater than the newest one they have already applied.
+        revision: u64,
         entries: Vec<PromptQueueEntry>,
         action: String,
         origin: String,

@@ -932,15 +932,21 @@ pub fn redact_update_with_secrets(
             origin,
             ..
         } => {
+            // Queue text is an editable projection, not display-only chrome:
+            // the desktop seeds its edit draft from this snapshot and saves it
+            // back under the same entry version. A length cap here would let a
+            // truncated copy overwrite the durable prompt and would give the
+            // GUI different text than `ptah_get_queue` returns. Secrets are
+            // still scrubbed; only the cap is dropped.
             for entry in entries {
-                entry.text = scrub_text(&entry.text, control_secrets, 4_000);
+                entry.text = scrub_secrets(&entry.text, control_secrets);
                 entry.source = scrub_text(&entry.source, control_secrets, 200);
                 if let Some(owner) = entry.owner.as_mut() {
                     *owner = scrub_text(owner, control_secrets, 200);
                 }
             }
             if let Some(entry) = changed_entry {
-                entry.text = scrub_text(&entry.text, control_secrets, 4_000);
+                entry.text = scrub_secrets(&entry.text, control_secrets);
                 entry.source = scrub_text(&entry.source, control_secrets, 200);
                 if let Some(owner) = entry.owner.as_mut() {
                     *owner = scrub_text(owner, control_secrets, 200);
@@ -1028,8 +1034,11 @@ fn redact_json_inner(v: &serde_json::Value, secrets: &[String], depth: usize) ->
     }
 }
 
-/// Remove bearer values and secrets entirely (no "marker + original").
-fn scrub_text(s: &str, secrets: &[String], max: usize) -> String {
+/// Remove bearer values and secrets entirely, preserving length.
+///
+/// Use this for text a client may write back (prompt queue entries). Anything
+/// display-only should go through [`scrub_text`], which also caps length.
+fn scrub_secrets(s: &str, secrets: &[String]) -> String {
     static BEARER: OnceLock<regex::Regex> = OnceLock::new();
     static AUTH: OnceLock<regex::Regex> = OnceLock::new();
     static ASSIGNMENT: OnceLock<regex::Regex> = OnceLock::new();
@@ -1058,6 +1067,12 @@ fn scrub_text(s: &str, secrets: &[String], max: usize) -> String {
             out = scrub_registered_secret(&out, secret);
         }
     }
+    out
+}
+
+/// Scrub secrets, then cap length for display-only fields.
+fn scrub_text(s: &str, secrets: &[String], max: usize) -> String {
+    let out = scrub_secrets(s, secrets);
     if out.len() <= max {
         out
     } else {
@@ -1344,6 +1359,7 @@ mod tests {
         entry.owner = Some("ctl-token-abc123".into());
         let update = SessionUpdate::PromptQueueChanged {
             session_id: sid,
+            revision: 7,
             entries: vec![entry.clone()],
             action: "queued".into(),
             origin: "mcp-secret-origin".into(),
@@ -1369,6 +1385,70 @@ mod tests {
                     .contains("ctl-token-abc123"));
                 assert_eq!(action, "queued");
                 assert_eq!(origin, "mcp-secret-origin");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// S1: the desktop seeds its edit draft from this snapshot and saves it
+    /// back under the same entry version, so a length cap here would let a
+    /// truncated copy overwrite the durable prompt — and would give the GUI
+    /// different text than `ptah_get_queue` hands an MCP coordinator.
+    #[test]
+    fn redact_preserves_full_queue_text_so_gui_and_mcp_agree() {
+        let sid = Uuid::new_v4();
+        // Comfortably past the old 4 KB cap and near MAX_PROMPT_BYTES.
+        let long_text = "x".repeat(90_000);
+        let entry =
+            crate::prompt_queue::PromptQueueEntry::new(long_text.clone(), "composer", false)
+                .unwrap();
+        let update = SessionUpdate::PromptQueueChanged {
+            session_id: sid,
+            revision: 1,
+            entries: vec![entry.clone()],
+            action: "queued".into(),
+            origin: "desktop".into(),
+            changed_entry: Some(entry),
+            disposition: None,
+        };
+        let redacted = redact_update_with_secrets(update, &["ctl-token-abc123".into()]);
+        match redacted {
+            SessionUpdate::PromptQueueChanged {
+                entries,
+                changed_entry,
+                ..
+            } => {
+                assert_eq!(entries[0].text, long_text, "queue text must not truncate");
+                assert!(!entries[0].text.contains("[truncated"));
+                assert_eq!(changed_entry.unwrap().text, long_text);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Dropping the cap must not drop the scrubbing: a secret buried past the
+    /// old truncation point still has to be removed.
+    #[test]
+    fn redact_scrubs_secrets_beyond_the_old_queue_cap() {
+        let sid = Uuid::new_v4();
+        let secret = "ctl-token-abc123".to_string();
+        let text = format!("{}\nuse {secret} here", "y".repeat(20_000));
+        let entry = crate::prompt_queue::PromptQueueEntry::new(text, "composer", false).unwrap();
+        let update = SessionUpdate::PromptQueueChanged {
+            session_id: sid,
+            revision: 1,
+            entries: vec![entry.clone()],
+            action: "queued".into(),
+            origin: "desktop".into(),
+            changed_entry: Some(entry),
+            disposition: None,
+        };
+        let redacted = redact_update_with_secrets(update, std::slice::from_ref(&secret));
+        match redacted {
+            SessionUpdate::PromptQueueChanged { entries, .. } => {
+                assert!(!entries[0].text.contains(&secret));
+                assert!(entries[0].text.contains("[redacted]"));
+                assert!(entries[0].text.len() > 20_000);
             }
             _ => panic!("wrong variant"),
         }

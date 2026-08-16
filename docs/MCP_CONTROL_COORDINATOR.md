@@ -285,7 +285,17 @@ Mutating tools take `request_id`:
   it is distinct from `ptah_steer`, which never cancels. `ptah_steer_queued`
   turns one queued entry into a safe-boundary steering action: it reports
   `pending` during a Build turn and `queued` while idle.
-- `ptah_clear_queue` removes all durable queued entries for the scoped session.
+- `ptah_clear_queue` removes all durable queued entries for the scoped session
+  **and cancels accepted steering that has not yet reached the model**. Because
+  steering already handed to a model boundary cannot be retracted, an empty
+  `entries` list is not on its own a promise that the session is quiet. The
+  receipt reports what actually happened:
+  - `clearedQueued` — durable follow-ups removed.
+  - `steeringCancelled` — accepted steering stopped before injection.
+  - `steeringInFlight` — steering already delivered to a boundary; it *will*
+    still be injected.
+  - `stopped` — `true` only when `steeringInFlight` is `0`. Branch on this,
+    not on `entries` being empty.
 - Every queue mutation is idempotent by `request_id`, and all mutation
   receipts use the same action identity/origin/snapshot shape so a coordinator
   can reconcile retries without guessing whether an action committed.
@@ -294,6 +304,17 @@ Mutating tools take `request_id`:
   composer consumption are journaled as state transitions, allowing a GUI or
   coordinator that reconnects to recover the same queue view without replaying
   a prompt.
+- `prompt_queue_changed` carries a monotonic per-session `revision`, stamped
+  under the bridge's queue mutation lock. Events are published *after* that
+  lock is released, so the bus `seq` reflects publish order while `revision`
+  reflects commit order. A consumer that applies snapshots must keep a
+  per-session watermark and ignore any snapshot whose `revision` is not
+  greater than the newest already applied; otherwise a late-published older
+  snapshot silently regresses the queue. The desktop reducer does this.
+- Entry `text` in `prompt_queue_changed` is **not** length-capped. Secrets are
+  still scrubbed, but the text is byte-identical to what `ptah_get_queue`
+  returns, so a GUI can safely seed an edit draft from the event and save it
+  back. Redaction must never truncate this field.
 - Priority flag moves to front; combine rules live in host `prompt_queue`.
 
 ### Bounded task admission

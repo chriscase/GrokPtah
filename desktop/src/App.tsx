@@ -870,11 +870,14 @@ export default function App() {
       applyUpdate(u, setTabs, setPermissionQueue, (queueUpdate) => {
         // MCP and desktop mutations share this bridge event. Applying the
         // snapshot directly avoids a second request racing the coordinator's
-        // newer queue version.
+        // newer queue version. `revision` is what gates it: the bridge stamps
+        // it under the mutation lock but publishes afterwards, so snapshots
+        // can arrive out of commit order and the reducer drops the stale ones.
         dispatchQueue({
           type: "replace",
           sessionId: queueUpdate.session_id,
           entries: queueUpdate.entries,
+          revision: queueUpdate.revision,
         });
       });
       if (u.type === "turn_started" || u.type === "turn_complete") {

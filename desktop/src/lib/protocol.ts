@@ -261,6 +261,13 @@ export type SessionUpdate =
   | {
       type: "prompt_queue_changed";
       session_id: string;
+      /**
+       * Per-session commit sequence stamped under the bridge's mutation lock.
+       * Publishing happens after that lock is released, so snapshots can
+       * arrive out of commit order — apply one only if its revision is
+       * greater than the newest already applied.
+       */
+      revision: number;
       entries: PromptQueueEntry[];
       action: string;
       origin: string;

@@ -1937,6 +1937,13 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
         .await
         .unwrap();
     assert!(cleared.structured["entries"].as_array().unwrap().is_empty());
+    // S4: an empty `entries` list is not by itself a promise that the session
+    // stopped. The receipt must say what clear actually cancelled and whether
+    // anything survived it, so a coordinator can branch on `stopped`.
+    assert_eq!(cleared.structured["steeringCancelled"], 0);
+    assert_eq!(cleared.structured["steeringInFlight"], 0);
+    assert_eq!(cleared.structured["stopped"], true);
+    assert!(cleared.structured["clearedQueued"].is_u64());
     assert!(client
         .call_tool(
             "ptah_get_queue",

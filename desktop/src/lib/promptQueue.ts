@@ -18,10 +18,42 @@ export type PromptQueueEntry = {
   priority: boolean;
 };
 
-export type PromptQueueState = Record<string, PromptQueueEntry[]>;
+export type PromptQueueState = {
+  entries: Record<string, PromptQueueEntry[]>;
+  /**
+   * Newest bridge `revision` applied per session. The bridge stamps a commit
+   * sequence under its mutation lock but publishes after releasing it, so
+   * snapshots can arrive out of commit order; anything at or below the
+   * watermark is a stale view of the queue and must be dropped.
+   */
+  revisions: Record<string, number>;
+};
+
+export const emptyPromptQueueState: PromptQueueState = {
+  entries: {},
+  revisions: {},
+};
+
+/** Entries the UI should render for a session. */
+export function queueEntriesFor(
+  state: PromptQueueState,
+  sessionId: string | null | undefined,
+): PromptQueueEntry[] {
+  if (!sessionId) return [];
+  return state.entries[sessionId] ?? [];
+}
 
 export type PromptQueueAction =
-  | { type: "replace"; sessionId: string; entries: PromptQueueEntry[] }
+  | {
+      type: "replace";
+      sessionId: string;
+      entries: PromptQueueEntry[];
+      /**
+       * Present only for bridge `prompt_queue_changed` snapshots. Refetches
+       * read current state directly and carry no revision.
+       */
+      revision?: number;
+    }
   | { type: "add"; sessionId: string; entry: PromptQueueEntry }
   | {
       type: "edit";
@@ -72,24 +104,44 @@ function withSession(
   state: PromptQueueState,
   sessionId: string,
   entries: PromptQueueEntry[],
+  revision?: number,
 ): PromptQueueState {
+  const revisions =
+    revision === undefined
+      ? state.revisions
+      : { ...state.revisions, [sessionId]: revision };
   if (entries.length === 0) {
-    if (!(sessionId in state)) return state;
-    const next = { ...state };
-    delete next[sessionId];
-    return next;
+    if (!(sessionId in state.entries)) {
+      return revisions === state.revisions ? state : { ...state, revisions };
+    }
+    const nextEntries = { ...state.entries };
+    delete nextEntries[sessionId];
+    return { entries: nextEntries, revisions };
   }
-  return { ...state, [sessionId]: entries };
+  return { entries: { ...state.entries, [sessionId]: entries }, revisions };
 }
 
 export function promptQueueReducer(
   state: PromptQueueState,
   action: PromptQueueAction,
 ): PromptQueueState {
-  const entries = state[action.sessionId] ?? [];
+  const entries = state.entries[action.sessionId] ?? [];
   switch (action.type) {
-    case "replace":
-      return withSession(state, action.sessionId, [...action.entries]);
+    case "replace": {
+      // Bridge snapshots can be published out of commit order. Applying an
+      // older one would silently regress the queue (drop a just-added entry,
+      // resurrect a removed one), so only ever move the watermark forward.
+      if (action.revision !== undefined) {
+        const applied = state.revisions[action.sessionId];
+        if (applied !== undefined && action.revision <= applied) return state;
+      }
+      return withSession(
+        state,
+        action.sessionId,
+        [...action.entries],
+        action.revision,
+      );
+    }
     case "add":
       return withSession(state, action.sessionId, [...entries, action.entry]);
     case "edit":

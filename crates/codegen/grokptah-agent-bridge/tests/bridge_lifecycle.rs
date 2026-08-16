@@ -1526,6 +1526,94 @@ async fn steer_now_injects_once_without_cancelling_active_turn() {
     );
 }
 
+/// S4: `clear` is the "stop what you're doing" control. It used to clear only
+/// the durable follow-ups and return `Ok(vec![])`, so a coordinator got an
+/// empty-queue receipt while an accepted steering interjection was still on
+/// its way to the model. Clearing must either stop it or say that it didn't.
+#[tokio::test]
+async fn clear_queue_accounts_for_accepted_steering_instead_of_reporting_empty() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let runner = {
+        let host = host.clone();
+        tokio::spawn(async move { host.session_prompt(session.id, "run sleep 1".into()).await })
+    };
+    loop {
+        let event = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("shell did not start")
+            .expect("event channel closed");
+        if matches!(event, SessionUpdate::ShellSessionStarted { .. }) {
+            break;
+        }
+    }
+
+    let receipt = host
+        .session_steer(session.id, "abandon this direction".into())
+        .unwrap();
+    assert_eq!(
+        receipt.disposition,
+        grokptah_agent_bridge::SteeringDisposition::Pending,
+        "mid-turn steering should be accepted, not deferred"
+    );
+    host.session_queue_add(session.id, "a follow up".into(), false)
+        .unwrap();
+
+    let (entries, outcome) = host
+        .session_queue_clear_with_origin_receipt(session.id, "mcp")
+        .unwrap();
+    assert!(entries.is_empty());
+    assert_eq!(outcome.queued_cleared, 1);
+    // The steering is either cancelled (not yet delivered) or reported as
+    // in flight (already handed to a boundary). Before the fix it was neither:
+    // it stayed pending and the receipt claimed an empty queue.
+    assert_eq!(
+        outcome.steering_cancelled + outcome.steering_in_flight,
+        1,
+        "accepted steering must be accounted for by clear"
+    );
+    let claimed_stopped = outcome.fully_stopped();
+    assert_eq!(claimed_stopped, outcome.steering_cancelled == 1);
+
+    timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("active turn did not finish")
+        .unwrap()
+        .unwrap();
+    let events = drain_until_turn_complete(&mut rx).await;
+    let injected = events
+        .iter()
+        .filter(|event| matches!(event, SessionUpdate::SteeringInjected { .. }))
+        .count();
+    if claimed_stopped {
+        assert_eq!(
+            injected, 0,
+            "clear reported the session stopped, so nothing may be injected"
+        );
+        assert!(
+            !host
+                .session_transcript(session.id)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.text.contains("abandon this direction")),
+            "cancelled steering must not reach the transcript"
+        );
+    }
+    assert!(
+        host.session_queue_list(session.id).unwrap().is_empty(),
+        "cleared steering must not be deferred back into the queue"
+    );
+}
+
 #[tokio::test]
 async fn steer_at_idle_boundary_is_preserved_as_run_next_queue_entry() {
     let _iso = IsolatedHome::install();

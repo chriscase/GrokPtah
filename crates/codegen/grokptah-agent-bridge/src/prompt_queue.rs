@@ -59,6 +59,25 @@ pub struct PromptQueueRunNextResult {
     pub changed_entry: PromptQueueEntry,
 }
 
+/// What a `clear` actually stopped, so the receipt cannot overstate it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptQueueClearOutcome {
+    /// Durable follow-ups removed.
+    pub queued_cleared: usize,
+    /// Accepted steering cancelled before it reached the model.
+    pub steering_cancelled: usize,
+    /// Steering already handed to a model boundary; clear cannot retract it,
+    /// so it will still be injected. Non-zero means the session is not quiet.
+    pub steering_in_flight: usize,
+}
+
+impl PromptQueueClearOutcome {
+    /// True only when nothing survives the clear.
+    pub fn fully_stopped(&self) -> bool {
+        self.steering_in_flight == 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SteeringDisposition {
@@ -187,8 +206,25 @@ impl SessionPromptQueue {
         Ok(self.queued.remove(index).expect("queue index exists"))
     }
 
-    pub fn clear(&mut self) {
+    /// Stop everything this queue can still stop.
+    ///
+    /// `queued` and `steering` are both dropped: a coordinator calling clear
+    /// wants the session to stop, and steering that has only been *accepted*
+    /// has not reached the model yet, so cancelling it is honest. `delivering`
+    /// has already been handed to a model boundary and cannot be retracted —
+    /// it is reported in the outcome instead of being silently ignored, so no
+    /// caller receives an "empty queue" receipt while an interjection is still
+    /// on its way.
+    pub fn clear(&mut self) -> PromptQueueClearOutcome {
+        let queued_cleared = self.queued.len();
+        let steering_cancelled = self.steering.len();
         self.queued.clear();
+        self.steering.clear();
+        PromptQueueClearOutcome {
+            queued_cleared,
+            steering_cancelled,
+            steering_in_flight: self.delivering.len(),
+        }
     }
 
     pub fn move_to(&mut self, id: &str, to_index: usize) -> Result<()> {
@@ -399,6 +435,50 @@ mod tests {
         );
         queue.remove(&a.id).unwrap();
         queue.clear();
+        assert!(queue.list().is_empty());
+    }
+
+    /// S4: `clear` used to leave `steering` untouched, so a coordinator that
+    /// called it to stop the session got an empty-queue receipt while an
+    /// accepted interjection was still waiting to be injected.
+    #[test]
+    fn clear_cancels_accepted_steering_that_has_not_been_delivered() {
+        let mut queue = SessionPromptQueue::default();
+        queue.add("follow up", "composer", false).unwrap();
+        queue
+            .steer_text_with_owner("change direction".into(), true, Some("mcp".into()))
+            .unwrap();
+
+        let outcome = queue.clear();
+        assert_eq!(outcome.queued_cleared, 1);
+        assert_eq!(outcome.steering_cancelled, 1);
+        assert_eq!(outcome.steering_in_flight, 0);
+        assert!(outcome.fully_stopped());
+
+        assert!(queue.list().is_empty());
+        // The cancelled steering must not resurface at the next boundary, on
+        // the deferral path, or through durable recovery.
+        assert!(queue.drain_steering().is_empty());
+        assert_eq!(queue.defer_pending_steering(), 0);
+        assert_eq!(queue.recover_pending_steering(), 0);
+        assert!(queue.durable_snapshot().list().is_empty());
+    }
+
+    /// Steering already handed to a model boundary cannot be retracted, so the
+    /// receipt must say so instead of reporting a quiet session.
+    #[test]
+    fn clear_reports_in_flight_steering_rather_than_claiming_it_stopped() {
+        let mut queue = SessionPromptQueue::default();
+        queue.steer_text("already delivered".into(), true).unwrap();
+        assert_eq!(queue.drain_steering().len(), 1);
+
+        let outcome = queue.clear();
+        assert_eq!(outcome.steering_cancelled, 0);
+        assert_eq!(outcome.steering_in_flight, 1);
+        assert!(
+            !outcome.fully_stopped(),
+            "an unretractable interjection must not read as stopped"
+        );
         assert!(queue.list().is_empty());
     }
 

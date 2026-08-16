@@ -40,6 +40,139 @@ fn started_host() -> grokptah_agent_bridge::AgentHostHandle {
     host
 }
 
+/// S2: `PromptQueueChanged` is published *after* the mutation lock is
+/// released, so the bus `seq` reflects publish order, not commit order. The
+/// per-session `revision` is stamped under the mutation lock instead, which
+/// means sorting snapshots by revision must reproduce the order the queue
+/// actually changed in.
+///
+/// Concretely: N concurrent adds must yield revisions 1..=N whose snapshots
+/// grow 1, 2, ..., N. Stamping the revision at publish time (or reusing the
+/// bus seq) pairs a late revision with an early snapshot and fails here.
+#[test]
+fn queue_revision_orders_snapshots_by_commit_not_publish() {
+    let (_home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let other = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(other.id, ws.path()).unwrap();
+
+    const WRITERS: usize = 8;
+    let mut events = host.event_bus().subscribe();
+
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|i| {
+            let host = host.clone();
+            std::thread::spawn(move || {
+                host.session_queue_add(session.id, format!("prompt {i}"), false)
+                    .expect("queue add");
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("writer thread");
+    }
+    // A second session's counter is independent, and its events must not
+    // perturb the first session's watermark.
+    host.session_queue_add(other.id, "unrelated".into(), false)
+        .unwrap();
+
+    let mut observed: Vec<(u64, usize)> = Vec::new();
+    let mut other_revisions: Vec<u64> = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let SessionUpdate::PromptQueueChanged {
+            session_id,
+            revision,
+            entries,
+            ..
+        } = event
+        {
+            if session_id == session.id {
+                observed.push((revision, entries.len()));
+            } else if session_id == other.id {
+                other_revisions.push(revision);
+            }
+        }
+    }
+
+    assert_eq!(observed.len(), WRITERS, "one snapshot per committed add");
+    observed.sort_by_key(|(revision, _)| *revision);
+    assert_eq!(
+        observed.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        (1..=WRITERS as u64).collect::<Vec<_>>(),
+        "revisions must be dense and monotonic per session"
+    );
+    assert_eq!(
+        observed.iter().map(|(_, len)| *len).collect::<Vec<_>>(),
+        (1..=WRITERS).collect::<Vec<_>>(),
+        "revision order must match the order the queue actually grew in"
+    );
+    assert_eq!(
+        other_revisions,
+        vec![1],
+        "each session carries its own revision counter"
+    );
+    assert_eq!(
+        host.session_queue_list(session.id).unwrap().len(),
+        WRITERS,
+        "every concurrent add must survive"
+    );
+    set_grokptah_home_override(None);
+}
+
+/// Every queue mutation kind has to stamp a revision, or a GUI holding a
+/// watermark would ignore that action's snapshot forever.
+#[test]
+fn every_queue_mutation_advances_the_revision() {
+    let (_home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let mut events = host.event_bus().subscribe();
+
+    let first = host
+        .session_queue_add(session.id, "one".into(), false)
+        .unwrap()[0]
+        .clone();
+    host.session_queue_add(session.id, "two".into(), false)
+        .unwrap();
+    host.session_queue_edit(session.id, &first.id, first.version, "one edited".into())
+        .unwrap();
+    host.session_queue_move(session.id, &first.id, 1).unwrap();
+    host.session_queue_run_next(session.id, &first.id).unwrap();
+    host.session_queue_remove(session.id, &first.id).unwrap();
+    host.session_queue_clear(session.id).unwrap();
+
+    let mut revisions = Vec::new();
+    let mut actions = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let SessionUpdate::PromptQueueChanged {
+            revision, action, ..
+        } = event
+        {
+            revisions.push(revision);
+            actions.push(action);
+        }
+    }
+    assert_eq!(
+        actions,
+        vec![
+            "queued",
+            "queued",
+            "edited",
+            "reordered",
+            "run_next",
+            "removed",
+            "cleared"
+        ]
+    );
+    assert_eq!(revisions, (1..=7).collect::<Vec<u64>>());
+    set_grokptah_home_override(None);
+}
+
 #[test]
 fn dual_subscriber_same_ordered_sequences() {
     let (_home, _lock) = setup_home();

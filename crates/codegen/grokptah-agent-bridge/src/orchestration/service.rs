@@ -1446,8 +1446,11 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let entries = match self.host.session_queue_clear_with_origin(session_id, "mcp") {
-            Ok(entries) => entries,
+        let (entries, outcome) = match self
+            .host
+            .session_queue_clear_with_origin_receipt(session_id, "mcp")
+        {
+            Ok(result) => result,
             Err(error) => {
                 return Err(self.fail_claim(
                     &mut lease,
@@ -1458,9 +1461,22 @@ impl OrchestrationService {
                 ));
             }
         };
-        let response = Self::queue_response(
+        let mut response = Self::queue_response(
             request_id, session_id, &claimed, "cleared", entries, None, None,
         );
+        // An empty `entries` list alone would be a fail-open receipt: steering
+        // already handed to a model boundary cannot be retracted and will
+        // still be injected. Report it rather than implying the session is
+        // quiet. `stopped` is the field a coordinator should branch on.
+        if let Some(object) = response.as_object_mut() {
+            object.insert("clearedQueued".into(), json!(outcome.queued_cleared));
+            object.insert(
+                "steeringCancelled".into(),
+                json!(outcome.steering_cancelled),
+            );
+            object.insert("steeringInFlight".into(), json!(outcome.steering_in_flight));
+            object.insert("stopped".into(), json!(outcome.fully_stopped()));
+        }
         if let Err(error) = lease.complete(None, response.clone()) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
