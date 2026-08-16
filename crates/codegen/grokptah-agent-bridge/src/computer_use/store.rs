@@ -276,6 +276,10 @@ impl ComputerStore {
             run.ended_at = Some(run.updated_at);
             run.grant = None;
             run.current_observation = None;
+            // A prior action summary can carry backend-chosen text. Clearing it
+            // is the same fail-closed move as dropping the observation: restart
+            // must not keep a leaky last_outcome on the durable record.
+            run.last_outcome = None;
             run.last_error = Some(ComputerError::new(
                 ComputerErrorCode::Interrupted,
                 "computer run interrupted by process restart; explicit reauthorization required",
@@ -566,7 +570,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::computer_use::{ActionClass, ActionGrant, ComputerTarget, ComputerUseLimits};
+    use crate::computer_use::{
+        ActionClass, ActionGrant, ActionOutcome, ComputerTarget, ComputerUseLimits,
+    };
 
     fn target() -> ComputerTarget {
         ComputerTarget {
@@ -601,6 +607,10 @@ mod tests {
                 revoked_at: None,
             });
             run.transition(ComputerRunState::Ready).unwrap();
+            run.last_outcome = Some(ActionOutcome::bounded(
+                "PRIVATE_DOCUMENT_TITLE leaked from AX",
+                Some(true),
+            ));
             store.save_run(&run).unwrap();
         }
         let store = ComputerStore::open(dir.path()).unwrap();
@@ -613,6 +623,14 @@ mod tests {
         assert!(recovered.control_epoch > 0);
         assert!(recovered.grant.is_none());
         assert!(recovered.current_observation.is_none());
+        assert!(
+            recovered.last_outcome.is_none(),
+            "restart must not keep a leaky last_outcome"
+        );
+        assert_eq!(
+            recovered.last_error.as_ref().map(|error| error.code),
+            Some(ComputerErrorCode::Interrupted)
+        );
         let last = recovered.audit.last().expect("recovery is journaled");
         assert_eq!(last.operation, "recover");
         assert_eq!(last.disposition, "interrupted");

@@ -613,7 +613,9 @@ export type ComputerControlDisposition =
  * outside observer about run state, control disposition, or epoch.
  *
  * Observed element labels, values, and evidence tokens are deliberately
- * absent — those stay on `ComputerRun`, which is local-only.
+ * absent — those stay on `ComputerRun`, which is local-only. Action summary
+ * text and error messages are likewise local-only; the projection carries
+ * only structured last-outcome / last-error summaries.
  */
 export interface ComputerRunProjection {
   runId: string;
@@ -669,10 +671,9 @@ export interface ComputerRunProjection {
     stale: boolean;
   } | null;
   lastOutcome?: {
-    summary: string;
     expectedPostconditionMet?: boolean | null;
   } | null;
-  lastError?: { code: string; message: string } | null;
+  lastError?: { code: string } | null;
   eventRange?: { startSeq: number; endSeq: number } | null;
 }
 

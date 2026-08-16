@@ -417,10 +417,12 @@ MCP**; the release gate snapshots the surface so a mutation cannot slip in.
   retained window is **410 `cursor_expired`** (recover from the projection's
   `eventRange` and resume at `startSeq - 1`); a cursor at or past the tail is
   a valid empty page. Omitting `after_seq` reads from the retained start.
-- `ptah_get_computer_capacity` reports the global ledger bound (256 records)
-  and stored/active totals plus counts scoped to the (session, workspace)
-  pair. Restart recovery marks live runs `interrupted`, revokes authority,
-  journals a `recover` entry, and keeps events replayable.
+- `ptah_get_computer_capacity` reports the constant ledger bound (256
+  records) plus counts scoped to the `(session, workspace)` binding
+  (`boundRuns` / `boundActiveRuns`). Host-wide stored/active totals are
+  absent so the tool cannot count other scopes after the workspace gate.
+  Restart recovery marks live runs `interrupted`, revokes authority, clears
+  `last_outcome`, journals a `recover` entry, and keeps events replayable.
 - If the host has no Computer Use ledger (or its exclusive lock is held
   elsewhere), all four tools fail closed with `unsupported`.
 - Live proof: `live_computer_reads_node_smoke`

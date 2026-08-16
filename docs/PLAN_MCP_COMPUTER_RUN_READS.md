@@ -31,10 +31,10 @@ verified against code, with evidence:
 
 | Claimed property | Verified against |
 |---|---|
-| Redaction-safe by construction | `computer_use/projection.rs` types omit element roles/labels/values/ids, geometry, evidence `asset_id`/hash. Transitively safe: `ComputerAuditEntry` (`types.rs:420-428`) carries only enums, ids, and 64-byte-truncated static operation/disposition strings — `error_code` is the enum, never a message; every `ComputerError` message in `service.rs`/`policy.rs`/`simulator.rs`/`macos_native.rs` is static or interpolates only enum/state/version values; `ActionOutcome` summaries are static ("set demo name"); `display_name` is the application name, never a window title (`macos_observation.rs:237`, pinned by test at `:1157-1158`). |
+| Redaction-safe by construction | `computer_use/projection.rs` types omit element roles/labels/values/ids, geometry, evidence `asset_id`/hash, and backend-chosen `ActionOutcome.summary` / `ComputerError.message`. `lastOutcome` / `lastError` are `ActionOutcomeSummary` / `ComputerErrorSummary` (postcondition flag + closed error code). `ComputerAuditEntry` carries only enums, ids, and 64-byte-truncated static operation/disposition strings. `display_name` is the application name, never a window title. |
 | Non-oracle scoped reads | `load_owned_run` maps id-validation failures and unknown/cross-session lookups to one identical `Unauthorized` error; tests assert equality of all three. Note this is deliberately **stronger** than the pre-existing Build-run reads, where unknown → `invalid_request "unknown run_id"` (`orchestration/service.rs:623`) but cross-session → `forbidden_scope` (`:1092-1096`) are distinguishable. |
 | Cursor semantics | `project_events`: limit clamped 1..=500, caller cursor `saturating_add`, `after == start_seq - 1` is continuity, below-window is `cursor_expired` with empty page, final page returns `next_cursor: None`, empty journal yields no false expiry. |
-| Restart recovery | `store.rs:262-283` marks non-terminal runs `Interrupted`, bumps `control_epoch`, clears grant + observation, sets a static `Interrupted` last error; #292's test proves the projection reports it and events stay replayable. |
+| Restart recovery | `store.rs` marks non-terminal runs `Interrupted`, bumps `control_epoch`, clears grant + observation + `last_outcome`, sets a static `Interrupted` last error; tests prove the projection reports it, the leaky outcome is gone, and events stay replayable. |
 | Disposition precedence | `computerActivity.ts` switches on disposition first and fails closed on unknown dispositions. Misleading combinations are unreachable: `cancel` sets `Stopped` (`service.rs:421`), `Paused → Completed` is not in the transition table (`types.rs:711-742`), and `validate_run_record` (`store.rs:391-399`) rejects inconsistent durable records. |
 | GUI/MCP parity | Byte-identical serialization test (desktop-held record vs scoped read); cockpit status renders exclusively from the projection; `run` is retained only for local approval detail. |
 | Frontend/a11y | Nine activity cases including fail-closed unknown disposition; disposition-uniqueness test; `aria-live` announcement names state + target; pulse animation suppressed under `prefers-reduced-motion`. |
@@ -53,10 +53,11 @@ verified against code, with evidence:
 3. **Future cursor is indistinguishable from caught-up.** `after_seq >
    end_seq` returns an empty non-expired page. Harmless (bounded, no leak);
    document it in the tool description rather than change semantics.
-4. **`capacity()` exposes global `stored_runs`/`active_runs` to any
-   session-scoped caller.** Matches the global semantics of
-   `ptah_get_capacity` (single shared bearer token; one trust domain); keep,
-   but document as intentional.
+4. **`ptah_get_computer_capacity` must not be a cross-scope activity
+   oracle.** After the workspace gate the tool returns `ComputerScopeCapacity`
+   (`maxRunRecords` + `boundRuns` / `boundActiveRuns`). Host-wide
+   `storedRuns` / `activeRuns` stay on the local-operator
+   `ComputerRunCapacity` and are not serialized on this surface.
 5. `record_audit` trims only when `len == 1024` exactly; `>=` is more
    defensive (unreachable via store reads because `validate_run_record`
    rejects longer vectors, so cosmetic).
@@ -130,7 +131,7 @@ schema/name snapshot tests (`tests/mcp_streamable_transport.rs:70`, `:446`;
 | `ptah_list_computer_runs` | `session_id`, `workspace` | `{ "runs": [ComputerRunProjection…] }` newest-first, session-scoped (ledger hard cap 256 records ⇒ response ≤ ~300 KiB) |
 | `ptah_get_computer_run` | `session_id`, `workspace`, `run_id` | `ComputerRunProjection` (status, disposition/epoch, progress, observation metadata, grant summary, lastOutcome/lastError, eventRange) |
 | `ptah_get_computer_run_events` | `session_id`, `workspace`, `run_id`; optional `after_seq` (int ≥ 0), `limit` (1–500, default 100) | `ComputerRunEventPage` (`runId`, `entries`, `nextCursor`, `cursorExpired:false`, `range`) |
-| `ptah_get_computer_capacity` | `session_id`, `workspace` | `ComputerRunCapacity` (global `maxRunRecords`/`storedRuns`/`activeRuns` + per-session counts) |
+| `ptah_get_computer_capacity` | `session_id`, `workspace` | `ComputerScopeCapacity` (`maxRunRecords` + `boundRuns` / `boundActiveRuns`; no host-wide occupancy) |
 
 Schemas follow the house style exactly: `additionalProperties: false`,
 `session_id` uuid string, `workspace` non-empty string, `run_id` string
@@ -184,7 +185,7 @@ Rust unit (bridge `cargo test --lib`):
   error as unknown-run; canonical string equality only.
 - `ComputerAuditEntry` serialized key-set pin (hardening item 1).
 - recovery audit entry appended (hardening item 2) and visible via
-  `owned_run_events` after reopen.
+  `ComputerRunReads::run_events` after reopen. Restart clears `last_outcome`.
 
 Transport (`tests/mcp_streamable_transport.rs`, offline host + simulator):
 - tools/list contains exactly `CONTROL_TOOLS` incl. the four new names, with

@@ -2129,7 +2129,8 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["data"]["code"], "invalid_request");
 
-        // Capacity reports global figures plus the scoped counts.
+        // Capacity is scoped to the (session, workspace) binding. Host-wide
+        // occupancy is absent so the tool cannot count other sessions' runs.
         let (status, body) = call_tool(
             &fixture,
             10,
@@ -2139,9 +2140,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let capacity = &body["result"]["structuredContent"];
-        assert_eq!(capacity["storedRuns"], 3);
-        assert_eq!(capacity["sessionRuns"], 1);
+        assert_eq!(capacity["boundRuns"], 1);
+        assert_eq!(capacity["boundActiveRuns"], 1);
         assert_eq!(capacity["maxRunRecords"], 256);
+        assert!(capacity.get("storedRuns").is_none());
+        assert!(capacity.get("activeRuns").is_none());
+        assert!(capacity.get("sessionRuns").is_none());
 
         // Events: bounded page, exact tail, and reads are nullipotent — the
         // same request twice returns the identical body.
@@ -2414,6 +2418,16 @@ mod tests {
             projection["grant"],
             Value::Null,
             "authority must not survive restart"
+        );
+        assert_eq!(
+            projection["lastOutcome"],
+            Value::Null,
+            "restart must not keep a leaky last_outcome"
+        );
+        assert_eq!(projection["lastError"]["code"], "interrupted");
+        assert!(
+            projection["lastError"].get("message").is_none(),
+            "lastError must be a code-only summary"
         );
 
         // The journal itself shows the interruption and stays replayable.
