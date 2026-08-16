@@ -26,6 +26,7 @@ import type {
 import type {
   PromptQueueEntry,
   PromptQueueRunNextResult,
+  PromptQueueSnapshot,
   PromptQueueTakeResult,
   SteeringReceipt,
 } from "./promptQueue";
@@ -217,10 +218,34 @@ export const api = {
       tabIds,
       activeId: activeId ?? null,
     }),
-  sessionPrompt: (sessionId: string, prompt: string) =>
-    invoke<string>("session_prompt", { sessionId, prompt }),
+  /**
+   * `reservation` must be the value a queue drain returned, so the drained
+   * prompt starts the turn its drain reserved rather than racing for a new one.
+   */
+  sessionPrompt: (
+    sessionId: string,
+    prompt: string,
+    reservation?: string | null,
+  ) =>
+    invoke<string>("session_prompt", {
+      sessionId,
+      prompt,
+      reservation: reservation ?? null,
+    }),
+  /** Returns entries plus the revision they were read at (see the reducer). */
   sessionQueueList: (sessionId: string) =>
-    invoke<PromptQueueEntry[]>("session_queue_list", { sessionId }),
+    invoke<PromptQueueSnapshot>("session_queue_list", { sessionId }),
+  /** Give back a drained batch whose turn never started. */
+  sessionQueueRestoreDrain: (
+    sessionId: string,
+    reservation: string | null | undefined,
+    entries: PromptQueueEntry[],
+  ) =>
+    invoke<PromptQueueEntry[]>("session_queue_restore_drain", {
+      sessionId,
+      reservation: reservation ?? null,
+      entries,
+    }),
   sessionQueueAdd: (
     sessionId: string,
     text: string,
@@ -243,10 +268,22 @@ export const api = {
       version,
       text,
     }),
-  sessionQueueRemove: (sessionId: string, entryId: string) =>
+  /**
+   * Every queue mutator is compare-and-set. `expectedVersion` is required
+   * because the desktop is only one of two writers — an MCP coordinator can
+   * mutate the same queue — so a mutation without a version is last-write-wins.
+   * Pass the `version` of the entry as this client last saw it; a stale one is
+   * rejected with a conflict and the caller should refetch.
+   */
+  sessionQueueRemove: (
+    sessionId: string,
+    entryId: string,
+    expectedVersion: number,
+  ) =>
     invoke<PromptQueueEntry[]>("session_queue_remove", {
       sessionId,
       entryId,
+      expectedVersion,
     }),
   sessionQueueClear: (sessionId: string) =>
     invoke<PromptQueueEntry[]>("session_queue_clear", { sessionId }),
@@ -254,23 +291,35 @@ export const api = {
     sessionId: string,
     entryId: string,
     toIndex: number,
+    expectedVersion: number,
   ) =>
     invoke<PromptQueueEntry[]>("session_queue_move", {
       sessionId,
       entryId,
       toIndex,
+      expectedVersion,
     }),
   sessionQueueTakeNext: (sessionId: string) =>
     invoke<PromptQueueTakeResult>("session_queue_take_next", { sessionId }),
-  sessionQueueRunNext: (sessionId: string, entryId: string) =>
+  sessionQueueRunNext: (
+    sessionId: string,
+    entryId: string,
+    expectedVersion: number,
+  ) =>
     invoke<PromptQueueRunNextResult>("session_queue_run_next", {
       sessionId,
       entryId,
+      expectedVersion,
     }),
-  sessionQueueSteerEntry: (sessionId: string, entryId: string) =>
+  sessionQueueSteerEntry: (
+    sessionId: string,
+    entryId: string,
+    expectedVersion: number,
+  ) =>
     invoke<SteeringReceipt>("session_queue_steer_entry", {
       sessionId,
       entryId,
+      expectedVersion,
     }),
   sessionSteer: (sessionId: string, text: string) =>
     invoke<SteeringReceipt>("session_steer", { sessionId, text }),

@@ -46,16 +46,56 @@ pub struct PromptQueueBatch {
     pub text: String,
 }
 
+/// A queue read together with the revision it was taken at.
+///
+/// Consumers apply this through the same watermark as `PromptQueueChanged`,
+/// so a slow read cannot overwrite a newer event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptQueueSnapshot {
+    pub entries: Vec<PromptQueueEntry>,
+    pub revision: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptQueueTakeResult {
     pub batch: Option<PromptQueueBatch>,
     pub entries: Vec<PromptQueueEntry>,
+    /// Turn reservation held for the drained batch, if any.
+    ///
+    /// Draining and starting the turn are two calls. Without a reservation
+    /// another writer can start a turn in between, the start is refused, and
+    /// the batch is already gone from the queue — a silently lost prompt. The
+    /// drain therefore claims the session's turn slot under the same lock that
+    /// removed the batch, and the caller must either present this owner when
+    /// starting the turn or hand the batch back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptQueueRunNextResult {
     pub entries: Vec<PromptQueueEntry>,
     pub cancelled_active: bool,
+    pub changed_entry: PromptQueueEntry,
+}
+
+/// What a `clear` actually stopped, so the receipt cannot overstate it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptQueueClearOutcome {
+    /// Durable follow-ups removed.
+    pub queued_cleared: usize,
+    /// Accepted steering cancelled before it reached the model.
+    pub steering_cancelled: usize,
+    /// Steering already handed to a model boundary; clear cannot retract it,
+    /// so it will still be injected. Non-zero means the session is not quiet.
+    pub steering_in_flight: usize,
+}
+
+impl PromptQueueClearOutcome {
+    /// True only when nothing survives the clear.
+    pub fn fully_stopped(&self) -> bool {
+        self.steering_in_flight == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +199,27 @@ impl SessionPromptQueue {
         Ok(entry.clone())
     }
 
+    /// Compare-and-set gate for every mutator that is not [`Self::edit`].
+    ///
+    /// The version is mandatory by type: an optional CAS on a control plane
+    /// with two writers is last-write-wins, and callers reached for it exactly
+    /// when they had no version to offer. This matches the Computer Use
+    /// control fence, which requires the current version on every transition.
+    pub fn check_version(&self, id: &str, version: u64) -> Result<()> {
+        let entry = self
+            .queued
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown queued prompt {id}"))?;
+        if entry.version != version {
+            bail!(
+                "stale queued prompt version for {id}: expected {}, got {version}",
+                entry.version
+            );
+        }
+        Ok(())
+    }
+
     pub fn remove(&mut self, id: &str) -> Result<PromptQueueEntry> {
         let index = self
             .queued
@@ -168,10 +229,38 @@ impl SessionPromptQueue {
         Ok(self.queued.remove(index).expect("queue index exists"))
     }
 
-    pub fn clear(&mut self) {
+    /// Stop everything this queue can still stop.
+    ///
+    /// `queued` and `steering` are both dropped: a coordinator calling clear
+    /// wants the session to stop, and steering that has only been *accepted*
+    /// has not reached the model yet, so cancelling it is honest. `delivering`
+    /// has already been handed to a model boundary and cannot be retracted —
+    /// it is reported in the outcome instead of being silently ignored, so no
+    /// caller receives an "empty queue" receipt while an interjection is still
+    /// on its way.
+    pub fn clear(&mut self) -> PromptQueueClearOutcome {
+        let queued_cleared = self.queued.len();
+        let steering_cancelled = self.steering.len();
         self.queued.clear();
+        self.steering.clear();
+        PromptQueueClearOutcome {
+            queued_cleared,
+            steering_cancelled,
+            steering_in_flight: self.delivering.len(),
+        }
     }
 
+    /// Move an entry to an absolute index, bumping every version that shifted.
+    ///
+    /// `to_index` is absolute, so it only means anything against a specific
+    /// ordering. Leaving versions untouched made `expected_version` unable to
+    /// detect a conflict even when supplied: two coordinators reordering
+    /// concurrently both succeeded and the final order was arbitrary. Every
+    /// entry whose index changed now describes a different position than the
+    /// one a concurrent writer read, so its version moves and that writer's
+    /// CAS fails closed. Entries outside the moved span keep their versions,
+    /// which keeps the conflict blast radius to the entries that actually
+    /// shifted.
     pub fn move_to(&mut self, id: &str, to_index: usize) -> Result<()> {
         let from_index = self
             .queued
@@ -183,6 +272,18 @@ impl SessionPromptQueue {
         };
         let target = to_index.min(self.queued.len());
         self.queued.insert(target, entry);
+        if target == from_index {
+            // Nothing shifted, so nothing observed by another writer changed.
+            return Ok(());
+        }
+        let (lo, hi) = if target < from_index {
+            (target, from_index)
+        } else {
+            (from_index, target)
+        };
+        for entry in self.queued.range_mut(lo..=hi) {
+            entry.version += 1;
+        }
         Ok(())
     }
 
@@ -289,6 +390,7 @@ impl SessionPromptQueue {
             return PromptQueueTakeResult {
                 batch: None,
                 entries: Vec::new(),
+                reservation: None,
             };
         }
         let gates = self.queued.iter().map(|entry| CombineGate {
@@ -314,6 +416,22 @@ impl SessionPromptQueue {
                 text,
             }),
             entries: self.list(),
+            // The host attaches the reservation; the queue itself owns no
+            // turn state.
+            reservation: None,
+        }
+    }
+
+    /// Put a drained batch back at the head, in its original order.
+    ///
+    /// Used when the turn the batch was drained for never started. Versions
+    /// are bumped because the entries left the queue and came back: any holder
+    /// of the pre-drain version was, for a moment, describing an entry that no
+    /// longer existed.
+    pub fn restore_batch(&mut self, entries: Vec<PromptQueueEntry>) {
+        for mut entry in entries.into_iter().rev() {
+            entry.version += 1;
+            self.queued.push_front(entry);
         }
     }
 }
@@ -380,6 +498,140 @@ mod tests {
         );
         queue.remove(&a.id).unwrap();
         queue.clear();
+        assert!(queue.list().is_empty());
+    }
+
+    /// S3: `to_index` is absolute, so it only means something against a known
+    /// ordering. Reorder used to leave every version alone, which made the
+    /// conflict structurally undetectable — `expected_version` could not catch
+    /// it even when supplied. Everything that shifted must move its version.
+    #[test]
+    fn reorder_bumps_the_version_of_every_entry_that_shifted() {
+        let mut queue = SessionPromptQueue::default();
+        for text in ["a", "b", "c", "d"] {
+            queue.add(text, "composer", false).unwrap();
+        }
+        let before: Vec<u64> = queue.list().iter().map(|entry| entry.version).collect();
+        assert_eq!(before, vec![0, 0, 0, 0]);
+
+        let d_id = queue.list()[3].id.clone();
+        queue.move_to(&d_id, 1).unwrap();
+
+        let after = queue.list();
+        assert_eq!(
+            after.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            vec!["a", "d", "b", "c"]
+        );
+        // "a" never moved, so a concurrent writer holding its version is still
+        // describing the entry accurately and must not be spuriously rejected.
+        assert_eq!(after[0].version, 0, "unshifted entry keeps its version");
+        assert_eq!(after[1].version, 1, "the moved entry shifted");
+        assert_eq!(after[2].version, 1, "displaced entry shifted");
+        assert_eq!(after[3].version, 1, "displaced entry shifted");
+    }
+
+    /// A move that lands where it started shifts nothing, so it must not
+    /// invalidate versions another coordinator is legitimately holding.
+    #[test]
+    fn reorder_to_the_same_index_leaves_every_version_alone() {
+        let mut queue = SessionPromptQueue::default();
+        for text in ["a", "b", "c"] {
+            queue.add(text, "composer", false).unwrap();
+        }
+        let b_id = queue.list()[1].id.clone();
+        queue.move_to(&b_id, 1).unwrap();
+        assert!(queue.list().iter().all(|entry| entry.version == 0));
+    }
+
+    /// S3: the case the review named. Two coordinators read the same queue and
+    /// both reorder. The first wins; the second is describing an ordering that
+    /// no longer exists, so its CAS has to fail rather than silently producing
+    /// an arbitrary final order with two success receipts.
+    #[test]
+    fn a_second_concurrent_reorder_fails_its_compare_and_set() {
+        let mut queue = SessionPromptQueue::default();
+        for text in ["a", "b", "c"] {
+            queue.add(text, "composer", false).unwrap();
+        }
+        let listed = queue.list();
+        let (a_id, b_id) = (listed[0].id.clone(), listed[1].id.clone());
+        // Both coordinators read version 0 for the entry each intends to move.
+        let (a_version, b_version) = (listed[0].version, listed[1].version);
+
+        // Coordinator A wins: move "a" to the back.
+        queue.check_version(&a_id, a_version).unwrap();
+        queue.move_to(&a_id, 2).unwrap();
+
+        // Coordinator B is still working from the pre-move ordering.
+        let conflict = queue.check_version(&b_id, b_version).unwrap_err();
+        assert!(
+            conflict.to_string().contains("stale queued prompt version"),
+            "expected a stale-version conflict, got: {conflict}"
+        );
+        assert_eq!(
+            queue
+                .list()
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c", "a"],
+            "the losing reorder must not have been applied"
+        );
+    }
+
+    /// S3: an omitted version used to mean "no check". The type no longer
+    /// admits that, so this asserts the remaining half — a version that is
+    /// merely wrong is rejected on every mutator that takes one.
+    #[test]
+    fn check_version_rejects_a_wrong_version() {
+        let mut queue = SessionPromptQueue::default();
+        let entry = queue.add("only", "composer", false).unwrap();
+        queue.check_version(&entry.id, entry.version).unwrap();
+        assert!(queue.check_version(&entry.id, entry.version + 1).is_err());
+        assert!(queue.check_version("no-such-entry", 0).is_err());
+    }
+
+    /// S4: `clear` used to leave `steering` untouched, so a coordinator that
+    /// called it to stop the session got an empty-queue receipt while an
+    /// accepted interjection was still waiting to be injected.
+    #[test]
+    fn clear_cancels_accepted_steering_that_has_not_been_delivered() {
+        let mut queue = SessionPromptQueue::default();
+        queue.add("follow up", "composer", false).unwrap();
+        queue
+            .steer_text_with_owner("change direction".into(), true, Some("mcp".into()))
+            .unwrap();
+
+        let outcome = queue.clear();
+        assert_eq!(outcome.queued_cleared, 1);
+        assert_eq!(outcome.steering_cancelled, 1);
+        assert_eq!(outcome.steering_in_flight, 0);
+        assert!(outcome.fully_stopped());
+
+        assert!(queue.list().is_empty());
+        // The cancelled steering must not resurface at the next boundary, on
+        // the deferral path, or through durable recovery.
+        assert!(queue.drain_steering().is_empty());
+        assert_eq!(queue.defer_pending_steering(), 0);
+        assert_eq!(queue.recover_pending_steering(), 0);
+        assert!(queue.durable_snapshot().list().is_empty());
+    }
+
+    /// Steering already handed to a model boundary cannot be retracted, so the
+    /// receipt must say so instead of reporting a quiet session.
+    #[test]
+    fn clear_reports_in_flight_steering_rather_than_claiming_it_stopped() {
+        let mut queue = SessionPromptQueue::default();
+        queue.steer_text("already delivered".into(), true).unwrap();
+        assert_eq!(queue.drain_steering().len(), 1);
+
+        let outcome = queue.clear();
+        assert_eq!(outcome.steering_cancelled, 0);
+        assert_eq!(outcome.steering_in_flight, 1);
+        assert!(
+            !outcome.fully_stopped(),
+            "an unretractable interjection must not read as stopped"
+        );
         assert!(queue.list().is_empty());
     }
 

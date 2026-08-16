@@ -181,16 +181,44 @@ async fn queue_and_steering() -> Result<ScenarioResult> {
     let session = host.session_new()?;
     let first = host.session_queue_add(session.id, "first follow-up".into(), false)?[0].clone();
     let second = host.session_queue_add(session.id, "priority follow-up".into(), true)?[1].clone();
-    let moved = host.session_queue_move(session.id, &second.id, 0)?;
-    let run_next = host.session_queue_run_next(session.id, &first.id)?;
+    // Queue mutators are compare-and-set, and reorder bumps the versions it
+    // shifts, so re-read the version each step leaves behind.
+    let version_of = |entry_id: &str| -> Result<u64> {
+        Ok(host
+            .session_queue_list(session.id)?
+            .into_iter()
+            .find(|entry| entry.id == entry_id)
+            .context("queued entry vanished")?
+            .version)
+    };
+    let moved = host.session_queue_move(session.id, &second.id, 0, version_of(&second.id)?)?;
+    let run_next = host.session_queue_run_next(session.id, &first.id, version_of(&first.id)?)?;
     let drained = host.session_queue_take_next(session.id)?;
+    // A drain claims the session's turn slot for the batch it removed, so the
+    // turn that follows must present that reservation rather than racing for a
+    // fresh one — the same handoff the desktop performs.
+    let drain_reservation = drained.reservation.clone();
 
     let host_for_turn = host.clone();
     let session_id = session.id;
     let runner = tokio::spawn(async move {
-        host_for_turn
-            .session_prompt(session_id, "run sleep 1".into())
-            .await
+        match drain_reservation {
+            Some(owner) => {
+                host_for_turn
+                    .session_prompt_reserved_with_max_rounds(
+                        session_id,
+                        "run sleep 1".into(),
+                        None,
+                        &owner,
+                    )
+                    .await
+            }
+            None => {
+                host_for_turn
+                    .session_prompt(session_id, "run sleep 1".into())
+                    .await
+            }
+        }
     });
     let mut events = Vec::new();
     loop {

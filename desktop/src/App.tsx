@@ -867,12 +867,24 @@ export default function App() {
           return `${prev.trimEnd()}\n${block}`;
         });
       }
-      applyUpdate(u, setTabs, setPermissionQueue);
+      applyUpdate(u, setTabs, setPermissionQueue, (queueUpdate) => {
+        // MCP and desktop mutations share this bridge event. Applying the
+        // snapshot directly avoids a second request racing the coordinator's
+        // newer queue version. `revision` is what gates it: the bridge stamps
+        // it under the mutation lock but publishes afterwards, so snapshots
+        // can arrive out of commit order and the reducer drops the stale ones.
+        dispatchQueue({
+          type: "replace",
+          sessionId: queueUpdate.session_id,
+          entries: queueUpdate.entries,
+          revision: queueUpdate.revision,
+        });
+      });
       if (u.type === "turn_started" || u.type === "turn_complete") {
         void syncRunOrigins([u.session_id]);
       }
     });
-  }, [syncRunOrigins]);
+  }, [dispatchQueue, syncRunOrigins]);
 
   // Restore sessions + open tabs from disk (desktop-app durability).
   useEffect(() => {
@@ -1515,6 +1527,8 @@ export default function App() {
   async function drainNextQueuedPrompt(sessionId: string) {
     if (queueDrainsRef.current.has(sessionId)) return;
     queueDrainsRef.current.add(sessionId);
+    let pending: { reservation?: string | null; entries: PromptQueueEntry[] } | null =
+      null;
     try {
       const requestVersion = invalidateQueue(sessionId);
       const result = await api.sessionQueueTakeNext(sessionId);
@@ -1527,11 +1541,38 @@ export default function App() {
       }
       const batch = result.batch;
       if (batch?.text.trim()) {
-        await sendPrompt(batch.text, { fromQueue: true, sessionId });
+        // The drain removed these entries and reserved the turn slot for
+        // them. Until the turn actually starts they exist only here, so
+        // anything that stops us short has to hand them back.
+        pending = { reservation: result.reservation, entries: batch.entries };
+        await sendPrompt(batch.text, {
+          fromQueue: true,
+          sessionId,
+          reservation: result.reservation,
+        });
+        pending = null;
+      } else if (result.reservation) {
+        // Nothing to send, but the slot was claimed: release it.
+        pending = { reservation: result.reservation, entries: [] };
       }
     } catch (error) {
       console.warn("prompt queue drain failed", error);
     } finally {
+      if (pending) {
+        try {
+          const entries = await api.sessionQueueRestoreDrain(
+            sessionId,
+            pending.reservation,
+            pending.entries,
+          );
+          dispatchQueue({ type: "replace", sessionId, entries });
+        } catch (restoreError) {
+          console.error(
+            "failed to restore a drained prompt queue batch",
+            restoreError,
+          );
+        }
+      }
       queueDrainsRef.current.delete(sessionId);
     }
   }
@@ -1543,6 +1584,8 @@ export default function App() {
       runNext?: boolean;
       fromQueue?: boolean;
       sessionId?: string;
+      /** Turn slot a queue drain already claimed for this prompt. */
+      reservation?: string | null;
     },
   ) {
     const prompt = (text ?? composer).trim();
@@ -1603,7 +1646,11 @@ export default function App() {
         const added = await api.sessionQueueAdd(id, prompt, false);
         const entry = added[added.length - 1];
         if (!entry) throw new Error("Bridge did not queue the prompt");
-        const result = await api.sessionQueueRunNext(id, entry.id);
+        const result = await api.sessionQueueRunNext(
+          id,
+          entry.id,
+          entry.version,
+        );
         if (isCurrentQueueRequest(id, requestVersion)) {
           dispatchQueue({
             type: "replace",
@@ -1681,7 +1728,7 @@ export default function App() {
       transcript: [...t.transcript, { kind: "user", text: prompt }],
     }));
     try {
-      if (prompt === "/compact") {
+      if (!opts?.fromQueue && prompt === "/compact") {
         await api.sessionCompact(id);
         // Compact only shrinks the server context window — rehydrate full
         // local history so nothing appears deleted in the UI.
@@ -1710,7 +1757,7 @@ export default function App() {
         return;
       }
       // #148: fork / rename / export / cd
-      if (prompt === "/fork" || prompt.startsWith("/fork ")) {
+      if (!opts?.fromQueue && (prompt === "/fork" || prompt.startsWith("/fork "))) {
         try {
           const f = await api.sessionFork(id);
           await openTab(f, true);
@@ -1732,7 +1779,7 @@ export default function App() {
         }
         return;
       }
-      if (prompt.startsWith("/rename ")) {
+      if (!opts?.fromQueue && prompt.startsWith("/rename ")) {
         const title = prompt.slice("/rename ".length).trim();
         try {
           if (!title) throw new Error("Usage: /rename <title>");
@@ -1759,7 +1806,7 @@ export default function App() {
         }
         return;
       }
-      if (prompt === "/export" || prompt.startsWith("/export ")) {
+      if (!opts?.fromQueue && (prompt === "/export" || prompt.startsWith("/export "))) {
         try {
           const text = await api.exportTranscript(id);
           await navigator.clipboard.writeText(text);
@@ -1786,7 +1833,7 @@ export default function App() {
         }
         return;
       }
-      if (prompt.startsWith("/cd ") || prompt === "/cd") {
+      if (!opts?.fromQueue && (prompt.startsWith("/cd ") || prompt === "/cd")) {
         const path = prompt === "/cd" ? "" : prompt.slice("/cd ".length).trim();
         try {
           if (!path) throw new Error("Usage: /cd <path>");
@@ -1818,7 +1865,7 @@ export default function App() {
         return;
       }
       // /resume → session browser; /continue → most recently updated other session (#38).
-      if (prompt === "/resume") {
+      if (!opts?.fromQueue && prompt === "/resume") {
         patchTab(id, (t) => ({
           ...t,
           busy: false,
@@ -1830,7 +1877,7 @@ export default function App() {
         setSessionBrowserOpen(true);
         return;
       }
-      if (prompt === "/continue") {
+      if (!opts?.fromQueue && prompt === "/continue") {
         try {
           const list = await api.sessionListByKind(workspaceMode, false);
           const sorted = [...list].sort(
@@ -1887,7 +1934,7 @@ export default function App() {
         }
         return;
       }
-      const reply = await api.sessionPrompt(id, prompt);
+      const reply = await api.sessionPrompt(id, prompt, opts?.reservation);
       // Prefer durable transcript (includes tool rows) over pure event state.
       // Events may lag or miss tool cards; disk is the source of truth after the turn.
       try {
@@ -1929,6 +1976,11 @@ export default function App() {
           { kind: "error", text: String(e) },
         ],
       }));
+      // Drained batches have already left the queue. Rethrow so the drain
+      // path keeps `pending` and restores them.
+      if (opts?.fromQueue || opts?.reservation) {
+        throw e;
+      }
     } finally {
       setTimeout(() => void drainNextQueuedPrompt(id), 0);
     }
@@ -2705,7 +2757,11 @@ export default function App() {
                 }
                 onRemove={(entry) =>
                   replaceQueue(activeSessionId, () =>
-                    api.sessionQueueRemove(activeSessionId, entry.id),
+                    api.sessionQueueRemove(
+                      activeSessionId,
+                      entry.id,
+                      entry.version,
+                    ),
                   )
                 }
                 onClear={() =>
@@ -2715,7 +2771,12 @@ export default function App() {
                 }
                 onMove={(entry, toIndex) =>
                   replaceQueue(activeSessionId, () =>
-                    api.sessionQueueMove(activeSessionId, entry.id, toIndex),
+                    api.sessionQueueMove(
+                      activeSessionId,
+                      entry.id,
+                      toIndex,
+                      entry.version,
+                    ),
                   )
                 }
                 onSteer={async (entry) => {
@@ -2723,6 +2784,7 @@ export default function App() {
                   const receipt = await api.sessionQueueSteerEntry(
                     activeSessionId,
                     entry.id,
+                    entry.version,
                   );
                   if (isCurrentQueueRequest(activeSessionId, requestVersion)) {
                     dispatchQueue({
@@ -2743,6 +2805,7 @@ export default function App() {
                   const result = await api.sessionQueueRunNext(
                     activeSessionId,
                     entry.id,
+                    entry.version,
                   );
                   if (isCurrentQueueRequest(activeSessionId, requestVersion)) {
                     dispatchQueue({
@@ -3720,6 +3783,9 @@ function applyUpdate(
   setPermissionQueue: React.Dispatch<
     React.SetStateAction<PermissionRequest[]>
   >,
+  onPromptQueueChanged?: (
+    update: Extract<SessionUpdate, { type: "prompt_queue_changed" }>,
+  ) => void,
 ) {
   const sid = sessionIdOf(u);
   if (!sid && u.type !== "permission_required") return;
@@ -3947,6 +4013,28 @@ function applyUpdate(
             label: "Steering",
             detail: "Guidance delivered at a safe step",
             live: true,
+          },
+        ),
+      );
+      break;
+    case "prompt_queue_changed":
+      onPromptQueueChanged?.(u);
+      withTab(sid!, (tab) =>
+        withActivity(
+          { ...tab, unseen: true },
+          {
+            phase:
+              u.action === "steer_now" && u.disposition === "pending"
+                ? "streaming"
+                : "queued",
+            label:
+              u.action === "steer_now"
+                ? u.disposition === "pending"
+                  ? "Steering pending"
+                  : "Steering queued"
+                : "Queue updated",
+            detail: `${u.origin === "mcp" ? "MCP" : "Desktop"} · ${u.action.replaceAll("_", " ")}`,
+            live: tab.busy || (u.disposition === "pending"),
           },
         ),
       );
