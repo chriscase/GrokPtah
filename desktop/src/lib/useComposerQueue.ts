@@ -56,8 +56,8 @@ export function useComposerQueue(activeSessionId: string | null) {
       const version = invalidateQueue(sessionId);
       const loaded = await load();
       // A refetch reports the revision it read at and is ordered against the
-      // event stream. A mutation receipt is just the entries and stays
-      // revisionless, so it keeps applying on request order alone.
+      // event stream. A mutation receipt is just the entries; the reducer
+      // drops it once a watermark exists so it cannot overwrite a newer event.
       const [entries, revision] = Array.isArray(loaded)
         ? [loaded, undefined]
         : [loaded.entries, loaded.revision];

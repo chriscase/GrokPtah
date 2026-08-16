@@ -1621,6 +1621,7 @@ impl OrchestrationService {
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_steer_queued";
+        self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),

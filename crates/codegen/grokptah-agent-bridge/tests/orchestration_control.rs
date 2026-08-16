@@ -593,6 +593,23 @@ async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
             "forbidden_scope",
             "reorder must refuse to promote a {label} command entry"
         );
+
+        let steered = orch
+            .steer_queued(
+                &auth,
+                &format!("steer-{label}"),
+                session.id,
+                ws.path(),
+                &entry.id,
+                entry.version,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            steered.code.as_str(),
+            "forbidden_scope",
+            "steer_queued must refuse to schedule a {label} command entry"
+        );
     }
 
     // Nothing moved, and nothing was cancelled on the strength of a refusal.
@@ -621,6 +638,87 @@ async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
         host.session_queue_list(session.id).unwrap()[0].text,
         "summarise the diff",
     );
+    set_grokptah_home_override(None);
+}
+
+/// Selection policy must authorize before reading the queue, or a coordinator
+/// could tell a forbidden command exists in another workspace from
+/// `forbidden_scope` vs `workspace_mismatch`.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn selecting_a_command_in_another_workspace_is_not_an_oracle() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    let other = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let slash = host
+        .session_queue_add(session.id, "/yolo".into(), false)
+        .unwrap()[0]
+        .clone();
+    let orch = OrchestrationService::new(
+        host,
+        EventBus::new(64),
+        OrchStore::open(home.path().join("orch")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([
+                ws.path().to_path_buf(),
+                other.path().to_path_buf(),
+            ]),
+            max_concurrent_runs: 4,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    let run_next = orch
+        .run_next_queue(
+            &auth,
+            "run-next-cross",
+            session.id,
+            other.path(),
+            &slash.id,
+            slash.version,
+        )
+        .await
+        .unwrap_err();
+    let reorder = orch
+        .reorder_queue(
+            &auth,
+            "reorder-cross",
+            session.id,
+            other.path(),
+            &slash.id,
+            0,
+            slash.version,
+        )
+        .await
+        .unwrap_err();
+    let steered = orch
+        .steer_queued(
+            &auth,
+            "steer-cross",
+            session.id,
+            other.path(),
+            &slash.id,
+            slash.version,
+        )
+        .await
+        .unwrap_err();
+    for (label, error) in [
+        ("run_next", run_next),
+        ("reorder", reorder),
+        ("steer_queued", steered),
+    ] {
+        assert_eq!(
+            error.code.as_str(),
+            "workspace_mismatch",
+            "{label} must fail on the session gate, not leak a command-policy error"
+        );
+    }
     set_grokptah_home_override(None);
 }
 

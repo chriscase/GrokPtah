@@ -49,8 +49,9 @@ export type PromptQueueAction =
       sessionId: string;
       entries: PromptQueueEntry[];
       /**
-       * Present only for bridge `prompt_queue_changed` snapshots. Refetches
-       * read current state directly and carry no revision.
+       * Present for bridge `prompt_queue_changed` snapshots and revisioned
+       * refetches. Mutation receipts omit it; once a watermark exists they
+       * must not overwrite that projection.
        */
       revision?: number;
     }
@@ -131,9 +132,13 @@ export function promptQueueReducer(
       // Bridge snapshots can be published out of commit order. Applying an
       // older one would silently regress the queue (drop a just-added entry,
       // resurrect a removed one), so only ever move the watermark forward.
+      // Revisionless receipts are request-ordered only: once an event or
+      // revisioned refetch has established a watermark, that projection wins.
+      const applied = state.revisions[action.sessionId];
       if (action.revision !== undefined) {
-        const applied = state.revisions[action.sessionId];
         if (applied !== undefined && action.revision <= applied) return state;
+      } else if (applied !== undefined) {
+        return state;
       }
       return withSession(
         state,

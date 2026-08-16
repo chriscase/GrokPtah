@@ -299,16 +299,17 @@ Mutating tools take `request_id`:
   that was observed while the queue was locked: if that turn ends before the
   cancel lands, nothing is cancelled and `cancelledActive` is `false` — a
   later turn never absorbs a cancel meant for an earlier one.
-- **`ptah_run_next` and `ptah_reorder_queue` will not schedule an entry the
-  control plane could not have created.** The desktop may author `!` shell
-  prompts and `/` commands locally; selecting one from the control plane is
-  refused with `forbidden_scope`, because promoting it to the head of the
-  queue — and, for `run_next`, cancelling the active turn to make it run — is
-  the same outcome `reject_control_prompt` exists to prevent, reached by
-  choosing instead of by writing. Ordinary entries are unaffected. It is distinct from `ptah_steer`,
-  which never cancels. `ptah_steer_queued` turns one queued entry into a
-  safe-boundary steering action: it reports `pending` during a Build turn and
-  `queued` while idle.
+- **`ptah_run_next`, `ptah_reorder_queue`, and `ptah_steer_queued` will not
+  schedule an entry the control plane could not have created.** The desktop
+  may author `!` shell prompts and `/` commands locally; selecting one from
+  the control plane is refused with `forbidden_scope` *after* the workspace
+  gate, so a cross-scope claim cannot learn that a forbidden entry exists.
+  Promoting or steering that text is the same outcome
+  `reject_control_prompt` exists to prevent, reached by choosing instead of
+  by writing. Ordinary entries are unaffected. `ptah_steer` never cancels.
+  `ptah_steer_queued` turns one queued ordinary entry into a safe-boundary
+  steering action: it reports `pending` during a Build turn and `queued`
+  while idle.
 - `ptah_clear_queue` removes all durable queued entries for the scoped session
   **and cancels accepted steering that has not yet reached the model**. Because
   steering already handed to a model boundary cannot be retracted, an empty

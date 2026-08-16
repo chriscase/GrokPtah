@@ -1728,7 +1728,7 @@ export default function App() {
       transcript: [...t.transcript, { kind: "user", text: prompt }],
     }));
     try {
-      if (prompt === "/compact") {
+      if (!opts?.fromQueue && prompt === "/compact") {
         await api.sessionCompact(id);
         // Compact only shrinks the server context window — rehydrate full
         // local history so nothing appears deleted in the UI.
@@ -1757,7 +1757,7 @@ export default function App() {
         return;
       }
       // #148: fork / rename / export / cd
-      if (prompt === "/fork" || prompt.startsWith("/fork ")) {
+      if (!opts?.fromQueue && (prompt === "/fork" || prompt.startsWith("/fork "))) {
         try {
           const f = await api.sessionFork(id);
           await openTab(f, true);
@@ -1779,7 +1779,7 @@ export default function App() {
         }
         return;
       }
-      if (prompt.startsWith("/rename ")) {
+      if (!opts?.fromQueue && prompt.startsWith("/rename ")) {
         const title = prompt.slice("/rename ".length).trim();
         try {
           if (!title) throw new Error("Usage: /rename <title>");
@@ -1806,7 +1806,7 @@ export default function App() {
         }
         return;
       }
-      if (prompt === "/export" || prompt.startsWith("/export ")) {
+      if (!opts?.fromQueue && (prompt === "/export" || prompt.startsWith("/export "))) {
         try {
           const text = await api.exportTranscript(id);
           await navigator.clipboard.writeText(text);
@@ -1833,7 +1833,7 @@ export default function App() {
         }
         return;
       }
-      if (prompt.startsWith("/cd ") || prompt === "/cd") {
+      if (!opts?.fromQueue && (prompt.startsWith("/cd ") || prompt === "/cd")) {
         const path = prompt === "/cd" ? "" : prompt.slice("/cd ".length).trim();
         try {
           if (!path) throw new Error("Usage: /cd <path>");
@@ -1865,7 +1865,7 @@ export default function App() {
         return;
       }
       // /resume → session browser; /continue → most recently updated other session (#38).
-      if (prompt === "/resume") {
+      if (!opts?.fromQueue && prompt === "/resume") {
         patchTab(id, (t) => ({
           ...t,
           busy: false,
@@ -1877,7 +1877,7 @@ export default function App() {
         setSessionBrowserOpen(true);
         return;
       }
-      if (prompt === "/continue") {
+      if (!opts?.fromQueue && prompt === "/continue") {
         try {
           const list = await api.sessionListByKind(workspaceMode, false);
           const sorted = [...list].sort(
@@ -1976,6 +1976,11 @@ export default function App() {
           { kind: "error", text: String(e) },
         ],
       }));
+      // Drained batches have already left the queue. Rethrow so the drain
+      // path keeps `pending` and restores them.
+      if (opts?.fromQueue || opts?.reservation) {
+        throw e;
+      }
     } finally {
       setTimeout(() => void drainNextQueuedPrompt(id), 0);
     }

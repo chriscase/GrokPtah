@@ -200,23 +200,39 @@ describe("prompt queue reducer", () => {
     expect(state.revisions[sessionId]).toBe(3);
   });
 
-  it("applies a revisionless mutation receipt without moving the watermark", () => {
+  it("drops a revisionless receipt that would overwrite a newer event", () => {
+    let state: PromptQueueState = emptyPromptQueueState;
+    state = promptQueueReducer(state, {
+      type: "replace",
+      sessionId,
+      entries: [entry("a", "one"), entry("b", "two")],
+      revision: 5,
+    });
+    // Concurrent MCP mutation painted revision 5 first. The desktop receipt
+    // is still the newest *request* but an older membership.
+    const afterEvent = state;
+    state = promptQueueReducer(state, {
+      type: "replace",
+      sessionId,
+      entries: [entry("a", "one")],
+    });
+    expect(state).toBe(afterEvent);
+    expect(queueEntriesFor(state, sessionId).map((item) => item.id)).toEqual([
+      "a",
+      "b",
+    ]);
+    expect(state.revisions[sessionId]).toBe(5);
+  });
+
+  it("applies a revisionless replace only before any watermark exists", () => {
     let state: PromptQueueState = emptyPromptQueueState;
     state = promptQueueReducer(state, {
       type: "replace",
       sessionId,
       entries: [entry("a", "one")],
-      revision: 4,
     });
-    // A mutation receipt carries no revision and is ordered by request
-    // alone; it must still apply.
-    state = promptQueueReducer(state, {
-      type: "replace",
-      sessionId,
-      entries: [entry("a", "one"), entry("b", "two")],
-    });
-    expect(queueEntriesFor(state, sessionId)).toHaveLength(2);
-    expect(state.revisions[sessionId]).toBe(4);
+    expect(queueEntriesFor(state, sessionId)).toHaveLength(1);
+    expect(state.revisions[sessionId]).toBeUndefined();
   });
 });
 
@@ -227,6 +243,12 @@ describe("prompt queue event wiring", () => {
   it("forwards the bridge revision from prompt_queue_changed", () => {
     const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
     expect(app).toMatch(/revision: queueUpdate\.revision/);
+  });
+
+  it("rethrows drained sendPrompt failures so the batch can be restored", () => {
+    const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
+    expect(app).toMatch(/opts\?\.fromQueue \|\| opts\?\.reservation/);
+    expect(app).toMatch(/!opts\?\.fromQueue && prompt === "\/compact"/);
   });
 });
 
