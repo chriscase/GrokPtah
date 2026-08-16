@@ -179,10 +179,13 @@ impl SessionPromptQueue {
         Ok(entry.clone())
     }
 
-    pub fn check_version(&self, id: &str, version: Option<u64>) -> Result<()> {
-        let Some(version) = version else {
-            return Ok(());
-        };
+    /// Compare-and-set gate for every mutator that is not [`Self::edit`].
+    ///
+    /// The version is mandatory by type: an optional CAS on a control plane
+    /// with two writers is last-write-wins, and callers reached for it exactly
+    /// when they had no version to offer. This matches the Computer Use
+    /// control fence, which requires the current version on every transition.
+    pub fn check_version(&self, id: &str, version: u64) -> Result<()> {
         let entry = self
             .queued
             .iter()
@@ -227,6 +230,17 @@ impl SessionPromptQueue {
         }
     }
 
+    /// Move an entry to an absolute index, bumping every version that shifted.
+    ///
+    /// `to_index` is absolute, so it only means anything against a specific
+    /// ordering. Leaving versions untouched made `expected_version` unable to
+    /// detect a conflict even when supplied: two coordinators reordering
+    /// concurrently both succeeded and the final order was arbitrary. Every
+    /// entry whose index changed now describes a different position than the
+    /// one a concurrent writer read, so its version moves and that writer's
+    /// CAS fails closed. Entries outside the moved span keep their versions,
+    /// which keeps the conflict blast radius to the entries that actually
+    /// shifted.
     pub fn move_to(&mut self, id: &str, to_index: usize) -> Result<()> {
         let from_index = self
             .queued
@@ -238,6 +252,18 @@ impl SessionPromptQueue {
         };
         let target = to_index.min(self.queued.len());
         self.queued.insert(target, entry);
+        if target == from_index {
+            // Nothing shifted, so nothing observed by another writer changed.
+            return Ok(());
+        }
+        let (lo, hi) = if target < from_index {
+            (target, from_index)
+        } else {
+            (from_index, target)
+        };
+        for entry in self.queued.range_mut(lo..=hi) {
+            entry.version += 1;
+        }
         Ok(())
     }
 
@@ -436,6 +462,96 @@ mod tests {
         queue.remove(&a.id).unwrap();
         queue.clear();
         assert!(queue.list().is_empty());
+    }
+
+    /// S3: `to_index` is absolute, so it only means something against a known
+    /// ordering. Reorder used to leave every version alone, which made the
+    /// conflict structurally undetectable — `expected_version` could not catch
+    /// it even when supplied. Everything that shifted must move its version.
+    #[test]
+    fn reorder_bumps_the_version_of_every_entry_that_shifted() {
+        let mut queue = SessionPromptQueue::default();
+        for text in ["a", "b", "c", "d"] {
+            queue.add(text, "composer", false).unwrap();
+        }
+        let before: Vec<u64> = queue.list().iter().map(|entry| entry.version).collect();
+        assert_eq!(before, vec![0, 0, 0, 0]);
+
+        let d_id = queue.list()[3].id.clone();
+        queue.move_to(&d_id, 1).unwrap();
+
+        let after = queue.list();
+        assert_eq!(
+            after.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(),
+            vec!["a", "d", "b", "c"]
+        );
+        // "a" never moved, so a concurrent writer holding its version is still
+        // describing the entry accurately and must not be spuriously rejected.
+        assert_eq!(after[0].version, 0, "unshifted entry keeps its version");
+        assert_eq!(after[1].version, 1, "the moved entry shifted");
+        assert_eq!(after[2].version, 1, "displaced entry shifted");
+        assert_eq!(after[3].version, 1, "displaced entry shifted");
+    }
+
+    /// A move that lands where it started shifts nothing, so it must not
+    /// invalidate versions another coordinator is legitimately holding.
+    #[test]
+    fn reorder_to_the_same_index_leaves_every_version_alone() {
+        let mut queue = SessionPromptQueue::default();
+        for text in ["a", "b", "c"] {
+            queue.add(text, "composer", false).unwrap();
+        }
+        let b_id = queue.list()[1].id.clone();
+        queue.move_to(&b_id, 1).unwrap();
+        assert!(queue.list().iter().all(|entry| entry.version == 0));
+    }
+
+    /// S3: the case the review named. Two coordinators read the same queue and
+    /// both reorder. The first wins; the second is describing an ordering that
+    /// no longer exists, so its CAS has to fail rather than silently producing
+    /// an arbitrary final order with two success receipts.
+    #[test]
+    fn a_second_concurrent_reorder_fails_its_compare_and_set() {
+        let mut queue = SessionPromptQueue::default();
+        for text in ["a", "b", "c"] {
+            queue.add(text, "composer", false).unwrap();
+        }
+        let listed = queue.list();
+        let (a_id, b_id) = (listed[0].id.clone(), listed[1].id.clone());
+        // Both coordinators read version 0 for the entry each intends to move.
+        let (a_version, b_version) = (listed[0].version, listed[1].version);
+
+        // Coordinator A wins: move "a" to the back.
+        queue.check_version(&a_id, a_version).unwrap();
+        queue.move_to(&a_id, 2).unwrap();
+
+        // Coordinator B is still working from the pre-move ordering.
+        let conflict = queue.check_version(&b_id, b_version).unwrap_err();
+        assert!(
+            conflict.to_string().contains("stale queued prompt version"),
+            "expected a stale-version conflict, got: {conflict}"
+        );
+        assert_eq!(
+            queue
+                .list()
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c", "a"],
+            "the losing reorder must not have been applied"
+        );
+    }
+
+    /// S3: an omitted version used to mean "no check". The type no longer
+    /// admits that, so this asserts the remaining half — a version that is
+    /// merely wrong is rejected on every mutator that takes one.
+    #[test]
+    fn check_version_rejects_a_wrong_version() {
+        let mut queue = SessionPromptQueue::default();
+        let entry = queue.add("only", "composer", false).unwrap();
+        queue.check_version(&entry.id, entry.version).unwrap();
+        assert!(queue.check_version(&entry.id, entry.version + 1).is_err());
+        assert!(queue.check_version("no-such-entry", 0).is_err());
     }
 
     /// S4: `clear` used to leave `steering` untouched, so a coordinator that

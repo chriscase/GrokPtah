@@ -1859,6 +1859,36 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
         .await
         .is_err());
 
+    // S3: every mutator below is compare-and-set, and omitting the version is
+    // a schema rejection rather than a last-write-wins mutation. Assert that
+    // before any of them is allowed to succeed, and that nothing moved.
+    for tool in [
+        "ptah_remove_queue",
+        "ptah_run_next",
+        "ptah_steer_queued",
+        "ptah_reorder_queue",
+    ] {
+        let mut args = json!({
+            "request_id": format!("queue-http-noversion-{tool}"),
+            "session_id": session.id,
+            "workspace": ws.path().display().to_string(),
+            "entry_id": second_id,
+        });
+        if tool == "ptah_reorder_queue" {
+            args["to_index"] = json!(0);
+        }
+        assert!(
+            client.call_tool(tool, args).await.is_err(),
+            "{tool} must require expected_version"
+        );
+    }
+    let untouched = client
+        .call_tool("ptah_get_queue", scope(session.id))
+        .await
+        .unwrap();
+    assert_eq!(untouched.structured["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(untouched.structured["entries"][0]["id"], first_id);
+
     let reordered = client
         .call_tool(
             "ptah_reorder_queue",
@@ -1874,6 +1904,32 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
         .await
         .unwrap();
     assert_eq!(reordered.structured["entries"][0]["id"], second_id);
+    // S3: reorder now bumps every version it shifted, so a second coordinator
+    // holding the pre-move ordering loses its CAS instead of both succeeding.
+    assert_eq!(reordered.structured["entries"][0]["version"], 1);
+    assert_eq!(reordered.structured["entries"][1]["version"], 2);
+    assert!(
+        client
+            .call_tool(
+                "ptah_reorder_queue",
+                json!({
+                    "request_id": "queue-http-reorder-stale",
+                    "session_id": session.id,
+                    "workspace": ws.path().display().to_string(),
+                    "entry_id": first_id,
+                    "to_index": 0,
+                    "expected_version": 1
+                }),
+            )
+            .await
+            .is_err(),
+        "a reorder built on the pre-move ordering must fail closed"
+    );
+    let after_conflict = client
+        .call_tool("ptah_get_queue", scope(session.id))
+        .await
+        .unwrap();
+    assert_eq!(after_conflict.structured["entries"][0]["id"], second_id);
 
     let steered = client
         .call_tool(
@@ -1883,13 +1939,13 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
                 "session_id": session.id,
                 "workspace": ws.path().display().to_string(),
                 "entry_id": second_id,
-                "expected_version": 0
+                "expected_version": 1
             }),
         )
         .await
         .unwrap();
     assert_eq!(steered.structured["disposition"], "queued");
-    assert_eq!(steered.structured["entry"]["version"], 1);
+    assert_eq!(steered.structured["entry"]["version"], 2);
 
     let run_next = client
         .call_tool(
@@ -1899,14 +1955,14 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
                 "session_id": session.id,
                 "workspace": ws.path().display().to_string(),
                 "entry_id": first_id,
-                "expected_version": 1
+                "expected_version": 2
             }),
         )
         .await
         .unwrap();
     assert_eq!(run_next.structured["action"], "run_next");
     assert_eq!(run_next.structured["entry"]["id"], first_id);
-    assert_eq!(run_next.structured["entry"]["version"], 2);
+    assert_eq!(run_next.structured["entry"]["version"], 3);
 
     let removed = client
         .call_tool(
@@ -1916,14 +1972,14 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
                 "session_id": session.id,
                 "workspace": ws.path().display().to_string(),
                 "entry_id": first_id,
-                "expected_version": 2
+                "expected_version": 3
             }),
         )
         .await
         .unwrap();
     assert_eq!(removed.structured["action"], "removed");
     assert_eq!(removed.structured["entry"]["id"], first_id);
-    assert_eq!(removed.structured["actionVersion"], 2);
+    assert_eq!(removed.structured["actionVersion"], 3);
 
     let cleared = client
         .call_tool(

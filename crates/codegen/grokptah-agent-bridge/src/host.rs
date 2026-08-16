@@ -3899,8 +3899,9 @@ impl AgentHostHandle {
         &self,
         session_id: Uuid,
         entry_id: &str,
+        expected_version: u64,
     ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_remove_with_origin(session_id, entry_id, "desktop")
+        self.session_queue_remove_with_origin(session_id, entry_id, "desktop", expected_version)
     }
 
     pub fn session_queue_remove_with_origin(
@@ -3908,18 +3909,9 @@ impl AgentHostHandle {
         session_id: Uuid,
         entry_id: &str,
         origin: &str,
+        expected_version: u64,
     ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_remove_with_origin_and_version(session_id, entry_id, origin, None)
-    }
-
-    pub fn session_queue_remove_with_origin_and_version(
-        &self,
-        session_id: Uuid,
-        entry_id: &str,
-        origin: &str,
-        expected_version: Option<u64>,
-    ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_remove_with_origin_and_version_receipt(
+        self.session_queue_remove_with_origin_receipt(
             session_id,
             entry_id,
             origin,
@@ -3928,12 +3920,12 @@ impl AgentHostHandle {
         .map(|(entries, _)| entries)
     }
 
-    pub fn session_queue_remove_with_origin_and_version_receipt(
+    pub fn session_queue_remove_with_origin_receipt(
         &self,
         session_id: Uuid,
         entry_id: &str,
         origin: &str,
-        expected_version: Option<u64>,
+        expected_version: u64,
     ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry)> {
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
@@ -4011,8 +4003,15 @@ impl AgentHostHandle {
         session_id: Uuid,
         entry_id: &str,
         to_index: usize,
+        expected_version: u64,
     ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_move_with_origin(session_id, entry_id, to_index, "desktop")
+        self.session_queue_move_with_origin(
+            session_id,
+            entry_id,
+            to_index,
+            "desktop",
+            expected_version,
+        )
     }
 
     pub fn session_queue_move_with_origin(
@@ -4021,19 +4020,7 @@ impl AgentHostHandle {
         entry_id: &str,
         to_index: usize,
         origin: &str,
-    ) -> Result<Vec<PromptQueueEntry>> {
-        self.session_queue_move_with_origin_and_version(
-            session_id, entry_id, to_index, origin, None,
-        )
-    }
-
-    pub fn session_queue_move_with_origin_and_version(
-        &self,
-        session_id: Uuid,
-        entry_id: &str,
-        to_index: usize,
-        origin: &str,
-        expected_version: Option<u64>,
+        expected_version: u64,
     ) -> Result<Vec<PromptQueueEntry>> {
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
@@ -4042,9 +4029,12 @@ impl AgentHostHandle {
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
             queue.check_version(entry_id, expected_version)?;
-            let changed_entry = queue.list().into_iter().find(|entry| entry.id == entry_id);
             queue.move_to(entry_id, to_index)?;
             let list = queue.list();
+            // Post-move, because reordering now bumps the versions of every
+            // entry that shifted: a pre-move copy would hand the caller a
+            // version its own next CAS would be rejected for.
+            let changed_entry = list.iter().find(|entry| entry.id == entry_id).cloned();
             let revision = g.next_queue_revision(session_id);
             (list, changed_entry, revision)
         };
@@ -4107,25 +4097,22 @@ impl AgentHostHandle {
         &self,
         session_id: Uuid,
         entry_id: &str,
+        expected_version: u64,
     ) -> Result<PromptQueueRunNextResult> {
-        self.session_queue_run_next_with_origin(session_id, entry_id, "desktop")
+        self.session_queue_run_next_with_origin(session_id, entry_id, "desktop", expected_version)
     }
 
+    /// Promote an entry to the head and cancel the active turn so it runs next.
+    ///
+    /// The cancel happens only after the CAS and the promotion have both
+    /// succeeded: a stale `expected_version` returns before the lock is
+    /// released, so a losing coordinator never interrupts a running turn.
     pub fn session_queue_run_next_with_origin(
         &self,
         session_id: Uuid,
         entry_id: &str,
         origin: &str,
-    ) -> Result<PromptQueueRunNextResult> {
-        self.session_queue_run_next_with_origin_and_version(session_id, entry_id, origin, None)
-    }
-
-    pub fn session_queue_run_next_with_origin_and_version(
-        &self,
-        session_id: Uuid,
-        entry_id: &str,
-        origin: &str,
-        expected_version: Option<u64>,
+        expected_version: u64,
     ) -> Result<PromptQueueRunNextResult> {
         let (changed_entry, active, revision) = {
             let mut g = self.inner.lock();
@@ -4162,8 +4149,14 @@ impl AgentHostHandle {
         &self,
         session_id: Uuid,
         entry_id: &str,
+        expected_version: u64,
     ) -> Result<SteeringReceipt> {
-        self.session_queue_steer_entry_with_origin(session_id, entry_id, "desktop")
+        self.session_queue_steer_entry_with_origin(
+            session_id,
+            entry_id,
+            "desktop",
+            expected_version,
+        )
     }
 
     pub fn session_queue_steer_entry_with_origin(
@@ -4171,16 +4164,7 @@ impl AgentHostHandle {
         session_id: Uuid,
         entry_id: &str,
         origin: &str,
-    ) -> Result<SteeringReceipt> {
-        self.session_queue_steer_entry_with_origin_and_version(session_id, entry_id, origin, None)
-    }
-
-    pub fn session_queue_steer_entry_with_origin_and_version(
-        &self,
-        session_id: Uuid,
-        entry_id: &str,
-        origin: &str,
-        expected_version: Option<u64>,
+        expected_version: u64,
     ) -> Result<SteeringReceipt> {
         let (receipt, revision) = {
             let mut g = self.inner.lock();

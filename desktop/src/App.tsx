@@ -1615,7 +1615,11 @@ export default function App() {
         const added = await api.sessionQueueAdd(id, prompt, false);
         const entry = added[added.length - 1];
         if (!entry) throw new Error("Bridge did not queue the prompt");
-        const result = await api.sessionQueueRunNext(id, entry.id);
+        const result = await api.sessionQueueRunNext(
+          id,
+          entry.id,
+          entry.version,
+        );
         if (isCurrentQueueRequest(id, requestVersion)) {
           dispatchQueue({
             type: "replace",
@@ -2717,7 +2721,11 @@ export default function App() {
                 }
                 onRemove={(entry) =>
                   replaceQueue(activeSessionId, () =>
-                    api.sessionQueueRemove(activeSessionId, entry.id),
+                    api.sessionQueueRemove(
+                      activeSessionId,
+                      entry.id,
+                      entry.version,
+                    ),
                   )
                 }
                 onClear={() =>
@@ -2727,7 +2735,12 @@ export default function App() {
                 }
                 onMove={(entry, toIndex) =>
                   replaceQueue(activeSessionId, () =>
-                    api.sessionQueueMove(activeSessionId, entry.id, toIndex),
+                    api.sessionQueueMove(
+                      activeSessionId,
+                      entry.id,
+                      toIndex,
+                      entry.version,
+                    ),
                   )
                 }
                 onSteer={async (entry) => {
@@ -2735,6 +2748,7 @@ export default function App() {
                   const receipt = await api.sessionQueueSteerEntry(
                     activeSessionId,
                     entry.id,
+                    entry.version,
                   );
                   if (isCurrentQueueRequest(activeSessionId, requestVersion)) {
                     dispatchQueue({
@@ -2755,6 +2769,7 @@ export default function App() {
                   const result = await api.sessionQueueRunNext(
                     activeSessionId,
                     entry.id,
+                    entry.version,
                   );
                   if (isCurrentQueueRequest(activeSessionId, requestVersion)) {
                     dispatchQueue({

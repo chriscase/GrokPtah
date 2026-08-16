@@ -825,8 +825,7 @@ struct QueueEntryMutationArgs {
     session_id: Uuid,
     workspace: PathBuf,
     entry_id: String,
-    #[serde(default)]
-    expected_version: Option<u64>,
+    expected_version: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -837,8 +836,7 @@ struct QueueReorderArgs {
     workspace: PathBuf,
     entry_id: String,
     to_index: usize,
-    #[serde(default)]
-    expected_version: Option<u64>,
+    expected_version: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1427,7 +1425,10 @@ fn tool_input_schema(name: &str) -> Value {
         }),
         "ptah_remove_queue" | "ptah_run_next" | "ptah_steer_queued" => json!({
             "type": "object",
-            "required": ["request_id", "session_id", "workspace", "entry_id"],
+            // expected_version is required: an optional CAS on a two-writer
+            // control plane is last-write-wins, and ptah_run_next cancels the
+            // active turn.
+            "required": ["request_id", "session_id", "workspace", "entry_id", "expected_version"],
             "additionalProperties": false,
             "properties": {
                 "request_id": req_id,
@@ -1439,7 +1440,7 @@ fn tool_input_schema(name: &str) -> Value {
         }),
         "ptah_reorder_queue" => json!({
             "type": "object",
-            "required": ["request_id", "session_id", "workspace", "entry_id", "to_index"],
+            "required": ["request_id", "session_id", "workspace", "entry_id", "to_index", "expected_version"],
             "additionalProperties": false,
             "properties": {
                 "request_id": req_id,

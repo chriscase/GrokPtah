@@ -1299,7 +1299,7 @@ impl OrchestrationService {
         session_id: Uuid,
         workspace: &Path,
         entry_id: &str,
-        expected_version: Option<u64>,
+        expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_remove_queue";
         let payload = json!({
@@ -1315,14 +1315,12 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let (entries, changed_entry) = match self
-            .host
-            .session_queue_remove_with_origin_and_version_receipt(
-                session_id,
-                entry_id,
-                "mcp",
-                expected_version,
-            ) {
+        let (entries, changed_entry) = match self.host.session_queue_remove_with_origin_receipt(
+            session_id,
+            entry_id,
+            "mcp",
+            expected_version,
+        ) {
             Ok(entries) => entries,
             Err(error) => {
                 return Err(self.fail_claim(
@@ -1367,7 +1365,7 @@ impl OrchestrationService {
         workspace: &Path,
         entry_id: &str,
         to_index: usize,
-        expected_version: Option<u64>,
+        expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_reorder_queue";
         let payload = json!({
@@ -1384,7 +1382,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let entries = match self.host.session_queue_move_with_origin_and_version(
+        let entries = match self.host.session_queue_move_with_origin(
             session_id,
             entry_id,
             to_index,
@@ -1499,7 +1497,7 @@ impl OrchestrationService {
         session_id: Uuid,
         workspace: &Path,
         entry_id: &str,
-        expected_version: Option<u64>,
+        expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_run_next";
         let payload = json!({
@@ -1515,7 +1513,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let result = match self.host.session_queue_run_next_with_origin_and_version(
+        let result = match self.host.session_queue_run_next_with_origin(
             session_id,
             entry_id,
             "mcp",
@@ -1567,7 +1565,7 @@ impl OrchestrationService {
         session_id: Uuid,
         workspace: &Path,
         entry_id: &str,
-        expected_version: Option<u64>,
+        expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_steer_queued";
         let payload = json!({
@@ -1583,7 +1581,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let receipt = match self.host.session_queue_steer_entry_with_origin_and_version(
+        let receipt = match self.host.session_queue_steer_entry_with_origin(
             session_id,
             entry_id,
             "mcp",

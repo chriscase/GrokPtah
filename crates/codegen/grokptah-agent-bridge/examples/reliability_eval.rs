@@ -181,8 +181,18 @@ async fn queue_and_steering() -> Result<ScenarioResult> {
     let session = host.session_new()?;
     let first = host.session_queue_add(session.id, "first follow-up".into(), false)?[0].clone();
     let second = host.session_queue_add(session.id, "priority follow-up".into(), true)?[1].clone();
-    let moved = host.session_queue_move(session.id, &second.id, 0)?;
-    let run_next = host.session_queue_run_next(session.id, &first.id)?;
+    // Queue mutators are compare-and-set, and reorder bumps the versions it
+    // shifts, so re-read the version each step leaves behind.
+    let version_of = |entry_id: &str| -> Result<u64> {
+        Ok(host
+            .session_queue_list(session.id)?
+            .into_iter()
+            .find(|entry| entry.id == entry_id)
+            .context("queued entry vanished")?
+            .version)
+    };
+    let moved = host.session_queue_move(session.id, &second.id, 0, version_of(&second.id)?)?;
+    let run_next = host.session_queue_run_next(session.id, &first.id, version_of(&first.id)?)?;
     let drained = host.session_queue_take_next(session.id)?;
 
     let host_for_turn = host.clone();

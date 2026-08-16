@@ -139,11 +139,24 @@ fn every_queue_mutation_advances_the_revision() {
         .clone();
     host.session_queue_add(session.id, "two".into(), false)
         .unwrap();
+    // Every mutator is compare-and-set now, and reorder bumps the versions it
+    // shifts, so each step has to re-read the version the previous one left.
+    let version_of = |entry_id: &str| {
+        host.session_queue_list(session.id)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == entry_id)
+            .expect("entry present")
+            .version
+    };
     host.session_queue_edit(session.id, &first.id, first.version, "one edited".into())
         .unwrap();
-    host.session_queue_move(session.id, &first.id, 1).unwrap();
-    host.session_queue_run_next(session.id, &first.id).unwrap();
-    host.session_queue_remove(session.id, &first.id).unwrap();
+    host.session_queue_move(session.id, &first.id, 1, version_of(&first.id))
+        .unwrap();
+    host.session_queue_run_next(session.id, &first.id, version_of(&first.id))
+        .unwrap();
+    host.session_queue_remove(session.id, &first.id, version_of(&first.id))
+        .unwrap();
     host.session_queue_clear(session.id).unwrap();
 
     let mut revisions = Vec::new();
@@ -377,14 +390,7 @@ async fn mcp_queue_controls_are_scoped_versioned_and_replay_safe() {
     let listed = orch.get_queue(&auth, session.id, ws.path()).unwrap();
     assert_eq!(listed["entries"].as_array().unwrap().len(), 1);
     let steered = orch
-        .steer_queued(
-            &auth,
-            "queue-steer-1",
-            session.id,
-            ws.path(),
-            first_id,
-            Some(1),
-        )
+        .steer_queued(&auth, "queue-steer-1", session.id, ws.path(), first_id, 1)
         .await
         .unwrap();
     assert_eq!(steered["action"], "steer_now");
@@ -397,6 +403,126 @@ async fn mcp_queue_controls_are_scoped_versioned_and_replay_safe() {
         .get_queue(&auth, session.id, outside.path())
         .unwrap_err();
     assert_eq!(denied.code.as_str(), "workspace_mismatch");
+    set_grokptah_home_override(None);
+}
+
+/// S3: the desktop and an MCP coordinator write the same queue. A coordinator
+/// that read the queue before a desktop mutation is describing a queue that no
+/// longer exists, and every mutator — not just `edit` — has to reject it. The
+/// reorder case is the one that used to be undetectable even with a version
+/// supplied, because reordering did not move any.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    for text in ["alpha", "beta", "gamma"] {
+        host.session_queue_add(session.id, text.into(), false)
+            .unwrap();
+    }
+    // What the coordinator read before the desktop touched anything.
+    let seen = host.session_queue_list(session.id).unwrap();
+    let (alpha, beta, gamma) = (seen[0].clone(), seen[1].clone(), seen[2].clone());
+
+    // The desktop reorders underneath it: "gamma" to the head.
+    host.session_queue_move(session.id, &gamma.id, 0, gamma.version)
+        .unwrap();
+    assert_eq!(
+        host.session_queue_list(session.id)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>(),
+        vec!["gamma", "alpha", "beta"]
+    );
+
+    // Each of the four mutators, driven from the coordinator's stale view.
+    let reorder = orch
+        .reorder_queue(
+            &auth,
+            "stale-reorder",
+            session.id,
+            ws.path(),
+            &beta.id,
+            0,
+            beta.version,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(reorder.code.as_str(), "stale_version");
+
+    let remove = orch
+        .remove_queue(
+            &auth,
+            "stale-remove",
+            session.id,
+            ws.path(),
+            &alpha.id,
+            alpha.version,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(remove.code.as_str(), "stale_version");
+
+    let run_next = orch
+        .run_next_queue(
+            &auth,
+            "stale-run-next",
+            session.id,
+            ws.path(),
+            &beta.id,
+            beta.version,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(run_next.code.as_str(), "stale_version");
+
+    let steer = orch
+        .steer_queued(
+            &auth,
+            "stale-steer-queued",
+            session.id,
+            ws.path(),
+            &alpha.id,
+            alpha.version,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(steer.code.as_str(), "stale_version");
+
+    // Nothing the coordinator attempted may have landed.
+    assert_eq!(
+        host.session_queue_list(session.id)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>(),
+        vec!["gamma", "alpha", "beta"],
+        "no rejected mutation may have been applied"
+    );
+
+    // Refetching the versions the desktop left behind lets the coordinator
+    // proceed, so this is a conflict to retry, not a permanent wedge.
+    let fresh = host.session_queue_list(session.id).unwrap();
+    let beta_now = fresh.iter().find(|entry| entry.id == beta.id).unwrap();
+    orch.remove_queue(
+        &auth,
+        "fresh-remove",
+        session.id,
+        ws.path(),
+        &beta_now.id,
+        beta_now.version,
+    )
+    .await
+    .unwrap();
+    assert_eq!(host.session_queue_list(session.id).unwrap().len(), 2);
     set_grokptah_home_override(None);
 }
 

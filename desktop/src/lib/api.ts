@@ -243,10 +243,22 @@ export const api = {
       version,
       text,
     }),
-  sessionQueueRemove: (sessionId: string, entryId: string) =>
+  /**
+   * Every queue mutator is compare-and-set. `expectedVersion` is required
+   * because the desktop is only one of two writers — an MCP coordinator can
+   * mutate the same queue — so a mutation without a version is last-write-wins.
+   * Pass the `version` of the entry as this client last saw it; a stale one is
+   * rejected with a conflict and the caller should refetch.
+   */
+  sessionQueueRemove: (
+    sessionId: string,
+    entryId: string,
+    expectedVersion: number,
+  ) =>
     invoke<PromptQueueEntry[]>("session_queue_remove", {
       sessionId,
       entryId,
+      expectedVersion,
     }),
   sessionQueueClear: (sessionId: string) =>
     invoke<PromptQueueEntry[]>("session_queue_clear", { sessionId }),
@@ -254,23 +266,35 @@ export const api = {
     sessionId: string,
     entryId: string,
     toIndex: number,
+    expectedVersion: number,
   ) =>
     invoke<PromptQueueEntry[]>("session_queue_move", {
       sessionId,
       entryId,
       toIndex,
+      expectedVersion,
     }),
   sessionQueueTakeNext: (sessionId: string) =>
     invoke<PromptQueueTakeResult>("session_queue_take_next", { sessionId }),
-  sessionQueueRunNext: (sessionId: string, entryId: string) =>
+  sessionQueueRunNext: (
+    sessionId: string,
+    entryId: string,
+    expectedVersion: number,
+  ) =>
     invoke<PromptQueueRunNextResult>("session_queue_run_next", {
       sessionId,
       entryId,
+      expectedVersion,
     }),
-  sessionQueueSteerEntry: (sessionId: string, entryId: string) =>
+  sessionQueueSteerEntry: (
+    sessionId: string,
+    entryId: string,
+    expectedVersion: number,
+  ) =>
     invoke<SteeringReceipt>("session_queue_steer_entry", {
       sessionId,
       entryId,
+      expectedVersion,
     }),
   sessionSteer: (sessionId: string, text: string) =>
     invoke<SteeringReceipt>("session_steer", { sessionId, text }),

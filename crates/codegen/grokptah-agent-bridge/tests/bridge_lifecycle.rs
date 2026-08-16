@@ -1417,12 +1417,24 @@ async fn bridge_prompt_queue_mutates_reorders_and_drains_authoritatively() {
         .session_queue_add(session.id, "second".into(), false)
         .unwrap();
     let second = entries[1].clone();
+    let version_of = |entry_id: &str| {
+        host.session_queue_list(session.id)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == entry_id)
+            .expect("entry present")
+            .version
+    };
     host.session_queue_edit(session.id, &first.id, first.version, "edited first".into())
         .unwrap();
-    let entries = host.session_queue_move(session.id, &second.id, 0).unwrap();
+    let entries = host
+        .session_queue_move(session.id, &second.id, 0, version_of(&second.id))
+        .unwrap();
     assert_eq!(entries[0].id, second.id);
 
-    let run_next = host.session_queue_run_next(session.id, &first.id).unwrap();
+    let run_next = host
+        .session_queue_run_next(session.id, &first.id, version_of(&first.id))
+        .unwrap();
     assert!(!run_next.cancelled_active);
     assert!(run_next.entries[0].priority);
     let drained = host.session_queue_take_next(session.id).unwrap();
@@ -1431,7 +1443,8 @@ async fn bridge_prompt_queue_mutates_reorders_and_drains_authoritatively() {
     assert_eq!(batch.text, "edited first");
     assert_eq!(drained.entries[0].id, second.id);
 
-    host.session_queue_remove(session.id, &second.id).unwrap();
+    host.session_queue_remove(session.id, &second.id, version_of(&second.id))
+        .unwrap();
     assert!(host.session_queue_list(session.id).unwrap().is_empty());
 }
 
@@ -1611,6 +1624,88 @@ async fn clear_queue_accounts_for_accepted_steering_instead_of_reporting_empty()
     assert!(
         host.session_queue_list(session.id).unwrap().is_empty(),
         "cleared steering must not be deferred back into the queue"
+    );
+}
+
+/// S3: `run_next` is the one queue mutator that cancels the active turn, and
+/// with an optional compare-and-set a coordinator working from a stale view
+/// could interrupt a running turn on the strength of a version it never
+/// checked. The cancel has to sit behind the CAS: a rejected call must leave
+/// both the queue and the turn exactly as it found them.
+#[tokio::test]
+async fn stale_run_next_is_rejected_without_cancelling_the_active_turn() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let entry = host
+        .session_queue_add(session.id, "follow up".into(), false)
+        .unwrap()[0]
+        .clone();
+
+    let runner = {
+        let host = host.clone();
+        tokio::spawn(async move { host.session_prompt(session.id, "run sleep 1".into()).await })
+    };
+    loop {
+        let event = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("shell did not start")
+            .expect("event channel closed");
+        if matches!(event, SessionUpdate::ShellSessionStarted { .. }) {
+            break;
+        }
+    }
+
+    let stale = host
+        .session_queue_run_next(session.id, &entry.id, entry.version + 1)
+        .expect_err("a stale run_next must fail closed");
+    assert!(
+        stale.to_string().contains("stale queued prompt version"),
+        "expected a stale-version conflict, got: {stale}"
+    );
+    let listed = host.session_queue_list(session.id).unwrap();
+    assert_eq!(listed.len(), 1, "a rejected run_next must not mutate");
+    assert_eq!(listed[0].version, entry.version);
+    assert!(!listed[0].priority, "the entry must not have been promoted");
+
+    // The turn is still running, which is the point: `cancelled_active` can
+    // only be true here if the rejected call left it alive.
+    let promoted = host
+        .session_queue_run_next(session.id, &entry.id, entry.version)
+        .unwrap();
+    assert!(
+        promoted.cancelled_active,
+        "the turn the stale call must not have cancelled is still cancellable"
+    );
+    assert!(promoted.entries[0].priority);
+
+    timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("active turn did not finish")
+        .unwrap()
+        .unwrap();
+    let events = drain_until_turn_complete(&mut rx).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                SessionUpdate::TurnComplete {
+                    cancelled: true,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "exactly one cancel, from the call whose CAS passed"
     );
 }
 

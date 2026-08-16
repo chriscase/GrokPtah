@@ -614,11 +614,12 @@ pub fn session_queue_remove(
     state: State<'_, AppState>,
     session_id: String,
     entry_id: String,
+    expected_version: u64,
 ) -> Result<Vec<PromptQueueEntry>, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .host
-        .session_queue_remove(id, &entry_id)
+        .session_queue_remove(id, &entry_id, expected_version)
         .map_err(map_err)
 }
 
@@ -637,11 +638,12 @@ pub fn session_queue_move(
     session_id: String,
     entry_id: String,
     to_index: usize,
+    expected_version: u64,
 ) -> Result<Vec<PromptQueueEntry>, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .host
-        .session_queue_move(id, &entry_id, to_index)
+        .session_queue_move(id, &entry_id, to_index, expected_version)
         .map_err(map_err)
 }
 
@@ -659,11 +661,12 @@ pub fn session_queue_run_next(
     state: State<'_, AppState>,
     session_id: String,
     entry_id: String,
+    expected_version: u64,
 ) -> Result<PromptQueueRunNextResult, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .host
-        .session_queue_run_next(id, &entry_id)
+        .session_queue_run_next(id, &entry_id, expected_version)
         .map_err(map_err)
 }
 
@@ -672,11 +675,12 @@ pub fn session_queue_steer_entry(
     state: State<'_, AppState>,
     session_id: String,
     entry_id: String,
+    expected_version: u64,
 ) -> Result<SteeringReceipt, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .host
-        .session_queue_steer_entry(id, &entry_id)
+        .session_queue_steer_entry(id, &entry_id, expected_version)
         .map_err(map_err)
 }
 
