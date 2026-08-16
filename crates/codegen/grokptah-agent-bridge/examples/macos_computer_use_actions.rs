@@ -44,9 +44,12 @@ async fn main() -> anyhow::Result<()> {
         backend,
         ComputerStore::open(temp.path().join("computer-use"))?,
     );
+    // Live smoke has no AgentHost session cwd. Fail closed with None rather
+    // than inventing a workspace from process cwd or the demo bundle path.
     let run = service.create_run(
         &Uuid::new_v4().to_string(),
         Uuid::new_v4(),
+        None,
         candidate.target,
         ComputerUseLimits {
             max_actions: 4,

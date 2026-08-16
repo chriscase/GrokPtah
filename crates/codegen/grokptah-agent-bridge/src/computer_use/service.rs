@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
@@ -8,6 +8,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::policy::ComputerPolicy;
+use super::projection::{
+    not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
+    ComputerRunProjection,
+};
 use super::store::{ComputerStore, MutationClaim};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
@@ -40,6 +44,82 @@ impl ComputerUseService {
 
     pub fn get_run(&self, run_id: &str) -> ComputerResult<Option<ComputerRun>> {
         self.store.load_run(run_id)
+    }
+
+    /// Local-operator projection of every run owned by one session, newest
+    /// first. The desktop cockpit uses this gate, including unbound runs.
+    /// Coordinator surfaces must not call this: they take
+    /// [`super::reads::ComputerReadBinding`] on [`super::reads::ComputerRunReads`]
+    /// so workspace binding is the authorization identity.
+    pub fn list_session_run_projections(
+        &self,
+        owner_session_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<Vec<ComputerRunProjection>> {
+        Ok(self
+            .store
+            .list_runs()?
+            .iter()
+            .filter(|run| run.owner_session_id == owner_session_id)
+            .map(|run| project_run_at(run, now))
+            .collect())
+    }
+
+    /// Local-operator projection of one session-owned run.
+    ///
+    /// Fails closed: an unknown run and a run owned by another session return
+    /// the identical error, so a caller cannot use this to probe whether a run
+    /// id exists outside its own session. Coordinator surfaces must use
+    /// [`super::reads::ComputerRunReads`] with a [`super::reads::ComputerReadBinding`].
+    pub fn project_session_run(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ComputerRunProjection> {
+        self.load_owned_run(owner_session_id, run_id)
+            .map(|run| project_run_at(&run, now))
+    }
+
+    /// One bounded page of a session-owned run's durable event journal.
+    ///
+    /// A cursor older than the retained window is reported as expired rather
+    /// than silently resuming mid-journal. Coordinator surfaces must use
+    /// [`super::reads::ComputerRunReads`].
+    pub fn session_run_events(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        after_seq: Option<u64>,
+        limit: usize,
+    ) -> ComputerResult<ComputerRunEventPage> {
+        self.load_owned_run(owner_session_id, run_id)
+            .map(|run| project_events(&run, after_seq, limit))
+    }
+
+    /// Local-operator ledger occupancy. Host-wide figures stay on this type
+    /// and must not be served after a workspace gate.
+    pub fn session_capacity(&self, owner_session_id: Uuid) -> ComputerResult<ComputerRunCapacity> {
+        let runs = self.store.list_runs()?;
+        let session_runs = runs
+            .iter()
+            .filter(|run| run.owner_session_id == owner_session_id);
+        Ok(ComputerRunCapacity {
+            max_run_records: ComputerStore::MAX_RUN_RECORDS as u32,
+            stored_runs: runs.len() as u32,
+            active_runs: runs.iter().filter(|run| !run.state.is_terminal()).count() as u32,
+            session_runs: session_runs.clone().count() as u32,
+            session_active_runs: session_runs.filter(|run| !run.state.is_terminal()).count() as u32,
+        })
+    }
+
+    /// Single ownership gate for every scoped read.
+    fn load_owned_run(&self, owner_session_id: Uuid, run_id: &str) -> ComputerResult<ComputerRun> {
+        validate_id("run_id", run_id).map_err(|_| not_available())?;
+        self.store
+            .load_run(run_id)?
+            .filter(|run| run.owner_session_id == owner_session_id)
+            .ok_or_else(not_available)
     }
 
     pub async fn read_current_evidence(
@@ -86,6 +166,7 @@ impl ComputerUseService {
         &self,
         request_id: &str,
         owner_session_id: Uuid,
+        workspace: Option<String>,
         target: ComputerTarget,
         limits: ComputerUseLimits,
     ) -> ComputerResult<ComputerRun> {
@@ -93,6 +174,7 @@ impl ComputerUseService {
         limits.validate()?;
         let payload = json!({
             "ownerSessionId": owner_session_id,
+            "workspace": workspace.as_deref(),
             "target": target,
             "limits": limits,
         });
@@ -101,7 +183,7 @@ impl ComputerUseService {
         }
         let result = (|| {
             self.store.can_create_run()?;
-            let mut run = ComputerRun::new(owner_session_id, target, limits)?;
+            let mut run = ComputerRun::new(owner_session_id, workspace, target, limits)?;
             run.record_audit("create_run", "accepted", None, None, None);
             self.store.save_run(&run)?;
             Ok(run)
@@ -876,6 +958,7 @@ mod tests {
             .create_run(
                 "create-1",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 ComputerUseLimits::default(),
             )
@@ -950,6 +1033,7 @@ mod tests {
             .create_run(
                 "create-conflict",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -999,6 +1083,7 @@ mod tests {
             .create_run(
                 "create-pause",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1030,6 +1115,7 @@ mod tests {
             .create_run(
                 "create-takeover",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1060,6 +1146,7 @@ mod tests {
             .create_run(
                 "create-takeover-fence",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1114,6 +1201,7 @@ mod tests {
             .create_run(
                 "create-denied",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1199,6 +1287,7 @@ mod tests {
             .create_run(
                 "create-evidence-limit",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 limits,
             )
@@ -1234,6 +1323,7 @@ mod tests {
             .create_run(
                 "create-evidence-read",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1281,6 +1371,7 @@ mod tests {
             .create_run(
                 "create-duration-limit",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1317,6 +1408,7 @@ mod tests {
             .create_run(
                 "create-one-use",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1366,6 +1458,7 @@ mod tests {
             .create_run(
                 "create-race",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1431,6 +1524,7 @@ mod tests {
             .create_run(
                 "create-cancel-race",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1482,5 +1576,330 @@ mod tests {
             .audit
             .iter()
             .any(|entry| entry.disposition == "uncertain_outcome"));
+    }
+
+    #[tokio::test]
+    async fn scoped_reads_refuse_another_session_and_never_confirm_run_existence() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        let intruder = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-scope",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let now = Utc::now();
+
+        let cross_session = service
+            .project_session_run(intruder, &run.run_id, now)
+            .unwrap_err();
+        let unknown_run = service
+            .project_session_run(intruder, "no-such-run", now)
+            .unwrap_err();
+        let unknown_to_owner = service
+            .project_session_run(owner, "no-such-run", now)
+            .unwrap_err();
+
+        assert_eq!(cross_session.code, ComputerErrorCode::Unauthorized);
+        // A real run belonging to someone else must be indistinguishable from a
+        // run that does not exist, or the read becomes an existence oracle.
+        assert_eq!(cross_session, unknown_run);
+        assert_eq!(cross_session, unknown_to_owner);
+
+        assert_eq!(
+            service
+                .session_run_events(intruder, &run.run_id, None, 10)
+                .unwrap_err(),
+            cross_session
+        );
+        assert!(service.project_session_run(owner, &run.run_id, now).is_ok());
+    }
+
+    #[tokio::test]
+    async fn traversal_shaped_run_ids_fail_closed_as_unauthorized() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        for probe in ["../escape", "runs/../../etc/passwd", "", "  "] {
+            let error = service
+                .project_session_run(owner, probe, Utc::now())
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                ComputerErrorCode::Unauthorized,
+                "run id {probe:?} must not leak a distinct validation error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_and_capacity_are_scoped_to_the_owning_session() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mine = service
+            .create_run(
+                "create-mine",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        service
+            .create_run(
+                "create-theirs",
+                other,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+
+        let listed = service
+            .list_session_run_projections(owner, Utc::now())
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].run_id, mine.run_id);
+        assert_eq!(listed[0].owner_session_id, owner);
+
+        let capacity = service.session_capacity(owner).unwrap();
+        assert_eq!(capacity.stored_runs, 2);
+        assert_eq!(capacity.session_runs, 1);
+        assert_eq!(capacity.session_active_runs, 1);
+        assert_eq!(
+            capacity.max_run_records,
+            ComputerStore::MAX_RUN_RECORDS as u32
+        );
+
+        // Cancelling the owner's run must not change the other session's view.
+        service.cancel("cancel-mine", &mine.run_id).await.unwrap();
+        assert_eq!(
+            service.session_capacity(owner).unwrap().session_active_runs,
+            0
+        );
+        assert_eq!(
+            service.session_capacity(other).unwrap().session_active_runs,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn session_scoped_read_matches_direct_projection() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-parity",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize("grant-parity", &run.run_id, run.version, grant(&run))
+            .unwrap();
+        service
+            .observe("observe-parity", &run.run_id, run.version)
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        // The desktop path projects the durable record it already holds; the
+        // session-scoped local read reloads it. Both must serialize identically.
+        // Coordinator reads take ComputerReadBinding on ComputerRunReads.
+        let gui = crate::computer_use::project_run_at(
+            &service.get_run(&run.run_id).unwrap().unwrap(),
+            now,
+        );
+        let session = service
+            .project_session_run(owner, &run.run_id, now)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&gui).unwrap(),
+            serde_json::to_string(&session).unwrap()
+        );
+        assert_eq!(
+            session,
+            service.list_session_run_projections(owner, now).unwrap()[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_contents_never_reach_the_scoped_projection() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-redaction",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize("grant-redaction", &run.run_id, run.version, grant(&run))
+            .unwrap();
+        let observation = service
+            .observe("observe-redaction", &run.run_id, run.version)
+            .await
+            .unwrap();
+        assert!(
+            !observation.elements.is_empty(),
+            "fixture must observe elements for this assertion to mean anything"
+        );
+
+        let projection = service
+            .project_session_run(owner, &run.run_id, Utc::now())
+            .unwrap();
+        let encoded = serde_json::to_value(&projection).unwrap();
+
+        // Compare against string *values* only. A raw substring scan over the
+        // whole document also matches JSON keys, so a short label such as
+        // "Name" would false-positive against the `displayName` key.
+        fn string_values(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(text) => out.push(text.clone()),
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|item| string_values(item, out))
+                }
+                serde_json::Value::Object(map) => {
+                    map.values().for_each(|item| string_values(item, out))
+                }
+                _ => {}
+            }
+        }
+        let mut values = Vec::new();
+        string_values(&encoded, &mut values);
+
+        for element in &observation.elements {
+            for projected in &values {
+                assert!(
+                    !projected.contains(&element.element_id),
+                    "element ids are observation-scoped capabilities and must not be projected"
+                );
+                if let Some(label) = &element.label {
+                    assert_ne!(projected, label, "observed labels must not be projected");
+                }
+                if let Some(value) = &element.value {
+                    assert_ne!(projected, value, "observed values must not be projected");
+                }
+            }
+        }
+
+        // Pin the exact observation key set so a future field addition cannot
+        // quietly widen what a coordinator observes.
+        let observation_keys: BTreeSet<&str> = encoded["observation"]
+            .as_object()
+            .expect("observation is projected")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            observation_keys,
+            BTreeSet::from([
+                "observationId",
+                "sequence",
+                "capturedAt",
+                "elementCount",
+                "elementsTruncated",
+                "sensitivity",
+                "hasScreenshot",
+                "screenshotRedacted",
+                "stale",
+            ])
+        );
+        assert_eq!(
+            projection.observation.as_ref().unwrap().element_count,
+            observation.elements.len() as u32
+        );
+
+        if let Some(last_outcome) = encoded
+            .get("lastOutcome")
+            .and_then(|value| value.as_object())
+        {
+            let keys: BTreeSet<&str> = last_outcome.keys().map(String::as_str).collect();
+            assert_eq!(keys, BTreeSet::from(["expectedPostconditionMet"]));
+        }
+        if let Some(last_error) = encoded.get("lastError").and_then(|value| value.as_object()) {
+            let keys: BTreeSet<&str> = last_error.keys().map(String::as_str).collect();
+            assert_eq!(keys, BTreeSet::from(["code"]));
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_projects_interrupted_control_state_and_keeps_events_readable() {
+        let dir = tempdir().unwrap().keep();
+        let owner = Uuid::new_v4();
+        let run_id;
+        {
+            let service = ComputerUseService::new(
+                Arc::new(SimulatorBackend::new()),
+                ComputerStore::open(dir.join("computer-use")).unwrap(),
+            );
+            let run = service
+                .create_run(
+                    "create-restart",
+                    owner,
+                    None,
+                    SimulatorBackend::demo_target(),
+                    Default::default(),
+                )
+                .unwrap();
+            run_id = run.run_id.clone();
+            service
+                .authorize("grant-restart", &run.run_id, run.version, grant(&run))
+                .unwrap();
+        }
+
+        let service = ComputerUseService::new(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(dir.join("computer-use")).unwrap(),
+        );
+        let recovered = service
+            .project_session_run(owner, &run_id, Utc::now())
+            .unwrap();
+        assert_eq!(recovered.state, ComputerRunState::Interrupted);
+        assert_eq!(
+            recovered.control_disposition,
+            ComputerControlDisposition::Interrupted
+        );
+        assert!(recovered.terminal);
+        assert!(!recovered.agent_active);
+        assert!(recovered.control_epoch > 0);
+        assert!(
+            recovered.grant.is_none(),
+            "authority must not survive restart"
+        );
+        assert!(recovered.observation.is_none());
+        assert!(
+            recovered.last_outcome.is_none(),
+            "restart must not keep a leaky last_outcome"
+        );
+
+        // Durable events survive the restart and stay replayable from the start.
+        let page = service
+            .session_run_events(owner, &run_id, None, 500)
+            .unwrap();
+        assert!(!page.cursor_expired);
+        assert!(page
+            .entries
+            .iter()
+            .any(|entry| entry.operation == "create_run"));
+        let range = recovered.event_range.expect("recovered run has events");
+        assert_eq!(page.range, Some(range));
+
+        // Replaying from the final sequence is a valid empty tail, not a gap.
+        let tail = service
+            .session_run_events(owner, &run_id, Some(range.end_seq), 500)
+            .unwrap();
+        assert!(tail.entries.is_empty());
+        assert!(!tail.cursor_expired);
+        assert_eq!(tail.next_cursor, None);
     }
 }

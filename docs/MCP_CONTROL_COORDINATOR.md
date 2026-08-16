@@ -199,6 +199,10 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_get_test_results` | read | `session_id`, `workspace`, `run_id` |
 | `ptah_get_handoff` | read | `session_id`, `workspace`, `run_id` |
 | `ptah_review_run` | read | `session_id`, `workspace`, `run_id` (completed isolated run only) |
+| `ptah_list_computer_runs` | read | `session_id`, `workspace` |
+| `ptah_get_computer_run` | read | `session_id`, `workspace`, `run_id` |
+| `ptah_get_computer_run_events` | read | `session_id`, `workspace`, `run_id`; optional `after_seq`, `limit` (1–500, default 100) |
+| `ptah_get_computer_capacity` | read | `session_id`, `workspace` |
 | `ptah_submit_task` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `bounds`, `execution_mode`, `allow_queue` |
 | `ptah_retry_run` | mutate | `request_id`, `session_id`, `workspace`, `run_id`, `prompt`; optional narrower `bounds`, matching `execution_mode`, `allow_queue` |
 | `ptah_approve_run` | mutate | exact run/session/workspace, source and final fingerprints, exact `changed_files`; optional bounded `ttl_ms` |
@@ -390,6 +394,54 @@ observed or when the response omits claims required by the observed work.
   concurrency (32). Exhausted run capacity → structured orch error
   (`capacity_exhausted` / session busy).
 - MCP request flood beyond 32 inflight → **429**.
+
+### Computer Run reads (#271 slice 2 — read-only)
+
+The four `ptah_*_computer_*` tools serve the redaction-safe
+`ComputerRunProjection` contract from `docs/COMPUTER_USE.md`. **No Computer
+Run mutation, grant issuance, evidence byte, or screenshot is exposed over
+MCP**; the release gate snapshots the surface so a mutation cannot slip in.
+
+- Every read requires the owning `session_id` plus the claimed allowlisted
+  `workspace` (canonicalized, matched against the session cwd). Computer Runs
+  additionally carry a **durable workspace binding** stamped at creation from
+  the owning session's canonical cwd; a read must match it exactly. Runs
+  created before the binding existed have none and are invisible to MCP —
+  fail closed, never inferred from process state.
+- Unknown runs, another session's runs, another workspace's runs, unbound
+  runs, and traversal-shaped ids all return the **identical**
+  `forbidden_scope` error ("computer run is not available to this session"),
+  so no read is a run-existence oracle.
+- `ptah_get_computer_run_events` pages the bounded durable audit ring.
+  `nextCursor` is present only while entries remain; a cursor below the
+  retained window is **410 `cursor_expired`** with `eventRange` on the error
+  so recovery does not require a second `ptah_get_computer_run`. Resume at
+  `startSeq - 1`. A cursor at or past the tail is a valid empty page.
+  Omitting `after_seq` reads from the retained start.
+- Unknown session, a mismatched allowlisted workspace, and an unauthorized
+  run all return the **identical** `forbidden_scope` error. Session existence
+  is not distinguishable from cross-scope. A claimed workspace that is not
+  on the host allowlist still fails as `workspace_mismatch` (session-
+  independent).
+- GUI and MCP projections are byte-identical for one `(record, now)`. Live
+  MCP uses `Utc::now()` per call, so `elapsedMillis` / `stale` / `expired`
+  may differ across surfaces.
+- `ptah_get_computer_capacity` reports the constant ledger bound (256
+  records) plus counts scoped to the `(session, workspace)` binding
+  (`boundRuns` / `boundActiveRuns`). Host-wide stored/active totals are
+  absent so the tool cannot count other scopes after the workspace gate.
+  Restart recovery marks live runs `interrupted`, revokes authority, clears
+  `last_outcome`, journals a `recover` entry, and keeps events replayable.
+- If the host has no Computer Use ledger (or its exclusive lock is held
+  elsewhere), all four tools fail closed with `unsupported`.
+- Live proof: `live_computer_reads_node_smoke`
+  (`tests/mcp_streamable_transport.rs`) boots the production
+  `start_control_from_env` server and drives
+  `tests/mcp_sdk_interop/run_computer_reads_smoke.mjs`, an independent Node
+  client, through discovery, scoped reads, wire-level projection key pins,
+  cursor paging/expiry/recovery, duplicate replay, cross-session and
+  cross-workspace rejection, capacity, auth-before-body, and reconnect
+  replay.
 
 ## Example client flow
 

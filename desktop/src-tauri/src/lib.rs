@@ -32,7 +32,7 @@ pub fn run() {
             host: host.clone(),
             pty: pty_host::PtyHub::new(),
             control: Mutex::new(None),
-            computer_use: computer_use::DesktopComputerUse::new(),
+            computer_use: computer_use::DesktopComputerUse::new(&host),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
