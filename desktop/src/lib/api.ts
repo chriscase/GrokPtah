@@ -287,17 +287,24 @@ export const api = {
     }),
   sessionQueueClear: (sessionId: string) =>
     invoke<PromptQueueEntry[]>("session_queue_clear", { sessionId }),
+  /**
+   * Reorder is fenced on the queue revision as well as the entry version:
+   * `toIndex` is absolute, so it only means something against the ordering it
+   * was computed from. Pass the revision this client last applied.
+   */
   sessionQueueMove: (
     sessionId: string,
     entryId: string,
     toIndex: number,
     expectedVersion: number,
+    expectedRevision: number,
   ) =>
-    invoke<PromptQueueEntry[]>("session_queue_move", {
+    invoke<PromptQueueSnapshot>("session_queue_move", {
       sessionId,
       entryId,
       toIndex,
       expectedVersion,
+      expectedRevision,
     }),
   sessionQueueTakeNext: (sessionId: string) =>
     invoke<PromptQueueTakeResult>("session_queue_take_next", { sessionId }),

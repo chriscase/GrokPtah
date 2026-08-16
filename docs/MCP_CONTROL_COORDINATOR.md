@@ -286,6 +286,14 @@ Mutating tools take `request_id`:
   unchanged, and the fix is to re-read the queue and retry. This matches the
   Computer Use control fence, which also requires the current version on
   every transition.
+- **Every queue mutation receipt reports the `revision` it produced**, and
+  `ptah_get_queue` reports the revision it read at. Because reorder is fenced
+  on the revision, a coordinator that could not learn the revision its own
+  mutation stamped would have to re-read before every reorder — and that read
+  can observe someone else's newer mutation. Chain straight from a receipt
+  instead. The desktop is held to the same fence: its reorders carry the
+  revision it is rendering, so neither writer can move an absolute index
+  against an ordering the other has already replaced.
 - `ptah_reorder_queue` **bumps the version of every entry whose index
   changed**, including the entry it moved. `to_index` is absolute, so it only
   means something against a specific ordering; without the bump two
