@@ -453,9 +453,11 @@ async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
             &beta.id,
             0,
             beta.version,
+            host.session_queue_snapshot(session.id).unwrap().revision,
         )
         .await
         .unwrap_err();
+    // The revision fence is satisfied; the per-entry CAS is what rejects this.
     assert_eq!(reorder.code.as_str(), "stale_version");
 
     let remove = orch
@@ -585,6 +587,7 @@ async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
                 &entry.id,
                 0,
                 entry.version,
+                host.session_queue_snapshot(session.id).unwrap().revision,
             )
             .await
             .unwrap_err();
@@ -2368,5 +2371,96 @@ async fn submit_round_limit_reached_via_wired_max_rounds() {
         text.contains("Stopped after 2 tool rounds"),
         "expected stop message reflecting max_rounds=2, got {text:?}"
     );
+    set_grokptah_home_override(None);
+}
+
+/// The per-entry CAS cannot see a promotion that leaves displaced entries'
+/// versions alone. An absolute reorder therefore also needs the queue
+/// revision, which changes for the competing `run_next`.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn run_next_invalidates_a_stale_reorder_revision() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    for text in ["alpha", "beta", "gamma"] {
+        host.session_queue_add(session.id, text.into(), false)
+            .unwrap();
+    }
+    let seen_snapshot = host.session_queue_snapshot(session.id).unwrap();
+    let (seen_revision, seen) = (seen_snapshot.revision, seen_snapshot.entries);
+    let (alpha, beta, gamma) = (seen[0].clone(), seen[1].clone(), seen[2].clone());
+
+    host.session_queue_run_next(session.id, &gamma.id, gamma.version)
+        .unwrap();
+    let current_snapshot = host.session_queue_snapshot(session.id).unwrap();
+    let (current_revision, after_run_next) = (current_snapshot.revision, current_snapshot.entries);
+    assert!(current_revision > seen_revision);
+    assert_eq!(
+        after_run_next
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gamma", "alpha", "beta"]
+    );
+    assert_eq!(
+        after_run_next
+            .iter()
+            .find(|entry| entry.id == alpha.id)
+            .unwrap()
+            .version,
+        alpha.version,
+        "run_next must not change displaced entry versions"
+    );
+
+    let stale = orch
+        .reorder_queue(
+            &auth,
+            "stale-reorder-after-run-next",
+            session.id,
+            ws.path(),
+            &beta.id,
+            0,
+            beta.version,
+            seen_revision,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code.as_str(), "stale_version");
+    assert_eq!(
+        host.session_queue_snapshot(session.id)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gamma", "alpha", "beta"],
+        "a stale absolute reorder must not apply"
+    );
+
+    let fresh_snapshot = host.session_queue_snapshot(session.id).unwrap();
+    let (fresh_revision, fresh) = (fresh_snapshot.revision, fresh_snapshot.entries);
+    let beta_now = fresh.iter().find(|entry| entry.id == beta.id).unwrap();
+    let reordered = orch
+        .reorder_queue(
+            &auth,
+            "fresh-reorder-after-run-next",
+            session.id,
+            ws.path(),
+            &beta_now.id,
+            0,
+            beta_now.version,
+            fresh_revision,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reordered["revision"], fresh_revision + 1);
+    assert_eq!(reordered["entries"][0]["id"], beta.id);
     set_grokptah_home_override(None);
 }

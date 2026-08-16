@@ -4096,8 +4096,62 @@ impl AgentHostHandle {
         origin: &str,
         expected_version: u64,
     ) -> Result<Vec<PromptQueueEntry>> {
+        self.session_queue_move_with_origin_impl(
+            session_id,
+            entry_id,
+            to_index,
+            origin,
+            expected_version,
+            None,
+        )
+        .map(|(entries, _)| entries)
+    }
+
+    /// Reorder an entry with both its per-entry CAS and the queue revision
+    /// that gives an absolute `to_index` meaning.
+    pub fn session_queue_move_with_origin_and_revision(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        to_index: usize,
+        origin: &str,
+        expected_version: u64,
+        expected_revision: u64,
+    ) -> Result<(Vec<PromptQueueEntry>, u64)> {
+        self.session_queue_move_with_origin_impl(
+            session_id,
+            entry_id,
+            to_index,
+            origin,
+            expected_version,
+            Some(expected_revision),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn session_queue_move_with_origin_impl(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        to_index: usize,
+        origin: &str,
+        expected_version: u64,
+        expected_revision: Option<u64>,
+    ) -> Result<(Vec<PromptQueueEntry>, u64)> {
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
+            let current_revision = g
+                .prompt_queue_revisions
+                .get(&session_id)
+                .copied()
+                .unwrap_or_default();
+            if let Some(expected_revision) = expected_revision {
+                if current_revision != expected_revision {
+                    bail!(
+                        "stale prompt queue revision: expected {expected_revision}, current {current_revision}"
+                    );
+                }
+            }
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
@@ -4122,7 +4176,7 @@ impl AgentHostHandle {
             changed_entry.clone(),
             None,
         );
-        Ok(list)
+        Ok((list, revision))
     }
 
     /// Drain the next batch and claim the session's turn slot for it.

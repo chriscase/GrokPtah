@@ -1163,7 +1163,9 @@ impl OrchestrationService {
 
     fn queue_error(error: anyhow::Error) -> OrchError {
         let message = error.to_string();
-        let code = if message.contains("stale queued prompt version") {
+        let code = if message.contains("stale queued prompt version")
+            || message.contains("stale prompt queue revision")
+        {
             OrchErrorCode::StaleVersion
         } else if message.contains("unknown queued prompt")
             || message.contains("no prompt queue for session")
@@ -1205,14 +1207,15 @@ impl OrchestrationService {
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
         let claimed = self.authorize_queue_request(session_id, workspace)?;
-        let entries = self
+        let snapshot = self
             .host
-            .session_queue_list(session_id)
+            .session_queue_snapshot(session_id)
             .map_err(Self::queue_error)?;
         Ok(json!({
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
-            "entries": entries,
+            "revision": snapshot.revision,
+            "entries": snapshot.entries,
         }))
     }
 
@@ -1366,6 +1369,7 @@ impl OrchestrationService {
         entry_id: &str,
         to_index: usize,
         expected_version: u64,
+        expected_revision: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_reorder_queue";
         self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
@@ -1375,6 +1379,7 @@ impl OrchestrationService {
             "entryId": entry_id,
             "toIndex": to_index,
             "expectedVersion": expected_version,
+            "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
             .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
@@ -1383,14 +1388,15 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let entries = match self.host.session_queue_move_with_origin(
+        let (entries, revision) = match self.host.session_queue_move_with_origin_and_revision(
             session_id,
             entry_id,
             to_index,
             "mcp",
             expected_version,
+            expected_revision,
         ) {
-            Ok(entries) => entries,
+            Ok(result) => result,
             Err(error) => {
                 return Err(self.fail_claim(
                     &mut lease,
@@ -1402,7 +1408,7 @@ impl OrchestrationService {
             }
         };
         let changed_entry = entries.iter().find(|entry| entry.id == entry_id).cloned();
-        let response = Self::queue_response(
+        let mut response = Self::queue_response(
             request_id,
             session_id,
             &claimed,
@@ -1411,6 +1417,7 @@ impl OrchestrationService {
             changed_entry,
             None,
         );
+        response["revision"] = json!(revision);
         if let Err(error) = lease.complete(None, response.clone()) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }

@@ -837,6 +837,7 @@ struct QueueReorderArgs {
     entry_id: String,
     to_index: usize,
     expected_version: u64,
+    expected_revision: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1440,7 +1441,7 @@ fn tool_input_schema(name: &str) -> Value {
         }),
         "ptah_reorder_queue" => json!({
             "type": "object",
-            "required": ["request_id", "session_id", "workspace", "entry_id", "to_index", "expected_version"],
+            "required": ["request_id", "session_id", "workspace", "entry_id", "to_index", "expected_version", "expected_revision"],
             "additionalProperties": false,
             "properties": {
                 "request_id": req_id,
@@ -1448,7 +1449,8 @@ fn tool_input_schema(name: &str) -> Value {
                 "workspace": workspace,
                 "entry_id": {"type": "string", "minLength": 1, "maxLength": 256},
                 "to_index": {"type": "integer", "minimum": 0},
-                "expected_version": {"type": "integer", "minimum": 0}
+                "expected_version": {"type": "integer", "minimum": 0},
+                "expected_revision": {"type": "integer", "minimum": 0}
             }
         }),
         "ptah_clear_queue" => json!({
@@ -1711,6 +1713,7 @@ async fn dispatch_tool(
                 &args.entry_id,
                 args.to_index,
                 args.expected_version,
+                args.expected_revision,
             )
             .await
         }
