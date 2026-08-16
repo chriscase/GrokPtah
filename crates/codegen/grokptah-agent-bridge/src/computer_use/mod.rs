@@ -7,8 +7,10 @@
 //! the state machine or policy boundary; MCP mutations remain absent.
 //!
 //! [`projection`] derives the redaction-safe serialized view that the desktop
-//! cockpit and any future coordinator surface both consume, so the two cannot
+//! cockpit and any coordinator surface both consume, so the two cannot
 //! disagree about run state, control disposition, epoch, or event range.
+//! Which runs each surface may list is a separate gate: the cockpit is
+//! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
 mod macos_observation;
 mod platform;
@@ -27,11 +29,12 @@ pub use platform::{
 };
 pub use policy::ComputerPolicy;
 pub use projection::{
-    project_run_at, ActionGrantSummary, ComputerRunCapacity, ComputerRunEventPage,
-    ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection, ComputerTargetSummary,
-    ObservationSummary, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    project_run_at, ActionGrantSummary, ActionOutcomeSummary, ComputerErrorSummary,
+    ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress,
+    ComputerRunProjection, ComputerScopeCapacity, ComputerTargetSummary, ObservationSummary,
+    DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
-pub use reads::ComputerRunReads;
+pub use reads::{ComputerReadBinding, ComputerRunReads};
 
 /// Canonical string form of a workspace path for the durable Computer Run
 /// binding. This is the same canonicalization the control plane applies to a

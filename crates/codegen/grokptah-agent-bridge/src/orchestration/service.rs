@@ -1113,8 +1113,9 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
         let runs = reads
-            .list_run_projections(session_id, &claimed, Utc::now())
+            .list_run_projections(binding, Utc::now())
             .map_err(computer_read_error)?;
         Ok(json!({ "runs": runs }))
     }
@@ -1128,8 +1129,9 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
         let projection = reads
-            .project_run(session_id, &claimed, run_id, Utc::now())
+            .project_run(binding, run_id, Utc::now())
             .map_err(computer_read_error)?;
         serde_json::to_value(projection)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
@@ -1146,8 +1148,9 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
         let page = reads
-            .run_events(session_id, &claimed, run_id, after_seq, limit)
+            .run_events(binding, run_id, after_seq, limit)
             .map_err(computer_read_error)?;
         if page.cursor_expired {
             // Same recovery idiom as `ptah_get_events`: an expired cursor is a
@@ -1170,9 +1173,8 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
-        let capacity = reads
-            .capacity(session_id, &claimed)
-            .map_err(computer_read_error)?;
+        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
+        let capacity = reads.capacity(binding).map_err(computer_read_error)?;
         serde_json::to_value(capacity)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }

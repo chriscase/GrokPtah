@@ -46,10 +46,12 @@ impl ComputerUseService {
         self.store.load_run(run_id)
     }
 
-    /// Authoritative projection of every run owned by one session, newest
-    /// first. This is the read the desktop cockpit and any coordinator surface
-    /// share; neither sees another session's runs.
-    pub fn list_run_projections(
+    /// Local-operator projection of every run owned by one session, newest
+    /// first. The desktop cockpit uses this gate, including unbound runs.
+    /// Coordinator surfaces must not call this: they take
+    /// [`super::reads::ComputerReadBinding`] on [`super::reads::ComputerRunReads`]
+    /// so workspace binding is the authorization identity.
+    pub fn list_session_run_projections(
         &self,
         owner_session_id: Uuid,
         now: DateTime<Utc>,
@@ -63,12 +65,13 @@ impl ComputerUseService {
             .collect())
     }
 
-    /// Authoritative projection of one owned run.
+    /// Local-operator projection of one session-owned run.
     ///
     /// Fails closed: an unknown run and a run owned by another session return
     /// the identical error, so a caller cannot use this to probe whether a run
-    /// id exists outside its own session.
-    pub fn project_owned_run(
+    /// id exists outside its own session. Coordinator surfaces must use
+    /// [`super::reads::ComputerRunReads`] with a [`super::reads::ComputerReadBinding`].
+    pub fn project_session_run(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -78,11 +81,12 @@ impl ComputerUseService {
             .map(|run| project_run_at(&run, now))
     }
 
-    /// One bounded page of an owned run's durable event journal.
+    /// One bounded page of a session-owned run's durable event journal.
     ///
     /// A cursor older than the retained window is reported as expired rather
-    /// than silently resuming mid-journal.
-    pub fn owned_run_events(
+    /// than silently resuming mid-journal. Coordinator surfaces must use
+    /// [`super::reads::ComputerRunReads`].
+    pub fn session_run_events(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -93,8 +97,9 @@ impl ComputerUseService {
             .map(|run| project_events(&run, after_seq, limit))
     }
 
-    /// Ledger capacity, with the per-session figures scoped to the caller.
-    pub fn capacity(&self, owner_session_id: Uuid) -> ComputerResult<ComputerRunCapacity> {
+    /// Local-operator ledger occupancy. Host-wide figures stay on this type
+    /// and must not be served after a workspace gate.
+    pub fn session_capacity(&self, owner_session_id: Uuid) -> ComputerResult<ComputerRunCapacity> {
         let runs = self.store.list_runs()?;
         let session_runs = runs
             .iter()
@@ -1590,13 +1595,13 @@ mod tests {
         let now = Utc::now();
 
         let cross_session = service
-            .project_owned_run(intruder, &run.run_id, now)
+            .project_session_run(intruder, &run.run_id, now)
             .unwrap_err();
         let unknown_run = service
-            .project_owned_run(intruder, "no-such-run", now)
+            .project_session_run(intruder, "no-such-run", now)
             .unwrap_err();
         let unknown_to_owner = service
-            .project_owned_run(owner, "no-such-run", now)
+            .project_session_run(owner, "no-such-run", now)
             .unwrap_err();
 
         assert_eq!(cross_session.code, ComputerErrorCode::Unauthorized);
@@ -1607,11 +1612,11 @@ mod tests {
 
         assert_eq!(
             service
-                .owned_run_events(intruder, &run.run_id, None, 10)
+                .session_run_events(intruder, &run.run_id, None, 10)
                 .unwrap_err(),
             cross_session
         );
-        assert!(service.project_owned_run(owner, &run.run_id, now).is_ok());
+        assert!(service.project_session_run(owner, &run.run_id, now).is_ok());
     }
 
     #[tokio::test]
@@ -1620,7 +1625,7 @@ mod tests {
         let owner = Uuid::new_v4();
         for probe in ["../escape", "runs/../../etc/passwd", "", "  "] {
             let error = service
-                .project_owned_run(owner, probe, Utc::now())
+                .project_session_run(owner, probe, Utc::now())
                 .unwrap_err();
             assert_eq!(
                 error.code,
@@ -1654,12 +1659,14 @@ mod tests {
             )
             .unwrap();
 
-        let listed = service.list_run_projections(owner, Utc::now()).unwrap();
+        let listed = service
+            .list_session_run_projections(owner, Utc::now())
+            .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, mine.run_id);
         assert_eq!(listed[0].owner_session_id, owner);
 
-        let capacity = service.capacity(owner).unwrap();
+        let capacity = service.session_capacity(owner).unwrap();
         assert_eq!(capacity.stored_runs, 2);
         assert_eq!(capacity.session_runs, 1);
         assert_eq!(capacity.session_active_runs, 1);
@@ -1670,12 +1677,18 @@ mod tests {
 
         // Cancelling the owner's run must not change the other session's view.
         service.cancel("cancel-mine", &mine.run_id).await.unwrap();
-        assert_eq!(service.capacity(owner).unwrap().session_active_runs, 0);
-        assert_eq!(service.capacity(other).unwrap().session_active_runs, 1);
+        assert_eq!(
+            service.session_capacity(owner).unwrap().session_active_runs,
+            0
+        );
+        assert_eq!(
+            service.session_capacity(other).unwrap().session_active_runs,
+            1
+        );
     }
 
     #[tokio::test]
-    async fn gui_and_coordinator_projections_are_byte_identical() {
+    async fn session_scoped_read_matches_direct_projection() {
         let (_backend, service) = service();
         let owner = Uuid::new_v4();
         let run = service
@@ -1697,19 +1710,22 @@ mod tests {
 
         let now = Utc::now();
         // The desktop path projects the durable record it already holds; the
-        // scoped read path reloads it. Both must serialize identically.
+        // session-scoped local read reloads it. Both must serialize identically.
+        // Coordinator reads take ComputerReadBinding on ComputerRunReads.
         let gui = crate::computer_use::project_run_at(
             &service.get_run(&run.run_id).unwrap().unwrap(),
             now,
         );
-        let coordinator = service.project_owned_run(owner, &run.run_id, now).unwrap();
+        let session = service
+            .project_session_run(owner, &run.run_id, now)
+            .unwrap();
         assert_eq!(
             serde_json::to_string(&gui).unwrap(),
-            serde_json::to_string(&coordinator).unwrap()
+            serde_json::to_string(&session).unwrap()
         );
         assert_eq!(
-            coordinator,
-            service.list_run_projections(owner, now).unwrap()[0]
+            session,
+            service.list_session_run_projections(owner, now).unwrap()[0]
         );
     }
 
@@ -1739,7 +1755,7 @@ mod tests {
         );
 
         let projection = service
-            .project_owned_run(owner, &run.run_id, Utc::now())
+            .project_session_run(owner, &run.run_id, Utc::now())
             .unwrap();
         let encoded = serde_json::to_value(&projection).unwrap();
 
@@ -1802,6 +1818,18 @@ mod tests {
             projection.observation.as_ref().unwrap().element_count,
             observation.elements.len() as u32
         );
+
+        if let Some(last_outcome) = encoded
+            .get("lastOutcome")
+            .and_then(|value| value.as_object())
+        {
+            let keys: BTreeSet<&str> = last_outcome.keys().map(String::as_str).collect();
+            assert_eq!(keys, BTreeSet::from(["expectedPostconditionMet"]));
+        }
+        if let Some(last_error) = encoded.get("lastError").and_then(|value| value.as_object()) {
+            let keys: BTreeSet<&str> = last_error.keys().map(String::as_str).collect();
+            assert_eq!(keys, BTreeSet::from(["code"]));
+        }
     }
 
     #[tokio::test]
@@ -1834,7 +1862,7 @@ mod tests {
             ComputerStore::open(dir.join("computer-use")).unwrap(),
         );
         let recovered = service
-            .project_owned_run(owner, &run_id, Utc::now())
+            .project_session_run(owner, &run_id, Utc::now())
             .unwrap();
         assert_eq!(recovered.state, ComputerRunState::Interrupted);
         assert_eq!(
@@ -1849,9 +1877,15 @@ mod tests {
             "authority must not survive restart"
         );
         assert!(recovered.observation.is_none());
+        assert!(
+            recovered.last_outcome.is_none(),
+            "restart must not keep a leaky last_outcome"
+        );
 
         // Durable events survive the restart and stay replayable from the start.
-        let page = service.owned_run_events(owner, &run_id, None, 500).unwrap();
+        let page = service
+            .session_run_events(owner, &run_id, None, 500)
+            .unwrap();
         assert!(!page.cursor_expired);
         assert!(page
             .entries
@@ -1862,7 +1896,7 @@ mod tests {
 
         // Replaying from the final sequence is a valid empty tail, not a gap.
         let tail = service
-            .owned_run_events(owner, &run_id, Some(range.end_seq), 500)
+            .session_run_events(owner, &run_id, Some(range.end_seq), 500)
             .unwrap();
         assert!(tail.entries.is_empty());
         assert!(!tail.cursor_expired);

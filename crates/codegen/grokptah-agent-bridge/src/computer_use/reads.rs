@@ -2,12 +2,13 @@
 //!
 //! Reads need no backend: they consult only the durable store, so the control
 //! plane can serve them without constructing a `ComputerUseService`. The
-//! desktop GUI keeps using the session-scoped reads on the service; this
-//! wrapper adds the durable workspace-binding check that MCP authorization
-//! requires. `workspace` is the caller's claim **after** the control plane
-//! has canonicalized it and matched it against the allowlist and the owning
-//! session's cwd — this layer performs an exact string compare against the
-//! binding stamped on the run at creation, never a filesystem lookup.
+//! desktop GUI keeps using the session-scoped reads on the service; those
+//! methods do not accept [`ComputerReadBinding`], so a coordinator surface
+//! cannot be wired to them. Binding is the authorization identity: the
+//! caller's claim **after** the control plane has canonicalized it and
+//! matched it against the allowlist and the owning session's cwd. This layer
+//! performs an exact string compare against the binding stamped on the run
+//! at creation, never a filesystem lookup.
 //!
 //! Every run-dependent failure — unknown id, traversal-shaped id, another
 //! session's run, another workspace's run, a run with no binding — collapses
@@ -18,11 +19,40 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::projection::{
-    not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
-    ComputerRunProjection,
+    not_available, project_events, project_run_at, ComputerRunEventPage, ComputerRunProjection,
+    ComputerScopeCapacity,
 };
 use super::store::ComputerStore;
 use super::types::{validate_id, ComputerResult, ComputerRun};
+
+/// Authorization identity for coordinator Computer Run reads.
+///
+/// The workspace is the exact durable binding string after the control-plane
+/// allowlist and session-cwd gate. Session-only [`super::service::ComputerUseService`]
+/// methods do not accept this type, so a coordinator surface cannot be wired
+/// to those methods without a type error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputerReadBinding<'a> {
+    owner_session_id: Uuid,
+    workspace: &'a str,
+}
+
+impl<'a> ComputerReadBinding<'a> {
+    pub fn new(owner_session_id: Uuid, workspace: &'a str) -> Self {
+        Self {
+            owner_session_id,
+            workspace,
+        }
+    }
+
+    pub fn owner_session_id(self) -> Uuid {
+        self.owner_session_id
+    }
+
+    pub fn workspace(self) -> &'a str {
+        self.workspace
+    }
+}
 
 /// Backend-free scoped read surface over the durable Computer Run ledger.
 #[derive(Clone)]
@@ -40,15 +70,14 @@ impl ComputerRunReads {
     /// existed carry no workspace and are invisible here by design.
     pub fn list_run_projections(
         &self,
-        owner_session_id: Uuid,
-        workspace: &str,
+        binding: ComputerReadBinding<'_>,
         now: DateTime<Utc>,
     ) -> ComputerResult<Vec<ComputerRunProjection>> {
         Ok(self
             .store
             .list_runs()?
             .iter()
-            .filter(|run| owned_and_bound(run, owner_session_id, workspace))
+            .filter(|run| owned_and_bound(run, binding))
             .map(|run| project_run_at(run, now))
             .collect())
     }
@@ -56,67 +85,59 @@ impl ComputerRunReads {
     /// Authoritative projection of one owned, workspace-bound run.
     pub fn project_run(
         &self,
-        owner_session_id: Uuid,
-        workspace: &str,
+        binding: ComputerReadBinding<'_>,
         run_id: &str,
         now: DateTime<Utc>,
     ) -> ComputerResult<ComputerRunProjection> {
-        self.load_bound_run(owner_session_id, workspace, run_id)
+        self.load_bound_run(binding, run_id)
             .map(|run| project_run_at(&run, now))
     }
 
     /// One bounded page of an owned, workspace-bound run's durable journal.
     pub fn run_events(
         &self,
-        owner_session_id: Uuid,
-        workspace: &str,
+        binding: ComputerReadBinding<'_>,
         run_id: &str,
         after_seq: Option<u64>,
         limit: usize,
     ) -> ComputerResult<ComputerRunEventPage> {
-        self.load_bound_run(owner_session_id, workspace, run_id)
+        self.load_bound_run(binding, run_id)
             .map(|run| project_events(&run, after_seq, limit))
     }
 
-    /// Global ledger figures plus counts scoped to the (session, workspace)
-    /// pair. Global totals are deliberate: capacity is a host-wide property
-    /// under the plane's single shared bearer token, and counts reveal no run
-    /// content.
+    /// Capacity scoped to the authorization identity. Host-wide occupancy is
+    /// absent: after a workspace gate those figures would be a cross-scope
+    /// activity oracle.
     pub fn capacity(
         &self,
-        owner_session_id: Uuid,
-        workspace: &str,
-    ) -> ComputerResult<ComputerRunCapacity> {
+        binding: ComputerReadBinding<'_>,
+    ) -> ComputerResult<ComputerScopeCapacity> {
         let runs = self.store.list_runs()?;
-        let scoped = runs
-            .iter()
-            .filter(|run| owned_and_bound(run, owner_session_id, workspace));
-        Ok(ComputerRunCapacity {
+        let scoped = runs.iter().filter(|run| owned_and_bound(run, binding));
+        Ok(ComputerScopeCapacity {
             max_run_records: ComputerStore::MAX_RUN_RECORDS as u32,
-            stored_runs: runs.len() as u32,
-            active_runs: runs.iter().filter(|run| !run.state.is_terminal()).count() as u32,
-            session_runs: scoped.clone().count() as u32,
-            session_active_runs: scoped.filter(|run| !run.state.is_terminal()).count() as u32,
+            bound_runs: scoped.clone().count() as u32,
+            bound_active_runs: scoped.filter(|run| !run.state.is_terminal()).count() as u32,
         })
     }
 
     /// Single ownership gate for every scoped read.
     fn load_bound_run(
         &self,
-        owner_session_id: Uuid,
-        workspace: &str,
+        binding: ComputerReadBinding<'_>,
         run_id: &str,
     ) -> ComputerResult<ComputerRun> {
         validate_id("run_id", run_id).map_err(|_| not_available())?;
         self.store
             .load_run(run_id)?
-            .filter(|run| owned_and_bound(run, owner_session_id, workspace))
+            .filter(|run| owned_and_bound(run, binding))
             .ok_or_else(not_available)
     }
 }
 
-fn owned_and_bound(run: &ComputerRun, owner_session_id: Uuid, workspace: &str) -> bool {
-    run.owner_session_id == owner_session_id && run.workspace.as_deref() == Some(workspace)
+fn owned_and_bound(run: &ComputerRun, binding: ComputerReadBinding<'_>) -> bool {
+    run.owner_session_id == binding.owner_session_id()
+        && run.workspace.as_deref() == Some(binding.workspace())
 }
 
 #[cfg(test)]
@@ -124,7 +145,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::computer_use::types::{ComputerRunState, ComputerTarget, ComputerUseLimits};
+    use crate::computer_use::types::{
+        ActionOutcome, ComputerRunState, ComputerTarget, ComputerUseLimits,
+    };
     use crate::computer_use::Sensitivity;
 
     fn target() -> ComputerTarget {
@@ -163,34 +186,29 @@ mod tests {
         let unbound = saved_run(&store, owner, None);
         let reads = ComputerRunReads::new(store);
         let now = Utc::now();
+        let owner_a = ComputerReadBinding::new(owner, "/workspace/a");
+        let owner_b = ComputerReadBinding::new(owner, "/workspace/b");
+        let intruder_a = ComputerReadBinding::new(intruder, "/workspace/a");
 
-        let baseline = reads
-            .project_run(owner, "/workspace/a", "no-such-run", now)
-            .unwrap_err();
+        let baseline = reads.project_run(owner_a, "no-such-run", now).unwrap_err();
         // Cross-session, cross-workspace, unbound, and traversal-shaped reads
         // must be byte-identical to the unknown-run error.
         for error in [
             reads
-                .project_run(intruder, "/workspace/a", &bound.run_id, now)
+                .project_run(intruder_a, &bound.run_id, now)
                 .unwrap_err(),
+            reads.project_run(owner_b, &bound.run_id, now).unwrap_err(),
             reads
-                .project_run(owner, "/workspace/b", &bound.run_id, now)
+                .project_run(owner_a, &unbound.run_id, now)
                 .unwrap_err(),
+            reads.project_run(owner_a, "../escape", now).unwrap_err(),
             reads
-                .project_run(owner, "/workspace/a", &unbound.run_id, now)
-                .unwrap_err(),
-            reads
-                .project_run(owner, "/workspace/a", "../escape", now)
-                .unwrap_err(),
-            reads
-                .run_events(owner, "/workspace/b", &bound.run_id, None, 10)
+                .run_events(owner_b, &bound.run_id, None, 10)
                 .unwrap_err(),
         ] {
             assert_eq!(error, baseline);
         }
-        assert!(reads
-            .project_run(owner, "/workspace/a", &bound.run_id, now)
-            .is_ok());
+        assert!(reads.project_run(owner_a, &bound.run_id, now).is_ok());
     }
 
     #[test]
@@ -205,20 +223,29 @@ mod tests {
         saved_run(&store, other, Some("/workspace/a"));
         let reads = ComputerRunReads::new(store);
 
-        let listed = reads
-            .list_run_projections(owner, "/workspace/a", Utc::now())
-            .unwrap();
+        let binding = ComputerReadBinding::new(owner, "/workspace/a");
+        let listed = reads.list_run_projections(binding, Utc::now()).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, mine.run_id);
 
-        let capacity = reads.capacity(owner, "/workspace/a").unwrap();
-        assert_eq!(capacity.stored_runs, 4);
-        assert_eq!(capacity.active_runs, 4);
-        assert_eq!(capacity.session_runs, 1);
-        assert_eq!(capacity.session_active_runs, 1);
+        let capacity = reads.capacity(binding).unwrap();
+        assert_eq!(capacity.bound_runs, 1);
+        assert_eq!(capacity.bound_active_runs, 1);
         assert_eq!(
             capacity.max_run_records,
             ComputerStore::MAX_RUN_RECORDS as u32
+        );
+        let encoded = serde_json::to_value(capacity).unwrap();
+        let keys: std::collections::BTreeSet<&str> = encoded
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["maxRunRecords", "boundRuns", "boundActiveRuns"]),
+            "host-wide storedRuns/activeRuns must not ride the coordinator capacity"
         );
     }
 
@@ -229,21 +256,74 @@ mod tests {
         let run_id;
         {
             let store = ComputerStore::open(dir.path()).unwrap();
-            run_id = saved_run(&store, owner, Some("/workspace/a")).run_id;
+            let mut run = saved_run(&store, owner, Some("/workspace/a"));
+            run.last_outcome = Some(ActionOutcome::bounded(
+                "PRIVATE_DOCUMENT_TITLE leaked from AX",
+                Some(true),
+            ));
+            store.save_run(&run).unwrap();
+            run_id = run.run_id;
         }
         let reads = ComputerRunReads::new(ComputerStore::open(dir.path()).unwrap());
-        let recovered = reads
-            .project_run(owner, "/workspace/a", &run_id, Utc::now())
-            .unwrap();
+        let binding = ComputerReadBinding::new(owner, "/workspace/a");
+        let recovered = reads.project_run(binding, &run_id, Utc::now()).unwrap();
         assert_eq!(recovered.state, ComputerRunState::Interrupted);
+        assert!(
+            recovered.last_outcome.is_none(),
+            "restart recovery must not keep a leaky last_outcome"
+        );
+        let encoded = serde_json::to_string(&recovered).unwrap();
+        assert!(!encoded.contains("PRIVATE_DOCUMENT_TITLE"));
+        assert_eq!(
+            recovered.last_error.as_ref().map(|error| error.code),
+            Some(crate::computer_use::ComputerErrorCode::Interrupted)
+        );
         // The recovery itself is journaled and readable through the same
         // scoped read path.
-        let page = reads
-            .run_events(owner, "/workspace/a", &run_id, None, 100)
-            .unwrap();
+        let page = reads.run_events(binding, &run_id, None, 100).unwrap();
         assert!(page
             .entries
             .iter()
             .any(|entry| entry.operation == "recover" && entry.disposition == "interrupted"));
+    }
+
+    #[test]
+    fn coordinator_dispatch_is_not_wired_to_session_only_service_methods() {
+        let orch = include_str!("../orchestration/service.rs");
+        let mcp = include_str!("../mcp_control.rs");
+        assert!(
+            orch.contains("ComputerReadBinding"),
+            "coordinator reads must take ComputerReadBinding as authorization identity"
+        );
+        assert!(
+            orch.contains("ComputerRunReads"),
+            "coordinator reads must go through ComputerRunReads"
+        );
+        for needle in [
+            "project_owned_run",
+            "list_session_run_projections",
+            "project_session_run",
+            "session_run_events",
+            "session_capacity",
+            "ComputerUseService",
+        ] {
+            assert!(
+                !orch.contains(needle),
+                "orchestration must not call session-only {needle}"
+            );
+        }
+        // mcp_control tests seed the ledger through ComputerUseService; the
+        // production dispatch must still only call the orch scoped readers.
+        assert!(
+            mcp.contains("orch.list_computer_runs_scoped")
+                && mcp.contains("orch.get_computer_run_scoped")
+                && mcp.contains("orch.get_computer_run_events_scoped")
+                && mcp.contains("orch.get_computer_capacity_scoped"),
+            "MCP computer tools must dispatch through OrchestrationService scoped readers"
+        );
+        assert!(
+            !mcp.contains("project_owned_run") && !mcp.contains("project_session_run"),
+            "MCP dispatch must not call session-only service read methods"
+        );
     }
 }

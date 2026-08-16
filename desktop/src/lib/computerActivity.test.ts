@@ -108,7 +108,7 @@ describe("computerActivityState", () => {
         controlDisposition: "uncertain_outcome",
         state: "failed",
         terminal: true,
-        lastError: { code: "uncertain_outcome", message: "action completed after cancel" },
+        lastError: { code: "uncertain_outcome" },
       }),
     );
     expect(state.id).toBe("uncertain_outcome");

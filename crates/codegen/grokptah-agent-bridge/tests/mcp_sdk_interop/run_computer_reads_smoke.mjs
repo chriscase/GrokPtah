@@ -89,6 +89,9 @@ const OBSERVATION_KEYS = [
   "capturedAt", "elementCount", "elementsTruncated", "hasScreenshot",
   "observationId", "screenshotRedacted", "sensitivity", "sequence", "stale",
 ];
+const LAST_OUTCOME_KEYS = ["expectedPostconditionMet"];
+const LAST_ERROR_KEYS = ["code"];
+const CAPACITY_KEYS = ["boundActiveRuns", "boundRuns", "maxRunRecords"];
 
 function pinProjection(name, projection) {
   check(
@@ -102,6 +105,22 @@ function pinProjection(name, projection) {
       JSON.stringify(Object.keys(projection.observation).sort()) ===
         JSON.stringify(OBSERVATION_KEYS),
       Object.keys(projection.observation).sort().join(","),
+    );
+  }
+  if (projection.lastOutcome) {
+    check(
+      `${name}: lastOutcome keys are pinned`,
+      JSON.stringify(Object.keys(projection.lastOutcome).sort()) ===
+        JSON.stringify(LAST_OUTCOME_KEYS),
+      Object.keys(projection.lastOutcome).sort().join(","),
+    );
+  }
+  if (projection.lastError) {
+    check(
+      `${name}: lastError keys are pinned`,
+      JSON.stringify(Object.keys(projection.lastError).sort()) ===
+        JSON.stringify(LAST_ERROR_KEYS),
+      Object.keys(projection.lastError).sort().join(","),
     );
   }
 }
@@ -246,12 +265,18 @@ async function main() {
       crossWorkspace.body?.error?.data?.code === "workspace_mismatch",
   );
 
-  // Capacity: global figures plus the session/workspace-scoped counts.
+  // Capacity is scoped to the (session, workspace) binding. Host-wide
+  // occupancy would be a cross-scope activity oracle after the workspace gate.
   const capacity = await tool(72, "ptah_get_computer_capacity", callArgs(), { session: sid });
   check("capacity succeeds", capacity.status === 200);
+  check(
+    "capacity keys are pinned",
+    JSON.stringify(Object.keys(capacity.result ?? {}).sort()) === JSON.stringify(CAPACITY_KEYS),
+    Object.keys(capacity.result ?? {}).sort().join(","),
+  );
   check("capacity max is the ledger bound", capacity.result?.maxRunRecords === 256);
-  check("capacity scopes session runs", capacity.result?.sessionRuns === 2, JSON.stringify(capacity.result));
-  check("capacity counts every stored run", (capacity.result?.storedRuns ?? 0) >= 3);
+  check("capacity counts only bound runs", capacity.result?.boundRuns === 2, JSON.stringify(capacity.result));
+  check("capacity does not report host-global storedRuns", capacity.result?.storedRuns === undefined);
 
   // Auth-before-body on the new tools.
   const badToken = await rpc(80, "tools/call", { name: "ptah_list_computer_runs", arguments: callArgs() }, { token: "wrong-token", session: sid });
