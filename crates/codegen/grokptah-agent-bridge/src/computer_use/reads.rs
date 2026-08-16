@@ -142,11 +142,16 @@ fn owned_and_bound(run: &ComputerRun, binding: ComputerReadBinding<'_>) -> bool 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use chrono::Duration;
     use tempfile::tempdir;
 
     use super::*;
+    use crate::computer_use::project_run_at;
     use crate::computer_use::types::{
-        ActionOutcome, ComputerRunState, ComputerTarget, ComputerUseLimits,
+        ActionClass, ActionGrant, ActionOutcome, ComputerObservation, ComputerRunState,
+        ComputerTarget, ComputerUseLimits, GrantIssuer, ObservationGeometry,
     };
     use crate::computer_use::Sensitivity;
 
@@ -236,7 +241,7 @@ mod tests {
             ComputerStore::MAX_RUN_RECORDS as u32
         );
         let encoded = serde_json::to_value(capacity).unwrap();
-        let keys: std::collections::BTreeSet<&str> = encoded
+        let keys: BTreeSet<&str> = encoded
             .as_object()
             .unwrap()
             .keys()
@@ -244,7 +249,7 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            std::collections::BTreeSet::from(["maxRunRecords", "boundRuns", "boundActiveRuns"]),
+            BTreeSet::from(["maxRunRecords", "boundRuns", "boundActiveRuns"]),
             "host-wide storedRuns/activeRuns must not ride the coordinator capacity"
         );
     }
@@ -285,6 +290,66 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.operation == "recover" && entry.disposition == "interrupted"));
+    }
+
+    #[test]
+    fn bound_read_matches_direct_projection_including_clock_fields() {
+        let dir = tempdir().unwrap();
+        let store = ComputerStore::open(dir.path()).unwrap();
+        let owner = Uuid::new_v4();
+        let now = Utc::now();
+        let mut run = saved_run(&store, owner, Some("/workspace/a"));
+        run.transition(ComputerRunState::Ready).unwrap();
+        run.started_at = Some(now - Duration::seconds(10));
+        run.current_observation = Some(ComputerObservation {
+            observation_id: "obs-clock".into(),
+            sequence: 1,
+            target: run.target.clone(),
+            captured_at: now - Duration::milliseconds(1),
+            geometry: ObservationGeometry {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0,
+                scale_factor: 1.0,
+            },
+            screenshot: None,
+            elements: Vec::new(),
+            elements_truncated: false,
+            sensitivity: Sensitivity::None,
+        });
+        run.grant = Some(ActionGrant {
+            grant_id: "grant-clock".into(),
+            run_id: run.run_id.clone(),
+            target: run.target.clone(),
+            action_classes: BTreeSet::from([ActionClass::Semantic]),
+            issued_by: GrantIssuer::LocalUser,
+            issued_at: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(1),
+            uses_remaining: Some(2),
+            revoked_at: None,
+        });
+        run.last_outcome = Some(ActionOutcome::bounded("set demo name", Some(true)));
+        store.save_run(&run).unwrap();
+
+        let reads = ComputerRunReads::new(store);
+        let binding = ComputerReadBinding::new(owner, "/workspace/a");
+        let gui = project_run_at(&run, now);
+        let bound = reads.project_run(binding, &run.run_id, now).unwrap();
+        assert_eq!(gui, bound);
+        assert_eq!(
+            serde_json::to_string(&gui).unwrap(),
+            serde_json::to_string(&bound).unwrap()
+        );
+        assert!(!gui.observation.as_ref().unwrap().stale);
+        assert!(!gui.grant.as_ref().unwrap().expired);
+
+        // Clock-derived fields move with the instant. Live MCP and GUI calls
+        // that do not share `now` are not promised byte-identical.
+        let later = project_run_at(&run, now + Duration::hours(1));
+        assert_ne!(gui.progress.elapsed_millis, later.progress.elapsed_millis);
+        assert!(later.observation.as_ref().unwrap().stale);
+        assert!(later.grant.as_ref().unwrap().expired);
     }
 
     #[test]

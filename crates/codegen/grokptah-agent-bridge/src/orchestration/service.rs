@@ -1088,20 +1088,37 @@ impl OrchestrationService {
     /// Session + workspace gate shared by every Computer Run read. Computer
     /// Runs are owned by build and chat sessions alike, so this requires the
     /// session to exist and match the claimed allowlisted workspace — not to
-    /// be a Build session. Every failure here depends only on caller-claimed
-    /// scope, never on any run, so it cannot signal run existence.
+    /// be a Build session.
+    ///
+    /// The claimed workspace is allowlisted first (session-independent).
+    /// Unknown session, missing cwd, and cwd mismatch then collapse into the
+    /// same `forbidden_scope` as an unauthorized run, so session existence
+    /// is not distinguishable from cross-scope.
     fn authorize_computer_scope(
         &self,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<String, OrchError> {
-        let session = self
-            .host
-            .session_load(session_id)
-            .map_err(|_| OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"))?;
-        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
         let allowlist = self.config.lock().allowlist.clone();
-        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        let claimed = super::authz::canonical_workspace(workspace)?;
+        if !allowlist.contains(&claimed) {
+            return Err(OrchError::new(
+                OrchErrorCode::WorkspaceMismatch,
+                "workspace not in allowlist",
+            ));
+        }
+        let session = self.host.session_load(session_id).ok();
+        let cwd = session
+            .as_ref()
+            .and_then(|loaded| (!loaded.cwd.is_empty()).then(|| PathBuf::from(&loaded.cwd)));
+        let Some(cwd) = cwd else {
+            return Err(computer_scope_denied());
+        };
+        let session_cwd =
+            super::authz::canonical_workspace(&cwd).map_err(|_| computer_scope_denied())?;
+        if session_cwd != claimed {
+            return Err(computer_scope_denied());
+        }
         Ok(claimed.display().to_string())
     }
 
@@ -1153,12 +1170,17 @@ impl OrchestrationService {
             .run_events(binding, run_id, after_seq, limit)
             .map_err(computer_read_error)?;
         if page.cursor_expired {
-            // Same recovery idiom as `ptah_get_events`: an expired cursor is a
-            // 410 error, and the caller resumes from the projection's
-            // `eventRange` rather than silently skipping the gap.
-            return Err(OrchError::new(
+            // Same 410 idiom as `ptah_get_events`, but the retained window
+            // rides the error so recovery does not require a second get.
+            return Err(OrchError::with_data(
                 OrchErrorCode::CursorExpired,
-                "computer run event cursor is below the retained window; resume from the projection's eventRange",
+                "computer run event cursor is below the retained window; resume from eventRange",
+                json!({
+                    "eventRange": page.range.map(|range| json!({
+                        "startSeq": range.start_seq,
+                        "endSeq": range.end_seq,
+                    })),
+                }),
             ));
         }
         serde_json::to_value(page)
@@ -3405,6 +3427,13 @@ impl OrchestrationService {
 /// `Unauthorized` covers unknown, cross-session, cross-workspace, unbound, and
 /// traversal-shaped reads with one shared message, so this mapping must stay
 /// single-valued to preserve that indistinguishability on the wire.
+fn computer_scope_denied() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::ForbiddenScope,
+        "computer run is not available to this session",
+    )
+}
+
 fn computer_read_error(error: crate::computer_use::ComputerError) -> OrchError {
     use crate::computer_use::ComputerErrorCode;
     let code = match error.code {

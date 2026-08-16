@@ -36,7 +36,7 @@ verified against code, with evidence:
 | Cursor semantics | `project_events`: limit clamped 1..=500, caller cursor `saturating_add`, `after == start_seq - 1` is continuity, below-window is `cursor_expired` with empty page, final page returns `next_cursor: None`, empty journal yields no false expiry. |
 | Restart recovery | `store.rs` marks non-terminal runs `Interrupted`, bumps `control_epoch`, clears grant + observation + `last_outcome`, sets a static `Interrupted` last error; tests prove the projection reports it, the leaky outcome is gone, and events stay replayable. |
 | Disposition precedence | `computerActivity.ts` switches on disposition first and fails closed on unknown dispositions. Misleading combinations are unreachable: `cancel` sets `Stopped` (`service.rs:421`), `Paused → Completed` is not in the transition table (`types.rs:711-742`), and `validate_run_record` (`store.rs:391-399`) rejects inconsistent durable records. |
-| GUI/MCP parity | Byte-identical serialization test (desktop-held record vs scoped read); cockpit status renders exclusively from the projection; `run` is retained only for local approval detail. |
+| GUI/MCP parity | Same `(record, now)` is byte-identical, including clock-derived fields (bound-read test). Live MCP uses `Utc::now()` independently; `elapsedMillis` / `stale` / `expired` are not promised identical across surfaces. Cockpit status renders from the projection; `run` is local-only. |
 | Frontend/a11y | Nine activity cases including fail-closed unknown disposition; disposition-uniqueness test; `aria-live` announcement names state + target; pulse animation suppressed under `prefers-reduced-motion`. |
 
 ### Hardening items found (P2/P3 — fold into this slice, do not file)

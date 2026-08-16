@@ -224,17 +224,16 @@ async function main() {
       tail.result?.cursorExpired === false,
   );
 
-  // Stale cursor: below the retained ring is a hard 410 with recovery via the
-  // projection's eventRange.
+  // Stale cursor: below the retained ring is a hard 410. eventRange rides
+  // the error so recovery does not require a second get.
   const stale = await tool(61, "ptah_get_computer_run_events", callArgs({ run_id: runC, after_seq: 0 }), { session: sid });
   check(
     "cursor below retention is 410 cursor_expired",
     stale.status === 410 && stale.body?.error?.data?.code === "cursor_expired",
     JSON.stringify(stale.body?.error ?? null),
   );
-  const recovered = await tool(62, "ptah_get_computer_run", callArgs({ run_id: runC }), { session: sid });
-  const startSeq = recovered.result?.eventRange?.startSeq;
-  check("recovered range starts past the evicted prefix", (startSeq ?? 0) > 1);
+  const startSeq = stale.body?.error?.data?.eventRange?.startSeq;
+  check("410 carries eventRange past the evicted prefix", (startSeq ?? 0) > 1, JSON.stringify(stale.body?.error ?? null));
   const resumed = await tool(63, "ptah_get_computer_run_events", callArgs({ run_id: runC, after_seq: startSeq - 1, limit: 5 }), { session: sid });
   check(
     "resuming from the retained start is continuity",
@@ -257,12 +256,23 @@ async function main() {
     crossSession.body?.error?.data?.code === "forbidden_scope",
   );
 
-  // Claiming a different allowlisted workspace fails on the session gate.
-  const crossWorkspace = await tool(71, "ptah_get_computer_run", { session_id: sessionId, workspace: otherWorkspace, run_id: runA }, { session: sid });
+  // Claiming a different allowlisted workspace, or an unknown session, is
+  // the same unauthorized error — session existence is not an oracle.
+  const crossWorkspace = await tool(70, "ptah_get_computer_run", { session_id: sessionId, workspace: otherWorkspace, run_id: runA }, { session: sid });
+  const unknownSession = await tool(70, "ptah_get_computer_run", { session_id: "00000000-0000-4000-8000-000000000000", workspace, run_id: runA }, { session: sid });
   check(
-    "cross-workspace claim is a workspace mismatch",
-    crossWorkspace.status === 403 &&
-      crossWorkspace.body?.error?.data?.code === "workspace_mismatch",
+    "cross-workspace is indistinguishable from unauthorized",
+    JSON.stringify(crossWorkspace.body) === JSON.stringify(crossSession.body),
+    JSON.stringify([crossWorkspace.body, crossSession.body]),
+  );
+  check(
+    "unknown session is indistinguishable from unauthorized",
+    JSON.stringify(unknownSession.body) === JSON.stringify(unknown.body),
+    JSON.stringify([unknownSession.body, unknown.body]),
+  );
+  check(
+    "cross-scope refusal uses forbidden_scope",
+    crossWorkspace.body?.error?.data?.code === "forbidden_scope",
   );
 
   // Capacity is scoped to the (session, workspace) binding. Host-wide

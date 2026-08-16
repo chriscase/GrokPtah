@@ -1336,6 +1336,12 @@ fn status_for(e: &OrchError) -> StatusCode {
 }
 
 fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
+    let mut data = json!({ "code": e.code.as_str() });
+    if let Some(extra) = e.data.as_ref().and_then(Value::as_object) {
+        for (key, value) in extra {
+            data[key] = value.clone();
+        }
+    }
     (
         status,
         Json(JsonRpcResp {
@@ -1345,7 +1351,7 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
             error: Some(json!({
                 "code": -32000,
                 "message": e.message,
-                "data": { "code": e.code.as_str() },
+                "data": data,
             })),
         }),
     )
@@ -1456,7 +1462,7 @@ fn tool_input_schema(name: &str) -> Value {
                 "after_seq": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Durable cursor. Omit to read from the start of the retained journal; a cursor below the retained window fails with cursor_expired."
+                    "description": "Durable cursor. Omit to read from the start of the retained journal; a cursor below the retained window fails with cursor_expired and includes eventRange."
                 },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500}
             }
@@ -2426,9 +2432,11 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0]["runId"], run_a.run_id.as_str());
 
-        // The wire payload is the byte-identical shared projection the GUI
-        // embeds: an unstarted run has no volatile field, so the comparison is
-        // exact for any instant.
+        // Given the same (record, now), GUI and MCP serialize identically.
+        // This unstarted run has no clock-derived fields; see the bound-read
+        // clock test for a started record. Live MCP calls use Utc::now()
+        // independently and do not promise cross-surface identity for
+        // elapsedMillis / stale / expired.
         let (status, body) = call_tool(
             &fixture,
             3,
@@ -2481,28 +2489,28 @@ mod tests {
         assert_eq!(error_bodies[0], error_bodies[2]);
         assert_eq!(error_bodies[0]["error"]["data"]["code"], "forbidden_scope");
 
-        // Claiming another allowlisted workspace fails on the session gate
-        // before any run is consulted.
-        let (status, body) = call_tool(
+        // Claiming another allowlisted workspace, or an unknown session, is
+        // the same unauthorized error as an unknown run — session existence
+        // is not distinguishable from cross-scope.
+        let (status, cross_workspace) = call_tool(
             &fixture,
-            8,
+            7,
             "ptah_get_computer_run",
             json!({"session_id": session_a.id, "workspace": ws_b.path(), "run_id": run_a.run_id}),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["error"]["data"]["code"], "workspace_mismatch");
-
-        // An unknown session fails independently of any run.
-        let (status, body) = call_tool(
+        let (status, unknown_session) = call_tool(
             &fixture,
-            9,
+            7,
             "ptah_get_computer_run",
             json!({"session_id": Uuid::new_v4(), "workspace": ws_a.path(), "run_id": run_a.run_id}),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["data"]["code"], "invalid_request");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(cross_workspace, error_bodies[0]);
+        assert_eq!(unknown_session, error_bodies[0]);
+        assert_eq!(unknown_session["error"]["data"]["code"], "forbidden_scope");
 
         // Capacity is scoped to the (session, workspace) binding. Host-wide
         // occupancy is absent so the tool cannot count other sessions' runs.
@@ -2650,7 +2658,8 @@ mod tests {
         };
 
         // A cursor below the retained window is a hard 410, mirroring
-        // ptah_get_events; the gap is never silently skipped.
+        // ptah_get_events; the gap is never silently skipped. The retained
+        // window rides the error so recovery does not need a second get.
         let (status, body) = call_tool(
             &fixture,
             1,
@@ -2665,18 +2674,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::GONE);
         assert_eq!(body["error"]["data"]["code"], "cursor_expired");
-
-        // Recovery: the projection's eventRange names the retained window,
-        // and resuming from exactly startSeq - 1 is continuity, not a gap.
-        let (status, body) = call_tool(
-            &fixture,
-            2,
-            "ptah_get_computer_run",
-            json!({"session_id": session.id, "workspace": ws.path(), "run_id": run.run_id}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let start_seq = body["result"]["structuredContent"]["eventRange"]["startSeq"]
+        let start_seq = body["error"]["data"]["eventRange"]["startSeq"]
             .as_u64()
             .unwrap();
         assert!(start_seq > 1, "eviction must have advanced the window");
