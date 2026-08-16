@@ -261,6 +261,68 @@ impl Inner {
     }
 }
 
+struct PromptQueueRecovery {
+    entries: Vec<PromptQueueEntry>,
+    revision: u64,
+}
+
+/// What a recovery attempt actually achieved.
+enum PromptQueueRecoveryOutcome {
+    /// Nothing was pending; the queue is untouched.
+    Nothing,
+    /// Recovered and durably committed. Safe to publish as authoritative.
+    Committed(PromptQueueRecovery),
+    /// Recovered in memory, but the durable write failed.
+    ///
+    /// The steering is still in the live queue — dropping it here would lose an
+    /// interjection the operator already accepted, and the entry that a
+    /// caller can no longer see is the worst of the available outcomes. What
+    /// is withheld is the *claim of authority*: no queue snapshot is
+    /// published, because publishing one would assert a durable commit that
+    /// did not happen. The failure is reported instead.
+    NotPersisted { error: anyhow::Error },
+}
+
+/// Recover steering into the durable queue and capture the committed snapshot.
+///
+/// The caller must hold the `Inner` mutation lock.
+///
+/// Ordering is persist-then-publish: the durable write is attempted before any
+/// snapshot is published, so a failed save can never produce an event for a
+/// mutation that was not committed. A failed save does **not** discard the
+/// recovery, though. The recovery is applied to the live queue either way and
+/// the caller is handed the error to report, because the previous behaviour —
+/// return `Err` before touching the queue — left accepted steering stranded in
+/// `steering`/`delivering`, where no later boundary would deliver it and
+/// neither the GUI nor `ptah_get_queue` could see it.
+fn recover_pending_steering_locked(g: &mut Inner, session_id: Uuid) -> PromptQueueRecoveryOutcome {
+    let mut next = g
+        .prompt_queues
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default();
+    if next.recover_pending_steering() == 0 {
+        return PromptQueueRecoveryOutcome::Nothing;
+    }
+
+    let entries = next.list();
+    let persisted = session_store::save_prompt_queue(session_id, &next)
+        .map_err(|error| anyhow!("persist steering recovery: {error}"));
+    // Applied regardless: the in-memory queue is what the session actually
+    // runs from, and leaving it un-recovered loses the interjection outright.
+    g.prompt_queues.insert(session_id, next);
+    match persisted {
+        Ok(()) => {
+            let revision = g.next_queue_revision(session_id);
+            PromptQueueRecoveryOutcome::Committed(PromptQueueRecovery { entries, revision })
+        }
+        // No revision is claimed for an uncommitted mutation, so consumers
+        // holding a watermark are not advanced past a state that may not
+        // survive a restart.
+        Err(error) => PromptQueueRecoveryOutcome::NotPersisted { error },
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionUsage {
     prompt_tokens: u64,
@@ -294,15 +356,29 @@ impl Drop for TurnBusyGuard {
         if !self.armed {
             return;
         }
-        {
+        let outcome = {
             let mut g = self.host.inner.lock();
             g.turn_cancels.remove(&self.session_id);
             g.turn_generations.remove(&self.session_id);
             g.turn_max_rounds.remove(&self.session_id);
-            g.prompt_queues
-                .entry(self.session_id)
-                .or_default()
-                .recover_pending_steering();
+            recover_pending_steering_locked(&mut g, self.session_id)
+        };
+        match outcome {
+            PromptQueueRecoveryOutcome::Nothing => {}
+            PromptQueueRecoveryOutcome::Committed(recovery) => {
+                self.host
+                    .emit_pending_steering_recovery(self.session_id, recovery);
+                // Already durable; a second write here would only add
+                // contention on the session's temp file.
+                return;
+            }
+            // This path used to discard the error entirely, so an abort-path
+            // persistence failure was invisible — unlike the agent-error path,
+            // which reports it. Same failure, same contract, both audible now.
+            PromptQueueRecoveryOutcome::NotPersisted { error } => {
+                self.host
+                    .report_steering_recovery_failure(self.session_id, &error);
+            }
         }
         let _ = self.host.persist_prompt_queue(self.session_id);
     }
@@ -4993,6 +5069,18 @@ impl AgentHostHandle {
         Ok(())
     }
 
+    fn emit_pending_steering_recovery(&self, session_id: Uuid, recovery: PromptQueueRecovery) {
+        self.emit_prompt_queue_changed(
+            session_id,
+            recovery.revision,
+            recovery.entries,
+            "recovered",
+            "bridge".into(),
+            None,
+            Some(SteeringDisposition::Queued),
+        );
+    }
+
     /// Publish a queue snapshot. `revision` must have been stamped by
     /// [`Inner::next_queue_revision`] under the same lock that committed the
     /// mutation — publishing happens here, after that lock is released, so
@@ -5471,17 +5559,35 @@ impl AgentHostHandle {
     }
 
     fn recover_pending_steering_delivery(&self, session_id: Uuid) -> Result<()> {
-        let mut g = self.inner.lock();
-        let mut next = g
-            .prompt_queues
-            .get(&session_id)
-            .cloned()
-            .unwrap_or_default();
-        next.recover_pending_steering();
-        session_store::save_prompt_queue(session_id, &next)
-            .map_err(|error| anyhow!("persist steering recovery: {error}"))?;
-        g.prompt_queues.insert(session_id, next);
-        Ok(())
+        let outcome = {
+            let mut g = self.inner.lock();
+            recover_pending_steering_locked(&mut g, session_id)
+        };
+        match outcome {
+            PromptQueueRecoveryOutcome::Nothing => Ok(()),
+            PromptQueueRecoveryOutcome::Committed(recovery) => {
+                self.emit_pending_steering_recovery(session_id, recovery);
+                Ok(())
+            }
+            // The recovery is already applied in memory; the error still
+            // propagates so the caller reports it, as it always has.
+            PromptQueueRecoveryOutcome::NotPersisted { error } => Err(error),
+        }
+    }
+
+    /// Report a recovery that could not be made durable.
+    ///
+    /// Uses the same `SessionUpdate::Error` channel the agent-error path
+    /// already uses for this failure, so both routes are observable the same
+    /// way. Deliberately not a queue snapshot: the mutation is live but not
+    /// committed, and publishing a revision for it would advance consumer
+    /// watermarks past a state that may not survive a restart.
+    fn report_steering_recovery_failure(&self, session_id: Uuid, error: &anyhow::Error) {
+        let event_tx = { self.inner.lock().event_tx.clone() };
+        let _ = event_tx.send(SessionUpdate::Error {
+            session_id,
+            message: error.to_string(),
+        });
     }
 
     fn drain_pending_steering(
@@ -8501,5 +8607,244 @@ mod computer_agent_host_tests {
 
         drop(host);
         crate::set_grokptah_home_override(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discover::{home_override_serial, set_grokptah_home_override};
+    use crate::event_bus::EventReceiver;
+
+    struct TestHome {
+        _tmp: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            set_grokptah_home_override(None);
+        }
+    }
+
+    fn test_host() -> (TestHome, AgentHostHandle, Uuid) {
+        let lock = home_override_serial();
+        let tmp = tempfile::tempdir().expect("test home");
+        let home = tmp.path().join(".grokptah");
+        std::fs::create_dir_all(home.join("sessions")).expect("sessions directory");
+        set_grokptah_home_override(Some(home));
+
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        host.start().expect("start host");
+        let session = host
+            .session_new_kind(SessionKind::Build)
+            .expect("create build session");
+        (
+            TestHome {
+                _tmp: tmp,
+                _lock: lock,
+            },
+            host,
+            session.id,
+        )
+    }
+
+    fn assert_recovery_event(
+        events: &mut EventReceiver,
+        session_id: Uuid,
+        queued: &PromptQueueEntry,
+        steering: &PromptQueueEntry,
+    ) {
+        let event = events.try_recv().expect("queue recovery event");
+        match event {
+            SessionUpdate::PromptQueueChanged {
+                session_id: event_session_id,
+                revision,
+                entries,
+                action,
+                origin,
+                changed_entry,
+                disposition,
+            } => {
+                assert_eq!(event_session_id, session_id);
+                assert_eq!(revision, 1);
+                assert_eq!(action, "recovered");
+                assert_eq!(origin, "bridge");
+                assert_eq!(changed_entry, None);
+                assert_eq!(disposition, Some(SteeringDisposition::Queued));
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].id, steering.id);
+                assert_eq!(entries[0].version, steering.version + 1);
+                assert_eq!(entries[0].source, "steering_delivery_recovery");
+                assert!(entries[0].priority);
+                assert_eq!(entries[0].owner, steering.owner);
+                assert_eq!(entries[1], *queued);
+            }
+            other => panic!("unexpected queue recovery event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_busy_guard_abort_recovery_emits_authoritative_queue_snapshot() {
+        let (_home, host, session_id) = test_host();
+        let (queued, steering) = {
+            let mut g = host.inner.lock();
+            g.turn_cancels.insert(session_id, CancellationToken::new());
+            let queue = g.prompt_queues.entry(session_id).or_default();
+            let queued = queue
+                .add("durable follow-up", "composer", false)
+                .expect("queue follow-up");
+            let steering = queue
+                .steer_text_with_owner("recover after abort".into(), true, Some("mcp".into()))
+                .expect("queue steering")
+                .entry;
+            (queued, steering)
+        };
+        let mut events = host.event_bus().subscribe();
+
+        drop(TurnBusyGuard {
+            host: host.clone(),
+            session_id,
+            armed: true,
+        });
+
+        assert!(!host.session_busy(session_id));
+        assert_recovery_event(&mut events, session_id, &queued, &steering);
+        let entries = host
+            .session_queue_list(session_id)
+            .expect("recovered queue");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, steering.id);
+        assert_eq!(entries[0].version, steering.version + 1);
+    }
+
+    /// Make the durable write fail deterministically: `atomic_write_json`
+    /// creates `<queue>.json.tmp`, so a directory at that path fails the
+    /// create without touching anything else.
+    fn block_queue_persistence(session_id: Uuid) {
+        let blocked = crate::session_store::session_dir(session_id).join("prompt_queue.json.tmp");
+        std::fs::create_dir_all(&blocked).expect("block the queue temp path");
+    }
+
+    fn seed_pending_steering(
+        host: &AgentHostHandle,
+        session_id: Uuid,
+    ) -> (PromptQueueEntry, PromptQueueEntry) {
+        let mut g = host.inner.lock();
+        let queue = g.prompt_queues.entry(session_id).or_default();
+        let queued = queue
+            .add("durable follow-up", "composer", false)
+            .expect("queue follow-up");
+        let steering = queue
+            .steer_text_with_owner("recover me".into(), true, Some("mcp".into()))
+            .expect("queue steering")
+            .entry;
+        queue.drain_steering();
+        (queued, steering)
+    }
+
+    /// A durable write failure used to return before the recovery was applied,
+    /// so accepted steering stayed in `delivering` where no later boundary
+    /// would deliver it and neither the GUI nor `ptah_get_queue` could see it —
+    /// and the abort path discarded the error, so nothing said so.
+    ///
+    /// The interjection must survive in the live queue, and the failure must
+    /// be audible.
+    #[test]
+    fn a_failed_recovery_write_keeps_the_steering_and_reports_the_failure() {
+        let (_home, host, session_id) = test_host();
+        let (_queued, steering) = seed_pending_steering(&host, session_id);
+        block_queue_persistence(session_id);
+        let mut events = host.event_bus().subscribe();
+
+        let error = host
+            .recover_pending_steering_delivery(session_id)
+            .expect_err("a blocked durable write must be reported");
+        assert!(
+            error.to_string().contains("persist steering recovery"),
+            "unexpected error: {error}"
+        );
+
+        // Not lost: the interjection is in the live queue where the session
+        // can still act on it.
+        let entries = host.session_queue_list(session_id).expect("queue readable");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, steering.id);
+        assert_eq!(entries[0].source, "steering_delivery_recovery");
+
+        // Not claimed as authoritative: no queue snapshot is published for a
+        // mutation that is not durable, so no consumer watermark advances.
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, SessionUpdate::PromptQueueChanged { .. }),
+                "an uncommitted recovery must not publish a queue snapshot"
+            );
+        }
+    }
+
+    /// The abort path is the common one and used to swallow the error whole.
+    #[test]
+    fn the_abort_path_reports_a_failed_recovery_write_too() {
+        let (_home, host, session_id) = test_host();
+        let (_queued, steering) = seed_pending_steering(&host, session_id);
+        block_queue_persistence(session_id);
+        let mut events = host.event_bus().subscribe();
+
+        {
+            let _guard = TurnBusyGuard {
+                host: host.clone(),
+                session_id,
+                armed: true,
+            };
+        }
+
+        let reported = std::iter::from_fn(|| events.try_recv().ok()).any(|event| match event {
+            SessionUpdate::Error { message, .. } => message.contains("persist steering recovery"),
+            SessionUpdate::PromptQueueChanged { .. } => {
+                panic!("an uncommitted recovery must not publish a queue snapshot")
+            }
+            _ => false,
+        });
+        assert!(
+            reported,
+            "the abort path must report a failed durable write"
+        );
+
+        let entries = host.session_queue_list(session_id).expect("queue readable");
+        assert_eq!(entries[0].id, steering.id);
+    }
+
+    #[test]
+    fn agent_error_recovery_emits_authoritative_queue_snapshot() {
+        let (_home, host, session_id) = test_host();
+        let (queued, steering) = {
+            let mut g = host.inner.lock();
+            let queue = g.prompt_queues.entry(session_id).or_default();
+            let queued = queue
+                .add("durable follow-up", "composer", false)
+                .expect("queue follow-up");
+            let steering = queue
+                .steer_text_with_owner("recover after agent error".into(), true, Some("mcp".into()))
+                .expect("queue steering")
+                .entry;
+            queue.drain_steering();
+            (queued, steering)
+        };
+        let mut events = host.event_bus().subscribe();
+
+        // This is the recovery handler called by the agent-error arm.
+        host.recover_pending_steering_delivery(session_id)
+            .expect("recover steering after agent error");
+
+        assert_recovery_event(&mut events, session_id, &queued, &steering);
+        let entries = host
+            .session_queue_list(session_id)
+            .expect("recovered queue");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, steering.id);
+        assert_eq!(entries[0].version, steering.version + 1);
     }
 }
