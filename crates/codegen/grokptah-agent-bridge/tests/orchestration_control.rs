@@ -526,6 +526,104 @@ async fn desktop_writes_invalidate_a_coordinators_stale_queue_mutations() {
     set_grokptah_home_override(None);
 }
 
+/// S7: `reject_control_prompt` stops the control plane from *authoring* `!`
+/// and `/` prompts, but selection verbs took an entry id and never looked at
+/// what they selected. A locally authored admin command could therefore be
+/// promoted to the head of the queue by a correctly authenticated coordinator,
+/// and `run_next` would cancel the active turn to make it run. Selection must
+/// be held to the same policy as authorship.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_coordinator_cannot_schedule_a_locally_authored_command_entry() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 4);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    // The desktop is allowed to author these; the control plane is not.
+    let slash = host
+        .session_queue_add(session.id, "/yolo".into(), false)
+        .unwrap()[0]
+        .clone();
+    let bang = host
+        .session_queue_add(session.id, "!rm -rf /tmp/x".into(), false)
+        .unwrap()[1]
+        .clone();
+    let ordinary = host
+        .session_queue_add(session.id, "summarise the diff".into(), false)
+        .unwrap()[2]
+        .clone();
+
+    for (entry, label) in [(&slash, "slash"), (&bang, "bang")] {
+        let promoted = orch
+            .run_next_queue(
+                &auth,
+                &format!("run-next-{label}"),
+                session.id,
+                ws.path(),
+                &entry.id,
+                entry.version,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            promoted.code.as_str(),
+            "forbidden_scope",
+            "run_next must refuse to schedule a {label} command entry"
+        );
+
+        let moved = orch
+            .reorder_queue(
+                &auth,
+                &format!("reorder-{label}"),
+                session.id,
+                ws.path(),
+                &entry.id,
+                0,
+                entry.version,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            moved.code.as_str(),
+            "forbidden_scope",
+            "reorder must refuse to promote a {label} command entry"
+        );
+    }
+
+    // Nothing moved, and nothing was cancelled on the strength of a refusal.
+    assert_eq!(
+        host.session_queue_list(session.id)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>(),
+        vec!["/yolo", "!rm -rf /tmp/x", "summarise the diff"],
+    );
+
+    // An ordinary entry is still selectable, so this is a policy gate and not
+    // a blanket refusal of the verbs.
+    orch.run_next_queue(
+        &auth,
+        "run-next-ordinary",
+        session.id,
+        ws.path(),
+        &ordinary.id,
+        ordinary.version,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        host.session_queue_list(session.id).unwrap()[0].text,
+        "summarise the diff",
+    );
+    set_grokptah_home_override(None);
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn workspace_mismatch_fail_closed() {

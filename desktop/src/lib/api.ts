@@ -26,6 +26,7 @@ import type {
 import type {
   PromptQueueEntry,
   PromptQueueRunNextResult,
+  PromptQueueSnapshot,
   PromptQueueTakeResult,
   SteeringReceipt,
 } from "./promptQueue";
@@ -217,10 +218,34 @@ export const api = {
       tabIds,
       activeId: activeId ?? null,
     }),
-  sessionPrompt: (sessionId: string, prompt: string) =>
-    invoke<string>("session_prompt", { sessionId, prompt }),
+  /**
+   * `reservation` must be the value a queue drain returned, so the drained
+   * prompt starts the turn its drain reserved rather than racing for a new one.
+   */
+  sessionPrompt: (
+    sessionId: string,
+    prompt: string,
+    reservation?: string | null,
+  ) =>
+    invoke<string>("session_prompt", {
+      sessionId,
+      prompt,
+      reservation: reservation ?? null,
+    }),
+  /** Returns entries plus the revision they were read at (see the reducer). */
   sessionQueueList: (sessionId: string) =>
-    invoke<PromptQueueEntry[]>("session_queue_list", { sessionId }),
+    invoke<PromptQueueSnapshot>("session_queue_list", { sessionId }),
+  /** Give back a drained batch whose turn never started. */
+  sessionQueueRestoreDrain: (
+    sessionId: string,
+    reservation: string | null | undefined,
+    entries: PromptQueueEntry[],
+  ) =>
+    invoke<PromptQueueEntry[]>("session_queue_restore_drain", {
+      sessionId,
+      reservation: reservation ?? null,
+      entries,
+    }),
   sessionQueueAdd: (
     sessionId: string,
     text: string,

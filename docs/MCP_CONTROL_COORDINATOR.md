@@ -295,7 +295,17 @@ Mutating tools take `request_id`:
   versions after any reorder, yours or someone else's.
 - `ptah_run_next` promotes an entry and may explicitly cancel an active turn;
   the cancel happens only after the compare-and-set has passed, so a rejected
-  call never interrupts a running turn. It is distinct from `ptah_steer`,
+  call never interrupts a running turn. The cancel is also bound to the turn
+  that was observed while the queue was locked: if that turn ends before the
+  cancel lands, nothing is cancelled and `cancelledActive` is `false` — a
+  later turn never absorbs a cancel meant for an earlier one.
+- **`ptah_run_next` and `ptah_reorder_queue` will not schedule an entry the
+  control plane could not have created.** The desktop may author `!` shell
+  prompts and `/` commands locally; selecting one from the control plane is
+  refused with `forbidden_scope`, because promoting it to the head of the
+  queue — and, for `run_next`, cancelling the active turn to make it run — is
+  the same outcome `reject_control_prompt` exists to prevent, reached by
+  choosing instead of by writing. Ordinary entries are unaffected. It is distinct from `ptah_steer`,
   which never cancels. `ptah_steer_queued` turns one queued entry into a
   safe-boundary steering action: it reports `pending` during a Build turn and
   `queued` while idle.

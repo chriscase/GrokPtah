@@ -1368,6 +1368,7 @@ impl OrchestrationService {
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_reorder_queue";
+        self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -1490,6 +1491,57 @@ impl OrchestrationService {
         Ok(response)
     }
 
+    /// S7: the control plane must not be able to *schedule* a prompt it is
+    /// forbidden from *creating*.
+    ///
+    /// `reject_control_prompt` blocks `!` and `/` prompts on every path that
+    /// authors text, but selection verbs took an entry id and never looked at
+    /// what they were selecting. A locally authored `/yolo` or `!rm ...` could
+    /// therefore be promoted to the head of the queue, and `run_next` would
+    /// cancel the active turn to make it run — the forbidden outcome reached
+    /// by choosing instead of by writing. Selection is now held to the same
+    /// policy as authorship, evaluated against the stored text.
+    ///
+    /// Reading the entry before claiming the mutation is safe against edits in
+    /// the gap: changing the text bumps the entry version, so the caller's
+    /// `expected_version` fails closed.
+    fn reject_selecting_control_entry(
+        &self,
+        tool: &str,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        entry_id: &str,
+    ) -> Result<(), OrchError> {
+        // Authorize before reading. This runs ahead of `begin_queue_mutation`,
+        // which does its own authorization, so without this an unscoped caller
+        // could learn something about another workspace's queue from whether
+        // the policy rejected it.
+        self.authorize_queue_request(session_id, workspace)?;
+        let entries = self.host.session_queue_list(session_id).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                format!("queue unavailable: {error}"),
+            )
+        })?;
+        let Some(entry) = entries.into_iter().find(|entry| entry.id == entry_id) else {
+            // Leave "unknown entry" to the mutator, so the not-found contract
+            // stays in one place.
+            return Ok(());
+        };
+        if let Err(error) = reject_control_prompt(&entry.text) {
+            self.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&workspace.display().to_string()),
+                &error,
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub async fn run_next_queue(
         &self,
         _auth: &AuthContext,
@@ -1500,6 +1552,7 @@ impl OrchestrationService {
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_run_next";
+        self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),

@@ -46,10 +46,30 @@ pub struct PromptQueueBatch {
     pub text: String,
 }
 
+/// A queue read together with the revision it was taken at.
+///
+/// Consumers apply this through the same watermark as `PromptQueueChanged`,
+/// so a slow read cannot overwrite a newer event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptQueueSnapshot {
+    pub entries: Vec<PromptQueueEntry>,
+    pub revision: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptQueueTakeResult {
     pub batch: Option<PromptQueueBatch>,
     pub entries: Vec<PromptQueueEntry>,
+    /// Turn reservation held for the drained batch, if any.
+    ///
+    /// Draining and starting the turn are two calls. Without a reservation
+    /// another writer can start a turn in between, the start is refused, and
+    /// the batch is already gone from the queue — a silently lost prompt. The
+    /// drain therefore claims the session's turn slot under the same lock that
+    /// removed the batch, and the caller must either present this owner when
+    /// starting the turn or hand the batch back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +390,7 @@ impl SessionPromptQueue {
             return PromptQueueTakeResult {
                 batch: None,
                 entries: Vec::new(),
+                reservation: None,
             };
         }
         let gates = self.queued.iter().map(|entry| CombineGate {
@@ -395,6 +416,22 @@ impl SessionPromptQueue {
                 text,
             }),
             entries: self.list(),
+            // The host attaches the reservation; the queue itself owns no
+            // turn state.
+            reservation: None,
+        }
+    }
+
+    /// Put a drained batch back at the head, in its original order.
+    ///
+    /// Used when the turn the batch was drained for never started. Versions
+    /// are bumped because the entries left the queue and came back: any holder
+    /// of the pre-drain version was, for a moment, describing an entry that no
+    /// longer existed.
+    pub fn restore_batch(&mut self, entries: Vec<PromptQueueEntry>) {
+        for mut entry in entries.into_iter().rev() {
+            entry.version += 1;
+            self.queued.push_front(entry);
         }
     }
 }

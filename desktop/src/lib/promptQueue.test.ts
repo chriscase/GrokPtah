@@ -158,7 +158,49 @@ describe("prompt queue reducer", () => {
     expect(state.revisions).toEqual({ [sessionId]: 5, other: 1 });
   });
 
-  it("applies a revisionless refetch without moving the watermark", () => {
+  it("drops a refetch that was overtaken by a newer event", () => {
+    let state: PromptQueueState = emptyPromptQueueState;
+    // A refetch reads the queue at revision 4...
+    const refetch = {
+      type: "replace" as const,
+      sessionId,
+      entries: [entry("a", "one")],
+      revision: 4,
+    };
+    // ...but a mutation commits and its event lands first.
+    state = promptQueueReducer(state, {
+      type: "replace",
+      sessionId,
+      entries: [entry("a", "one"), entry("b", "two")],
+      revision: 5,
+    });
+    // The slow read must not restore the older membership.
+    state = promptQueueReducer(state, refetch);
+    expect(queueEntriesFor(state, sessionId)).toHaveLength(2);
+    expect(state.revisions[sessionId]).toBe(5);
+  });
+
+  it("applies a refetch that is newer than every event seen", () => {
+    let state: PromptQueueState = emptyPromptQueueState;
+    state = promptQueueReducer(state, {
+      type: "replace",
+      sessionId,
+      entries: [entry("a", "one")],
+      revision: 2,
+    });
+    // A refetch can legitimately be ahead of the event stream: it reads
+    // committed state directly, and its event may not have arrived yet.
+    state = promptQueueReducer(state, {
+      type: "replace",
+      sessionId,
+      entries: [entry("a", "one"), entry("b", "two")],
+      revision: 3,
+    });
+    expect(queueEntriesFor(state, sessionId)).toHaveLength(2);
+    expect(state.revisions[sessionId]).toBe(3);
+  });
+
+  it("applies a revisionless mutation receipt without moving the watermark", () => {
     let state: PromptQueueState = emptyPromptQueueState;
     state = promptQueueReducer(state, {
       type: "replace",
@@ -166,8 +208,8 @@ describe("prompt queue reducer", () => {
       entries: [entry("a", "one")],
       revision: 4,
     });
-    // Tauri `session_queue_list` reads current host state and carries no
-    // revision; it must still apply.
+    // A mutation receipt carries no revision and is ordered by request
+    // alone; it must still apply.
     state = promptQueueReducer(state, {
       type: "replace",
       sessionId,

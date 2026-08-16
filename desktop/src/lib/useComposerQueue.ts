@@ -12,6 +12,7 @@ import {
   queueEntriesFor,
   type PromptQueueAction,
   type PromptQueueEntry,
+  type PromptQueueSnapshot,
 } from "./promptQueue";
 
 export function useComposerQueue(activeSessionId: string | null) {
@@ -37,18 +38,31 @@ export function useComposerQueue(activeSessionId: string | null) {
   );
 
   /**
-   * Apply a bridge snapshot only if it is still the newest request for the
-   * session. Startup hydration and a fast edit/reorder can otherwise race.
+   * Apply a refetched snapshot only if it is still the newest *request* for the
+   * session **and** not older than the newest *event* already applied.
+   *
+   * Those are two different orderings and a refetch loses to both. Request
+   * ordering alone cannot see the event stream: a list response can be
+   * overtaken by a newer `PromptQueueChanged`, still pass this guard, and then
+   * restore the older membership and ordering. The snapshot therefore carries
+   * the revision it was read at, and the reducer's watermark rejects it if an
+   * event has already moved past it.
    */
   const syncQueue = useCallback(
     async (
       sessionId: string,
-      load: () => Promise<PromptQueueEntry[]>,
+      load: () => Promise<PromptQueueEntry[] | PromptQueueSnapshot>,
     ): Promise<PromptQueueEntry[]> => {
       const version = invalidateQueue(sessionId);
-      const entries = await load();
+      const loaded = await load();
+      // A refetch reports the revision it read at and is ordered against the
+      // event stream. A mutation receipt is just the entries and stays
+      // revisionless, so it keeps applying on request order alone.
+      const [entries, revision] = Array.isArray(loaded)
+        ? [loaded, undefined]
+        : [loaded.entries, loaded.revision];
       if (isCurrentQueueRequest(sessionId, version)) {
-        dispatchQueue({ type: "replace", sessionId, entries });
+        dispatchQueue({ type: "replace", sessionId, entries, revision });
       }
       return entries;
     },

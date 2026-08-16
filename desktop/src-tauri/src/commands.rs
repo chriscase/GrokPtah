@@ -4,10 +4,10 @@ use grokptah_agent_bridge::{
     desktop_auto_update_enabled, AuthState, BackgroundTask, ComputerAction, ComputerPermission,
     ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
     JournalPage, McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
-    PromptQueueRunNextResult, PromptQueueTakeResult, ProviderDeadlineClass, ProviderProfileUpdate,
-    ProviderQualificationReport, RunExecutionMode, RunReview, RunState, SearchHit, SearchQuery,
-    SessionCompletion, SessionKind, SessionSummary, SkillInfo, SteeringReceipt, SubagentInfo,
-    TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    PromptQueueRunNextResult, PromptQueueSnapshot, PromptQueueTakeResult, ProviderDeadlineClass,
+    ProviderProfileUpdate, ProviderQualificationReport, RunExecutionMode, RunReview, RunState,
+    SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
+    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
@@ -566,18 +566,46 @@ pub async fn session_prompt(
     state: State<'_, AppState>,
     session_id: String,
     prompt: String,
+    reservation: Option<String>,
 ) -> Result<String, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    state.host.session_prompt(id, prompt).await.map_err(map_err)
+    // A queue drain reserves the session's turn slot under the same lock that
+    // removed the batch, so the drained prompt must start the turn it reserved
+    // rather than racing for a fresh one.
+    match reservation {
+        Some(owner) => state
+            .host
+            .session_prompt_reserved_with_max_rounds(id, prompt, None, &owner)
+            .await
+            .map_err(map_err),
+        None => state.host.session_prompt(id, prompt).await.map_err(map_err),
+    }
+}
+
+#[tauri::command]
+pub fn session_queue_restore_drain(
+    state: State<'_, AppState>,
+    session_id: String,
+    reservation: Option<String>,
+    entries: Vec<PromptQueueEntry>,
+) -> Result<Vec<PromptQueueEntry>, String> {
+    let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .session_queue_restore_drain(id, reservation.as_deref(), entries)
+        .map_err(map_err)
 }
 
 #[tauri::command]
 pub fn session_queue_list(
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<Vec<PromptQueueEntry>, String> {
+) -> Result<PromptQueueSnapshot, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    state.host.session_queue_list(id).map_err(map_err)
+    // Returns the revision alongside the entries so the GUI can order a
+    // refetch against the event stream instead of always trusting whichever
+    // arrived last.
+    state.host.session_queue_snapshot(id).map_err(map_err)
 }
 
 #[tauri::command]

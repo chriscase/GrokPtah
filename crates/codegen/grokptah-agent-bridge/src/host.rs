@@ -45,7 +45,8 @@ use crate::orchestration::{
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::prompt_queue::{
     format_interjection, PromptQueueClearOutcome, PromptQueueEntry, PromptQueueRunNextResult,
-    PromptQueueTakeResult, SessionPromptQueue, SteeringDisposition, SteeringReceipt,
+    PromptQueueSnapshot, PromptQueueTakeResult, SessionPromptQueue, SteeringDisposition,
+    SteeringReceipt,
 };
 use crate::run_promotion::{self, RunReview};
 use crate::search_engine::{self, SearchHit, SearchQuery};
@@ -160,6 +161,13 @@ pub(crate) struct Inner {
     /// Per-session turn cancellation so multiple sessions can run concurrently
     /// (Claude Code–style parallel build sessions).
     turn_cancels: HashMap<Uuid, CancellationToken>,
+    /// Identity of the turn currently installed in `turn_cancels`, so a caller
+    /// that observed a turn under the lock can prove the turn it is about to
+    /// cancel is still that same turn. Without it, a turn that finishes while
+    /// the lock is released lets the next turn absorb someone else's cancel.
+    turn_generations: HashMap<Uuid, u64>,
+    /// Monotonic across all sessions; a generation is never reused.
+    next_turn_generation: u64,
     /// Explicit, short-lived model qualification/proposal calls from the
     /// Computer cockpit. These are independent from Build turns and always
     /// cancelled by local Stop/Take over.
@@ -170,6 +178,11 @@ pub(crate) struct Inner {
     /// Short-lived orchestration admission reservations. These close the gap
     /// between accepting a run and polling its async prompt future.
     turn_reservations: HashMap<Uuid, String>,
+    /// When a queue-drain reservation was taken. A drain claims the turn slot
+    /// and hands it to a separate start call, so a caller that dies in between
+    /// would otherwise wedge the session as permanently busy. Only drain
+    /// reservations are reclaimable, and only after [`DRAIN_RESERVATION_TTL`].
+    drain_reservations: HashMap<Uuid, std::time::Instant>,
     /// Host-global orchestration admissions shared by every control service.
     orchestration_admissions: HashMap<String, Uuid>,
     /// Host-global bounded pending admissions shared by every control service.
@@ -213,6 +226,39 @@ impl Inner {
         *slot += 1;
         *slot
     }
+
+    /// Revision a reader should stamp on a snapshot it just read: the newest
+    /// one already committed, without claiming a new one.
+    fn current_queue_revision(&self, session_id: Uuid) -> u64 {
+        self.prompt_queue_revisions
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Drop a queue-drain reservation whose start call never arrived, so a
+    /// dead drainer cannot leave the session busy forever. Returns true if one
+    /// was reclaimed.
+    fn reclaim_expired_drain_reservation(&mut self, session_id: Uuid) -> bool {
+        let expired = self
+            .drain_reservations
+            .get(&session_id)
+            .is_some_and(|taken| taken.elapsed() >= DRAIN_RESERVATION_TTL);
+        if expired {
+            self.drain_reservations.remove(&session_id);
+            self.turn_reservations.remove(&session_id);
+        }
+        expired
+    }
+
+    /// Install a fresh turn identity. Called under the same lock that inserts
+    /// into `turn_cancels`, so observers see the pair atomically.
+    fn begin_turn_generation(&mut self, session_id: Uuid) -> u64 {
+        self.next_turn_generation += 1;
+        let generation = self.next_turn_generation;
+        self.turn_generations.insert(session_id, generation);
+        generation
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -224,6 +270,11 @@ pub(crate) struct SessionUsage {
 }
 
 const MAX_SESSION_COMPLETION_HISTORY: usize = 64;
+
+/// How long a queue-drain reservation may go unclaimed before another drain
+/// may take the slot. A drain that has not started its turn within this window
+/// is not coming back, and the session must not stay busy on its behalf.
+const DRAIN_RESERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Clears `turn_cancels` for a session when dropped — keeps panics from wedging busy.
 struct TurnBusyGuard {
@@ -246,6 +297,7 @@ impl Drop for TurnBusyGuard {
         {
             let mut g = self.host.inner.lock();
             g.turn_cancels.remove(&self.session_id);
+            g.turn_generations.remove(&self.session_id);
             g.turn_max_rounds.remove(&self.session_id);
             g.prompt_queues
                 .entry(self.session_id)
@@ -476,9 +528,12 @@ impl AgentHost {
             background_cancels: HashMap::new(),
             pending_permissions: HashMap::new(),
             turn_cancels: HashMap::new(),
+            turn_generations: HashMap::new(),
+            next_turn_generation: 0,
             computer_agent_operations: HashMap::new(),
             computer_agent_qualifications: HashMap::new(),
             turn_reservations: HashMap::new(),
+            drain_reservations: HashMap::new(),
             orchestration_admissions: HashMap::new(),
             orchestration_pending_admissions: HashMap::new(),
             orchestration_next_pending_sequence: 0,
@@ -1324,6 +1379,7 @@ impl AgentHostHandle {
     pub fn stop(&self) -> Result<()> {
         self.invalidate_computer_agent_authority();
         let mut g = self.inner.lock();
+        g.turn_generations.clear();
         for (_, c) in g.turn_cancels.drain() {
             c.cancel();
         }
@@ -1673,6 +1729,7 @@ impl AgentHostHandle {
         let mut g = self.inner.lock();
         if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) {
             g.turn_reservations.remove(&session_id);
+            g.drain_reservations.remove(&session_id);
             drop(g);
             self.orchestration_wakeup.notify_waiters();
             true
@@ -2820,6 +2877,7 @@ impl AgentHostHandle {
     pub fn begin_turn_for_test(&self, session_id: Uuid) {
         let mut g = self.inner.lock();
         g.turn_cancels.entry(session_id).or_default();
+        g.begin_turn_generation(session_id);
     }
 
     /// Cancel a single subagent without cancelling the parent turn or siblings (#152).
@@ -3776,14 +3834,30 @@ impl AgentHostHandle {
     }
 
     pub fn session_queue_list(&self, session_id: Uuid) -> Result<Vec<PromptQueueEntry>> {
+        Ok(self.session_queue_snapshot(session_id)?.entries)
+    }
+
+    /// The queue plus the revision it was read at, taken under one lock.
+    ///
+    /// A refetch competes with the event stream, not just with other refetches:
+    /// a list response can be overtaken by a newer `PromptQueueChanged` and
+    /// then applied on top of it, silently restoring an older membership and
+    /// ordering. Stamping the read with the newest committed revision lets a
+    /// consumer put refetches and events through one ordering rule instead of
+    /// two that cannot see each other.
+    pub fn session_queue_snapshot(&self, session_id: Uuid) -> Result<PromptQueueSnapshot> {
         let g = self.inner.lock();
         if !g.sessions.contains_key(&session_id) {
             bail!("unknown session");
         }
-        Ok(g.prompt_queues
-            .get(&session_id)
-            .map(SessionPromptQueue::list)
-            .unwrap_or_default())
+        Ok(PromptQueueSnapshot {
+            entries: g
+                .prompt_queues
+                .get(&session_id)
+                .map(SessionPromptQueue::list)
+                .unwrap_or_default(),
+            revision: g.current_queue_revision(session_id),
+        })
     }
 
     pub fn session_queue_add(
@@ -4051,30 +4125,54 @@ impl AgentHostHandle {
         Ok(list)
     }
 
+    /// Drain the next batch and claim the session's turn slot for it.
+    ///
+    /// Draining and starting the turn are separate calls, so without a
+    /// reservation another writer can start a turn in the gap: the start is
+    /// then refused and the batch is already gone from the queue, which loses
+    /// the prompt outright. Taking the batch and reserving the turn under one
+    /// lock makes the handoff atomic. The caller must present
+    /// `result.reservation` when starting the turn, or call
+    /// [`Self::session_queue_restore_drain`] to give both back.
     pub fn session_queue_take_next(&self, session_id: Uuid) -> Result<PromptQueueTakeResult> {
         let (result, revision) = {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&session_id) {
                 bail!("unknown session");
             }
-            let active = g.turn_cancels.contains_key(&session_id);
+            // A reservation counts as busy too: draining into a session an
+            // orchestration run has already claimed would hit the same refusal.
+            // An abandoned drain reservation is reclaimed first, so a drainer
+            // that died between taking a batch and starting its turn cannot
+            // leave the session busy forever.
+            g.reclaim_expired_drain_reservation(session_id);
+            let busy = g.turn_cancels.contains_key(&session_id)
+                || g.turn_reservations.contains_key(&session_id);
             let queue = g.prompt_queues.entry(session_id).or_default();
-            if active {
+            if busy {
                 let entries = queue.list();
                 (
                     PromptQueueTakeResult {
                         batch: None,
                         entries,
+                        reservation: None,
                     },
                     None,
                 )
             } else {
-                let result = queue.take_next();
-                // Only a real drain mutates the queue, so only that stamps.
-                let revision = result
-                    .batch
-                    .is_some()
-                    .then(|| g.next_queue_revision(session_id));
+                let mut result = queue.take_next();
+                // Only a real drain mutates the queue, so only that stamps
+                // a revision and only that claims the turn slot.
+                let revision = if result.batch.is_some() {
+                    let owner = format!("queue-drain:{}", Uuid::new_v4());
+                    g.turn_reservations.insert(session_id, owner.clone());
+                    g.drain_reservations
+                        .insert(session_id, std::time::Instant::now());
+                    result.reservation = Some(owner);
+                    Some(g.next_queue_revision(session_id))
+                } else {
+                    None
+                };
                 (result, revision)
             }
         };
@@ -4091,6 +4189,54 @@ impl AgentHostHandle {
             );
         }
         Ok(result)
+    }
+
+    /// Hand a drained batch back after its turn failed to start.
+    ///
+    /// Releases the reservation taken by [`Self::session_queue_take_next`] and
+    /// pushes the entries back at the head in their original order, so a drain
+    /// whose turn never began is a no-op rather than a lost prompt. Safe to
+    /// call with a reservation that is no longer held — the entries are still
+    /// restored, because the batch being out of the queue is the part that
+    /// loses data.
+    pub fn session_queue_restore_drain(
+        &self,
+        session_id: Uuid,
+        reservation: Option<&str>,
+        entries: Vec<PromptQueueEntry>,
+    ) -> Result<Vec<PromptQueueEntry>> {
+        if entries.is_empty() {
+            if let Some(owner) = reservation {
+                self.release_turn_reservation(session_id, owner);
+            }
+            return self.session_queue_list(session_id);
+        }
+        let (list, revision) = {
+            let mut g = self.inner.lock();
+            if let Some(owner) = reservation {
+                if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) {
+                    g.turn_reservations.remove(&session_id);
+                    g.drain_reservations.remove(&session_id);
+                }
+            }
+            let queue = g.prompt_queues.entry(session_id).or_default();
+            queue.restore_batch(entries);
+            let list = queue.list();
+            let revision = g.next_queue_revision(session_id);
+            (list, revision)
+        };
+        self.orchestration_wakeup.notify_waiters();
+        let _ = self.persist_prompt_queue(session_id);
+        self.emit_prompt_queue_changed(
+            session_id,
+            revision,
+            list.clone(),
+            "restored",
+            "desktop".to_string(),
+            list.first().cloned(),
+            None,
+        );
+        Ok(list)
     }
 
     pub fn session_queue_run_next(
@@ -4114,7 +4260,7 @@ impl AgentHostHandle {
         origin: &str,
         expected_version: u64,
     ) -> Result<PromptQueueRunNextResult> {
-        let (changed_entry, active, revision) = {
+        let (changed_entry, active_generation, revision) = {
             let mut g = self.inner.lock();
             let queue = g
                 .prompt_queues
@@ -4122,12 +4268,19 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("no prompt queue for session {session_id}"))?;
             queue.check_version(entry_id, expected_version)?;
             let changed_entry = queue.run_next(entry_id)?;
-            let active = g.turn_cancels.contains_key(&session_id);
+            // Capture *which* turn is active, not merely that one is. The
+            // observed turn can finish before the cancel below, and an
+            // unconditional cancel would then interrupt whichever turn started
+            // next — a turn this caller never observed.
+            let active_generation = g.turn_generations.get(&session_id).copied();
             let revision = g.next_queue_revision(session_id);
-            (changed_entry, active, revision)
+            (changed_entry, active_generation, revision)
         };
         let _ = self.persist_prompt_queue(session_id);
-        let cancelled_active = active && self.cancel_turn(Some(session_id)).is_ok();
+        let cancelled_active = active_generation.is_some_and(|generation| {
+            self.cancel_turn_if_generation(session_id, generation)
+                .is_ok()
+        });
         let result = PromptQueueRunNextResult {
             entries: self.session_queue_list(session_id)?,
             cancelled_active,
@@ -4241,8 +4394,52 @@ impl AgentHostHandle {
 
     /// Cancel the in-flight turn for `session_id`, or every active turn when
     /// `session_id` is `None` (shutdown / global stop).
+    /// Cancel a session's turn **only if** it is still the turn identified by
+    /// `generation`.
+    ///
+    /// `run_next` observes the active turn while holding the queue lock but
+    /// cannot cancel under it, because teardown re-enters the lock. Between
+    /// those two points the observed turn can finish and a new one can start,
+    /// and an unconditional `cancel_turn` would then kill the newcomer — a
+    /// turn the caller never saw and never asked to interrupt. Re-checking the
+    /// identity closes that window: a mismatch means the observed turn is
+    /// already gone, so there is nothing this call is entitled to cancel.
+    fn cancel_turn_if_generation(&self, session_id: Uuid, generation: u64) -> Result<()> {
+        self.cancel_turn_checked(Some(session_id), Some(generation))
+    }
+
+    /// Test helper: back-date a drain reservation so the reclaim path is
+    /// reachable without sleeping for the TTL.
+    pub fn expire_drain_reservation_for_test(&self, session_id: Uuid) {
+        let mut g = self.inner.lock();
+        if let Some(taken) = g.drain_reservations.get_mut(&session_id) {
+            *taken = std::time::Instant::now() - DRAIN_RESERVATION_TTL;
+        }
+    }
+
+    /// Test helper: cancel only if `generation` is still the live turn.
+    pub fn cancel_turn_if_generation_for_test(
+        &self,
+        session_id: Uuid,
+        generation: u64,
+    ) -> Result<()> {
+        self.cancel_turn_if_generation(session_id, generation)
+    }
+
     pub fn cancel_turn(&self, session_id: Option<Uuid>) -> Result<()> {
-        let (live_shells, kill_ids) = self.cancel_turn_prepare(session_id)?;
+        self.cancel_turn_checked(session_id, None)
+    }
+
+    fn cancel_turn_checked(
+        &self,
+        session_id: Option<Uuid>,
+        expect_generation: Option<u64>,
+    ) -> Result<()> {
+        // The identity check lives inside `cancel_turn_prepare`, under the one
+        // lock acquisition that also fires the token: checking first and
+        // cancelling afterwards would leave exactly the window it is meant to
+        // close.
+        let (live_shells, kill_ids) = self.cancel_turn_prepare(session_id, expect_generation)?;
         // Fire-and-forget kill for sync callers (desktop stop button).
         let handle = tokio::runtime::Handle::try_current();
         if let Ok(h) = handle {
@@ -4261,7 +4458,7 @@ impl AgentHostHandle {
 
     /// Cancel turn and **await** shell/subagent teardown (duration limits / orchestration).
     pub async fn cancel_turn_and_await(&self, session_id: Option<Uuid>) -> Result<()> {
-        let (live_shells, kill_ids) = self.cancel_turn_prepare(session_id)?;
+        let (live_shells, kill_ids) = self.cancel_turn_prepare(session_id, None)?;
         kill_shells(live_shells, kill_ids).await;
         // Brief settle so cancel tokens propagate.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -4271,10 +4468,16 @@ impl AgentHostHandle {
     fn cancel_turn_prepare(
         &self,
         session_id: Option<Uuid>,
+        expect_generation: Option<u64>,
     ) -> Result<(local_tools::LiveShellMap, Vec<Uuid>)> {
         let mut g = self.inner.lock();
         match session_id {
             Some(id) => {
+                if let Some(expected) = expect_generation {
+                    if g.turn_generations.get(&id).copied() != Some(expected) {
+                        bail!("turn {expected} for session {id} is no longer active");
+                    }
+                }
                 let Some(c) = g.turn_cancels.get(&id) else {
                     bail!("no active turn for session {id}");
                 };
@@ -4405,6 +4608,7 @@ impl AgentHostHandle {
                     if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) =>
                 {
                     g.turn_reservations.remove(&session_id);
+                    g.drain_reservations.remove(&session_id);
                 }
                 Some(_) => bail!("missing or mismatched turn reservation"),
                 None if g.turn_reservations.contains_key(&session_id) => {
@@ -4417,6 +4621,7 @@ impl AgentHostHandle {
             let effort = g.effort;
             let cancel = CancellationToken::new();
             g.turn_cancels.insert(session_id, cancel.clone());
+            g.begin_turn_generation(session_id);
             if let Some(n) = max_rounds {
                 g.turn_max_rounds.insert(session_id, n.max(1));
             } else {

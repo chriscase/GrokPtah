@@ -106,6 +106,7 @@ pub fn run() {
             commands::session_queue_edit,
             commands::session_queue_remove,
             commands::session_queue_clear,
+            commands::session_queue_restore_drain,
             commands::session_queue_move,
             commands::session_queue_take_next,
             commands::session_queue_run_next,

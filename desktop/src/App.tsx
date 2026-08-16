@@ -1527,6 +1527,8 @@ export default function App() {
   async function drainNextQueuedPrompt(sessionId: string) {
     if (queueDrainsRef.current.has(sessionId)) return;
     queueDrainsRef.current.add(sessionId);
+    let pending: { reservation?: string | null; entries: PromptQueueEntry[] } | null =
+      null;
     try {
       const requestVersion = invalidateQueue(sessionId);
       const result = await api.sessionQueueTakeNext(sessionId);
@@ -1539,11 +1541,38 @@ export default function App() {
       }
       const batch = result.batch;
       if (batch?.text.trim()) {
-        await sendPrompt(batch.text, { fromQueue: true, sessionId });
+        // The drain removed these entries and reserved the turn slot for
+        // them. Until the turn actually starts they exist only here, so
+        // anything that stops us short has to hand them back.
+        pending = { reservation: result.reservation, entries: batch.entries };
+        await sendPrompt(batch.text, {
+          fromQueue: true,
+          sessionId,
+          reservation: result.reservation,
+        });
+        pending = null;
+      } else if (result.reservation) {
+        // Nothing to send, but the slot was claimed: release it.
+        pending = { reservation: result.reservation, entries: [] };
       }
     } catch (error) {
       console.warn("prompt queue drain failed", error);
     } finally {
+      if (pending) {
+        try {
+          const entries = await api.sessionQueueRestoreDrain(
+            sessionId,
+            pending.reservation,
+            pending.entries,
+          );
+          dispatchQueue({ type: "replace", sessionId, entries });
+        } catch (restoreError) {
+          console.error(
+            "failed to restore a drained prompt queue batch",
+            restoreError,
+          );
+        }
+      }
       queueDrainsRef.current.delete(sessionId);
     }
   }
@@ -1555,6 +1584,8 @@ export default function App() {
       runNext?: boolean;
       fromQueue?: boolean;
       sessionId?: string;
+      /** Turn slot a queue drain already claimed for this prompt. */
+      reservation?: string | null;
     },
   ) {
     const prompt = (text ?? composer).trim();
@@ -1903,7 +1934,7 @@ export default function App() {
         }
         return;
       }
-      const reply = await api.sessionPrompt(id, prompt);
+      const reply = await api.sessionPrompt(id, prompt, opts?.reservation);
       // Prefer durable transcript (includes tool rows) over pure event state.
       // Events may lag or miss tool cards; disk is the source of truth after the turn.
       try {

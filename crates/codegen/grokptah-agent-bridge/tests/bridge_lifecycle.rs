@@ -1709,6 +1709,210 @@ async fn stale_run_next_is_rejected_without_cancelling_the_active_turn() {
     );
 }
 
+/// P1: `run_next` observes the active turn under the queue lock but cancels
+/// after releasing it. If the observed turn finishes in that gap and a new one
+/// starts, an unconditional cancel kills the newcomer — a turn the caller
+/// never saw. The cancel must be bound to the turn that was observed.
+#[tokio::test]
+async fn run_next_cannot_cancel_a_turn_that_started_after_the_one_it_observed() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let entry = host
+        .session_queue_add(session.id, "follow up".into(), false)
+        .unwrap()[0]
+        .clone();
+
+    // Turn A runs and finishes.
+    host.session_prompt(session.id, "run true".into())
+        .await
+        .unwrap();
+    let _ = drain_until_turn_complete(&mut rx).await;
+
+    // Turn B starts. `run_next` must not be able to cancel it on the strength
+    // of having observed turn A.
+    let runner = {
+        let host = host.clone();
+        tokio::spawn(async move { host.session_prompt(session.id, "run sleep 1".into()).await })
+    };
+    loop {
+        let event = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("second turn did not start")
+            .expect("event channel closed");
+        if matches!(event, SessionUpdate::ShellSessionStarted { .. }) {
+            break;
+        }
+    }
+
+    // A stale generation stands in for "the turn I observed is already gone".
+    let stale = host.cancel_turn_if_generation_for_test(session.id, 1);
+    assert!(
+        stale.is_err(),
+        "cancelling a turn that already ended must not fall through to the current one"
+    );
+
+    timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("turn B did not finish")
+        .unwrap()
+        .unwrap();
+    let events = drain_until_turn_complete(&mut rx).await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            SessionUpdate::TurnComplete {
+                cancelled: true,
+                ..
+            }
+        )),
+        "turn B must not have absorbed a cancel meant for turn A"
+    );
+    // The queue is untouched by the refused cancel.
+    let listed = host.session_queue_list(session.id).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, entry.id);
+}
+
+/// P1: draining a batch and starting its turn are two calls. Without a turn
+/// reservation another writer can start a turn in between; the drained prompt
+/// is then refused by the busy check and is already gone from the queue.
+#[tokio::test]
+async fn a_drain_reserves_the_turn_so_a_racing_writer_cannot_lose_the_prompt() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+    host.session_queue_add(session.id, "queued work".into(), false)
+        .unwrap();
+
+    let drained = host.session_queue_take_next(session.id).unwrap();
+    let batch = drained.batch.expect("a batch was queued");
+    let reservation = drained
+        .reservation
+        .expect("a drain that removes entries must claim the turn slot");
+    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+
+    // The racing writer now loses, instead of winning and stranding the batch.
+    let raced = host
+        .reserve_orchestration_turn("competing-run", session.id)
+        .is_err();
+    assert!(raced, "the drain must hold the session's turn slot");
+
+    // And the drain can still start the turn it reserved.
+    host.session_prompt_reserved_with_max_rounds(
+        session.id,
+        batch.text.clone(),
+        None,
+        &reservation,
+    )
+    .await
+    .unwrap();
+}
+
+/// The other half: if the turn never starts, the batch has to come back rather
+/// than vanish, and the reservation must not be left holding the session.
+#[tokio::test]
+async fn restoring_an_unstarted_drain_returns_the_prompts_and_frees_the_turn() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig::default());
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+    host.session_queue_add(session.id, "first".into(), false)
+        .unwrap();
+    host.session_queue_add(session.id, "second".into(), false)
+        .unwrap();
+    let before: Vec<String> = host
+        .session_queue_list(session.id)
+        .unwrap()
+        .iter()
+        .map(|entry| entry.text.clone())
+        .collect();
+
+    let drained = host.session_queue_take_next(session.id).unwrap();
+    let batch = drained.batch.expect("a batch was queued");
+    let reservation = drained.reservation.expect("drain reserves the turn");
+
+    let restored = host
+        .session_queue_restore_drain(session.id, Some(&reservation), batch.entries.clone())
+        .unwrap();
+    assert_eq!(
+        restored
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>(),
+        before,
+        "restored entries keep their original order"
+    );
+    // Versions move, because the entries were briefly out of the queue: a
+    // holder of the pre-drain version was describing something that did not
+    // exist.
+    assert!(restored.iter().all(|entry| entry.version >= 1));
+    // The slot is free again for whoever wants it next.
+    host.reserve_orchestration_turn("later-run", session.id)
+        .expect("restore must release the reservation");
+}
+
+/// Reserving the turn on drain is what stops a racing writer from stranding
+/// the batch, but it also means a drainer that dies between taking the batch
+/// and starting the turn would hold the session busy forever. An abandoned
+/// drain reservation must be reclaimable.
+#[tokio::test]
+async fn an_abandoned_drain_reservation_does_not_wedge_the_session() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig::default());
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+    host.session_queue_add(session.id, "first".into(), false)
+        .unwrap();
+    host.session_queue_add(session.id, "second".into(), false)
+        .unwrap();
+
+    // Drain once and then simply walk away, as a crashed renderer would.
+    // `take_next` combines the plain prefix, so this empties the queue.
+    let abandoned = host.session_queue_take_next(session.id).unwrap();
+    assert!(abandoned.reservation.is_some());
+    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+
+    // New work arrives for a session whose turn slot is still held.
+    host.session_queue_add(session.id, "third".into(), false)
+        .unwrap();
+    assert!(
+        host.session_queue_take_next(session.id)
+            .unwrap()
+            .batch
+            .is_none(),
+        "a live reservation must still block a second drain"
+    );
+
+    host.expire_drain_reservation_for_test(session.id);
+
+    let recovered = host.session_queue_take_next(session.id).unwrap();
+    assert_eq!(
+        recovered.batch.as_ref().map(|batch| batch.text.as_str()),
+        Some("third"),
+        "an abandoned drain reservation must be reclaimable"
+    );
+    assert!(recovered.reservation.is_some());
+}
+
 #[tokio::test]
 async fn steer_at_idle_boundary_is_preserved_as_run_next_queue_entry() {
     let _iso = IsolatedHome::install();

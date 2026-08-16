@@ -199,6 +199,19 @@ export type PromptQueueBatch = {
 export type PromptQueueTakeResult = {
   batch?: PromptQueueBatch | null;
   entries: PromptQueueEntry[];
+  /**
+   * Turn slot claimed for this batch under the same lock that removed it.
+   * Present only when a batch was drained. Present it when starting the turn,
+   * or hand the batch back — a drain whose turn never starts otherwise loses
+   * the prompt outright.
+   */
+  reservation?: string | null;
+};
+
+/** A queue read stamped with the revision it was taken at. */
+export type PromptQueueSnapshot = {
+  entries: PromptQueueEntry[];
+  revision: number;
 };
 
 export type PromptQueueRunNextResult = {
