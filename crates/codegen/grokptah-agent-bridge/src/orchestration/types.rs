@@ -442,6 +442,10 @@ impl OrchErrorCode {
 pub struct OrchError {
     pub code: OrchErrorCode,
     pub message: String,
+    /// Extra JSON-RPC `error.data` fields (merged with `code`). Used so a
+    /// 410 `cursor_expired` can carry `eventRange` without a second read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 impl OrchError {
@@ -449,6 +453,19 @@ impl OrchError {
         Self {
             code,
             message: message.into(),
+            data: None,
+        }
+    }
+
+    pub fn with_data(
+        code: OrchErrorCode,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: Some(data),
         }
     }
 }

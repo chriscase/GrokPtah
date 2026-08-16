@@ -67,9 +67,13 @@ messages stay on the local `ComputerRun` record; the projection carries only
 `expectedPostconditionMet` and the closed `code` enum. Restart recovery clears
 `last_outcome` so a leaky action summary cannot survive a process restart.
 
-`project_run_at` takes an explicit instant instead of reading an ambient clock. One durable
-record therefore serializes identically on both surfaces, and staleness and duration assertions
-are deterministic under test.
+`project_run_at` takes an explicit instant instead of reading an ambient clock. Given the same
+`(record, now)`, GUI and coordinator serialize identically — including clock-derived fields
+(`progress.elapsedMillis`, `observation.stale`, `grant.expired`). Live MCP calls pass
+`Utc::now()` independently, so those three fields are **not** promised byte-identical across
+surfaces or across duplicate live calls. Durable fields (state, disposition, epoch, event
+range, last-outcome/error summaries, observation metadata other than staleness) do not depend
+on the call instant.
 
 The two read gates share the projection type, not an API:
 
@@ -94,8 +98,9 @@ tools over this contract — `ptah_list_computer_runs`, `ptah_get_computer_run`,
 owning `session_id` plus the claimed allowlisted workspace, which must equal the run's
 binding exactly. A run without a binding (created before the field existed) is invisible
 to MCP: authorization fails closed rather than inferring a workspace from current process
-state. Cross-workspace, cross-session, unbound, unknown, and traversal-shaped reads all
-collapse into the same `unauthorized`/`forbidden_scope` failure. The desktop and the
+state. Unknown session, a mismatched allowlisted workspace, cross-session, unbound,
+unknown run, and traversal-shaped reads all collapse into the same
+`unauthorized`/`forbidden_scope` failure. The desktop and the
 control plane share one `ComputerStore` handle through `AgentHost::ensure_computer_store`
 because the ledger holds an exclusive file lock. No mutation, grant, evidence byte, or
 screenshot crosses MCP; see `docs/MCP_CONTROL_COORDINATOR.md` for the wire contract and

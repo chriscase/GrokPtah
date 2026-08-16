@@ -414,9 +414,18 @@ MCP**; the release gate snapshots the surface so a mutation cannot slip in.
   so no read is a run-existence oracle.
 - `ptah_get_computer_run_events` pages the bounded durable audit ring.
   `nextCursor` is present only while entries remain; a cursor below the
-  retained window is **410 `cursor_expired`** (recover from the projection's
-  `eventRange` and resume at `startSeq - 1`); a cursor at or past the tail is
-  a valid empty page. Omitting `after_seq` reads from the retained start.
+  retained window is **410 `cursor_expired`** with `eventRange` on the error
+  so recovery does not require a second `ptah_get_computer_run`. Resume at
+  `startSeq - 1`. A cursor at or past the tail is a valid empty page.
+  Omitting `after_seq` reads from the retained start.
+- Unknown session, a mismatched allowlisted workspace, and an unauthorized
+  run all return the **identical** `forbidden_scope` error. Session existence
+  is not distinguishable from cross-scope. A claimed workspace that is not
+  on the host allowlist still fails as `workspace_mismatch` (session-
+  independent).
+- GUI and MCP projections are byte-identical for one `(record, now)`. Live
+  MCP uses `Utc::now()` per call, so `elapsedMillis` / `stale` / `expired`
+  may differ across surfaces.
 - `ptah_get_computer_capacity` reports the constant ledger bound (256
   records) plus counts scoped to the `(session, workspace)` binding
   (`boundRuns` / `boundActiveRuns`). Host-wide stored/active totals are
