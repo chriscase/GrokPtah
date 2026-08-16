@@ -1932,7 +1932,7 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
                     "entry_id": first_id,
                     "to_index": 0,
                     "expected_version": 1,
-                    "expected_revision": reorder_revision
+                    "expected_revision": reorder_revision + 1
                 }),
             )
             .await

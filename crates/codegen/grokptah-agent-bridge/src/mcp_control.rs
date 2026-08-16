@@ -2012,6 +2012,16 @@ mod tests {
                 "{name} missing session_id"
             );
             assert_eq!(schema["additionalProperties"], json!(false));
+            if name == "ptah_reorder_queue" {
+                assert!(
+                    schema["required"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item == "expected_revision"),
+                    "{name} missing expected_revision"
+                );
+            }
         }
     }
 }
