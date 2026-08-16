@@ -1299,7 +1299,9 @@ impl OrchestrationService {
 
     fn queue_error(error: anyhow::Error) -> OrchError {
         let message = error.to_string();
-        let code = if message.contains("stale queued prompt version") {
+        let code = if message.contains("stale queued prompt version")
+            || message.contains("stale prompt queue revision")
+        {
             OrchErrorCode::StaleVersion
         } else if message.contains("unknown queued prompt")
             || message.contains("no prompt queue for session")
@@ -1311,6 +1313,7 @@ impl OrchestrationService {
         OrchError::new(code, message)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn queue_response(
         request_id: &str,
         session_id: Uuid,
@@ -1319,6 +1322,7 @@ impl OrchestrationService {
         entries: Vec<PromptQueueEntry>,
         changed_entry: Option<PromptQueueEntry>,
         disposition: Option<SteeringDisposition>,
+        revision: u64,
     ) -> serde_json::Value {
         json!({
             "requestId": request_id,
@@ -1329,6 +1333,12 @@ impl OrchestrationService {
             "action": action,
             "disposition": disposition,
             "actionVersion": changed_entry.as_ref().map(|entry| entry.version),
+            // The queue revision this mutation produced. Reorder is fenced on
+            // it, so a coordinator that had to re-read the queue after every
+            // other verb could never chain a mutation into a reorder without a
+            // window for someone else to move first. Every receipt now carries
+            // the revision its own mutation stamped.
+            "revision": revision,
             "entry": changed_entry,
             "entries": entries,
         })
@@ -1341,14 +1351,15 @@ impl OrchestrationService {
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
         let claimed = self.authorize_queue_request(session_id, workspace)?;
-        let entries = self
+        let snapshot = self
             .host
-            .session_queue_list(session_id)
+            .session_queue_snapshot(session_id)
             .map_err(Self::queue_error)?;
         Ok(json!({
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
-            "entries": entries,
+            "revision": snapshot.revision,
+            "entries": snapshot.entries,
         }))
     }
 
@@ -1388,7 +1399,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let entries = match self
+        let (entries, revision) = match self
             .host
             .session_queue_edit_with_origin(session_id, entry_id, version, text, "mcp")
         {
@@ -1412,6 +1423,7 @@ impl OrchestrationService {
             entries,
             changed_entry,
             None,
+            revision,
         );
         if let Err(error) = lease.complete(None, response.clone()) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
@@ -1451,12 +1463,10 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let (entries, changed_entry) = match self.host.session_queue_remove_with_origin_receipt(
-            session_id,
-            entry_id,
-            "mcp",
-            expected_version,
-        ) {
+        let (entries, changed_entry, revision) = match self
+            .host
+            .session_queue_remove_with_origin_receipt(session_id, entry_id, "mcp", expected_version)
+        {
             Ok(entries) => entries,
             Err(error) => {
                 return Err(self.fail_claim(
@@ -1476,6 +1486,7 @@ impl OrchestrationService {
             entries,
             Some(changed_entry),
             None,
+            revision,
         );
         if let Err(error) = lease.complete(None, response.clone()) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
@@ -1502,6 +1513,7 @@ impl OrchestrationService {
         entry_id: &str,
         to_index: usize,
         expected_version: u64,
+        expected_revision: u64,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_reorder_queue";
         self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
@@ -1511,6 +1523,7 @@ impl OrchestrationService {
             "entryId": entry_id,
             "toIndex": to_index,
             "expectedVersion": expected_version,
+            "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
             .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
@@ -1519,14 +1532,15 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let entries = match self.host.session_queue_move_with_origin(
+        let (entries, revision) = match self.host.session_queue_move_with_origin_and_revision(
             session_id,
             entry_id,
             to_index,
             "mcp",
             expected_version,
+            expected_revision,
         ) {
-            Ok(entries) => entries,
+            Ok(result) => result,
             Err(error) => {
                 return Err(self.fail_claim(
                     &mut lease,
@@ -1538,7 +1552,7 @@ impl OrchestrationService {
             }
         };
         let changed_entry = entries.iter().find(|entry| entry.id == entry_id).cloned();
-        let response = Self::queue_response(
+        let mut response = Self::queue_response(
             request_id,
             session_id,
             &claimed,
@@ -1546,7 +1560,9 @@ impl OrchestrationService {
             entries,
             changed_entry,
             None,
+            revision,
         );
+        response["revision"] = json!(revision);
         if let Err(error) = lease.complete(None, response.clone()) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
@@ -1581,7 +1597,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let (entries, outcome) = match self
+        let (entries, outcome, revision) = match self
             .host
             .session_queue_clear_with_origin_receipt(session_id, "mcp")
         {
@@ -1597,7 +1613,7 @@ impl OrchestrationService {
             }
         };
         let mut response = Self::queue_response(
-            request_id, session_id, &claimed, "cleared", entries, None, None,
+            request_id, session_id, &claimed, "cleared", entries, None, None, revision,
         );
         // An empty `entries` list alone would be a fail-open receipt: steering
         // already handed to a model boundary cannot be retracted and will
@@ -1702,7 +1718,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let result = match self.host.session_queue_run_next_with_origin(
+        let (result, revision) = match self.host.session_queue_run_next_with_origin(
             session_id,
             entry_id,
             "mcp",
@@ -1730,6 +1746,7 @@ impl OrchestrationService {
             result.entries,
             changed_entry,
             None,
+            revision,
         );
         response["cancelledActive"] = json!(result.cancelled_active);
         if let Err(error) = lease.complete(None, response.clone()) {
@@ -1771,7 +1788,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let receipt = match self.host.session_queue_steer_entry_with_origin(
+        let (receipt, revision) = match self.host.session_queue_steer_entry_with_origin(
             session_id,
             entry_id,
             "mcp",
@@ -1796,6 +1813,7 @@ impl OrchestrationService {
             receipt.entries,
             Some(receipt.entry),
             Some(receipt.disposition),
+            revision,
         );
         if let Err(error) = lease.complete(None, response.clone()) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
@@ -2813,24 +2831,25 @@ impl OrchestrationService {
             IdempotencyStart::Perform(lease) => lease,
         };
 
-        let (entries, changed_entry) = match self.host.session_queue_add_with_source_receipt(
-            session_id,
-            prompt,
-            priority,
-            "control",
-            Some("mcp".into()),
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                return Err(self.fail_claim(
-                    &mut lease,
-                    None,
-                    session_id,
-                    &claimed,
-                    OrchError::new(OrchErrorCode::Internal, e.to_string()),
-                ));
-            }
-        };
+        let (entries, changed_entry, revision) =
+            match self.host.session_queue_add_with_source_receipt(
+                session_id,
+                prompt,
+                priority,
+                "control",
+                Some("mcp".into()),
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        None,
+                        session_id,
+                        &claimed,
+                        OrchError::new(OrchErrorCode::Internal, e.to_string()),
+                    ));
+                }
+            };
         let response = json!({
             "requestId": request_id,
             "actionId": request_id,
@@ -2840,6 +2859,7 @@ impl OrchestrationService {
             "action": "queued",
             "disposition": "queued",
             "actionVersion": changed_entry.version,
+            "revision": revision,
             "entry": changed_entry,
             "entries": entries,
         });
@@ -2910,21 +2930,22 @@ impl OrchestrationService {
             IdempotencyStart::Perform(lease) => lease,
         };
 
-        let receipt = match self
-            .host
-            .session_steer_with_owner(session_id, text, Some("mcp".into()))
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(self.fail_claim(
-                    &mut lease,
-                    None,
-                    session_id,
-                    &claimed,
-                    OrchError::new(OrchErrorCode::Internal, e.to_string()),
-                ));
-            }
-        };
+        let (receipt, revision) =
+            match self
+                .host
+                .session_steer_with_owner(session_id, text, Some("mcp".into()))
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        None,
+                        session_id,
+                        &claimed,
+                        OrchError::new(OrchErrorCode::Internal, e.to_string()),
+                    ));
+                }
+            };
         let response = json!({
             "requestId": request_id,
             "actionId": request_id,
@@ -2935,6 +2956,7 @@ impl OrchestrationService {
             "disposition": receipt.disposition,
             "entry": receipt.entry,
             "actionVersion": receipt.entry.version,
+            "revision": revision,
             "entries": receipt.entries,
         });
         if let Err(e) = lease.complete(None, response.clone()) {

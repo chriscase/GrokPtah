@@ -1825,6 +1825,7 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
         .await
         .unwrap();
     assert_eq!(snapshot.structured["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot.structured["revision"], 2);
 
     let edit_args = json!({
         "request_id": "queue-http-edit",
@@ -1860,6 +1861,15 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
         .await
         .is_err());
 
+    let before_reorder = client
+        .call_tool("ptah_get_queue", scope(session.id))
+        .await
+        .unwrap();
+    let reorder_revision = before_reorder.structured["revision"]
+        .as_u64()
+        .expect("queue revision");
+    assert_eq!(reorder_revision, 3);
+
     // S3: every mutator below is compare-and-set, and omitting the version is
     // a schema rejection rather than a last-write-wins mutation. Assert that
     // before any of them is allowed to succeed, and that nothing moved.
@@ -1877,6 +1887,7 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
         });
         if tool == "ptah_reorder_queue" {
             args["to_index"] = json!(0);
+            args["expected_revision"] = json!(0);
         }
         assert!(
             client.call_tool(tool, args).await.is_err(),
@@ -1899,12 +1910,14 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
                 "workspace": ws.path().display().to_string(),
                 "entry_id": second_id,
                 "to_index": 0,
-                "expected_version": 0
+                "expected_version": 0,
+                "expected_revision": reorder_revision
             }),
         )
         .await
         .unwrap();
     assert_eq!(reordered.structured["entries"][0]["id"], second_id);
+    assert_eq!(reordered.structured["revision"], reorder_revision + 1);
     // S3: reorder now bumps every version it shifted, so a second coordinator
     // holding the pre-move ordering loses its CAS instead of both succeeding.
     assert_eq!(reordered.structured["entries"][0]["version"], 1);
@@ -1919,7 +1932,8 @@ async fn http_queue_controls_share_versions_replay_and_scope() {
                     "workspace": ws.path().display().to_string(),
                     "entry_id": first_id,
                     "to_index": 0,
-                    "expected_version": 1
+                    "expected_version": 1,
+                    "expected_revision": reorder_revision + 1
                 }),
             )
             .await

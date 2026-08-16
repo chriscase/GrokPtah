@@ -1427,8 +1427,14 @@ async fn bridge_prompt_queue_mutates_reorders_and_drains_authoritatively() {
     };
     host.session_queue_edit(session.id, &first.id, first.version, "edited first".into())
         .unwrap();
-    let entries = host
-        .session_queue_move(session.id, &second.id, 0, version_of(&second.id))
+    let (entries, _) = host
+        .session_queue_move(
+            session.id,
+            &second.id,
+            0,
+            version_of(&second.id),
+            host.session_queue_snapshot(session.id).unwrap().revision,
+        )
         .unwrap();
     assert_eq!(entries[0].id, second.id);
 
@@ -1581,7 +1587,7 @@ async fn clear_queue_accounts_for_accepted_steering_instead_of_reporting_empty()
     host.session_queue_add(session.id, "a follow up".into(), false)
         .unwrap();
 
-    let (entries, outcome) = host
+    let (entries, outcome, _revision) = host
         .session_queue_clear_with_origin_receipt(session.id, "mcp")
         .unwrap();
     assert!(entries.is_empty());

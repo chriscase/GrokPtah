@@ -208,11 +208,11 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_approve_run` | mutate | exact run/session/workspace, source and final fingerprints, exact `changed_files`; optional bounded `ttl_ms` |
 | `ptah_promote_run` | mutate | `request_id`, exact run/session/workspace, `approval_id` |
 | `ptah_discard_run` | mutate | `request_id`, exact run/session/workspace |
-| `ptah_get_queue` | read | `session_id`, `workspace` |
+| `ptah_get_queue` | read | `session_id`, `workspace` (response includes the current queue `revision`) |
 | `ptah_queue_prompt` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `priority` |
 | `ptah_edit_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `version`, `text` |
 | `ptah_remove_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `expected_version` |
-| `ptah_reorder_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `to_index`, `expected_version` |
+| `ptah_reorder_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `to_index`, `expected_version`, `expected_revision` |
 | `ptah_clear_queue` | mutate | `request_id`, `session_id`, `workspace` |
 | `ptah_run_next` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `expected_version` |
 | `ptah_steer_queued` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `expected_version` |
@@ -290,6 +290,14 @@ Mutating tools take `request_id`:
   unchanged, and the fix is to re-read the queue and retry. This matches the
   Computer Use control fence, which also requires the current version on
   every transition.
+- **Every queue mutation receipt reports the `revision` it produced**, and
+  `ptah_get_queue` reports the revision it read at. Because reorder is fenced
+  on the revision, a coordinator that could not learn the revision its own
+  mutation stamped would have to re-read before every reorder — and that read
+  can observe someone else's newer mutation. Chain straight from a receipt
+  instead. The desktop is held to the same fence: its reorders carry the
+  revision it is rendering, so neither writer can move an absolute index
+  against an ordering the other has already replaced.
 - `ptah_reorder_queue` **bumps the version of every entry whose index
   changed**, including the entry it moved. `to_index` is absolute, so it only
   means something against a specific ordering; without the bump two
@@ -297,6 +305,13 @@ Mutating tools take `request_id`:
   arbitrary final order. Entries that did not shift keep their versions, and a
   move that lands on its current index changes nothing. Expect to refresh
   versions after any reorder, yours or someone else's.
+- `ptah_reorder_queue` also takes the queue's current `expected_revision`, which
+  `ptah_get_queue` returns and `prompt_queue_changed` publishes. The bridge
+  checks it under the same lock as the reorder before checking the entry CAS.
+  This fences an absolute reorder built before a competing `ptah_run_next` (or
+  another queue mutation that changed the ordering) even when the displaced
+  entries' quieter per-entry versions are unchanged. A stale revision is the
+  same `stale_version` / 409 conflict and leaves the queue untouched.
 - `ptah_run_next` promotes an entry and may explicitly cancel an active turn;
   the cancel happens only after the compare-and-set has passed, so a rejected
   call never interrupts a running turn. The cancel is also bound to the turn

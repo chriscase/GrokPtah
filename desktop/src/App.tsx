@@ -78,7 +78,10 @@ import {
   queuedActivity,
   type ActivityState,
 } from "./lib/activity";
-import type { PromptQueueEntry } from "./lib/promptQueue";
+import type {
+  PromptQueueEntry,
+  PromptQueueSnapshot,
+} from "./lib/promptQueue";
 import { useComposerQueue } from "./lib/useComposerQueue";
 import { findTabOfKind, kindForTab } from "./lib/sessionTab";
 
@@ -268,6 +271,7 @@ export default function App() {
     isCurrentQueueRequest,
     syncQueue,
     queueFor,
+    queueRevision,
   } = useComposerQueue(activeSessionId);
   const queueDrainsRef = useRef<Set<string>>(new Set());
   const queueSyncInFlightRef = useRef<Set<string>>(new Set());
@@ -1510,7 +1514,9 @@ export default function App() {
 
   async function replaceQueue(
     sessionId: string,
-    mutation: () => Promise<PromptQueueEntry[]>,
+    // A mutation that reports the revision it produced is ordered against the
+    // event stream; one that does not still applies on request order alone.
+    mutation: () => Promise<PromptQueueEntry[] | PromptQueueSnapshot>,
   ) {
     try {
       await syncQueue(sessionId, mutation);
@@ -2776,6 +2782,7 @@ export default function App() {
                       entry.id,
                       toIndex,
                       entry.version,
+                      queueRevision(activeSessionId),
                     ),
                   )
                 }

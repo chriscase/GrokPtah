@@ -3987,9 +3987,12 @@ impl AgentHostHandle {
         owner: Option<String>,
     ) -> Result<Vec<PromptQueueEntry>> {
         self.session_queue_add_with_source_receipt(session_id, text, priority, source, owner)
-            .map(|(entries, _)| entries)
+            .map(|(entries, _, _)| entries)
     }
 
+    /// Mutators that advance the queue revision return it, so a caller can
+    /// continue — notably to a revision-fenced reorder — without a second read
+    /// that could observe someone else's newer mutation.
     pub fn session_queue_add_with_source_receipt(
         &self,
         session_id: Uuid,
@@ -3997,7 +4000,7 @@ impl AgentHostHandle {
         priority: bool,
         source: &str,
         owner: Option<String>,
-    ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry)> {
+    ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry, u64)> {
         let origin = owner.clone().unwrap_or_else(|| source.to_string());
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
@@ -4026,7 +4029,7 @@ impl AgentHostHandle {
             Some(changed_entry.clone()),
             None,
         );
-        Ok((list, changed_entry))
+        Ok((list, changed_entry, revision))
     }
 
     pub fn session_queue_edit(
@@ -4037,6 +4040,7 @@ impl AgentHostHandle {
         text: String,
     ) -> Result<Vec<PromptQueueEntry>> {
         self.session_queue_edit_with_origin(session_id, entry_id, version, text, "desktop")
+            .map(|(entries, _)| entries)
     }
 
     pub fn session_queue_edit_with_origin(
@@ -4046,7 +4050,7 @@ impl AgentHostHandle {
         version: u64,
         text: String,
         origin: &str,
-    ) -> Result<Vec<PromptQueueEntry>> {
+    ) -> Result<(Vec<PromptQueueEntry>, u64)> {
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
             let queue = g
@@ -4068,7 +4072,7 @@ impl AgentHostHandle {
             Some(changed_entry),
             None,
         );
-        Ok(list)
+        Ok((list, revision))
     }
 
     pub fn session_queue_remove(
@@ -4093,7 +4097,7 @@ impl AgentHostHandle {
             origin,
             expected_version,
         )
-        .map(|(entries, _)| entries)
+        .map(|(entries, _, _)| entries)
     }
 
     pub fn session_queue_remove_with_origin_receipt(
@@ -4102,7 +4106,7 @@ impl AgentHostHandle {
         entry_id: &str,
         origin: &str,
         expected_version: u64,
-    ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry)> {
+    ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry, u64)> {
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
             let queue = g
@@ -4125,7 +4129,7 @@ impl AgentHostHandle {
             Some(changed_entry.clone()),
             None,
         );
-        Ok((list, changed_entry))
+        Ok((list, changed_entry, revision))
     }
 
     pub fn session_queue_clear(&self, session_id: Uuid) -> Result<Vec<PromptQueueEntry>> {
@@ -4138,7 +4142,7 @@ impl AgentHostHandle {
         origin: &str,
     ) -> Result<Vec<PromptQueueEntry>> {
         self.session_queue_clear_with_origin_receipt(session_id, origin)
-            .map(|(entries, _)| entries)
+            .map(|(entries, _, _)| entries)
     }
 
     /// Clear plus the outcome describing what could not be stopped.
@@ -4151,7 +4155,7 @@ impl AgentHostHandle {
         &self,
         session_id: Uuid,
         origin: &str,
-    ) -> Result<(Vec<PromptQueueEntry>, PromptQueueClearOutcome)> {
+    ) -> Result<(Vec<PromptQueueEntry>, PromptQueueClearOutcome, u64)> {
         let (outcome, revision) = {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&session_id) {
@@ -4171,7 +4175,7 @@ impl AgentHostHandle {
             None,
             None,
         );
-        Ok((Vec::new(), outcome))
+        Ok((Vec::new(), outcome, revision))
     }
 
     pub fn session_queue_move(
@@ -4180,16 +4184,25 @@ impl AgentHostHandle {
         entry_id: &str,
         to_index: usize,
         expected_version: u64,
-    ) -> Result<Vec<PromptQueueEntry>> {
+        expected_revision: u64,
+    ) -> Result<(Vec<PromptQueueEntry>, u64)> {
         self.session_queue_move_with_origin(
             session_id,
             entry_id,
             to_index,
             "desktop",
             expected_version,
+            expected_revision,
         )
     }
 
+    /// The desktop reorders under the same revision fence as the control plane.
+    ///
+    /// `to_index` is absolute, so it only means something against a specific
+    /// ordering, and the per-entry CAS cannot see a `run_next` that displaced
+    /// entries without changing their versions. Exempting the desktop would
+    /// leave that hole open from the other writer — the same reason S3 made
+    /// `expected_version` mandatory here rather than MCP-only.
     pub fn session_queue_move_with_origin(
         &self,
         session_id: Uuid,
@@ -4197,9 +4210,63 @@ impl AgentHostHandle {
         to_index: usize,
         origin: &str,
         expected_version: u64,
-    ) -> Result<Vec<PromptQueueEntry>> {
+        expected_revision: u64,
+    ) -> Result<(Vec<PromptQueueEntry>, u64)> {
+        self.session_queue_move_with_origin_impl(
+            session_id,
+            entry_id,
+            to_index,
+            origin,
+            expected_version,
+            Some(expected_revision),
+        )
+    }
+
+    /// Reorder an entry with both its per-entry CAS and the queue revision
+    /// that gives an absolute `to_index` meaning.
+    pub fn session_queue_move_with_origin_and_revision(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        to_index: usize,
+        origin: &str,
+        expected_version: u64,
+        expected_revision: u64,
+    ) -> Result<(Vec<PromptQueueEntry>, u64)> {
+        self.session_queue_move_with_origin_impl(
+            session_id,
+            entry_id,
+            to_index,
+            origin,
+            expected_version,
+            Some(expected_revision),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn session_queue_move_with_origin_impl(
+        &self,
+        session_id: Uuid,
+        entry_id: &str,
+        to_index: usize,
+        origin: &str,
+        expected_version: u64,
+        expected_revision: Option<u64>,
+    ) -> Result<(Vec<PromptQueueEntry>, u64)> {
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
+            let current_revision = g
+                .prompt_queue_revisions
+                .get(&session_id)
+                .copied()
+                .unwrap_or_default();
+            if let Some(expected_revision) = expected_revision {
+                if current_revision != expected_revision {
+                    bail!(
+                        "stale prompt queue revision: expected {expected_revision}, current {current_revision}"
+                    );
+                }
+            }
             let queue = g
                 .prompt_queues
                 .get_mut(&session_id)
@@ -4224,7 +4291,7 @@ impl AgentHostHandle {
             changed_entry.clone(),
             None,
         );
-        Ok(list)
+        Ok((list, revision))
     }
 
     /// Drain the next batch and claim the session's turn slot for it.
@@ -4348,6 +4415,7 @@ impl AgentHostHandle {
         expected_version: u64,
     ) -> Result<PromptQueueRunNextResult> {
         self.session_queue_run_next_with_origin(session_id, entry_id, "desktop", expected_version)
+            .map(|(result, _)| result)
     }
 
     /// Promote an entry to the head and cancel the active turn so it runs next.
@@ -4361,7 +4429,7 @@ impl AgentHostHandle {
         entry_id: &str,
         origin: &str,
         expected_version: u64,
-    ) -> Result<PromptQueueRunNextResult> {
+    ) -> Result<(PromptQueueRunNextResult, u64)> {
         let (changed_entry, active_generation, revision) = {
             let mut g = self.inner.lock();
             let queue = g
@@ -4397,7 +4465,7 @@ impl AgentHostHandle {
             Some(changed_entry),
             None,
         );
-        Ok(result)
+        Ok((result, revision))
     }
 
     pub fn session_queue_steer_entry(
@@ -4412,6 +4480,7 @@ impl AgentHostHandle {
             "desktop",
             expected_version,
         )
+        .map(|(receipt, _)| receipt)
     }
 
     pub fn session_queue_steer_entry_with_origin(
@@ -4420,7 +4489,7 @@ impl AgentHostHandle {
         entry_id: &str,
         origin: &str,
         expected_version: u64,
-    ) -> Result<SteeringReceipt> {
+    ) -> Result<(SteeringReceipt, u64)> {
         let (receipt, revision) = {
             let mut g = self.inner.lock();
             let is_build = g
@@ -4448,11 +4517,12 @@ impl AgentHostHandle {
             Some(receipt.entry.clone()),
             Some(receipt.disposition),
         );
-        Ok(receipt)
+        Ok((receipt, revision))
     }
 
     pub fn session_steer(&self, session_id: Uuid, text: String) -> Result<SteeringReceipt> {
         self.session_steer_with_owner(session_id, text, Some("desktop".into()))
+            .map(|(receipt, _)| receipt)
     }
 
     pub fn session_steer_with_owner(
@@ -4460,7 +4530,7 @@ impl AgentHostHandle {
         session_id: Uuid,
         text: String,
         owner: Option<String>,
-    ) -> Result<SteeringReceipt> {
+    ) -> Result<(SteeringReceipt, u64)> {
         let origin = owner.clone().unwrap_or_else(|| "desktop".into());
         let (receipt, revision) = {
             let mut g = self.inner.lock();
@@ -4491,7 +4561,7 @@ impl AgentHostHandle {
             Some(receipt.entry.clone()),
             Some(receipt.disposition),
         );
-        Ok(receipt)
+        Ok((receipt, revision))
     }
 
     /// Cancel the in-flight turn for `session_id`, or every active turn when
