@@ -32,7 +32,7 @@ pub fn run() {
             host: host.clone(),
             pty: pty_host::PtyHub::new(),
             control: Mutex::new(None),
-            computer_use: computer_use::DesktopComputerUse::new(),
+            computer_use: computer_use::DesktopComputerUse::new(&host),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -106,6 +106,7 @@ pub fn run() {
             commands::session_queue_edit,
             commands::session_queue_remove,
             commands::session_queue_clear,
+            commands::session_queue_restore_drain,
             commands::session_queue_move,
             commands::session_queue_take_next,
             commands::session_queue_run_next,

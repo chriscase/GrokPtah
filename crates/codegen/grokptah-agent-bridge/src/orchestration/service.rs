@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::event_bus::{CursorExpiredError, EventBus, EventReceiver, JournalPage};
 use crate::host::AgentHostHandle;
+use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{require_workspace_match, AuthContext, WorkspaceAllowlist};
@@ -840,6 +841,142 @@ impl OrchestrationService {
         self.bus.subscribe()
     }
 
+    // ── Computer Run reads (#271 slice 2) ──────────────────────────────
+    //
+    // Read-only projections of the durable Computer Run ledger. Mutations
+    // deliberately remain absent from the control plane.
+
+    /// Backend-free scoped reader over the host's shared Computer Run store.
+    /// Availability is global and session-independent, so this failure leaks
+    /// nothing about any run or session.
+    fn computer_reads(&self) -> Result<crate::computer_use::ComputerRunReads, OrchError> {
+        self.host
+            .ensure_computer_store()
+            .map(crate::computer_use::ComputerRunReads::new)
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Unsupported,
+                    "computer use is unavailable on this host",
+                )
+            })
+    }
+
+    /// Session + workspace gate shared by every Computer Run read. Computer
+    /// Runs are owned by build and chat sessions alike, so this requires the
+    /// session to exist and match the claimed allowlisted workspace — not to
+    /// be a Build session.
+    ///
+    /// The claimed workspace is allowlisted first (session-independent).
+    /// Unknown session, missing cwd, and cwd mismatch then collapse into the
+    /// same `forbidden_scope` as an unauthorized run, so session existence
+    /// is not distinguishable from cross-scope.
+    fn authorize_computer_scope(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<String, OrchError> {
+        let allowlist = self.config.lock().allowlist.clone();
+        let claimed = super::authz::canonical_workspace(workspace)?;
+        if !allowlist.contains(&claimed) {
+            return Err(OrchError::new(
+                OrchErrorCode::WorkspaceMismatch,
+                "workspace not in allowlist",
+            ));
+        }
+        let session = self.host.session_load(session_id).ok();
+        let cwd = session
+            .as_ref()
+            .and_then(|loaded| (!loaded.cwd.is_empty()).then(|| PathBuf::from(&loaded.cwd)));
+        let Some(cwd) = cwd else {
+            return Err(computer_scope_denied());
+        };
+        let session_cwd =
+            super::authz::canonical_workspace(&cwd).map_err(|_| computer_scope_denied())?;
+        if session_cwd != claimed {
+            return Err(computer_scope_denied());
+        }
+        Ok(claimed.display().to_string())
+    }
+
+    pub fn list_computer_runs_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let reads = self.computer_reads()?;
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
+        let runs = reads
+            .list_run_projections(binding, Utc::now())
+            .map_err(computer_read_error)?;
+        Ok(json!({ "runs": runs }))
+    }
+
+    pub fn get_computer_run_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let reads = self.computer_reads()?;
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
+        let projection = reads
+            .project_run(binding, run_id, Utc::now())
+            .map_err(computer_read_error)?;
+        serde_json::to_value(projection)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    pub fn get_computer_run_events_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        after_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<serde_json::Value, OrchError> {
+        let reads = self.computer_reads()?;
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
+        let page = reads
+            .run_events(binding, run_id, after_seq, limit)
+            .map_err(computer_read_error)?;
+        if page.cursor_expired {
+            // Same 410 idiom as `ptah_get_events`, but the retained window
+            // rides the error so recovery does not require a second get.
+            return Err(OrchError::with_data(
+                OrchErrorCode::CursorExpired,
+                "computer run event cursor is below the retained window; resume from eventRange",
+                json!({
+                    "eventRange": page.range.map(|range| json!({
+                        "startSeq": range.start_seq,
+                        "endSeq": range.end_seq,
+                    })),
+                }),
+            ));
+        }
+        serde_json::to_value(page)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    pub fn get_computer_capacity_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let reads = self.computer_reads()?;
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
+        let capacity = reads.capacity(binding).map_err(computer_read_error)?;
+        serde_json::to_value(capacity)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
     fn events_for_run(
         &self,
         run: RunRecord,
@@ -1106,6 +1243,591 @@ impl OrchestrationService {
             ));
         }
         Ok(run)
+    }
+
+    fn authorize_queue_request(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<PathBuf, OrchError> {
+        let session = self.require_build_session(session_id)?;
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        require_workspace_match(&allowlist, cwd.as_deref(), workspace)
+    }
+
+    async fn begin_queue_mutation(
+        &self,
+        tool: &str,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        payload: &serde_json::Value,
+    ) -> Result<(PathBuf, IdempotencyStart), OrchError> {
+        let claimed = match self.authorize_queue_request(session_id, workspace) {
+            Ok(path) => path,
+            Err(error) => {
+                self.audit_err(
+                    tool,
+                    Some(request_id),
+                    Some(session_id),
+                    Some(&workspace.display().to_string()),
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+        let payload_hash = hash_payload(payload);
+        let start = match self
+            .begin_idempotency(tool, request_id, &payload_hash, session_id, &claimed)
+            .await
+        {
+            Ok(start) => start,
+            Err(error) => {
+                self.audit_err(
+                    tool,
+                    Some(request_id),
+                    Some(session_id),
+                    Some(&claimed.display().to_string()),
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+        Ok((claimed, start))
+    }
+
+    fn queue_error(error: anyhow::Error) -> OrchError {
+        let message = error.to_string();
+        let code = if message.contains("stale queued prompt version")
+            || message.contains("stale prompt queue revision")
+        {
+            OrchErrorCode::StaleVersion
+        } else if message.contains("unknown queued prompt")
+            || message.contains("no prompt queue for session")
+        {
+            OrchErrorCode::InvalidRequest
+        } else {
+            OrchErrorCode::Internal
+        };
+        OrchError::new(code, message)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn queue_response(
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        action: &str,
+        entries: Vec<PromptQueueEntry>,
+        changed_entry: Option<PromptQueueEntry>,
+        disposition: Option<SteeringDisposition>,
+        revision: u64,
+    ) -> serde_json::Value {
+        json!({
+            "requestId": request_id,
+            "actionId": request_id,
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "origin": "mcp",
+            "action": action,
+            "disposition": disposition,
+            "actionVersion": changed_entry.as_ref().map(|entry| entry.version),
+            // The queue revision this mutation produced. Reorder is fenced on
+            // it, so a coordinator that had to re-read the queue after every
+            // other verb could never chain a mutation into a reorder without a
+            // window for someone else to move first. Every receipt now carries
+            // the revision its own mutation stamped.
+            "revision": revision,
+            "entry": changed_entry,
+            "entries": entries,
+        })
+    }
+
+    pub fn get_queue(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_queue_request(session_id, workspace)?;
+        let snapshot = self
+            .host
+            .session_queue_snapshot(session_id)
+            .map_err(Self::queue_error)?;
+        Ok(json!({
+            "sessionId": session_id,
+            "workspace": claimed.display().to_string(),
+            "revision": snapshot.revision,
+            "entries": snapshot.entries,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn edit_queue(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        entry_id: &str,
+        version: u64,
+        text: String,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_edit_queue";
+        if let Err(error) = reject_control_prompt(&text) {
+            self.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&workspace.display().to_string()),
+                &error,
+            );
+            return Err(error);
+        }
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "entryId": entry_id,
+            "version": version,
+            "text": text,
+        });
+        let (claimed, start) = self
+            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let (entries, revision) = match self
+            .host
+            .session_queue_edit_with_origin(session_id, entry_id, version, text, "mcp")
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    Self::queue_error(error),
+                ));
+            }
+        };
+        let changed_entry = entries.iter().find(|entry| entry.id == entry_id).cloned();
+        let response = Self::queue_response(
+            request_id,
+            session_id,
+            &claimed,
+            "edited",
+            entries,
+            changed_entry,
+            None,
+            revision,
+        );
+        if let Err(error) = lease.complete(None, response.clone()) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        self.audit(
+            tool,
+            Some(request_id),
+            Some(session_id),
+            Some(&claimed.display().to_string()),
+            "accepted",
+            None,
+            "queue edited",
+        );
+        Ok(response)
+    }
+
+    pub async fn remove_queue(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        entry_id: &str,
+        expected_version: u64,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_remove_queue";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "entryId": entry_id,
+            "expectedVersion": expected_version,
+        });
+        let (claimed, start) = self
+            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let (entries, changed_entry, revision) = match self
+            .host
+            .session_queue_remove_with_origin_receipt(session_id, entry_id, "mcp", expected_version)
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    Self::queue_error(error),
+                ));
+            }
+        };
+        let response = Self::queue_response(
+            request_id,
+            session_id,
+            &claimed,
+            "removed",
+            entries,
+            Some(changed_entry),
+            None,
+            revision,
+        );
+        if let Err(error) = lease.complete(None, response.clone()) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        self.audit(
+            tool,
+            Some(request_id),
+            Some(session_id),
+            Some(&claimed.display().to_string()),
+            "accepted",
+            None,
+            "queue entry removed",
+        );
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reorder_queue(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        entry_id: &str,
+        to_index: usize,
+        expected_version: u64,
+        expected_revision: u64,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_reorder_queue";
+        self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "entryId": entry_id,
+            "toIndex": to_index,
+            "expectedVersion": expected_version,
+            "expectedRevision": expected_revision,
+        });
+        let (claimed, start) = self
+            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let (entries, revision) = match self.host.session_queue_move_with_origin_and_revision(
+            session_id,
+            entry_id,
+            to_index,
+            "mcp",
+            expected_version,
+            expected_revision,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    Self::queue_error(error),
+                ));
+            }
+        };
+        let changed_entry = entries.iter().find(|entry| entry.id == entry_id).cloned();
+        let mut response = Self::queue_response(
+            request_id,
+            session_id,
+            &claimed,
+            "reordered",
+            entries,
+            changed_entry,
+            None,
+            revision,
+        );
+        response["revision"] = json!(revision);
+        if let Err(error) = lease.complete(None, response.clone()) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        self.audit(
+            tool,
+            Some(request_id),
+            Some(session_id),
+            Some(&claimed.display().to_string()),
+            "accepted",
+            None,
+            "queue reordered",
+        );
+        Ok(response)
+    }
+
+    pub async fn clear_queue(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_clear_queue";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+        });
+        let (claimed, start) = self
+            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let (entries, outcome, revision) = match self
+            .host
+            .session_queue_clear_with_origin_receipt(session_id, "mcp")
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    Self::queue_error(error),
+                ));
+            }
+        };
+        let mut response = Self::queue_response(
+            request_id, session_id, &claimed, "cleared", entries, None, None, revision,
+        );
+        // An empty `entries` list alone would be a fail-open receipt: steering
+        // already handed to a model boundary cannot be retracted and will
+        // still be injected. Report it rather than implying the session is
+        // quiet. `stopped` is the field a coordinator should branch on.
+        if let Some(object) = response.as_object_mut() {
+            object.insert("clearedQueued".into(), json!(outcome.queued_cleared));
+            object.insert(
+                "steeringCancelled".into(),
+                json!(outcome.steering_cancelled),
+            );
+            object.insert("steeringInFlight".into(), json!(outcome.steering_in_flight));
+            object.insert("stopped".into(), json!(outcome.fully_stopped()));
+        }
+        if let Err(error) = lease.complete(None, response.clone()) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        self.audit(
+            tool,
+            Some(request_id),
+            Some(session_id),
+            Some(&claimed.display().to_string()),
+            "accepted",
+            None,
+            "queue cleared",
+        );
+        Ok(response)
+    }
+
+    /// S7: the control plane must not be able to *schedule* a prompt it is
+    /// forbidden from *creating*.
+    ///
+    /// `reject_control_prompt` blocks `!` and `/` prompts on every path that
+    /// authors text, but selection verbs took an entry id and never looked at
+    /// what they were selecting. A locally authored `/yolo` or `!rm ...` could
+    /// therefore be promoted to the head of the queue, and `run_next` would
+    /// cancel the active turn to make it run — the forbidden outcome reached
+    /// by choosing instead of by writing. Selection is now held to the same
+    /// policy as authorship, evaluated against the stored text.
+    ///
+    /// Reading the entry before claiming the mutation is safe against edits in
+    /// the gap: changing the text bumps the entry version, so the caller's
+    /// `expected_version` fails closed.
+    fn reject_selecting_control_entry(
+        &self,
+        tool: &str,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        entry_id: &str,
+    ) -> Result<(), OrchError> {
+        // Authorize before reading. This runs ahead of `begin_queue_mutation`,
+        // which does its own authorization, so without this an unscoped caller
+        // could learn something about another workspace's queue from whether
+        // the policy rejected it.
+        self.authorize_queue_request(session_id, workspace)?;
+        let entries = self.host.session_queue_list(session_id).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                format!("queue unavailable: {error}"),
+            )
+        })?;
+        let Some(entry) = entries.into_iter().find(|entry| entry.id == entry_id) else {
+            // Leave "unknown entry" to the mutator, so the not-found contract
+            // stays in one place.
+            return Ok(());
+        };
+        if let Err(error) = reject_control_prompt(&entry.text) {
+            self.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&workspace.display().to_string()),
+                &error,
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub async fn run_next_queue(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        entry_id: &str,
+        expected_version: u64,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_run_next";
+        self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "entryId": entry_id,
+            "expectedVersion": expected_version,
+        });
+        let (claimed, start) = self
+            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let (result, revision) = match self.host.session_queue_run_next_with_origin(
+            session_id,
+            entry_id,
+            "mcp",
+            expected_version,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    Self::queue_error(error),
+                ));
+            }
+        };
+        // `run_next` removes the entry from the durable queue, so the host
+        // returns the changed entry separately from the post-action snapshot.
+        let changed_entry = Some(result.changed_entry.clone());
+        let mut response = Self::queue_response(
+            request_id,
+            session_id,
+            &claimed,
+            "run_next",
+            result.entries,
+            changed_entry,
+            None,
+            revision,
+        );
+        response["cancelledActive"] = json!(result.cancelled_active);
+        if let Err(error) = lease.complete(None, response.clone()) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        self.audit(
+            tool,
+            Some(request_id),
+            Some(session_id),
+            Some(&claimed.display().to_string()),
+            "accepted",
+            None,
+            "queue entry promoted to run next",
+        );
+        Ok(response)
+    }
+
+    pub async fn steer_queued(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        entry_id: &str,
+        expected_version: u64,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_steer_queued";
+        self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "entryId": entry_id,
+            "expectedVersion": expected_version,
+        });
+        let (claimed, start) = self
+            .begin_queue_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let (receipt, revision) = match self.host.session_queue_steer_entry_with_origin(
+            session_id,
+            entry_id,
+            "mcp",
+            expected_version,
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    Self::queue_error(error),
+                ));
+            }
+        };
+        let response = Self::queue_response(
+            request_id,
+            session_id,
+            &claimed,
+            "steer_now",
+            receipt.entries,
+            Some(receipt.entry),
+            Some(receipt.disposition),
+            revision,
+        );
+        if let Err(error) = lease.complete(None, response.clone()) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        self.audit(
+            tool,
+            Some(request_id),
+            Some(session_id),
+            Some(&claimed.display().to_string()),
+            "accepted",
+            None,
+            "queued entry steered without cancelling",
+        );
+        Ok(response)
     }
 
     fn isolated_review(
@@ -2109,27 +2831,36 @@ impl OrchestrationService {
             IdempotencyStart::Perform(lease) => lease,
         };
 
-        let entries = match self.host.session_queue_add_with_source(
-            session_id,
-            prompt,
-            priority,
-            "control",
-            Some("mcp".into()),
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                return Err(self.fail_claim(
-                    &mut lease,
-                    None,
-                    session_id,
-                    &claimed,
-                    OrchError::new(OrchErrorCode::Internal, e.to_string()),
-                ));
-            }
-        };
+        let (entries, changed_entry, revision) =
+            match self.host.session_queue_add_with_source_receipt(
+                session_id,
+                prompt,
+                priority,
+                "control",
+                Some("mcp".into()),
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        None,
+                        session_id,
+                        &claimed,
+                        OrchError::new(OrchErrorCode::Internal, e.to_string()),
+                    ));
+                }
+            };
         let response = json!({
             "requestId": request_id,
+            "actionId": request_id,
             "sessionId": session_id,
+            "workspace": claimed.display().to_string(),
+            "origin": "mcp",
+            "action": "queued",
+            "disposition": "queued",
+            "actionVersion": changed_entry.version,
+            "revision": revision,
+            "entry": changed_entry,
             "entries": entries,
         });
         if let Err(e) = lease.complete(None, response.clone()) {
@@ -2199,26 +2930,33 @@ impl OrchestrationService {
             IdempotencyStart::Perform(lease) => lease,
         };
 
-        let receipt = match self
-            .host
-            .session_steer_with_owner(session_id, text, Some("mcp".into()))
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(self.fail_claim(
-                    &mut lease,
-                    None,
-                    session_id,
-                    &claimed,
-                    OrchError::new(OrchErrorCode::Internal, e.to_string()),
-                ));
-            }
-        };
+        let (receipt, revision) =
+            match self
+                .host
+                .session_steer_with_owner(session_id, text, Some("mcp".into()))
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        None,
+                        session_id,
+                        &claimed,
+                        OrchError::new(OrchErrorCode::Internal, e.to_string()),
+                    ));
+                }
+            };
         let response = json!({
             "requestId": request_id,
+            "actionId": request_id,
             "sessionId": session_id,
+            "workspace": claimed.display().to_string(),
+            "origin": "mcp",
+            "action": "steer_now",
             "disposition": receipt.disposition,
             "entry": receipt.entry,
+            "actionVersion": receipt.entry.version,
+            "revision": revision,
             "entries": receipt.entries,
         });
         if let Err(e) = lease.complete(None, response.clone()) {
@@ -2423,6 +3161,27 @@ impl OrchestrationService {
     }
 }
 
+/// Map a Computer Run read failure into the control plane's error vocabulary.
+/// `Unauthorized` covers unknown, cross-session, cross-workspace, unbound, and
+/// traversal-shaped reads with one shared message, so this mapping must stay
+/// single-valued to preserve that indistinguishability on the wire.
+fn computer_scope_denied() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::ForbiddenScope,
+        "computer run is not available to this session",
+    )
+}
+
+fn computer_read_error(error: crate::computer_use::ComputerError) -> OrchError {
+    use crate::computer_use::ComputerErrorCode;
+    let code = match error.code {
+        ComputerErrorCode::Unauthorized => OrchErrorCode::ForbiddenScope,
+        ComputerErrorCode::InvalidRequest => OrchErrorCode::InvalidRequest,
+        _ => OrchErrorCode::Internal,
+    };
+    OrchError::new(code, error.message)
+}
+
 fn canonical_cmp(a: &Path, b: &Path) -> Result<(), ()> {
     let ca = dunce::canonicalize(a).map_err(|_| ())?;
     let cb = dunce::canonicalize(b).map_err(|_| ())?;
@@ -2572,7 +3331,8 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | FileEdit { session_id, .. }
         | AgentProgress { session_id, .. }
         | RateLimited { session_id, .. }
-        | SteeringInjected { session_id, .. } => Some(*session_id),
+        | SteeringInjected { session_id, .. }
+        | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
     }
 }

@@ -160,7 +160,8 @@ impl EventLedger {
             | SessionUpdate::SubagentUpdate { .. }
             | SessionUpdate::BackgroundTask { .. }
             | SessionUpdate::ShellOutput { .. }
-            | SessionUpdate::AgentProgress { .. } => {}
+            | SessionUpdate::AgentProgress { .. }
+            | SessionUpdate::PromptQueueChanged { .. } => {}
         }
     }
 
@@ -358,6 +359,7 @@ fn event_name(update: &SessionUpdate) -> String {
         SessionUpdate::AgentProgress { .. } => "agent_progress",
         SessionUpdate::RateLimited { .. } => "rate_limited",
         SessionUpdate::SteeringInjected { .. } => "steering_injected",
+        SessionUpdate::PromptQueueChanged { .. } => "prompt_queue_changed",
     }
     .into()
 }

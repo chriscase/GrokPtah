@@ -13,9 +13,10 @@ use grokptah_agent_bridge::orchestration::{
     WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, start_control_from_env, start_control_server,
-    start_control_server_with, AgentHost, ControlServerLimits, HostConfig, McpControlClient,
-    SessionKind, CONTROL_TOOLS,
+    canonical_workspace_string, set_grokptah_home_override, start_control_from_env,
+    start_control_server, start_control_server_with, ActionClass, ActionGrant, AgentHost,
+    ComputerRun, ComputerUseService, ControlServerLimits, GrantIssuer, HostConfig,
+    McpControlClient, SessionKind, SimulatorBackend, CONTROL_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -1767,6 +1768,269 @@ async fn http_steer_idle_queues_without_starting_run() {
     set_grokptah_home_override(None);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn http_queue_controls_share_versions_replay_and_scope() {
+    let (_home, _lock, host, ws, orch) = setup();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), "stream-token-200");
+    client.initialize().await.unwrap();
+    let scope = |session_id| {
+        json!({
+            "session_id": session_id,
+            "workspace": ws.path().display().to_string(),
+        })
+    };
+
+    let first = client
+        .call_tool(
+            "ptah_queue_prompt",
+            json!({
+                "request_id": "queue-http-first",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "prompt": "first queued prompt"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.structured["actionId"], "queue-http-first");
+    assert_eq!(first.structured["origin"], "mcp");
+    assert_eq!(first.structured["disposition"], "queued");
+    let first_entry = first.structured["entry"].clone();
+    let first_id = first_entry["id"].as_str().unwrap().to_string();
+    assert_eq!(first_entry["version"], 0);
+
+    let second = client
+        .call_tool(
+            "ptah_queue_prompt",
+            json!({
+                "request_id": "queue-http-second",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "prompt": "second queued prompt"
+            }),
+        )
+        .await
+        .unwrap();
+    let second_id = second.structured["entry"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let snapshot = client
+        .call_tool("ptah_get_queue", scope(session.id))
+        .await
+        .unwrap();
+    assert_eq!(snapshot.structured["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot.structured["revision"], 2);
+
+    let edit_args = json!({
+        "request_id": "queue-http-edit",
+        "session_id": session.id,
+        "workspace": ws.path().display().to_string(),
+        "entry_id": first_id,
+        "version": 0,
+        "text": "edited queued prompt"
+    });
+    let edited = client
+        .call_tool("ptah_edit_queue", edit_args.clone())
+        .await
+        .unwrap();
+    assert_eq!(edited.structured["entry"]["version"], 1);
+    assert_eq!(edited.structured["action"], "edited");
+    let replay = client
+        .call_tool("ptah_edit_queue", edit_args)
+        .await
+        .unwrap();
+    assert_eq!(replay.structured, edited.structured);
+    assert!(client
+        .call_tool(
+            "ptah_edit_queue",
+            json!({
+                "request_id": "queue-http-stale",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "entry_id": first_id,
+                "version": 0,
+                "text": "stale edit must fail"
+            }),
+        )
+        .await
+        .is_err());
+
+    let before_reorder = client
+        .call_tool("ptah_get_queue", scope(session.id))
+        .await
+        .unwrap();
+    let reorder_revision = before_reorder.structured["revision"]
+        .as_u64()
+        .expect("queue revision");
+    assert_eq!(reorder_revision, 3);
+
+    // S3: every mutator below is compare-and-set, and omitting the version is
+    // a schema rejection rather than a last-write-wins mutation. Assert that
+    // before any of them is allowed to succeed, and that nothing moved.
+    for tool in [
+        "ptah_remove_queue",
+        "ptah_run_next",
+        "ptah_steer_queued",
+        "ptah_reorder_queue",
+    ] {
+        let mut args = json!({
+            "request_id": format!("queue-http-noversion-{tool}"),
+            "session_id": session.id,
+            "workspace": ws.path().display().to_string(),
+            "entry_id": second_id,
+        });
+        if tool == "ptah_reorder_queue" {
+            args["to_index"] = json!(0);
+            args["expected_revision"] = json!(0);
+        }
+        assert!(
+            client.call_tool(tool, args).await.is_err(),
+            "{tool} must require expected_version"
+        );
+    }
+    let untouched = client
+        .call_tool("ptah_get_queue", scope(session.id))
+        .await
+        .unwrap();
+    assert_eq!(untouched.structured["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(untouched.structured["entries"][0]["id"], first_id);
+
+    let reordered = client
+        .call_tool(
+            "ptah_reorder_queue",
+            json!({
+                "request_id": "queue-http-reorder",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "entry_id": second_id,
+                "to_index": 0,
+                "expected_version": 0,
+                "expected_revision": reorder_revision
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reordered.structured["entries"][0]["id"], second_id);
+    assert_eq!(reordered.structured["revision"], reorder_revision + 1);
+    // S3: reorder now bumps every version it shifted, so a second coordinator
+    // holding the pre-move ordering loses its CAS instead of both succeeding.
+    assert_eq!(reordered.structured["entries"][0]["version"], 1);
+    assert_eq!(reordered.structured["entries"][1]["version"], 2);
+    assert!(
+        client
+            .call_tool(
+                "ptah_reorder_queue",
+                json!({
+                    "request_id": "queue-http-reorder-stale",
+                    "session_id": session.id,
+                    "workspace": ws.path().display().to_string(),
+                    "entry_id": first_id,
+                    "to_index": 0,
+                    "expected_version": 1,
+                    "expected_revision": reorder_revision + 1
+                }),
+            )
+            .await
+            .is_err(),
+        "a reorder built on the pre-move ordering must fail closed"
+    );
+    let after_conflict = client
+        .call_tool("ptah_get_queue", scope(session.id))
+        .await
+        .unwrap();
+    assert_eq!(after_conflict.structured["entries"][0]["id"], second_id);
+
+    let steered = client
+        .call_tool(
+            "ptah_steer_queued",
+            json!({
+                "request_id": "queue-http-steer-queued",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "entry_id": second_id,
+                "expected_version": 1
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(steered.structured["disposition"], "queued");
+    assert_eq!(steered.structured["entry"]["version"], 2);
+
+    let run_next = client
+        .call_tool(
+            "ptah_run_next",
+            json!({
+                "request_id": "queue-http-run-next",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "entry_id": first_id,
+                "expected_version": 2
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(run_next.structured["action"], "run_next");
+    assert_eq!(run_next.structured["entry"]["id"], first_id);
+    assert_eq!(run_next.structured["entry"]["version"], 3);
+
+    let removed = client
+        .call_tool(
+            "ptah_remove_queue",
+            json!({
+                "request_id": "queue-http-remove",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "entry_id": first_id,
+                "expected_version": 3
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(removed.structured["action"], "removed");
+    assert_eq!(removed.structured["entry"]["id"], first_id);
+    assert_eq!(removed.structured["actionVersion"], 3);
+
+    let cleared = client
+        .call_tool(
+            "ptah_clear_queue",
+            json!({
+                "request_id": "queue-http-clear",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string()
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(cleared.structured["entries"].as_array().unwrap().is_empty());
+    // S4: an empty `entries` list is not by itself a promise that the session
+    // stopped. The receipt must say what clear actually cancelled and whether
+    // anything survived it, so a coordinator can branch on `stopped`.
+    assert_eq!(cleared.structured["steeringCancelled"], 0);
+    assert_eq!(cleared.structured["steeringInFlight"], 0);
+    assert_eq!(cleared.structured["stopped"], true);
+    assert!(cleared.structured["clearedQueued"].is_u64());
+    assert!(client
+        .call_tool(
+            "ptah_get_queue",
+            json!({
+                "session_id": session.id,
+                "workspace": tempdir().unwrap().path().display().to_string()
+            }),
+        )
+        .await
+        .is_err());
+
+    client.close_session().await.unwrap();
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
 /// Live coordinator smoke against the **desktop env bootstrap** path
 /// (`start_control_from_env` — same contract as Tauri `start_embedded_control`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1876,4 +2140,199 @@ fn desktop_control_bootstrap_uses_shared_start_control_from_env() {
         !src.contains("OrchStore::open(grokptah_home()"),
         "desktop must not re-open orch store outside shared bootstrap"
     );
+}
+
+/// The Computer Run ledger holds an exclusive lock, so the desktop must reach
+/// it through the host's shared handle — a direct open would either split the
+/// surfaces or fail on the lock at runtime.
+#[test]
+fn desktop_computer_use_shares_the_host_store() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../desktop/src-tauri/src/computer_use.rs");
+    let src = std::fs::read_to_string(&path).expect("read desktop computer_use.rs");
+    assert!(
+        src.contains("ensure_computer_store"),
+        "desktop must borrow the host's computer store"
+    );
+    assert!(
+        !src.contains("ComputerStore::open(grokptah_home()"),
+        "desktop must not open the shared computer ledger outside the host"
+    );
+}
+
+fn smoke_grant(run: &ComputerRun) -> ActionGrant {
+    let now = Utc::now();
+    ActionGrant {
+        grant_id: format!("smoke-grant-{}", run.run_id),
+        run_id: run.run_id.clone(),
+        target: run.target.clone(),
+        action_classes: std::collections::BTreeSet::from([ActionClass::Semantic]),
+        issued_by: GrantIssuer::LocalUser,
+        issued_at: now,
+        expires_at: now + ChronoDuration::minutes(10),
+        uses_remaining: None,
+        revoked_at: None,
+    }
+}
+
+/// Live desktop-equivalent proof for the read-only Computer Run tools: the
+/// production `start_control_from_env` bootstrap (the same entry the Tauri
+/// desktop uses), seeded with real simulator runs through the host's shared
+/// store, exercised end to end by an independent Node client over real
+/// loopback HTTP — discovery, scoped reads, redaction pins, cursor paging,
+/// duplicate replay, stale-cursor recovery, cross-session/workspace
+/// rejection, capacity, auth-before-body, and reconnect replay.
+#[tokio::test]
+async fn live_computer_reads_node_smoke() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let ws_other = tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".grokptah")).unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let other_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(other_session.id, ws_other.path())
+        .unwrap();
+
+    let canon = canonical_workspace_string(ws.path()).unwrap();
+    let canon_other = canonical_workspace_string(ws_other.path()).unwrap();
+    let computer = ComputerUseService::new(
+        std::sync::Arc::new(SimulatorBackend::new()),
+        host.ensure_computer_store().unwrap(),
+    );
+
+    // Run A: bound, authorized, observed — projection metadata plus journal.
+    let run_a = computer
+        .create_run(
+            "smoke-create-a",
+            session.id,
+            Some(canon.clone()),
+            SimulatorBackend::demo_target(),
+            Default::default(),
+        )
+        .unwrap();
+    let run_a = computer
+        .authorize(
+            "smoke-grant-a",
+            &run_a.run_id,
+            run_a.version,
+            smoke_grant(&run_a),
+        )
+        .unwrap();
+    computer
+        .observe("smoke-observe-a", &run_a.run_id, run_a.version)
+        .await
+        .unwrap();
+
+    // Run B: another session's run in another workspace — the rejection target.
+    let run_b = computer
+        .create_run(
+            "smoke-create-b",
+            other_session.id,
+            Some(canon_other),
+            SimulatorBackend::demo_target(),
+            Default::default(),
+        )
+        .unwrap();
+
+    // Run C: journal driven past the bounded ring so an early cursor is
+    // genuinely evicted on the wire, using only public service operations.
+    let run_c = computer
+        .create_run(
+            "smoke-create-c",
+            session.id,
+            Some(canon.clone()),
+            SimulatorBackend::demo_target(),
+            Default::default(),
+        )
+        .unwrap();
+    let run_c = computer
+        .authorize(
+            "smoke-grant-c",
+            &run_c.run_id,
+            run_c.version,
+            smoke_grant(&run_c),
+        )
+        .unwrap();
+    let mut version = run_c.version;
+    let mut spins = 0u32;
+    loop {
+        computer
+            .observe(&format!("smoke-observe-c-{spins}"), &run_c.run_id, version)
+            .await
+            .unwrap();
+        let current = computer.get_run(&run_c.run_id).unwrap().unwrap();
+        version = current.version;
+        if current
+            .audit
+            .first()
+            .map(|entry| entry.sequence)
+            .unwrap_or(1)
+            > 1
+        {
+            break;
+        }
+        spins += 1;
+        assert!(spins < 1_500, "audit ring eviction did not occur");
+    }
+
+    // Disposable token — never a real credential.
+    let token = format!("computer-smoke-{}", uuid::Uuid::new_v4());
+    env.set("GROKPTAH_CONTROL_TOKEN", &token);
+    env.set("GROKPTAH_CONTROL_PORT", "0");
+    env.set(
+        "GROKPTAH_CONTROL_WORKSPACES",
+        std::env::join_paths([ws.path(), ws_other.path()]).unwrap(),
+    );
+
+    let srv = start_control_from_env(host.clone())
+        .await
+        .expect("desktop env bootstrap must start control server");
+    assert!(srv.addr.ip().is_loopback());
+
+    let url = format!("http://{}/mcp", srv.addr);
+    let sdk_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_sdk_interop");
+    let output = tokio::process::Command::new("node")
+        .arg(sdk_dir.join("run_computer_reads_smoke.mjs"))
+        .env("GROKPTAH_MCP_URL", &url)
+        .env("GROKPTAH_MCP_TOKEN", &token)
+        .env("GROKPTAH_MCP_SESSION_ID", session.id.to_string())
+        .env("GROKPTAH_MCP_WORKSPACE", ws.path().display().to_string())
+        .env(
+            "GROKPTAH_MCP_OTHER_WORKSPACE",
+            ws_other.path().display().to_string(),
+        )
+        .env("GROKPTAH_MCP_COMPUTER_RUN_A", &run_a.run_id)
+        .env("GROKPTAH_MCP_COMPUTER_RUN_B", &run_b.run_id)
+        .env("GROKPTAH_MCP_COMPUTER_RUN_C", &run_c.run_id)
+        .output()
+        .await
+        .expect("spawn computer reads smoke");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "computer reads smoke failed\nstdout={stdout}\nstderr={stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(report["ok"], true, "computer reads smoke report={report}");
+    if let Some(failed) = report["failed"].as_array() {
+        assert!(failed.is_empty(), "failed checks: {failed:?}");
+    }
+    // Durable transcript for verifiers (`--nocapture`).
+    eprintln!("LIVE_COMPUTER_READS_SMOKE_REPORT {report}");
+
+    srv.stop_and_wait().await;
+    set_grokptah_home_override(None);
+    drop(env);
 }

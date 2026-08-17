@@ -4,11 +4,12 @@ use std::sync::Arc;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
-    grokptah_home, ActionClass, ActionGrant, ComputerAction, ComputerAgentProposal,
-    ComputerCapabilities, ComputerError, ComputerObservation, ComputerObservationPlatform,
-    ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun,
-    ComputerRunState, ComputerStore, ComputerTargetCandidate, ComputerUseLimits,
-    ComputerUseService, GrantIssuer, MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
+    ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
+    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
+    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
+    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -43,6 +44,13 @@ pub struct PendingComputerApproval {
 pub struct ComputerCockpitSnapshot {
     pub backend: ComputerCapabilities,
     pub origin: String,
+    /// Authoritative run view. This is the identical serialized projection a
+    /// coordinator surface receives, so the cockpit and an external observer
+    /// cannot disagree about state, control disposition, epoch, or progress.
+    pub projection: Option<ComputerRunProjection>,
+    /// Local-only detail. It carries observed element labels and values needed
+    /// to render an approval and must never cross the MCP boundary; the
+    /// projection above is what does.
     pub run: Option<ComputerRun>,
     pub pending_approval: Option<PendingComputerApproval>,
 }
@@ -56,8 +64,9 @@ pub struct ComputerAgentProposalResult {
 }
 
 pub struct DesktopComputerUse {
+    host: AgentHostHandle,
     platform: Option<Arc<dyn ComputerObservationPlatform>>,
-    store: Option<ComputerStore>,
+    store: Option<grokptah_agent_bridge::ComputerStore>,
     initialization_error: Option<String>,
     operation: Mutex<()>,
     selections: std::sync::Mutex<HashMap<String, grokptah_agent_bridge::ComputerTarget>>,
@@ -68,9 +77,12 @@ pub struct DesktopComputerUse {
 }
 
 impl DesktopComputerUse {
-    pub fn new() -> Self {
+    pub fn new(host: &AgentHostHandle) -> Self {
         let (platform, platform_error) = native_platform();
-        let (store, store_error) = match ComputerStore::open(grokptah_home().join("computer-use")) {
+        // The durable ledger holds an exclusive file lock, so the desktop and
+        // the embedded MCP control plane must share the host's single handle
+        // rather than each opening their own store.
+        let (store, store_error) = match host.ensure_computer_store() {
             Ok(store) => (Some(store), None),
             Err(error) => (
                 None,
@@ -84,6 +96,7 @@ impl DesktopComputerUse {
             ))
         });
         Self {
+            host: host.clone(),
             platform,
             store,
             initialization_error: platform_error.or(store_error),
@@ -94,6 +107,19 @@ impl DesktopComputerUse {
             simulator_operation: Mutex::new(()),
             pending_approval: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Durable workspace binding for a new run: the owning session's canonical
+    /// project cwd. `None` (no session, empty cwd, or a path that cannot be
+    /// canonicalized) keeps the run fully usable from the desktop but
+    /// invisible to workspace-scoped MCP reads, which fail closed on an
+    /// absent binding rather than inferring one from process state.
+    fn session_workspace(&self, owner_session_id: Uuid) -> Option<String> {
+        let session = self.host.session_load(owner_session_id).ok()?;
+        if session.cwd.is_empty() {
+            return None;
+        }
+        canonical_workspace_string(std::path::Path::new(&session.cwd))
     }
 
     pub fn status(&self) -> ComputerPlatformStatus {
@@ -182,6 +208,7 @@ impl DesktopComputerUse {
             .create_run(
                 &Uuid::new_v4().to_string(),
                 owner_session_id,
+                self.session_workspace(owner_session_id),
                 target,
                 limits,
             )
@@ -279,6 +306,9 @@ impl DesktopComputerUse {
         Ok(ComputerCockpitSnapshot {
             backend,
             origin: "desktop".into(),
+            projection: run
+                .as_ref()
+                .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now())),
             run,
             pending_approval,
         })
@@ -310,6 +340,7 @@ impl DesktopComputerUse {
             .create_run(
                 &Uuid::new_v4().to_string(),
                 owner_session_id,
+                self.session_workspace(owner_session_id),
                 target,
                 limits,
             )
@@ -368,6 +399,7 @@ impl DesktopComputerUse {
             .create_run(
                 &Uuid::new_v4().to_string(),
                 owner_session_id,
+                self.session_workspace(owner_session_id),
                 target,
                 limits,
             )
@@ -870,7 +902,7 @@ mod tests {
 
     use async_trait::async_trait;
     use grokptah_agent_bridge::computer_use::{ObservationGeometry, SemanticElement, Sensitivity};
-    use grokptah_agent_bridge::{ActionOutcome, ComputerBackend, ComputerTarget};
+    use grokptah_agent_bridge::{ActionOutcome, ComputerBackend, ComputerStore, ComputerTarget};
 
     use super::*;
 
@@ -1015,16 +1047,32 @@ mod tests {
         }
     }
 
+    /// Host fixture with its persist directories bound under the disposable
+    /// fixture directory. The process-global home override is serialized and
+    /// restored so parallel tests never touch the real user home.
+    fn test_host(dir: &std::path::Path) -> AgentHostHandle {
+        let _guard = grokptah_agent_bridge::home_override_serial();
+        grokptah_agent_bridge::set_grokptah_home_override(Some(dir.join(".grokptah")));
+        let host = grokptah_agent_bridge::AgentHost::create(Default::default());
+        grokptah_agent_bridge::set_grokptah_home_override(None);
+        host
+    }
+
     fn test_desktop() -> (tempfile::TempDir, DesktopComputerUse) {
         let dir = tempfile::tempdir().unwrap();
+        // Tests deliberately open an isolated store in the fixture directory;
+        // production `new()` must borrow the host's shared handle instead.
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
         let simulator = Arc::new(ComputerUseService::new(
             Arc::new(SimulatorBackend::new()),
             store.clone(),
         ));
+        // Build the host before `dir` moves into the returned tuple.
+        let host = test_host(dir.path());
         (
             dir,
             DesktopComputerUse {
+                host,
                 platform: None,
                 store: Some(store),
                 initialization_error: None,

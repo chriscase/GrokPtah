@@ -1,5 +1,9 @@
 import { memo } from "react";
-import type { PromptQueueEntry, PromptQueueState } from "../lib/promptQueue";
+import {
+  queueEntriesFor,
+  type PromptQueueEntry,
+  type PromptQueueState,
+} from "../lib/promptQueue";
 import type { SessionTab } from "../lib/protocol";
 
 export type FleetStripProps = {
@@ -25,9 +29,9 @@ export function queueSummary(entries: PromptQueueEntry[]): string[] {
   return summary;
 }
 
-function phaseLabel(t: SessionTab, queues: PromptQueueState = {}): string {
+function phaseLabel(t: SessionTab, queues?: PromptQueueState): string {
   if (t.needsPermission) return "needs you";
-  const queueEntries = queues[t.id] ?? [];
+  const queueEntries = queues ? queueEntriesFor(queues, t.id) : [];
   const fleetBits: string[] = queueSummary(queueEntries);
   if (t.runningSubagents && t.runningSubagents > 0) {
     fleetBits.push(
@@ -101,7 +105,9 @@ export const FleetStrip = memo(function FleetStrip({
               data-session-id={t.id}
               data-running-subagents={t.runningSubagents ?? 0}
               data-total-tokens={t.totalTokens ?? 0}
-              data-queue-count={queues?.[t.id]?.length ?? 0}
+              data-queue-count={
+                queues ? queueEntriesFor(queues, t.id).length : 0
+              }
               aria-pressed={isPrimary}
               aria-current={isPrimary ? "true" : undefined}
               aria-label={`${t.title}: ${phaseLabel(t, queues)}${

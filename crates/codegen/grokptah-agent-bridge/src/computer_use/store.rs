@@ -10,11 +10,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::types::{
-    validate_id, ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerResult,
-    ComputerRun, ComputerRunState,
+    validate_id, validate_workspace, ComputerControlDisposition, ComputerError, ComputerErrorCode,
+    ComputerResult, ComputerRun, ComputerRunState,
 };
 
-const MAX_RUN_RECORDS: usize = 256;
 const MAX_RECEIPTS: usize = 2_048;
 const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const TERMINAL_RUN_AGE: Duration = Duration::days(30);
@@ -62,6 +61,10 @@ pub(crate) enum MutationClaim {
 }
 
 impl ComputerStore {
+    /// Durable ledger ceiling, surfaced so capacity reads report the same
+    /// bound the store actually enforces in [`Self::can_create_run`].
+    pub const MAX_RUN_RECORDS: usize = 256;
+
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
@@ -133,7 +136,7 @@ impl ComputerStore {
 
     pub(crate) fn can_create_run(&self) -> ComputerResult<()> {
         let count = self.list_runs()?.len();
-        if count >= MAX_RUN_RECORDS {
+        if count >= Self::MAX_RUN_RECORDS {
             return Err(ComputerError::new(
                 ComputerErrorCode::LimitReached,
                 "computer-use run record limit reached",
@@ -273,10 +276,24 @@ impl ComputerStore {
             run.ended_at = Some(run.updated_at);
             run.grant = None;
             run.current_observation = None;
+            // A prior action summary can carry backend-chosen text. Clearing it
+            // is the same fail-closed move as dropping the observation: restart
+            // must not keep a leaky last_outcome on the durable record.
+            run.last_outcome = None;
             run.last_error = Some(ComputerError::new(
                 ComputerErrorCode::Interrupted,
                 "computer run interrupted by process restart; explicit reauthorization required",
             ));
+            // The interruption must be visible in the durable journal itself,
+            // not only on the run record, so a coordinator replaying events
+            // sees why the run ended (#286).
+            run.record_audit(
+                "recover",
+                "interrupted",
+                None,
+                None,
+                Some(ComputerErrorCode::Interrupted),
+            );
             atomic_write_json(&path, &run).map_err(internal_error)?;
         }
         Ok(())
@@ -313,7 +330,7 @@ impl ComputerStore {
         for (index, (path, run)) in runs.into_iter().enumerate() {
             let expired = run.state.is_terminal()
                 && now.signed_duration_since(run.updated_at) > TERMINAL_RUN_AGE;
-            if run.state.is_terminal() && (index >= MAX_RUN_RECORDS || expired) {
+            if run.state.is_terminal() && (index >= Self::MAX_RUN_RECORDS || expired) {
                 fs::remove_file(path).map_err(internal_error)?;
             }
         }
@@ -362,6 +379,7 @@ impl ComputerStore {
 
 fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
     validate_id("run_id", &run.run_id)?;
+    validate_workspace(run.workspace.as_deref())?;
     if let Some(parent_run_id) = &run.parent_run_id {
         validate_id("parent_run_id", parent_run_id)?;
     }
@@ -552,7 +570,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::computer_use::{ActionClass, ActionGrant, ComputerTarget, ComputerUseLimits};
+    use crate::computer_use::{
+        ActionClass, ActionGrant, ActionOutcome, ComputerTarget, ComputerUseLimits,
+    };
 
     fn target() -> ComputerTarget {
         ComputerTarget {
@@ -571,7 +591,8 @@ mod tests {
         {
             let store = ComputerStore::open(dir.path()).unwrap();
             let mut run =
-                ComputerRun::new(Uuid::new_v4(), target(), ComputerUseLimits::default()).unwrap();
+                ComputerRun::new(Uuid::new_v4(), None, target(), ComputerUseLimits::default())
+                    .unwrap();
             run_id = run.run_id.clone();
             let now = Utc::now();
             run.grant = Some(ActionGrant {
@@ -586,6 +607,10 @@ mod tests {
                 revoked_at: None,
             });
             run.transition(ComputerRunState::Ready).unwrap();
+            run.last_outcome = Some(ActionOutcome::bounded(
+                "PRIVATE_DOCUMENT_TITLE leaked from AX",
+                Some(true),
+            ));
             store.save_run(&run).unwrap();
         }
         let store = ComputerStore::open(dir.path()).unwrap();
@@ -598,6 +623,18 @@ mod tests {
         assert!(recovered.control_epoch > 0);
         assert!(recovered.grant.is_none());
         assert!(recovered.current_observation.is_none());
+        assert!(
+            recovered.last_outcome.is_none(),
+            "restart must not keep a leaky last_outcome"
+        );
+        assert_eq!(
+            recovered.last_error.as_ref().map(|error| error.code),
+            Some(ComputerErrorCode::Interrupted)
+        );
+        let last = recovered.audit.last().expect("recovery is journaled");
+        assert_eq!(last.operation, "recover");
+        assert_eq!(last.disposition, "interrupted");
+        assert_eq!(last.error_code, Some(ComputerErrorCode::Interrupted));
     }
 
     #[test]
@@ -646,7 +683,8 @@ mod tests {
         {
             let store = ComputerStore::open(dir.path()).unwrap();
             let run =
-                ComputerRun::new(Uuid::new_v4(), target(), ComputerUseLimits::default()).unwrap();
+                ComputerRun::new(Uuid::new_v4(), None, target(), ComputerUseLimits::default())
+                    .unwrap();
             store.save_run(&run).unwrap();
             fs::rename(
                 store.run_path(&run.run_id).unwrap(),

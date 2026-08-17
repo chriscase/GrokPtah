@@ -1417,12 +1417,30 @@ async fn bridge_prompt_queue_mutates_reorders_and_drains_authoritatively() {
         .session_queue_add(session.id, "second".into(), false)
         .unwrap();
     let second = entries[1].clone();
+    let version_of = |entry_id: &str| {
+        host.session_queue_list(session.id)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == entry_id)
+            .expect("entry present")
+            .version
+    };
     host.session_queue_edit(session.id, &first.id, first.version, "edited first".into())
         .unwrap();
-    let entries = host.session_queue_move(session.id, &second.id, 0).unwrap();
+    let (entries, _) = host
+        .session_queue_move(
+            session.id,
+            &second.id,
+            0,
+            version_of(&second.id),
+            host.session_queue_snapshot(session.id).unwrap().revision,
+        )
+        .unwrap();
     assert_eq!(entries[0].id, second.id);
 
-    let run_next = host.session_queue_run_next(session.id, &first.id).unwrap();
+    let run_next = host
+        .session_queue_run_next(session.id, &first.id, version_of(&first.id))
+        .unwrap();
     assert!(!run_next.cancelled_active);
     assert!(run_next.entries[0].priority);
     let drained = host.session_queue_take_next(session.id).unwrap();
@@ -1431,7 +1449,8 @@ async fn bridge_prompt_queue_mutates_reorders_and_drains_authoritatively() {
     assert_eq!(batch.text, "edited first");
     assert_eq!(drained.entries[0].id, second.id);
 
-    host.session_queue_remove(session.id, &second.id).unwrap();
+    host.session_queue_remove(session.id, &second.id, version_of(&second.id))
+        .unwrap();
     assert!(host.session_queue_list(session.id).unwrap().is_empty());
 }
 
@@ -1524,6 +1543,380 @@ async fn steer_now_injects_once_without_cancelling_active_turn() {
         1,
         "steering must be persisted exactly once"
     );
+}
+
+/// S4: `clear` is the "stop what you're doing" control. It used to clear only
+/// the durable follow-ups and return `Ok(vec![])`, so a coordinator got an
+/// empty-queue receipt while an accepted steering interjection was still on
+/// its way to the model. Clearing must either stop it or say that it didn't.
+#[tokio::test]
+async fn clear_queue_accounts_for_accepted_steering_instead_of_reporting_empty() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let runner = {
+        let host = host.clone();
+        tokio::spawn(async move { host.session_prompt(session.id, "run sleep 1".into()).await })
+    };
+    loop {
+        let event = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("shell did not start")
+            .expect("event channel closed");
+        if matches!(event, SessionUpdate::ShellSessionStarted { .. }) {
+            break;
+        }
+    }
+
+    let receipt = host
+        .session_steer(session.id, "abandon this direction".into())
+        .unwrap();
+    assert_eq!(
+        receipt.disposition,
+        grokptah_agent_bridge::SteeringDisposition::Pending,
+        "mid-turn steering should be accepted, not deferred"
+    );
+    host.session_queue_add(session.id, "a follow up".into(), false)
+        .unwrap();
+
+    let (entries, outcome, _revision) = host
+        .session_queue_clear_with_origin_receipt(session.id, "mcp")
+        .unwrap();
+    assert!(entries.is_empty());
+    assert_eq!(outcome.queued_cleared, 1);
+    // The steering is either cancelled (not yet delivered) or reported as
+    // in flight (already handed to a boundary). Before the fix it was neither:
+    // it stayed pending and the receipt claimed an empty queue.
+    assert_eq!(
+        outcome.steering_cancelled + outcome.steering_in_flight,
+        1,
+        "accepted steering must be accounted for by clear"
+    );
+    let claimed_stopped = outcome.fully_stopped();
+    assert_eq!(claimed_stopped, outcome.steering_cancelled == 1);
+
+    timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("active turn did not finish")
+        .unwrap()
+        .unwrap();
+    let events = drain_until_turn_complete(&mut rx).await;
+    let injected = events
+        .iter()
+        .filter(|event| matches!(event, SessionUpdate::SteeringInjected { .. }))
+        .count();
+    if claimed_stopped {
+        assert_eq!(
+            injected, 0,
+            "clear reported the session stopped, so nothing may be injected"
+        );
+        assert!(
+            !host
+                .session_transcript(session.id)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.text.contains("abandon this direction")),
+            "cancelled steering must not reach the transcript"
+        );
+    }
+    assert!(
+        host.session_queue_list(session.id).unwrap().is_empty(),
+        "cleared steering must not be deferred back into the queue"
+    );
+}
+
+/// S3: `run_next` is the one queue mutator that cancels the active turn, and
+/// with an optional compare-and-set a coordinator working from a stale view
+/// could interrupt a running turn on the strength of a version it never
+/// checked. The cancel has to sit behind the CAS: a rejected call must leave
+/// both the queue and the turn exactly as it found them.
+#[tokio::test]
+async fn stale_run_next_is_rejected_without_cancelling_the_active_turn() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let entry = host
+        .session_queue_add(session.id, "follow up".into(), false)
+        .unwrap()[0]
+        .clone();
+
+    let runner = {
+        let host = host.clone();
+        tokio::spawn(async move { host.session_prompt(session.id, "run sleep 1".into()).await })
+    };
+    loop {
+        let event = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("shell did not start")
+            .expect("event channel closed");
+        if matches!(event, SessionUpdate::ShellSessionStarted { .. }) {
+            break;
+        }
+    }
+
+    let stale = host
+        .session_queue_run_next(session.id, &entry.id, entry.version + 1)
+        .expect_err("a stale run_next must fail closed");
+    assert!(
+        stale.to_string().contains("stale queued prompt version"),
+        "expected a stale-version conflict, got: {stale}"
+    );
+    let listed = host.session_queue_list(session.id).unwrap();
+    assert_eq!(listed.len(), 1, "a rejected run_next must not mutate");
+    assert_eq!(listed[0].version, entry.version);
+    assert!(!listed[0].priority, "the entry must not have been promoted");
+
+    // The turn is still running, which is the point: `cancelled_active` can
+    // only be true here if the rejected call left it alive.
+    let promoted = host
+        .session_queue_run_next(session.id, &entry.id, entry.version)
+        .unwrap();
+    assert!(
+        promoted.cancelled_active,
+        "the turn the stale call must not have cancelled is still cancellable"
+    );
+    assert!(promoted.entries[0].priority);
+
+    timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("active turn did not finish")
+        .unwrap()
+        .unwrap();
+    let events = drain_until_turn_complete(&mut rx).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                SessionUpdate::TurnComplete {
+                    cancelled: true,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "exactly one cancel, from the call whose CAS passed"
+    );
+}
+
+/// P1: `run_next` observes the active turn under the queue lock but cancels
+/// after releasing it. If the observed turn finishes in that gap and a new one
+/// starts, an unconditional cancel kills the newcomer — a turn the caller
+/// never saw. The cancel must be bound to the turn that was observed.
+#[tokio::test]
+async fn run_next_cannot_cancel_a_turn_that_started_after_the_one_it_observed() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+
+    let entry = host
+        .session_queue_add(session.id, "follow up".into(), false)
+        .unwrap()[0]
+        .clone();
+
+    // Turn A runs and finishes.
+    host.session_prompt(session.id, "run true".into())
+        .await
+        .unwrap();
+    let _ = drain_until_turn_complete(&mut rx).await;
+
+    // Turn B starts. `run_next` must not be able to cancel it on the strength
+    // of having observed turn A.
+    let runner = {
+        let host = host.clone();
+        tokio::spawn(async move { host.session_prompt(session.id, "run sleep 1".into()).await })
+    };
+    loop {
+        let event = timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("second turn did not start")
+            .expect("event channel closed");
+        if matches!(event, SessionUpdate::ShellSessionStarted { .. }) {
+            break;
+        }
+    }
+
+    // A stale generation stands in for "the turn I observed is already gone".
+    let stale = host.cancel_turn_if_generation_for_test(session.id, 1);
+    assert!(
+        stale.is_err(),
+        "cancelling a turn that already ended must not fall through to the current one"
+    );
+
+    timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("turn B did not finish")
+        .unwrap()
+        .unwrap();
+    let events = drain_until_turn_complete(&mut rx).await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            SessionUpdate::TurnComplete {
+                cancelled: true,
+                ..
+            }
+        )),
+        "turn B must not have absorbed a cancel meant for turn A"
+    );
+    // The queue is untouched by the refused cancel.
+    let listed = host.session_queue_list(session.id).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, entry.id);
+}
+
+/// P1: draining a batch and starting its turn are two calls. Without a turn
+/// reservation another writer can start a turn in between; the drained prompt
+/// is then refused by the busy check and is already gone from the queue.
+#[tokio::test]
+async fn a_drain_reserves_the_turn_so_a_racing_writer_cannot_lose_the_prompt() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+    host.session_queue_add(session.id, "queued work".into(), false)
+        .unwrap();
+
+    let drained = host.session_queue_take_next(session.id).unwrap();
+    let batch = drained.batch.expect("a batch was queued");
+    let reservation = drained
+        .reservation
+        .expect("a drain that removes entries must claim the turn slot");
+    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+
+    // The racing writer now loses, instead of winning and stranding the batch.
+    let raced = host
+        .reserve_orchestration_turn("competing-run", session.id)
+        .is_err();
+    assert!(raced, "the drain must hold the session's turn slot");
+
+    // And the drain can still start the turn it reserved.
+    host.session_prompt_reserved_with_max_rounds(
+        session.id,
+        batch.text.clone(),
+        None,
+        &reservation,
+    )
+    .await
+    .unwrap();
+}
+
+/// The other half: if the turn never starts, the batch has to come back rather
+/// than vanish, and the reservation must not be left holding the session.
+#[tokio::test]
+async fn restoring_an_unstarted_drain_returns_the_prompts_and_frees_the_turn() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig::default());
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+    host.session_queue_add(session.id, "first".into(), false)
+        .unwrap();
+    host.session_queue_add(session.id, "second".into(), false)
+        .unwrap();
+    let before: Vec<String> = host
+        .session_queue_list(session.id)
+        .unwrap()
+        .iter()
+        .map(|entry| entry.text.clone())
+        .collect();
+
+    let drained = host.session_queue_take_next(session.id).unwrap();
+    let batch = drained.batch.expect("a batch was queued");
+    let reservation = drained.reservation.expect("drain reserves the turn");
+
+    let restored = host
+        .session_queue_restore_drain(session.id, Some(&reservation), batch.entries.clone())
+        .unwrap();
+    assert_eq!(
+        restored
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>(),
+        before,
+        "restored entries keep their original order"
+    );
+    // Versions move, because the entries were briefly out of the queue: a
+    // holder of the pre-drain version was describing something that did not
+    // exist.
+    assert!(restored.iter().all(|entry| entry.version >= 1));
+    // The slot is free again for whoever wants it next.
+    host.reserve_orchestration_turn("later-run", session.id)
+        .expect("restore must release the reservation");
+}
+
+/// Reserving the turn on drain is what stops a racing writer from stranding
+/// the batch, but it also means a drainer that dies between taking the batch
+/// and starting the turn would hold the session busy forever. An abandoned
+/// drain reservation must be reclaimable.
+#[tokio::test]
+async fn an_abandoned_drain_reservation_does_not_wedge_the_session() {
+    let _iso = IsolatedHome::install();
+    let dir = tempfile::tempdir().unwrap();
+    let host = AgentHost::create(HostConfig::default());
+    host.start().unwrap();
+    host.set_project_cwd(dir.path()).unwrap();
+    let session = host.session_new().unwrap();
+    host.session_queue_add(session.id, "first".into(), false)
+        .unwrap();
+    host.session_queue_add(session.id, "second".into(), false)
+        .unwrap();
+
+    // Drain once and then simply walk away, as a crashed renderer would.
+    // `take_next` combines the plain prefix, so this empties the queue.
+    let abandoned = host.session_queue_take_next(session.id).unwrap();
+    assert!(abandoned.reservation.is_some());
+    assert!(host.session_queue_list(session.id).unwrap().is_empty());
+
+    // New work arrives for a session whose turn slot is still held.
+    host.session_queue_add(session.id, "third".into(), false)
+        .unwrap();
+    assert!(
+        host.session_queue_take_next(session.id)
+            .unwrap()
+            .batch
+            .is_none(),
+        "a live reservation must still block a second drain"
+    );
+
+    host.expire_drain_reservation_for_test(session.id);
+
+    let recovered = host.session_queue_take_next(session.id).unwrap();
+    assert_eq!(
+        recovered.batch.as_ref().map(|batch| batch.text.as_str()),
+        Some("third"),
+        "an abandoned drain reservation must be reclaimable"
+    );
+    assert!(recovered.reservation.is_some());
 }
 
 #[tokio::test]

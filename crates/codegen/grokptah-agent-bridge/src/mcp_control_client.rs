@@ -81,6 +81,7 @@ pub struct PtahRecoveryNotification {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum LiveNotification {
     Event(PtahEventNotification),
     Recovery(PtahRecoveryNotification),

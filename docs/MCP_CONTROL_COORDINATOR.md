@@ -199,12 +199,23 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_get_test_results` | read | `session_id`, `workspace`, `run_id` |
 | `ptah_get_handoff` | read | `session_id`, `workspace`, `run_id` |
 | `ptah_review_run` | read | `session_id`, `workspace`, `run_id` (completed isolated run only) |
+| `ptah_list_computer_runs` | read | `session_id`, `workspace` |
+| `ptah_get_computer_run` | read | `session_id`, `workspace`, `run_id` |
+| `ptah_get_computer_run_events` | read | `session_id`, `workspace`, `run_id`; optional `after_seq`, `limit` (1–500, default 100) |
+| `ptah_get_computer_capacity` | read | `session_id`, `workspace` |
 | `ptah_submit_task` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `bounds`, `execution_mode`, `allow_queue` |
 | `ptah_retry_run` | mutate | `request_id`, `session_id`, `workspace`, `run_id`, `prompt`; optional narrower `bounds`, matching `execution_mode`, `allow_queue` |
 | `ptah_approve_run` | mutate | exact run/session/workspace, source and final fingerprints, exact `changed_files`; optional bounded `ttl_ms` |
 | `ptah_promote_run` | mutate | `request_id`, exact run/session/workspace, `approval_id` |
 | `ptah_discard_run` | mutate | `request_id`, exact run/session/workspace |
+| `ptah_get_queue` | read | `session_id`, `workspace` (response includes the current queue `revision`) |
 | `ptah_queue_prompt` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `priority` |
+| `ptah_edit_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `version`, `text` |
+| `ptah_remove_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `expected_version` |
+| `ptah_reorder_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `to_index`, `expected_version`, `expected_revision` |
+| `ptah_clear_queue` | mutate | `request_id`, `session_id`, `workspace` |
+| `ptah_run_next` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `expected_version` |
+| `ptah_steer_queued` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `expected_version` |
 | `ptah_steer` | mutate | `request_id`, `session_id`, `workspace`, `text` |
 | `ptah_cancel` | mutate | `request_id`, `session_id`, `workspace`, `run_id` |
 
@@ -262,8 +273,92 @@ Mutating tools take `request_id`:
 
 ### Queue
 
+- `ptah_get_queue` returns the authenticated session's durable queued entries;
+  it never returns another session's queue or a queue outside the workspace
+  allowlist.
 - `ptah_queue_prompt` enqueues follow-ups; durable across host restart when the
-  host session store reloads from the same GrokPtah home.
+  host session store reloads from the same GrokPtah home. Its receipt includes
+  `actionId`, `origin`, `action`, `disposition`, `actionVersion`, `entry`, and
+  the complete post-action `entries` snapshot.
+- **Every queue mutator is compare-and-set, and the version is required.**
+  `ptah_edit_queue` takes the current entry `version`; `ptah_remove_queue`,
+  `ptah_reorder_queue`, `ptah_run_next`, and `ptah_steer_queued` take
+  `expected_version`. Omitting it is a schema rejection, not a
+  last-write-wins mutation — the desktop writes this same queue, so an
+  unconditional mutation is a mutation against a queue you have not read.
+  A stale version is a `stale_version` conflict (HTTP 409), the queue is
+  unchanged, and the fix is to re-read the queue and retry. This matches the
+  Computer Use control fence, which also requires the current version on
+  every transition.
+- **Every queue mutation receipt reports the `revision` it produced**, and
+  `ptah_get_queue` reports the revision it read at. Because reorder is fenced
+  on the revision, a coordinator that could not learn the revision its own
+  mutation stamped would have to re-read before every reorder — and that read
+  can observe someone else's newer mutation. Chain straight from a receipt
+  instead. The desktop is held to the same fence: its reorders carry the
+  revision it is rendering, so neither writer can move an absolute index
+  against an ordering the other has already replaced.
+- `ptah_reorder_queue` **bumps the version of every entry whose index
+  changed**, including the entry it moved. `to_index` is absolute, so it only
+  means something against a specific ordering; without the bump two
+  coordinators could reorder concurrently, both receive success, and leave an
+  arbitrary final order. Entries that did not shift keep their versions, and a
+  move that lands on its current index changes nothing. Expect to refresh
+  versions after any reorder, yours or someone else's.
+- `ptah_reorder_queue` also takes the queue's current `expected_revision`, which
+  `ptah_get_queue` returns and `prompt_queue_changed` publishes. The bridge
+  checks it under the same lock as the reorder before checking the entry CAS.
+  This fences an absolute reorder built before a competing `ptah_run_next` (or
+  another queue mutation that changed the ordering) even when the displaced
+  entries' quieter per-entry versions are unchanged. A stale revision is the
+  same `stale_version` / 409 conflict and leaves the queue untouched.
+- `ptah_run_next` promotes an entry and may explicitly cancel an active turn;
+  the cancel happens only after the compare-and-set has passed, so a rejected
+  call never interrupts a running turn. The cancel is also bound to the turn
+  that was observed while the queue was locked: if that turn ends before the
+  cancel lands, nothing is cancelled and `cancelledActive` is `false` — a
+  later turn never absorbs a cancel meant for an earlier one.
+- **`ptah_run_next`, `ptah_reorder_queue`, and `ptah_steer_queued` will not
+  schedule an entry the control plane could not have created.** The desktop
+  may author `!` shell prompts and `/` commands locally; selecting one from
+  the control plane is refused with `forbidden_scope` *after* the workspace
+  gate, so a cross-scope claim cannot learn that a forbidden entry exists.
+  Promoting or steering that text is the same outcome
+  `reject_control_prompt` exists to prevent, reached by choosing instead of
+  by writing. Ordinary entries are unaffected. `ptah_steer` never cancels.
+  `ptah_steer_queued` turns one queued ordinary entry into a safe-boundary
+  steering action: it reports `pending` during a Build turn and `queued`
+  while idle.
+- `ptah_clear_queue` removes all durable queued entries for the scoped session
+  **and cancels accepted steering that has not yet reached the model**. Because
+  steering already handed to a model boundary cannot be retracted, an empty
+  `entries` list is not on its own a promise that the session is quiet. The
+  receipt reports what actually happened:
+  - `clearedQueued` — durable follow-ups removed.
+  - `steeringCancelled` — accepted steering stopped before injection.
+  - `steeringInFlight` — steering already delivered to a boundary; it *will*
+    still be injected.
+  - `stopped` — `true` only when `steeringInFlight` is `0`. Branch on this,
+    not on `entries` being empty.
+- Every queue mutation is idempotent by `request_id`, and all mutation
+  receipts use the same action identity/origin/snapshot shape so a coordinator
+  can reconcile retries without guessing whether an action committed.
+- Queue changes are also emitted as redacted `prompt_queue_changed` session
+  events with the post-action snapshot. Delivery, deferral, and desktop
+  composer consumption are journaled as state transitions, allowing a GUI or
+  coordinator that reconnects to recover the same queue view without replaying
+  a prompt.
+- `prompt_queue_changed` carries a monotonic per-session `revision`, stamped
+  under the bridge's queue mutation lock. Events are published *after* that
+  lock is released, so the bus `seq` reflects publish order while `revision`
+  reflects commit order. A consumer that applies snapshots must keep a
+  per-session watermark and ignore any snapshot whose `revision` is not
+  greater than the newest already applied; otherwise a late-published older
+  snapshot silently regresses the queue. The desktop reducer does this.
+- Entry `text` in `prompt_queue_changed` is **not** length-capped. Secrets are
+  still scrubbed, but the text is byte-identical to what `ptah_get_queue`
+  returns, so a GUI can safely seed an edit draft from the event and save it
+  back. Redaction must never truncate this field.
 - Priority flag moves to front; combine rules live in host `prompt_queue`.
 
 ### Bounded task admission
@@ -390,6 +485,54 @@ observed or when the response omits claims required by the observed work.
   concurrency (32). Exhausted run capacity → structured orch error
   (`capacity_exhausted` / session busy).
 - MCP request flood beyond 32 inflight → **429**.
+
+### Computer Run reads (#271 slice 2 — read-only)
+
+The four `ptah_*_computer_*` tools serve the redaction-safe
+`ComputerRunProjection` contract from `docs/COMPUTER_USE.md`. **No Computer
+Run mutation, grant issuance, evidence byte, or screenshot is exposed over
+MCP**; the release gate snapshots the surface so a mutation cannot slip in.
+
+- Every read requires the owning `session_id` plus the claimed allowlisted
+  `workspace` (canonicalized, matched against the session cwd). Computer Runs
+  additionally carry a **durable workspace binding** stamped at creation from
+  the owning session's canonical cwd; a read must match it exactly. Runs
+  created before the binding existed have none and are invisible to MCP —
+  fail closed, never inferred from process state.
+- Unknown runs, another session's runs, another workspace's runs, unbound
+  runs, and traversal-shaped ids all return the **identical**
+  `forbidden_scope` error ("computer run is not available to this session"),
+  so no read is a run-existence oracle.
+- `ptah_get_computer_run_events` pages the bounded durable audit ring.
+  `nextCursor` is present only while entries remain; a cursor below the
+  retained window is **410 `cursor_expired`** with `eventRange` on the error
+  so recovery does not require a second `ptah_get_computer_run`. Resume at
+  `startSeq - 1`. A cursor at or past the tail is a valid empty page.
+  Omitting `after_seq` reads from the retained start.
+- Unknown session, a mismatched allowlisted workspace, and an unauthorized
+  run all return the **identical** `forbidden_scope` error. Session existence
+  is not distinguishable from cross-scope. A claimed workspace that is not
+  on the host allowlist still fails as `workspace_mismatch` (session-
+  independent).
+- GUI and MCP projections are byte-identical for one `(record, now)`. Live
+  MCP uses `Utc::now()` per call, so `elapsedMillis` / `stale` / `expired`
+  may differ across surfaces.
+- `ptah_get_computer_capacity` reports the constant ledger bound (256
+  records) plus counts scoped to the `(session, workspace)` binding
+  (`boundRuns` / `boundActiveRuns`). Host-wide stored/active totals are
+  absent so the tool cannot count other scopes after the workspace gate.
+  Restart recovery marks live runs `interrupted`, revokes authority, clears
+  `last_outcome`, journals a `recover` entry, and keeps events replayable.
+- If the host has no Computer Use ledger (or its exclusive lock is held
+  elsewhere), all four tools fail closed with `unsupported`.
+- Live proof: `live_computer_reads_node_smoke`
+  (`tests/mcp_streamable_transport.rs`) boots the production
+  `start_control_from_env` server and drives
+  `tests/mcp_sdk_interop/run_computer_reads_smoke.mjs`, an independent Node
+  client, through discovery, scoped reads, wire-level projection key pins,
+  cursor paging/expiry/recovery, duplicate replay, cross-session and
+  cross-workspace rejection, capacity, auth-before-body, and reconnect
+  replay.
 
 ## Example client flow
 
