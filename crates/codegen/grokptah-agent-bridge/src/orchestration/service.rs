@@ -2484,7 +2484,9 @@ impl OrchestrationService {
             } else {
                 RunState::Running
             },
+            agent_id: None,
             retry_of: retry_of.map(str::to_string),
+            parent_run_id: None,
             queue_position: None,
             bounds: bounds.clone(),
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),

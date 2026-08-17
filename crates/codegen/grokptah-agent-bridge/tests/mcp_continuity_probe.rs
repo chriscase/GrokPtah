@@ -48,7 +48,9 @@ fn seed_run(
             request_id: format!("{run_id}-request"),
             client_id: Some("mcp".into()),
             state,
+            agent_id: None,
             retry_of: None,
+            parent_run_id: None,
             queue_position: None,
             bounds: RunBounds {
                 max_prompt_bytes: 10_000,

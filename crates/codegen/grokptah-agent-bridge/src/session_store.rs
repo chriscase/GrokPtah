@@ -81,6 +81,8 @@ impl Default for WorkspaceChrome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub id: Uuid,
+    #[serde(default)]
+    pub agent_id: Option<String>,
     pub title: String,
     pub cwd: String,
     pub created_at: DateTime<Utc>,
@@ -439,6 +441,7 @@ impl SessionMeta {
     fn from_session(s: &Session) -> Self {
         Self {
             id: s.id,
+            agent_id: s.agent_id.clone(),
             title: s.title.clone(),
             cwd: s.cwd.display().to_string(),
             created_at: s.created_at,
@@ -466,6 +469,7 @@ impl SessionMeta {
     fn into_shell(self) -> Session {
         Session {
             id: self.id,
+            agent_id: self.agent_id,
             title: self.title,
             cwd: PathBuf::from(self.cwd),
             created_at: self.created_at,

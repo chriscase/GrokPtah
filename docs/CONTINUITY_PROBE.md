@@ -2,7 +2,9 @@
 
 **Status:** Passing disposable offline probe
 **Date:** 2026-08-16
-**Production changes:** None
+**Production changes:** The runtime now has a first-class persistent-agent
+identity/checkpoint contract, but this historical probe still exercises the
+HTTP coordinator's harness-owned derivation flow.
 
 ## What was exercised
 
@@ -49,27 +51,33 @@ The probe required no production edits. Existing behavior was sufficient for:
 5. scoped, resumable SSE events with monotonic sequence IDs; and
 6. explicit recovery signaling that names the durable read tool.
 
+The runtime additionally persists `AgentRecord` and
+`ContinuationCheckpoint` records for desktop Build turns. Those records are
+validated and resumable through an explicit desktop bridge seam; this probe
+has not yet been migrated to consume them, so its harness lineage remains a
+useful compatibility check for the external coordinator protocol.
+
 ## Harness-invented continuity state
 
-The runtime does not persist a general continuity-chain record. The harness
-therefore owns and persists:
+This historical HTTP probe still owns and persists:
 
 - `chainId`;
 - ordinal and parent-run links for ordinary continuation;
 - the complete durable read bundle used as derivation input; and
 - the hash envelope placed in each post-seed prompt.
 
-The runtime's persisted `retry_of` field is authoritative for the restart edge.
-The ordinary parent chain and the derivation-input history are coordinator
-lineage, not runtime identity. A future durable identity/continuation feature
-should store these relationships by explicit IDs rather than infer them from a
-focused session or current working directory.
+The runtime's persisted `retry_of` field remains authoritative for the
+explicit restart edge exercised here. For desktop Build turns, ordinary
+continuation now has explicit `agent_id`, `parent_run_id`, and checkpoint
+lineage in the durable orchestration store. The HTTP probe's ordinary parent
+chain remains coordinator lineage until the external protocol is deliberately
+extended to consume the new contract.
 
 ## Observed degradations and follow-ups
 
 | Observation | Evidence | Runtime change required by this probe |
 | --- | --- | --- |
-| No first-class chain/parent/derivation record exists | Harness state contains the five post-seed derivation records; runtime only exposes `retry_of` for the restart edge | None for #296; future durable identity/continuation work should add explicit IDs and a migration/recovery contract |
+| The historical HTTP probe does not consume runtime checkpoints | Harness state contains the five post-seed derivation records; desktop Build runtime now exposes explicit agent/checkpoint lineage | Future protocol work can add scoped agent/checkpoint reads after an authority decision; no automatic resume is implied |
 | Live recovery is a signal, not automatic replay | `notifications/ptah_recovery` names `ptah_get_events` and `afterSeq`; the coordinator must poll and reconcile | None; this is the intended fail-closed contract |
 | Journal retention can make an old nonzero cursor expire | Existing `ptah_get_events` reports cursor expiry instead of silently skipping; this probe starts reconciliation at durable sequence zero | None; callers must retain/reconcile from a durable checkpoint |
 | Offline disposable setup emits repeated `chrome persist failed` stderr lines while the continuity checks remain green | Test output only; no MCP call failed and no probe check depended on Chrome state | No #296 production change; isolate or repair the existing test-fixture persistence path separately if its noise is undesirable |

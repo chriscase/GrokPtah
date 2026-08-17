@@ -11,8 +11,8 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 
 use super::types::{
-    safe_id_filename, AuditEntry, IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState,
-    RunRecord, RunState,
+    safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
+    IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
 };
 
 #[derive(Clone)]
@@ -88,6 +88,8 @@ impl OrchStore {
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
+        fs::create_dir_all(root.join("agents"))?;
+        fs::create_dir_all(root.join("checkpoints"))?;
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
@@ -172,6 +174,20 @@ impl OrchStore {
             .join(format!("{safe}.json")))
     }
 
+    fn agent_path(&self, agent_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(agent_id)?;
+        Ok(self.inner.root.join("agents").join(format!("{safe}.json")))
+    }
+
+    fn checkpoint_path(&self, checkpoint_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(checkpoint_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("checkpoints")
+            .join(format!("{safe}.json")))
+    }
+
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
         let _g = self.inner.lock.lock();
         let result = self
@@ -238,6 +254,145 @@ impl OrchStore {
             }
         }
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
+    }
+
+    /// Persist one transport-neutral durable agent identity.
+    pub fn save_agent(&self, agent: &AgentRecord) -> anyhow::Result<()> {
+        agent
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        let path = self
+            .agent_path(&agent.agent_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        atomic_write_json(&path, agent)
+    }
+
+    pub fn load_agent(&self, agent_id: &str) -> anyhow::Result<Option<AgentRecord>> {
+        let _g = self.inner.lock.lock();
+        let path = match self.agent_path(agent_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let agent: AgentRecord = serde_json::from_str(&fs::read_to_string(path)?)?;
+        agent
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(Some(agent))
+    }
+
+    pub fn list_agents(&self) -> anyhow::Result<Vec<AgentRecord>> {
+        let _g = self.inner.lock.lock();
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("agents");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let agent: AgentRecord = serde_json::from_str(&fs::read_to_string(path)?)?;
+            agent
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            out.push(agent);
+        }
+        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(out)
+    }
+
+    pub fn update_agent<F>(&self, agent_id: &str, update: F) -> anyhow::Result<Option<AgentRecord>>
+    where
+        F: FnOnce(&mut AgentRecord) -> anyhow::Result<()>,
+    {
+        let _g = self.inner.lock.lock();
+        let path = self
+            .agent_path(agent_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let mut agent: AgentRecord = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        agent
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        update(&mut agent)?;
+        agent
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        agent.updated_at = Utc::now();
+        atomic_write_json(&path, &agent)?;
+        Ok(Some(agent))
+    }
+
+    /// Persist a verified continuation point. Checkpoint records are append-
+    /// only at the logical level; replacing an ID is allowed only for the
+    /// atomic write/recovery path and must still pass hash validation.
+    pub fn save_checkpoint(&self, checkpoint: &ContinuationCheckpoint) -> anyhow::Result<()> {
+        checkpoint
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        let path = self
+            .checkpoint_path(&checkpoint.checkpoint_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        atomic_write_json(&path, checkpoint)
+    }
+
+    pub fn load_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<Option<ContinuationCheckpoint>> {
+        let _g = self.inner.lock.lock();
+        let path = match self.checkpoint_path(checkpoint_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let checkpoint: ContinuationCheckpoint = serde_json::from_str(&fs::read_to_string(path)?)?;
+        checkpoint
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(Some(checkpoint))
+    }
+
+    pub fn list_checkpoints(
+        &self,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<Vec<ContinuationCheckpoint>> {
+        let _g = self.inner.lock.lock();
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("checkpoints");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let checkpoint: ContinuationCheckpoint =
+                serde_json::from_str(&fs::read_to_string(path)?)?;
+            checkpoint
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if agent_id.is_none_or(|id| checkpoint.agent_id == id) {
+                out.push(checkpoint);
+            }
+        }
+        out.sort_by(|a, b| {
+            b.ordinal
+                .cmp(&a.ordinal)
+                .then(b.created_at.cmp(&a.created_at))
+        });
         Ok(out)
     }
 
@@ -624,6 +779,7 @@ impl OrchStore {
 
     pub fn mark_unfinished_interrupted(&self) -> anyhow::Result<usize> {
         let mut n = 0;
+        let mut interrupted_agents = Vec::new();
         for mut run in self.list_runs()? {
             if matches!(run.state, RunState::Queued | RunState::Running) {
                 run.state = RunState::Interrupted;
@@ -635,8 +791,39 @@ impl OrchStore {
                     execution.promotion_state = PromotionState::Conflicted;
                 }
                 self.save_run(&run)?;
+                if let Some(agent_id) = run.agent_id.clone() {
+                    interrupted_agents.push((agent_id, run.run_id.clone()));
+                }
                 n += 1;
             }
+        }
+        for (agent_id, run_id) in interrupted_agents {
+            let _ = self.update_agent(&agent_id, |agent| {
+                if agent.current_run_id.as_deref() == Some(run_id.as_str()) {
+                    agent.current_run_id = None;
+                    agent.state = AgentState::Interrupted;
+                }
+                Ok(())
+            })?;
+        }
+        // A crash can occur after a terminal run is durably installed but
+        // before its checkpoint is attached to the agent. Never leave that
+        // agent permanently active: terminal ownership is no longer live.
+        for agent in self.list_agents()? {
+            let Some(run_id) = agent.current_run_id.clone() else {
+                continue;
+            };
+            let next_state = match self.load_run(&run_id)? {
+                Some(run) if run.state.is_terminal() => AgentState::Waiting,
+                Some(_) | None => AgentState::Interrupted,
+            };
+            let _ = self.update_agent(&agent.agent_id, |current| {
+                if current.current_run_id.as_deref() == Some(run_id.as_str()) {
+                    current.current_run_id = None;
+                    current.state = next_state;
+                }
+                Ok(())
+            })?;
         }
         Ok(n)
     }
@@ -792,7 +979,9 @@ fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestration::types::RunBounds;
+    use crate::orchestration::types::{
+        AgentRecord, ContinuationCheckpoint, ContinuationReason, RunBounds,
+    };
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -804,7 +993,9 @@ mod tests {
             request_id: format!("req-{run_id}"),
             client_id: None,
             state: RunState::Completed,
+            agent_id: None,
             retry_of: None,
+            parent_run_id: None,
             queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
@@ -822,6 +1013,25 @@ mod tests {
         }
     }
 
+    fn checkpoint(agent_id: &str, session_id: Uuid, run_id: &str) -> ContinuationCheckpoint {
+        let mut checkpoint = ContinuationCheckpoint {
+            checkpoint_id: format!("checkpoint-{run_id}"),
+            agent_id: agent_id.into(),
+            session_id,
+            run_id: run_id.into(),
+            parent_checkpoint_id: None,
+            ordinal: 1,
+            workspace: "/tmp/w".into(),
+            context_summary: "verified context".into(),
+            context_hash: String::new(),
+            event_seq: 2,
+            reason: ContinuationReason::TurnCompleted,
+            created_at: Utc::now(),
+        };
+        checkpoint.context_hash = checkpoint.context_hash_for();
+        checkpoint
+    }
+
     #[test]
     fn restart_marks_running_interrupted() {
         let d = tempdir().unwrap();
@@ -833,7 +1043,9 @@ mod tests {
             request_id: "req1".into(),
             client_id: None,
             state: RunState::Running,
+            agent_id: None,
             retry_of: None,
+            parent_run_id: None,
             queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
@@ -857,6 +1069,94 @@ mod tests {
     }
 
     #[test]
+    fn restart_marks_bound_agent_interrupted_but_preserves_checkpoint() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let session_id = Uuid::new_v4();
+        let agent_id = "agent-restart";
+        let cp = checkpoint(agent_id, session_id, "r-agent");
+        store.save_checkpoint(&cp).unwrap();
+        store
+            .save_agent(&AgentRecord {
+                agent_id: agent_id.into(),
+                session_id,
+                workspace: "/tmp/w".into(),
+                model: "grok".into(),
+                state: AgentState::Active,
+                current_run_id: Some("r-agent".into()),
+                latest_checkpoint_id: Some(cp.checkpoint_id.clone()),
+                continuation_ordinal: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        let mut run = terminal_run("r-agent");
+        run.session_id = session_id;
+        run.state = RunState::Running;
+        run.terminal_result = None;
+        run.final_response = None;
+        run.agent_id = Some(agent_id.into());
+        run.end_seq = None;
+        store.save_run(&run).unwrap();
+        drop(store);
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        let agent = reopened.load_agent(agent_id).unwrap().unwrap();
+        assert_eq!(agent.state, AgentState::Interrupted);
+        assert_eq!(agent.current_run_id, None);
+        assert!(reopened
+            .load_checkpoint(&cp.checkpoint_id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn restart_clears_agent_after_terminal_run_before_checkpoint_attach() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let session_id = Uuid::new_v4();
+        let agent_id = "agent-terminal-gap";
+        store
+            .save_agent(&AgentRecord {
+                agent_id: agent_id.into(),
+                session_id,
+                workspace: "/tmp/w".into(),
+                model: "grok".into(),
+                state: AgentState::Active,
+                current_run_id: Some("terminal-gap".into()),
+                latest_checkpoint_id: None,
+                continuation_ordinal: 0,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        let mut run = terminal_run("terminal-gap");
+        run.session_id = session_id;
+        run.agent_id = Some(agent_id.into());
+        store.save_run(&run).unwrap();
+        drop(store);
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        let agent = reopened.load_agent(agent_id).unwrap().unwrap();
+        assert_eq!(agent.state, AgentState::Waiting);
+        assert_eq!(agent.current_run_id, None);
+    }
+
+    #[test]
+    fn tampered_checkpoint_fails_closed() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let cp = checkpoint("agent-tamper", Uuid::new_v4(), "run-tamper");
+        store.save_checkpoint(&cp).unwrap();
+        let path = store.checkpoint_path(&cp.checkpoint_id).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path.clone()).unwrap()).unwrap();
+        value["contextSummary"] = serde_json::Value::String("tampered".into());
+        fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        assert!(store.load_checkpoint(&cp.checkpoint_id).is_err());
+    }
+
+    #[test]
     fn clone_does_not_interrupt_running() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
@@ -867,7 +1167,9 @@ mod tests {
             request_id: "req2".into(),
             client_id: None,
             state: RunState::Running,
+            agent_id: None,
             retry_of: None,
+            parent_run_id: None,
             queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
@@ -1093,7 +1395,9 @@ mod tests {
             request_id: "req-tx".into(),
             client_id: None,
             state: RunState::Running,
+            agent_id: None,
             retry_of: None,
+            parent_run_id: None,
             queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
