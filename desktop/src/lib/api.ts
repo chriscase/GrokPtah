@@ -23,6 +23,7 @@ import type {
   WorkspaceUiState,
   ProviderQualificationReport,
   PersistentAgent,
+  PersistentAgentResumePlan,
 } from "./protocol";
 import type {
   PromptQueueEntry,
@@ -40,6 +41,10 @@ export const api = {
     invoke<PersistentAgent[]>("persistent_agent_list"),
   persistentAgentGet: (agentId: string) =>
     invoke<PersistentAgent | null>("persistent_agent_get", { agentId }),
+  persistentAgentResumePlan: (sessionId: string) =>
+    invoke<PersistentAgentResumePlan>("persistent_agent_resume_plan", {
+      sessionId,
+    }),
   persistentAgentResume: (
     sessionId: string,
     prompt: string,

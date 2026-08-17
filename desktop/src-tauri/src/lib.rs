@@ -62,6 +62,7 @@ pub fn run() {
             commands::agent_status,
             commands::persistent_agent_list,
             commands::persistent_agent_get,
+            commands::persistent_agent_resume_plan,
             commands::persistent_agent_resume,
             commands::computer_use_status,
             commands::computer_use_request_permission,

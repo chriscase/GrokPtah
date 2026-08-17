@@ -77,6 +77,27 @@ export interface PersistentAgent {
   updatedAt: string;
 }
 
+export interface PersistentAgentCheckpoint {
+  checkpointId: string;
+  agentId: string;
+  sessionId: string;
+  runId: string;
+  parentCheckpointId?: string | null;
+  ordinal: number;
+  workspace: string;
+  contextSummary: string;
+  contextHash: string;
+  eventSeq: number;
+  reason: string;
+  createdAt: string;
+}
+
+export interface PersistentAgentResumePlan {
+  agent: PersistentAgent;
+  checkpoint: PersistentAgentCheckpoint;
+  parentRunId: string;
+}
+
 export type RunExecutionMode = "shared" | "isolated_worktree";
 export type PromotionState =
   | "not_applicable"

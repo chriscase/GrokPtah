@@ -32,6 +32,7 @@ import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
 import { PromptQueuePanel } from "./components/PromptQueuePanel";
 import { RunInspector } from "./components/RunInspector";
+import { PersistentAgentPanel } from "./components/PersistentAgentPanel";
 import { SubagentCard } from "./components/SubagentCard";
 import {
   appendDeny,
@@ -97,6 +98,7 @@ type RightTab =
   | "mcp"
   | "plugins"
   | "skills"
+  | "agents"
   | "tasks"
   | "rules";
 
@@ -313,6 +315,9 @@ export default function App() {
   const [runsError, setRunsError] = useState<string | null>(null);
   const [runsBusy, setRunsBusy] = useState(false);
   const [runsWatching, setRunsWatching] = useState(true);
+  const [persistentAgents, setPersistentAgents] = useState<import("./lib/protocol").PersistentAgent[]>([]);
+  const [persistentAgentsBusy, setPersistentAgentsBusy] = useState(false);
+  const [persistentAgentsError, setPersistentAgentsError] = useState<string | null>(null);
   const [hooksPreview, setHooksPreview] = useState<string | null>(null);
   const [rules, setRules] = useState<string[]>([]);
   const [product, setProduct] = useState({
@@ -410,6 +415,18 @@ export default function App() {
       if (runsRefreshGuard.isCurrent(request)) setRunsBusy(false);
     }
   }, [activeSessionId, runsRefreshGuard]);
+
+  const refreshPersistentAgents = useCallback(async () => {
+    setPersistentAgentsBusy(true);
+    try {
+      setPersistentAgents(await api.persistentAgentList());
+      setPersistentAgentsError(null);
+    } catch (error) {
+      setPersistentAgentsError(`Could not refresh persistent agents: ${String(error)}`);
+    } finally {
+      setPersistentAgentsBusy(false);
+    }
+  }, []);
 
   const syncRunOrigins = useCallback(async (sessionIds: string[]) => {
     if (runOriginSyncInFlight.current) return;
@@ -2007,6 +2024,7 @@ export default function App() {
       }
       if (tab === "plugins") setPlugins(await api.pluginsList());
       if (tab === "skills") setSkills(await api.skillsList());
+      if (tab === "agents") await refreshPersistentAgents();
       if (tab === "tasks") {
         setSubagents(await api.subagentsList());
         setBgTasks(await api.backgroundTasks());
@@ -2017,6 +2035,40 @@ export default function App() {
       console.warn(e);
     }
   }
+
+  const openPersistentAgentSession = useCallback(
+    async (agent: import("./lib/protocol").PersistentAgent) => {
+      try {
+        const session = await api.sessionLoad(agent.sessionId);
+        setWorkspaceMode("build");
+        await openTab(session, true);
+      } catch (error) {
+        setPersistentAgentsError(`Could not open agent session: ${String(error)}`);
+      }
+    },
+    [openTab],
+  );
+
+  const resumePersistentAgent = useCallback(
+    async (agent: import("./lib/protocol").PersistentAgent, prompt: string) => {
+      const response = await api.persistentAgentResume(
+        agent.sessionId,
+        prompt,
+        undefined,
+        crypto.randomUUID(),
+      );
+      try {
+        const session = await api.sessionLoad(agent.sessionId);
+        await openTab(session, true);
+      } catch {
+        /* The event stream still updates an already-open tab. */
+      }
+      await refreshPersistentAgents();
+      await refreshChrome();
+      return response;
+    },
+    [openTab, refreshChrome, refreshPersistentAgents],
+  );
 
   async function onFuzzy(q: string) {
     setFuzzy(q);
@@ -3090,6 +3142,7 @@ export default function App() {
               "mcp",
               "plugins",
               "skills",
+              "agents",
               "tasks",
               "rules",
             ] as RightTab[]
@@ -3383,6 +3436,19 @@ export default function App() {
               </button>
             </div>
           </>
+        )}
+
+        {rightTab === "agents" && (
+          <PersistentAgentPanel
+            agents={persistentAgents}
+            activeSessionId={activeSessionId}
+            busy={persistentAgentsBusy}
+            error={persistentAgentsError}
+            onRefresh={() => void refreshPersistentAgents()}
+            onOpenSession={(agent) => void openPersistentAgentSession(agent)}
+            onInspect={(sessionId) => api.persistentAgentResumePlan(sessionId)}
+            onResume={(agent, prompt) => resumePersistentAgent(agent, prompt)}
+          />
         )}
 
         {rightTab === "tasks" && (

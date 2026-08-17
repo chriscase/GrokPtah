@@ -85,6 +85,16 @@ pub async fn persistent_agent_get(
     run_blocking(move || host.get_persistent_agent(&agent_id).map_err(map_err)).await
 }
 
+#[tauri::command]
+pub async fn persistent_agent_resume_plan(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<grokptah_agent_bridge::AgentResumePlan, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || host.prepare_agent_resume(session_id).map_err(map_err)).await
+}
+
 /// Manual continuation only: the caller supplies a fresh instruction and the
 /// bridge validates the latest durable checkpoint before starting a run.
 #[tauri::command]
