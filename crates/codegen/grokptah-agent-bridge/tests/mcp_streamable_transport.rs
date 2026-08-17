@@ -2175,7 +2175,7 @@ fn smoke_grant(run: &ComputerRun) -> ActionGrant {
     }
 }
 
-/// Live desktop-equivalent proof for the read-only Computer Run tools: the
+/// Live desktop-equivalent proof for the scoped Computer Run reads: the
 /// production `start_control_from_env` bootstrap (the same entry the Tauri
 /// desktop uses), seeded with real simulator runs through the host's shared
 /// store, exercised end to end by an independent Node client over real

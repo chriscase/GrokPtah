@@ -486,12 +486,22 @@ observed or when the response omits claims required by the observed work.
   (`capacity_exhausted` / session busy).
 - MCP request flood beyond 32 inflight → **429**.
 
-### Computer Run reads (#271 slice 2 — read-only)
+### Computer Run reads and bounded control (#271 slices 2–3)
 
 The four `ptah_*_computer_*` tools serve the redaction-safe
-`ComputerRunProjection` contract from `docs/COMPUTER_USE.md`. **No Computer
-Run mutation, grant issuance, evidence byte, or screenshot is exposed over
-MCP**; the release gate snapshots the surface so a mutation cannot slip in.
+`ComputerRunProjection` contract from `docs/COMPUTER_USE.md`. The MCP surface
+also exposes four bounded controls: `ptah_authorize_computer_run`,
+`ptah_pause_computer_run`, `ptah_take_over_computer_run`, and
+`ptah_cancel_computer_run`. Controls require an initialized MCP transport
+session; the server binds the grant issuer to initialize `clientInfo` plus the
+server-issued transport session id. Grant issuance accepts only semantic and
+text-entry classes with bounded lifetime/use count. Every control requires the
+owning session, canonical workspace, run id, and expected version. The desktop
+adapter performs the mutation against the already-open Computer Run service.
+
+Computer Run creation, observation, action execution, evidence bytes,
+screenshots, raw input, and target selection remain local-only; the release
+gate snapshots the surface so an unsafe tool cannot slip in silently.
 
 - Every read requires the owning `session_id` plus the claimed allowlisted
   `workspace` (canonicalized, matched against the session cwd). Computer Runs

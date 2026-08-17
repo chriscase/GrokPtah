@@ -463,6 +463,10 @@ pub struct AgentHostHandle {
     /// an exclusive file lock, so the desktop cockpit and the MCP control
     /// plane must share this handle instead of opening their own.
     computer_store: Arc<Mutex<Option<crate::computer_use::ComputerStore>>>,
+    /// Optional live Computer Run backend owned by the desktop host. MCP
+    /// mutations delegate through this adapter rather than opening a second
+    /// service against the exclusive Computer Run ledger.
+    computer_controller: Arc<Mutex<Option<Arc<dyn crate::computer_use::ComputerRunController>>>>,
     /// Prevent concurrent desktop promotion/discard operations for one run.
     promotion_locks: Arc<Mutex<HashSet<String>>>,
     reviewed_runs: Arc<Mutex<HashSet<String>>>,
@@ -633,6 +637,7 @@ impl AgentHost {
             event_rx_factory: Arc::new(Mutex::new(Some(event_rx))),
             orchestration_store: Arc::new(Mutex::new(None)),
             computer_store: Arc::new(Mutex::new(None)),
+            computer_controller: Arc::new(Mutex::new(None)),
             promotion_locks: Arc::new(Mutex::new(HashSet::new())),
             reviewed_runs: Arc::new(Mutex::new(HashSet::new())),
             orchestration_wakeup: Arc::new(Notify::new()),
@@ -894,6 +899,24 @@ impl AgentHostHandle {
     /// Return the already-open Computer Run ledger without filesystem work.
     pub fn computer_store(&self) -> Option<crate::computer_use::ComputerStore> {
         self.computer_store.lock().clone()
+    }
+
+    /// Register the live desktop Computer Run backend used by MCP mutation
+    /// tools. Registration is process-local and replaces any prior adapter
+    /// only during host setup.
+    pub fn set_computer_run_controller(
+        &self,
+        controller: Arc<dyn crate::computer_use::ComputerRunController>,
+    ) {
+        *self.computer_controller.lock() = Some(controller);
+    }
+
+    /// Return the registered live Computer Run backend without opening any
+    /// filesystem state.
+    pub fn computer_run_controller(
+        &self,
+    ) -> Option<Arc<dyn crate::computer_use::ComputerRunController>> {
+        self.computer_controller.lock().clone()
     }
 
     /// Install a store supplied by the orchestration service when the host has

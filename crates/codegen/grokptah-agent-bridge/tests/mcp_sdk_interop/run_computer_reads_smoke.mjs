@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Independent live client for the read-only Computer Run MCP tools (#271).
+// Independent live client for the scoped Computer Run reads and bounded
+// control discovery contract (#271).
 //
 // Talks raw Streamable HTTP JSON-RPC against a desktop-equivalent server
 // started by `start_control_from_env` (driven by the Rust test
@@ -137,24 +138,26 @@ async function main() {
   const initialized = await rpc(null, "notifications/initialized", {}, { session: sid });
   check("initialized notification is accepted", initialized.status === 202);
 
-  // Discovery: the four read tools, and no computer mutation.
+  // Discovery: the four reads plus the explicitly bounded control slice;
+  // observation, action, evidence, and raw-input tools remain absent.
   const list = await rpc(2, "tools/list", {}, { session: sid });
   const names = (list.body?.result?.tools ?? []).map((t) => t.name);
-  for (const name of [
+  const allowedComputerTools = [
     "ptah_list_computer_runs",
     "ptah_get_computer_run",
     "ptah_get_computer_run_events",
     "ptah_get_computer_capacity",
-  ]) {
+    "ptah_authorize_computer_run",
+    "ptah_pause_computer_run",
+    "ptah_take_over_computer_run",
+    "ptah_cancel_computer_run",
+  ];
+  for (const name of allowedComputerTools) {
     check(`discovery includes ${name}`, names.includes(name));
   }
   check(
-    "discovery has no computer mutation",
-    !names.some(
-      (n) =>
-        n.includes("computer") &&
-        !["ptah_list_computer_runs", "ptah_get_computer_run", "ptah_get_computer_run_events", "ptah_get_computer_capacity"].includes(n),
-    ),
+    "discovery has no unapproved computer tool",
+    !names.some((n) => n.includes("computer") && !allowedComputerTools.includes(n)),
     names.join(","),
   );
 

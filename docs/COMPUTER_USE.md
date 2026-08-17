@@ -4,7 +4,8 @@ Computer Use is tracked by epic [#267](https://github.com/chriscase/GrokPtah/iss
 It is intentionally staged. The safety kernel, simulator, desktop operator cockpit, native macOS
 observation, and the first semantic macOS action slice share one bounded run contract. A selected,
 qualified model can now propose one semantic action at a time, but only the local cockpit can stage
-and approve it. Computer Use is not exposed as an MCP mutation surface.
+and approve it. MCP exposes only a bounded control slice: client-identified grants plus
+pause/take-over/cancel for an existing run.
 
 ## Safety boundary
 
@@ -12,8 +13,9 @@ Computer Use treats observation and action as separate privileged operations:
 
 1. A local user selects an exact application/window target.
 2. GrokPtah creates a bounded run in `awaiting_authorization`.
-3. A local-user grant binds that run, target generation, allowed action classes, expiry, and
-   optional remaining-use count.
+3. A local-user grant, or an explicitly identified MCP client grant in the bounded control
+   slice, binds that run, target generation, allowed action classes, expiry, and optional
+   remaining-use count.
 4. An observation receives a monotonic ID. Every action must reference the current observation.
 5. Policy is checked again immediately before the backend action.
 6. Successful actions invalidate the observation, forcing the caller to observe again.
@@ -102,9 +104,11 @@ state. Unknown session, a mismatched allowlisted workspace, cross-session, unbou
 unknown run, and traversal-shaped reads all collapse into the same
 `unauthorized`/`forbidden_scope` failure. The desktop and the
 control plane share one `ComputerStore` handle through `AgentHost::ensure_computer_store`
-because the ledger holds an exclusive file lock. No mutation, grant, evidence byte, or
-screenshot crosses MCP; see `docs/MCP_CONTROL_COORDINATOR.md` for the wire contract and
-the independent live smoke.
+because the ledger holds an exclusive file lock. MCP controls may issue only bounded
+semantic/text-entry grants or pause, take over, and cancel an existing run; observation,
+action execution, evidence bytes, screenshots, raw input, and target creation remain
+local-only. See `docs/MCP_CONTROL_COORDINATOR.md` for the wire contract and the independent
+live smoke.
 
 ### Event cursors and gaps
 
@@ -193,7 +197,8 @@ packaging requirements, and disposable smoke fixture.
 
 - no Windows UI Automation or Linux portal adapter;
 - no unattended or continuously autonomous model invocation;
-- no MCP Computer Run surface;
+- no MCP Computer Run observation/action/evidence surface (only the bounded grant and
+  pause/take-over/cancel control slice is exposed);
 - no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell endpoint;
 - no background or unattended grant;
 - no cross-application target switching inside a run.

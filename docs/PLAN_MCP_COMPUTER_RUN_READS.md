@@ -1,4 +1,4 @@
-# Plan: read-only MCP coordinator surface for Computer Runs (slice 2 of #271)
+# Plan: MCP coordinator surface for Computer Runs (slices 2–3 of #271)
 
 Status: **implemented on this branch.** This document was first produced as
 a design-only deliverable while the session treated its container disk
@@ -228,9 +228,11 @@ LIVE_COMPUTER_READS_SMOKE_REPORT {"checks":53,"failed":[],"ok":true,"passed":53}
 
 ## 6. Deliberately deferred (document in the PR)
 
-- All Computer Run mutations over MCP (submit/steer/pause/cancel/take-over)
-  and grant issuance with client identity — #271's grant section; the
-  service-side idempotency receipts and takeover fences already exist.
+- Computer Run creation, observation, action execution, evidence resources,
+  and submit/steer orchestration over MCP remain deferred. The bounded control
+  slice (client-identified grant issuance plus pause/cancel/take-over) now
+  delegates through the desktop-owned service; its workspace scope, version,
+  idempotency, and takeover fences are covered by the mutation probe.
 - Durable `origin` + cockpit MCP-activity labeling (#286) — ships with the
   first producer.
 - Live computer-run event streaming (`notifications/ptah_event` pattern) —

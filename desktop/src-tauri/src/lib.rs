@@ -15,7 +15,7 @@ pub struct AppState {
     pub pty: pty_host::PtyHub,
     /// Loopback MCP control plane (#196); optional when token not configured.
     pub control: Mutex<Option<ControlServerHandle>>,
-    pub computer_use: computer_use::DesktopComputerUse,
+    pub computer_use: std::sync::Arc<computer_use::DesktopComputerUse>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -32,11 +32,12 @@ pub fn run() {
             host: host.clone(),
             pty: pty_host::PtyHub::new(),
             control: Mutex::new(None),
-            computer_use: computer_use::DesktopComputerUse::new(&host),
+            computer_use: std::sync::Arc::new(computer_use::DesktopComputerUse::new(&host)),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
             app.state::<AppState>().pty.set_app(handle.clone());
+            host.set_computer_run_controller(app.state::<AppState>().computer_use.clone());
             let _ = host.start();
             event_forward::spawn_event_forwarder(handle, event_rx);
 

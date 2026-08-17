@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
@@ -16,8 +16,9 @@ use super::store::{ComputerStore, MutationClaim};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
     ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
-    ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
+    ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits, GrantIssuer,
 };
+use super::ComputerGrantRequest;
 
 pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
@@ -221,6 +222,73 @@ impl ComputerUseService {
                 }
                 self.policy.authorize_grant(run, &grant, Utc::now())?;
                 run.grant = Some(grant.clone());
+                run.last_error = None;
+                run.transition(ComputerRunState::Ready)?;
+                run.set_control_disposition(ComputerControlDisposition::AgentOwned);
+                run.record_audit("authorize", "granted", None, None, None);
+                Ok(())
+            })
+            .and_then(|run| run.ok_or_else(unknown_run));
+        if let Err(error) = &result {
+            self.record_denial(run_id, "authorize", None, error);
+        }
+        self.finish_mutation(request_id, &result)?;
+        result
+    }
+
+    /// Authorize a bounded MCP client grant with a stable mutation payload.
+    ///
+    /// The durable receipt must be claimed before server-generated grant
+    /// timestamps and ids are created. Otherwise a retry with the same
+    /// request id would hash differently and be rejected instead of replaying
+    /// the original result.
+    pub fn authorize_mcp_client(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        client_id: String,
+        grant_request: ComputerGrantRequest,
+    ) -> ComputerResult<ComputerRun> {
+        validate_id("run_id", run_id)?;
+        validate_id("client_id", &client_id)?;
+        let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        grant_request.validate(run.limits)?;
+        let payload = json!({
+            "runId": run_id,
+            "expectedVersion": expected_version,
+            "clientId": client_id,
+            "grantRequest": grant_request,
+        });
+        if let Some(replayed) = self.begin_mutation(request_id, "authorize", &payload)? {
+            return replayed;
+        }
+        let now = Utc::now();
+        let result = self
+            .store
+            .update_run(run_id, |run| {
+                ensure_version(run, expected_version)?;
+                if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidState,
+                        "operator takeover is absorbing; create a new computer run",
+                    ));
+                }
+                let grant = ActionGrant {
+                    grant_id: format!("mcp-{}", Uuid::new_v4()),
+                    run_id: run.run_id.clone(),
+                    target: run.target.clone(),
+                    action_classes: grant_request.action_classes.clone(),
+                    issued_by: GrantIssuer::McpClient {
+                        client_id: client_id.clone(),
+                    },
+                    issued_at: now,
+                    expires_at: now + Duration::milliseconds(grant_request.ttl_ms as i64),
+                    uses_remaining: grant_request.uses_remaining,
+                    revoked_at: None,
+                };
+                self.policy.authorize_grant(run, &grant, now)?;
+                run.grant = Some(grant);
                 run.last_error = None;
                 run.transition(ComputerRunState::Ready)?;
                 run.set_control_disposition(ComputerControlDisposition::AgentOwned);

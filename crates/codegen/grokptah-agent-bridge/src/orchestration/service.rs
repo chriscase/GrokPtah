@@ -977,6 +977,145 @@ impl OrchestrationService {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
+    // ── Computer Run mutations (#271 control slice) ───────────────────
+
+    fn computer_controller(
+        &self,
+    ) -> Result<Arc<dyn crate::computer_use::ComputerRunController>, OrchError> {
+        self.host.computer_run_controller().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Unsupported,
+                "computer use control is unavailable on this host",
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn authorize_computer_run_scoped(
+        &self,
+        _auth: &AuthContext,
+        client: &crate::computer_use::ComputerClientIdentity,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        expected_version: u64,
+        grant: crate::computer_use::ComputerGrantRequest,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let controller = self.computer_controller()?;
+        controller
+            .authorize(
+                client,
+                request_id,
+                session_id,
+                &claimed,
+                run_id,
+                expected_version,
+                grant,
+            )
+            .await
+            .map_err(computer_mutation_error)?;
+        self.project_computer_run(session_id, &claimed, run_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn pause_computer_run_scoped(
+        &self,
+        _auth: &AuthContext,
+        client: &crate::computer_use::ComputerClientIdentity,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let controller = self.computer_controller()?;
+        controller
+            .pause(
+                client,
+                request_id,
+                session_id,
+                &claimed,
+                run_id,
+                expected_version,
+            )
+            .await
+            .map_err(computer_mutation_error)?;
+        self.project_computer_run(session_id, &claimed, run_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn take_over_computer_run_scoped(
+        &self,
+        _auth: &AuthContext,
+        client: &crate::computer_use::ComputerClientIdentity,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let controller = self.computer_controller()?;
+        controller
+            .take_over(
+                client,
+                request_id,
+                session_id,
+                &claimed,
+                run_id,
+                expected_version,
+            )
+            .await
+            .map_err(computer_mutation_error)?;
+        self.project_computer_run(session_id, &claimed, run_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn cancel_computer_run_scoped(
+        &self,
+        _auth: &AuthContext,
+        client: &crate::computer_use::ComputerClientIdentity,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let controller = self.computer_controller()?;
+        controller
+            .cancel(
+                client,
+                request_id,
+                session_id,
+                &claimed,
+                run_id,
+                expected_version,
+            )
+            .await
+            .map_err(computer_mutation_error)?;
+        self.project_computer_run(session_id, &claimed, run_id)
+    }
+
+    fn project_computer_run(
+        &self,
+        session_id: Uuid,
+        claimed_workspace: &str,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let reads = self.computer_reads()?;
+        let binding = crate::computer_use::ComputerReadBinding::new(session_id, claimed_workspace);
+        serde_json::to_value(
+            reads
+                .project_run(binding, run_id, Utc::now())
+                .map_err(computer_read_error)?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
     fn events_for_run(
         &self,
         run: RunRecord,
@@ -3177,6 +3316,27 @@ fn computer_read_error(error: crate::computer_use::ComputerError) -> OrchError {
     let code = match error.code {
         ComputerErrorCode::Unauthorized => OrchErrorCode::ForbiddenScope,
         ComputerErrorCode::InvalidRequest => OrchErrorCode::InvalidRequest,
+        _ => OrchErrorCode::Internal,
+    };
+    OrchError::new(code, error.message)
+}
+
+fn computer_mutation_error(error: crate::computer_use::ComputerError) -> OrchError {
+    use crate::computer_use::ComputerErrorCode;
+    let code = match error.code {
+        ComputerErrorCode::Unauthorized
+        | ComputerErrorCode::ForbiddenTarget
+        | ComputerErrorCode::PermissionDenied
+        | ComputerErrorCode::PermissionRevoked => OrchErrorCode::ForbiddenScope,
+        ComputerErrorCode::InvalidRequest => OrchErrorCode::InvalidRequest,
+        ComputerErrorCode::Conflict | ComputerErrorCode::StaleObservation => {
+            OrchErrorCode::Conflict
+        }
+        ComputerErrorCode::InvalidState
+        | ComputerErrorCode::TargetChanged
+        | ComputerErrorCode::TargetClosed
+        | ComputerErrorCode::Interrupted
+        | ComputerErrorCode::UncertainOutcome => OrchErrorCode::Conflict,
         _ => OrchErrorCode::Internal,
     };
     OrchError::new(code, error.message)

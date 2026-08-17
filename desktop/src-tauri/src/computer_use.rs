@@ -1,15 +1,17 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
-    ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
-    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    ComputerAgentProposal, ComputerCapabilities, ComputerClientIdentity, ComputerError,
+    ComputerErrorCode, ComputerGrantRequest, ComputerObservation, ComputerObservationPlatform,
+    ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun,
+    ComputerRunController, ComputerRunProjection, ComputerRunState, ComputerTargetCandidate,
+    ComputerUseLimits, ComputerUseService, GrantIssuer, MacOsObservationPlatform, SemanticAction,
+    SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -759,6 +761,101 @@ impl DesktopComputerUse {
         self.initialization_error
             .clone()
             .unwrap_or_else(|| "Computer Use is unavailable on this platform".into())
+    }
+}
+
+#[async_trait]
+impl ComputerRunController for DesktopComputerUse {
+    async fn authorize(
+        &self,
+        client: &ComputerClientIdentity,
+        request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+        grant_request: ComputerGrantRequest,
+    ) -> Result<ComputerRun, ComputerError> {
+        let _guard = self.simulator_operation.lock().await;
+        let (service, run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        grant_request.validate(run.limits)?;
+        service.authorize_mcp_client(
+            request_id,
+            run_id,
+            expected_version,
+            client.actor_id(),
+            grant_request,
+        )
+    }
+
+    async fn pause(
+        &self,
+        _client: &ComputerClientIdentity,
+        request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<ComputerRun, ComputerError> {
+        let _guard = self.simulator_operation.lock().await;
+        self.clear_pending_for_owner(owner_session_id)
+            .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error))?;
+        let (service, _run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        service.pause(request_id, run_id, expected_version).await
+    }
+
+    async fn take_over(
+        &self,
+        _client: &ComputerClientIdentity,
+        request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<ComputerRun, ComputerError> {
+        let _guard = self.simulator_operation.lock().await;
+        self.clear_pending_for_owner(owner_session_id)
+            .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error))?;
+        let (service, _run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        service
+            .take_over(request_id, run_id, expected_version)
+            .await
+    }
+
+    async fn cancel(
+        &self,
+        _client: &ComputerClientIdentity,
+        request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        _expected_version: u64,
+    ) -> Result<ComputerRun, ComputerError> {
+        let _guard = self.simulator_operation.lock().await;
+        self.clear_pending_for_owner(owner_session_id)
+            .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error))?;
+        let (service, _run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        service.cancel(request_id, run_id).await
+    }
+}
+
+impl DesktopComputerUse {
+    fn controller_run(
+        &self,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+    ) -> Result<(Arc<ComputerUseService>, ComputerRun), ComputerError> {
+        let (service, run) = self
+            .owned_service(owner_session_id, run_id)
+            .map_err(|error| ComputerError::new(ComputerErrorCode::Unauthorized, error))?;
+        if run.workspace.as_deref() != Some(workspace) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "Computer Run is not available to this client scope",
+            ));
+        }
+        Ok((service, run))
     }
 }
 

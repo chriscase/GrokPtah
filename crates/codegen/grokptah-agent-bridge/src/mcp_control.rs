@@ -7,7 +7,7 @@
 //! Policy remains in [`OrchestrationService`]; this module is a thin adapter.
 //! `rmcp` is intentionally not linked here (reqwest 0.13 quarantine; see #200).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -30,6 +30,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use crate::computer_use::ComputerClientIdentity;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
     AuthContext, ChangeRecord, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
@@ -54,6 +55,12 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
     "2024-10-07",
 ];
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+const COMPUTER_MUTATION_TOOLS: &[&str] = &[
+    "ptah_authorize_computer_run",
+    "ptah_pause_computer_run",
+    "ptah_take_over_computer_run",
+    "ptah_cancel_computer_run",
+];
 
 /// Tunable transport limits for the loopback control server.
 ///
@@ -99,6 +106,8 @@ struct AppState {
 struct SessionState {
     #[allow(dead_code)]
     protocol_version: String,
+    client_name: String,
+    client_version: String,
     initialized: bool,
     #[allow(dead_code)]
     created_at: Instant,
@@ -780,6 +789,30 @@ struct ComputerEventsArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ComputerGrantArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+    expected_version: u64,
+    action_classes: BTreeSet<crate::computer_use::ActionClass>,
+    ttl_ms: u64,
+    #[serde(default)]
+    uses_remaining: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComputerControlArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+    expected_version: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SubmitArgs {
     request_id: String,
     session_id: Uuid,
@@ -1019,7 +1052,8 @@ async fn streamable_post_handler(
             }
             "tools/call" => {
                 require_session_if_present(&state, &headers)?;
-                let v = tools_call(&state.orch, &auth, &req.params).await?;
+                let client = computer_client_identity(&state, &headers)?;
+                let v = tools_call(&state.orch, &auth, &req.params, client).await?;
                 Ok((v, session_id_from_headers(&headers)))
             }
             "" => Err(OrchError::new(
@@ -1114,6 +1148,30 @@ fn require_session_if_present(state: &AppState, headers: &HeaderMap) -> Result<(
     Ok(())
 }
 
+fn computer_client_identity(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<ComputerClientIdentity>, OrchError> {
+    let Some(session_id) = session_id_from_headers(headers) else {
+        return Ok(None);
+    };
+    let sessions = state.sessions.lock();
+    let Some(session) = sessions.get(&session_id) else {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "unknown mcp-session-id",
+        ));
+    };
+    if !session.initialized {
+        return Ok(None);
+    }
+    Ok(Some(ComputerClientIdentity {
+        transport_session_id: session_id,
+        client_name: session.client_name.clone(),
+        client_version: session.client_version.clone(),
+    }))
+}
+
 /// Evict least-recently-seen sessions until `map.len() <= max`.
 fn evict_sessions_lru(map: &mut HashMap<String, SessionState>, max: usize) {
     while map.len() > max {
@@ -1143,6 +1201,8 @@ mod session_cap_tests {
                 format!("s{i}"),
                 SessionState {
                     protocol_version: "2025-11-25".into(),
+                    client_name: "test".into(),
+                    client_version: "0".into(),
                     initialized: true,
                     created_at: t0,
                     last_seen: t0 + Duration::from_secs(i),
@@ -1186,6 +1246,19 @@ fn handle_initialize(
             ));
         }
     }
+    let client_info = req.params.get("clientInfo").and_then(Value::as_object);
+    let client_name = bounded_client_field(
+        client_info
+            .and_then(|info| info.get("name"))
+            .and_then(Value::as_str),
+        "anonymous",
+    )?;
+    let client_version = bounded_client_field(
+        client_info
+            .and_then(|info| info.get("version"))
+            .and_then(Value::as_str),
+        "unknown",
+    )?;
     let session_id = Uuid::new_v4().to_string();
     {
         let mut g = state.sessions.lock();
@@ -1193,6 +1266,8 @@ fn handle_initialize(
             session_id.clone(),
             SessionState {
                 protocol_version: negotiated.to_string(),
+                client_name,
+                client_version,
                 initialized: false,
                 created_at: Instant::now(),
                 last_seen: Instant::now(),
@@ -1216,6 +1291,23 @@ fn handle_initialize(
         }),
         Some(session_id),
     ))
+}
+
+fn bounded_client_field(value: Option<&str>, fallback: &str) -> Result<String, OrchError> {
+    let value = value.unwrap_or(fallback).trim();
+    if value.is_empty()
+        || value.len() > 96
+        || value.bytes().any(|byte| byte.is_ascii_control())
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains("..")
+    {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "clientInfo fields must be non-empty, printable, path-safe, and at most 96 bytes",
+        ));
+    }
+    Ok(value.to_string())
 }
 
 fn status_for(e: &OrchError) -> StatusCode {
@@ -1336,6 +1428,43 @@ fn tool_input_schema(name: &str) -> Value {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500}
             }
         }),
+        "ptah_authorize_computer_run" => json!({
+            "type": "object",
+            "required": [
+                "request_id", "session_id", "workspace", "run_id",
+                "expected_version", "action_classes", "ttl_ms"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id,
+                "expected_version": {"type": "integer", "minimum": 0},
+                "action_classes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {"type": "string", "enum": ["semantic", "text_entry"]}
+                },
+                "ttl_ms": {"type": "integer", "minimum": 1, "maximum": 3600000},
+                "uses_remaining": {"type": "integer", "minimum": 1}
+            }
+        }),
+        "ptah_pause_computer_run" | "ptah_take_over_computer_run" | "ptah_cancel_computer_run" => {
+            json!({
+                "type": "object",
+                "required": ["request_id", "session_id", "workspace", "run_id", "expected_version"],
+                "additionalProperties": false,
+                "properties": {
+                    "request_id": req_id,
+                    "session_id": session,
+                    "workspace": workspace,
+                    "run_id": run_id,
+                    "expected_version": {"type": "integer", "minimum": 0}
+                }
+            })
+        }
         "ptah_get_events" => json!({
             "type": "object",
             "required": ["session_id", "workspace", "run_id"],
@@ -1550,6 +1679,7 @@ async fn tools_call(
     orch: &Arc<OrchestrationService>,
     auth: &crate::orchestration::AuthContext,
     params: &Value,
+    client: Option<ComputerClientIdentity>,
 ) -> Result<Value, OrchError> {
     let call: ToolsCallParams = match parse_value(params) {
         Ok(call) => call,
@@ -1567,7 +1697,15 @@ async fn tools_call(
         orch.audit_transport_result(name, Some(&error));
         return Err(error);
     }
-    let result = dispatch_tool(orch, auth, name, &call.arguments).await;
+    if COMPUTER_MUTATION_TOOLS.contains(&name) && client.is_none() {
+        let error = OrchError::new(
+            OrchErrorCode::ForbiddenScope,
+            "Computer Run mutations require an initialized MCP client session",
+        );
+        orch.audit_transport_result(name, Some(&error));
+        return Err(error);
+    }
+    let result = dispatch_tool(orch, auth, name, &call.arguments, client.as_ref()).await;
     orch.audit_transport_result(name, result.as_ref().err());
     let body = result?;
     Ok(json!({
@@ -1582,6 +1720,7 @@ async fn dispatch_tool(
     auth: &crate::orchestration::AuthContext,
     name: &str,
     args: &Value,
+    client: Option<&ComputerClientIdentity>,
 ) -> Result<Value, OrchError> {
     match name {
         "ptah_list_sessions" => {
@@ -1670,6 +1809,95 @@ async fn dispatch_tool(
         "ptah_get_computer_capacity" => {
             let args: ComputerScopeArgs = parse_value(args)?;
             orch.get_computer_capacity_scoped(auth, args.session_id, &args.workspace)
+        }
+        "ptah_authorize_computer_run" => {
+            let args: ComputerGrantArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.run_id, "run_id")?;
+            let client = client.ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "Computer Run mutations require an initialized MCP client session",
+                )
+            })?;
+            orch.authorize_computer_run_scoped(
+                auth,
+                client,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
+                args.expected_version,
+                crate::computer_use::ComputerGrantRequest {
+                    action_classes: args.action_classes,
+                    ttl_ms: args.ttl_ms,
+                    uses_remaining: args.uses_remaining,
+                },
+            )
+            .await
+        }
+        "ptah_pause_computer_run" => {
+            let args: ComputerControlArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.run_id, "run_id")?;
+            let client = client.ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "Computer Run mutations require an initialized MCP client session",
+                )
+            })?;
+            orch.pause_computer_run_scoped(
+                auth,
+                client,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
+                args.expected_version,
+            )
+            .await
+        }
+        "ptah_take_over_computer_run" => {
+            let args: ComputerControlArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.run_id, "run_id")?;
+            let client = client.ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "Computer Run mutations require an initialized MCP client session",
+                )
+            })?;
+            orch.take_over_computer_run_scoped(
+                auth,
+                client,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
+                args.expected_version,
+            )
+            .await
+        }
+        "ptah_cancel_computer_run" => {
+            let args: ComputerControlArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.run_id, "run_id")?;
+            let client = client.ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "Computer Run mutations require an initialized MCP client session",
+                )
+            })?;
+            orch.cancel_computer_run_scoped(
+                auth,
+                client,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
+                args.expected_version,
+            )
+            .await
         }
         "ptah_submit_task" => {
             let args: SubmitArgs = parse_value(args)?;
@@ -2201,7 +2429,8 @@ mod tests {
             client: reqwest::Client::new(),
         };
 
-        // Discovery includes exactly the read tools, never a computer mutation.
+        // Discovery includes the scoped reads plus the consciously bounded
+        // control slice, never observation/action/evidence/raw-input tools.
         let list = fixture
             .client
             .post(&fixture.url)
@@ -2224,14 +2453,29 @@ mod tests {
             "ptah_get_computer_run",
             "ptah_get_computer_run_events",
             "ptah_get_computer_capacity",
+            "ptah_authorize_computer_run",
+            "ptah_pause_computer_run",
+            "ptah_take_over_computer_run",
+            "ptah_cancel_computer_run",
         ] {
             assert!(names.contains(&name), "{name} must be discoverable");
         }
         assert!(
-            !names.iter().any(|name| name.contains("computer")
-                && !name.contains("get")
-                && !name.contains("list")),
-            "no computer mutation may be discoverable"
+            !names.iter().any(|name| {
+                name.contains("computer")
+                    && ![
+                        "ptah_list_computer_runs",
+                        "ptah_get_computer_run",
+                        "ptah_get_computer_run_events",
+                        "ptah_get_computer_capacity",
+                        "ptah_authorize_computer_run",
+                        "ptah_pause_computer_run",
+                        "ptah_take_over_computer_run",
+                        "ptah_cancel_computer_run",
+                    ]
+                    .contains(name)
+            }),
+            "no unapproved computer mutation may be discoverable"
         );
 
         // Listing is scoped to the session AND the durable workspace binding:

@@ -340,12 +340,12 @@ async fn unsupported_pointer_fallback_never_reaches_backend() {
     );
 }
 
-/// The MCP control plane exposes exactly four read-only Computer Run tools.
-/// Any additional computer-prefixed tool — a mutation, an evidence or
-/// screenshot fetch, raw input, or admin control — must consciously widen
-/// this snapshot rather than slip in silently (#271 read-only slice).
+/// The MCP control plane exposes the scoped Computer Run reads plus the
+/// explicitly bounded control slice. Any additional computer-prefixed tool —
+/// an action, evidence or screenshot fetch, raw input, or admin control — must
+/// consciously widen this snapshot rather than slip in silently (#271).
 #[test]
-fn mcp_surface_exposes_only_the_scoped_computer_read_tools() {
+fn mcp_surface_exposes_only_the_scoped_computer_tools() {
     use grokptah_agent_bridge::{CONTROL_TOOLS, FORBIDDEN_TOOLS};
 
     let computer_tools: Vec<&str> = CONTROL_TOOLS
@@ -360,16 +360,16 @@ fn mcp_surface_exposes_only_the_scoped_computer_read_tools() {
             "ptah_get_computer_run",
             "ptah_get_computer_run_events",
             "ptah_get_computer_capacity",
+            "ptah_authorize_computer_run",
+            "ptah_pause_computer_run",
+            "ptah_take_over_computer_run",
+            "ptah_cancel_computer_run",
         ]
     );
     for forbidden_fragment in [
         "submit_computer",
         "computer_action",
         "computer_act",
-        "computer_pause",
-        "computer_cancel",
-        "computer_take_over",
-        "computer_grant",
         "computer_approve",
         "computer_evidence",
         "computer_screenshot",

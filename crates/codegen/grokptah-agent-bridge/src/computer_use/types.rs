@@ -276,11 +276,16 @@ pub enum ActionClass {
     PointerFallback,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantIssuer {
     /// Explicit authorization made through the local GrokPtah operator UI.
     LocalUser,
+    /// Explicit authorization made by one authenticated MCP transport
+    /// session. The client id is derived from initialize metadata plus the
+    /// server-issued transport session id; it is never accepted from a tool
+    /// argument.
+    McpClient { client_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,6 +600,9 @@ impl ActionGrant {
         validate_id("grant_id", &self.grant_id)?;
         validate_id("run_id", &self.run_id)?;
         self.target.validate()?;
+        if let GrantIssuer::McpClient { client_id } = &self.issued_by {
+            validate_id("client_id", client_id)?;
+        }
         if self.action_classes.is_empty() || self.expires_at <= self.issued_at {
             return Err(ComputerError::new(
                 ComputerErrorCode::InvalidRequest,

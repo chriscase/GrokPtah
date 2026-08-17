@@ -240,7 +240,7 @@ pub fn project_run_at(run: &ComputerRun, now: DateTime<Utc>) -> ComputerRunProje
         grant: run.grant.as_ref().map(|grant| ActionGrantSummary {
             grant_id: grant.grant_id.clone(),
             action_classes: grant.action_classes.clone(),
-            issued_by: grant.issued_by,
+            issued_by: grant.issued_by.clone(),
             issued_at: grant.issued_at,
             expires_at: grant.expires_at,
             uses_remaining: grant.uses_remaining,
