@@ -211,11 +211,20 @@ discovery, scoped read, paging with strictly increasing sequences, expiry
 handling, cross-session rejection through an independent client.
 
 Frontend: no UI change in this slice (read tools only); #292's cockpit,
-activity, and a11y suites remain the coverage. Desktop-started live smoke:
-extend `run_live_smoke.mjs` with the four tools and run it via the
-documented desktop env contract (`GROKPTAH_CONTROL_TOKEN`/`PORT`/
-`WORKSPACES`) on a real desktop host — **this is the "live proof" step and
-it has not been run**; it needs a desktop-capable machine.
+activity, and a11y suites remain the coverage. Desktop-started live smoke is
+implemented by `live_computer_reads_node_smoke` and its independent
+`run_computer_reads_smoke.mjs` client. It runs through the production
+`start_control_from_env` bootstrap (the same shared entry used by Tauri), the
+documented desktop env contract (`GROKPTAH_CONTROL_TOKEN`/
+`GROKPTAH_CONTROL_PORT`/`GROKPTAH_CONTROL_WORKSPACES`), and real loopback
+HTTP. On 2026-08-16 the merged-main proof passed with 53 checks and no
+failures:
+
+```text
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --test mcp_streamable_transport live_computer_reads_node_smoke -- --nocapture
+LIVE_COMPUTER_READS_SMOKE_REPORT {"checks":53,"failed":[],"ok":true,"passed":53}
+```
 
 ## 6. Deliberately deferred (document in the PR)
 
