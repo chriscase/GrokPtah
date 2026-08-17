@@ -39,8 +39,9 @@ use crate::host_helpers::{
 };
 use crate::local_tools;
 use crate::orchestration::{
-    apply_run_aggregate, prompt_preview, OrchStore, PromotionState, RunAggregates, RunBounds,
-    RunExecution, RunExecutionMode, RunRecord, RunState,
+    apply_run_aggregate, prompt_preview, AgentRecord, AgentResumePlan, AgentState,
+    ContinuationCheckpoint, ContinuationReason, OrchStore, PromotionState, RunAggregates,
+    RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
 };
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::prompt_queue::{
@@ -886,6 +887,212 @@ impl AgentHostHandle {
         self.orchestration_store.lock().clone()
     }
 
+    /// Return or create the durable agent identity for a Build session. The
+    /// session owns the binding, while the orchestration store owns lifecycle
+    /// state; this keeps transport adapters from inventing identity.
+    pub fn ensure_session_agent(&self, session_id: Uuid) -> Result<AgentRecord> {
+        let (cwd, model, kind, existing_id) = {
+            let g = self.inner.lock();
+            let session = g
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            (
+                session.cwd.clone(),
+                session.model.clone(),
+                session.kind,
+                session.agent_id.clone(),
+            )
+        };
+        if kind != SessionKind::Build {
+            bail!("persistent agents are available only for Build sessions");
+        }
+        let store = self.ensure_orchestration_store()?;
+        let workspace = cwd.display().to_string();
+        let agent_id = existing_id
+            .clone()
+            .unwrap_or_else(|| format!("agent-{session_id}"));
+        let now = Utc::now();
+        let mut agent = match store.load_agent(&agent_id)? {
+            Some(agent) => {
+                if agent.session_id != session_id || agent.workspace != workspace {
+                    bail!("session is bound to a different persistent agent workspace");
+                }
+                agent
+            }
+            None => AgentRecord {
+                agent_id: agent_id.clone(),
+                session_id,
+                workspace: workspace.clone(),
+                model: model.clone(),
+                state: AgentState::Waiting,
+                current_run_id: None,
+                latest_checkpoint_id: None,
+                continuation_ordinal: 0,
+                created_at: now,
+                updated_at: now,
+            },
+        };
+        if agent.model != model {
+            agent.model = model;
+            agent.updated_at = now;
+            store.save_agent(&agent)?;
+        } else if store.load_agent(&agent_id)?.is_none() {
+            store.save_agent(&agent)?;
+        }
+        if existing_id.is_none() {
+            let session = {
+                let mut g = self.inner.lock();
+                let session = g
+                    .sessions
+                    .get_mut(&session_id)
+                    .ok_or_else(|| anyhow!("unknown session"))?;
+                session.agent_id = Some(agent_id.clone());
+                session.clone()
+            };
+            if let Err(error) = session_store::save_session_meta(&session) {
+                bail!("failed to persist session agent binding: {error:#}");
+            }
+        }
+        Ok(agent)
+    }
+
+    pub fn list_persistent_agents(&self) -> Result<Vec<AgentRecord>> {
+        Ok(self.ensure_orchestration_store()?.list_agents()?)
+    }
+
+    pub fn get_persistent_agent(&self, agent_id: &str) -> Result<Option<AgentRecord>> {
+        Ok(self.ensure_orchestration_store()?.load_agent(agent_id)?)
+    }
+
+    /// Validate a manual continuation against the durable agent, session, and
+    /// latest checkpoint. No scheduling or automatic resume is implied.
+    pub fn prepare_agent_resume(&self, session_id: Uuid) -> Result<AgentResumePlan> {
+        let (workspace, agent_id) = {
+            let g = self.inner.lock();
+            let session = g
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            (
+                session.cwd.display().to_string(),
+                session
+                    .agent_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("session has no persistent agent identity"))?,
+            )
+        };
+        let store = self.ensure_orchestration_store()?;
+        let agent = store
+            .load_agent(&agent_id)?
+            .ok_or_else(|| anyhow!("persistent agent record is missing"))?;
+        let checkpoint_id = agent
+            .latest_checkpoint_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("persistent agent has no verified checkpoint"))?;
+        let checkpoint = store
+            .load_checkpoint(checkpoint_id)?
+            .ok_or_else(|| anyhow!("latest persistent checkpoint is missing"))?;
+        let plan = AgentResumePlan {
+            parent_run_id: checkpoint.run_id.clone(),
+            agent,
+            checkpoint,
+        };
+        plan.validate_for(session_id, &workspace)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(plan)
+    }
+
+    /// Explicit manual resume seam for the current desktop bridge. The caller
+    /// supplies the new user instruction; the verified checkpoint is injected
+    /// as auditable system context and linked through `parent_run_id`.
+    pub async fn resume_agent(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+    ) -> Result<String> {
+        self.resume_agent_with_request_id(session_id, prompt, max_rounds, None)
+            .await
+    }
+
+    /// Explicit resume with a caller-owned idempotency key. Reusing the same
+    /// key and payload replays the completed response; a changed payload is a
+    /// durable conflict and cannot start a second run.
+    pub async fn resume_agent_with_request_id(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        max_rounds: Option<u32>,
+        request_id: Option<String>,
+    ) -> Result<String> {
+        let store = self.ensure_orchestration_store()?;
+        let request_id = request_id.unwrap_or_else(|| format!("resume-{}", Uuid::new_v4()));
+        let payload_hash = crate::orchestration::hash_payload(&serde_json::json!({
+            "sessionId": session_id,
+            "prompt": prompt.clone(),
+            "maxRounds": max_rounds,
+        }));
+        match store.claim_idempotency("persistent_agent_resume", &request_id, &payload_hash)? {
+            crate::orchestration::IdempotencyClaim::Replay(Ok(value)) => value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| anyhow!("idempotent resume response is not text")),
+            crate::orchestration::IdempotencyClaim::Replay(Err(error)) => {
+                Err(anyhow!(error.to_string()))
+            }
+            crate::orchestration::IdempotencyClaim::Pending => {
+                bail!("resume request is already in progress")
+            }
+            crate::orchestration::IdempotencyClaim::Perform => {
+                let plan = match self.prepare_agent_resume(session_id) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        let _ = store.fail_idempotency(
+                            "persistent_agent_resume",
+                            &request_id,
+                            &payload_hash,
+                            None,
+                            crate::orchestration::OrchError::new(
+                                crate::orchestration::OrchErrorCode::Conflict,
+                                error.to_string(),
+                            ),
+                        );
+                        return Err(error);
+                    }
+                };
+                let result = self
+                    .session_prompt_inner(session_id, prompt, max_rounds, None, None, Some(plan))
+                    .await;
+                match result {
+                    Ok(response) => {
+                        store.complete_idempotency(
+                            "persistent_agent_resume",
+                            &request_id,
+                            &payload_hash,
+                            None,
+                            serde_json::Value::String(response.clone()),
+                        )?;
+                        Ok(response)
+                    }
+                    Err(error) => {
+                        let _ = store.fail_idempotency(
+                            "persistent_agent_resume",
+                            &request_id,
+                            &payload_hash,
+                            None,
+                            crate::orchestration::OrchError::new(
+                                crate::orchestration::OrchErrorCode::Internal,
+                                error.to_string(),
+                            ),
+                        );
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
     /// Read desktop-visible runs for one session. Session scoping prevents a
     /// local inspector from displaying another workspace's coordinator data.
     pub fn list_session_runs(&self, session_id: Uuid) -> Result<Vec<RunRecord>> {
@@ -1158,6 +1365,8 @@ impl AgentHostHandle {
         start_seq: u64,
         turn_id: Uuid,
         execution: Option<RunExecution>,
+        agent_id: Option<String>,
+        parent_run_id: Option<String>,
     ) -> Option<(String, OrchStore)> {
         let store = match self.ensure_orchestration_store() {
             Ok(store) => store,
@@ -1179,7 +1388,9 @@ impl AgentHostHandle {
             request_id: format!("desktop-turn-{turn_id}"),
             client_id: Some("desktop".into()),
             state: RunState::Running,
+            agent_id: agent_id.clone(),
             retry_of: None,
+            parent_run_id,
             queue_position: None,
             bounds,
             prompt_preview: self
@@ -1199,8 +1410,30 @@ impl AgentHostHandle {
             execution,
             approval: None,
         };
+        if let Some(agent_id) = agent_id.as_deref() {
+            if let Err(error) = store.update_agent(agent_id, |agent| {
+                if agent.state == AgentState::Active && agent.current_run_id.is_some() {
+                    bail!("persistent agent already has an active run");
+                }
+                agent.state = AgentState::Active;
+                agent.current_run_id = Some(run_id.clone());
+                Ok(())
+            }) {
+                eprintln!("[grokptah] persistent agent {agent_id} activation failed: {error:#}");
+                return None;
+            }
+        }
         if let Err(error) = store.save_run(&run) {
             eprintln!("[grokptah] desktop run {run_id} start persistence failed: {error:#}");
+            if let Some(agent_id) = agent_id.as_deref() {
+                let _ = store.update_agent(agent_id, |agent| {
+                    if agent.current_run_id.as_deref() == Some(run_id.as_str()) {
+                        agent.current_run_id = None;
+                        agent.state = AgentState::Waiting;
+                    }
+                    Ok(())
+                });
+            }
             return None;
         }
         Some((run_id, store))
@@ -1219,6 +1452,105 @@ impl AgentHostHandle {
                 apply_run_aggregate(&store, &run_id, session_id, &update);
             }
         })
+    }
+
+    fn checkpoint_context(
+        &self,
+        session_id: Uuid,
+        event_tx: &crate::event_bus::EventBus,
+    ) -> Result<String> {
+        let (summary, tail) = {
+            let g = self.inner.lock();
+            let session = g
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            let tail = session
+                .transcript
+                .iter()
+                .rev()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>();
+            (session.compacted_summary.clone(), tail)
+        };
+        let mut raw = String::new();
+        if let Some(summary) = summary {
+            raw.push_str("Compacted summary:\n");
+            raw.push_str(&summary);
+            raw.push('\n');
+        }
+        raw.push_str("Recent durable transcript:\n");
+        for entry in tail.into_iter().rev() {
+            raw.push_str(&entry.role);
+            raw.push_str(": ");
+            raw.push_str(&entry.text);
+            raw.push('\n');
+        }
+        let redacted = event_tx.redact_text(&raw, crate::orchestration::MAX_AGENT_CONTEXT_BYTES);
+        let bounded = crate::textutil::truncate_at_char_boundary(
+            &redacted,
+            crate::orchestration::MAX_AGENT_CONTEXT_BYTES,
+        )
+        .trim()
+        .to_string();
+        if bounded.is_empty() {
+            bail!("cannot create an empty persistent checkpoint context");
+        }
+        Ok(bounded)
+    }
+
+    fn persist_agent_checkpoint(
+        &self,
+        run: &RunRecord,
+        outcome: &str,
+        end_seq: u64,
+        event_tx: &crate::event_bus::EventBus,
+        store: &OrchStore,
+    ) -> Result<()> {
+        let Some(agent_id) = run.agent_id.as_deref() else {
+            return Ok(());
+        };
+        let agent = store
+            .load_agent(agent_id)?
+            .ok_or_else(|| anyhow!("persistent agent record disappeared"))?;
+        let context_summary = self.checkpoint_context(run.session_id, event_tx)?;
+        let reason = match outcome {
+            "completed" => ContinuationReason::TurnCompleted,
+            "cancelled" => ContinuationReason::Cancelled,
+            "limit_reached" => ContinuationReason::LimitReached,
+            _ => ContinuationReason::Failed,
+        };
+        let mut checkpoint = ContinuationCheckpoint {
+            checkpoint_id: format!("checkpoint-{}-{}", agent_id, Uuid::new_v4()),
+            agent_id: agent_id.to_string(),
+            session_id: run.session_id,
+            run_id: run.run_id.clone(),
+            parent_checkpoint_id: agent.latest_checkpoint_id.clone(),
+            ordinal: agent.continuation_ordinal.saturating_add(1),
+            workspace: run.workspace.clone(),
+            context_summary,
+            context_hash: String::new(),
+            event_seq: end_seq,
+            reason,
+            created_at: Utc::now(),
+        };
+        checkpoint.context_hash = checkpoint.context_hash_for();
+        store.save_checkpoint(&checkpoint)?;
+        store
+            .update_agent(agent_id, |current| {
+                current.current_run_id = None;
+                current.latest_checkpoint_id = Some(checkpoint.checkpoint_id.clone());
+                current.continuation_ordinal = checkpoint.ordinal;
+                current.state = if outcome == "failed" {
+                    AgentState::Failed
+                } else {
+                    AgentState::Waiting
+                };
+                Ok(())
+            })?
+            .ok_or_else(|| anyhow!("persistent agent disappeared while checkpointing"))?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)] // Keeps terminal evidence inputs explicit at this boundary.
@@ -1289,6 +1621,9 @@ impl AgentHostHandle {
         run.updated_at = Utc::now();
         if let Err(error) = store.persist_finalization(&run) {
             eprintln!("[grokptah] desktop run {run_id} finalization failed: {error:#}");
+        }
+        if let Err(error) = self.persist_agent_checkpoint(&run, outcome, end_seq, event_tx, store) {
+            eprintln!("[grokptah] persistent checkpoint for run {run_id} failed: {error:#}");
         }
     }
 
@@ -4689,7 +5024,7 @@ impl AgentHostHandle {
         prompt: String,
         max_rounds: Option<u32>,
     ) -> Result<String> {
-        self.session_prompt_inner(session_id, prompt, max_rounds, None, None)
+        self.session_prompt_inner(session_id, prompt, max_rounds, None, None, None)
             .await
     }
 
@@ -4701,7 +5036,7 @@ impl AgentHostHandle {
         max_rounds: Option<u32>,
         owner: &str,
     ) -> Result<String> {
-        self.session_prompt_inner(session_id, prompt, max_rounds, Some(owner), None)
+        self.session_prompt_inner(session_id, prompt, max_rounds, Some(owner), None, None)
             .await
     }
 
@@ -4726,6 +5061,7 @@ impl AgentHostHandle {
                 run_id: run_id.to_string(),
                 execution_mode,
             }),
+            None,
         )
         .await
     }
@@ -4737,9 +5073,33 @@ impl AgentHostHandle {
         max_rounds: Option<u32>,
         reservation_owner: Option<&str>,
         external_run: Option<ExternalRunContext>,
+        resume: Option<AgentResumePlan>,
     ) -> Result<String> {
         self.ensure_transcript_loaded(session_id)?;
         self.ensure_build_workspace_ready(session_id)?;
+        if let Some(plan) = resume.as_ref() {
+            let (workspace, agent_id) = {
+                let g = self.inner.lock();
+                let session = g
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(|| anyhow!("unknown session"))?;
+                (session.cwd.display().to_string(), session.agent_id.clone())
+            };
+            if agent_id.as_deref() != Some(plan.agent.agent_id.as_str()) {
+                bail!("resume agent does not match the session binding");
+            }
+            plan.validate_for(session_id, &workspace)
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
+        let resume_context = resume.as_ref().map(|plan| {
+            format!(
+                "Verified persistent continuation checkpoint {} (ordinal {}):\n{}",
+                plan.checkpoint.checkpoint_id,
+                plan.checkpoint.ordinal,
+                plan.checkpoint.context_summary
+            )
+        });
         let (cwd, model, effort, plan_mode, kind, execution_mode, cancel, event_tx) = {
             let mut g = self.inner.lock();
             if !g.running {
@@ -4781,6 +5141,9 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("unknown session"))?;
             s.model = model.clone();
             s.effort = effort;
+            if let Some(context) = resume_context.as_deref() {
+                s.transcript.push(TranscriptEntry::system(context));
+            }
             s.transcript.push(TranscriptEntry::user(prompt.clone()));
             if s.title == "New session" || s.title == "New chat" {
                 s.title = prompt.chars().take(48).collect();
@@ -4809,6 +5172,11 @@ impl AgentHostHandle {
         let start_seq = event_tx.current_seq();
         let usage_before = self.session_usage_snapshot(session_id);
         let turn_id = Uuid::new_v4();
+        let agent = if kind == SessionKind::Build {
+            Some(self.ensure_session_agent(session_id)?)
+        } else {
+            None
+        };
         let requested_execution_mode = external_run
             .as_ref()
             .map(|run| run.execution_mode)
@@ -4883,6 +5251,8 @@ impl AgentHostHandle {
                 start_seq,
                 turn_id,
                 run_execution.clone(),
+                agent.as_ref().map(|agent| agent.agent_id.clone()),
+                resume.as_ref().map(|plan| plan.parent_run_id.clone()),
             )
         } else {
             None
