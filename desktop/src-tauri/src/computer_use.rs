@@ -6,12 +6,12 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
-    ComputerAgentProposal, ComputerCapabilities, ComputerClientIdentity, ComputerError,
-    ComputerErrorCode, ComputerGrantRequest, ComputerObservation, ComputerObservationPlatform,
-    ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun,
-    ComputerRunController, ComputerRunProjection, ComputerRunState, ComputerTargetCandidate,
-    ComputerUseLimits, ComputerUseService, GrantIssuer, MacOsObservationPlatform, SemanticAction,
-    SimulatorBackend,
+    ComputerAgentObservation, ComputerAgentProposal, ComputerCapabilities, ComputerClientIdentity,
+    ComputerError, ComputerErrorCode, ComputerGrantRequest, ComputerObservation,
+    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerRun, ComputerRunAgentController, ComputerRunController,
+    ComputerRunProjection, ComputerRunState, ComputerTargetCandidate, ComputerUseLimits,
+    ComputerUseService, GrantIssuer, MacOsObservationPlatform, SemanticAction, SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -38,6 +38,7 @@ pub struct PendingComputerApproval {
     pub action: ComputerAction,
     pub action_summary: String,
     pub risk: String,
+    pub origin: String,
     pub created_at: chrono::DateTime<Utc>,
 }
 
@@ -307,7 +308,10 @@ impl DesktopComputerUse {
         };
         Ok(ComputerCockpitSnapshot {
             backend,
-            origin: "desktop".into(),
+            origin: pending_approval
+                .as_ref()
+                .map(|pending| pending.origin.clone())
+                .unwrap_or_else(|| "desktop".into()),
             projection: run
                 .as_ref()
                 .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now())),
@@ -463,6 +467,7 @@ impl DesktopComputerUse {
             expected_version,
             observation_id,
             action,
+            "desktop",
         )
     }
 
@@ -473,6 +478,7 @@ impl DesktopComputerUse {
         expected_version: u64,
         observation_id: &str,
         action: ComputerAction,
+        origin: &str,
     ) -> Result<ComputerCockpitSnapshot, String> {
         let (_service, run) = self.owned_service(owner_session_id, run_id)?;
         if run.version != expected_version {
@@ -509,6 +515,7 @@ impl DesktopComputerUse {
             action,
             action_summary,
             risk,
+            origin: origin.into(),
             created_at: Utc::now(),
         });
         drop(pending);
@@ -563,6 +570,7 @@ impl DesktopComputerUse {
                     expected_version,
                     observation_id,
                     action,
+                    "model",
                 )?;
                 Ok(ComputerAgentProposalResult {
                     snapshot,
@@ -836,6 +844,56 @@ impl ComputerRunController for DesktopComputerUse {
             .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error))?;
         let (service, _run) = self.controller_run(owner_session_id, workspace, run_id)?;
         service.cancel(request_id, run_id).await
+    }
+}
+
+#[async_trait]
+impl ComputerRunAgentController for DesktopComputerUse {
+    async fn observe(
+        &self,
+        request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+    ) -> Result<ComputerAgentObservation, ComputerError> {
+        let _guard = self.simulator_operation.lock().await;
+        let (service, _run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        let observation = service
+            .observe(request_id, run_id, expected_version)
+            .await?;
+        let (_service, refreshed) = self.controller_run(owner_session_id, workspace, run_id)?;
+        Ok(ComputerAgentObservation {
+            observation,
+            run_version: refreshed.version,
+        })
+    }
+
+    async fn stage_action(
+        &self,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
+    ) -> Result<ComputerRun, ComputerError> {
+        let _guard = self.simulator_operation.lock().await;
+        // Validate the session/workspace scope before mutating the local
+        // pending-approval slot. A failed scope check must leave no staged
+        // approval behind for a different Build cwd.
+        let (_service, _run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        self.stage_action_locked(
+            owner_session_id,
+            run_id,
+            expected_version,
+            observation_id,
+            action,
+            "build_agent",
+        )
+        .map_err(|error| ComputerError::new(ComputerErrorCode::InvalidRequest, error))?;
+        let (_service, run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        Ok(run)
     }
 }
 
@@ -1314,6 +1372,97 @@ mod tests {
             )
             .await;
         assert!(stale.is_err());
+    }
+
+    #[tokio::test]
+    async fn build_agent_bridge_observes_and_stages_without_dispatch() {
+        let (dir, desktop) = test_desktop();
+        desktop.host.start().unwrap();
+        let session = desktop
+            .host
+            .session_new_kind(grokptah_agent_bridge::SessionKind::Build)
+            .unwrap();
+        desktop
+            .host
+            .session_set_cwd(session.id, dir.path())
+            .unwrap();
+        let target = SimulatorBackend::demo_target();
+        let started = desktop
+            .start_simulator(session.id, &target.app_id)
+            .await
+            .unwrap();
+        let run = started.run.unwrap();
+        let workspace = run.workspace.clone().unwrap();
+
+        let observed = ComputerRunAgentController::observe(
+            &desktop,
+            "build-observe-1",
+            session.id,
+            &workspace,
+            &run.run_id,
+            run.version,
+        )
+        .await
+        .unwrap();
+        assert!(observed.run_version > run.version);
+        assert!(ComputerRunAgentController::observe(
+            &desktop,
+            "build-observe-stale",
+            session.id,
+            &workspace,
+            &run.run_id,
+            run.version,
+        )
+        .await
+        .is_err());
+
+        let element_id = format!("{}-name", observed.observation.observation_id);
+        assert!(ComputerRunAgentController::stage_action(
+            &desktop,
+            session.id,
+            "different-workspace",
+            &run.run_id,
+            observed.run_version,
+            &observed.observation.observation_id,
+            ComputerAction::SetValue {
+                element_id: element_id.clone(),
+                text: "must not stage".into(),
+            },
+        )
+        .await
+        .is_err());
+        assert!(desktop
+            .cockpit_snapshot(session.id)
+            .unwrap()
+            .pending_approval
+            .is_none());
+
+        let staged = ComputerRunAgentController::stage_action(
+            &desktop,
+            session.id,
+            &workspace,
+            &run.run_id,
+            observed.run_version,
+            &observed.observation.observation_id,
+            ComputerAction::SetValue {
+                element_id,
+                text: "Build agent staged value".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(staged.action_count, 0);
+        let snapshot = desktop.cockpit_snapshot(session.id).unwrap();
+        assert_eq!(snapshot.origin, "build_agent");
+        let approval = snapshot.pending_approval.unwrap();
+        let approved = desktop
+            .approve_simulator_action(session.id, &approval.approval_id, "build-review")
+            .await
+            .unwrap();
+        let approved_run = approved.run.unwrap();
+        assert_eq!(approved_run.action_count, 1);
+        assert_eq!(approved_run.state, ComputerRunState::Paused);
+        assert!(approved_run.current_observation.is_none());
     }
 
     #[tokio::test]

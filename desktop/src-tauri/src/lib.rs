@@ -38,6 +38,7 @@ pub fn run() {
             let handle = app.handle().clone();
             app.state::<AppState>().pty.set_app(handle.clone());
             host.set_computer_run_controller(app.state::<AppState>().computer_use.clone());
+            host.set_computer_run_agent_controller(app.state::<AppState>().computer_use.clone());
             let _ = host.start();
             event_forward::spawn_event_forwarder(handle, event_rx);
 

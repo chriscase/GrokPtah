@@ -637,7 +637,8 @@ pub(crate) fn session_id_of(u: &SessionUpdate) -> Option<uuid::Uuid> {
         | AgentProgress { session_id, .. }
         | RateLimited { session_id, .. }
         | SteeringInjected { session_id, .. }
-        | PromptQueueChanged { session_id, .. } => Some(*session_id),
+        | PromptQueueChanged { session_id, .. }
+        | ComputerApprovalRequired { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
     }
 }
@@ -985,7 +986,8 @@ pub fn redact_update_with_secrets(
         | SessionUpdate::CompletionEvidence { .. }
         | SessionUpdate::TurnComplete { .. }
         | SessionUpdate::ShellSessionEnded { .. }
-        | SessionUpdate::SubagentSpawned { .. } => {}
+        | SessionUpdate::SubagentSpawned { .. }
+        | SessionUpdate::ComputerApprovalRequired { .. } => {}
     }
     update
 }

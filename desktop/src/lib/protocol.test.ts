@@ -31,6 +31,23 @@ describe("normalizeSessionUpdate", () => {
     expect(normalizeSessionUpdate(42)).toBeNull();
   });
 
+  it("normalizes the local Computer approval refresh event", () => {
+    expect(
+      normalizeSessionUpdate({
+        computer_approval_required: {
+          session_id: "s1",
+          run_id: "run-1",
+          run_version: 4,
+        },
+      }),
+    ).toEqual({
+      type: "computer_approval_required",
+      session_id: "s1",
+      run_id: "run-1",
+      run_version: 4,
+    });
+  });
+
   it("preserves shared queue snapshots and steering disposition", () => {
     const u = normalizeSessionUpdate({
       type: "prompt_queue_changed",

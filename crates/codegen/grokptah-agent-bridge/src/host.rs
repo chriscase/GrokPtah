@@ -26,13 +26,14 @@ use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     auto_cargo_reverify_command, build_agent_messages, build_compact_summary, call_xai_agent_step,
     call_xai_chat, cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
-    cargo_test_reverify_coaching, coding_agent_tools, count_cargo_test_failures, emit_message,
-    emit_thought, filter_tools_batch_edit_only, filter_tools_edit_and_shell,
-    filter_tools_edit_only, is_incomplete_stop_message, is_round_limit_stop_message,
-    is_true_noop_tool_step, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
-    offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
-    push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
-    resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    cargo_test_reverify_coaching, coding_agent_tools, computer_agent_tools,
+    count_cargo_test_failures, emit_message, emit_thought, filter_tools_batch_edit_only,
+    filter_tools_edit_and_shell, filter_tools_edit_only, is_incomplete_stop_message,
+    is_round_limit_stop_message, is_true_noop_tool_step, multi_failure_partial_edit_coaching,
+    normalize_sandbox_profile, offline_plan_steps, parse_effort_arg,
+    post_cargo_failure_skip_message, propose_plan_with_model, push_assistant, push_thought,
+    push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
+    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
     IdenticalToolCallRun, McpToolIndex,
@@ -467,6 +468,10 @@ pub struct AgentHostHandle {
     /// mutations delegate through this adapter rather than opening a second
     /// service against the exclusive Computer Run ledger.
     computer_controller: Arc<Mutex<Option<Arc<dyn crate::computer_use::ComputerRunController>>>>,
+    /// Optional local Computer Run bridge used by the Build agent tools. It
+    /// can observe and stage a one-use approval, never dispatch an action.
+    computer_agent_controller:
+        Arc<Mutex<Option<Arc<dyn crate::computer_use::ComputerRunAgentController>>>>,
     /// Prevent concurrent desktop promotion/discard operations for one run.
     promotion_locks: Arc<Mutex<HashSet<String>>>,
     reviewed_runs: Arc<Mutex<HashSet<String>>>,
@@ -638,6 +643,7 @@ impl AgentHost {
             orchestration_store: Arc::new(Mutex::new(None)),
             computer_store: Arc::new(Mutex::new(None)),
             computer_controller: Arc::new(Mutex::new(None)),
+            computer_agent_controller: Arc::new(Mutex::new(None)),
             promotion_locks: Arc::new(Mutex::new(HashSet::new())),
             reviewed_runs: Arc::new(Mutex::new(HashSet::new())),
             orchestration_wakeup: Arc::new(Notify::new()),
@@ -659,6 +665,38 @@ impl AgentHostHandle {
     /// Additional live subscriber (does not steal the primary GUI receiver).
     pub fn subscribe_events(&self) -> crate::event_bus::EventReceiver {
         self.inner.lock().event_tx.subscribe()
+    }
+
+    fn computer_agent_route_is_authorized(
+        &self,
+        session_id: Uuid,
+        model: &str,
+        credentials: &crate::auth_store::WireCredentials,
+    ) -> Result<()> {
+        let resolved = resolve_computer_eligibility(credentials, model)?;
+        if resolved.eligibility.tier.allows_semantic_action() {
+            return Ok(());
+        }
+        let qualified = self
+            .inner
+            .lock()
+            .computer_agent_qualifications
+            .get(&(session_id, model.to_string()))
+            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+        if qualified {
+            Ok(())
+        } else {
+            bail!("selected model is not qualified for semantic Computer actions")
+        }
+    }
+
+    fn ensure_computer_agent_authority(&self, session_id: Uuid) -> Result<()> {
+        let eligibility = self.computer_agent_eligibility(session_id)?;
+        if eligibility.tier.allows_semantic_action() {
+            Ok(())
+        } else {
+            bail!("selected model is not qualified for semantic Computer actions")
+        }
     }
 
     /// Current model authority for the local Computer cockpit. Unknown models
@@ -917,6 +955,22 @@ impl AgentHostHandle {
         &self,
     ) -> Option<Arc<dyn crate::computer_use::ComputerRunController>> {
         self.computer_controller.lock().clone()
+    }
+
+    /// Register the local Build-agent Computer Run bridge during desktop
+    /// setup. This is distinct from the MCP mutation adapter because the
+    /// Build loop may stage approval but cannot execute an action directly.
+    pub fn set_computer_run_agent_controller(
+        &self,
+        controller: Arc<dyn crate::computer_use::ComputerRunAgentController>,
+    ) {
+        *self.computer_agent_controller.lock() = Some(controller);
+    }
+
+    pub fn computer_run_agent_controller(
+        &self,
+    ) -> Option<Arc<dyn crate::computer_use::ComputerRunAgentController>> {
+        self.computer_agent_controller.lock().clone()
     }
 
     /// Install a store supplied by the orchestration service when the host has
@@ -6083,7 +6137,16 @@ impl AgentHostHandle {
             .await
             .unwrap_or_default()
         };
-        let (tools, mcp_index) = coding_agent_tools(&mcp_specs);
+        let (mut tools, mcp_index) = coding_agent_tools(&mcp_specs);
+        let computer_tools_enabled = self.computer_run_agent_controller().is_some()
+            && self
+                .computer_agent_route_is_authorized(session_id, model, creds)
+                .is_ok();
+        if computer_tools_enabled {
+            if let Some(tool_list) = tools.as_array_mut() {
+                tool_list.extend(computer_agent_tools());
+            }
+        }
         // #168: at most one Stop-hook continue per user turn
         let mut stop_continued = false;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
@@ -6380,6 +6443,7 @@ impl AgentHostHandle {
                     }));
 
                     let mut edited_while_needs_reverify = false;
+                    let mut computer_approval_pending = false;
                     for tc in &tool_calls {
                         if cancel.is_cancelled() {
                             break;
@@ -6434,6 +6498,11 @@ impl AgentHostHandle {
                         } else {
                             content
                         };
+                        if tc.name == "computer_use_propose"
+                            && content.contains("\"status\":\"awaiting_local_approval\"")
+                        {
+                            computer_approval_pending = true;
+                        }
                         // Under tight budgets, only clear the post-failure gate when cargo is
                         // green again. Clearing on edit alone allowed final answers without a
                         // re-run (#187 verified=false despite oracle pass via external check).
@@ -6486,6 +6555,16 @@ impl AgentHostHandle {
                             "tool_call_id": tc.id,
                             "content": content,
                         }));
+                        if computer_approval_pending {
+                            break;
+                        }
+                    }
+
+                    if computer_approval_pending {
+                        let msg = "Computer action staged for local approval. Open the Computer Run cockpit to review it; the Build turn will resume when you continue.";
+                        emit_message(event_tx, session_id, msg);
+                        push_assistant(self, session_id, msg);
+                        return Ok(msg.into());
                     }
 
                     // Host-driven cargo re-verify after edits while still red
@@ -6654,6 +6733,162 @@ impl AgentHostHandle {
         }
 
         match name {
+            "computer_use_observe" => {
+                self.ensure_computer_agent_authority(session_id)?;
+                let request_id = args
+                    .get("request_id")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow!("computer_use_observe requires request_id"))?
+                    .to_string();
+                let run_id = args
+                    .get("run_id")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow!("computer_use_observe requires run_id"))?
+                    .to_string();
+                let expected_version = args
+                    .get("expected_version")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| anyhow!("computer_use_observe requires expected_version"))?;
+                let controller = self
+                    .computer_run_agent_controller()
+                    .ok_or_else(|| anyhow!("Computer Use is unavailable in this host"))?;
+                let workspace = crate::computer_use::canonical_workspace_string(cwd)
+                    .ok_or_else(|| anyhow!("Computer Use requires a canonical project workspace"))?;
+                let input = args.clone();
+                self.run_tool_for_output(
+                    session_id,
+                    "computer_use_observe",
+                    &args,
+                    move || async move {
+                        let observed = controller
+                            .observe(
+                                &request_id,
+                                session_id,
+                                &workspace,
+                                &run_id,
+                                expected_version,
+                            )
+                            .await
+                            .map_err(|error| anyhow!(error.to_string()))?;
+                        let output = serde_json::json!({
+                            "status": "observed",
+                            "run_id": run_id,
+                            "run_version": observed.run_version,
+                            "observation": crate::computer_agent::observation_for_model(&observed.observation),
+                        })
+                        .to_string();
+                        Ok(local_tools::ToolResult::basic(
+                            "computer_use_observe".into(),
+                            ToolCallKind::Other,
+                            input,
+                            output,
+                            false,
+                            String::new(),
+                        ))
+                    },
+                    cancel,
+                    event_tx,
+                )
+                .await
+            }
+            "computer_use_propose" => {
+                self.ensure_computer_agent_authority(session_id)?;
+                let run_id = args
+                    .get("run_id")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow!("computer_use_propose requires run_id"))?
+                    .to_string();
+                let expected_version = args
+                    .get("expected_version")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| anyhow!("computer_use_propose requires expected_version"))?;
+                let observation_id = args
+                    .get("observation_id")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow!("computer_use_propose requires observation_id"))?
+                    .to_string();
+                let summary = args
+                    .get("summary")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty() && value.len() <= 512)
+                    .ok_or_else(|| anyhow!("computer_use_propose requires a bounded summary"))?
+                    .to_string();
+                let action_value = args
+                    .get("action")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("computer_use_propose requires action"))?;
+                let action: crate::computer_use::ComputerAction =
+                    serde_json::from_value(action_value)
+                        .context("computer_use_propose returned malformed action")?;
+                if !matches!(
+                    action,
+                    crate::computer_use::ComputerAction::ActivateTarget
+                        | crate::computer_use::ComputerAction::Invoke { .. }
+                        | crate::computer_use::ComputerAction::SetValue { .. }
+                        | crate::computer_use::ComputerAction::Select { .. }
+                        | crate::computer_use::ComputerAction::Scroll { .. }
+                ) {
+                    bail!("computer_use_propose accepts semantic actions only");
+                }
+                action
+                    .validate(&crate::computer_use::ComputerUseLimits::ceiling())
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                let controller = self
+                    .computer_run_agent_controller()
+                    .ok_or_else(|| anyhow!("Computer Use is unavailable in this host"))?;
+                let workspace = crate::computer_use::canonical_workspace_string(cwd)
+                    .ok_or_else(|| anyhow!("Computer Use requires a canonical project workspace"))?;
+                let input = args.clone();
+                let approval_event_tx = event_tx.clone();
+                let event_run_id = run_id.clone();
+                self.run_tool_for_output(
+                    session_id,
+                    "computer_use_propose",
+                    &args,
+                    move || async move {
+                        let staged = controller
+                            .stage_action(
+                                session_id,
+                                &workspace,
+                                &run_id,
+                                expected_version,
+                                &observation_id,
+                                action,
+                            )
+                            .await
+                            .map_err(|error| anyhow!(error.to_string()))?;
+                        let _ = approval_event_tx.send(SessionUpdate::ComputerApprovalRequired {
+                            session_id,
+                            run_id: event_run_id,
+                            run_version: staged.version,
+                        });
+                        let output = serde_json::json!({
+                            "status": "awaiting_local_approval",
+                            "run_id": staged.run_id,
+                            "run_version": staged.version,
+                            "observation_id": observation_id,
+                            "summary": summary,
+                            "instruction": "The action is staged in the Computer Run cockpit. Do not retry or issue another Computer action while local approval is pending.",
+                        })
+                        .to_string();
+                        Ok(local_tools::ToolResult::basic(
+                            "computer_use_propose".into(),
+                            ToolCallKind::Other,
+                            input,
+                            output,
+                            false,
+                            String::new(),
+                        ))
+                    },
+                    cancel,
+                    event_tx,
+                )
+                .await
+            }
             "list_dir" => {
                 let path = args
                     .get("path")

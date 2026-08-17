@@ -1041,6 +1041,60 @@ pub(crate) fn coding_agent_tools(
     (serde_json::Value::Array(tools), index)
 }
 
+/// Local Computer Use tools exposed only when the desktop has registered the
+/// approval-staging bridge. These tools never dispatch an OS action.
+pub(crate) fn computer_agent_tools() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "computer_use_observe",
+                "description": "Observe the active, user-selected Computer Run and return a redacted semantic snapshot. This advances the run observation fence; it never executes an action.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "request_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "run_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "expected_version": {"type": "integer", "minimum": 0}
+                    },
+                    "required": ["request_id", "run_id", "expected_version"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "computer_use_propose",
+                "description": "Stage exactly one semantic Computer Run action for visible local approval. This tool never executes the action; do not retry while approval is pending.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "expected_version": {"type": "integer", "minimum": 0},
+                        "observation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "action": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["activate_target", "invoke", "set_value", "select", "scroll"]},
+                                "element_id": {"type": "string", "maxLength": 256},
+                                "text": {"type": "string", "maxLength": 16384},
+                                "delta_x": {"type": "integer", "minimum": -10000, "maximum": 10000},
+                                "delta_y": {"type": "integer", "minimum": -10000, "maximum": 10000}
+                            },
+                            "required": ["type"],
+                            "additionalProperties": false
+                        },
+                        "summary": {"type": "string", "minLength": 1, "maxLength": 512}
+                    },
+                    "required": ["run_id", "expected_version", "observation_id", "action", "summary"],
+                    "additionalProperties": false
+                }
+            }
+        }),
+    ]
+}
+
 pub(crate) fn normalize_sandbox_profile(profile: &str) -> &'static str {
     match profile.trim().to_ascii_lowercase().as_str() {
         "read-only" | "readonly" | "read_only" | "ro" => "read-only",
@@ -2881,6 +2935,31 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
             wf < ld,
             "write_files should sort before list_dir, got {names:?}"
         );
+    }
+
+    #[test]
+    fn computer_agent_tools_are_bounded_semantic_actions() {
+        let tools = computer_agent_tools();
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["computer_use_observe", "computer_use_propose"]);
+
+        let propose = tools
+            .iter()
+            .find(|tool| tool["function"]["name"] == "computer_use_propose")
+            .unwrap();
+        let action = &propose["function"]["parameters"]["properties"]["action"];
+        assert_eq!(
+            action["properties"]["type"]["enum"],
+            serde_json::json!(["activate_target", "invoke", "set_value", "select", "scroll"])
+        );
+        assert_eq!(action["additionalProperties"], false);
+        let serialized = serde_json::to_string(&tools).unwrap();
+        assert!(!serialized.contains("key_chord"));
+        assert!(!serialized.contains("pointer"));
+        assert!(!serialized.contains("screenshot"));
     }
 
     #[test]

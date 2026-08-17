@@ -39,6 +39,10 @@ function bus(): Bus {
 function ensureListening() {
   const b = bus();
   if (b.started) return;
+  const runtime = globalThis as unknown as {
+    __TAURI_INTERNALS__?: unknown;
+  };
+  if (!runtime.__TAURI_INTERNALS__) return;
   b.started = true;
   void listen("session://update", (event) => {
     const u = normalizeSessionUpdate(event.payload);
@@ -53,6 +57,13 @@ function ensureListening() {
     }
   }).then((fn) => {
     b.unlisten = fn;
+  }).catch((error) => {
+    // Browser/jsdom previews do not provide the Tauri event bridge. Keep the
+    // subscription optional so a cockpit render cannot create an unhandled
+    // rejection, and allow a later desktop bootstrap to retry.
+    b.started = false;
+    b.unlisten = null;
+    console.warn("session update bus unavailable", error);
   });
 }
 

@@ -4,6 +4,7 @@ import {
   computerActivityAnnouncement,
   computerActivityState,
 } from "../lib/computerActivity";
+import { subscribeSessionUpdates } from "../lib/sessionEvents";
 import type {
   ComputerAction,
   ComputerAgentEligibility,
@@ -140,6 +141,33 @@ export function ComputerCockpit({
     return () => {
       void api.computerUseCockpitCancelAgent(sessionId).catch(() => {});
     };
+  }, [sessionId, onRunState]);
+
+  // A Build-agent proposal is staged through the bridge rather than through
+  // this component's button handlers. Refresh the authoritative cockpit
+  // snapshot as soon as that local approval becomes pending.
+  useEffect(() => {
+    if (!sessionId) return;
+    return subscribeSessionUpdates((update) => {
+      if (
+        update.type !== "computer_approval_required" ||
+        update.session_id !== sessionId
+      ) {
+        return;
+      }
+      const epoch = requestEpoch.current;
+      void api
+        .computerUseCockpitSnapshot(sessionId)
+        .then((next) => {
+          if (requestEpoch.current !== epoch) return;
+          setSnapshot(next);
+          onRunState?.(next.run?.state ?? null);
+        })
+        .catch(() => {
+          // The next normal cockpit refresh remains authoritative if the run
+          // was taken over or stopped while the notification was in flight.
+        });
+    });
   }, [sessionId, onRunState]);
 
   const apply = async (

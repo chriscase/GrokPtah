@@ -267,7 +267,7 @@ fn qualification_prompt(observation: &ComputerObservation, element_id: &str) -> 
     ))
 }
 
-fn observation_for_model(observation: &ComputerObservation) -> serde_json::Value {
+pub(crate) fn observation_for_model(observation: &ComputerObservation) -> serde_json::Value {
     serde_json::json!({
         "observation_id": observation.observation_id,
         "sequence": observation.sequence,

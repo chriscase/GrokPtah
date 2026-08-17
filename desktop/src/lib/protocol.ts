@@ -178,6 +178,12 @@ export type SessionUpdate =
       output?: string | null;
     }
   | {
+      type: "computer_approval_required";
+      session_id: string;
+      run_id: string;
+      run_version: number;
+    }
+  | {
       type: "plan";
       session_id: string;
       steps: string[];

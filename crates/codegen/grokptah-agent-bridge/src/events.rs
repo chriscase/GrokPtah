@@ -58,6 +58,14 @@ pub enum SessionUpdate {
         status: ToolCallStatus,
         output: Option<String>,
     },
+    /// A Build-agent Computer Use proposal was staged for local approval.
+    /// The cockpit re-reads its authoritative snapshot instead of trusting
+    /// this notification for run state.
+    ComputerApprovalRequired {
+        session_id: Uuid,
+        run_id: String,
+        run_version: u64,
+    },
     Plan {
         session_id: Uuid,
         steps: Vec<String>,

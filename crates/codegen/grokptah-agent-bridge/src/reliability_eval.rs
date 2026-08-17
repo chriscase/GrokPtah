@@ -161,7 +161,8 @@ impl EventLedger {
             | SessionUpdate::BackgroundTask { .. }
             | SessionUpdate::ShellOutput { .. }
             | SessionUpdate::AgentProgress { .. }
-            | SessionUpdate::PromptQueueChanged { .. } => {}
+            | SessionUpdate::PromptQueueChanged { .. }
+            | SessionUpdate::ComputerApprovalRequired { .. } => {}
         }
     }
 
@@ -360,6 +361,7 @@ fn event_name(update: &SessionUpdate) -> String {
         SessionUpdate::RateLimited { .. } => "rate_limited",
         SessionUpdate::SteeringInjected { .. } => "steering_injected",
         SessionUpdate::PromptQueueChanged { .. } => "prompt_queue_changed",
+        SessionUpdate::ComputerApprovalRequired { .. } => "computer_approval_required",
     }
     .into()
 }

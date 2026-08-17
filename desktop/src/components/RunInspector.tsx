@@ -77,6 +77,8 @@ function eventLabel(update: SessionUpdate): string {
       return `${compactEventText(update.title, 120)} · ${update.status}`;
     case "tool_call_update":
       return `${update.call_id} · ${update.status}${update.output ? ` · ${compactEventText(update.output, 140)}` : ""}`;
+    case "computer_approval_required":
+      return `Computer action awaiting local approval · ${update.run_id} · version ${update.run_version}`;
     case "plan":
       return `Plan · ${update.status} · ${update.steps.length} steps`;
     case "permission_required":

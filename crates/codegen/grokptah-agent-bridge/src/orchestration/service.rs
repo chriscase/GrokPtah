@@ -3492,7 +3492,8 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | AgentProgress { session_id, .. }
         | RateLimited { session_id, .. }
         | SteeringInjected { session_id, .. }
-        | PromptQueueChanged { session_id, .. } => Some(*session_id),
+        | PromptQueueChanged { session_id, .. }
+        | ComputerApprovalRequired { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
     }
 }

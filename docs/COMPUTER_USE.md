@@ -167,6 +167,24 @@ The cockpit's model loop is deliberately narrower than the native action backend
    cannot contain or cause an OS mutation. **Stop** and **Take over** cancel Computer inference and
    invalidate late responses without cancelling an unrelated Build turn.
 
+### Build-agent bridge
+
+The desktop Build loop now has a deliberately small local bridge to the same cockpit contract:
+
+- `computer_use_observe` is available only when the selected route is durably or session-qualified
+  for semantic Computer actions. It returns a redacted semantic snapshot and advances the durable
+  observation fence; it cannot act.
+- `computer_use_propose` accepts only one bounded semantic action (`activate_target`, `invoke`,
+  `set_value`, `select`, or `scroll`) for that exact observation. It stages the action in the visible
+  cockpit and emits an approval-required refresh event; it cannot dispatch the action.
+- The local user must still review and approve the one-use pending action. Approval, re-observation,
+  stale-frame rejection, takeover, cancellation, provenance, and durable event handling remain in
+  the Computer Run service rather than in model-facing tool code.
+
+These are desktop-local Build tools, not MCP tools. They intentionally do not expose screenshots,
+evidence bytes, element locators outside the observation response, raw pointer or keyboard input,
+clipboard, shell, or arbitrary multi-step automation.
+
 The opt-in `computer_agent_live` example exercises the real selected model against only the
 deterministic simulator. Its report is redacted and explicitly records that no action executed.
 
@@ -189,7 +207,8 @@ non-prompting status, explicit per-permission requests, bounded window discovery
 review, one-use approvals, evidence and audit visibility, pause, Stop, Take over, and
 non-cancelling steering. Native actions are limited to activation, Accessibility invoke, visible
 value entry, selection, and semantic scrolling. Every mutation requires a fresh observation and
-local one-use grant. It does not register a model action or MCP tool. See
+local one-use grant. The desktop Build bridge above is the only model-facing action path; it stages
+through this cockpit and does not create an MCP or raw-input endpoint. See
 [Computer Use on macOS](COMPUTER_USE_MACOS.md) for the privacy boundary, dispatch attestation,
 packaging requirements, and disposable smoke fixture.
 

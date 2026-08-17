@@ -23,7 +23,10 @@ mod simulator;
 mod store;
 mod types;
 
-pub use control::{ComputerClientIdentity, ComputerGrantRequest, ComputerRunController};
+pub use control::{
+    ComputerAgentObservation, ComputerClientIdentity, ComputerGrantRequest,
+    ComputerRunAgentController, ComputerRunController,
+};
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,

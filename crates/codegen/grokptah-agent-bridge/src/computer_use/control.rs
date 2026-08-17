@@ -10,7 +10,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::types::{ActionClass, ComputerResult, ComputerRun, ComputerUseLimits};
+use super::types::{
+    ActionClass, ComputerAction, ComputerObservation, ComputerResult, ComputerRun,
+    ComputerUseLimits,
+};
 
 /// Identity derived from the authenticated MCP transport session.
 ///
@@ -65,6 +68,14 @@ impl ComputerGrantRequest {
     }
 }
 
+/// A fresh observation plus the durable run fence that must accompany any
+/// proposal derived from it.
+#[derive(Debug, Clone)]
+pub struct ComputerAgentObservation {
+    pub observation: ComputerObservation,
+    pub run_version: u64,
+}
+
 /// Live backend owner installed by the desktop host.
 ///
 /// MCP mutation methods never open the Computer Run store themselves. The
@@ -113,5 +124,32 @@ pub trait ComputerRunController: Send + Sync {
         workspace: &str,
         run_id: &str,
         expected_version: u64,
+    ) -> ComputerResult<ComputerRun>;
+}
+
+/// Desktop-owned bridge for the Build agent's local Computer Use tools.
+///
+/// This is deliberately separate from the MCP mutation adapter: the Build
+/// loop is local and can stage an approval, but it must never receive a raw
+/// backend or a direct dispatch capability.
+#[async_trait]
+pub trait ComputerRunAgentController: Send + Sync {
+    async fn observe(
+        &self,
+        request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+    ) -> ComputerResult<ComputerAgentObservation>;
+
+    async fn stage_action(
+        &self,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
     ) -> ComputerResult<ComputerRun>;
 }
