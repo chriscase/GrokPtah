@@ -69,6 +69,10 @@ impl SessionKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: Uuid,
+    /// Durable Build-agent identity, when this session has entered the
+    /// persistent-agent lifecycle. Chat sessions and legacy shells may omit it.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     pub title: String,
     pub cwd: String,
     pub created_at: DateTime<Utc>,
@@ -185,6 +189,8 @@ impl TranscriptEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: Uuid,
+    #[serde(default)]
+    pub agent_id: Option<String>,
     pub title: String,
     pub cwd: std::path::PathBuf,
     pub created_at: DateTime<Utc>,
@@ -256,6 +262,7 @@ impl Session {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
+            agent_id: None,
             title: match kind {
                 SessionKind::Chat => "New chat".into(),
                 SessionKind::Build => "New session".into(),
@@ -295,6 +302,7 @@ impl Session {
         };
         SessionSummary {
             id: self.id,
+            agent_id: self.agent_id.clone(),
             title: self.title.clone(),
             cwd: self.cwd.display().to_string(),
             created_at: self.created_at,

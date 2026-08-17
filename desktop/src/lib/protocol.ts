@@ -57,6 +57,47 @@ export type DurableRunState =
   | "interrupted"
   | "limit_reached";
 
+export type PersistentAgentState =
+  | "active"
+  | "waiting"
+  | "interrupted"
+  | "failed"
+  | "completed";
+
+export interface PersistentAgent {
+  agentId: string;
+  sessionId: string;
+  workspace: string;
+  model: string;
+  state: PersistentAgentState;
+  currentRunId?: string | null;
+  latestCheckpointId?: string | null;
+  continuationOrdinal: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PersistentAgentCheckpoint {
+  checkpointId: string;
+  agentId: string;
+  sessionId: string;
+  runId: string;
+  parentCheckpointId?: string | null;
+  ordinal: number;
+  workspace: string;
+  contextSummary: string;
+  contextHash: string;
+  eventSeq: number;
+  reason: string;
+  createdAt: string;
+}
+
+export interface PersistentAgentResumePlan {
+  agent: PersistentAgent;
+  checkpoint: PersistentAgentCheckpoint;
+  parentRunId: string;
+}
+
 export type RunExecutionMode = "shared" | "isolated_worktree";
 export type PromotionState =
   | "not_applicable"
@@ -115,8 +156,11 @@ export interface DurableRun {
   requestId: string;
   clientId?: string | null;
   state: DurableRunState;
+  agentId?: string | null;
   /** Source run for an explicit post-restart replacement. */
   retryOf?: string | null;
+  /** Verified continuation source, distinct from explicit retry replacement. */
+  parentRunId?: string | null;
   /** One-based position while waiting in the bounded MCP admission queue. */
   queuePosition?: number | null;
   bounds: {
@@ -299,6 +343,7 @@ export type WorkspaceStatus =
 
 export interface SessionSummary {
   id: string;
+  agent_id?: string | null;
   title: string;
   cwd: string;
   created_at: string;

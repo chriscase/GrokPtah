@@ -22,6 +22,8 @@ import type {
   RunReview,
   WorkspaceUiState,
   ProviderQualificationReport,
+  PersistentAgent,
+  PersistentAgentResumePlan,
 } from "./protocol";
 import type {
   PromptQueueEntry,
@@ -35,6 +37,26 @@ export const api = {
   agentStart: () => invoke<void>("agent_start"),
   agentStop: () => invoke<void>("agent_stop"),
   agentStatus: () => invoke<AgentStatus>("agent_status"),
+  persistentAgentList: () =>
+    invoke<PersistentAgent[]>("persistent_agent_list"),
+  persistentAgentGet: (agentId: string) =>
+    invoke<PersistentAgent | null>("persistent_agent_get", { agentId }),
+  persistentAgentResumePlan: (sessionId: string) =>
+    invoke<PersistentAgentResumePlan>("persistent_agent_resume_plan", {
+      sessionId,
+    }),
+  persistentAgentResume: (
+    sessionId: string,
+    prompt: string,
+    maxRounds?: number,
+    requestId?: string,
+  ) =>
+    invoke<string>("persistent_agent_resume", {
+      sessionId,
+      prompt,
+      maxRounds: maxRounds ?? null,
+      requestId: requestId ?? null,
+    }),
   computerUseStatus: () =>
     invoke<ComputerPlatformStatus>("computer_use_status"),
   computerUseRequestPermission: (
