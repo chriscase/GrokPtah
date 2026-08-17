@@ -674,6 +674,53 @@ impl OrchestrationService {
         Ok(json!({ "sessions": rows }))
     }
 
+    /// Create an allowlisted Build session for a remote coordinator.
+    ///
+    /// Session creation is intentionally narrower than the desktop API: the
+    /// caller chooses only an existing configured workspace and an optional
+    /// bounded title. All model, provider, and tool policy remains owned by
+    /// the service host.
+    pub fn create_session(
+        &self,
+        _auth: &AuthContext,
+        workspace: &Path,
+        title: Option<String>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = canonical_workspace(workspace)?;
+        if !self.config.lock().allowlist.contains(&claimed) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "workspace is not allowlisted by this service",
+            ));
+        }
+        let summary = self
+            .host
+            .session_new_kind(SessionKind::Build)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let summary = self
+            .host
+            .session_set_cwd(summary.id, &claimed)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let summary = match title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(title) => self
+                .host
+                .session_rename(summary.id, title.to_string())
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            None => summary,
+        };
+        Ok(json!({
+            "sessionId": summary.id,
+            "title": summary.title,
+            "workspace": summary.cwd,
+            "updatedAt": summary.updated_at,
+            "busy": false,
+        }))
+    }
+
     /// List durable agent identities whose workspaces are visible to this
     /// authenticated control-plane instance. Checkpoint contents remain a
     /// scoped read so listing cannot become a transcript or workspace oracle.
@@ -690,6 +737,30 @@ impl OrchestrationService {
             .filter(|agent| allowlist.contains(Path::new(&agent.workspace)))
             .collect::<Vec<_>>();
         Ok(json!({ "agents": agents }))
+    }
+
+    /// List every durable Build run in one authorized session/workspace.
+    ///
+    /// Persistent-agent records intentionally point at the current run only;
+    /// this read keeps completed and cancelled remote history reviewable
+    /// without exposing runs from another session or workspace.
+    pub fn list_runs_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_queue_request(session_id, workspace)?;
+        let runs = self
+            .store
+            .list_runs()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .into_iter()
+            .filter(|run| {
+                run.session_id == session_id && run.workspace == claimed.display().to_string()
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "runs": runs }))
     }
 
     pub fn get_persistent_agent_scoped(

@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type {
   DurableRun,
+  DurableRunEvent,
   DurableRunEventPage,
   RunReview,
   SessionUpdate,
@@ -10,6 +11,8 @@ type RunInspectorProps = {
   runs: DurableRun[];
   error?: string | null;
   busy?: boolean;
+  remote?: boolean;
+  liveEvents?: Record<string, DurableRunEvent[]>;
   watching?: boolean;
   onWatchingChange?: (watching: boolean) => void;
   onRefresh: () => void;
@@ -120,6 +123,8 @@ export function RunInspector({
   runs,
   error,
   busy,
+  remote = false,
+  liveEvents,
   watching,
   onWatchingChange,
   onRefresh,
@@ -143,6 +148,30 @@ export function RunInspector({
   const [retryPrompts, setRetryPrompts] = useState<Record<string, string>>({});
   const [steerPrompts, setSteerPrompts] = useState<Record<string, string>>({});
   const watchValue = watching ?? localWatching;
+
+  useEffect(() => {
+    if (!liveEvents) return;
+    setEventPages((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const [runId, events] of Object.entries(liveEvents)) {
+        if (!events.length) continue;
+        const previous = current[runId];
+        const entries = [...(previous?.entries ?? []), ...events].filter(
+          (entry, index, all) => all.findIndex((candidate) => candidate.seq === entry.seq) === index,
+        ).sort((a, b) => a.seq - b.seq);
+        if (!previous || entries.length !== previous.entries.length) {
+          next[runId] = {
+            entries,
+            nextCursor: entries.at(-1)?.seq ?? previous?.nextCursor ?? null,
+            cursorExpired: previous?.cursorExpired ?? false,
+          };
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [liveEvents]);
 
   function setWatchValue(next: boolean) {
     setLocalWatching(next);
@@ -376,9 +405,9 @@ export function RunInspector({
                   </span>
                   <span
                     className="run-origin"
-                    title={`Run submitted by ${runOriginLabel(run)}`}
+                    title={`Run submitted by ${remote ? "Remote service" : runOriginLabel(run)}`}
                   >
-                    {runOriginLabel(run)}
+                    {remote ? "Remote service" : runOriginLabel(run)}
                   </span>
                   <span
                     className="run-execution-mode"
@@ -425,7 +454,7 @@ export function RunInspector({
                     This run stopped after restart. Review it before starting a linked retry.
                   </div>
                 )}
-                {run.state === "interrupted" && run.clientId === "mcp" && (
+                {!remote && run.state === "interrupted" && run.clientId === "mcp" && (
                   <div className="run-retry">
                     <label htmlFor={`retry-prompt-${run.runId}`}>Fresh recovery prompt</label>
                     <textarea
@@ -550,7 +579,7 @@ export function RunInspector({
                     )}
                   </details>
                 )}
-                {run.execution?.mode === "isolated_worktree" &&
+                {!remote && run.execution?.mode === "isolated_worktree" &&
                   run.state === "completed" && (
                     <div className="run-promotion" aria-label="Isolated run actions">
                       <div className="run-promotion-status">

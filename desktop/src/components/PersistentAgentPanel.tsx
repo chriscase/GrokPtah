@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import type {
   PersistentAgent,
   PersistentAgentResumePlan,
+  RemoteSessionTarget,
+  RemoteServiceStatus,
 } from "../lib/protocol";
 
 export type PersistentAgentPanelProps = {
@@ -13,6 +15,13 @@ export type PersistentAgentPanelProps = {
   onOpenSession: (agent: PersistentAgent) => void;
   onInspect: (sessionId: string) => Promise<PersistentAgentResumePlan>;
   onResume: (agent: PersistentAgent, prompt: string) => Promise<string>;
+  remoteStatus?: RemoteServiceStatus;
+  onConnectRemote?: (baseUrl: string, token: string) => Promise<void>;
+  onDisconnectRemote?: () => Promise<void>;
+  remoteSessions?: RemoteSessionTarget[];
+  selectedRemoteSessionId?: string | null;
+  onSelectRemoteSession?: (sessionId: string) => void;
+  onCreateRemoteSession?: (workspace: string, title?: string) => Promise<RemoteSessionTarget>;
 };
 
 function timeLabel(value: string): string {
@@ -43,6 +52,13 @@ export function PersistentAgentPanel({
   onOpenSession,
   onInspect,
   onResume,
+  remoteStatus = { connected: false },
+  onConnectRemote,
+  onDisconnectRemote,
+  remoteSessions = [],
+  selectedRemoteSessionId = null,
+  onSelectRemoteSession,
+  onCreateRemoteSession,
 }: PersistentAgentPanelProps) {
   const sortedAgents = useMemo(
     () =>
@@ -59,6 +75,13 @@ export function PersistentAgentPanel({
   const [prompts, setPrompts] = useState<Record<string, string>>({});
   const [resumeBusy, setResumeBusy] = useState<string | null>(null);
   const [responses, setResponses] = useState<Record<string, string>>({});
+  const [remoteUrl, setRemoteUrl] = useState("http://127.0.0.1:39200");
+  const [remoteToken, setRemoteToken] = useState("");
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [remoteWorkspace, setRemoteWorkspace] = useState("");
+  const [remoteTitle, setRemoteTitle] = useState("");
+  const [remoteSessionBusy, setRemoteSessionBusy] = useState(false);
 
   useEffect(() => {
     if (selectedAgentId && sortedAgents.some((agent) => agent.agentId === selectedAgentId)) {
@@ -105,6 +128,35 @@ export function PersistentAgentPanel({
     }
   }
 
+  async function connectRemote() {
+    if (!onConnectRemote || !remoteUrl.trim() || !remoteToken.trim()) return;
+    setRemoteBusy(true);
+    setRemoteError(null);
+    try {
+      await onConnectRemote(remoteUrl.trim(), remoteToken);
+      setRemoteToken("");
+      onRefresh();
+    } catch (connectError) {
+      setRemoteError(String(connectError));
+    } finally {
+      setRemoteBusy(false);
+    }
+  }
+
+  async function disconnectRemote() {
+    if (!onDisconnectRemote) return;
+    setRemoteBusy(true);
+    setRemoteError(null);
+    try {
+      await onDisconnectRemote();
+      onRefresh();
+    } catch (disconnectError) {
+      setRemoteError(String(disconnectError));
+    } finally {
+      setRemoteBusy(false);
+    }
+  }
+
   return (
     <section className="persistent-agent-panel" role="region" aria-label="Persistent agents">
       <div className="panel-block">
@@ -117,6 +169,110 @@ export function PersistentAgentPanel({
         <p style={{ fontSize: 11, color: "var(--muted)", margin: "0.4rem 0 0" }}>
           Durable Build identities and verified checkpoints. Resume is always an explicit operator action.
         </p>
+        {onConnectRemote && (
+          <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
+            <div style={{ fontSize: 11, color: "var(--muted)" }}>
+              {remoteStatus.connected
+                ? `Remote service connected${remoteStatus.baseUrl ? ` · ${remoteStatus.baseUrl}` : ""}`
+                : "Local service mode"}
+            </div>
+            {remoteStatus.connected ? (
+              <button type="button" onClick={() => void disconnectRemote()} disabled={remoteBusy}>
+                {remoteBusy ? "Disconnecting…" : "Disconnect remote service"}
+              </button>
+            ) : (
+              <>
+                <input
+                  aria-label="Remote service URL"
+                  value={remoteUrl}
+                  onChange={(event) => setRemoteUrl(event.target.value)}
+                  placeholder="https://service.example/mcp"
+                />
+                <input
+                  aria-label="Remote service token"
+                  type="password"
+                  value={remoteToken}
+                  onChange={(event) => setRemoteToken(event.target.value)}
+                  placeholder="Bearer token (memory only)"
+                />
+                <button
+                  type="button"
+                  onClick={() => void connectRemote()}
+                  disabled={remoteBusy || !remoteUrl.trim() || !remoteToken.trim()}
+                >
+                  {remoteBusy ? "Connecting…" : "Connect remote service"}
+                </button>
+                <div style={{ fontSize: 10, color: "var(--muted)" }}>
+                  The token is held in backend memory and is never displayed or persisted by GrokPtah.
+                </div>
+              </>
+            )}
+            {remoteError && <div role="alert">Remote connection failed: {remoteError}</div>}
+            {remoteStatus.connected && onSelectRemoteSession && onCreateRemoteSession && (
+              <div
+                style={{
+                  marginTop: 8,
+                  paddingTop: 8,
+                  borderTop: "1px solid var(--border)",
+                  display: "grid",
+                  gap: 6,
+                }}
+              >
+                <strong style={{ fontSize: 11 }}>Remote execution target</strong>
+                <select
+                  aria-label="Remote execution session"
+                  value={selectedRemoteSessionId ?? ""}
+                  onChange={(event) => onSelectRemoteSession(event.target.value)}
+                  disabled={remoteSessionBusy}
+                >
+                  <option value="" disabled>
+                    {remoteSessions.length === 0 ? "Create a service session" : "Choose a service session"}
+                  </option>
+                  {remoteSessions.map((session) => (
+                    <option key={session.sessionId} value={session.sessionId}>
+                      {session.title || session.workspace} {session.busy ? "· busy" : ""}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  aria-label="Remote session workspace"
+                  value={remoteWorkspace}
+                  onChange={(event) => setRemoteWorkspace(event.target.value)}
+                  placeholder="Allowlisted workspace path"
+                  disabled={remoteSessionBusy}
+                />
+                <input
+                  aria-label="Remote session title"
+                  value={remoteTitle}
+                  onChange={(event) => setRemoteTitle(event.target.value)}
+                  placeholder="Session title (optional)"
+                  disabled={remoteSessionBusy}
+                />
+                <button
+                  type="button"
+                  disabled={remoteSessionBusy || !remoteWorkspace.trim()}
+                  onClick={() => {
+                    setRemoteSessionBusy(true);
+                    setRemoteError(null);
+                    void onCreateRemoteSession(remoteWorkspace.trim(), remoteTitle.trim() || undefined)
+                      .then((session) => {
+                        onSelectRemoteSession(session.sessionId);
+                        setRemoteWorkspace("");
+                        setRemoteTitle("");
+                      })
+                      .catch((createError) => setRemoteError(`Remote session failed: ${String(createError)}`))
+                      .finally(() => setRemoteSessionBusy(false));
+                  }}
+                >
+                  {remoteSessionBusy ? "Creating…" : "Create remote session"}
+                </button>
+                <div style={{ fontSize: 10, color: "var(--muted)" }}>
+                  The workspace must already be allowlisted by the service.
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {error && (
@@ -152,7 +308,7 @@ export function PersistentAgentPanel({
               {agent.workspace}
             </div>
             <div className="worktree-create-actions" style={{ marginTop: 7 }}>
-              {!isCurrent && (
+              {!isCurrent && !remoteStatus.connected && (
                 <button type="button" onClick={() => onOpenSession(agent)}>
                   Open session
                 </button>

@@ -24,6 +24,10 @@ import type {
   ProviderQualificationReport,
   PersistentAgent,
   PersistentAgentResumePlan,
+  RemoteSessionTarget,
+  RemoteServiceStatus,
+  RemoteRunScope,
+  RemoteTaskSubmission,
 } from "./protocol";
 import type {
   PromptQueueEntry,
@@ -37,6 +41,56 @@ export const api = {
   agentStart: () => invoke<void>("agent_start"),
   agentStop: () => invoke<void>("agent_stop"),
   agentStatus: () => invoke<AgentStatus>("agent_status"),
+  remoteServiceConnect: (baseUrl: string, token: string) =>
+    invoke<RemoteServiceStatus>("remote_service_connect", { baseUrl, token }),
+  remoteServiceDisconnect: () => invoke<void>("remote_service_disconnect"),
+  remoteServiceStatus: () =>
+    invoke<RemoteServiceStatus>("remote_service_status"),
+  remoteServiceSessionList: () =>
+    invoke<RemoteSessionTarget[]>("remote_service_session_list"),
+  remoteServiceSessionCreate: (workspace: string, title?: string) =>
+    invoke<RemoteSessionTarget>("remote_service_session_create", {
+      workspace,
+      title: title ?? null,
+    }),
+  remoteServiceTaskSubmit: (
+    sessionId: string,
+    workspace: string,
+    prompt: string,
+    executionMode: RunExecutionMode = "shared",
+    allowQueue = true,
+  ) =>
+    invoke<RemoteTaskSubmission>("remote_service_task_submit", {
+      sessionId,
+      workspace,
+      prompt,
+      executionMode,
+      allowQueue,
+    }),
+  remoteServiceRunList: () =>
+    invoke<DurableRun[]>("remote_service_run_list"),
+  remoteServiceRunGet: (sessionId: string, workspace: string, runId: string) =>
+    invoke<DurableRun>("remote_service_run_get", { sessionId, workspace, runId }),
+  remoteServiceRunEvents: (
+    sessionId: string,
+    workspace: string,
+    runId: string,
+    afterSeq = 0,
+    limit = 80,
+  ) =>
+    invoke<DurableRunEventPage>("remote_service_run_events", {
+      sessionId,
+      workspace,
+      runId,
+      afterSeq,
+      limit,
+    }),
+  remoteServiceRunSteer: (sessionId: string, workspace: string, text: string) =>
+    invoke<void>("remote_service_run_steer", { sessionId, workspace, text }),
+  remoteServiceRunCancel: (sessionId: string, workspace: string, runId: string) =>
+    invoke<void>("remote_service_run_cancel", { sessionId, workspace, runId }),
+  remoteServiceWatchRuns: (scopes: RemoteRunScope[]) =>
+    invoke<void>("remote_service_watch_runs", { scopes }),
   persistentAgentList: () =>
     invoke<PersistentAgent[]>("persistent_agent_list"),
   persistentAgentGet: (agentId: string) =>

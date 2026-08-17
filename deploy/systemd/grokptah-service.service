@@ -1,0 +1,30 @@
+[Unit]
+Description=GrokPtah headless agent service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grokptah
+Group=grokptah
+EnvironmentFile=/etc/grokptah/grokptah-service.env
+ExecStart=/usr/local/bin/grokptah-service
+WorkingDirectory=/var/lib/grokptah
+StateDirectory=grokptah
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/grokptah /srv/grokptah/workspace
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=027
+
+# Keep this unit aligned with GROKPTAH_SERVICE_WORKSPACES. Add every
+# configured workspace to ReadWritePaths before starting the service.
+
+[Install]
+WantedBy=multi-user.target

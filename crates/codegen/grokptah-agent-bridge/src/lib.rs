@@ -108,7 +108,7 @@ pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use mcp_control::{
     discovered_tool_names, start_control_from_env, start_control_server, start_control_server_with,
-    ControlServerHandle, ControlServerLimits,
+    start_control_server_with_bind, ControlServerHandle, ControlServerLimits,
 };
 pub use mcp_control_client::{
     ListedTool, LiveEventFrame, LiveNotification, McpControlClient, McpEventStream,

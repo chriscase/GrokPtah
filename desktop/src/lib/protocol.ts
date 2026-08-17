@@ -98,6 +98,48 @@ export interface PersistentAgentResumePlan {
   parentRunId: string;
 }
 
+export interface RemoteServiceStatus {
+  connected: boolean;
+  baseUrl?: string | null;
+}
+
+export interface RemoteSessionTarget {
+  sessionId: string;
+  title: string;
+  workspace: string;
+  updatedAt: string;
+  busy: boolean;
+}
+
+export interface RemoteTaskSubmission {
+  runId: string;
+  sessionId: string;
+  state: DurableRunState;
+  requestId: string;
+  executionMode: RunExecutionMode;
+  queuedPosition?: number | null;
+}
+
+export interface RemoteRunScope {
+  sessionId: string;
+  workspace: string;
+  runId: string;
+}
+
+export interface RemoteRunEvent extends DurableRunEvent {
+  runId: string;
+  sessionId: string;
+  workspace: string;
+}
+
+export interface RemoteRunRecovery {
+  runId: string;
+  sessionId: string;
+  workspace: string;
+  afterSeq: number;
+  reason: string;
+}
+
 export type RunExecutionMode = "shared" | "isolated_worktree";
 export type PromotionState =
   | "not_applicable"

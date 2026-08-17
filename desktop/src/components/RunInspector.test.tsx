@@ -107,6 +107,58 @@ describe("RunInspector", () => {
     expect(screen.getByText("Shared workspace", { selector: ".run-execution-mode" })).toBeTruthy();
   });
 
+  it("renders live remote events and routes scoped controls", async () => {
+    const onSteer = vi.fn(async () => undefined);
+    const onCancel = vi.fn(async () => undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const remoteRun = run({
+      runId: "remote-run",
+      sessionId: "remote-session",
+      workspace: "/tmp/remote",
+      state: "running",
+      clientId: "mcp",
+      progress: {
+        round: 1,
+        maxRounds: 4,
+        lastTool: "inspect",
+        detail: "Watching the remote workspace",
+        updatedAt: "2026-08-17T12:01:00Z",
+      },
+    });
+    render(
+      <RunInspector
+        runs={[remoteRun]}
+        remote
+        liveEvents={{
+          "remote-run": [
+            {
+              seq: 9,
+              ts: "2026-08-17T12:01:09Z",
+              update: {
+                type: "agent_message_chunk",
+                session_id: "remote-session",
+                text: "Remote progress",
+              },
+            },
+          ],
+        }}
+        onRefresh={vi.fn()}
+        {...actions}
+        onSteer={onSteer}
+        onCancel={onCancel}
+      />,
+    );
+
+    expect(await screen.findByText("Assistant · Remote progress")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Steering prompt"), {
+      target: { value: "Keep checking the workspace" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Steer now" }));
+    await waitFor(() => expect(onSteer).toHaveBeenCalledWith("remote-run", "Keep checking the workspace"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+    await waitFor(() => expect(onCancel).toHaveBeenCalledWith("remote-run"));
+  });
+
   it("labels coordinator-owned runs", () => {
     render(
       <RunInspector
@@ -117,6 +169,37 @@ describe("RunInspector", () => {
     );
 
     expect(screen.getByText("MCP coordinator", { selector: ".run-origin" })).toBeTruthy();
+  });
+
+  it("keeps completed and cancelled remote history after the live pointer changes", () => {
+    render(
+      <RunInspector
+        runs={[
+          run({ runId: "history-complete", state: "completed", clientId: "mcp" }),
+          run({ runId: "history-cancel", state: "cancelled", clientId: "mcp" }),
+          run({
+            runId: "live-remote",
+            state: "running",
+            clientId: "mcp",
+            progress: {
+              round: 1,
+              maxRounds: 4,
+              lastTool: "inspect",
+              detail: "New live run",
+              updatedAt: "2026-08-17T12:04:00Z",
+            },
+          }),
+        ]}
+        remote
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByText("Completed")).toBeTruthy();
+    expect(screen.getByText("Cancelled")).toBeTruthy();
+    expect(screen.getByText("Running")).toBeTruthy();
+    expect(screen.getAllByText("Remote service", { selector: ".run-origin" })).toHaveLength(3);
   });
 
   it("shows the durable admission position for queued coordinator work", () => {

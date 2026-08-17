@@ -14,6 +14,8 @@ import {
   type SubagentInfo,
   type TranscriptItem,
   type DurableRun,
+  type DurableRunEvent,
+  type RemoteSessionTarget,
   type RunOrigin,
   type WorkspaceStatus,
 } from "./lib/protocol";
@@ -62,6 +64,12 @@ import {
   mergeAssistantChunk,
   subscribeSessionUpdates,
 } from "./lib/sessionEvents";
+import { subscribeRemoteRunEvents } from "./lib/remoteRunEvents";
+import {
+  executionTargetValue,
+  parseExecutionTargetValue,
+  remoteSubmissionMessage,
+} from "./lib/remoteExecution";
 import { displaySessionTitle } from "./lib/sessionTitle";
 import { activeRunOrigin } from "./lib/runOrigin";
 import { entriesToTranscriptItems, hasInterruptedTurn } from "./lib/transcript";
@@ -318,6 +326,14 @@ export default function App() {
   const [persistentAgents, setPersistentAgents] = useState<import("./lib/protocol").PersistentAgent[]>([]);
   const [persistentAgentsBusy, setPersistentAgentsBusy] = useState(false);
   const [persistentAgentsError, setPersistentAgentsError] = useState<string | null>(null);
+  const [remoteServiceStatus, setRemoteServiceStatus] = useState<import("./lib/protocol").RemoteServiceStatus>({
+    connected: false,
+  });
+  const [remoteSessions, setRemoteSessions] = useState<RemoteSessionTarget[]>([]);
+  const [remoteTargetSessionId, setRemoteTargetSessionId] = useState<string | null>(null);
+  const [executionTarget, setExecutionTarget] = useState<"local" | "remote">("local");
+  const [remoteRunEvents, setRemoteRunEvents] = useState<Record<string, DurableRunEvent[]>>({});
+  const [remoteRunRecoveryErrors, setRemoteRunRecoveryErrors] = useState<Record<string, string>>({});
   const [hooksPreview, setHooksPreview] = useState<string | null>(null);
   const [rules, setRules] = useState<string[]>([]);
   const [product, setProduct] = useState({
@@ -384,10 +400,12 @@ export default function App() {
   );
 
   const refreshRuns = useCallback(async () => {
+    const remote = remoteServiceStatus.connected;
     const sessionId = activeSessionId;
-    if (sessionId && runsRefreshInFlight.current?.sessionId === sessionId) return;
+    const scopeKey = remote ? "__remote__" : sessionId;
+    if (scopeKey && runsRefreshInFlight.current?.sessionId === scopeKey) return;
     const request = runsRefreshGuard.begin();
-    if (!sessionId) {
+    if (!scopeKey) {
       runsRefreshInFlight.current = null;
       setRuns([]);
       setRunsSessionId(null);
@@ -395,18 +413,33 @@ export default function App() {
       setRunsBusy(false);
       return;
     }
-    runsRefreshInFlight.current = { sessionId, request };
+    runsRefreshInFlight.current = { sessionId: scopeKey, request };
     setRunsBusy(true);
     try {
-      const nextRuns = await api.runList(sessionId);
+      const nextRuns = remote
+        ? await api.remoteServiceRunList()
+        : await api.runList(sessionId!);
       if (!runsRefreshGuard.isCurrent(request)) return;
       setRuns(nextRuns);
-      setRunsSessionId(sessionId);
+      setRunsSessionId(scopeKey);
       setRunsError(null);
+      if (remote) {
+        void api
+          .remoteServiceWatchRuns(
+            nextRuns
+              .filter((run) => run.startSeq != null && (run.state === "running" || run.state === "queued"))
+              .map((run) => ({
+                sessionId: run.sessionId,
+                workspace: run.workspace,
+                runId: run.runId,
+              })),
+          )
+          .catch((error) => console.warn("remote run watcher unavailable", error));
+      }
     } catch (error) {
       if (!runsRefreshGuard.isCurrent(request)) return;
       setRuns([]);
-      setRunsSessionId(sessionId);
+      setRunsSessionId(scopeKey);
       setRunsError(`Could not refresh durable runs: ${String(error)}`);
       console.warn("durable run refresh failed", error);
     } finally {
@@ -414,7 +447,7 @@ export default function App() {
       runsRefreshInFlight.current = null;
       if (runsRefreshGuard.isCurrent(request)) setRunsBusy(false);
     }
-  }, [activeSessionId, runsRefreshGuard]);
+  }, [activeSessionId, remoteServiceStatus.connected, runsRefreshGuard]);
 
   const refreshPersistentAgents = useCallback(async () => {
     setPersistentAgentsBusy(true);
@@ -427,6 +460,102 @@ export default function App() {
       setPersistentAgentsBusy(false);
     }
   }, []);
+
+  const refreshRemoteServiceStatus = useCallback(async () => {
+    try {
+      setRemoteServiceStatus(await api.remoteServiceStatus());
+    } catch {
+      setRemoteServiceStatus({ connected: false });
+    }
+  }, []);
+
+  const refreshRemoteSessions = useCallback(async () => {
+    if (!remoteServiceStatus.connected) {
+      setRemoteSessions([]);
+      setRemoteTargetSessionId(null);
+      return;
+    }
+    try {
+      const sessions = await api.remoteServiceSessionList();
+      setRemoteSessions(sessions);
+      setRemoteTargetSessionId((current) =>
+        sessions.some((session) => session.sessionId === current)
+          ? current
+          : sessions[0]?.sessionId ?? null,
+      );
+    } catch (error) {
+      setPersistentAgentsError(`Could not refresh remote sessions: ${String(error)}`);
+    }
+  }, [remoteServiceStatus.connected]);
+
+  useEffect(() => {
+    void refreshRemoteServiceStatus();
+  }, [refreshRemoteServiceStatus]);
+
+  useEffect(() => {
+    return subscribeRemoteRunEvents((notification) => {
+      if (notification.type === "event") {
+        const event = notification.payload;
+        setRemoteRunEvents((current) => {
+          const previous = current[event.runId] ?? [];
+          if (previous.some((entry) => entry.seq === event.seq)) return current;
+          return {
+            ...current,
+            [event.runId]: [...previous, event].sort((a, b) => a.seq - b.seq).slice(-500),
+          };
+        });
+        void refreshRuns();
+      } else {
+        setRemoteRunRecoveryErrors((current) => ({
+          ...current,
+          [notification.payload.runId]: notification.payload.reason,
+        }));
+        void refreshRuns();
+      }
+    });
+  }, [refreshRuns]);
+
+  const connectRemoteService = useCallback(
+    async (baseUrl: string, token: string) => {
+      const status = await api.remoteServiceConnect(baseUrl, token);
+      setRemoteServiceStatus(status);
+      setRemoteRunEvents({});
+      setRemoteRunRecoveryErrors({});
+      const sessions = await api.remoteServiceSessionList();
+      setRemoteSessions(sessions);
+      setRemoteTargetSessionId(sessions[0]?.sessionId ?? null);
+      await refreshPersistentAgents();
+    },
+    [refreshPersistentAgents],
+  );
+
+  const disconnectRemoteService = useCallback(async () => {
+    await api.remoteServiceDisconnect();
+    setRemoteServiceStatus({ connected: false });
+    setRemoteSessions([]);
+    setRemoteTargetSessionId(null);
+    setExecutionTarget("local");
+    setRemoteRunEvents({});
+    setRemoteRunRecoveryErrors({});
+    await refreshPersistentAgents();
+  }, [refreshPersistentAgents]);
+
+  const createRemoteSession = useCallback(
+    async (workspace: string, title?: string) => {
+      const session = await api.remoteServiceSessionCreate(workspace, title);
+      setRemoteSessions((current) => [
+        session,
+        ...current.filter((item) => item.sessionId !== session.sessionId),
+      ]);
+      setRemoteTargetSessionId(session.sessionId);
+      return session;
+    },
+    [],
+  );
+
+  useEffect(() => {
+    void refreshRemoteSessions();
+  }, [refreshRemoteSessions]);
 
   const syncRunOrigins = useCallback(async (sessionIds: string[]) => {
     if (runOriginSyncInFlight.current) return;
@@ -491,12 +620,12 @@ export default function App() {
   }, [openSessionIds, syncOpenQueues, syncRunOrigins]);
 
   useEffect(() => {
-    if (rightTab !== "tasks" || !activeSessionId) return;
+    if (rightTab !== "tasks" || (!remoteServiceStatus.connected && !activeSessionId)) return;
     void refreshRuns();
     if (!runsWatching) return;
     const timer = window.setInterval(() => void refreshRuns(), 1200);
     return () => window.clearInterval(timer);
-  }, [activeSessionId, refreshRuns, rightTab, runsWatching]);
+  }, [activeSessionId, refreshRuns, remoteServiceStatus.connected, rightTab, runsWatching]);
 
   // Narrow windows need the stage first; rails remain available through the
   // header toggles and open as overlays when explicitly requested.
@@ -1617,6 +1746,64 @@ export default function App() {
     if (fromComposer) {
       clearComposerFor(activeSessionId);
     }
+    if (fromComposer && executionTarget === "remote") {
+      const target = remoteSessions.find(
+        (session) => session.sessionId === remoteTargetSessionId,
+      );
+      const reportRemoteError = (message: string) => {
+        if (activeSessionId) {
+          patchTab(activeSessionId, (tab) => ({
+            ...tab,
+            activity: errorActivity(message),
+          }));
+        } else {
+          setRunsError(message);
+        }
+      };
+      if (!target) {
+        restoreComposer(prompt, activeSessionId);
+        reportRemoteError("Choose or create a remote execution session first.");
+        return;
+      }
+      if (prompt.startsWith("/")) {
+        restoreComposer(prompt, activeSessionId);
+        reportRemoteError("Slash commands run against local sessions; send this as a normal remote prompt.");
+        return;
+      }
+      try {
+        const submission = await api.remoteServiceTaskSubmit(
+          target.sessionId,
+          target.workspace,
+          prompt,
+          "shared",
+          true,
+        );
+        await refreshRuns();
+        if (activeSessionId) {
+          patchTab(activeSessionId, (tab) => ({
+            ...tab,
+            activity: {
+              ...tab.activity,
+              detail: `Remote run ${submission.runId} submitted · open Tasks to monitor`,
+              lastEventAt: Date.now(),
+            },
+            transcript: [
+              ...tab.transcript,
+              { kind: "user", text: prompt },
+              {
+                kind: "assistant",
+                text: remoteSubmissionMessage(target, submission),
+              },
+            ],
+          }));
+        }
+        setRightTab("tasks");
+      } catch (error) {
+        restoreComposer(prompt, activeSessionId);
+        reportRemoteError(`Remote submission failed: ${String(error)}`);
+      }
+      return;
+    }
     let id: string;
     try {
       id = opts?.sessionId ?? (await ensureSession());
@@ -2038,6 +2225,12 @@ export default function App() {
 
   const openPersistentAgentSession = useCallback(
     async (agent: import("./lib/protocol").PersistentAgent) => {
+      if (remoteServiceStatus.connected) {
+        setPersistentAgentsError(
+          "Remote sessions are operated through the service; they are not opened as local desktop tabs.",
+        );
+        return;
+      }
       try {
         const session = await api.sessionLoad(agent.sessionId);
         setWorkspaceMode("build");
@@ -2067,7 +2260,7 @@ export default function App() {
       await refreshChrome();
       return response;
     },
-    [openTab, refreshChrome, refreshPersistentAgents],
+    [openTab, refreshChrome, refreshPersistentAgents, remoteServiceStatus.connected],
   );
 
   async function onFuzzy(q: string) {
@@ -2943,6 +3136,39 @@ export default function App() {
                     }}
                   />
                 </label>
+                {remoteServiceStatus.connected && (
+                  <label
+                    className="composer-pill"
+                    title="Choose whether this prompt runs in the local desktop or on the connected remote service."
+                  >
+                    <span className="composer-pill-label">Run on</span>
+                    <StyledSelect
+                      aria-label="Execution target"
+                      className="composer-select"
+                      value={executionTargetValue(
+                        executionTarget === "remote" && remoteTargetSessionId
+                          ? { kind: "remote", sessionId: remoteTargetSessionId }
+                          : { kind: "local" },
+                      )}
+                      options={[
+                        { value: "local", label: "Local desktop" },
+                        ...remoteSessions.map((session) => ({
+                          value: `remote:${session.sessionId}`,
+                          label: `Remote · ${session.title || session.workspace}`,
+                        })),
+                      ]}
+                      onChange={(value) => {
+                        const choice = parseExecutionTargetValue(value);
+                        if (!choice || choice.kind === "local") {
+                          setExecutionTarget("local");
+                          return;
+                        }
+                        setRemoteTargetSessionId(choice.sessionId);
+                        setExecutionTarget("remote");
+                      }}
+                    />
+                  </label>
+                )}
                 {activeIsBuild && activeSummary && (
                   <button
                     type="button"
@@ -3439,56 +3665,114 @@ export default function App() {
         )}
 
         {rightTab === "agents" && (
-          <PersistentAgentPanel
-            agents={persistentAgents}
-            activeSessionId={activeSessionId}
-            busy={persistentAgentsBusy}
-            error={persistentAgentsError}
-            onRefresh={() => void refreshPersistentAgents()}
-            onOpenSession={(agent) => void openPersistentAgentSession(agent)}
-            onInspect={(sessionId) => api.persistentAgentResumePlan(sessionId)}
-            onResume={(agent, prompt) => resumePersistentAgent(agent, prompt)}
-          />
+            <PersistentAgentPanel
+              agents={persistentAgents}
+              activeSessionId={activeSessionId}
+              busy={persistentAgentsBusy}
+              error={persistentAgentsError}
+              remoteStatus={remoteServiceStatus}
+              onRefresh={() => void refreshPersistentAgents()}
+              onOpenSession={(agent) => void openPersistentAgentSession(agent)}
+              onInspect={(sessionId) => api.persistentAgentResumePlan(sessionId)}
+              onResume={(agent, prompt) => resumePersistentAgent(agent, prompt)}
+              onConnectRemote={connectRemoteService}
+              onDisconnectRemote={disconnectRemoteService}
+              remoteSessions={remoteSessions}
+              selectedRemoteSessionId={remoteTargetSessionId}
+              onSelectRemoteSession={(sessionId) => {
+                setRemoteTargetSessionId(sessionId);
+                setExecutionTarget("remote");
+              }}
+              onCreateRemoteSession={createRemoteSession}
+            />
         )}
 
         {rightTab === "tasks" && (
           <>
             <RunInspector
-              runs={runsSessionId === activeSessionId ? runs : []}
-              error={runsSessionId === activeSessionId ? runsError : null}
+              runs={
+                remoteServiceStatus.connected
+                  ? runsSessionId === "__remote__"
+                    ? runs
+                    : []
+                  : runsSessionId === activeSessionId
+                    ? runs
+                    : []
+              }
+              error={
+                remoteServiceStatus.connected
+                  ? runsSessionId === "__remote__"
+                    ? Object.values(remoteRunRecoveryErrors)[0] ?? runsError
+                    : null
+                  : runsSessionId === activeSessionId
+                    ? runsError
+                    : null
+              }
               busy={runsBusy}
               watching={runsWatching}
+              remote={remoteServiceStatus.connected}
+              liveEvents={remoteServiceStatus.connected ? remoteRunEvents : undefined}
               onWatchingChange={setRunsWatching}
               onRefresh={() => void refreshRuns()}
               onReview={(runId) => {
+                if (remoteServiceStatus.connected) {
+                  return Promise.reject(new Error("Remote diff review is not available in this view"));
+                }
                 if (!activeSessionId) return Promise.reject(new Error("No active session"));
                 return api.runReview(activeSessionId, runId);
               }}
               onApprove={async (runId) => {
+                if (remoteServiceStatus.connected) throw new Error("Remote promotion is not available in this view");
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runApprove(activeSessionId, runId);
               }}
               onPromote={async (runId) => {
+                if (remoteServiceStatus.connected) throw new Error("Remote promotion is not available in this view");
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runPromote(activeSessionId, runId);
               }}
               onDiscard={async (runId) => {
+                if (remoteServiceStatus.connected) throw new Error("Remote discard is not available in this view");
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runDiscard(activeSessionId, runId);
               }}
               onRetry={async (runId, prompt) => {
+                if (remoteServiceStatus.connected) throw new Error("Resume remote persistent agents from the Agents panel");
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runRetry(activeSessionId, runId, prompt);
               }}
               onSteer={async (runId, text) => {
+                const run = runs.find((candidate) => candidate.runId === runId);
+                if (!run) throw new Error("Remote run is no longer visible");
+                if (remoteServiceStatus.connected) {
+                  await api.remoteServiceRunSteer(run.sessionId, run.workspace, text);
+                  return;
+                }
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runSteer(activeSessionId, runId, text);
               }}
               onCancel={async (runId) => {
+                const run = runs.find((candidate) => candidate.runId === runId);
+                if (!run) throw new Error("Remote run is no longer visible");
+                if (remoteServiceStatus.connected) {
+                  await api.remoteServiceRunCancel(run.sessionId, run.workspace, runId);
+                  return;
+                }
                 if (!activeSessionId) throw new Error("No active session");
                 await api.runCancel(activeSessionId, runId);
               }}
               onEvents={(runId, afterSeq = 0, limit = 80) => {
+                const run = runs.find((candidate) => candidate.runId === runId);
+                if (remoteServiceStatus.connected) {
+                  if (!run) return Promise.reject(new Error("Remote run is no longer visible"));
+                  return api.remoteServiceRunEvents(
+                    run.sessionId,
+                    run.workspace,
+                    runId,
+                    afterSeq,
+                    limit,
+                  );
+                }
                 if (!activeSessionId) return Promise.reject(new Error("No active session"));
                 return api.runEvents(activeSessionId, runId, afterSeq, limit);
               }}
