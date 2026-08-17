@@ -34,6 +34,21 @@ export const emptyPromptQueueState: PromptQueueState = {
   revisions: {},
 };
 
+/**
+ * Newest revision this client has applied for a session.
+ *
+ * This is what a revision-fenced write must send: it names the ordering the
+ * UI is actually showing, so a write computed against a view the bridge has
+ * since moved past fails closed instead of landing on a queue nobody read.
+ */
+export function queueRevisionFor(
+  state: PromptQueueState,
+  sessionId: string | null | undefined,
+): number {
+  if (!sessionId) return 0;
+  return state.revisions[sessionId] ?? 0;
+}
+
 /** Entries the UI should render for a session. */
 export function queueEntriesFor(
   state: PromptQueueState,

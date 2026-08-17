@@ -10,6 +10,7 @@ import {
   emptyPromptQueueState,
   promptQueueReducer,
   queueEntriesFor,
+  queueRevisionFor,
   type PromptQueueAction,
   type PromptQueueEntry,
   type PromptQueueSnapshot,
@@ -144,5 +145,8 @@ export function useComposerQueue(activeSessionId: string | null) {
     syncQueue,
     queueFor: (sessionId: string | null): PromptQueueEntry[] =>
       queueEntriesFor(queues, sessionId),
+    /** Revision a revision-fenced write should send for this session. */
+    queueRevision: (sessionId: string | null): number =>
+      queueRevisionFor(queues, sessionId),
   };
 }
