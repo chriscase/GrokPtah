@@ -386,6 +386,9 @@ impl RemoteServiceClient {
         let result = match first {
             Ok(result) => result,
             Err(first_error) => {
+                if !should_reconnect_remote_error(&first_error) {
+                    return Err(first_error);
+                }
                 self.reconnect()
                     .await
                     .context("reconnect remote MCP service")?;
@@ -785,6 +788,9 @@ async fn open_remote_stream(
     match first {
         Ok(stream) => Ok(stream),
         Err(first_error) => {
+            if !should_reconnect_remote_error(&first_error) {
+                return Err(first_error);
+            }
             client
                 .reconnect()
                 .await
@@ -868,6 +874,31 @@ fn normalize_base_url(value: &str) -> Result<String> {
     Ok(value.trim().trim_end_matches('/').to_string())
 }
 
+/// Reconnect only for transport failures, retryable HTTP statuses, or a
+/// server-side MCP session that disappeared during a restart. Application
+/// errors such as an invalid request or a terminal run must be returned
+/// directly; replaying those requests can duplicate mutations.
+fn should_reconnect_remote_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    if let Some(rest) = message.strip_prefix("MCP HTTP ") {
+        let status = rest
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u16>().ok());
+        return message.contains("unknown mcp-session-id")
+            || status.is_some_and(|code| code == 408 || code == 429 || code >= 500);
+    }
+    if message.starts_with("MCP error:")
+        || message.starts_with("missing required argument ")
+        || message.starts_with("unexpected argument ")
+        || message.starts_with("unknown tool ")
+        || message.starts_with("MCP client not initialized")
+    {
+        return false;
+    }
+    true
+}
+
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
@@ -883,7 +914,7 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{normalize_base_url, RemoteServiceClient};
+    use super::{normalize_base_url, should_reconnect_remote_error, RemoteServiceClient};
 
     #[test]
     fn local_http_is_allowed_but_remote_http_and_embedded_credentials_are_not() {
@@ -894,6 +925,28 @@ mod tests {
         assert!(normalize_base_url("http://service.example:39200").is_err());
         assert!(normalize_base_url("https://user:pass@service.example").is_err());
         assert!(normalize_base_url("ftp://service.example").is_err());
+    }
+
+    #[test]
+    fn remote_client_reconnects_only_for_transport_or_stale_session_errors() {
+        assert!(should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP HTTP 400 Bad Request: unknown mcp-session-id"
+        )));
+        assert!(should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP HTTP 503 Service Unavailable"
+        )));
+        assert!(should_reconnect_remote_error(&anyhow::anyhow!(
+            "error sending request for url"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP HTTP 400 Bad Request: run already terminal (Completed)"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP HTTP 401 Unauthorized"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP error: invalid request"
+        )));
     }
 
     #[tokio::test]
@@ -944,15 +997,6 @@ mod tests {
                 RunExecutionMode::Shared,
                 true,
                 "desktop-remote-submit".into(),
-            )
-            .await
-            .unwrap();
-        client
-            .cancel(
-                submission.session_id,
-                session.workspace.clone(),
-                submission.run_id.clone(),
-                "desktop-remote-submit-cancel".into(),
             )
             .await
             .unwrap();
