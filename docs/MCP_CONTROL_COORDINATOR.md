@@ -191,6 +191,9 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | Tool | Kind | Required arguments |
 |------|------|--------------------|
 | `ptah_list_sessions` | read | _(none)_ |
+| `ptah_create_session` | mutate | `workspace`; optional `title` |
+| `ptah_list_persistent_agents` | read | _(none)_ |
+| `ptah_list_runs` | read | `session_id`, `workspace` |
 | `ptah_get_capacity` | read | _(none)_ |
 | `ptah_get_run` | read | `session_id`, `workspace`, `run_id` |
 | `ptah_get_progress` | read | `session_id`, `workspace`, `run_id` |
@@ -219,7 +222,7 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 
 `run_terminal_cmd`, `shell`, `bash`, `ptah_shell`, `ptah_set_config`,
 `ptah_manage_plugin`, `ptah_manage_mcp`, `ptah_approve`, `ptah_pause`,
-`ptah_resume`, `ptah_create_session`, `ptah_delete_session`.
+`ptah_resume`, `ptah_delete_session`.
 
 Unknown / forbidden tool names return HTTP client error with
 `error.data.code = "forbidden_scope"`.
@@ -229,6 +232,9 @@ Unknown / forbidden tool names return HTTP client error with
 ### Sessions and workspaces
 
 - Only **Build** sessions accept queue / steer / submit / cancel.
+- `ptah_create_session` creates only a Build session and accepts an existing
+  allowlisted workspace plus an optional bounded title; it cannot create,
+  delete, or retarget arbitrary host sessions.
 - `workspace` must be on the server **allowlist** and match the session cwd
   (canonicalized; symlink escape outside root → fail closed).
 - Reads are **run-scoped and caller-scoped**: every run read and review must
@@ -494,6 +500,10 @@ POST /mcp
 POST /mcp
   tools/call ptah_get_capacity
 POST /mcp
+  tools/call ptah_list_sessions
+POST /mcp
+  tools/call ptah_create_session { workspace, title? }  # optional bootstrap
+POST /mcp
   tools/call ptah_submit_task { request_id, session_id, workspace, prompt }
 POST /mcp
   tools/call ptah_get_run / ptah_get_events / ptah_get_handoff
@@ -589,6 +599,10 @@ SDK. The campaign verifies:
 - isolated submission, bounded diff review, exact short-lived approval, and
   promotion into a disposable Git workspace;
 - MCP session deletion/reconnect with durable run reads after reconnect.
+- scoped durable run listing that keeps completed remote history reviewable
+  after the persistent agent's current-run pointer is cleared.
+- deterministic capacity hardening with fail-fast rejection, bounded queue
+  admission, queued cancellation, release accounting, and scope rejection.
 
 The soak hardening suite additionally exercises a fresh-host restart against
 the same durable home, including session recovery, scoped evidence reads, and
@@ -604,11 +618,15 @@ workspaces must be explicitly disposable, allowlisted, and have clean Git
 baselines. The campaign writes one named file through isolated
 promotion and must never be pointed at a user's active workspace.
 
-Optional desktop (only if desktop paths change):
+Optional desktop (when desktop paths change):
 
 ```bash
 cd desktop && npm run typecheck && npm test
 ```
+
+The desktop target-mapping tests cover local/remote picker round trips,
+malformed target rejection, remote submission feedback, and remote session
+creation/selection in the Agents panel.
 
 ## SDK limitations
 

@@ -754,9 +754,11 @@ pub fn is_recognized_test_command(command: &str) -> bool {
 /// Tools exposed by the control plane (schema snapshot source of truth).
 pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_list_sessions",
+    "ptah_create_session",
     "ptah_list_persistent_agents",
     "ptah_get_persistent_agent",
     "ptah_get_capacity",
+    "ptah_list_runs",
     "ptah_get_run",
     "ptah_get_progress",
     "ptah_get_events",
@@ -793,7 +795,6 @@ pub const FORBIDDEN_TOOLS: &[&str] = &[
     "ptah_approve",
     "ptah_pause",
     "ptah_resume",
-    "ptah_create_session",
     "ptah_delete_session",
 ];
 

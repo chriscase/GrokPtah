@@ -4,6 +4,7 @@ mod commands;
 mod computer_use;
 mod event_forward;
 mod pty_host;
+mod remote_service;
 
 use std::sync::Mutex;
 
@@ -16,6 +17,7 @@ pub struct AppState {
     /// Loopback MCP control plane (#196); optional when token not configured.
     pub control: Mutex<Option<ControlServerHandle>>,
     pub computer_use: computer_use::DesktopComputerUse,
+    pub remote_service: std::sync::Arc<remote_service::RemoteServiceState>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -33,6 +35,7 @@ pub fn run() {
             pty: pty_host::PtyHub::new(),
             control: Mutex::new(None),
             computer_use: computer_use::DesktopComputerUse::new(),
+            remote_service: remote_service::RemoteServiceState::new(),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -60,6 +63,18 @@ pub fn run() {
             commands::agent_start,
             commands::agent_stop,
             commands::agent_status,
+            commands::remote_service_connect,
+            commands::remote_service_disconnect,
+            commands::remote_service_status,
+            commands::remote_service_session_list,
+            commands::remote_service_session_create,
+            commands::remote_service_task_submit,
+            commands::remote_service_run_list,
+            commands::remote_service_run_get,
+            commands::remote_service_run_events,
+            commands::remote_service_run_steer,
+            commands::remote_service_run_cancel,
+            commands::remote_service_watch_runs,
             commands::persistent_agent_list,
             commands::persistent_agent_get,
             commands::persistent_agent_resume_plan,

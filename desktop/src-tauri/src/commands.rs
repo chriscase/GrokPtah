@@ -9,7 +9,7 @@ use grokptah_agent_bridge::{
     SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
     SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
-use tauri::State;
+use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
@@ -69,9 +69,190 @@ pub fn agent_status(state: State<'_, AppState>) -> grokptah_agent_bridge::AgentS
 }
 
 #[tauri::command]
+pub async fn remote_service_connect(
+    state: State<'_, AppState>,
+    base_url: String,
+    token: String,
+) -> Result<crate::remote_service::RemoteServiceStatus, String> {
+    state
+        .remote_service
+        .connect(base_url, token)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn remote_service_disconnect(state: State<'_, AppState>) -> Result<(), String> {
+    state.remote_service.disconnect().await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remote_service_status(
+    state: State<'_, AppState>,
+) -> Result<crate::remote_service::RemoteServiceStatus, String> {
+    Ok(state.remote_service.status().await)
+}
+
+#[tauri::command]
+pub async fn remote_service_session_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::remote_service::RemoteSessionTarget>, String> {
+    state
+        .remote_service
+        .list_sessions()
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_session_create(
+    state: State<'_, AppState>,
+    workspace: String,
+    title: Option<String>,
+) -> Result<crate::remote_service::RemoteSessionTarget, String> {
+    state
+        .remote_service
+        .create_session(workspace, title)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_task_submit(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    prompt: String,
+    execution_mode: Option<RunExecutionMode>,
+    allow_queue: Option<bool>,
+) -> Result<crate::remote_service::RemoteTaskSubmission, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .submit_task(
+            session_id,
+            workspace,
+            prompt,
+            execution_mode.unwrap_or_default(),
+            allow_queue.unwrap_or(true),
+        )
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_run_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<grokptah_agent_bridge::RunRecord>, String> {
+    state
+        .remote_service
+        .list_runs()
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_run_get(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    run_id: String,
+) -> Result<grokptah_agent_bridge::RunRecord, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .get_run(session_id, workspace, run_id)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_run_events(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    run_id: String,
+    after_seq: Option<u64>,
+    limit: Option<usize>,
+) -> Result<grokptah_agent_bridge::JournalPage, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .get_events(
+            session_id,
+            workspace,
+            run_id,
+            after_seq.unwrap_or(0),
+            limit.unwrap_or(80),
+        )
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_run_steer(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    text: String,
+) -> Result<(), String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .steer(session_id, workspace, text, Uuid::new_v4().to_string())
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_run_cancel(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    run_id: String,
+) -> Result<(), String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .cancel(session_id, workspace, run_id, Uuid::new_v4().to_string())
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_watch_runs(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    scopes: Vec<crate::remote_service::RemoteRunScope>,
+) -> Result<(), String> {
+    state
+        .remote_service
+        .watch_runs(scopes, app)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
 pub async fn persistent_agent_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<grokptah_agent_bridge::AgentRecord>, String> {
+    if let Some(agents) = state
+        .remote_service
+        .list_persistent_agents()
+        .await
+        .map_err(map_err)?
+    {
+        return Ok(agents);
+    }
     let host = state.host.clone();
     run_blocking(move || host.list_persistent_agents().map_err(map_err)).await
 }
@@ -81,6 +262,14 @@ pub async fn persistent_agent_get(
     state: State<'_, AppState>,
     agent_id: String,
 ) -> Result<Option<grokptah_agent_bridge::AgentRecord>, String> {
+    if let Some(agent) = state
+        .remote_service
+        .get_persistent_agent(&agent_id)
+        .await
+        .map_err(map_err)?
+    {
+        return Ok(Some(agent));
+    }
     let host = state.host.clone();
     run_blocking(move || host.get_persistent_agent(&agent_id).map_err(map_err)).await
 }
@@ -91,6 +280,14 @@ pub async fn persistent_agent_resume_plan(
     session_id: String,
 ) -> Result<grokptah_agent_bridge::AgentResumePlan, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    if let Some(plan) = state
+        .remote_service
+        .resume_plan(session_id)
+        .await
+        .map_err(map_err)?
+    {
+        return Ok(plan);
+    }
     let host = state.host.clone();
     run_blocking(move || host.prepare_agent_resume(session_id).map_err(map_err)).await
 }
@@ -106,6 +303,21 @@ pub async fn persistent_agent_resume(
     request_id: Option<String>,
 ) -> Result<String, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    if let Some(response) = state
+        .remote_service
+        .resume(
+            session_id,
+            prompt.clone(),
+            max_rounds,
+            request_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        )
+        .await
+        .map_err(map_err)?
+    {
+        return Ok(response);
+    }
     state
         .host
         .resume_agent_with_request_id(session_id, prompt, max_rounds, request_id)

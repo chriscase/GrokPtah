@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   PersistentAgent,
   PersistentAgentResumePlan,
+  RemoteSessionTarget,
 } from "../lib/protocol";
 import { PersistentAgentPanel } from "./PersistentAgentPanel";
 
@@ -99,5 +100,79 @@ describe("PersistentAgentPanel", () => {
       target: { value: "Do not run" },
     });
     expect(resumeButton).toBeDisabled();
+  });
+
+  it("connects a remote service without exposing the token in status", async () => {
+    const onConnectRemote = vi.fn(async () => undefined);
+    render(
+      <PersistentAgentPanel
+        agents={[]}
+        activeSessionId={null}
+        onRefresh={vi.fn()}
+        onOpenSession={vi.fn()}
+        onInspect={vi.fn(async () => plan)}
+        onResume={vi.fn(async () => "never")}
+        onConnectRemote={onConnectRemote}
+        onDisconnectRemote={vi.fn(async () => undefined)}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Remote service URL"), {
+      target: { value: "https://service.example" },
+    });
+    fireEvent.change(screen.getByLabelText("Remote service token"), {
+      target: { value: "secret-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Connect remote service" }));
+
+    await waitFor(() =>
+      expect(onConnectRemote).toHaveBeenCalledWith(
+        "https://service.example",
+        "secret-token",
+      ),
+    );
+    expect(screen.getByLabelText("Remote service token")).toHaveValue("");
+  });
+
+  it("creates and selects a scoped remote execution session", async () => {
+    const session: RemoteSessionTarget = {
+      sessionId: "remote-session-1",
+      title: "VM Build",
+      workspace: "/srv/grokptah",
+      updatedAt: "2026-08-17T12:00:00Z",
+      busy: false,
+    };
+    const onCreateRemoteSession = vi.fn(async () => session);
+    const onSelectRemoteSession = vi.fn();
+    render(
+      <PersistentAgentPanel
+        agents={[]}
+        activeSessionId={null}
+        onRefresh={vi.fn()}
+        onOpenSession={vi.fn()}
+        onInspect={vi.fn(async () => plan)}
+        onResume={vi.fn(async () => "never")}
+        remoteStatus={{ connected: true, baseUrl: "https://service.example" }}
+        onConnectRemote={vi.fn(async () => undefined)}
+        onSelectRemoteSession={onSelectRemoteSession}
+        onCreateRemoteSession={onCreateRemoteSession}
+        remoteSessions={[]}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Remote session workspace"), {
+      target: { value: "/srv/grokptah" },
+    });
+    fireEvent.change(screen.getByLabelText("Remote session title"), {
+      target: { value: "VM Build" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create remote session" }));
+
+    await waitFor(() =>
+      expect(onCreateRemoteSession).toHaveBeenCalledWith("/srv/grokptah", "VM Build"),
+    );
+    await waitFor(() =>
+      expect(onSelectRemoteSession).toHaveBeenCalledWith(session.sessionId),
+    );
   });
 });

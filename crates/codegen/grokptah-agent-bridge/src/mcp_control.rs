@@ -93,6 +93,7 @@ struct AppState {
     total_requests: Arc<AtomicU64>,
     max_concurrent: usize,
     live_streams: Arc<Semaphore>,
+    health_requires_auth: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -416,6 +417,30 @@ pub async fn start_control_server_with(
     port: u16,
     limits: ControlServerLimits,
 ) -> anyhow::Result<ControlServerHandle> {
+    start_control_server_with_bind(
+        orch,
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        limits,
+        false,
+    )
+    .await
+}
+
+/// Start the control server on an explicit address.
+///
+/// Loopback remains the default and keeps `/health` and `/ready` probeable
+/// without credentials. A non-loopback listener is permitted only when the
+/// caller explicitly enables authenticated health probes; this prevents a
+/// service configuration from accidentally exposing unauthenticated status.
+pub async fn start_control_server_with_bind(
+    orch: Arc<OrchestrationService>,
+    addr: SocketAddr,
+    limits: ControlServerLimits,
+    health_requires_auth: bool,
+) -> anyhow::Result<ControlServerHandle> {
+    if !addr.ip().is_loopback() && !health_requires_auth {
+        anyhow::bail!("non-loopback control listeners require authenticated health probes");
+    }
     let cancel = tokio_util::sync::CancellationToken::new();
     let max_concurrent = limits.max_concurrent.max(1);
     let state = AppState {
@@ -429,9 +454,11 @@ pub async fn start_control_server_with(
         total_requests: Arc::new(AtomicU64::new(0)),
         max_concurrent,
         live_streams: Arc::new(Semaphore::new(MAX_LIVE_STREAMS)),
+        health_requires_auth,
     };
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
         .route("/", post(streamable_post_handler))
         .route(
             "/mcp",
@@ -449,12 +476,8 @@ pub async fn start_control_server_with(
         ))
         .with_state(state.clone());
 
-    // Fail closed: IPv4 loopback only — never 0.0.0.0 / public interfaces.
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
+    let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
-    if !addr.ip().is_loopback() {
-        anyhow::bail!("control server refused non-loopback bind address {addr}");
-    }
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let token = String::new();
     let cancel_serve = cancel.clone();
@@ -489,8 +512,9 @@ async fn authenticate_request(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // Health is unauthenticated (loopback only) for coordinator probes.
-    if request.uri().path() == "/health" {
+    // Health/readiness are unauthenticated only for loopback listeners. A
+    // service explicitly exposed beyond the host must authenticate probes too.
+    if matches!(request.uri().path(), "/health" | "/ready") && !state.health_requires_auth {
         return next.run(request).await;
     }
     let auth_header = request
@@ -504,8 +528,10 @@ async fn authenticate_request(
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let readiness = readiness_snapshot(&state);
     Json(json!({
         "ok": true,
+        "ready": readiness.ready,
         "service": "grokptah-control",
         "transport": "mcp-streamable-http",
         "uptimeMs": state.started_at.elapsed().as_millis() as u64,
@@ -517,6 +543,48 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         "maxConcurrent": state.max_concurrent,
         "protocolVersions": SUPPORTED_PROTOCOL_VERSIONS,
     }))
+}
+
+struct ReadinessSnapshot {
+    ready: bool,
+    payload: Value,
+}
+
+fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
+    let payload = state
+        .orch
+        .get_capacity(&AuthContext {
+            token_id: "health-probe".into(),
+        })
+        .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
+    let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
+    let ready = [
+        "eventJournalPersistenceError",
+        "auditPersistenceError",
+        "runPersistenceError",
+        "serviceError",
+    ]
+    .iter()
+    .all(|key| health.get(*key).is_none_or(Value::is_null));
+    ReadinessSnapshot { ready, payload }
+}
+
+async fn ready_handler(State(state): State<AppState>) -> Response {
+    let snapshot = readiness_snapshot(&state);
+    let status = if snapshot.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "ok": snapshot.ready,
+            "ready": snapshot.ready,
+            "capacity": snapshot.payload,
+        })),
+    )
+        .into_response()
 }
 
 async fn fail_closed_fallback() -> impl IntoResponse {
@@ -710,6 +778,21 @@ struct PersistentAgentArgs {
     session_id: Uuid,
     workspace: PathBuf,
     agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionWorkspaceArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateSessionArgs {
+    workspace: PathBuf,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1284,6 +1367,24 @@ fn tool_input_schema(name: &str) -> Value {
             "properties": {},
             "additionalProperties": false
         }),
+        "ptah_create_session" => json!({
+            "type": "object",
+            "required": ["workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "workspace": workspace,
+                "title": {"type": "string", "minLength": 1, "maxLength": 160}
+            }
+        }),
+        "ptah_list_runs" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
+            }
+        }),
         "ptah_get_persistent_agent" => json!({
             "type": "object",
             "required": ["session_id", "workspace", "agent_id"],
@@ -1574,9 +1675,17 @@ async fn dispatch_tool(
             let _: EmptyArgs = parse_value(args)?;
             orch.list_sessions(auth)
         }
+        "ptah_create_session" => {
+            let args: CreateSessionArgs = parse_value(args)?;
+            orch.create_session(auth, &args.workspace, args.title)
+        }
         "ptah_list_persistent_agents" => {
             let _: EmptyArgs = parse_value(args)?;
             orch.list_persistent_agents(auth)
+        }
+        "ptah_list_runs" => {
+            let args: SessionWorkspaceArgs = parse_value(args)?;
+            orch.list_runs_scoped(auth, args.session_id, &args.workspace)
         }
         "ptah_get_persistent_agent" => {
             let args: PersistentAgentArgs = parse_value(args)?;

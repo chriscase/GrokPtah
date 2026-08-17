@@ -1,0 +1,21 @@
+[package]
+name = "grokptah-service"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Headless GrokPtah agent service"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+grokptah-agent-bridge = { path = "../grokptah-agent-bridge" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+
+[dev-dependencies]
+chrono = { version = "0.4", features = ["clock"] }
+dunce = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
