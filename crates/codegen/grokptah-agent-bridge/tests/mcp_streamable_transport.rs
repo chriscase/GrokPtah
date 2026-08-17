@@ -1207,7 +1207,9 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
             request_id: "http-source-request".into(),
             client_id: Some("mcp".into()),
             state: RunState::Interrupted,
+            agent_id: None,
             retry_of: None,
+            parent_run_id: None,
             queue_position: None,
             bounds: RunBounds {
                 max_prompt_bytes: 10_000,

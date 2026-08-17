@@ -192,7 +192,9 @@ fn service_store_seed(
             request_id: "coordinator-interrupted-request".into(),
             client_id: Some("mcp".into()),
             state: RunState::Interrupted,
+            agent_id: None,
             retry_of: None,
+            parent_run_id: None,
             queue_position: None,
             bounds: RunBounds {
                 max_prompt_bytes: 10_000,

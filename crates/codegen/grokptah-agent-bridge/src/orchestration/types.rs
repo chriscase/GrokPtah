@@ -336,9 +336,18 @@ pub struct RunRecord {
     pub request_id: String,
     pub client_id: Option<String>,
     pub state: RunState,
+    /// Durable agent identity owning this run. Optional for legacy runs and
+    /// non-agent orchestration clients.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     /// The interrupted run this explicit replacement was created from.
     #[serde(default)]
     pub retry_of: Option<String>,
+    /// The verified continuation source for this run. This is intentionally
+    /// distinct from `retry_of`: retry means replacing an interrupted run,
+    /// while parent_run_id records normal agent continuation lineage.
+    #[serde(default)]
+    pub parent_run_id: Option<String>,
     /// One-based position in the bounded host-global admission queue.
     /// Cleared when the run starts, is cancelled, or is interrupted on restart.
     #[serde(default)]
@@ -364,6 +373,191 @@ pub struct RunRecord {
     /// Optional persisted approval for an exact isolated-run review.
     #[serde(default)]
     pub approval: Option<RunApproval>,
+}
+
+pub const MAX_AGENT_CONTEXT_BYTES: usize = 16 * 1024;
+pub const MAX_AGENT_WORKSPACE_BYTES: usize = 4 * 1024;
+pub const MAX_AGENT_MODEL_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    Active,
+    Waiting,
+    Interrupted,
+    Failed,
+    Completed,
+}
+
+impl AgentState {
+    pub fn can_resume(self) -> bool {
+        matches!(self, Self::Waiting | Self::Interrupted | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationReason {
+    TurnCompleted,
+    Interrupted,
+    Cancelled,
+    Failed,
+    LimitReached,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRecord {
+    pub agent_id: String,
+    pub session_id: Uuid,
+    pub workspace: String,
+    pub model: String,
+    pub state: AgentState,
+    #[serde(default)]
+    pub current_run_id: Option<String>,
+    #[serde(default)]
+    pub latest_checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub continuation_ordinal: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl AgentRecord {
+    pub fn validate(&self) -> Result<(), OrchError> {
+        validate_id(&self.agent_id, "agent_id")?;
+        validate_workspace(&self.workspace)?;
+        validate_bounded_string(&self.model, MAX_AGENT_MODEL_BYTES, "model")?;
+        if let Some(run_id) = self.current_run_id.as_deref() {
+            validate_id(run_id, "current_run_id")?;
+        }
+        if let Some(checkpoint_id) = self.latest_checkpoint_id.as_deref() {
+            validate_id(checkpoint_id, "latest_checkpoint_id")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuationCheckpoint {
+    pub checkpoint_id: String,
+    pub agent_id: String,
+    pub session_id: Uuid,
+    pub run_id: String,
+    #[serde(default)]
+    pub parent_checkpoint_id: Option<String>,
+    pub ordinal: u64,
+    pub workspace: String,
+    /// Redacted, bounded context sufficient to explain the verified resume
+    /// point. The full session transcript remains the source of conversation.
+    pub context_summary: String,
+    pub context_hash: String,
+    pub event_seq: u64,
+    pub reason: ContinuationReason,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ContinuationCheckpoint {
+    pub fn context_hash_for(&self) -> String {
+        hash_payload(&serde_json::json!({
+            "agentId": self.agent_id,
+            "runId": self.run_id,
+            "ordinal": self.ordinal,
+            "contextSummary": self.context_summary,
+        }))
+    }
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        validate_id(&self.checkpoint_id, "checkpoint_id")?;
+        validate_id(&self.agent_id, "agent_id")?;
+        validate_id(&self.run_id, "run_id")?;
+        if let Some(parent) = self.parent_checkpoint_id.as_deref() {
+            validate_id(parent, "parent_checkpoint_id")?;
+        }
+        validate_workspace(&self.workspace)?;
+        validate_bounded_string(
+            &self.context_summary,
+            MAX_AGENT_CONTEXT_BYTES,
+            "context_summary",
+        )?;
+        if self.context_hash.len() != 64
+            || !self.context_hash.chars().all(|c| c.is_ascii_hexdigit())
+            || self.context_hash != self.context_hash_for()
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "checkpoint context hash is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentResumePlan {
+    pub agent: AgentRecord,
+    pub checkpoint: ContinuationCheckpoint,
+    pub parent_run_id: String,
+}
+
+impl AgentResumePlan {
+    pub fn validate_for(&self, session_id: Uuid, workspace: &str) -> Result<(), OrchError> {
+        self.agent.validate()?;
+        self.checkpoint.validate()?;
+        if !self.agent.state.can_resume() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "agent is active and cannot be resumed",
+            ));
+        }
+        if self.agent.session_id != session_id
+            || self.checkpoint.session_id != session_id
+            || self.agent.workspace != workspace
+            || self.checkpoint.workspace != workspace
+            || self.checkpoint.agent_id != self.agent.agent_id
+            || self.agent.latest_checkpoint_id.as_deref()
+                != Some(self.checkpoint.checkpoint_id.as_str())
+            || self.parent_run_id != self.checkpoint.run_id
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::WorkspaceMismatch,
+                "resume plan does not match the requested session workspace",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_id(value: &str, field: &str) -> Result<(), OrchError> {
+    safe_id_filename(value).map(|_| ()).map_err(|error| {
+        OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{field} is invalid: {}", error.message),
+        )
+    })
+}
+
+fn validate_workspace(value: &str) -> Result<(), OrchError> {
+    validate_bounded_string(value, MAX_AGENT_WORKSPACE_BYTES, "workspace")?;
+    if value.trim().is_empty() {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "workspace must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bounded_string(value: &str, max_bytes: usize, field: &str) -> Result<(), OrchError> {
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(|c| c == '\0') {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("{field} is empty or exceeds its bound"),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -692,5 +886,111 @@ mod tests {
         assert_ne!(a, b);
         assert!(!a.contains('/'));
         assert!(!b.contains(".."));
+    }
+
+    #[test]
+    fn checkpoint_hash_is_verified_and_tamper_evident() {
+        let mut checkpoint = ContinuationCheckpoint {
+            checkpoint_id: "checkpoint-1".into(),
+            agent_id: "agent-1".into(),
+            session_id: Uuid::new_v4(),
+            run_id: "run-1".into(),
+            parent_checkpoint_id: None,
+            ordinal: 1,
+            workspace: "/tmp/project".into(),
+            context_summary: "last verified turn".into(),
+            context_hash: String::new(),
+            event_seq: 4,
+            reason: ContinuationReason::TurnCompleted,
+            created_at: Utc::now(),
+        };
+        checkpoint.context_hash = checkpoint.context_hash_for();
+        assert!(checkpoint.validate().is_ok());
+        checkpoint.context_summary.push_str(" changed");
+        assert!(checkpoint.validate().is_err());
+    }
+
+    #[test]
+    fn resume_plan_rejects_workspace_or_active_agent_mismatch() {
+        let session_id = Uuid::new_v4();
+        let mut agent = AgentRecord {
+            agent_id: "agent-1".into(),
+            session_id,
+            workspace: "/tmp/project".into(),
+            model: "grok".into(),
+            state: AgentState::Waiting,
+            current_run_id: None,
+            latest_checkpoint_id: Some("checkpoint-1".into()),
+            continuation_ordinal: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let mut checkpoint = ContinuationCheckpoint {
+            checkpoint_id: "checkpoint-1".into(),
+            agent_id: agent.agent_id.clone(),
+            session_id,
+            run_id: "run-1".into(),
+            parent_checkpoint_id: None,
+            ordinal: 1,
+            workspace: agent.workspace.clone(),
+            context_summary: "verified".into(),
+            context_hash: String::new(),
+            event_seq: 2,
+            reason: ContinuationReason::TurnCompleted,
+            created_at: Utc::now(),
+        };
+        checkpoint.context_hash = checkpoint.context_hash_for();
+        let plan = AgentResumePlan {
+            agent: agent.clone(),
+            checkpoint,
+            parent_run_id: "run-1".into(),
+        };
+        assert!(plan.validate_for(session_id, "/tmp/project").is_ok());
+        assert!(plan.validate_for(session_id, "/tmp/other").is_err());
+        agent.state = AgentState::Active;
+        let active_plan = AgentResumePlan { agent, ..plan };
+        assert!(active_plan
+            .validate_for(session_id, "/tmp/project")
+            .is_err());
+    }
+
+    #[test]
+    fn resume_plan_is_transport_neutral_and_roundtrips_through_json() {
+        let session_id = Uuid::new_v4();
+        let agent = AgentRecord {
+            agent_id: "agent-adapter".into(),
+            session_id,
+            workspace: "/tmp/project".into(),
+            model: "grok".into(),
+            state: AgentState::Interrupted,
+            current_run_id: None,
+            latest_checkpoint_id: Some("checkpoint-adapter".into()),
+            continuation_ordinal: 2,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let mut checkpoint = ContinuationCheckpoint {
+            checkpoint_id: "checkpoint-adapter".into(),
+            agent_id: agent.agent_id.clone(),
+            session_id,
+            run_id: "run-adapter".into(),
+            parent_checkpoint_id: None,
+            ordinal: 2,
+            workspace: agent.workspace.clone(),
+            context_summary: "adapter contract".into(),
+            context_hash: String::new(),
+            event_seq: 9,
+            reason: ContinuationReason::Interrupted,
+            created_at: Utc::now(),
+        };
+        checkpoint.context_hash = checkpoint.context_hash_for();
+        let plan = AgentResumePlan {
+            agent,
+            checkpoint,
+            parent_run_id: "run-adapter".into(),
+        };
+        let encoded = serde_json::to_vec(&plan).unwrap();
+        let decoded: AgentResumePlan = serde_json::from_slice(&encoded).unwrap();
+        assert!(decoded.validate_for(session_id, "/tmp/project").is_ok());
     }
 }

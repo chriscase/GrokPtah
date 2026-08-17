@@ -69,6 +69,41 @@ pub fn agent_status(state: State<'_, AppState>) -> grokptah_agent_bridge::AgentS
 }
 
 #[tauri::command]
+pub async fn persistent_agent_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<grokptah_agent_bridge::AgentRecord>, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.list_persistent_agents().map_err(map_err)).await
+}
+
+#[tauri::command]
+pub async fn persistent_agent_get(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<Option<grokptah_agent_bridge::AgentRecord>, String> {
+    let host = state.host.clone();
+    run_blocking(move || host.get_persistent_agent(&agent_id).map_err(map_err)).await
+}
+
+/// Manual continuation only: the caller supplies a fresh instruction and the
+/// bridge validates the latest durable checkpoint before starting a run.
+#[tauri::command]
+pub async fn persistent_agent_resume(
+    state: State<'_, AppState>,
+    session_id: String,
+    prompt: String,
+    max_rounds: Option<u32>,
+    request_id: Option<String>,
+) -> Result<String, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .resume_agent_with_request_id(session_id, prompt, max_rounds, request_id)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
 pub fn computer_use_status(state: State<'_, AppState>) -> ComputerPlatformStatus {
     state.computer_use.status()
 }
