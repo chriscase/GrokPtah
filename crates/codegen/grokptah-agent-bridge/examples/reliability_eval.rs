@@ -191,7 +191,13 @@ async fn queue_and_steering() -> Result<ScenarioResult> {
             .context("queued entry vanished")?
             .version)
     };
-    let moved = host.session_queue_move(session.id, &second.id, 0, version_of(&second.id)?)?;
+    let (moved, _moved_revision) = host.session_queue_move(
+        session.id,
+        &second.id,
+        0,
+        version_of(&second.id)?,
+        host.session_queue_snapshot(session.id)?.revision,
+    )?;
     let run_next = host.session_queue_run_next(session.id, &first.id, version_of(&first.id)?)?;
     let drained = host.session_queue_take_next(session.id)?;
     // A drain claims the session's turn slot for the batch it removed, so the

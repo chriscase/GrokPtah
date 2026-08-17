@@ -667,11 +667,15 @@ pub fn session_queue_move(
     entry_id: String,
     to_index: usize,
     expected_version: u64,
-) -> Result<Vec<PromptQueueEntry>, String> {
+    expected_revision: u64,
+) -> Result<PromptQueueSnapshot, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    // An absolute reorder is a statement about an ordering, so the desktop
+    // supplies the revision it computed against, exactly as a coordinator does.
     state
         .host
-        .session_queue_move(id, &entry_id, to_index, expected_version)
+        .session_queue_move(id, &entry_id, to_index, expected_version, expected_revision)
+        .map(|(entries, revision)| PromptQueueSnapshot { entries, revision })
         .map_err(map_err)
 }
 
