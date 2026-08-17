@@ -715,6 +715,26 @@ struct EmptyArgs {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PersistentAgentArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentAgentResumeArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    agent_id: String,
+    prompt: String,
+    #[serde(default)]
+    max_rounds: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RunArgs {
     session_id: Uuid,
     workspace: PathBuf,
@@ -1382,10 +1402,20 @@ fn tool_input_schema(name: &str) -> Value {
         }
     });
     match name {
-        "ptah_list_sessions" | "ptah_get_capacity" => json!({
+        "ptah_list_sessions" | "ptah_list_persistent_agents" | "ptah_get_capacity" => json!({
             "type": "object",
             "properties": {},
             "additionalProperties": false
+        }),
+        "ptah_get_persistent_agent" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "agent_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
         }),
         "ptah_get_run"
         | "ptah_get_progress"
@@ -1498,6 +1528,19 @@ fn tool_input_schema(name: &str) -> Value {
                     "default": false,
                     "description": "When true, queue behind bounded capacity/session contention instead of failing fast."
                 }
+            }
+        }),
+        "ptah_resume_persistent_agent" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "agent_id", "prompt"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "prompt": {"type": "string", "minLength": 1},
+                "max_rounds": {"type": "integer", "minimum": 1, "maximum": 24}
             }
         }),
         "ptah_retry_run" => json!({
@@ -1727,6 +1770,15 @@ async fn dispatch_tool(
             let _: EmptyArgs = parse_value(args)?;
             orch.list_sessions(auth)
         }
+        "ptah_list_persistent_agents" => {
+            let _: EmptyArgs = parse_value(args)?;
+            orch.list_persistent_agents(auth)
+        }
+        "ptah_get_persistent_agent" => {
+            let args: PersistentAgentArgs = parse_value(args)?;
+            require_nonempty(&args.agent_id, "agent_id")?;
+            orch.get_persistent_agent_scoped(auth, args.session_id, &args.workspace, &args.agent_id)
+        }
         "ptah_get_capacity" => {
             let _: EmptyArgs = parse_value(args)?;
             orch.get_capacity(auth)
@@ -1910,6 +1962,21 @@ async fn dispatch_tool(
                 args.bounds,
                 args.execution_mode,
                 args.allow_queue,
+            )
+            .await
+        }
+        "ptah_resume_persistent_agent" => {
+            let args: PersistentAgentResumeArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.agent_id, "agent_id")?;
+            orch.resume_persistent_agent(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.agent_id,
+                args.prompt,
+                args.max_rounds,
             )
             .await
         }
@@ -2125,8 +2192,12 @@ pub fn discovered_tool_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::host::{AgentHost, HostConfig};
-    use crate::orchestration::{OrchStore, OrchestrationConfig, RunBounds, WorkspaceAllowlist};
+    use crate::orchestration::{
+        ContinuationCheckpoint, ContinuationReason, OrchErrorCode, OrchStore, OrchestrationConfig,
+        RunBounds, WorkspaceAllowlist,
+    };
     use crate::{home_override_serial, set_grokptah_home_override};
+    use chrono::Utc;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -2192,6 +2263,8 @@ mod tests {
         let tools = body["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"ptah_list_sessions"));
+        assert!(names.contains(&"ptah_list_persistent_agents"));
+        assert!(names.contains(&"ptah_resume_persistent_agent"));
         assert!(!names.contains(&"run_terminal_cmd"));
 
         srv.stop();
@@ -2970,5 +3043,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn persistent_agent_tools_require_scope_and_expose_checkpoint_resume() {
+        let list = tool_input_schema("ptah_list_persistent_agents");
+        assert_eq!(list["additionalProperties"], json!(false));
+
+        let get = tool_input_schema("ptah_get_persistent_agent");
+        assert_eq!(
+            get["required"],
+            json!(["session_id", "workspace", "agent_id"])
+        );
+        let resume = tool_input_schema("ptah_resume_persistent_agent");
+        for key in [
+            "request_id",
+            "session_id",
+            "workspace",
+            "agent_id",
+            "prompt",
+        ] {
+            assert!(resume["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == key));
+        }
+        assert_eq!(resume["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn persistent_agent_service_scopes_checkpoint_reads_to_session_workspace() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        host.start().unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, workspace.path()).unwrap();
+        let agent = host.ensure_session_agent(session.id).unwrap();
+        let store = host.ensure_orchestration_store().unwrap();
+        let mut checkpoint = ContinuationCheckpoint {
+            checkpoint_id: "checkpoint-agent-scope-1".into(),
+            agent_id: agent.agent_id.clone(),
+            session_id: session.id,
+            run_id: "desktop-run-scope-1".into(),
+            parent_checkpoint_id: None,
+            ordinal: 1,
+            workspace: agent.workspace.clone(),
+            context_summary: "A bounded verified checkpoint".into(),
+            context_hash: String::new(),
+            event_seq: 1,
+            reason: ContinuationReason::TurnCompleted,
+            created_at: Utc::now(),
+        };
+        checkpoint.context_hash = checkpoint.context_hash_for();
+        store.save_checkpoint(&checkpoint).unwrap();
+        store
+            .update_agent(&agent.agent_id, |current| {
+                current.latest_checkpoint_id = Some(checkpoint.checkpoint_id.clone());
+                current.continuation_ordinal = checkpoint.ordinal;
+                Ok(())
+            })
+            .unwrap();
+
+        let workspace_path = std::path::PathBuf::from(&agent.workspace);
+        assert!(host
+            .get_persistent_agent(&agent.agent_id)
+            .unwrap()
+            .is_some());
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            store.clone(),
+            OrchestrationConfig {
+                bearer_token: "agent-scope-token".into(),
+                allowlist: WorkspaceAllowlist::new([workspace_path.clone()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        let auth = orch.auth_header(Some("Bearer agent-scope-token")).unwrap();
+        assert!(host
+            .get_persistent_agent(&agent.agent_id)
+            .unwrap()
+            .is_some());
+        let listed = orch.list_persistent_agents(&auth).unwrap();
+        assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+        let plan = orch
+            .get_persistent_agent_scoped(&auth, session.id, &workspace_path, &agent.agent_id)
+            .unwrap();
+        assert_eq!(
+            plan["checkpoint"]["checkpointId"],
+            "checkpoint-agent-scope-1"
+        );
+
+        let error = orch
+            .get_persistent_agent_scoped(&auth, session.id, &workspace_path, "agent-not-visible")
+            .unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::ForbiddenScope);
+        set_grokptah_home_override(None);
     }
 }

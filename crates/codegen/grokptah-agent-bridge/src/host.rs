@@ -9545,4 +9545,48 @@ mod tests {
         assert_eq!(entries[0].id, steering.id);
         assert_eq!(entries[0].version, steering.version + 1);
     }
+
+    #[tokio::test]
+    async fn persistent_resume_idempotency_replays_failure_and_rejects_payload_change() {
+        let (_home, host, session_id) = test_host();
+        let workspace = tempfile::tempdir().unwrap();
+        host.set_project_cwd(workspace.path()).unwrap();
+        host.session_set_cwd(session_id, workspace.path()).unwrap();
+        host.ensure_session_agent(session_id).unwrap();
+
+        let first = host
+            .resume_agent_with_request_id(
+                session_id,
+                "continue from the checkpoint".into(),
+                Some(1),
+                Some("resume-idempotency-test".into()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        let replay = host
+            .resume_agent_with_request_id(
+                session_id,
+                "continue from the checkpoint".into(),
+                Some(1),
+                Some("resume-idempotency-test".into()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(first.contains("persistent agent has no verified checkpoint"));
+        assert!(replay.contains("persistent agent has no verified checkpoint"));
+
+        let changed = host
+            .resume_agent_with_request_id(
+                session_id,
+                "different payload".into(),
+                Some(1),
+                Some("resume-idempotency-test".into()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(changed.contains("idempotency") || changed.contains("payload"));
+    }
 }

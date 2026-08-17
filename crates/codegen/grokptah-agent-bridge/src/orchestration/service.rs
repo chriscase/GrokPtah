@@ -15,7 +15,7 @@ use crate::host::AgentHostHandle;
 use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
-use super::authz::{require_workspace_match, AuthContext, WorkspaceAllowlist};
+use super::authz::{canonical_workspace, require_workspace_match, AuthContext, WorkspaceAllowlist};
 use super::store::{IdempotencyClaim, OrchStore};
 use super::types::*;
 
@@ -672,6 +672,158 @@ impl OrchestrationService {
             })
             .collect();
         Ok(json!({ "sessions": rows }))
+    }
+
+    /// List durable agent identities whose workspaces are visible to this
+    /// authenticated control-plane instance. Checkpoint contents remain a
+    /// scoped read so listing cannot become a transcript or workspace oracle.
+    pub fn list_persistent_agents(
+        &self,
+        _auth: &AuthContext,
+    ) -> Result<serde_json::Value, OrchError> {
+        let allowlist = self.config.lock().allowlist.clone();
+        let agents = self
+            .host
+            .list_persistent_agents()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .into_iter()
+            .filter(|agent| allowlist.contains(Path::new(&agent.workspace)))
+            .collect::<Vec<_>>();
+        Ok(json!({ "agents": agents }))
+    }
+
+    pub fn get_persistent_agent_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        agent_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let _ = self.authorize_persistent_agent_request(session_id, workspace, agent_id)?;
+        let plan = self
+            .host
+            .prepare_agent_resume(session_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Conflict, error.to_string()))?;
+        if plan.agent.agent_id != agent_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "persistent agent is not available in the requested scope",
+            ));
+        }
+        serde_json::to_value(plan)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// Resume one verified persistent agent through the service adapter. The
+    /// host owns the idempotency receipt and checkpoint validation; this layer
+    /// adds workspace/session authorization and transport bounds.
+    pub async fn resume_persistent_agent(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        agent_id: &str,
+        prompt: String,
+        max_rounds: Option<u32>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_resume_persistent_agent";
+        let (agent, claimed) =
+            match self.authorize_persistent_agent_request(session_id, workspace, agent_id) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.audit_err(
+                        tool,
+                        Some(request_id),
+                        Some(session_id),
+                        Some(&workspace.display().to_string()),
+                        &error,
+                    );
+                    return Err(error);
+                }
+            };
+        if let Err(error) = reject_control_prompt(&prompt) {
+            self.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&claimed.display().to_string()),
+                &error,
+            );
+            return Err(error);
+        }
+        let bounds = self.config.lock().bounds.clone();
+        if prompt.len() > bounds.max_prompt_bytes {
+            let error = OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                format!(
+                    "prompt exceeds max_prompt_bytes ({})",
+                    bounds.max_prompt_bytes
+                ),
+            );
+            self.audit_err(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&claimed.display().to_string()),
+                &error,
+            );
+            return Err(error);
+        }
+        if let Some(rounds) = max_rounds {
+            if rounds == 0 || rounds > bounds.max_rounds {
+                let error = OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    format!("max_rounds must be between 1 and {}", bounds.max_rounds),
+                );
+                self.audit_err(
+                    tool,
+                    Some(request_id),
+                    Some(session_id),
+                    Some(&claimed.display().to_string()),
+                    &error,
+                );
+                return Err(error);
+            }
+        }
+        let response = match self
+            .host
+            .resume_agent_with_request_id(session_id, prompt, max_rounds, Some(request_id.into()))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let error = OrchError::new(OrchErrorCode::Conflict, error.to_string());
+                self.audit_err(
+                    tool,
+                    Some(request_id),
+                    Some(session_id),
+                    Some(&claimed.display().to_string()),
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+        let updated = self
+            .host
+            .get_persistent_agent(agent_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .unwrap_or(agent);
+        self.audit(
+            tool,
+            Some(request_id),
+            Some(session_id),
+            Some(&claimed.display().to_string()),
+            "accepted",
+            None,
+            "persistent agent resumed",
+        );
+        Ok(json!({
+            "agent": updated,
+            "sessionId": session_id,
+            "workspace": claimed.display().to_string(),
+            "response": response,
+        }))
     }
 
     pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
@@ -1382,6 +1534,36 @@ impl OrchestrationService {
             ));
         }
         Ok(run)
+    }
+
+    fn authorize_persistent_agent_request(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+        agent_id: &str,
+    ) -> Result<(AgentRecord, PathBuf), OrchError> {
+        let session = self.require_build_session(session_id)?;
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        let agent = self
+            .host
+            .get_persistent_agent(agent_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "persistent agent is not available in the requested scope",
+                )
+            })?;
+        let agent_workspace = canonical_workspace(Path::new(&agent.workspace))?;
+        if agent.session_id != session_id || agent_workspace != claimed {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "persistent agent is not available in the requested scope",
+            ));
+        }
+        Ok((agent, claimed))
     }
 
     fn authorize_queue_request(

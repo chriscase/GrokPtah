@@ -771,6 +771,8 @@ pub fn is_recognized_test_command(command: &str) -> bool {
 /// Tools exposed by the control plane (schema snapshot source of truth).
 pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_list_sessions",
+    "ptah_list_persistent_agents",
+    "ptah_get_persistent_agent",
     "ptah_get_capacity",
     "ptah_get_run",
     "ptah_get_progress",
@@ -788,6 +790,7 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_take_over_computer_run",
     "ptah_cancel_computer_run",
     "ptah_submit_task",
+    "ptah_resume_persistent_agent",
     "ptah_retry_run",
     "ptah_approve_run",
     "ptah_promote_run",
