@@ -11,7 +11,7 @@ that keeps the upstream CLI/TUI and adds a **desktop client** on Tauri 2 + React
 | UI | React + Vite, dark desktop chrome (GrokPtah branding only) |
 | Scope | TUI **capability** parity (not pixel-perfect ratatui) |
 | CLI | `xai-grok-pager-bin` remains independently buildable |
-| Build agent runtime | **Hybrid thin loop** deepened in-bridge; path to embed upstream — see [`ADR-001-agent-runtime.md`](./ADR-001-agent-runtime.md) |
+| Build agent runtime | **Hybrid thin loop** deepened in-bridge; path to embed upstream — see [`ADR-001-agent-runtime.md`](./ADR-001-agent-runtime.md) and [`ADR-002-runtime-boundaries.md`](./ADR-002-runtime-boundaries.md) |
 
 ## Layer diagram
 
