@@ -204,7 +204,14 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_approve_run` | mutate | exact run/session/workspace, source and final fingerprints, exact `changed_files`; optional bounded `ttl_ms` |
 | `ptah_promote_run` | mutate | `request_id`, exact run/session/workspace, `approval_id` |
 | `ptah_discard_run` | mutate | `request_id`, exact run/session/workspace |
+| `ptah_get_queue` | read | `session_id`, `workspace` |
 | `ptah_queue_prompt` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `priority` |
+| `ptah_edit_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `version`, `text` |
+| `ptah_remove_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `expected_version` |
+| `ptah_reorder_queue` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `to_index`, `expected_version` |
+| `ptah_clear_queue` | mutate | `request_id`, `session_id`, `workspace` |
+| `ptah_run_next` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `expected_version` |
+| `ptah_steer_queued` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `expected_version` |
 | `ptah_steer` | mutate | `request_id`, `session_id`, `workspace`, `text` |
 | `ptah_cancel` | mutate | `request_id`, `session_id`, `workspace`, `run_id` |
 
@@ -262,8 +269,77 @@ Mutating tools take `request_id`:
 
 ### Queue
 
+- `ptah_get_queue` returns the authenticated session's durable queued entries;
+  it never returns another session's queue or a queue outside the workspace
+  allowlist.
 - `ptah_queue_prompt` enqueues follow-ups; durable across host restart when the
-  host session store reloads from the same GrokPtah home.
+  host session store reloads from the same GrokPtah home. Its receipt includes
+  `actionId`, `origin`, `action`, `disposition`, `actionVersion`, `entry`, and
+  the complete post-action `entries` snapshot.
+- **Every queue mutator is compare-and-set, and the version is required.**
+  `ptah_edit_queue` takes the current entry `version`; `ptah_remove_queue`,
+  `ptah_reorder_queue`, `ptah_run_next`, and `ptah_steer_queued` take
+  `expected_version`. Omitting it is a schema rejection, not a
+  last-write-wins mutation — the desktop writes this same queue, so an
+  unconditional mutation is a mutation against a queue you have not read.
+  A stale version is a `stale_version` conflict (HTTP 409), the queue is
+  unchanged, and the fix is to re-read the queue and retry. This matches the
+  Computer Use control fence, which also requires the current version on
+  every transition.
+- `ptah_reorder_queue` **bumps the version of every entry whose index
+  changed**, including the entry it moved. `to_index` is absolute, so it only
+  means something against a specific ordering; without the bump two
+  coordinators could reorder concurrently, both receive success, and leave an
+  arbitrary final order. Entries that did not shift keep their versions, and a
+  move that lands on its current index changes nothing. Expect to refresh
+  versions after any reorder, yours or someone else's.
+- `ptah_run_next` promotes an entry and may explicitly cancel an active turn;
+  the cancel happens only after the compare-and-set has passed, so a rejected
+  call never interrupts a running turn. The cancel is also bound to the turn
+  that was observed while the queue was locked: if that turn ends before the
+  cancel lands, nothing is cancelled and `cancelledActive` is `false` — a
+  later turn never absorbs a cancel meant for an earlier one.
+- **`ptah_run_next`, `ptah_reorder_queue`, and `ptah_steer_queued` will not
+  schedule an entry the control plane could not have created.** The desktop
+  may author `!` shell prompts and `/` commands locally; selecting one from
+  the control plane is refused with `forbidden_scope` *after* the workspace
+  gate, so a cross-scope claim cannot learn that a forbidden entry exists.
+  Promoting or steering that text is the same outcome
+  `reject_control_prompt` exists to prevent, reached by choosing instead of
+  by writing. Ordinary entries are unaffected. `ptah_steer` never cancels.
+  `ptah_steer_queued` turns one queued ordinary entry into a safe-boundary
+  steering action: it reports `pending` during a Build turn and `queued`
+  while idle.
+- `ptah_clear_queue` removes all durable queued entries for the scoped session
+  **and cancels accepted steering that has not yet reached the model**. Because
+  steering already handed to a model boundary cannot be retracted, an empty
+  `entries` list is not on its own a promise that the session is quiet. The
+  receipt reports what actually happened:
+  - `clearedQueued` — durable follow-ups removed.
+  - `steeringCancelled` — accepted steering stopped before injection.
+  - `steeringInFlight` — steering already delivered to a boundary; it *will*
+    still be injected.
+  - `stopped` — `true` only when `steeringInFlight` is `0`. Branch on this,
+    not on `entries` being empty.
+- Every queue mutation is idempotent by `request_id`, and all mutation
+  receipts use the same action identity/origin/snapshot shape so a coordinator
+  can reconcile retries without guessing whether an action committed.
+- Queue changes are also emitted as redacted `prompt_queue_changed` session
+  events with the post-action snapshot. Delivery, deferral, and desktop
+  composer consumption are journaled as state transitions, allowing a GUI or
+  coordinator that reconnects to recover the same queue view without replaying
+  a prompt.
+- `prompt_queue_changed` carries a monotonic per-session `revision`, stamped
+  under the bridge's queue mutation lock. Events are published *after* that
+  lock is released, so the bus `seq` reflects publish order while `revision`
+  reflects commit order. A consumer that applies snapshots must keep a
+  per-session watermark and ignore any snapshot whose `revision` is not
+  greater than the newest already applied; otherwise a late-published older
+  snapshot silently regresses the queue. The desktop reducer does this.
+- Entry `text` in `prompt_queue_changed` is **not** length-capped. Secrets are
+  still scrubbed, but the text is byte-identical to what `ptah_get_queue`
+  returns, so a GUI can safely seed an edit draft from the event and save it
+  back. Redaction must never truncate this field.
 - Priority flag moves to front; combine rules live in host `prompt_queue`.
 
 ### Bounded task admission

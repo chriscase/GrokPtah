@@ -1767,6 +1767,255 @@ async fn http_steer_idle_queues_without_starting_run() {
     set_grokptah_home_override(None);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn http_queue_controls_share_versions_replay_and_scope() {
+    let (_home, _lock, host, ws, orch) = setup();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), "stream-token-200");
+    client.initialize().await.unwrap();
+    let scope = |session_id| {
+        json!({
+            "session_id": session_id,
+            "workspace": ws.path().display().to_string(),
+        })
+    };
+
+    let first = client
+        .call_tool(
+            "ptah_queue_prompt",
+            json!({
+                "request_id": "queue-http-first",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "prompt": "first queued prompt"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.structured["actionId"], "queue-http-first");
+    assert_eq!(first.structured["origin"], "mcp");
+    assert_eq!(first.structured["disposition"], "queued");
+    let first_entry = first.structured["entry"].clone();
+    let first_id = first_entry["id"].as_str().unwrap().to_string();
+    assert_eq!(first_entry["version"], 0);
+
+    let second = client
+        .call_tool(
+            "ptah_queue_prompt",
+            json!({
+                "request_id": "queue-http-second",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "prompt": "second queued prompt"
+            }),
+        )
+        .await
+        .unwrap();
+    let second_id = second.structured["entry"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let snapshot = client
+        .call_tool("ptah_get_queue", scope(session.id))
+        .await
+        .unwrap();
+    assert_eq!(snapshot.structured["entries"].as_array().unwrap().len(), 2);
+
+    let edit_args = json!({
+        "request_id": "queue-http-edit",
+        "session_id": session.id,
+        "workspace": ws.path().display().to_string(),
+        "entry_id": first_id,
+        "version": 0,
+        "text": "edited queued prompt"
+    });
+    let edited = client
+        .call_tool("ptah_edit_queue", edit_args.clone())
+        .await
+        .unwrap();
+    assert_eq!(edited.structured["entry"]["version"], 1);
+    assert_eq!(edited.structured["action"], "edited");
+    let replay = client
+        .call_tool("ptah_edit_queue", edit_args)
+        .await
+        .unwrap();
+    assert_eq!(replay.structured, edited.structured);
+    assert!(client
+        .call_tool(
+            "ptah_edit_queue",
+            json!({
+                "request_id": "queue-http-stale",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "entry_id": first_id,
+                "version": 0,
+                "text": "stale edit must fail"
+            }),
+        )
+        .await
+        .is_err());
+
+    // S3: every mutator below is compare-and-set, and omitting the version is
+    // a schema rejection rather than a last-write-wins mutation. Assert that
+    // before any of them is allowed to succeed, and that nothing moved.
+    for tool in [
+        "ptah_remove_queue",
+        "ptah_run_next",
+        "ptah_steer_queued",
+        "ptah_reorder_queue",
+    ] {
+        let mut args = json!({
+            "request_id": format!("queue-http-noversion-{tool}"),
+            "session_id": session.id,
+            "workspace": ws.path().display().to_string(),
+            "entry_id": second_id,
+        });
+        if tool == "ptah_reorder_queue" {
+            args["to_index"] = json!(0);
+        }
+        assert!(
+            client.call_tool(tool, args).await.is_err(),
+            "{tool} must require expected_version"
+        );
+    }
+    let untouched = client
+        .call_tool("ptah_get_queue", scope(session.id))
+        .await
+        .unwrap();
+    assert_eq!(untouched.structured["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(untouched.structured["entries"][0]["id"], first_id);
+
+    let reordered = client
+        .call_tool(
+            "ptah_reorder_queue",
+            json!({
+                "request_id": "queue-http-reorder",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "entry_id": second_id,
+                "to_index": 0,
+                "expected_version": 0
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reordered.structured["entries"][0]["id"], second_id);
+    // S3: reorder now bumps every version it shifted, so a second coordinator
+    // holding the pre-move ordering loses its CAS instead of both succeeding.
+    assert_eq!(reordered.structured["entries"][0]["version"], 1);
+    assert_eq!(reordered.structured["entries"][1]["version"], 2);
+    assert!(
+        client
+            .call_tool(
+                "ptah_reorder_queue",
+                json!({
+                    "request_id": "queue-http-reorder-stale",
+                    "session_id": session.id,
+                    "workspace": ws.path().display().to_string(),
+                    "entry_id": first_id,
+                    "to_index": 0,
+                    "expected_version": 1
+                }),
+            )
+            .await
+            .is_err(),
+        "a reorder built on the pre-move ordering must fail closed"
+    );
+    let after_conflict = client
+        .call_tool("ptah_get_queue", scope(session.id))
+        .await
+        .unwrap();
+    assert_eq!(after_conflict.structured["entries"][0]["id"], second_id);
+
+    let steered = client
+        .call_tool(
+            "ptah_steer_queued",
+            json!({
+                "request_id": "queue-http-steer-queued",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "entry_id": second_id,
+                "expected_version": 1
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(steered.structured["disposition"], "queued");
+    assert_eq!(steered.structured["entry"]["version"], 2);
+
+    let run_next = client
+        .call_tool(
+            "ptah_run_next",
+            json!({
+                "request_id": "queue-http-run-next",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "entry_id": first_id,
+                "expected_version": 2
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(run_next.structured["action"], "run_next");
+    assert_eq!(run_next.structured["entry"]["id"], first_id);
+    assert_eq!(run_next.structured["entry"]["version"], 3);
+
+    let removed = client
+        .call_tool(
+            "ptah_remove_queue",
+            json!({
+                "request_id": "queue-http-remove",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "entry_id": first_id,
+                "expected_version": 3
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(removed.structured["action"], "removed");
+    assert_eq!(removed.structured["entry"]["id"], first_id);
+    assert_eq!(removed.structured["actionVersion"], 3);
+
+    let cleared = client
+        .call_tool(
+            "ptah_clear_queue",
+            json!({
+                "request_id": "queue-http-clear",
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string()
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(cleared.structured["entries"].as_array().unwrap().is_empty());
+    // S4: an empty `entries` list is not by itself a promise that the session
+    // stopped. The receipt must say what clear actually cancelled and whether
+    // anything survived it, so a coordinator can branch on `stopped`.
+    assert_eq!(cleared.structured["steeringCancelled"], 0);
+    assert_eq!(cleared.structured["steeringInFlight"], 0);
+    assert_eq!(cleared.structured["stopped"], true);
+    assert!(cleared.structured["clearedQueued"].is_u64());
+    assert!(client
+        .call_tool(
+            "ptah_get_queue",
+            json!({
+                "session_id": session.id,
+                "workspace": tempdir().unwrap().path().display().to_string()
+            }),
+        )
+        .await
+        .is_err());
+
+    client.close_session().await.unwrap();
+    srv.stop();
+    set_grokptah_home_override(None);
+}
+
 /// Live coordinator smoke against the **desktop env bootstrap** path
 /// (`start_control_from_env` — same contract as Tauri `start_embedded_control`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

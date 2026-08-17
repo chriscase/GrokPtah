@@ -802,6 +802,53 @@ struct QueueArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct QueueScopeArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueEditArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    entry_id: String,
+    version: u64,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueEntryMutationArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    entry_id: String,
+    expected_version: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueReorderArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    entry_id: String,
+    to_index: usize,
+    expected_version: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueueClearArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SteerArgs {
     request_id: String,
     session_id: Uuid,
@@ -1149,7 +1196,8 @@ fn status_for(e: &OrchError) -> StatusCode {
     match e.code {
         OrchErrorCode::Unauthenticated => StatusCode::UNAUTHORIZED,
         OrchErrorCode::ForbiddenScope | OrchErrorCode::WorkspaceMismatch => StatusCode::FORBIDDEN,
-        OrchErrorCode::InvalidRequest | OrchErrorCode::Conflict => StatusCode::BAD_REQUEST,
+        OrchErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        OrchErrorCode::StaleVersion | OrchErrorCode::Conflict => StatusCode::CONFLICT,
         OrchErrorCode::Unsupported => StatusCode::METHOD_NOT_ALLOWED,
         OrchErrorCode::CursorExpired => StatusCode::GONE,
         OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted => StatusCode::CONFLICT,
@@ -1341,6 +1389,15 @@ fn tool_input_schema(name: &str) -> Value {
                 "run_id": run_id
             }
         }),
+        "ptah_get_queue" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
+            }
+        }),
         "ptah_queue_prompt" => json!({
             "type": "object",
             "required": ["request_id", "session_id", "workspace", "prompt"],
@@ -1351,6 +1408,57 @@ fn tool_input_schema(name: &str) -> Value {
                 "workspace": workspace,
                 "prompt": {"type": "string", "minLength": 1},
                 "priority": {"type": "boolean"}
+            }
+        }),
+        "ptah_edit_queue" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "entry_id", "version", "text"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "entry_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "version": {"type": "integer", "minimum": 0},
+                "text": {"type": "string", "minLength": 1}
+            }
+        }),
+        "ptah_remove_queue" | "ptah_run_next" | "ptah_steer_queued" => json!({
+            "type": "object",
+            // expected_version is required: an optional CAS on a two-writer
+            // control plane is last-write-wins, and ptah_run_next cancels the
+            // active turn.
+            "required": ["request_id", "session_id", "workspace", "entry_id", "expected_version"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "entry_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "expected_version": {"type": "integer", "minimum": 0}
+            }
+        }),
+        "ptah_reorder_queue" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "entry_id", "to_index", "expected_version"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "entry_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "to_index": {"type": "integer", "minimum": 0},
+                "expected_version": {"type": "integer", "minimum": 0}
+            }
+        }),
+        "ptah_clear_queue" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace
             }
         }),
         "ptah_steer" => json!({
@@ -1546,6 +1654,10 @@ async fn dispatch_tool(
             )
             .await
         }
+        "ptah_get_queue" => {
+            let args: QueueScopeArgs = parse_value(args)?;
+            orch.get_queue(auth, args.session_id, &args.workspace)
+        }
         "ptah_queue_prompt" => {
             let args: QueueArgs = parse_value(args)?;
             orch.queue_prompt(
@@ -1555,6 +1667,84 @@ async fn dispatch_tool(
                 &args.workspace,
                 args.prompt,
                 args.priority,
+            )
+            .await
+        }
+        "ptah_edit_queue" => {
+            let args: QueueEditArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.entry_id, "entry_id")?;
+            orch.edit_queue(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.entry_id,
+                args.version,
+                args.text,
+            )
+            .await
+        }
+        "ptah_remove_queue" => {
+            let args: QueueEntryMutationArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.entry_id, "entry_id")?;
+            orch.remove_queue(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.entry_id,
+                args.expected_version,
+            )
+            .await
+        }
+        "ptah_reorder_queue" => {
+            let args: QueueReorderArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.entry_id, "entry_id")?;
+            orch.reorder_queue(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.entry_id,
+                args.to_index,
+                args.expected_version,
+            )
+            .await
+        }
+        "ptah_clear_queue" => {
+            let args: QueueClearArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            orch.clear_queue(auth, &args.request_id, args.session_id, &args.workspace)
+                .await
+        }
+        "ptah_run_next" => {
+            let args: QueueEntryMutationArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.entry_id, "entry_id")?;
+            orch.run_next_queue(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.entry_id,
+                args.expected_version,
+            )
+            .await
+        }
+        "ptah_steer_queued" => {
+            let args: QueueEntryMutationArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.entry_id, "entry_id")?;
+            orch.steer_queued(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.entry_id,
+                args.expected_version,
             )
             .await
         }
@@ -1786,6 +1976,39 @@ mod tests {
                     "{name} missing {key}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn queue_control_schemas_require_scope_and_mutation_identity() {
+        let scoped = tool_input_schema("ptah_get_queue");
+        assert_eq!(scoped["required"], json!(["session_id", "workspace"]));
+        for name in [
+            "ptah_edit_queue",
+            "ptah_remove_queue",
+            "ptah_reorder_queue",
+            "ptah_clear_queue",
+            "ptah_run_next",
+            "ptah_steer_queued",
+        ] {
+            let schema = tool_input_schema(name);
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item == "request_id"),
+                "{name} missing request_id"
+            );
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item == "session_id"),
+                "{name} missing session_id"
+            );
+            assert_eq!(schema["additionalProperties"], json!(false));
         }
     }
 }

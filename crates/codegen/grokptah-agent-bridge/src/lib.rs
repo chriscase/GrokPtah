@@ -60,8 +60,8 @@ pub use gateway_config::{
 pub use isolation::prepare_isolation_cwd;
 pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};
 pub use prompt_queue::{
-    PromptQueueBatch, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueTakeResult,
-    SteeringDisposition, SteeringReceipt,
+    PromptQueueBatch, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueSnapshot,
+    PromptQueueTakeResult, SteeringDisposition, SteeringReceipt,
 };
 pub use provider_discovery::{discover_profile_models, parse_compatible_model_catalog};
 pub use provider_qualification::{

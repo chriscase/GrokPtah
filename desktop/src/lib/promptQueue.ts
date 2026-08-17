@@ -1,8 +1,10 @@
 export type PromptQueueKind = "prompt" | "command";
 export type PromptQueueSource =
   | "composer"
+  | "control"
   | "steer_now"
   | "steering_deferred"
+  | "steering_delivery_recovery"
   | "desktop";
 
 export type PromptQueueEntry = {
@@ -16,10 +18,43 @@ export type PromptQueueEntry = {
   priority: boolean;
 };
 
-export type PromptQueueState = Record<string, PromptQueueEntry[]>;
+export type PromptQueueState = {
+  entries: Record<string, PromptQueueEntry[]>;
+  /**
+   * Newest bridge `revision` applied per session. The bridge stamps a commit
+   * sequence under its mutation lock but publishes after releasing it, so
+   * snapshots can arrive out of commit order; anything at or below the
+   * watermark is a stale view of the queue and must be dropped.
+   */
+  revisions: Record<string, number>;
+};
+
+export const emptyPromptQueueState: PromptQueueState = {
+  entries: {},
+  revisions: {},
+};
+
+/** Entries the UI should render for a session. */
+export function queueEntriesFor(
+  state: PromptQueueState,
+  sessionId: string | null | undefined,
+): PromptQueueEntry[] {
+  if (!sessionId) return [];
+  return state.entries[sessionId] ?? [];
+}
 
 export type PromptQueueAction =
-  | { type: "replace"; sessionId: string; entries: PromptQueueEntry[] }
+  | {
+      type: "replace";
+      sessionId: string;
+      entries: PromptQueueEntry[];
+      /**
+       * Present for bridge `prompt_queue_changed` snapshots and revisioned
+       * refetches. Mutation receipts omit it; once a watermark exists they
+       * must not overwrite that projection.
+       */
+      revision?: number;
+    }
   | { type: "add"; sessionId: string; entry: PromptQueueEntry }
   | {
       type: "edit";
@@ -70,24 +105,48 @@ function withSession(
   state: PromptQueueState,
   sessionId: string,
   entries: PromptQueueEntry[],
+  revision?: number,
 ): PromptQueueState {
+  const revisions =
+    revision === undefined
+      ? state.revisions
+      : { ...state.revisions, [sessionId]: revision };
   if (entries.length === 0) {
-    if (!(sessionId in state)) return state;
-    const next = { ...state };
-    delete next[sessionId];
-    return next;
+    if (!(sessionId in state.entries)) {
+      return revisions === state.revisions ? state : { ...state, revisions };
+    }
+    const nextEntries = { ...state.entries };
+    delete nextEntries[sessionId];
+    return { entries: nextEntries, revisions };
   }
-  return { ...state, [sessionId]: entries };
+  return { entries: { ...state.entries, [sessionId]: entries }, revisions };
 }
 
 export function promptQueueReducer(
   state: PromptQueueState,
   action: PromptQueueAction,
 ): PromptQueueState {
-  const entries = state[action.sessionId] ?? [];
+  const entries = state.entries[action.sessionId] ?? [];
   switch (action.type) {
-    case "replace":
-      return withSession(state, action.sessionId, [...action.entries]);
+    case "replace": {
+      // Bridge snapshots can be published out of commit order. Applying an
+      // older one would silently regress the queue (drop a just-added entry,
+      // resurrect a removed one), so only ever move the watermark forward.
+      // Revisionless receipts are request-ordered only: once an event or
+      // revisioned refetch has established a watermark, that projection wins.
+      const applied = state.revisions[action.sessionId];
+      if (action.revision !== undefined) {
+        if (applied !== undefined && action.revision <= applied) return state;
+      } else if (applied !== undefined) {
+        return state;
+      }
+      return withSession(
+        state,
+        action.sessionId,
+        [...action.entries],
+        action.revision,
+      );
+    }
     case "add":
       return withSession(state, action.sessionId, [...entries, action.entry]);
     case "edit":
@@ -145,11 +204,25 @@ export type PromptQueueBatch = {
 export type PromptQueueTakeResult = {
   batch?: PromptQueueBatch | null;
   entries: PromptQueueEntry[];
+  /**
+   * Turn slot claimed for this batch under the same lock that removed it.
+   * Present only when a batch was drained. Present it when starting the turn,
+   * or hand the batch back — a drain whose turn never starts otherwise loses
+   * the prompt outright.
+   */
+  reservation?: string | null;
+};
+
+/** A queue read stamped with the revision it was taken at. */
+export type PromptQueueSnapshot = {
+  entries: PromptQueueEntry[];
+  revision: number;
 };
 
 export type PromptQueueRunNextResult = {
   entries: PromptQueueEntry[];
   cancelled_active: boolean;
+  changed_entry?: PromptQueueEntry;
 };
 
 export type SteeringReceipt = {
