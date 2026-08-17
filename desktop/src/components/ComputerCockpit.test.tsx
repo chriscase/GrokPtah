@@ -1,7 +1,11 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComputerCockpit } from "./ComputerCockpit";
-import type { ComputerCockpitSnapshot, ComputerRun } from "../lib/protocol";
+import type {
+  ComputerCockpitSnapshot,
+  ComputerRun,
+  ComputerRunProjection,
+} from "../lib/protocol";
 
 const mocks = vi.hoisted(() => ({
   snapshot: vi.fn(),
@@ -136,8 +140,83 @@ function run(state = "ready"): ComputerRun {
   };
 }
 
+const TERMINAL_STATES = ["completed", "failed", "cancelled", "interrupted", "limit_reached"];
+
+/**
+ * Mirror of the Rust `project_run_at` derivation so fixtures exercise the same
+ * authoritative shape the host actually sends, rather than a snapshot missing
+ * the projection the cockpit renders its status from.
+ */
+function projectionFor(runValue: ComputerRun): ComputerRunProjection {
+  return {
+    runId: runValue.runId,
+    ownerSessionId: runValue.ownerSessionId,
+    parentRunId: null,
+    campaignId: null,
+    target: runValue.target,
+    state: runValue.state,
+    controlDisposition: runValue.controlDisposition ?? "agent_owned",
+    controlEpoch: runValue.controlEpoch ?? 0,
+    version: runValue.version,
+    agentActive: ["observing", "acting"].includes(runValue.state),
+    terminal: TERMINAL_STATES.includes(runValue.state),
+    createdAt: runValue.createdAt,
+    updatedAt: runValue.updatedAt,
+    startedAt: runValue.startedAt ?? null,
+    endedAt: runValue.endedAt ?? null,
+    progress: {
+      actionCount: runValue.actionCount,
+      maxActions: runValue.limits.maxActions,
+      evidenceBytes: 0,
+      maxEvidenceBytes: 8 * 1024 * 1024,
+      elapsedMillis: 1000,
+      maxDurationSecs: runValue.limits.maxDurationSecs,
+      durationExceeded: false,
+    },
+    grant: runValue.grant
+      ? {
+          grantId: runValue.grant.grantId,
+          actionClasses: runValue.grant.actionClasses,
+          issuedBy: "local_user",
+          issuedAt: runValue.createdAt,
+          expiresAt: runValue.grant.expiresAt,
+          usesRemaining: runValue.grant.usesRemaining ?? null,
+          revoked: Boolean(runValue.grant.revokedAt),
+          expired: false,
+        }
+      : null,
+    observation: runValue.currentObservation
+      ? {
+          observationId: runValue.currentObservation.observationId,
+          sequence: runValue.currentObservation.sequence,
+          capturedAt: runValue.currentObservation.capturedAt,
+          elementCount: runValue.currentObservation.elements.length,
+          elementsTruncated: runValue.currentObservation.elementsTruncated,
+          sensitivity: "none",
+          hasScreenshot: false,
+          screenshotRedacted: null,
+          stale: false,
+        }
+      : null,
+    lastOutcome: runValue.lastOutcome ?? null,
+    lastError: runValue.lastError ?? null,
+    eventRange: runValue.audit.length
+      ? {
+          startSeq: runValue.audit[0].sequence,
+          endSeq: runValue.audit[runValue.audit.length - 1].sequence,
+        }
+      : null,
+  };
+}
+
 function snapshot(runValue: ComputerRun | null = null): ComputerCockpitSnapshot {
-  return { backend, origin: "desktop", run: runValue, pendingApproval: null };
+  return {
+    backend,
+    origin: "desktop",
+    projection: runValue ? projectionFor(runValue) : null,
+    run: runValue,
+    pendingApproval: null,
+  };
 }
 
 const props = {

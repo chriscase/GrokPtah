@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
+import {
+  computerActivityAnnouncement,
+  computerActivityState,
+} from "../lib/computerActivity";
 import type {
   ComputerAction,
   ComputerAgentEligibility,
@@ -159,6 +163,11 @@ export function ComputerCockpit({
   };
 
   const run = snapshot?.run ?? null;
+  // Status rendering reads the authoritative projection, which is the same
+  // payload an external coordinator observes. `run` is kept only for the
+  // local-only observation detail an approval needs.
+  const projection = snapshot?.projection ?? null;
+  const activity = projection ? computerActivityState(projection) : null;
   const observation = run?.currentObservation ?? null;
   const nameElement = run ? elementByAction(run, "set_value") : undefined;
   const submitElement = run ? elementByAction(run, "invoke") : undefined;
@@ -167,7 +176,6 @@ export function ComputerCockpit({
   );
   const approval = snapshot?.pendingApproval ?? null;
   const grantActive = Boolean(run?.grant && !run.grant.revokedAt);
-  const runActive = Boolean(run && !isTerminal(run));
   const timeline = useMemo(() => run?.audit.slice(-12).reverse() ?? [], [run]);
   const selectedNativeTarget = nativeTargets.find(
     (candidate) => candidate.selectionToken === selectedNativeToken,
@@ -313,10 +321,14 @@ export function ComputerCockpit({
           </div>
         </div>
         <div className="computer-header-actions">
-          {runActive && (
-            <span className={`computer-live-indicator state-${run?.state}`} role="status">
+          {activity && projection && (
+            <span
+              className={`computer-live-indicator tone-${activity.tone} state-${projection.state}`}
+              data-activity={activity.id}
+              title={activity.detail}
+            >
               <span aria-hidden />
-              {titleCase(run?.state ?? "idle")}
+              {activity.label}
             </span>
           )}
           <button type="button" onClick={onClose} aria-label="Close Computer Run cockpit">
@@ -324,6 +336,13 @@ export function ComputerCockpit({
           </button>
         </div>
       </header>
+
+      {/* Single authoritative announcement of who owns the run, so assistive
+          technology hears takeover, stop, interruption, and uncertain outcomes
+          rather than only a lifecycle state name. */}
+      <p className="computer-visually-hidden" role="status" aria-live="polite">
+        {projection ? computerActivityAnnouncement(projection) : ""}
+      </p>
 
       {!sessionId && (
         <div className="computer-empty" role="status">
@@ -613,10 +632,25 @@ export function ComputerCockpit({
 
             <aside className="computer-run-details" aria-label="Computer Run details">
               <span className="computer-section-label">Run details</span>
+              {activity && (
+                <div
+                  className={`computer-activity-state tone-${activity.tone}`}
+                  data-activity={activity.id}
+                >
+                  <strong>{activity.label}</strong>
+                  <span>{activity.detail}</span>
+                </div>
+              )}
               <dl>
                 <div><dt>Target</dt><dd>{run.target.displayName}</dd></div>
                 <div><dt>Backend</dt><dd>{snapshot.backend.backendId}</dd></div>
                 <div><dt>Origin</dt><dd>{titleCase(snapshot.origin)}</dd></div>
+                {projection && (
+                  <div>
+                    <dt>Control epoch</dt>
+                    <dd>{projection.controlEpoch}</dd>
+                  </div>
+                )}
                 <div><dt>Agent model</dt><dd>{model} · {effort}</dd></div>
                 <div>
                   <dt>Agent access</dt>

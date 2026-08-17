@@ -49,6 +49,55 @@ stale approvals and reconnects cannot return authority to the agent, and a new C
 required. Stop records `stopped`; restart recovery records `interrupted`; a late mutation whose
 receipt cannot be trusted records `uncertain_outcome` without replaying the action.
 
+## Authoritative run projection (#271 read contract)
+
+`computer_use::projection` derives `ComputerRunProjection`, the single serialized view the
+desktop cockpit reads and the one a future coordinator surface will serve. Both surfaces
+consuming one projection is what prevents the GUI and an external observer from disagreeing
+about who owns a run.
+
+The projection is redaction-safe **by construction**. Observed element roles, labels, values,
+and geometry, plus the evidence asset token and content hash, are absent from the type rather
+than filtered at a transport boundary, so a coordinator learns that an observation exists, how
+many elements it held, whether a screenshot was captured, and whether it is stale — never what
+it contained. Element IDs are observation-scoped capabilities and are likewise not projected.
+
+`project_run_at` takes an explicit instant instead of reading an ambient clock. One durable
+record therefore serializes identically on both surfaces, and staleness and duration assertions
+are deterministic under test.
+
+Scoped reads on `ComputerUseService` fail closed:
+
+| Read | Scope |
+|---|---|
+| `list_run_projections` | Runs owned by exactly one session |
+| `project_owned_run` | One owned run |
+| `owned_run_events` | Bounded event page for one owned run |
+| `capacity` | Ledger totals plus per-session counts |
+
+An unknown run and a run owned by another session return the **identical** `unauthorized`
+error, so a scoped read cannot be used as a run-existence oracle. Traversal-shaped and empty
+run ids fail the same way rather than surfacing a distinct validation error.
+
+### Event cursors and gaps
+
+Event pages are derived from the durable audit journal, which is a bounded ring. Sequences are
+monotonic, pages are clamped to `MAX_EVENT_PAGE` (500), and `nextCursor` is present only while
+more entries remain. A cursor pointing below the retained window is reported as `cursorExpired`
+with an empty page: once the ring evicts entries, those sequences never return, and a gap is
+never presented as a complete stream. `afterSeq == startSeq - 1` is exact continuity, not a gap.
+
+Restart keeps events readable. Recovery marks the run `interrupted`, clears authority, and
+increments `controlEpoch`; the durable journal remains replayable from its retained start.
+
+### Visible activity states
+
+`desktop/src/lib/computerActivity.ts` maps the projection to exactly one visible state. Control
+disposition wins over lifecycle state, so a stopped or taken-over run can never present as an
+ordinary pause even though all three share the `paused` lifecycle state. A terminal agent-owned
+run is shown as ended rather than as live agent control, and a disposition this build does not
+recognize fails closed as "unrecognized control state" instead of rendering as an ordinary run.
+
 ## Threat model
 
 See [Computer Use Threat Model and Release Gate](COMPUTER_USE_THREAT_MODEL.md) for the current
