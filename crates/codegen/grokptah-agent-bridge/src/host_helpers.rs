@@ -574,6 +574,22 @@ pub(crate) struct ChatReply {
     pub usage: Option<crate::completion::CompletionUsage>,
 }
 
+/// Result of exercising the production xAI chat-completions wire path against
+/// a loopback-only provider contract fixture.
+///
+/// This is deliberately narrow test support: it cannot target a remote host,
+/// uses fixed synthetic credentials, and does not expose request headers.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderContractReplay {
+    pub text: String,
+    pub streamed: bool,
+    pub reasoning: Option<String>,
+    pub deltas: Vec<String>,
+    pub thought_deltas: Vec<String>,
+    pub usage: Option<crate::completion::CompletionUsage>,
+}
+
 /// Map of OpenAI function name → (real server name, real tool name).
 pub(crate) type McpToolIndex = std::collections::HashMap<String, (String, String)>;
 
@@ -1740,6 +1756,38 @@ pub(crate) async fn call_xai_agent_step<F, G>(
     tools: &serde_json::Value,
     allow_transient_retries: bool,
     cancel: &CancellationToken,
+    on_delta: F,
+    on_thought: G,
+) -> Result<AgentStep>
+where
+    F: FnMut(&str),
+    G: FnMut(&str),
+{
+    let creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
+    let target = resolve_model_target(&creds, model)?;
+    call_provider_agent_step(
+        creds,
+        target,
+        effort,
+        messages,
+        tools,
+        allow_transient_retries,
+        cancel,
+        on_delta,
+        on_thought,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_provider_agent_step<F, G>(
+    mut creds: crate::auth_store::WireCredentials,
+    target: ResolvedModelTarget,
+    effort: EffortLevel,
+    messages: &[serde_json::Value],
+    tools: &serde_json::Value,
+    allow_transient_retries: bool,
+    cancel: &CancellationToken,
     mut on_delta: F,
     mut on_thought: G,
 ) -> Result<AgentStep>
@@ -1747,8 +1795,6 @@ where
     F: FnMut(&str),
     G: FnMut(&str),
 {
-    let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
-    let target = resolve_model_target(&creds, model)?;
     if !target.capabilities.tools {
         bail!(
             "provider model `{}` is not qualified for coding tools; use Chat or qualify native tool calling first",
@@ -2087,6 +2133,103 @@ where
         "{}",
         last_err.unwrap_or_else(|| "agent request failed".into())
     );
+}
+
+/// Exercise the production xAI request builder, HTTP streaming path, SSE
+/// decoder, terminal-marker validation, and usage extraction against a local
+/// scripted gateway. The endpoint must be an explicit HTTP loopback URL whose
+/// path is `/v1`; fixed synthetic Grok Build credentials are the only
+/// credentials this helper can send.
+#[doc(hidden)]
+pub async fn replay_xai_provider_contract_on_loopback(
+    base_url: &str,
+    model: &str,
+    messages: &[serde_json::Value],
+    tools: &serde_json::Value,
+) -> Result<ProviderContractReplay> {
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|error| anyhow!("invalid provider contract loopback URL: {error}"))?;
+    let host = parsed.host_str().unwrap_or_default();
+    let loopback = host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback());
+    if parsed.scheme() != "http"
+        || !loopback
+        || parsed.port().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path().trim_end_matches('/') != "/v1"
+    {
+        bail!("provider contract replay requires an explicit HTTP loopback /v1 endpoint");
+    }
+    if model.trim().is_empty() {
+        bail!("provider contract replay model must not be empty");
+    }
+
+    let capabilities = crate::gateway_config::ModelCapabilities {
+        tools: true,
+        stream: true,
+        parallel_tool_calls: true,
+        source: crate::gateway_config::CapabilitySource::Declared,
+        ..crate::gateway_config::ModelCapabilities::default()
+    };
+    let target = ResolvedModelTarget {
+        base_url: parsed.as_str().trim_end_matches('/').to_string(),
+        wire_model: model.to_string(),
+        dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
+        capabilities,
+        deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
+    };
+    let credentials = crate::auth_store::WireCredentials {
+        provider_id: "provider-contract-loopback".into(),
+        bearer: "synthetic-provider-contract-token".into(),
+        oidc_token_auth: true,
+        display_name: "Synthetic provider contract".into(),
+        method: "test-support".into(),
+        user_id: Some("synthetic-user".into()),
+        team_id: Some("synthetic-team".into()),
+        auth_scope: None,
+        refresh_token: None,
+        oidc_issuer: None,
+        oidc_client_id: None,
+        principal_type: None,
+        principal_id: None,
+        expires_at: None,
+    };
+    let mut deltas = Vec::new();
+    let mut thought_deltas = Vec::new();
+    let step = call_provider_agent_step(
+        credentials,
+        target,
+        EffortLevel::None,
+        messages,
+        tools,
+        false,
+        &CancellationToken::new(),
+        |delta| deltas.push(delta.to_string()),
+        |delta| thought_deltas.push(delta.to_string()),
+    )
+    .await?;
+    match step {
+        AgentStep::Final {
+            text,
+            streamed,
+            reasoning,
+            usage,
+        } => Ok(ProviderContractReplay {
+            text,
+            streamed,
+            reasoning,
+            deltas,
+            thought_deltas,
+            usage,
+        }),
+        AgentStep::ToolCalls { .. } => {
+            bail!("provider contract fixture unexpectedly requested a tool call")
+        }
+    }
 }
 
 #[cfg(test)]

@@ -53,11 +53,12 @@ pub use agents_personas::{
     discover_agents, discover_personas, resolve_agent, resolve_persona, AgentDef, PersonaDef,
 };
 pub use certification::{
-    scan_value_for_forbidden_data, ArtifactReference, AttemptDisposition, CampaignBudgets,
-    CampaignIdentity, CertificationCheck, CertificationError, CredentialMethodClass,
-    DurableStateEvidence, PersistentAgentCapture, ProviderAttemptEvidence, ProviderDialectClass,
-    ProviderIdentity, ProviderRouteClass, StreamFraming, UsageEvidence, MAX_CAPTURE_ATTEMPTS,
-    MAX_CAPTURE_BYTES, MAX_CAPTURE_CHECKS, MAX_RAW_ARTIFACT_BYTES, PERSISTENT_AGENT_CAPTURE_SCHEMA,
+    scan_value_for_forbidden_data, ArtifactReference, AttemptDisposition, CampaignActuals,
+    CampaignBudgets, CampaignIdentity, CertificationCheck, CertificationError,
+    CredentialMethodClass, DurableStateEvidence, PersistentAgentCapture, ProviderAttemptEvidence,
+    ProviderDialectClass, ProviderIdentity, ProviderRouteClass, StreamFraming, UsageEvidence,
+    MAX_CAPTURE_ATTEMPTS, MAX_CAPTURE_BYTES, MAX_CAPTURE_CHECKS, MAX_RAW_ARTIFACT_BYTES,
+    PERSISTENT_AGENT_CAPTURE_SCHEMA,
 };
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
 pub use gateway_config::{
@@ -86,6 +87,8 @@ pub use host_helpers::coding_agent_efficiency_guidance;
 pub use host_helpers::{
     is_edit_or_shell_tool, is_post_cargo_explore_only_burn, should_skip_tool_after_cargo_failure,
 };
+#[doc(hidden)]
+pub use host_helpers::{replay_xai_provider_contract_on_loopback, ProviderContractReplay};
 
 pub use memory::{MemoryFact, MemoryScope};
 
