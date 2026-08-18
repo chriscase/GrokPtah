@@ -43,7 +43,7 @@ use crate::memory::{MemoryAccess, MemoryAddress, MemoryScope};
 use crate::orchestration::{
     apply_run_aggregate, prompt_preview, AgentRecord, AgentResumePlan, AgentState,
     ContinuationCheckpoint, ContinuationReason, OrchStore, PromotionState, RunAggregates,
-    RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
+    RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
 };
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::prompt_queue::{
@@ -342,6 +342,246 @@ pub(crate) struct SessionUsage {
     requests: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunTokenStop {
+    Reached { consumed: u64, ceiling: u64 },
+    UsageUnavailable { ceiling: u64 },
+    AccountingOverflow { ceiling: u64 },
+}
+
+impl RunTokenStop {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Reached { .. } => "max_total_tokens_reached",
+            Self::UsageUnavailable { .. } => "max_total_tokens_usage_unavailable",
+            Self::AccountingOverflow { .. } => "max_total_tokens_accounting_overflow",
+        }
+    }
+
+    fn cause(self) -> RunStopCause {
+        match self {
+            Self::Reached { .. } => RunStopCause::TokenCeiling,
+            Self::UsageUnavailable { .. } => RunStopCause::TokenAccountingUnavailable,
+            Self::AccountingOverflow { .. } => RunStopCause::TokenAccountingOverflow,
+        }
+    }
+
+    fn message(self) -> String {
+        match self {
+            Self::Reached { consumed, ceiling } => format!(
+                "Stopped at the run token boundary: consumed {consumed} total tokens, meeting or exceeding the max_total_tokens ceiling of {ceiling}."
+            ),
+            Self::UsageUnavailable { ceiling } => format!(
+                "Stopped at the run token boundary because the provider did not return usable token metadata for a run bounded by max_total_tokens={ceiling}."
+            ),
+            Self::AccountingOverflow { ceiling } => format!(
+                "Stopped at the run token boundary because token accounting overflowed for a run bounded by max_total_tokens={ceiling}."
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RunUsageState {
+    usage: CompletionUsage,
+    complete: bool,
+    pending_requests: u32,
+    stop: Option<RunTokenStop>,
+}
+
+struct RunUsageTracker {
+    run_id: String,
+    store: OrchStore,
+    max_total_tokens: Option<u64>,
+    state: Mutex<RunUsageState>,
+    bounded_admission: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct RunUsageAttempt {
+    tracker: Arc<RunUsageTracker>,
+    _bounded_admission: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl RunUsageAttempt {
+    fn finish(self, usage: Option<&CompletionUsage>) -> Result<Option<String>> {
+        self.tracker.finish_attempt(usage)
+    }
+}
+
+impl RunUsageTracker {
+    fn from_run(store: OrchStore, run: &RunRecord) -> Arc<Self> {
+        Arc::new(Self {
+            run_id: run.run_id.clone(),
+            store,
+            max_total_tokens: run.bounds.max_total_tokens,
+            state: Mutex::new(RunUsageState {
+                usage: run.aggregates.usage.clone(),
+                complete: run.aggregates.usage_complete,
+                pending_requests: run.aggregates.usage_pending_requests,
+                stop: None,
+            }),
+            bounded_admission: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    fn stop_message(&self) -> Option<String> {
+        self.state.lock().stop.map(RunTokenStop::message)
+    }
+
+    #[cfg(test)]
+    fn stop_code(&self) -> Option<&'static str> {
+        self.state.lock().stop.map(RunTokenStop::code)
+    }
+
+    fn durable_stop_code(&self) -> Option<String> {
+        self.store
+            .load_run(&self.run_id)
+            .ok()
+            .flatten()
+            .and_then(|run| run.stop_cause.map(|_| run.error_code))
+            .flatten()
+    }
+
+    fn mark_host_stop(&self, cause: RunStopCause, code: &str) -> Result<()> {
+        self.store
+            .update_run(&self.run_id, |run| {
+                run.error_code = Some(code.into());
+                run.stop_cause = Some(cause);
+                run.updated_at = Utc::now();
+                Ok(())
+            })?
+            .ok_or_else(|| anyhow!("run disappeared while recording its stop cause"))?;
+        Ok(())
+    }
+
+    fn is_bounded(&self) -> bool {
+        self.max_total_tokens.is_some()
+    }
+
+    async fn begin_attempt(self: &Arc<Self>) -> Result<RunUsageAttempt> {
+        let bounded_admission = if self.is_bounded() {
+            Some(self.bounded_admission.clone().lock_owned().await)
+        } else {
+            None
+        };
+        if let Some(stop) = self.state.lock().stop {
+            bail!(stop.message());
+        }
+        let pending_requests = {
+            let mut state = self.state.lock();
+            state.pending_requests = state
+                .pending_requests
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("provider attempt counter overflowed"))?;
+            state.pending_requests
+        };
+        match self.store.update_run(&self.run_id, |run| {
+            run.aggregates.usage_pending_requests = pending_requests;
+            run.updated_at = Utc::now();
+            Ok(())
+        }) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.state.lock().pending_requests = pending_requests.saturating_sub(1);
+                bail!("run disappeared while admitting a provider request");
+            }
+            Err(error) => {
+                self.state.lock().pending_requests = pending_requests.saturating_sub(1);
+                return Err(error);
+            }
+        }
+        Ok(RunUsageAttempt {
+            tracker: self.clone(),
+            _bounded_admission: bounded_admission,
+        })
+    }
+
+    fn finish_attempt(&self, usage: Option<&CompletionUsage>) -> Result<Option<String>> {
+        {
+            let mut state = self.state.lock();
+            state.pending_requests = state.pending_requests.saturating_sub(1);
+        }
+        self.record(usage)
+    }
+
+    fn record(&self, usage: Option<&CompletionUsage>) -> Result<Option<String>> {
+        let (snapshot, complete, pending_requests, stop) = {
+            let mut state = self.state.lock();
+            match usage {
+                Some(usage) => {
+                    let next = (|| {
+                        Some(CompletionUsage {
+                            prompt_tokens: state
+                                .usage
+                                .prompt_tokens
+                                .checked_add(usage.prompt_tokens)?,
+                            completion_tokens: state
+                                .usage
+                                .completion_tokens
+                                .checked_add(usage.completion_tokens)?,
+                            total_tokens: state
+                                .usage
+                                .total_tokens
+                                .checked_add(usage.total_tokens)?,
+                            requests: state.usage.requests.checked_add(usage.requests)?,
+                        })
+                    })();
+                    if let Some(next) = next {
+                        state.usage = next;
+                        if let Some(ceiling) = self.max_total_tokens {
+                            if state.usage.total_tokens >= ceiling {
+                                state.stop = Some(RunTokenStop::Reached {
+                                    consumed: state.usage.total_tokens,
+                                    ceiling,
+                                });
+                            }
+                        }
+                    } else if let Some(ceiling) = self.max_total_tokens {
+                        state.complete = false;
+                        state.stop = Some(RunTokenStop::AccountingOverflow { ceiling });
+                    } else {
+                        bail!("run token accounting overflowed");
+                    }
+                }
+                None => {
+                    state.complete = false;
+                    if let Some(ceiling) = self.max_total_tokens {
+                        state.stop = Some(RunTokenStop::UsageUnavailable { ceiling });
+                    }
+                }
+            }
+            (
+                state.usage.clone(),
+                state.complete,
+                state.pending_requests,
+                state.stop,
+            )
+        };
+        self.store
+            .update_run(&self.run_id, |run| {
+                run.aggregates.usage = snapshot.clone();
+                // Once terminal teardown or restart has declared an attempt
+                // unresolved, a late response may add measured totals but may
+                // not restore the stronger claim that accounting is complete.
+                run.aggregates.usage_complete &= complete;
+                run.aggregates.usage_pending_requests = pending_requests;
+                if let Some(verification) = run.aggregates.verification.as_mut() {
+                    verification.usage = snapshot.clone();
+                }
+                if let Some(stop) = stop {
+                    if run.stop_cause != Some(RunStopCause::TokenAccountingUnavailable) {
+                        run.error_code = Some(stop.code().into());
+                        run.stop_cause = Some(stop.cause());
+                    }
+                }
+                run.updated_at = Utc::now();
+                Ok(())
+            })?
+            .ok_or_else(|| anyhow!("run disappeared while recording provider usage"))?;
+        Ok(stop.map(RunTokenStop::message))
+    }
+}
+
 const MAX_SESSION_COMPLETION_HISTORY: usize = 64;
 
 /// How long a queue-drain reservation may go unclaimed before another drain
@@ -480,6 +720,9 @@ pub struct AgentHostHandle {
     /// Wakes every embedded orchestration service after a global admission
     /// slot is actually released, after the completion event itself.
     orchestration_wakeup: Arc<Notify>,
+    /// Explicit run-scoped accounting shared by the parent model loop and any
+    /// children it spawns. A session counter is not a safe run identity.
+    run_usage_trackers: Arc<Mutex<HashMap<Uuid, Arc<RunUsageTracker>>>>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
 }
@@ -645,6 +888,7 @@ impl AgentHost {
             promotion_locks: Arc::new(Mutex::new(HashSet::new())),
             reviewed_runs: Arc::new(Mutex::new(HashSet::new())),
             orchestration_wakeup: Arc::new(Notify::new()),
+            run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             _instance_lock: instance_lock,
         }
     }
@@ -1503,6 +1747,7 @@ impl AgentHostHandle {
             terminal_result: None,
             final_response: None,
             error_code: None,
+            stop_cause: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution,
@@ -1616,7 +1861,13 @@ impl AgentHostHandle {
         let reason = match outcome {
             "completed" => ContinuationReason::TurnCompleted,
             "cancelled" => ContinuationReason::Cancelled,
-            "limit_reached" => ContinuationReason::LimitReached,
+            "limit_reached"
+            | "max_rounds_reached"
+            | "stationarity"
+            | "recovery_exhausted"
+            | "max_total_tokens_reached"
+            | "max_total_tokens_usage_unavailable"
+            | "max_total_tokens_accounting_overflow" => ContinuationReason::LimitReached,
             _ => ContinuationReason::Failed,
         };
         let mut checkpoint = ContinuationCheckpoint {
@@ -1679,12 +1930,34 @@ impl AgentHostHandle {
         run.state = match outcome {
             "completed" => RunState::Completed,
             "cancelled" => RunState::Cancelled,
-            "limit_reached" => RunState::LimitReached,
+            "limit_reached"
+            | "max_rounds_reached"
+            | "stationarity"
+            | "recovery_exhausted"
+            | "max_total_tokens_reached"
+            | "max_total_tokens_usage_unavailable"
+            | "max_total_tokens_accounting_overflow" => RunState::LimitReached,
             _ => RunState::Failed,
         };
         run.end_seq = Some(end_seq);
         run.terminal_result = Some(outcome.into());
-        run.error_code = (outcome != "completed").then(|| outcome.into());
+        let durable_token_error = run
+            .error_code
+            .as_deref()
+            .is_some_and(|code| code.starts_with("max_total_tokens_"));
+        if outcome == "completed" {
+            run.error_code = None;
+        } else if !durable_token_error {
+            run.error_code = Some(outcome.into());
+        }
+        if run.stop_cause.is_none() {
+            run.stop_cause = match outcome {
+                "completed" => Some(RunStopCause::Completed),
+                "cancelled" => Some(RunStopCause::Cancelled),
+                "failed" => Some(RunStopCause::Failed),
+                _ => None,
+            };
+        }
         run.final_response = match result {
             Ok(text) => Some(event_tx.redact_text(text, 8_000)),
             Err(error) => Some(event_tx.redact_text(&error.to_string(), 2_000)),
@@ -2836,18 +3109,34 @@ impl AgentHostHandle {
                  Preserve: user goals, decisions, file paths touched, failing tests, open TODOs. \
                  Be dense (≤600 words). Do not invent facts.\n\n{blob}"
             );
-            match call_xai_chat(
-                &creds,
-                &model,
-                &[("user".into(), prompt)],
-                None,
-                &cwd,
-                SessionKind::Build,
-            )
-            .await
-            {
-                Ok(t) if !t.trim().is_empty() => Some(format!("LLM compact summary:\n{t}")),
-                _ => None,
+            let (call_allowed, usage_attempt) = match self.begin_provider_attempt(id).await {
+                Ok(attempt) => (true, attempt),
+                Err(error) if self.run_token_stop_before_request(id).is_some() => (false, None),
+                Err(error) => return Err(error),
+            };
+            if !call_allowed {
+                None
+            } else {
+                match call_xai_chat(
+                    &creds,
+                    &model,
+                    &[("user".into(), prompt)],
+                    None,
+                    &cwd,
+                    SessionKind::Build,
+                )
+                .await
+                {
+                    Ok(reply) => {
+                        self.finish_provider_attempt(id, usage_attempt, reply.usage.as_ref())?;
+                        (!reply.text.trim().is_empty())
+                            .then(|| format!("LLM compact summary:\n{}", reply.text))
+                    }
+                    Err(_) => {
+                        self.finish_provider_attempt(id, usage_attempt, None)?;
+                        None
+                    }
+                }
             }
         } else {
             None
@@ -3044,6 +3333,92 @@ impl AgentHostHandle {
         }
         self.inner.lock().model = model;
         self.persist_chrome();
+    }
+
+    /// Accumulate token usage for /usage (#159).
+    async fn begin_provider_attempt(&self, session_id: Uuid) -> Result<Option<RunUsageAttempt>> {
+        let tracker = self.run_usage_trackers.lock().get(&session_id).cloned();
+        Self::begin_provider_attempt_for_tracker(tracker).await
+    }
+
+    async fn begin_provider_attempt_for_tracker(
+        tracker: Option<Arc<RunUsageTracker>>,
+    ) -> Result<Option<RunUsageAttempt>> {
+        match tracker {
+            Some(tracker) => Ok(Some(tracker.begin_attempt().await?)),
+            None => Ok(None),
+        }
+    }
+
+    fn finish_provider_attempt(
+        &self,
+        session_id: Uuid,
+        attempt: Option<RunUsageAttempt>,
+        usage: Option<&CompletionUsage>,
+    ) -> Result<Option<String>> {
+        if let Some(usage) = usage {
+            self.record_session_usage(
+                session_id,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+            );
+        }
+        match attempt {
+            Some(attempt) => attempt.finish(usage),
+            None => Ok(None),
+        }
+    }
+
+    /// Accumulate token usage for /usage (#159).
+    fn record_provider_usage(
+        &self,
+        session_id: Uuid,
+        usage: Option<&CompletionUsage>,
+    ) -> Result<Option<String>> {
+        let tracker = self.run_usage_trackers.lock().get(&session_id).cloned();
+        self.record_provider_usage_for_tracker(session_id, usage, tracker.as_deref())
+    }
+
+    fn record_provider_usage_for_tracker(
+        &self,
+        session_id: Uuid,
+        usage: Option<&CompletionUsage>,
+        tracker: Option<&RunUsageTracker>,
+    ) -> Result<Option<String>> {
+        if let Some(usage) = usage {
+            self.record_session_usage(
+                session_id,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+            );
+        }
+        match tracker {
+            Some(tracker) => tracker.record(usage),
+            None => Ok(None),
+        }
+    }
+
+    fn run_token_stop_before_request(&self, session_id: Uuid) -> Option<String> {
+        self.run_usage_trackers
+            .lock()
+            .get(&session_id)
+            .and_then(|tracker| tracker.stop_message())
+    }
+
+    fn run_tokens_bounded(&self, session_id: Uuid) -> bool {
+        self.run_usage_trackers
+            .lock()
+            .get(&session_id)
+            .is_some_and(|tracker| tracker.is_bounded())
+    }
+
+    fn mark_run_stop(&self, session_id: Uuid, cause: RunStopCause, code: &str) -> Result<()> {
+        if let Some(tracker) = self.run_usage_trackers.lock().get(&session_id).cloned() {
+            tracker.mark_host_stop(cause, code)?;
+        }
+        Ok(())
     }
 
     /// Accumulate token usage for /usage (#159).
@@ -3521,6 +3896,47 @@ impl AgentHostHandle {
 
     pub fn subagents(&self) -> Vec<SubagentInfo> {
         self.inner.lock().subagents.clone()
+    }
+
+    /// A bounded Run cannot finalize while a fire-and-forget child can still
+    /// spend against it. Cancel only this Lane's running children and wait for
+    /// their in-flight provider reads to settle before freezing the ledger.
+    async fn quiesce_bounded_run_subagents(
+        &self,
+        session_id: Uuid,
+        tracker: &RunUsageTracker,
+    ) -> Result<()> {
+        if !tracker.is_bounded() {
+            return Ok(());
+        }
+        let session_key = session_id.to_string();
+        let tokens = {
+            let g = self.inner.lock();
+            g.subagents
+                .iter()
+                .filter(|subagent| {
+                    subagent.status == "running"
+                        && subagent.session_id.as_deref() == Some(session_key.as_str())
+                })
+                .filter_map(|subagent| g.subagent_cancels.get(&subagent.id).cloned())
+                .collect::<Vec<_>>()
+        };
+        for token in tokens {
+            token.cancel();
+        }
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while self.running_subagent_count(Some(session_id)) > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !settled {
+            // Spending may still be in flight, so an exact bounded total is no
+            // longer provable. Persist the fail-closed state before finalizing.
+            tracker.record(None)?;
+        }
+        Ok(())
     }
 
     /// Public spawn entry for tools, Tauri, and tests (#151).
@@ -5539,6 +5955,24 @@ impl AgentHostHandle {
         } else {
             None
         };
+        let run_usage_tracker = if let Some(external) = external_run.as_ref() {
+            let store = self.ensure_orchestration_store()?;
+            let run = store
+                .load_run(&external.run_id)?
+                .ok_or_else(|| anyhow!("external run disappeared before token accounting"))?;
+            Some(RunUsageTracker::from_run(store, &run))
+        } else if let Some((run_id, store)) = desktop_run.as_ref() {
+            store
+                .load_run(run_id)?
+                .map(|run| RunUsageTracker::from_run(store.clone(), &run))
+        } else {
+            None
+        };
+        if let Some(tracker) = run_usage_tracker.as_ref() {
+            self.run_usage_trackers
+                .lock()
+                .insert(session_id, tracker.clone());
+        }
         let mut desktop_aggregator = desktop_run.as_ref().map(|(run_id, store)| {
             self.start_desktop_run_aggregator(run_id, session_id, store.clone())
         });
@@ -5547,7 +5981,7 @@ impl AgentHostHandle {
             turn_id,
         });
 
-        let result = self
+        let mut result = self
             .run_turn(
                 session_id,
                 &execution_cwd,
@@ -5560,6 +5994,37 @@ impl AgentHostHandle {
                 event_tx.clone(),
             )
             .await;
+        if let Some(tracker) = run_usage_tracker.as_ref() {
+            if let Err(error) = self
+                .quiesce_bounded_run_subagents(session_id, tracker)
+                .await
+            {
+                result = Err(error);
+            }
+            if let (Ok(text), Some(stop)) = (&mut result, tracker.stop_message()) {
+                if !text.contains("Stopped at the run token boundary") {
+                    if !text.trim().is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&stop);
+                    self.replace_last_assistant_text(session_id, text);
+                    self.persist_session_rewrite(session_id);
+                    emit_message(&event_tx, session_id, &stop);
+                }
+            }
+        }
+        let durable_stop_code = run_usage_tracker
+            .as_ref()
+            .and_then(|tracker| tracker.durable_stop_code());
+        if let Some(expected) = run_usage_tracker.as_ref() {
+            let mut trackers = self.run_usage_trackers.lock();
+            if trackers
+                .get(&session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                trackers.remove(&session_id);
+            }
+        }
 
         // Append assistant turn(s) written by push_assistant.
         self.persist_session(session_id);
@@ -5642,13 +6107,10 @@ impl AgentHostHandle {
         };
         let outcome = if cancelled {
             "cancelled"
+        } else if let Some(code) = durable_stop_code.as_deref() {
+            code
         } else if result.is_err() {
             "failed"
-        } else if result
-            .as_ref()
-            .is_ok_and(|text| is_incomplete_stop_message(text))
-        {
-            "limit_reached"
         } else {
             "completed"
         };
@@ -5856,7 +6318,10 @@ impl AgentHostHandle {
                 )
                 .await
                 {
-                    Ok(text) => text,
+                    Ok(reply) => {
+                        self.record_provider_usage(session_id, reply.usage.as_ref())?;
+                        reply.text
+                    }
                     Err(e) => format!(
                         "Model call failed: {e}\n\nAuth: {} ({})\nRun `grok login` if needed.",
                         creds.display_name, creds.method
@@ -5882,18 +6347,49 @@ impl AgentHostHandle {
                 .unwrap_or(prompt)
                 .trim()
                 .to_string();
+            let mut plan_token_stop = None;
             let steps = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
                 offline_plan_steps(&goal)
             } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(model)
                 .map_err(anyhow::Error::msg)?
             {
-                match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
-                    Ok(s) if !s.is_empty() => s,
-                    Ok(_) => offline_plan_steps(&goal),
-                    Err(e) => {
-                        let mut s = offline_plan_steps(&goal);
-                        s.insert(0, format!("(model plan fallback: {e})"));
-                        s
+                let usage_attempt = match self.begin_provider_attempt(session_id).await {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        plan_token_stop = self.run_token_stop_before_request(session_id);
+                        if plan_token_stop.is_none() {
+                            return Err(error);
+                        }
+                        None
+                    }
+                };
+                if plan_token_stop.is_some() {
+                    offline_plan_steps(&goal)
+                } else {
+                    match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
+                        Ok((steps, usage)) if !steps.is_empty() => {
+                            plan_token_stop = self.finish_provider_attempt(
+                                session_id,
+                                usage_attempt,
+                                usage.as_ref(),
+                            )?;
+                            steps
+                        }
+                        Ok((_steps, usage)) => {
+                            plan_token_stop = self.finish_provider_attempt(
+                                session_id,
+                                usage_attempt,
+                                usage.as_ref(),
+                            )?;
+                            offline_plan_steps(&goal)
+                        }
+                        Err(e) => {
+                            plan_token_stop =
+                                self.finish_provider_attempt(session_id, usage_attempt, None)?;
+                            let mut s = offline_plan_steps(&goal);
+                            s.insert(0, format!("(model plan fallback: {e})"));
+                            s
+                        }
                     }
                 }
             } else {
@@ -5917,6 +6413,10 @@ impl AgentHostHandle {
             let mut msg = String::from("Plan proposed. Accept or reject from the plan panel.\n\n");
             for (i, step) in steps.iter().enumerate() {
                 msg.push_str(&format!("{}. {}\n", i + 1, step));
+            }
+            if let Some(stop) = plan_token_stop {
+                msg.push('\n');
+                msg.push_str(&stop);
             }
             emit_message(&event_tx, session_id, &msg);
             push_assistant(self, session_id, &msg);
@@ -6404,6 +6904,7 @@ impl AgentHostHandle {
                 });
             }
             let msg = round_limit_stop_message(max_rounds);
+            self.mark_run_stop(session_id, RunStopCause::RoundLimit, "max_rounds_reached")?;
             emit_message(event_tx, session_id, &msg);
             push_assistant(self, session_id, &msg);
             return Ok(msg);
@@ -6729,6 +7230,11 @@ impl AgentHostHandle {
                 push_assistant(self, session_id, &msg);
                 return Ok(msg);
             }
+            if let Some(msg) = self.run_token_stop_before_request(session_id) {
+                emit_message(event_tx, session_id, &msg);
+                push_assistant(self, session_id, &msg);
+                return Ok(msg);
+            }
 
             let steering_count =
                 self.append_pending_steering_messages(session_id, event_tx, &mut messages);
@@ -6738,6 +7244,7 @@ impl AgentHostHandle {
             if steering_count == 0 {
                 if let Some((run_len, tool_name, true_noop)) = identical_tool_calls.stop_info() {
                     let msg = action_stationarity_stop_message(run_len, &tool_name, true_noop);
+                    self.mark_run_stop(session_id, RunStopCause::Stationarity, "stationarity")?;
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
                         session_id,
                         round: round as u32,
@@ -6847,12 +7354,24 @@ impl AgentHostHandle {
                 detail: format!("Model step {round}/{visible_max_rounds}"),
             });
 
+            let usage_attempt = match self.begin_provider_attempt(session_id).await {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    if let Some(stop) = self.run_token_stop_before_request(session_id) {
+                        emit_message(event_tx, session_id, &stop);
+                        push_assistant(self, session_id, &stop);
+                        return Ok(stop);
+                    }
+                    return Err(error);
+                }
+            };
             let step = match call_xai_agent_step(
                 creds,
                 model,
                 effort,
                 &messages,
                 &tools_this_round,
+                !self.run_tokens_bounded(session_id),
                 cancel,
                 |delta| {
                     emit_message(event_tx, session_id, delta);
@@ -6865,25 +7384,61 @@ impl AgentHostHandle {
             {
                 Ok(s) => s,
                 Err(e) => {
+                    if let Some(stop) =
+                        self.finish_provider_attempt(session_id, usage_attempt, None)?
+                    {
+                        emit_message(event_tx, session_id, &stop);
+                        push_assistant(self, session_id, &stop);
+                        return Ok(stop);
+                    }
                     surface_rate_limit_or_error(event_tx, session_id, &e.to_string());
                     return Err(e);
                 }
             };
+            let token_stop = self.finish_provider_attempt(
+                session_id,
+                usage_attempt,
+                match &step {
+                    AgentStep::Final { usage, .. } | AgentStep::ToolCalls { usage, .. } => {
+                        usage.as_ref()
+                    }
+                },
+            )?;
 
             match step {
                 AgentStep::Final {
-                    text,
+                    mut text,
                     streamed,
                     reasoning,
+                    ..
                 } => {
                     if let Some(r) = reasoning.as_deref() {
                         push_thought(self, session_id, r);
+                    }
+                    if let Some(stop) = token_stop {
+                        let original = text.trim().to_string();
+                        if !original.is_empty() && !streamed {
+                            emit_message(event_tx, session_id, &original);
+                        }
+                        emit_message(event_tx, session_id, &stop);
+                        text = if original.is_empty() {
+                            stop
+                        } else {
+                            format!("{original}\n\n{stop}")
+                        };
+                        push_assistant(self, session_id, &text);
+                        return Ok(text);
                     }
                     if max_rounds <= 8 && test_failure_needs_edit {
                         if in_recovery_grace {
                             // Recovery already spent — do not accept a success claim
                             // while cargo is still unresolved (#187).
                             let msg = "Stopped after recovery step with unresolved cargo test failures. Ask me to continue with the failing tests and source still in context.".to_string();
+                            self.mark_run_stop(
+                                session_id,
+                                RunStopCause::RecoveryExhausted,
+                                "recovery_exhausted",
+                            )?;
                             emit_message(event_tx, session_id, &msg);
                             push_assistant(self, session_id, &msg);
                             return Ok(msg);
@@ -6972,6 +7527,7 @@ impl AgentHostHandle {
                     tool_calls,
                     streamed,
                     reasoning,
+                    ..
                 } => {
                     if let Some(r) = reasoning.as_deref() {
                         push_thought(self, session_id, r);
@@ -7211,8 +7767,27 @@ impl AgentHostHandle {
                         tool_name,
                         is_true_noop_tool_step(&tool_calls),
                     );
+                    // Usage belongs to the model boundary that produced these
+                    // calls. Let every tool in that accepted response settle,
+                    // then stop here so the final loop exit cannot overwrite a
+                    // token-ceiling cause with a round-limit cause.
+                    if let Some(stop) = token_stop {
+                        emit_message(event_tx, session_id, &stop);
+                        push_assistant(self, session_id, &stop);
+                        return Ok(stop);
+                    }
                 }
             }
+        }
+
+        // A synchronous tool (notably spawn_explore) may have completed a
+        // shared bounded provider attempt after the parent response usage was
+        // recorded. Re-read the shared tracker before installing a round-limit
+        // cause so that child usage remains authoritative.
+        if let Some(msg) = self.run_token_stop_before_request(session_id) {
+            emit_message(event_tx, session_id, &msg);
+            push_assistant(self, session_id, &msg);
+            return Ok(msg);
         }
 
         let msg = if recovery_grace {
@@ -7220,6 +7795,19 @@ impl AgentHostHandle {
         } else {
             round_limit_stop_message(max_rounds)
         };
+        self.mark_run_stop(
+            session_id,
+            if recovery_grace {
+                RunStopCause::RecoveryExhausted
+            } else {
+                RunStopCause::RoundLimit
+            },
+            if recovery_grace {
+                "recovery_exhausted"
+            } else {
+                "max_rounds_reached"
+            },
+        )?;
         debug_assert!(is_round_limit_stop_message(&msg));
         emit_message(event_tx, session_id, &msg);
         push_assistant(self, session_id, &msg);
@@ -7940,17 +8528,54 @@ impl AgentHostHandle {
                      Query: {query}\n\nFindings:\n{}",
                     summary.chars().take(8_000).collect::<String>()
                 );
-                if let Ok(text) = call_xai_chat(
-                    &creds,
-                    &model,
-                    &[("user".into(), ask)],
-                    None,
-                    cwd,
-                    SessionKind::Build,
-                )
-                .await
+                let usage_attempt = match self.begin_provider_attempt(session_id).await {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        if let Some(stop) = self.run_token_stop_before_request(session_id) {
+                            summary = format!("{summary}\n\n### Explorer summary\n{stop}");
+                            None
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                };
+                if usage_attempt.is_some()
+                    || self.run_token_stop_before_request(session_id).is_none()
                 {
-                    summary = format!("{summary}\n\n### Explorer summary\n{text}");
+                    match call_xai_chat(
+                        &creds,
+                        &model,
+                        &[("user".into(), ask)],
+                        None,
+                        cwd,
+                        SessionKind::Build,
+                    )
+                    .await
+                    {
+                        Ok(reply) => {
+                            let stop = self.finish_provider_attempt(
+                                session_id,
+                                usage_attempt,
+                                reply.usage.as_ref(),
+                            )?;
+                            summary = format!(
+                                "{summary}\n\n### Explorer summary\n{}{}",
+                                reply.text,
+                                stop.map(|stop| format!("\n\n{stop}")).unwrap_or_default()
+                            );
+                        }
+                        Err(_error) => {
+                            if let Some(stop) =
+                                self.finish_provider_attempt(session_id, usage_attempt, None)?
+                            {
+                                summary = format!("{summary}\n\n### Explorer summary\n{stop}");
+                            } else {
+                                summary = format!(
+                                    "{summary}\n\n### Explorer summary\n(model summary unavailable)"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -8094,6 +8719,9 @@ impl AgentHostHandle {
         let persona_reminder = persona_layer
             .as_ref()
             .map(crate::agents_personas::persona_system_reminder);
+        // Snapshot the durable parent Run identity. Looking this up again from
+        // the session after the parent finishes could charge a later Run.
+        let run_usage_tracker = self.run_usage_trackers.lock().get(&session_id).cloned();
         let sub_id_task = sub_id.clone();
         tokio::spawn(async move {
             host.run_gp_subagent_body(
@@ -8105,6 +8733,7 @@ impl AgentHostHandle {
                 child_cancel,
                 event_tx,
                 persona_reminder,
+                run_usage_tracker,
             )
             .await;
         });
@@ -8136,6 +8765,7 @@ impl AgentHostHandle {
         cancel: CancellationToken,
         event_tx: crate::event_bus::EventBus,
         persona_reminder: Option<String>,
+        run_usage_tracker: Option<Arc<RunUsageTracker>>,
     ) {
         if cancel.is_cancelled() {
             self.finish_subagent(sub_id, "cancelled", &event_tx, session_id, None);
@@ -8256,33 +8886,87 @@ impl AgentHostHandle {
                 self.finish_subagent(sub_id, "cancelled", &event_tx, session_id, None);
                 return;
             }
+            if let Some(stop) = run_usage_tracker
+                .as_ref()
+                .and_then(|tracker| tracker.stop_message())
+            {
+                last = stop;
+                break;
+            }
+            let usage_attempt =
+                match Self::begin_provider_attempt_for_tracker(run_usage_tracker.clone()).await {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        last = run_usage_tracker
+                            .as_ref()
+                            .and_then(|tracker| tracker.stop_message())
+                            .unwrap_or_else(|| format!("GP subagent admission failed: {error:#}"));
+                        break;
+                    }
+                };
             let step = call_xai_agent_step(
                 &creds,
                 &model,
                 effort,
                 &messages,
                 &tools,
+                !run_usage_tracker
+                    .as_ref()
+                    .is_some_and(|tracker| tracker.is_bounded()),
                 &cancel,
                 |_d| {},
                 |_t| {},
             )
             .await;
+            let step = match step {
+                Ok(step) => step,
+                Err(error) => {
+                    match self.finish_provider_attempt(session_id, usage_attempt, None) {
+                        Ok(Some(stop)) => last = stop,
+                        Ok(None) => last = format!("GP subagent model call failed: {error:#}"),
+                        Err(persist_error) => {
+                            last =
+                                format!("GP subagent usage persistence failed: {persist_error:#}")
+                        }
+                    }
+                    break;
+                }
+            };
+            let token_stop = match self.finish_provider_attempt(
+                session_id,
+                usage_attempt,
+                match &step {
+                    AgentStep::Final { usage, .. } | AgentStep::ToolCalls { usage, .. } => {
+                        usage.as_ref()
+                    }
+                },
+            ) {
+                Ok(stop) => stop,
+                Err(error) => {
+                    last = format!("GP subagent usage persistence failed: {error:#}");
+                    break;
+                }
+            };
             match step {
-                Ok(AgentStep::Final {
+                AgentStep::Final {
                     text, reasoning, ..
-                }) => {
+                } => {
                     if let Some(r) = reasoning {
                         push_thought(self, session_id, &r);
                     }
-                    last = text;
+                    last = match token_stop {
+                        Some(stop) if text.trim().is_empty() => stop,
+                        Some(stop) => format!("{text}\n\n{stop}"),
+                        None => text,
+                    };
                     break;
                 }
-                Ok(AgentStep::ToolCalls {
+                AgentStep::ToolCalls {
                     content,
                     tool_calls,
                     reasoning,
                     ..
-                }) => {
+                } => {
                     if let Some(r) = reasoning {
                         push_thought(self, session_id, &r);
                     }
@@ -8334,10 +9018,10 @@ impl AgentHostHandle {
                         }));
                         last = out;
                     }
-                }
-                Err(e) => {
-                    last = format!("GP subagent error: {e}");
-                    break;
+                    if let Some(stop) = token_stop {
+                        last = stop;
+                        break;
+                    }
                 }
             }
         }
@@ -9471,6 +10155,189 @@ mod tests {
             host,
             session.id,
         )
+    }
+
+    fn usage_test_run(run_id: &str, max_total_tokens: Option<u64>) -> RunRecord {
+        let now = Utc::now();
+        RunRecord {
+            run_id: run_id.into(),
+            session_id: Uuid::new_v4(),
+            workspace: "/tmp/project".into(),
+            request_id: format!("request-{run_id}"),
+            client_id: Some("test".into()),
+            state: RunState::Running,
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            queue_position: None,
+            bounds: RunBounds {
+                max_total_tokens,
+                ..RunBounds::default()
+            },
+            prompt_preview: "test".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: now,
+            updated_at: now,
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            stop_cause: None,
+            aggregates: RunAggregates::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        }
+    }
+
+    #[test]
+    fn run_usage_tracker_persists_cumulative_usage_and_typed_ceiling_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("orch");
+        let store = OrchStore::open(&path).unwrap();
+        let run = usage_test_run("usage-ceiling", Some(10));
+        store.save_run(&run).unwrap();
+        let tracker = RunUsageTracker::from_run(store.clone(), &run);
+
+        assert!(tracker
+            .record(Some(&CompletionUsage {
+                prompt_tokens: 3,
+                completion_tokens: 1,
+                total_tokens: 4,
+                requests: 1,
+            }))
+            .unwrap()
+            .is_none());
+        let stop = tracker
+            .record(Some(&CompletionUsage {
+                prompt_tokens: 4,
+                completion_tokens: 2,
+                total_tokens: 6,
+                requests: 1,
+            }))
+            .unwrap()
+            .unwrap();
+        assert!(stop.contains("max_total_tokens ceiling of 10"));
+        assert_eq!(tracker.stop_code(), Some("max_total_tokens_reached"));
+
+        let persisted = store.load_run("usage-ceiling").unwrap().unwrap();
+        assert_eq!(persisted.aggregates.usage.total_tokens, 10);
+        assert_eq!(persisted.aggregates.usage.requests, 2);
+        assert!(persisted.aggregates.usage_complete);
+        assert_eq!(
+            persisted.error_code.as_deref(),
+            Some("max_total_tokens_reached")
+        );
+        assert_eq!(persisted.stop_cause, Some(RunStopCause::TokenCeiling));
+
+        drop(tracker);
+        drop(store);
+        let reopened = OrchStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .load_run("usage-ceiling")
+                .unwrap()
+                .unwrap()
+                .aggregates
+                .usage
+                .total_tokens,
+            10
+        );
+    }
+
+    #[test]
+    fn bounded_missing_usage_fails_closed_while_unbounded_run_stays_observable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = OrchStore::open(temp.path().join("orch")).unwrap();
+        let bounded = usage_test_run("bounded-missing", Some(100));
+        let unbounded = usage_test_run("unbounded-missing", None);
+        store.save_run(&bounded).unwrap();
+        store.save_run(&unbounded).unwrap();
+
+        let bounded_tracker = RunUsageTracker::from_run(store.clone(), &bounded);
+        assert!(bounded_tracker.record(None).unwrap().is_some());
+        assert_eq!(
+            bounded_tracker.stop_code(),
+            Some("max_total_tokens_usage_unavailable")
+        );
+        assert_eq!(
+            store
+                .load_run("bounded-missing")
+                .unwrap()
+                .unwrap()
+                .stop_cause,
+            Some(RunStopCause::TokenAccountingUnavailable)
+        );
+        let unbounded_tracker = RunUsageTracker::from_run(store.clone(), &unbounded);
+        assert!(unbounded_tracker.record(None).unwrap().is_none());
+
+        for run_id in ["bounded-missing", "unbounded-missing"] {
+            let run = store.load_run(run_id).unwrap().unwrap();
+            assert!(!run.aggregates.usage_complete);
+        }
+        assert_eq!(
+            store
+                .load_run("unbounded-missing")
+                .unwrap()
+                .unwrap()
+                .error_code,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_provider_attempts_are_serialized_and_durably_reconciled() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = OrchStore::open(temp.path().join("orch")).unwrap();
+        let run = usage_test_run("bounded-admission", Some(100));
+        store.save_run(&run).unwrap();
+        let tracker = RunUsageTracker::from_run(store.clone(), &run);
+
+        let first = tracker.begin_attempt().await.unwrap();
+        assert_eq!(
+            store
+                .load_run("bounded-admission")
+                .unwrap()
+                .unwrap()
+                .aggregates
+                .usage_pending_requests,
+            1
+        );
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            tracker.begin_attempt()
+        )
+        .await
+        .is_err());
+
+        first
+            .finish(Some(&CompletionUsage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                total_tokens: 5,
+                requests: 1,
+            }))
+            .unwrap();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            tracker.begin_attempt(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        second
+            .finish(Some(&CompletionUsage {
+                prompt_tokens: 2,
+                completion_tokens: 1,
+                total_tokens: 3,
+                requests: 1,
+            }))
+            .unwrap();
+
+        let persisted = store.load_run("bounded-admission").unwrap().unwrap();
+        assert_eq!(persisted.aggregates.usage_pending_requests, 0);
+        assert_eq!(persisted.aggregates.usage.total_tokens, 8);
+        assert_eq!(persisted.aggregates.usage.requests, 2);
     }
 
     fn assert_recovery_event(

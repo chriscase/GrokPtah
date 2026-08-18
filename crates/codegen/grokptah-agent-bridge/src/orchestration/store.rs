@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use super::types::{
     safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
+    RunStopCause,
 };
 
 #[derive(Clone)]
@@ -548,9 +549,15 @@ impl OrchStore {
                     merge_run_observations(&mut final_run, &current);
                     if current.state.is_terminal() {
                         final_run.state = current.state;
-                        final_run.terminal_result = current.terminal_result;
                         final_run.final_response = current.final_response;
-                        final_run.error_code = current.error_code;
+                        if final_run.stop_cause == Some(RunStopCause::TokenAccountingUnavailable) {
+                            let code = "max_total_tokens_usage_unavailable";
+                            final_run.terminal_result = Some(code.into());
+                            final_run.error_code = Some(code.into());
+                        } else {
+                            final_run.terminal_result = current.terminal_result;
+                            final_run.error_code = current.error_code;
+                        }
                     }
                 }
                 Err(_) => {
@@ -781,20 +788,25 @@ impl OrchStore {
         let mut n = 0;
         let mut interrupted_agents = Vec::new();
         for mut run in self.list_runs()? {
-            if matches!(run.state, RunState::Queued | RunState::Running) {
+            let unfinished = matches!(run.state, RunState::Queued | RunState::Running);
+            if unfinished {
                 run.state = RunState::Interrupted;
                 run.queue_position = None;
-                run.updated_at = Utc::now();
                 run.terminal_result = Some("interrupted".into());
                 run.error_code = Some("interrupted".into());
+                run.stop_cause = Some(RunStopCause::Interrupted);
                 if let Some(execution) = run.execution.as_mut() {
                     execution.promotion_state = PromotionState::Conflicted;
                 }
-                self.save_run(&run)?;
                 if let Some(agent_id) = run.agent_id.clone() {
                     interrupted_agents.push((agent_id, run.run_id.clone()));
                 }
                 n += 1;
+            }
+            let unresolved_provider_attempt = run.fail_closed_unresolved_provider_attempts();
+            if unfinished || unresolved_provider_attempt {
+                run.updated_at = Utc::now();
+                self.save_run(&run)?;
             }
         }
         for (agent_id, run_id) in interrupted_agents {
@@ -905,6 +917,54 @@ fn merge_run_observations(target: &mut RunRecord, current: &RunRecord) {
             target.aggregates.tests.push(test.clone());
         }
     }
+    // Usage updates are cumulative snapshots, not deltas. A finalization
+    // candidate must never overwrite a newer durable snapshot with stale
+    // zeros, and missing usage is sticky across every observation.
+    target.aggregates.usage.prompt_tokens = target
+        .aggregates
+        .usage
+        .prompt_tokens
+        .max(current.aggregates.usage.prompt_tokens);
+    target.aggregates.usage.completion_tokens = target
+        .aggregates
+        .usage
+        .completion_tokens
+        .max(current.aggregates.usage.completion_tokens);
+    target.aggregates.usage.total_tokens = target
+        .aggregates
+        .usage
+        .total_tokens
+        .max(current.aggregates.usage.total_tokens);
+    target.aggregates.usage.requests = target
+        .aggregates
+        .usage
+        .requests
+        .max(current.aggregates.usage.requests);
+    target.aggregates.usage_complete &= current.aggregates.usage_complete;
+    // A terminal candidate may have deliberately closed an unresolved marker
+    // as accounting-unavailable. Do not resurrect the stale durable pending
+    // count while installing that fail-closed decision.
+    if target.stop_cause != Some(RunStopCause::TokenAccountingUnavailable) {
+        target.aggregates.usage_pending_requests = current.aggregates.usage_pending_requests;
+    }
+    if let Some(verification) = target.aggregates.verification.as_mut() {
+        verification.usage = target.aggregates.usage.clone();
+    }
+    // The current durable record may have been updated by the provider usage
+    // tracker after the finalization candidate was cloned. Its host-decided
+    // cause is therefore authoritative over a stale candidate cause.
+    if current.stop_cause.is_some()
+        && target.stop_cause != Some(RunStopCause::TokenAccountingUnavailable)
+    {
+        target.stop_cause = current.stop_cause;
+    }
+    if current
+        .error_code
+        .as_deref()
+        .is_some_and(|code| code.starts_with("max_total_tokens_"))
+    {
+        target.error_code = current.error_code.clone();
+    }
     if current
         .progress
         .as_ref()
@@ -1006,6 +1066,7 @@ mod tests {
             terminal_result: Some("completed".into()),
             final_response: Some("done".into()),
             error_code: None,
+            stop_cause: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -1056,6 +1117,7 @@ mod tests {
             terminal_result: None,
             final_response: None,
             error_code: None,
+            stop_cause: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -1066,6 +1128,66 @@ mod tests {
         let store2 = OrchStore::open(d.path()).unwrap();
         let loaded = store2.load_run("r1").unwrap().unwrap();
         assert_eq!(loaded.state, RunState::Interrupted);
+    }
+
+    #[test]
+    fn restart_fails_closed_when_a_bounded_provider_attempt_was_unresolved() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let mut run = terminal_run("pending-provider");
+        run.state = RunState::Running;
+        run.terminal_result = None;
+        run.final_response = None;
+        run.bounds.max_total_tokens = Some(1_000);
+        run.aggregates.usage_pending_requests = 1;
+        store.save_run(&run).unwrap();
+        drop(store);
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        let recovered = reopened.load_run("pending-provider").unwrap().unwrap();
+        assert_eq!(recovered.state, RunState::Interrupted);
+        assert_eq!(recovered.aggregates.usage_pending_requests, 0);
+        assert!(!recovered.aggregates.usage_complete);
+        assert_eq!(
+            recovered.error_code.as_deref(),
+            Some("max_total_tokens_usage_unavailable")
+        );
+        assert_eq!(
+            recovered.stop_cause,
+            Some(RunStopCause::TokenAccountingUnavailable)
+        );
+    }
+
+    #[test]
+    fn restart_reconciles_a_terminal_run_with_an_unresolved_provider_attempt() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let mut run = terminal_run("terminal-pending-provider");
+        run.state = RunState::Cancelled;
+        run.terminal_result = Some("cancelled".into());
+        run.error_code = Some("cancelled".into());
+        run.stop_cause = Some(RunStopCause::Cancelled);
+        run.bounds.max_total_tokens = Some(1_000);
+        run.aggregates.usage_pending_requests = 1;
+        store.save_run(&run).unwrap();
+        drop(store);
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        let recovered = reopened
+            .load_run("terminal-pending-provider")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, RunState::Cancelled);
+        assert_eq!(recovered.aggregates.usage_pending_requests, 0);
+        assert!(!recovered.aggregates.usage_complete);
+        assert_eq!(
+            recovered.error_code.as_deref(),
+            Some("max_total_tokens_usage_unavailable")
+        );
+        assert_eq!(
+            recovered.stop_cause,
+            Some(RunStopCause::TokenAccountingUnavailable)
+        );
     }
 
     #[test]
@@ -1182,6 +1304,7 @@ mod tests {
             terminal_result: None,
             final_response: None,
             error_code: None,
+            stop_cause: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -1410,6 +1533,7 @@ mod tests {
             terminal_result: None,
             final_response: None,
             error_code: None,
+            stop_cause: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -1512,5 +1636,82 @@ mod tests {
             RunState::Completed
         );
         assert!(!intent.exists());
+    }
+
+    #[test]
+    fn finalization_preserves_newer_durable_usage_and_typed_stop() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let mut durable = terminal_run("usage-final");
+        durable.state = RunState::Running;
+        durable.terminal_result = None;
+        durable.final_response = None;
+        durable.aggregates.usage.prompt_tokens = 7;
+        durable.aggregates.usage.completion_tokens = 5;
+        durable.aggregates.usage.total_tokens = 12;
+        durable.aggregates.usage.requests = 2;
+        durable.aggregates.usage_complete = false;
+        durable.error_code = Some("max_total_tokens_usage_unavailable".into());
+        durable.stop_cause = Some(RunStopCause::TokenAccountingUnavailable);
+        store.save_run(&durable).unwrap();
+
+        let mut stale_candidate = terminal_run("usage-final");
+        stale_candidate.error_code = Some("limit_reached".into());
+        stale_candidate.stop_cause = Some(RunStopCause::Completed);
+        let finalized = store.persist_finalization(&stale_candidate).unwrap();
+
+        assert_eq!(finalized.aggregates.usage.prompt_tokens, 7);
+        assert_eq!(finalized.aggregates.usage.completion_tokens, 5);
+        assert_eq!(finalized.aggregates.usage.total_tokens, 12);
+        assert_eq!(finalized.aggregates.usage.requests, 2);
+        assert!(!finalized.aggregates.usage_complete);
+        assert_eq!(
+            finalized.error_code.as_deref(),
+            Some("max_total_tokens_usage_unavailable")
+        );
+        assert_eq!(
+            finalized.stop_cause,
+            Some(RunStopCause::TokenAccountingUnavailable)
+        );
+    }
+
+    #[test]
+    fn finalization_keeps_accounting_fields_consistent_across_a_cancel_race() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let mut cancelled = terminal_run("cancel-accounting-race");
+        cancelled.state = RunState::Cancelled;
+        cancelled.terminal_result = Some("cancelled".into());
+        cancelled.error_code = Some("cancelled".into());
+        cancelled.stop_cause = Some(RunStopCause::Cancelled);
+        cancelled.bounds.max_total_tokens = Some(100);
+        cancelled.aggregates.usage_pending_requests = 1;
+        store.save_run(&cancelled).unwrap();
+
+        let mut accounting = terminal_run("cancel-accounting-race");
+        accounting.state = RunState::LimitReached;
+        accounting.bounds.max_total_tokens = Some(100);
+        accounting.terminal_result = Some("max_total_tokens_usage_unavailable".into());
+        accounting.error_code = Some("max_total_tokens_usage_unavailable".into());
+        accounting.stop_cause = Some(RunStopCause::TokenAccountingUnavailable);
+        accounting.aggregates.usage_complete = false;
+        accounting.aggregates.usage_pending_requests = 0;
+
+        let finalized = store.persist_finalization(&accounting).unwrap();
+        assert_eq!(finalized.state, RunState::Cancelled);
+        assert_eq!(
+            finalized.stop_cause,
+            Some(RunStopCause::TokenAccountingUnavailable)
+        );
+        assert_eq!(
+            finalized.terminal_result.as_deref(),
+            Some("max_total_tokens_usage_unavailable")
+        );
+        assert_eq!(
+            finalized.error_code.as_deref(),
+            Some("max_total_tokens_usage_unavailable")
+        );
+        assert_eq!(finalized.aggregates.usage_pending_requests, 0);
+        assert!(!finalized.aggregates.usage_complete);
     }
 }

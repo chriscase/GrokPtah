@@ -121,7 +121,7 @@ pub use orchestration::{
     is_recognized_test_command, merge_bounds, prompt_preview, safe_id_filename, AgentRecord,
     AgentResumePlan, AgentState, ContinuationCheckpoint, ContinuationReason, OrchStore,
     OrchestrationConfig, OrchestrationService, PromotionState, RetentionPolicy, RetentionReport,
-    RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
+    RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
     WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
 };
 pub use permission::{PermissionDecision, PermissionRequest};

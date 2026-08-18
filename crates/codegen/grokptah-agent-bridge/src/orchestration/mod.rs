@@ -16,5 +16,6 @@ pub use types::{
     safe_id_filename, AgentRecord, AgentResumePlan, AgentState, AuditEntry, ChangeRecord,
     ContinuationCheckpoint, ContinuationReason, IdempotencyReceipt, OrchError, OrchErrorCode,
     PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution, RunExecutionMode,
-    RunRecord, RunState, TestObservation, CONTROL_TOOLS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
+    RunRecord, RunState, RunStopCause, TestObservation, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    MAX_AGENT_CONTEXT_BYTES,
 };

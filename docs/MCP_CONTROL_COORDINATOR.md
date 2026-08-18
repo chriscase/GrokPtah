@@ -270,6 +270,30 @@ Mutating tools take `request_id`:
   Cross-session, workspace-mismatched, non-interrupted, or mode-changing
   requests fail closed.
 
+### Run token ceiling contract
+
+`bounds` accepts both `maxTotalTokens` and `max_total_tokens` as a positive
+integer. This is an additive bounds-contract revision: legacy callers that omit
+the field preserve the previous behavior. A configured server ceiling is
+applied when the caller omits the field; an explicit caller value may only
+narrow it. Zero, values above the server ceiling, and unknown bounds fields are
+rejected.
+
+`ptah_get_run`, `ptah_list_runs`, and `ptah_get_handoff` expose the applied
+`bounds`, cumulative `usage`, `usageComplete`, `usagePendingRequests`, and typed
+`stopCause`. Accounting
+is persisted after each provider response rather than reconstructed from the
+process-local `/usage` counter, so a restart cannot turn consumed tokens back
+into zero. Enforcement happens at model-round boundaries: the response that
+reaches the ceiling and its already-returned tool batch finish, but no next
+parent or subagent model request begins. Missing or malformed usage stops a
+bounded run fail-closed with `token_accounting_unavailable`; unbounded runs
+continue and report `usageComplete: false`.
+Bounded parent and child requests share one serialized admission gate, and an
+in-flight attempt is persisted before network transmission. Restart recovery
+turns any unresolved attempt into incomplete accounting rather than assuming
+it consumed zero tokens.
+
 ### `ptah_steer` (non-cancelling)
 
 - Guides the active Build turn at the **next safe model boundary**.

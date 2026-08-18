@@ -57,6 +57,26 @@ function testLabel(run: DurableRun): string {
   return `${passed}/${tests.length} tests passed`;
 }
 
+function tokenLabel(run: DurableRun): string | null {
+  const usage = run.aggregates.usage;
+  const ceiling = run.bounds.maxTotalTokens;
+  if (!usage.requests && ceiling == null && run.aggregates.usageComplete !== false) return null;
+  const measured = run.aggregates.usagePendingRequests
+    ? "measuring"
+    : run.aggregates.usageComplete === false
+      ? "partial"
+      : "measured";
+  if (ceiling != null) {
+    return `${usage.totalTokens.toLocaleString()} / ${ceiling.toLocaleString()} tokens · ${measured}`;
+  }
+  return `${usage.totalTokens.toLocaleString()} tokens · ${measured}`;
+}
+
+function stopCauseLabel(run: DurableRun): string | null {
+  if (!run.stopCause) return null;
+  return run.stopCause.replace(/_/g, " ");
+}
+
 function runOriginLabel(run: DurableRun): string {
   if (run.clientId === "mcp") return "MCP coordinator";
   if (run.clientId === "desktop") return "Desktop";
@@ -413,6 +433,8 @@ export function RunInspector({
             const approvalExpiry = run.approval ? Date.parse(run.approval.expiresAt) : NaN;
             const approvalActive = Number.isFinite(approvalExpiry) && approvalExpiry > Date.now();
             const requiresDurableApproval = run.clientId === "mcp";
+            const tokens = tokenLabel(run);
+            const stopCause = stopCauseLabel(run);
             return (
               <article className={`run-card state-${run.state}`} key={run.runId}>
                 <div className="run-card-heading">
@@ -465,7 +487,13 @@ export function RunInspector({
                   <span>{run.aggregates.changes.length} files</span>
                   <span>{testLabel(run)}</span>
                   {verification && <span>Verification: {verification.status}</span>}
+                  {tokens && <span>{tokens}</span>}
                 </div>
+                {stopCause && (
+                  <div className="run-callout" role="status">
+                    Stop cause: {stopCause}
+                  </div>
+                )}
                 {run.state === "interrupted" && (
                   <div className="run-callout" role="status">
                     This run stopped after restart. Review it before starting a linked retry.

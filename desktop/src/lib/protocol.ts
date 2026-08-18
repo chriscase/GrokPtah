@@ -57,6 +57,19 @@ export type DurableRunState =
   | "interrupted"
   | "limit_reached";
 
+export type DurableRunStopCause =
+  | "completed"
+  | "round_limit"
+  | "duration_limit"
+  | "token_ceiling"
+  | "token_accounting_unavailable"
+  | "token_accounting_overflow"
+  | "stationarity"
+  | "recovery_exhausted"
+  | "cancelled"
+  | "interrupted"
+  | "failed";
+
 export type PersistentAgentState =
   | "active"
   | "waiting"
@@ -244,6 +257,7 @@ export interface DurableRun {
     maxPromptBytes: number;
     maxRounds: number;
     maxDurationMs: number;
+    maxTotalTokens?: number | null;
   };
   promptPreview: string;
   startSeq?: number | null;
@@ -253,6 +267,7 @@ export interface DurableRun {
   terminalResult?: string | null;
   finalResponse?: string | null;
   errorCode?: string | null;
+  stopCause?: DurableRunStopCause | null;
   aggregates: {
     changes: Array<{ path: string; summary: string }>;
     tests: Array<{
@@ -266,6 +281,8 @@ export interface DurableRun {
     permissionsGranted: number;
     permissionsDenied: number;
     usage: CompletionEvidence["usage"];
+    usageComplete?: boolean;
+    usagePendingRequests?: number;
     verification?: CompletionEvidence | null;
   };
   progress?: {

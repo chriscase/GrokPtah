@@ -31,12 +31,34 @@ impl RunState {
     }
 }
 
+/// Host-decided terminal cause. Unlike `terminal_result`/`final_response`,
+/// this is never inferred from model-authored prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStopCause {
+    Completed,
+    RoundLimit,
+    DurationLimit,
+    TokenCeiling,
+    TokenAccountingUnavailable,
+    TokenAccountingOverflow,
+    Stationarity,
+    RecoveryExhausted,
+    Cancelled,
+    Interrupted,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunBounds {
     pub max_prompt_bytes: usize,
     pub max_rounds: u32,
     pub max_duration_ms: u64,
+    /// Optional run-wide model-token stop threshold. `None` preserves the
+    /// historical unbounded-token behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u64>,
 }
 
 impl Default for RunBounds {
@@ -45,6 +67,7 @@ impl Default for RunBounds {
             max_prompt_bytes: 100_000,
             max_rounds: 24,
             max_duration_ms: 15 * 60 * 1000,
+            max_total_tokens: None,
         }
     }
 }
@@ -68,6 +91,12 @@ impl RunBounds {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
                 "max_duration_ms must be > 0",
+            ));
+        }
+        if self.max_total_tokens == Some(0) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "max_total_tokens must be > 0",
             ));
         }
         Ok(())
@@ -141,6 +170,8 @@ pub fn merge_bounds(
                 | "max_rounds"
                 | "maxDurationMs"
                 | "max_duration_ms"
+                | "maxTotalTokens"
+                | "max_total_tokens"
         ) {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -154,6 +185,18 @@ pub fn merge_bounds(
         read_bound_u32(obj, &["maxRounds", "max_rounds"])?.unwrap_or(ceiling.max_rounds);
     let max_duration_ms = read_bound_u64(obj, &["maxDurationMs", "max_duration_ms"])?
         .unwrap_or(ceiling.max_duration_ms);
+    let requested_max_total_tokens = read_bound_u64(obj, &["maxTotalTokens", "max_total_tokens"])?;
+    let max_total_tokens = match (ceiling.max_total_tokens, requested_max_total_tokens) {
+        (Some(server_ceiling), Some(requested)) if requested > server_ceiling => {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "max_total_tokens exceeds server ceiling",
+            ));
+        }
+        (Some(server_ceiling), Some(requested)) => Some(requested.min(server_ceiling)),
+        (Some(server_ceiling), None) => Some(server_ceiling),
+        (None, requested) => requested,
+    };
 
     if max_prompt_bytes > ceiling.max_prompt_bytes {
         return Err(OrchError::new(
@@ -177,6 +220,7 @@ pub fn merge_bounds(
         max_prompt_bytes,
         max_rounds,
         max_duration_ms,
+        max_total_tokens,
     };
     merged.validate()?;
     Ok(merged)
@@ -266,7 +310,7 @@ fn positive_u64(v: &serde_json::Value, key: &str) -> Result<u64, OrchError> {
     Ok(n)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunAggregates {
     pub changes: Vec<ChangeRecord>,
@@ -279,8 +323,33 @@ pub struct RunAggregates {
     pub permissions_denied: u32,
     #[serde(default)]
     pub usage: CompletionUsage,
+    /// True only when every provider request attributable to this run returned
+    /// valid usage metadata. Missing on legacy records intentionally means
+    /// false so old zero totals are never mistaken for measured usage.
+    #[serde(default)]
+    pub usage_complete: bool,
+    /// Provider requests durably admitted but not yet reconciled with a
+    /// response. A non-zero value after restart makes accounting incomplete.
+    #[serde(default)]
+    pub usage_pending_requests: u32,
     #[serde(default)]
     pub verification: Option<CompletionEvidence>,
+}
+
+impl Default for RunAggregates {
+    fn default() -> Self {
+        Self {
+            changes: Vec::new(),
+            tests: Vec::new(),
+            permissions_requested: 0,
+            permissions_granted: 0,
+            permissions_denied: 0,
+            usage: CompletionUsage::default(),
+            usage_complete: true,
+            usage_pending_requests: 0,
+            verification: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +430,8 @@ pub struct RunRecord {
     pub terminal_result: Option<String>,
     pub final_response: Option<String>,
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub stop_cause: Option<RunStopCause>,
     /// Durable per-run aggregates for journal rollover (#196 residual).
     #[serde(default)]
     pub aggregates: RunAggregates,
@@ -383,6 +454,25 @@ impl RunRecord {
     /// explicit to new callers.
     pub fn lane_id(&self) -> Uuid {
         self.session_id
+    }
+
+    /// Close a durable provider-attempt marker that can no longer be
+    /// reconciled with a response. Missing usage is sticky, and a bounded run
+    /// records an explicit host-decided accounting stop rather than pretending
+    /// its measured total is complete.
+    pub(crate) fn fail_closed_unresolved_provider_attempts(&mut self) -> bool {
+        if self.aggregates.usage_pending_requests == 0 {
+            return false;
+        }
+        self.aggregates.usage_pending_requests = 0;
+        self.aggregates.usage_complete = false;
+        if self.bounds.max_total_tokens.is_some() {
+            let code = "max_total_tokens_usage_unavailable";
+            self.terminal_result = Some(code.into());
+            self.error_code = Some(code.into());
+            self.stop_cause = Some(RunStopCause::TokenAccountingUnavailable);
+        }
+        true
     }
 }
 
@@ -886,6 +976,72 @@ mod tests {
         let m = merge_bounds(&ceil, Some(&ok)).unwrap();
         assert_eq!(m.max_rounds, 2);
         assert_eq!(m.max_duration_ms, 1000);
+    }
+
+    #[test]
+    fn token_bound_is_optional_and_caller_may_only_narrow() {
+        let unbounded = RunBounds::default();
+        let omitted = merge_bounds(&unbounded, None).unwrap();
+        assert_eq!(omitted.max_total_tokens, None);
+
+        let caller_bound = serde_json::json!({"maxTotalTokens": 9_000});
+        assert_eq!(
+            merge_bounds(&unbounded, Some(&caller_bound))
+                .unwrap()
+                .max_total_tokens,
+            Some(9_000)
+        );
+
+        let ceiling = RunBounds {
+            max_total_tokens: Some(8_000),
+            ..RunBounds::default()
+        };
+        assert_eq!(
+            merge_bounds(&ceiling, None).unwrap().max_total_tokens,
+            Some(8_000)
+        );
+        assert_eq!(
+            merge_bounds(
+                &ceiling,
+                Some(&serde_json::json!({"max_total_tokens": 4_000}))
+            )
+            .unwrap()
+            .max_total_tokens,
+            Some(4_000)
+        );
+        assert!(merge_bounds(
+            &ceiling,
+            Some(&serde_json::json!({"maxTotalTokens": 8_001}))
+        )
+        .is_err());
+        assert!(merge_bounds(&ceiling, Some(&serde_json::json!({"maxTotalTokens": 0}))).is_err());
+    }
+
+    #[test]
+    fn legacy_run_bounds_deserialize_without_a_token_limit() {
+        let bounds: RunBounds = serde_json::from_value(serde_json::json!({
+            "maxPromptBytes": 1000,
+            "maxRounds": 3,
+            "maxDurationMs": 5000
+        }))
+        .unwrap();
+        assert_eq!(bounds.max_total_tokens, None);
+        assert!(serde_json::to_value(bounds)
+            .unwrap()
+            .get("maxTotalTokens")
+            .is_none());
+    }
+
+    #[test]
+    fn new_aggregates_start_complete_but_legacy_usage_is_unknown() {
+        assert!(RunAggregates::default().usage_complete);
+        let legacy: RunAggregates = serde_json::from_value(serde_json::json!({
+            "changes": [],
+            "tests": [],
+            "usage": {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0, "requests": 0}
+        }))
+        .unwrap();
+        assert!(!legacy.usage_complete);
     }
 
     #[test]

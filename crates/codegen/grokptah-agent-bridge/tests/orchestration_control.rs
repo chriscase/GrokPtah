@@ -3,16 +3,21 @@
 mod common;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
     hash_payload, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
     RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    discovered_tool_names, set_grokptah_home_override, start_control_server, AgentHost, EventBus,
-    HostConfig, SessionKind, SessionUpdate, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    discovered_tool_names, model_selection_key, set_grokptah_home_override, start_control_server,
+    AgentHost, EventBus, HostConfig, SessionKind, SessionUpdate, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -1067,6 +1072,7 @@ fn restart_interrupted_no_auto_resume() {
         terminal_result: None,
         final_response: None,
         error_code: None,
+        stop_cause: None,
         aggregates: Default::default(),
         progress: None,
         execution: None,
@@ -1103,6 +1109,7 @@ fn restart_clears_queued_admission_position() {
         terminal_result: None,
         final_response: None,
         error_code: None,
+        stop_cause: None,
         aggregates: Default::default(),
         progress: None,
         execution: None,
@@ -1148,6 +1155,7 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
                 max_prompt_bytes: 10_000,
                 max_rounds: 2,
                 max_duration_ms: 30_000,
+                max_total_tokens: None,
             },
             prompt_preview: "previous attempt".into(),
             start_seq: Some(1),
@@ -1157,6 +1165,7 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
             terminal_result: Some("interrupted".into()),
             final_response: None,
             error_code: Some("interrupted".into()),
+            stop_cause: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -1764,6 +1773,7 @@ fn run_event_pages_filter_before_limit_across_sessions() {
             terminal_result: Some("completed".into()),
             final_response: None,
             error_code: None,
+            stop_cause: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -1958,6 +1968,10 @@ async fn queued_admission_is_bounded_fair_and_cancellable() {
         .unwrap();
     assert_eq!(cancelled["wasQueued"], true);
     assert_eq!(cancelled["teardownComplete"], true);
+    assert_eq!(
+        orch.get_run(&auth, cancelled_id).unwrap()["stopCause"],
+        "cancelled"
+    );
     let cap = orch.get_capacity(&auth).unwrap();
     assert_eq!(cap["queuedRuns"], 3);
     assert_eq!(
@@ -2585,6 +2599,177 @@ async fn submit_round_limit_reached_via_wired_max_rounds() {
         text.contains("Stopped after 2 tool rounds"),
         "expected stop message reflecting max_rounds=2, got {text:?}"
     );
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn token_ceiling_wins_over_round_limit_after_last_round_tool_calls() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Json(json!({
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-write-at-ceiling",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"ceiling-proof.txt\",\"content\":\"settled\\n\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 6,
+                    "completion_tokens": 4,
+                    "total_tokens": 10
+                }
+            }))
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (home, mut guard) = setup_home();
+    guard.remove("GROKPTAH_AGENT_OFFLINE");
+    guard.set("GROKPTAH_API_BASE", format!("http://{address}/v1"));
+    guard.set("GROKPTAH_API_KEY", "synthetic-compatible-key");
+    let host = started_host();
+    host.set_model(model_selection_key("env-grokptah", "synthetic-cheap-code"));
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orch")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds {
+                max_rounds: 1,
+                max_total_tokens: Some(10),
+                ..RunBounds::default()
+            },
+        },
+    );
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let accepted = orch
+        .submit_task(
+            &auth,
+            "token-last-round",
+            session.id,
+            ws.path(),
+            "Write the proof file.".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let run_id = accepted["runId"].as_str().unwrap();
+    let state = wait_run_terminal(&orch, &auth, run_id, Duration::from_secs(10)).await;
+    assert_eq!(state, RunState::LimitReached);
+    let run = orch.get_run(&auth, run_id).unwrap();
+    assert_eq!(run["stopCause"], "token_ceiling");
+    assert_eq!(run["errorCode"], "max_total_tokens_reached");
+    assert_eq!(run["aggregates"]["usage"]["totalTokens"], 10);
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("ceiling-proof.txt")).unwrap(),
+        "settled\n"
+    );
+
+    host.stop().unwrap();
+    server.abort();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn bounded_compaction_uses_durable_admission_and_stops_before_the_main_model_call() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|State(requests): State<Arc<AtomicUsize>>| async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                Json(json!({
+                    "choices": [{"message": {"content": "Compacted durable context."}}],
+                    "usage": {
+                        "prompt_tokens": 6,
+                        "completion_tokens": 4,
+                        "total_tokens": 10
+                    }
+                }))
+            }),
+        )
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (home, mut guard) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    for index in 0..21 {
+        host.session_prompt(session.id, format!("offline context turn {index}"))
+            .await
+            .unwrap();
+    }
+
+    guard.remove("GROKPTAH_AGENT_OFFLINE");
+    guard.set("GROKPTAH_API_BASE", format!("http://{address}/v1"));
+    guard.set("GROKPTAH_API_KEY", "synthetic-compatible-key");
+    host.set_model(model_selection_key("env-grokptah", "synthetic-cheap-code"));
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orch")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds {
+                max_rounds: 3,
+                max_total_tokens: Some(10),
+                ..RunBounds::default()
+            },
+        },
+    );
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let accepted = orch
+        .submit_task(
+            &auth,
+            "bounded-compact",
+            session.id,
+            ws.path(),
+            "Continue after compacting the accumulated context.".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let run_id = accepted["runId"].as_str().unwrap();
+    let state = wait_run_terminal(&orch, &auth, run_id, Duration::from_secs(10)).await;
+    assert_eq!(state, RunState::LimitReached);
+    let run = orch.get_run(&auth, run_id).unwrap();
+    assert_eq!(run["stopCause"], "token_ceiling");
+    assert_eq!(run["aggregates"]["usage"]["totalTokens"], 10);
+    assert_eq!(run["aggregates"]["usagePendingRequests"], 0);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+    host.stop().unwrap();
+    server.abort();
     set_grokptah_home_override(None);
 }
 

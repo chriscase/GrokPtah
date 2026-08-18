@@ -545,13 +545,33 @@ pub(crate) enum AgentStep {
         streamed: bool,
         /// Model reasoning_content (also streamed as AgentThoughtChunk).
         reasoning: Option<String>,
+        /// Provider-reported usage for this completed model request.
+        usage: Option<crate::completion::CompletionUsage>,
     },
     ToolCalls {
         content: Option<String>,
         tool_calls: Vec<AgentToolCall>,
         streamed: bool,
         reasoning: Option<String>,
+        /// Provider-reported usage for this completed model request.
+        usage: Option<crate::completion::CompletionUsage>,
     },
+}
+
+impl AgentStep {
+    fn with_usage(mut self, usage: Option<crate::completion::CompletionUsage>) -> Self {
+        match &mut self {
+            Self::Final { usage: slot, .. } | Self::ToolCalls { usage: slot, .. } => {
+                *slot = usage;
+            }
+        }
+        self
+    }
+}
+
+pub(crate) struct ChatReply {
+    pub text: String,
+    pub usage: Option<crate::completion::CompletionUsage>,
 }
 
 /// Map of OpenAI function name → (real server name, real tool name).
@@ -1164,6 +1184,7 @@ pub(crate) fn is_round_limit_stop_message(text: &str) -> bool {
 /// not produce a trustworthy completion, even when the model returned text.
 pub(crate) fn is_incomplete_stop_message(text: &str) -> bool {
     is_round_limit_stop_message(text)
+        || text.contains("Stopped at the run token boundary")
         || (text.starts_with("Stopped after ") && text.contains("without making progress"))
         || (text.starts_with("Stopped after recovery step")
             && text.contains("unresolved cargo test"))
@@ -1208,7 +1229,7 @@ pub(crate) async fn propose_plan_with_model(
     cwd: &Path,
     goal: &str,
     cancel: &CancellationToken,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Option<crate::completion::CompletionUsage>)> {
     if cancel.is_cancelled() {
         bail!("cancelled");
     }
@@ -1217,7 +1238,7 @@ pub(crate) async fn propose_plan_with_model(
          Return ONLY a numbered list of 3-8 concrete steps (no preamble).\n\nGoal: {goal}\nProject: {}",
         cwd.display()
     );
-    let text = call_xai_chat(
+    let reply = call_xai_chat(
         creds,
         model,
         &[("user".into(), prompt)],
@@ -1226,11 +1247,10 @@ pub(crate) async fn propose_plan_with_model(
         SessionKind::Build,
     )
     .await?;
-    let steps = parse_numbered_plan(&text);
-    if steps.is_empty() {
-        bail!("model returned no parseable plan steps");
-    }
-    Ok(steps)
+    let steps = parse_numbered_plan(&reply.text);
+    // Preserve the successful response's usage even when its semantic shape
+    // is unusable; the caller can fall back without hiding billable work.
+    Ok((steps, reply.usage))
 }
 
 pub(crate) fn parse_numbered_plan(text: &str) -> Vec<String> {
@@ -1518,6 +1538,57 @@ struct AgentSseAccumulator {
     streamed_any: bool,
     saw_data: bool,
     tool_calls: std::collections::BTreeMap<u32, (String, String, String)>,
+    usage: Option<crate::completion::CompletionUsage>,
+    usage_invalid: bool,
+}
+
+/// Parse OpenAI chat-completions or Responses-style usage without guessing.
+/// A present but malformed usage object is a protocol error; an absent/null
+/// object is reported as unavailable so bounded runs can fail closed.
+pub(crate) fn parse_completion_usage(
+    value: &serde_json::Value,
+) -> Result<Option<crate::completion::CompletionUsage>> {
+    let usage = value
+        .get("usage")
+        .or_else(|| value.pointer("/response/usage"));
+    let Some(usage) = usage.filter(|usage| !usage.is_null()) else {
+        return Ok(None);
+    };
+    let object = usage
+        .as_object()
+        .ok_or_else(|| anyhow!("provider usage must be a JSON object"))?;
+    let read = |primary: &str, alias: &str| -> Result<u64> {
+        object
+            .get(primary)
+            .or_else(|| object.get(alias))
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("provider usage missing or invalid `{primary}`"))
+    };
+    let prompt_tokens = read("prompt_tokens", "input_tokens")?;
+    let completion_tokens = read("completion_tokens", "output_tokens")?;
+    let derived_total = prompt_tokens
+        .checked_add(completion_tokens)
+        .ok_or_else(|| anyhow!("provider usage token total overflowed"))?;
+    let total_tokens = match object.get("total_tokens") {
+        Some(value) => {
+            let reported = value
+                .as_u64()
+                .ok_or_else(|| anyhow!("provider usage has invalid `total_tokens`"))?;
+            if reported != derived_total {
+                bail!(
+                    "provider usage has contradictory `total_tokens`: reported {reported}, derived {derived_total}"
+                );
+            }
+            reported
+        }
+        None => derived_total,
+    };
+    Ok(Some(crate::completion::CompletionUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        requests: 1,
+    }))
 }
 
 fn apply_agent_sse_line<F, G>(
@@ -1546,6 +1617,14 @@ where
     }
     let value: serde_json::Value = serde_json::from_str(data)
         .map_err(|error| anyhow!("malformed provider SSE JSON: {error}"))?;
+    match parse_completion_usage(&value) {
+        Ok(Some(usage)) => acc.usage = Some(usage),
+        Ok(None) => {}
+        Err(_) => {
+            acc.usage = None;
+            acc.usage_invalid = true;
+        }
+    }
     let delta = if value["choices"][0]["delta"].is_object() {
         &value["choices"][0]["delta"]
     } else if value["choices"][0]["message"].is_object() {
@@ -1654,6 +1733,7 @@ pub(crate) async fn call_xai_agent_step<F, G>(
     effort: EffortLevel,
     messages: &[serde_json::Value],
     tools: &serde_json::Value,
+    allow_transient_retries: bool,
     cancel: &CancellationToken,
     mut on_delta: F,
     mut on_thought: G,
@@ -1691,11 +1771,20 @@ where
         "tool_choice": "auto",
         "stream": target.capabilities.stream
     });
+    if target.capabilities.stream {
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
     apply_effort_to_agent_body(&mut body, &target, effort)?;
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
+    // Three compatibility downgrades and up to three transient retries can all
+    // be needed by the same provider. Keep each downgrade independently
+    // eligible while retaining a hard cap on total loop attempts.
+    const MAX_REQUEST_ATTEMPTS: u32 = 7;
+    const MAX_TRANSIENT_RETRIES: u32 = 3;
+    let mut transient_retries = 0u32;
     let mut last_err = None::<String>;
-    for attempt in 0..4u32 {
+    for _request_attempt in 0..MAX_REQUEST_ATTEMPTS {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
@@ -1733,9 +1822,10 @@ where
                         format!("request error: {e}")
                     },
                 );
-                if attempt < 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(400 * (1 << attempt)))
-                        .await;
+                if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
+                    let delay = 400 * (1 << transient_retries);
+                    transient_retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
                 }
                 bail!("{}", last_err.unwrap());
@@ -1786,8 +1876,10 @@ where
             } else {
                 format!("HTTP {status}: {clipped}")
             });
-            if attempt < 3 {
-                tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << attempt))).await;
+            if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
+                let delay = 600 * (1 << transient_retries);
+                transient_retries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 continue;
             }
             bail!("{}", last_err.unwrap());
@@ -1797,6 +1889,19 @@ where
             let text = read_bounded_response_body(resp, cancel)
                 .await
                 .unwrap_or_default();
+            // Some OpenAI-compatible gateways support streaming but reject
+            // `stream_options`. Retry once without usage metadata; bounded
+            // runs will then stop fail-closed at the response boundary.
+            if status.as_u16() == 400
+                && target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
+                && body.get("stream_options").is_some()
+            {
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("stream_options");
+                }
+                last_err = Some("HTTP 400 (will retry without stream_options)".into());
+                continue;
+            }
             // Some compatible gateways support native tools but reject the
             // optional tool_choice field. Retry once without that foreign
             // field before changing the streaming contract.
@@ -1811,11 +1916,13 @@ where
                 continue;
             }
             // Some proxies reject stream+tools — fall back to non-stream once.
-            if attempt < 2
-                && status.as_u16() == 400
+            if status.as_u16() == 400
                 && body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
             {
                 body["stream"] = serde_json::Value::Bool(false);
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("stream_options");
+                }
                 last_err = Some(format!(
                     "HTTP {status} (will retry non-stream): {}",
                     text.chars().take(200).collect::<String>()
@@ -1843,25 +1950,27 @@ where
             let raw = read_bounded_response_body(resp, cancel).await?;
             let v: serde_json::Value =
                 serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
-            // Note: session usage is accumulated in the turn loop when available.
-            let _ = v.get("usage"); // kept for future wire-through of session_id
-            return parse_agent_step_from_message(
+            let usage = parse_completion_usage(&v).unwrap_or(None);
+            return Ok(parse_agent_step_from_message(
                 &v["choices"][0]["message"],
                 false,
                 &mut on_delta,
                 &mut on_thought,
-            );
+            )?
+            .with_usage(usage));
         }
         if content_type.contains("application/json") {
             let raw = read_bounded_response_body(resp, cancel).await?;
             let value: serde_json::Value =
                 serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
-            return parse_agent_step_from_message(
+            let usage = parse_completion_usage(&value).unwrap_or(None);
+            return Ok(parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
                 &mut on_delta,
                 &mut on_thought,
-            );
+            )?
+            .with_usage(usage));
         }
 
         // SSE stream path — cancel kills the body read promptly.
@@ -1907,12 +2016,14 @@ where
             let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|error| {
                 anyhow!("provider returned neither SSE nor valid JSON: {error}")
             })?;
-            return parse_agent_step_from_message(
+            let usage = parse_completion_usage(&value).unwrap_or(None);
+            return Ok(parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
                 &mut on_delta,
                 &mut on_thought,
-            );
+            )?
+            .with_usage(usage));
         }
 
         ensure_stream_completed(acc.saw_data, done)?;
@@ -1923,6 +2034,7 @@ where
         } else {
             Some(acc.reasoning)
         };
+        let usage = if acc.usage_invalid { None } else { acc.usage };
 
         if !tool_calls.is_empty() {
             let content_opt = if acc.content.trim().is_empty() {
@@ -1935,6 +2047,7 @@ where
                 tool_calls,
                 streamed: acc.streamed_any,
                 reasoning: reasoning_opt,
+                usage,
             });
         }
 
@@ -1943,6 +2056,7 @@ where
                 text: acc.content,
                 streamed: acc.streamed_any,
                 reasoning: reasoning_opt,
+                usage,
             });
         }
         if let Some(r) = reasoning_opt {
@@ -1951,14 +2065,18 @@ where
                 text: String::new(),
                 streamed: true,
                 reasoning: Some(r),
+                usage,
             });
         }
-        last_err = Some("empty stream response".into());
-        if attempt < 3 {
-            body["stream"] = serde_json::Value::Bool(false);
-            continue;
-        }
-        bail!("{}", last_err.unwrap());
+        // A successful stream may legitimately carry only usage metadata.
+        // It is still a billable provider response, so never hide it behind
+        // an internal retry that the run ledger cannot observe.
+        return Ok(AgentStep::Final {
+            text: String::new(),
+            streamed: acc.streamed_any,
+            reasoning: None,
+            usage,
+        });
     }
     bail!(
         "{}",
@@ -1969,9 +2087,12 @@ where
 #[cfg(test)]
 mod compatible_stream_tests {
     use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use axum::body::{Body, Bytes};
+    use axum::extract::Json;
     use axum::http::{header, Response, StatusCode};
     use axum::routing::post;
     use axum::Router;
@@ -2137,6 +2258,89 @@ mod compatible_stream_tests {
     }
 
     #[test]
+    fn parses_chat_and_responses_usage_without_guessing() {
+        let chat = parse_completion_usage(&serde_json::json!({
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "total_tokens": 18
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(chat.prompt_tokens, 11);
+        assert_eq!(chat.completion_tokens, 7);
+        assert_eq!(chat.total_tokens, 18);
+        assert_eq!(chat.requests, 1);
+
+        let responses = parse_completion_usage(&serde_json::json!({
+            "response": {"usage": {"input_tokens": 4, "output_tokens": 3}}
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(responses.total_tokens, 7);
+        assert!(parse_completion_usage(&serde_json::json!({}))
+            .unwrap()
+            .is_none());
+        assert!(
+            parse_completion_usage(&serde_json::json!({"usage": {"total_tokens": 3}})).is_err()
+        );
+        assert!(parse_completion_usage(&serde_json::json!({
+            "usage": {"prompt_tokens": -1, "completion_tokens": 1, "total_tokens": 0}
+        }))
+        .is_err());
+        let contradictory = parse_completion_usage(&serde_json::json!({
+            "usage": {
+                "prompt_tokens": 10_000,
+                "completion_tokens": 5_000,
+                "total_tokens": 1
+            }
+        }))
+        .unwrap_err();
+        assert!(contradictory.to_string().contains("contradictory"));
+        assert!(parse_completion_usage(&serde_json::json!({
+            "usage": {
+                "prompt_tokens": u64::MAX,
+                "completion_tokens": 1,
+                "total_tokens": u64::MAX
+            }
+        }))
+        .unwrap_err()
+        .to_string()
+        .contains("overflowed"));
+    }
+
+    #[test]
+    fn streamed_usage_uses_the_last_valid_chunk_and_malformed_becomes_missing() {
+        let mut acc = AgentSseAccumulator::default();
+        apply_agent_sse_line(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}",
+            &mut acc,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(acc.usage.as_ref().unwrap().total_tokens, 7);
+        apply_agent_sse_line(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}",
+            &mut acc,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(acc.usage.as_ref().unwrap().total_tokens, 8);
+        apply_agent_sse_line(
+            "data: {\"choices\":[],\"usage\":{\"total_tokens\":9}}",
+            &mut acc,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(acc.usage.is_none());
+        assert!(acc.usage_invalid);
+    }
+
+    #[test]
     fn malformed_non_stream_tool_calls_fail_before_dispatch() {
         for message in [
             serde_json::json!({"tool_calls": [{
@@ -2155,6 +2359,154 @@ mod compatible_stream_tests {
                 parse_agent_step_from_message(&message, false, &mut |_| {}, &mut |_| {},).is_err()
             );
         }
+    }
+
+    #[test]
+    fn compatible_bad_request_downgrades_are_independent() {
+        let _lock = crate::discover::home_override_serial();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let observed = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+                let handler_observed = Arc::clone(&observed);
+                let app = Router::new().route(
+                    "/v1/chat/completions",
+                    post(move |Json(body): Json<serde_json::Value>| {
+                        let observed = Arc::clone(&handler_observed);
+                        async move {
+                            observed.lock().unwrap().push(body.clone());
+                            if body.get("stream_options").is_some()
+                                || body.get("tool_choice").is_some()
+                                || body.get("stream").and_then(serde_json::Value::as_bool)
+                                    == Some(true)
+                            {
+                                return Response::builder()
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .body(Body::from("unsupported compatibility field"))
+                                    .unwrap();
+                            }
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    serde_json::json!({
+                                        "choices": [{"message": {"content": "done"}}],
+                                        "usage": {
+                                            "prompt_tokens": 2,
+                                            "completion_tokens": 1,
+                                            "total_tokens": 3
+                                        }
+                                    })
+                                    .to_string(),
+                                ))
+                                .unwrap()
+                        }
+                    }),
+                );
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let temp = tempfile::tempdir().unwrap();
+                let model =
+                    install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
+                let result = call_xai_agent_step(
+                    &compatible_credentials("cancel-test"),
+                    &model,
+                    EffortLevel::None,
+                    &[serde_json::json!({"role": "user", "content": "synthetic"})],
+                    &serde_json::json!([]),
+                    true,
+                    &CancellationToken::new(),
+                    |_| {},
+                    |_| {},
+                )
+                .await
+                .unwrap();
+                match result {
+                    AgentStep::Final { text, usage, .. } => {
+                        assert_eq!(text, "done");
+                        assert_eq!(usage.unwrap().total_tokens, 3);
+                    }
+                    AgentStep::ToolCalls { .. } => panic!("expected a final response"),
+                }
+
+                let requests = observed.lock().unwrap();
+                assert_eq!(requests.len(), 4);
+                assert!(requests[0].get("stream_options").is_some());
+                assert!(requests[1].get("stream_options").is_none());
+                assert!(requests[1].get("tool_choice").is_some());
+                assert!(requests[2].get("tool_choice").is_none());
+                assert_eq!(requests[2]["stream"], true);
+                assert_eq!(requests[3]["stream"], false);
+                drop(requests);
+                server.abort();
+            });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn successful_usage_only_stream_is_never_retried() {
+        let _lock = crate::discover::home_override_serial();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let requests = Arc::new(AtomicUsize::new(0));
+                let handler_requests = Arc::clone(&requests);
+                let app = Router::new().route(
+                    "/v1/chat/completions",
+                    post(move || {
+                        let requests = Arc::clone(&handler_requests);
+                        async move {
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "text/event-stream")
+                                .body(Body::from(concat!(
+                                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n",
+                                    "data: [DONE]\n\n"
+                                )))
+                                .unwrap()
+                        }
+                    }),
+                );
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let temp = tempfile::tempdir().unwrap();
+                let model =
+                    install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
+                let result = call_xai_agent_step(
+                    &compatible_credentials("cancel-test"),
+                    &model,
+                    EffortLevel::None,
+                    &[serde_json::json!({"role": "user", "content": "synthetic"})],
+                    &serde_json::json!([]),
+                    true,
+                    &CancellationToken::new(),
+                    |_| {},
+                    |_| {},
+                )
+                .await
+                .unwrap();
+                match result {
+                    AgentStep::Final { text, usage, .. } => {
+                        assert!(text.is_empty());
+                        assert_eq!(usage.unwrap().total_tokens, 6);
+                    }
+                    AgentStep::ToolCalls { .. } => panic!("expected a final response"),
+                }
+                assert_eq!(requests.load(Ordering::SeqCst), 1);
+                server.abort();
+            });
+        crate::discover::set_grokptah_home_override(None);
     }
 
     #[test]
@@ -2201,6 +2553,7 @@ mod compatible_stream_tests {
                         EffortLevel::None,
                         &[serde_json::json!({"role": "user", "content": "synthetic"})],
                         &serde_json::json!([]),
+                        true,
                         &cancel,
                         move |_| cancel_after_delta.cancel(),
                         |_| {},
@@ -2316,6 +2669,7 @@ where
                 tool_calls,
                 streamed: streamed || has_content,
                 reasoning,
+                usage: None,
             });
         }
     }
@@ -2337,6 +2691,7 @@ where
                 text: content.to_string(),
                 streamed: true,
                 reasoning,
+                usage: None,
             });
         }
     }
@@ -2345,6 +2700,7 @@ where
             text: String::new(),
             streamed: true,
             reasoning: Some(r),
+            usage: None,
         });
     }
     bail!("empty agent response: {msg}");
@@ -2441,7 +2797,7 @@ pub(crate) async fn call_xai_chat(
     compacted_summary: Option<&str>,
     cwd: &Path,
     kind: SessionKind,
-) -> Result<String> {
+) -> Result<ChatReply> {
     // Prefer a non-expired / refreshed OIDC access token before the first call.
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
 
@@ -2586,16 +2942,23 @@ pub(crate) async fn call_xai_chat(
     let raw = read_bounded_response_body(resp, &CancellationToken::new()).await?;
     let v: serde_json::Value =
         serde_json::from_str(&raw).map_err(|error| anyhow!("provider JSON: {error}"))?;
+    let usage = parse_completion_usage(&v).unwrap_or(None);
     // chat/completions shape
     if let Some(content) = v["choices"][0]["message"]["content"].as_str() {
         if !content.is_empty() {
-            return Ok(content.to_string());
+            return Ok(ChatReply {
+                text: content.to_string(),
+                usage,
+            });
         }
     }
     // responses API fallback (some catalog models use this backend)
     if let Some(content) = v["output_text"].as_str() {
         if !content.is_empty() {
-            return Ok(content.to_string());
+            return Ok(ChatReply {
+                text: content.to_string(),
+                usage,
+            });
         }
     }
     if let Some(arr) = v["output"].as_array() {
@@ -2606,7 +2969,10 @@ pub(crate) async fn call_xai_chat(
             }
         }
         if !parts.is_empty() {
-            return Ok(parts.join(""));
+            return Ok(ChatReply {
+                text: parts.join(""),
+                usage,
+            });
         }
     }
     bail!("empty model response: {v}");
