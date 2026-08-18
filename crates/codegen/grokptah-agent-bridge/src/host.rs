@@ -8480,8 +8480,16 @@ impl AgentHostHandle {
         }
 
         // PreToolUse hooks can deny before permission UI / execution.
-        let project = self.inner.lock().project_cwd.clone();
-        if let Some(msg) = crate::hooks::pre_tool_use_deny(project.as_deref(), tool_name, input) {
+        let session_workspace = {
+            let g = self.inner.lock();
+            g.sessions
+                .get(&session_id)
+                .map(|session| session.cwd.clone())
+                .ok_or_else(|| anyhow!("unknown session"))?
+        };
+        if let Some(msg) =
+            crate::hooks::pre_tool_use_deny(Some(&session_workspace), tool_name, input)
+        {
             let call_id = Uuid::new_v4().to_string();
             let _ = event_tx.send(SessionUpdate::ToolCall {
                 session_id,
@@ -8582,8 +8590,12 @@ impl AgentHostHandle {
                     ToolCallStatus::Completed
                 };
                 let status_s = if tr.cancelled { "failed" } else { "completed" };
-                let _ =
-                    crate::hooks::post_tool_use_note(project.as_deref(), tool_name, status_s, &out);
+                let _ = crate::hooks::post_tool_use_note(
+                    Some(&session_workspace),
+                    tool_name,
+                    status_s,
+                    &out,
+                );
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
                     call_id: call_id.clone(),
@@ -8602,8 +8614,12 @@ impl AgentHostHandle {
             }
             Err(e) => {
                 let msg = e.to_string();
-                let _ =
-                    crate::hooks::post_tool_use_note(project.as_deref(), tool_name, "failed", &msg);
+                let _ = crate::hooks::post_tool_use_note(
+                    Some(&session_workspace),
+                    tool_name,
+                    "failed",
+                    &msg,
+                );
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
                     call_id: call_id.clone(),

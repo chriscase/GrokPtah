@@ -357,3 +357,50 @@ async fn memory_write_obeys_pre_tool_hooks() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn memory_write_uses_the_lane_workspace_hook_not_the_focused_project() {
+    let _process = IsolatedProcess::install();
+    let locked_workspace = fixture_repo();
+    let open_workspace = fixture_repo();
+    fs::create_dir_all(locked_workspace.path().join(".grokptah")).unwrap();
+    fs::write(
+        locked_workspace.path().join(".grokptah/hooks.json"),
+        r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "memory_write", "deny": true, "message": "locked Lane memory" }
+    ],
+    "PostToolUse": []
+  }
+}"#,
+    )
+    .unwrap();
+
+    let host = started_host(locked_workspace.path());
+    let locked_lane = host.session_new().unwrap();
+    host.set_project_cwd(open_workspace.path()).unwrap();
+    let open_lane = host.session_new().unwrap();
+
+    // The open workspace is focused, but the first prompt still belongs to
+    // the locked Lane and must use that Lane's durable hook policy.
+    host.session_prompt(locked_lane.id, "remember must stay blocked".into())
+        .await
+        .unwrap();
+    assert!(host
+        .memory_list(locked_lane.id, MemoryScope::Project)
+        .unwrap()
+        .is_empty());
+
+    // Conversely, the focused open Lane must not inherit the other Lane's
+    // denial merely because both sessions share one host process.
+    host.session_prompt(open_lane.id, "remember open Lane fact".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        host.memory_list(open_lane.id, MemoryScope::Project)
+            .unwrap()[0]
+            .text,
+        "open Lane fact"
+    );
+}
