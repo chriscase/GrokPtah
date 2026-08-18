@@ -106,6 +106,7 @@ pub fn run() {
             commands::session_list_by_kind,
             commands::search_sessions,
             commands::session_load,
+            commands::session_inspect,
             commands::session_list,
             commands::session_list_archived,
             commands::session_list_all,

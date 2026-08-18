@@ -36,4 +36,44 @@ describe("StateCard", () => {
     expect(screen.getByText("No durable Agents yet")).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
   });
+
+  it.each([
+    ["loading", "status"],
+    ["stale", "status"],
+    ["disconnected", "status"],
+    ["queued", "status"],
+    ["approval", "status"],
+    ["blocked", "alert"],
+    ["error", "alert"],
+  ] as const)("announces %s with the expected live semantic", (variant, role) => {
+    render(
+      <StateCard
+        variant={variant}
+        title={`${variant} title`}
+        description={`${variant} description`}
+      />,
+    );
+
+    expect(screen.getByRole(role)).toHaveTextContent(`${variant} description`);
+    expect(screen.getByText(`${variant} title`).closest(".state-card")).toHaveAttribute(
+      "data-state",
+      variant,
+    );
+  });
+
+  it.each(["archived", "retired", "proposed"] as const)(
+    "keeps the %s state informative without an urgent announcement",
+    (variant) => {
+      render(
+        <StateCard
+          variant={variant}
+          title={`${variant} title`}
+          description={`${variant} description`}
+        />,
+      );
+
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.queryByRole("status")).toBeNull();
+    },
+  );
 });

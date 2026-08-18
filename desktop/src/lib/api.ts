@@ -271,6 +271,8 @@ export const api = {
       tag: opts.tag ?? null,
     }),
   sessionLoad: (id: string) => invoke<SessionSummary>("session_load", { id }),
+  sessionInspect: (id: string) =>
+    invoke<SessionSummary>("session_inspect", { id }),
   sessionList: () => invoke<SessionSummary[]>("session_list"),
   sessionListArchived: () => invoke<SessionSummary[]>("session_list_archived"),
   sessionListAll: () => invoke<SessionSummary[]>("session_list_all"),

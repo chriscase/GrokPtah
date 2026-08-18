@@ -59,7 +59,8 @@ describe("resume / continue (#38)", () => {
     expect(app).toMatch(/prompt === ["']\/resume["']/);
     expect(app).toMatch(/setSessionBrowserOpen\(true\)/);
     expect(app).toMatch(/id:\s*["']resume["']/);
-    // openTab must promote backend active session on hydrate
-    expect(app).toMatch(/api\.sessionLoad\(summary\.id\)/);
+    // openTab must use the serialized Lane-scope promotion path on hydrate.
+    expect(app).toMatch(/queueLaneScopePromotion\(\s*summary\.id/);
+    expect(app).toMatch(/archived \? api\.sessionInspect\(id\) : api\.sessionLoad\(id\)/);
   });
 });

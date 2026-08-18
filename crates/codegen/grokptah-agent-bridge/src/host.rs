@@ -575,9 +575,18 @@ impl AgentHost {
         }
         let active_session = chrome
             .active_session
-            .filter(|id| sessions.contains_key(id))
-            .or_else(|| open_tab_ids.first().copied())
-            .or_else(|| sessions.keys().next().copied());
+            .filter(|id| sessions.get(id).is_some_and(|session| !session.archived))
+            .or_else(|| {
+                open_tab_ids
+                    .iter()
+                    .find(|id| sessions.get(id).is_some_and(|session| !session.archived))
+                    .copied()
+            })
+            .or_else(|| {
+                sessions
+                    .iter()
+                    .find_map(|(id, session)| (!session.archived).then_some(*id))
+            });
         let prompt_queues = session_store::load_all_prompt_queues(sessions.keys().copied());
         let inner = Inner {
             running: false,
@@ -822,6 +831,7 @@ impl AgentHostHandle {
         &self,
         session_id: Uuid,
     ) -> Result<(String, CancellationToken, ComputerAgentBusyGuard)> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let operation_id = Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
         {
@@ -1809,18 +1819,13 @@ impl AgentHostHandle {
     }
 
     /// Remember open tabs (call when the tab strip changes).
-    pub fn set_open_tabs(&self, ids: Vec<Uuid>, active: Option<Uuid>) {
+    pub fn set_open_tabs(&self, ids: Vec<Uuid>, _active: Option<Uuid>) {
         {
             let mut g = self.inner.lock();
             g.open_tab_ids = ids
                 .into_iter()
                 .filter(|id| g.sessions.contains_key(id))
                 .collect();
-            if let Some(a) = active {
-                if g.sessions.contains_key(&a) {
-                    g.active_session = Some(a);
-                }
-            }
         }
         self.persist_chrome();
     }
@@ -1940,17 +1945,27 @@ impl AgentHostHandle {
                 .sessions
                 .get(&id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
+            if s.archived {
+                bail!("archived Lane is inspection-only; restore it before opening for work");
+            }
             (s.kind, s.cwd.clone())
         };
         // A missing session workspace is recoverable, not permission to run in
         // whichever project happens to be open. Rebinding is explicit through
         // session_set_cwd, normally driven by the desktop folder picker.
-        if kind == SessionKind::Build && workspace_status(&cwd) == WorkspaceStatus::Ready {
-            let current = self.inner.lock().project_cwd.clone();
-            if current.as_ref() != Some(&cwd) {
-                let _ = self.set_project_cwd(&cwd);
-            }
+        let workspace_state = workspace_status(&cwd);
+        if kind == SessionKind::Build && workspace_state != WorkspaceStatus::Ready {
+            bail!(
+                "Lane workspace is {}; choose a valid workspace before resuming work",
+                workspace_state.as_str().replace('_', " ")
+            );
         }
+        let workspace_projection = (kind == SessionKind::Build).then(|| {
+            (
+                crate::discover::load_mcp_servers(Some(&cwd)),
+                crate::discover::discover_skills(Some(&cwd)),
+            )
+        });
         let summary = {
             let mut g = self.inner.lock();
             let s = g
@@ -1958,6 +1973,11 @@ impl AgentHostHandle {
                 .get(&id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
             let summary = s.summary();
+            if let Some((mcp, skills)) = workspace_projection {
+                g.project_cwd = Some(cwd);
+                g.mcp_servers = mcp;
+                g.skills = skills;
+            }
             g.active_session = Some(id);
             if !g.open_tab_ids.contains(&id) {
                 g.open_tab_ids.push(id);
@@ -1968,6 +1988,31 @@ impl AgentHostHandle {
         self.load_session_subagents(id);
         self.persist_chrome();
         Ok(summary)
+    }
+
+    /// Read an archived or active Lane without promoting its workspace,
+    /// changing the active Lane, or adding it to the persisted tab strip.
+    pub fn session_inspect(&self, id: Uuid) -> Result<SessionSummary> {
+        self.ensure_transcript_loaded(id)?;
+        let g = self.inner.lock();
+        g.sessions
+            .get(&id)
+            .map(Session::summary)
+            .ok_or_else(|| anyhow!("unknown session"))
+    }
+
+    /// Reject work/state mutations for an archived Lane while leaving read and
+    /// explicit recovery operations available.
+    pub fn ensure_session_accepts_new_work(&self, id: Uuid) -> Result<()> {
+        let g = self.inner.lock();
+        let session = g
+            .sessions
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        if session.archived {
+            bail!("archived Lane is inspection-only; restore it before starting new work");
+        }
+        Ok(())
     }
 
     /// Full transcript for hydrating a session tab (loads JSONL on demand).
@@ -2033,6 +2078,7 @@ impl AgentHostHandle {
     }
 
     pub fn reserve_orchestration_turn(&self, run_id: &str, session_id: Uuid) -> Result<()> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let mut g = self.inner.lock();
         if !g.sessions.contains_key(&session_id) {
             bail!("unknown session");
@@ -2076,6 +2122,7 @@ impl AgentHostHandle {
     /// their local queue limits into an unbounded prompt store, while the
     /// sequence number gives the scheduler one ordering domain.
     pub fn reserve_orchestration_queue_slot(&self, run_id: &str, session_id: Uuid) -> Result<()> {
+        self.ensure_session_accepts_new_work(session_id)?;
         const MAX_PENDING_ADMISSIONS: usize = 32;
         let mut g = self.inner.lock();
         if let Some(existing) = g.orchestration_pending_admissions.get(run_id) {
@@ -2131,6 +2178,12 @@ impl AgentHostHandle {
     /// untouched; another embedded service may own the globally eligible run.
     pub fn claim_orchestration_pending(&self, run_id: &str, session_id: Uuid) -> bool {
         let mut g = self.inner.lock();
+        if g.sessions
+            .get(&session_id)
+            .is_none_or(|session| session.archived)
+        {
+            return false;
+        }
         let Some(requested) = g.orchestration_pending_admissions.get(run_id).copied() else {
             return false;
         };
@@ -2314,7 +2367,9 @@ impl AgentHostHandle {
             g.prompt_queues.remove(&id);
             g.open_tab_ids.retain(|t| *t != id);
             if g.active_session == Some(id) {
-                g.active_session = g.open_tab_ids.first().copied();
+                // Only session_load may promote a replacement Lane and its
+                // workspace atomically. The desktop will focus a surviving tab.
+                g.active_session = None;
             }
         }
         session_store::delete_session(id)?;
@@ -2325,6 +2380,9 @@ impl AgentHostHandle {
     pub fn session_archive(&self, id: Uuid, archived: bool) -> Result<SessionSummary> {
         let summary = {
             let mut g = self.inner.lock();
+            if archived && g.turn_cancels.contains_key(&id) {
+                bail!("cannot archive a Lane with an active turn — stop it first");
+            }
             {
                 let s = g
                     .sessions
@@ -2334,12 +2392,10 @@ impl AgentHostHandle {
                 s.archived_at = if archived { Some(Utc::now()) } else { None };
                 s.updated_at = Utc::now();
             }
-            // Closing archived sessions out of the tab strip
-            if archived {
-                g.open_tab_ids.retain(|t| *t != id);
-                if g.active_session == Some(id) {
-                    g.active_session = g.open_tab_ids.first().copied();
-                }
+            // Archived tabs remain durable for read-only inspection, but an
+            // archived Lane can never own the live workspace/tool scope.
+            if archived && g.active_session == Some(id) {
+                g.active_session = None;
             }
             g.sessions
                 .get(&id)
@@ -2379,6 +2435,7 @@ impl AgentHostHandle {
     /// For build sessions this is the project root. When the session is active,
     /// also updates the host project cwd so the files/git panels match.
     pub fn session_set_cwd(&self, id: Uuid, path: impl AsRef<Path>) -> Result<SessionSummary> {
+        self.ensure_session_accepts_new_work(id)?;
         let p = path.as_ref().to_path_buf();
         if !p.is_dir() {
             bail!("not a directory: {}", p.display());
@@ -2415,6 +2472,7 @@ impl AgentHostHandle {
         id: Uuid,
         mode: RunExecutionMode,
     ) -> Result<SessionSummary> {
+        self.ensure_session_accepts_new_work(id)?;
         let summary = {
             let mut g = self.inner.lock();
             if g.turn_cancels.contains_key(&id) {
@@ -2548,6 +2606,7 @@ impl AgentHostHandle {
         keep_messages: usize,
         mode: &str,
     ) -> Result<SessionSummary> {
+        self.ensure_session_accepts_new_work(id)?;
         self.ensure_transcript_loaded(id)?;
         let mode = mode.trim().to_ascii_lowercase();
         let do_files = mode == "files" || mode == "all" || mode == "filesonly";
@@ -2662,6 +2721,7 @@ impl AgentHostHandle {
         id: Uuid,
         quality_summary: Option<String>,
     ) -> Result<SessionSummary> {
+        self.ensure_session_accepts_new_work(id)?;
         self.ensure_transcript_loaded(id)?;
         const KEEP_RECENT: usize = 6;
         let (summary, cwd, leaving_for_memory) = {
@@ -2720,6 +2780,7 @@ impl AgentHostHandle {
 
     /// Async compact: model-backed summary when online, extractive offline.
     pub async fn compact_session_async(&self, id: Uuid) -> Result<SessionSummary> {
+        self.ensure_session_accepts_new_work(id)?;
         self.ensure_transcript_loaded(id)?;
         const KEEP_RECENT: usize = 6;
         let (cwd, leaving, model) = {
@@ -4210,6 +4271,7 @@ impl AgentHostHandle {
     }
 
     pub fn set_plan_mode(&self, session_id: Uuid, enabled: bool) -> Result<()> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let mut g = self.inner.lock();
         let s = g
             .sessions
@@ -4225,6 +4287,7 @@ impl AgentHostHandle {
     /// Accept the proposed plan and immediately start an execution turn that
     /// follows those steps (plan → execute pipeline).
     pub async fn accept_plan(&self, session_id: Uuid) -> Result<String> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let (steps, goal) = {
             let mut g = self.inner.lock();
             let s = g
@@ -4290,6 +4353,7 @@ impl AgentHostHandle {
     }
 
     pub fn reject_plan(&self, session_id: Uuid) -> Result<()> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let mut g = self.inner.lock();
         let s = g
             .sessions
@@ -4389,6 +4453,7 @@ impl AgentHostHandle {
         source: &str,
         owner: Option<String>,
     ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry, u64)> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let origin = owner.clone().unwrap_or_else(|| source.to_string());
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
@@ -4439,6 +4504,7 @@ impl AgentHostHandle {
         text: String,
         origin: &str,
     ) -> Result<(Vec<PromptQueueEntry>, u64)> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
             let queue = g
@@ -4495,6 +4561,7 @@ impl AgentHostHandle {
         origin: &str,
         expected_version: u64,
     ) -> Result<(Vec<PromptQueueEntry>, PromptQueueEntry, u64)> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
             let queue = g
@@ -4544,6 +4611,7 @@ impl AgentHostHandle {
         session_id: Uuid,
         origin: &str,
     ) -> Result<(Vec<PromptQueueEntry>, PromptQueueClearOutcome, u64)> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let (outcome, revision) = {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&session_id) {
@@ -4641,6 +4709,7 @@ impl AgentHostHandle {
         expected_version: u64,
         expected_revision: Option<u64>,
     ) -> Result<(Vec<PromptQueueEntry>, u64)> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let (list, changed_entry, revision) = {
             let mut g = self.inner.lock();
             let current_revision = g
@@ -4692,6 +4761,7 @@ impl AgentHostHandle {
     /// `result.reservation` when starting the turn, or call
     /// [`Self::session_queue_restore_drain`] to give both back.
     pub fn session_queue_take_next(&self, session_id: Uuid) -> Result<PromptQueueTakeResult> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let (result, revision) = {
             let mut g = self.inner.lock();
             if !g.sessions.contains_key(&session_id) {
@@ -4818,6 +4888,7 @@ impl AgentHostHandle {
         origin: &str,
         expected_version: u64,
     ) -> Result<(PromptQueueRunNextResult, u64)> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let (changed_entry, active_generation, revision) = {
             let mut g = self.inner.lock();
             let queue = g
@@ -4878,6 +4949,7 @@ impl AgentHostHandle {
         origin: &str,
         expected_version: u64,
     ) -> Result<(SteeringReceipt, u64)> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let (receipt, revision) = {
             let mut g = self.inner.lock();
             let is_build = g
@@ -4919,6 +4991,7 @@ impl AgentHostHandle {
         text: String,
         owner: Option<String>,
     ) -> Result<(SteeringReceipt, u64)> {
+        self.ensure_session_accepts_new_work(session_id)?;
         let origin = owner.clone().unwrap_or_else(|| "desktop".into());
         let (receipt, revision) = {
             let mut g = self.inner.lock();
@@ -5154,6 +5227,7 @@ impl AgentHostHandle {
         external_run: Option<ExternalRunContext>,
         resume: Option<AgentResumePlan>,
     ) -> Result<String> {
+        self.ensure_session_accepts_new_work(session_id)?;
         self.ensure_transcript_loaded(session_id)?;
         self.ensure_build_workspace_ready(session_id)?;
         if let Some(plan) = resume.as_ref() {
@@ -9429,5 +9503,102 @@ mod tests {
             .expect("archived Lane remains durable");
         assert!(archived.archived);
         assert_eq!(archived.agent_id.as_deref(), Some(agent.agent_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn archived_lane_inspection_is_read_only_and_new_work_is_rejected() {
+        let (_home, host, lane_id) = test_host();
+        host.session_queue_add(lane_id, "preserve this queued prompt".into(), false)
+            .expect("queue before archive");
+        host.session_archive(lane_id, true).expect("archive Lane");
+
+        let before = host.workspace_ui_state();
+        let inspected = host
+            .session_inspect(lane_id)
+            .expect("inspect archived Lane");
+        let after = host.workspace_ui_state();
+
+        assert!(inspected.archived);
+        assert_eq!(before.active_lane_id, after.active_lane_id);
+        assert_eq!(before.active_session, after.active_session);
+        assert_eq!(before.open_tab_ids, after.open_tab_ids);
+        assert_eq!(before.project_cwd, after.project_cwd);
+        assert_eq!(
+            host.session_queue_list(lane_id)
+                .expect("archived queue remains readable")
+                .len(),
+            1
+        );
+
+        let load_error = host.session_load(lane_id).unwrap_err().to_string();
+        assert!(load_error.contains("inspection-only"));
+        host.set_open_tabs(vec![lane_id], Some(lane_id));
+        let persisted = host.workspace_ui_state();
+        assert!(persisted.open_tab_ids.contains(&lane_id));
+        assert_ne!(persisted.active_lane_id, Some(lane_id));
+
+        assert!(host.rewind_session(lane_id, 0, "all").is_err());
+        assert!(host.compact_session(lane_id).is_err());
+        assert!(host.set_plan_mode(lane_id, true).is_err());
+        assert!(host
+            .reserve_orchestration_turn("archived-run", lane_id)
+            .is_err());
+        assert!(host
+            .reserve_orchestration_queue_slot("archived-pending", lane_id)
+            .is_err());
+        assert!(host.begin_computer_agent_operation(lane_id).is_err());
+
+        let queue_error = host
+            .session_queue_add(lane_id, "must not queue".into(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(queue_error.contains("inspection-only"));
+        let drain_error = host
+            .session_queue_take_next(lane_id)
+            .unwrap_err()
+            .to_string();
+        assert!(drain_error.contains("inspection-only"));
+        let cwd_error = host
+            .session_set_cwd(lane_id, std::env::temp_dir())
+            .unwrap_err()
+            .to_string();
+        assert!(cwd_error.contains("inspection-only"));
+        let mode_error = host
+            .session_set_execution_mode(lane_id, RunExecutionMode::IsolatedWorktree)
+            .unwrap_err()
+            .to_string();
+        assert!(mode_error.contains("inspection-only"));
+        let prompt_error = host
+            .session_prompt(lane_id, "must not run".into())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(prompt_error.contains("inspection-only"));
+    }
+
+    #[test]
+    fn failed_workspace_promotion_preserves_the_previous_lane_scope() {
+        let (_home, host, first_lane_id) = test_host();
+        let first_workspace = tempfile::tempdir().unwrap();
+        host.session_set_cwd(first_lane_id, first_workspace.path())
+            .expect("bind first Lane workspace");
+        let second = host
+            .session_new_kind(SessionKind::Build)
+            .expect("create second Lane");
+        let missing = first_workspace.path().join("workspace-that-does-not-exist");
+        {
+            let mut inner = host.inner.lock();
+            inner.sessions.get_mut(&second.id).unwrap().cwd = missing;
+        }
+        host.session_load(first_lane_id)
+            .expect("promote first Lane workspace");
+
+        let before = host.workspace_ui_state();
+        let error = host.session_load(second.id).unwrap_err().to_string();
+        let after = host.workspace_ui_state();
+
+        assert!(error.contains("workspace is missing"));
+        assert_eq!(after.active_lane_id, before.active_lane_id);
+        assert_eq!(after.project_cwd, before.project_cwd);
     }
 }
