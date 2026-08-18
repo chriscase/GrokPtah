@@ -15,6 +15,7 @@ import {
   type TranscriptItem,
   type DurableRun,
   type DurableRunEvent,
+  type LaneSummary,
   type RemoteSessionTarget,
   type RunOrigin,
   type WorkspaceStatus,
@@ -263,6 +264,7 @@ export default function App() {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [auth, setAuth] = useState<AuthState>({ signed_in: false });
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [lanes, setLanes] = useState<LaneSummary[]>([]);
   /** Open concurrent workspaces (tabs). Multiple can be busy at once. */
   const [tabs, setTabs] = useState<SessionTab[]>([]);
   /**
@@ -866,6 +868,7 @@ export default function App() {
   const refreshSessions = useCallback(async () => {
     try {
       setSessions(await api.sessionListByKind(workspaceMode, false));
+      setLanes(await api.laneList(true));
     } catch {
       /* bridge down */
     }
@@ -1071,6 +1074,7 @@ export default function App() {
         const ws = await api.workspaceState();
         if (cancelled) return;
         setSessions(ws.sessions);
+        setLanes(ws.lanes ?? []);
         const byId = new Map(ws.sessions.map((s) => [s.id, s]));
         // Drop tabs for sessions that no longer exist on disk (test garbage, deletes).
         let tabIds = (ws.open_tab_ids ?? []).filter((id) => byId.has(id));
@@ -3717,6 +3721,7 @@ export default function App() {
         {rightTab === "agents" && (
             <PersistentAgentPanel
               agents={persistentAgents}
+              lanes={lanes}
               activeLaneId={activeLaneId}
               busy={persistentAgentsBusy}
               error={persistentAgentsError}

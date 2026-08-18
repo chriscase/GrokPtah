@@ -24,6 +24,7 @@ import type {
   ProviderQualificationReport,
   PersistentAgent,
   PersistentAgentResumePlan,
+  LaneSummary,
   RemoteSessionTarget,
   RemoteServiceStatus,
   RemoteRunScope,
@@ -100,6 +101,8 @@ export const api = {
       sessionId,
       agentId,
     }),
+  laneList: (includeArchived = false) =>
+    invoke<LaneSummary[]>("lane_list", { includeArchived }),
   persistentAgentResumePlan: (sessionId: string) =>
     invoke<PersistentAgentResumePlan>("persistent_agent_resume_plan", {
       sessionId,

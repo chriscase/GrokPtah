@@ -1019,6 +1019,20 @@ impl AgentHostHandle {
         self.ensure_orchestration_store()?.list_agents()
     }
 
+    /// List the product-facing Lane projection, including archived Lanes when
+    /// requested. The backing session records remain the source of truth.
+    pub fn list_lanes(&self, include_archived: bool) -> Vec<LaneSummary> {
+        let g = self.inner.lock();
+        let mut lanes: Vec<_> = g
+            .sessions
+            .values()
+            .filter(|session| include_archived || !session.archived)
+            .map(|session| LaneSummary::from(&session.summary()))
+            .collect();
+        lanes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        lanes
+    }
+
     pub fn get_persistent_agent(&self, agent_id: &str) -> Result<Option<AgentRecord>> {
         self.ensure_orchestration_store()?.load_agent(agent_id)
     }
@@ -9395,9 +9409,12 @@ mod tests {
             .lanes
             .iter()
             .all(|lane| lane.agent_id.as_deref() == Some(agent.agent_id.as_str())));
+        assert_eq!(host.list_lanes(false).len(), 2);
 
         host.session_archive(secondary.id, true)
             .expect("archive secondary Lane");
+        assert_eq!(host.list_lanes(false).len(), 1);
+        assert_eq!(host.list_lanes(true).len(), 2);
         let archived_workspace = host.workspace_ui_state();
         let archived_lane = archived_workspace
             .lanes

@@ -290,6 +290,14 @@ pub async fn persistent_agent_attach_session(
 }
 
 #[tauri::command]
+pub fn lane_list(
+    state: State<'_, AppState>,
+    include_archived: bool,
+) -> Vec<grokptah_agent_bridge::LaneSummary> {
+    state.host.list_lanes(include_archived)
+}
+
+#[tauri::command]
 pub async fn persistent_agent_resume_plan(
     state: State<'_, AppState>,
     session_id: String,

@@ -2,12 +2,14 @@ import { useEffect, useMemo, useState } from "react";
 import type {
   PersistentAgent,
   PersistentAgentResumePlan,
+  LaneSummary,
   RemoteSessionTarget,
   RemoteServiceStatus,
 } from "../lib/protocol";
 
 export type PersistentAgentPanelProps = {
   agents: PersistentAgent[];
+  lanes?: LaneSummary[];
   activeLaneId: string | null;
   busy?: boolean;
   error?: string | null;
@@ -45,6 +47,7 @@ function canResume(agent: PersistentAgent): boolean {
 
 export function PersistentAgentPanel({
   agents,
+  lanes = [],
   activeLaneId,
   busy = false,
   error,
@@ -291,6 +294,7 @@ export function PersistentAgentPanel({
         const isSelected = selectedAgentId === agent.agentId;
         const laneIds = agent.laneIds?.length ? agent.laneIds : [agent.sessionId];
         const isCurrent = Boolean(activeLaneId && laneIds.includes(activeLaneId));
+        const ownedLanes = lanes.filter((lane) => lane.agent_id === agent.agentId);
         const resumeAllowed = canResume(agent) && Boolean(agent.latestCheckpointId);
         return (
           <article
@@ -308,6 +312,15 @@ export function PersistentAgentPanel({
             <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 3, wordBreak: "break-word" }}>
               {agent.workspace}
             </div>
+            {ownedLanes.length > 0 && (
+              <div
+                aria-label={`Lanes owned by ${agent.agentId}`}
+                style={{ color: "var(--muted)", fontSize: 11, marginTop: 4 }}
+              >
+                Lanes: {ownedLanes.slice(0, 3).map((lane) => lane.title).join(" · ")}
+                {ownedLanes.length > 3 ? ` · +${ownedLanes.length - 3} more` : ""}
+              </div>
+            )}
             <div className="worktree-create-actions" style={{ marginTop: 7 }}>
               {!isCurrent && !remoteStatus.connected && (
                 <button type="button" onClick={() => onOpenSession(agent)}>
