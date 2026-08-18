@@ -1,8 +1,9 @@
 # GrokPtah issue #308 — Phase 2 design package
 
-Date: 2026-08-17
-Author: Claude (Fable 5), acting as senior product designer for Phase 2
-Status: design exploration for review — **no production code was changed**
+Date: 2026-08-18
+Authors: Claude (Fable 5) design exploration; Grok Build contract review;
+Codex integration, correction, and independent evaluation
+Status: implementation-ready design decision — **no production code was changed**
 
 This package answers the [Phase 2 design handoff](../../ux-audit/PHASE-2-DESIGN-HANDOFF.md)
 with three coherent, meaningfully different design directions, one shared
@@ -27,6 +28,10 @@ to it.
 | [components-and-states.md](components-and-states.md) | Component/state inventory, accessibility notes, responsive contract |
 | [prototype/](prototype/) | Static HTML/CSS/JS prototype with a visible direction switcher (no dependencies, no network) |
 | [captures/CAPTURES.md](captures/CAPTURES.md) | Deterministic screenshot index (headless Chrome renders of the prototype) |
+| [integration/DIRECTION-EVALUATION.md](integration/DIRECTION-EVALUATION.md) | S01–S14 walkthrough, hard gates, weighted scores, evidence gaps, and final hybrid decision |
+| [integration/IMPLEMENTATION-ROADMAP.md](integration/IMPLEMENTATION-ROADMAP.md) | Contract prerequisites and vertical slices with visual, interaction, accessibility, and regression criteria |
+| [integration/CONTRACT-INTEGRATION.md](integration/CONTRACT-INTEGRATION.md) | Reconciliation of repository behavior, audit facts, and proposed product contracts |
+| [delegated/GROK-BUILD-CONTRACT-REVIEW.md](delegated/GROK-BUILD-CONTRACT-REVIEW.md) | Independent repository-grounded contract review used as an input, not final product authority |
 
 ## How to preview the prototype
 
@@ -126,7 +131,7 @@ GrokPtah
 │   │                       (proposed lifecycle; always separate from Archive)
 │   └── Agent detail ...... identity + memory/policy; Lanes grouped Active /
 │                           Attention / Archived; Start Lane (runtime chosen here);
-│                           adopt ad-hoc Lanes
+│                           assign ad-hoc Build Lanes (D04; no reassignment)
 ├── Lanes ................. work records, not anonymous sessions
 │   ├── Active / Attention / Archived / All views
 │   └── Search ............ results keep Lane identity (title, Agent, workspace, state)
@@ -165,12 +170,12 @@ never the only channel — every state has an icon and a text label.
 | Blocked / Workspace missing | orange | Lane banner + header chip | the named repair (e.g. Choose folder) |
 | Interrupted | orange | Lane banner, Run history | resume from verified checkpoint / retry / inspect |
 | Reconnecting (stale) | orange | Lane banner | refresh; data labeled "from last durable cursor". Note: `reconnecting` is the wire value; "stale" is presentation of last-known data, never a stored connection state (C2) |
-| Disconnected | red | runtime chip, Lane banner | reconnect / switch runtime |
+| Disconnected | red | runtime chip, Lane banner | reconnect / continue in another Lane |
 | Failed | red | Run, refresh errors | retry + Technical details |
 | Unverified | orange | tests/changes | run or observe tests |
 | Completed | green | Run | inspect evidence |
 | Archived | gray box | Lane rows, Lane banner | restore / inspect (never implies deletion) |
-| Retired | gray moon | Agent | inspect / unretire; new work blocked with copy |
+| Retired | gray moon | Agent | inspect / proposed unretire; new work blocked with copy |
 | Empty | dashed card | any collection | the constructive next step |
 | Load failed | red card | any collection | retry; **replaces** empty state, never beside it |
 
@@ -202,6 +207,10 @@ validated in a product walkthrough:
   (contract review §2.4), visibly marked "Proposed" in the prototype. The
   retire dialog demonstrates the proposed D05 eligibility gate: retirement
   is blocked while queued/running Runs or live isolated approvals exist.
+- D04 permits explicit assignment of an ad-hoc Build Lane to an Agent without
+  rewriting transcript, Runs, or checkpoints. It does not retarget the Agent's
+  primary resume Lane/workspace, and routine Agent-to-Agent reassignment stays
+  unavailable until attributable history and cross-Lane resume land.
 - Computer Use appears in its audited unavailable state (default), plus one
   **contract-labelled operator-control illustration** for issue #273 /
   rubric S14 (`?drawer=computer&cu=contract`): exact Lane + Run, local

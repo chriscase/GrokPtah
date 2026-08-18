@@ -31,7 +31,7 @@ ATTENTION                Agent cards:                    Start a new Lane
                              (or aggregate — runtime       Attention needed
                              belongs to Lanes)             Active
                            active/archived counts          Archived (collapsed)
-                           current Lane → link           Adopt ad-hoc work
+                           current Lane → link           Assign ad-hoc Build work
                            checkpoint (or "none yet")
                            Open / Pause / Retire…
                              (marked Proposed)
@@ -68,10 +68,12 @@ ATTENTION                Agent cards:                    Start a new Lane
    Connected, Local service/VM · Disconnected, Hosted · Connected) before
    any prompt exists, satisfying "switching Runtime target is visible before
    the prompt is submitted." See `#/d2/agent/agent-2`.
-3. **Ad-hoc adoption is explicit and history-preserving.** Ad-hoc Lanes
+3. **D04 assignment is explicit and history-preserving.** Ad-hoc Build Lanes
    appear on the roster ("Ad-hoc work (no Agent)") and on each Agent detail
-   as adoptable; the Assign dialog states that the Lane's transcript and
-   Runs are unchanged and that policy/memory apply from the next Run onward.
+   as assignable. The dialog states that current ownership is recorded while
+   transcript, Runs, and checkpoints remain unchanged. It also exposes the
+   primary-resume Lane/workspace limitation and does not offer routine
+   Agent-to-Agent reassignment.
 4. **Attention rail.** The left rail lists Lanes needing a decision
    (approval, interruption, blockage) across all Agents, so identity-first
    never hides urgency.

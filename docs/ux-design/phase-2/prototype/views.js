@@ -148,7 +148,7 @@ function screenAgents(dir) {
     body = stateCard("empty", {
       icon: "agent",
       title: "No durable Agents yet.",
-      body: "An Agent is a long-lived identity with a role, policy, and memory. Create one, or just start an ad-hoc Lane — you can attach an Agent later.",
+      body: "An Agent is a long-lived identity with a role, policy, and memory. Create one, or start an ad-hoc Build Lane and explicitly assign an Agent later without rewriting its history.",
       actions:
         '<div class="row-gap center"><button type="button" class="btn btn-primary">Create Agent</button>' +
         '<button type="button" class="btn btn-secondary">Start ad-hoc Lane</button></div>',
@@ -167,7 +167,7 @@ function screenAgents(dir) {
       '<div class="agent-grid">' + AGENTS.map((a) => agentCard(dir, a)).join("") + "</div>" +
       '<section class="adhoc-section" aria-labelledby="adhoc-h">' +
       '<h3 id="adhoc-h">Ad-hoc work (no Agent)</h3>' +
-      '<p class="soft">Lanes can exist without a durable Agent. Assign one at any time — assignment never rewrites the Lane’s history.</p>' +
+      '<p class="soft">Lanes can exist without a durable Agent. An ad-hoc Build Lane may be explicitly assigned later; transcript, Runs, and checkpoints are not rewritten.</p>' +
       '<div class="lane-rows">' +
       adHocLanes().filter((l) => !l.archived).map((l) => laneRow(dir, l, { compact: true })).join("") +
       "</div></section>";
@@ -275,8 +275,8 @@ function screenAgentDetail(dir, agentId) {
     laneGroup(dir, "Archived Lanes", archived, { collapsed: true, always: true, emptyText: "No archived Lanes." }) +
 
     (!retired && adHocLanes().filter((l) => !l.archived).length
-      ? '<section class="lane-group"><h3>Adopt ad-hoc work</h3>' +
-        '<p class="soft">These Lanes have no Agent. Assigning ' + esc(agent.name) + " is explicit and appears in the Lane header; the Lane’s history is unchanged.</p>" +
+      ? '<section class="lane-group"><h3>Assign ad-hoc Build work</h3>' +
+        '<p class="soft">These Build Lanes have no Agent. Assignment records the current owner and preserves existing history; Agent-to-Agent reassignment is not offered.</p>' +
         '<div class="lane-rows">' +
         adHocLanes().filter((l) => !l.archived).map((l) =>
           laneRow(dir, l, { compact: true, extraAction: '<button type="button" class="btn btn-secondary btn-sm" data-modal="assign:' + l.id + ":" + agent.id + '">Assign to ' + esc(agent.name) + "</button>" })
@@ -652,8 +652,10 @@ function modalContent(kind, arg) {
     return {
       title: "Assign “" + lane.title + "” to " + agent.name + "?",
       body:
-        "<p>The Lane keeps its transcript and Runs exactly as they are. From the next Run onward, " +
-        esc(agent.name) + "’s policy, memory, and checkpoints apply, and the Lane header shows the Agent.</p>",
+        '<p class="chip tone-info">D04 contract · Build Lanes only</p>' +
+        "<p>The Lane keeps its transcript, Runs, and checkpoints exactly as they are. " +
+        esc(agent.name) + " becomes the current owner and the Lane appears in that Agent’s Lane list.</p>" +
+        "<p class=\"soft\">This does not change the Agent’s primary resume Lane or workspace. Cross-Lane checkpoint continuation remains blocked until #297; Agent-to-Agent reassignment is not offered.</p>",
       confirm: "Assign Agent",
       confirmClass: "btn-primary",
     };
@@ -665,7 +667,7 @@ function modalContent(kind, arg) {
         "<p>Static design prototype for GrokPtah issue #308 Phase 2. Three directions, one shared product model: " +
         "durable <strong>Agents</strong>, high-turnover <strong>Lanes</strong>, durable <strong>Runs</strong>, and explicit runtime targets.</p>" +
         "<p>All data is fixture data. Hosted-service and Computer Use surfaces reflect documented contracts and audited failure states only — " +
-        "no successful hosted round-trip or Computer Use capture is depicted, because the Phase 1 audit did not observe one.</p>" +
+        "no successful hosted round-trip or Computer Use capture was observed in Phase 1. The Computer Use operator view is contract-labelled design intent, not an observed capture.</p>" +
         '<p class="soft">See <code>docs/ux-design/phase-2/README.md</code> for the full package.</p>',
       confirm: null,
     };

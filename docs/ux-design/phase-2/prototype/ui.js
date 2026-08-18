@@ -389,6 +389,23 @@ function drawerBody(drawerId, lane) {
       }
       /* Contract illustration for issue #273 / rubric S14 — local only. */
       const cu = COMPUTER_USE_CONTRACT;
+      if (lane.id !== cu.laneId) {
+        const fixtureLane = getLane(cu.laneId);
+        const dirMatch = location.hash.match(/^#\/(d[123])\//);
+        const dir = dirMatch ? dirMatch[1] : "d1";
+        return (
+          drawerScopeLine(lane) + tabs +
+          '<div class="panel-block">' +
+          stateCard("empty", {
+            title: "No Computer Run contract fixture belongs to this Lane.",
+            body: "The #273 / S14 illustration is deliberately bound to " + fixtureLane.title +
+              ". Opening it here would contradict the selected Lane’s ownership.",
+            actions: '<a class="btn btn-secondary btn-sm" href="#/' + dir + "/lane/" + cu.laneId +
+              '?drawer=computer&cu=contract">Open the bound Lane</a>',
+          }) +
+          "</div>"
+        );
+      }
       return (
         drawerScopeLine(lane) + tabs +
         '<div class="panel-block cu-contract">' +

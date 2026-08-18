@@ -175,7 +175,7 @@ function render() {
 /* Move focus to the screen heading on navigation (screen-reader sanity). */
 function focusHeading() {
   const h = document.querySelector("main h1[tabindex='-1']");
-  if (h) h.focus({ preventScroll: false });
+  if (h) h.focus({ preventScroll: true });
 }
 
 /* ---------------- interactions ---------------- */

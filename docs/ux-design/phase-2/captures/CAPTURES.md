@@ -5,7 +5,8 @@ Deterministic renders of the Phase 2 prototype, produced by
 (`--headless=new --force-prefers-reduced-motion --virtual-time-budget=3000`).
 Fixture data uses fixed timestamps and reduced motion is forced, so repeated
 runs are visually identical. Desktop frames are 1440×900; narrow frames are
-760×1000.
+760×1000 except the 760×2200 supervision capture, whose extra height shows
+both stacked zones and the Inspector in one image.
 
 Regenerate at any time:
 
@@ -22,22 +23,24 @@ docs/ux-design/phase-2/captures/capture.sh
 | `d1-queued-run.png` | `#/d1/lane/lane-9` | Queued Run at position 2 on the hosted service, cancel offered |
 | `d1-stale-stream.png` | `#/d1/lane/lane-2?conn=stale` | Reconnecting event stream: "from last durable cursor" copy, refresh action |
 | `d1-expert-grid.png` | `#/d1/grid` | Opt-in expert Grid: two zones, each with own header and composer; scope bar |
-| `d2-agent-roster.png` | `#/d2/agents` | Direction 2 home: summary strip, agent cards with lifecycle ≠ health chips, runtime + connection, lane counts, checkpoint or "none yet", ad-hoc section |
+| `d2-agent-roster.png` | `#/d2/agents` | Direction 2 home: summary strip, agent cards with lifecycle ≠ health chips, current/last Lane runtime or aggregate, lane counts, checkpoint or "none yet", ad-hoc section |
 | `d2-agents-empty.png` | `#/d2/agents?demo=empty` | True empty state ("No durable Agents yet") with constructive actions |
 | `d2-agents-load-failed.png` | `#/d2/agents?demo=error` | Load-failed state that **replaces** the roster/empty state; Retry + Technical details containing the demoted store-lock diagnostics |
 | `d2-agent-detail-attention.png` | `#/d2/agent/agent-2` | Agent detail: identity/policy/memory/checkpoint, Start-Lane form with runtime targets and live connection chips, Lanes grouped by Attention/Active |
 | `d2-agent-retired.png` | `#/d2/agent/agent-4` | Retired Agent: banner, blocked new work with reason, history preserved |
 | `d2-lane-archived.png` | `#/d2/lane/lane-6` | Archived Lane: preservation copy, Restore action, composer blocked with restore guidance |
 | `d2-lanes-archived-view.png` | `#/d2/lanes/archived` | Archive view: preservation banner, archived rows (incl. "Scratch workspace" label hygiene), Restore actions |
-| `d2-lane-disconnected-vm.png` | `#/d2/lane/lane-10` | Disconnected local service/VM: last-seen, reconnect or switch-runtime, durable-history copy |
+| `d2-lane-disconnected-vm.png` | `#/d2/lane/lane-10` | Disconnected local service/VM: last-seen, reconnect or continue in another Lane, durable-history copy |
 | `d3-supervision-workspace.png` | `#/d3/workspace` | Direction 3 default: scope bar, two self-labeled zones with composers, Inspector pinned to a named Lane; hosted zone carries an inline documented-contract note |
 | `d3-runtime-targets.png` | `#/d3/runtime` | Runtime targets: connection, workspace authority, "what syncs" boundaries (local desktop distinguishes local persistence from provider traffic), support matrix, per-Lane runtime table, D11 continuation rule |
 | `d1-computer-use-contract.png` | `#/d1/lane/lane-1?drawer=computer&cu=contract` | Contract-labelled Computer Use operator control (#273 / S14): Lane + Run, local app/window target, grant scope/expiry, model/provider/origin, budgets, current action, observation freshness, approval bound to Lane·Run·action·target·evidence, invalidation statement, sticky Pause/Stop/Take over/Steer. Design contract, local only, not an observed capture |
 | `narrow-d1-focused-lane.png` | `#/d1/lane/lane-1` @760px | Narrow-window behavior: horizontal rail strip, icon-only dock (names preserved for AT), stacked composer |
 | `narrow-d2-agent-roster.png` | `#/d2/agents` @760px | Narrow roster: single-column cards, current/last Lane runtime rows, "Proposed" lifecycle markers, collapsed direction switcher |
+| `narrow-d3-supervision-workspace.png` | `#/d3/workspace` @760×2200 | Narrow supervision: stacked self-labelled zones and Inspector below them; no compressed three-column cockpit |
 | `narrow-d1-computer-contract.png` | `#/d1/lane/lane-1?drawer=computer&cu=contract` @760px | Computer Use contract state at narrow width: target block and operator controls remain visible (sticky) inside the overlay drawer |
 
 Evidence note: these are renders of fixture data in a static prototype.
 They demonstrate design intent only — in particular, hosted-service and
-service/VM frames illustrate the documented service contract, and Computer
-Use appears only in its audited unavailable state.
+service/VM frames illustrate the documented service contract. Computer Use
+includes the audited unavailable state and a separately labelled local-only
+#273/S14 contract illustration; neither is evidence of a successful capture.

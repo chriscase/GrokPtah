@@ -236,3 +236,32 @@ The final recommendation must mark every decision as one of:
 - contract dependency, with named owner and blocking question;
 - deferred, with an explicit product boundary;
 - rejected, with the alternative that replaces it.
+
+## Final Phase 2 dispositions
+
+This table supersedes the exploratory status lines above. “Contract” means
+the product rule is selected even when production enforcement is incomplete;
+“deferred” keeps an explicit evidence boundary.
+
+| ID | Final disposition | Evidence or owner |
+| --- | --- | --- |
+| D01 | **Decided:** restore the last valid focused Lane; otherwise enter the D1 work surface/Lanes attention context. Agents remains a permanent destination, not the universal home. | D1 score and S01/S03/S05 review in `DIRECTION-EVALUATION.md`; first-launch provider setup remains follow-up design. |
+| D02 | **Decided:** Agents and Lanes are both permanent top-level destinations. | All viable directions and contract review §9.4. |
+| D03 | **Decided:** multi-Lane supervision is a dedicated, opt-in D3 workspace with an exit to Focus. | D3 is strongest for S05 but scores 77.50 and carries the highest default load. |
+| D04 | **Contract:** an ad-hoc Build Lane may be explicitly assigned to an Agent without rewriting history. No Chat attachment or routine Agent-to-Agent reassignment. Primary resume Lane/workspace does not change yet. | `attach_session_to_agent`; contract review §2.3; #297 owns attributable reassignment/cross-Lane resume. |
+| D05 | **Contract:** retirement is blocked by queued/running Runs or live isolated approvals; it never archives, deletes, moves, reassigns, or rewrites Lanes. UI remains labelled proposed until lifecycle state and gates exist. | Contract review §§2.3–2.4; Agent runtime/data implementation owner. |
+| D06 | **Decided:** bulk archive applies only to Lanes selected by visible criteria; there is no bulk retire analogue. | Contract review D06 and S10. |
+| D07 | **Decided:** title/objective + Agent or Ad hoc + project display name + state; raw ids and paths live in Technical details. | D1 rail, Lane rows, scratch-workspace capture. |
+| D08 | **Decided:** choose Runtime at Lane creation and display it in the Lane header and composer before every send. | D2 Agent detail, focused Lane header/composer, Runtime screen. |
+| D09 | **Deferred with boundary:** a hosted Agent home is conceptual until authentication, tenancy, discovery, consistency, and second-device operation are observed. | S04 contract review; hosted service/product owner. |
+| D10 | **Contract:** only service-owned Runs, transcripts, checkpoints, and ledger metadata synchronize as documented. Source, credentials, terminals, clipboard, desktop layout, and Computer Use authority do not. | Contract review §4 and Runtime screen. |
+| D11 | **Contract:** a Lane is not silently retargeted. Continue elsewhere creates or selects a different Lane; files, terminals, credentials, and in-flight Runs do not move. | Composer dialog, disconnected recovery, Runtime screen. |
+| D12 | **Decided:** focused Lane defaults to context header, state banner when needed, transcript/progress, one composer, and contextual evidence drawers. | D1 route and 88.75 score. |
+| D13 | **Decided:** approval/decision → verified interruption → workspace/runtime repair → failed → queued → running → completed/archive-ready. | S05 fixtures and contract review D13. |
+| D14 | **Decided:** show impact and next action first; expose paths, transport details, cursors, bridge versions, and OS errors under Technical details. | Shared StateCard/banner grammar and Phase 1 findings. |
+| D15 | **Contract:** Reconnect, Resume checkpoint, Retry Run, Start new Run, and Continue in another Lane are different operations with different preconditions. | Contract review §2.6 and recovery fixtures. |
+| D16 | **Decided:** Lane, Agent/Ad hoc, Runtime, workspace, Run, and composer target remain visible or explicitly named when any contextual tool opens. | Drawer scope line, context header, D3 pin. |
+| D17 | **Decided:** D1/D2 contextual tools become overlay drawers at narrow widths; D3 zones and Inspector stack in reading order. | Three direction-specific narrow captures. |
+| D18 | **Decided:** every expert zone owns its Lane; the Inspector changes only through its pin control; focus is never mutation authority. | D3 desktop/narrow captures and S05 hard gate. |
+| D19 | **Decided:** retain GrokPtah’s dark technical identity and gold accent while reducing equal-weight panels, raw internals, and ambient chrome. | All prototype directions and comparison. |
+| D20 | **Decided:** first ship explicit Lane scope + shared state grammar + archive correction inside the existing shell; then D1, Lanes library, D2, Runtime/hosted clarity, D3, and #273. | `IMPLEMENTATION-ROADMAP.md`. |

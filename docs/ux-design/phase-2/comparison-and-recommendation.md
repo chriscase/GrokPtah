@@ -6,8 +6,9 @@ judgment and is labeled as such.
 
 Update 2026-08-18: aligned with the independent product-contract review
 (`delegated/GROK-BUILD-CONTRACT-REVIEW.md`) and the integration record
-(`integration/CONTRACT-INTEGRATION.md`). See §6 for the decisions those
-artifacts settle and the constraints they add.
+(`integration/CONTRACT-INTEGRATION.md`). The independent S01–S14 evaluation,
+hard gates, and weighted scores are in
+`integration/DIRECTION-EVALUATION.md`. See §6 for contract constraints.
 
 ## 1. Observed facts relied on (from Phase 1 / Fable review — not new claims)
 
@@ -42,6 +43,10 @@ multi-Lane supervision is reached.
 | Risk of recreating the audited overload | Low | Low | Real, if it ships as default |
 | New-user onboarding story | **Simplest** | Strong for the durable-agent promise | Weakest |
 
+Independent weighted result: **D1 88.75**, **D2 86.25**, **D3 77.50**. All
+three pass every design hard gate; the scores select implementation order,
+not three separate component systems.
+
 ## 3. Recommendation (judgment)
 
 **Compose, don't pick a silo: ship Direction 1's focused Lane workspace as
@@ -74,8 +79,9 @@ Suggested sequence (aligned with the runtime model's migration strategy):
 2. **Slice 2 — D1 shell.** Focused Lane default, rail, Lanes list/archive/
    search, lifecycle-grouped actions. Sessions sidebar behind a
    compatibility flag.
-3. **Slice 3 — D2 spine.** Agent roster/detail once Agent↔Lane association
-   lands; Retire/Pause with consequence copy; ad-hoc adoption.
+3. **Slice 3 — D2 spine.** Agent roster/detail once many-Lane resume semantics
+   are honest; Retire/Pause with consequence copy; current D04 ad-hoc Build
+   assignment with no routine Agent-to-Agent reassignment.
 4. **Slice 4 — D3 mode.** Supervision workspace with pinned Inspector,
    replacing Live rail and dock vocabulary.
 5. **Continuous:** runtime target/connection surfacing (already partially
@@ -114,8 +120,9 @@ The independent contract review settles several items this document
 previously left open, and adds constraints the recommendation must respect:
 
 - **Settled dispositions:** Agents and Lanes both permanently reachable
-  (D02); Assign Agent on ad-hoc Build Lanes, explicit and non-rewriting, no
-  routine Agent-to-Agent transfer (D04); Retire blocked while queued/running
+  (D02); any future Agent assignment must be explicit and non-rewriting,
+  with no routine Agent-to-Agent transfer, while attribution and checkpoint
+  semantics remain a D04 contract dependency; Retire blocked while queued/running
   Runs or live isolated approvals exist, never auto-archiving Lanes (D05);
   bulk archive is Lane-only (D06); runtime change is never a silent retarget
   — continuing elsewhere is a different Lane (D11); the Resume vocabulary

@@ -46,4 +46,5 @@ shot d1-computer-use-contract       "/d1/lane/lane-1?drawer=computer&cu=contract
 # Narrow-window behavior
 shot narrow-d1-focused-lane         "/d1/lane/lane-1"                    760,1000
 shot narrow-d2-agent-roster         "/d2/agents"                         760,1000
+shot narrow-d3-supervision-workspace "/d3/workspace"                     760,2200
 shot narrow-d1-computer-contract    "/d1/lane/lane-1?drawer=computer&cu=contract" 760,1000
