@@ -133,6 +133,7 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
 
     let host = AgentHost::create(HostConfig {
         always_approve: true,
+        event_bus_capacity: Some(256),
         ..HostConfig::default()
     });
     host.start().unwrap();
@@ -141,6 +142,7 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
     let gap_session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(gap_session.id, workspace.path())
         .unwrap();
+    let gap_start_seq = host.event_bus().current_seq().saturating_add(1);
     let store = OrchStore::open(home.path().join("orch")).unwrap();
     let interrupted_run_id = "continuity-interrupted-source";
     let gap_run_id = "continuity-gap-source";
@@ -158,6 +160,12 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
         workspace.path(),
         RunState::Running,
     );
+    store
+        .update_run(gap_run_id, |run| {
+            run.start_seq = Some(gap_start_seq);
+            Ok(())
+        })
+        .unwrap();
     let service = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
@@ -197,17 +205,24 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
     // server to emit the explicit recovery notification when the client
     // resumes reading.
     wait_for_file(&ready_file).await;
-    for index in 0..6_000 {
+    // Fill the bounded live subscriber without overwhelming the durable
+    // writer. The probe needs a subscriber lag, not a persistence gap: the
+    // latter is a distinct, correctly fail-closed condition that would make
+    // the follow-up durable read return cursor_expired.
+    for index in 0..2_048 {
         host.event_bus().publish(SessionUpdate::AgentMessageChunk {
             session_id: gap_session.id,
             text: format!("continuity-gap-{index}"),
         });
-        if index % 100 == 99 {
+        if index % 8 == 7 {
             // Keep the persistence writer ahead of its small queue while the
-            // unread HTTP body still forces the broadcast receiver to lag.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // unread HTTP body continues to accumulate broadcast messages.
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+    // Let the durable writer drain before releasing the unread broadcast
+    // subscriber. This separates live-subscriber recovery from a
+    // durable-journal persistence failure.
     tokio::time::sleep(Duration::from_millis(500)).await;
     std::fs::write(&release_file, "release").unwrap();
 
