@@ -5,6 +5,7 @@
 
 mod agents_personas;
 mod auth_store;
+pub mod certification;
 mod completion;
 mod computer_agent;
 pub mod computer_use;
@@ -50,6 +51,13 @@ mod worktree_gc;
 
 pub use agents_personas::{
     discover_agents, discover_personas, resolve_agent, resolve_persona, AgentDef, PersonaDef,
+};
+pub use certification::{
+    scan_value_for_forbidden_data, ArtifactReference, AttemptDisposition, CampaignBudgets,
+    CampaignIdentity, CertificationCheck, CertificationError, CredentialMethodClass,
+    DurableStateEvidence, PersistentAgentCapture, ProviderAttemptEvidence, ProviderDialectClass,
+    ProviderIdentity, ProviderRouteClass, StreamFraming, UsageEvidence, MAX_CAPTURE_ATTEMPTS,
+    MAX_CAPTURE_BYTES, MAX_CAPTURE_CHECKS, MAX_RAW_ARTIFACT_BYTES, PERSISTENT_AGENT_CAPTURE_SCHEMA,
 };
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
 pub use gateway_config::{
