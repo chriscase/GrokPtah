@@ -1,10 +1,10 @@
 # GrokPtah Phase 2 product-contract review
 
-**Reviewer:** Grok Build (Grok 4.6)  
-**Date:** 2026-08-17  
-**Issue:** [#308](https://github.com/chriscase/GrokPtah/issues/308)  
-**Related PR:** [#309](https://github.com/chriscase/GrokPtah/pull/309) (draft; head `codex/lane-context-foundation-20260817`)  
-**Working branch:** `codex/ux-phase2-prototypes-20260817`  
+**Reviewer:** Grok Build (Grok 4.6)
+**Date:** 2026-08-17
+**Issue:** [#308](https://github.com/chriscase/GrokPtah/issues/308)
+**Related PR:** [#309](https://github.com/chriscase/GrokPtah/pull/309) (draft; head `codex/lane-context-foundation-20260817`)
+**Working branch:** `codex/ux-phase2-prototypes-20260817`
 **Kind:** Independent design-contract analysis. No production code, runtime, or merge state was changed.
 
 This package is a product contract, not a visual prototype and not an implementation patch. It separates repository facts from recommendations. Where the existing design package and the running code disagree, the code and its tests are treated as current behavior; the design package is treated as intent.
@@ -87,7 +87,7 @@ PR #309 and its foundation commits added a real compatibility projection:
 
 Hard limits that still contradict the product story:
 
-1. **Resume is still bound to the Agent’s primary `session_id` and primary `workspace`.**  
+1. **Resume is still bound to the Agent’s primary `session_id` and primary `workspace`.**
    `AgentResumePlan::validate_for` requires `agent.session_id`, `checkpoint.session_id`, and both workspaces to match the requested session. `Host::ensure_session_agent` refuses if `agent.session_id != session_id` or `agent.workspace != workspace`.
 2. **An Agent still has one `workspace` field.** Secondary Lanes may have different cwds. Attaching them does not retarget the Agent record.
 3. **A checkpoint is produced for the Run’s `session_id`.** If the latest checkpoint was written from a secondary Lane, resume against the primary session fails closed.
@@ -750,10 +750,10 @@ PR #309 already shipped the italicized work. Later slices must not redo it.
 3. **Normalized state grammar (partially done).** Adopt `StateCard` everywhere Phase 1 showed empty+error. Map store-lock, disconnect, cursor expiry, and workspace status to the copy in §5.
 4. **Honest Runtime projection (partially done).** Keep local/service/hosted badges. Stop implying remote Lanes have local transcripts, archive state, or workspace checks. Stop implying “Run on” retargets the focused Lane.
 5. **Archive semantics correction.** Inspect-without-restore. Block new work while archived (UI + `require_build_session`). Bulk archive is Lane-only.
-6. **Unbind resume from primary `session_id` (blocker for the one-Agent-many-Lanes story).**  
-   Resume validates: Agent owns the requested Lane (`lane_ids` / `known_lane_ids`), checkpoint belongs to that Agent, checkpoint workspace matches the requested Lane workspace, Agent `can_resume`.  
-   `AgentRecord.session_id` remains serialized for old records and becomes “last resume Lane,” not the authorization key.  
-   Checkpoints stay Lane-attributed via their existing `session_id`.  
+6. **Unbind resume from primary `session_id` (blocker for the one-Agent-many-Lanes story).**
+   Resume validates: Agent owns the requested Lane (`lane_ids` / `known_lane_ids`), checkpoint belongs to that Agent, checkpoint workspace matches the requested Lane workspace, Agent `can_resume`.
+   `AgentRecord.session_id` remains serialized for old records and becomes “last resume Lane,” not the authorization key.
+   Checkpoints stay Lane-attributed via their existing `session_id`.
    This is the #297 overlap; Phase 2 UI must not lie before this ships.
 7. **Agent lifecycle.** Add `paused` / `retired` as a **separate field** from operational `AgentState`. Do not overload `AgentState`. Gate new work. Do not auto-archive Lanes.
 8. **Assignment UX.** “Assign Agent” on ad-hoc Build Lanes using `attach_session_to_agent`. No Agent-to-Agent transfer until history records exist.
