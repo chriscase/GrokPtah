@@ -1,12 +1,14 @@
 # GrokPtah
 
-**GrokPtah** is a desktop-first AI coding agent: open a project, chat with the agent, approve tools, review diffs, and run an integrated terminal — all in a native window.
+**GrokPtah** is a local-first AI agent harness with a native desktop and an
+optional persistent service home. Run everything on one computer, or keep
+long-running agents on a private host and reconnect from multiple devices.
 
 The name combines **Grok** (the agent lineage) with **Ptah** (Egyptian craftsman-creator), reflecting a tool meant for *building* software, not only chatting about it.
 
 | | |
 |--|--|
-| **Product** | GrokPtah desktop (Tauri 2 + React) |
+| **Product** | GrokPtah desktop + persistent agent service |
 | **Origin** | Fork of [xai-org/grok-build](https://github.com/xai-org/grok-build) (Grok Build / SpaceXAI) |
 | **License** | [Apache License 2.0](LICENSE) |
 | **Repo** | [chriscase/GrokPtah](https://github.com/chriscase/GrokPtah) |
@@ -17,10 +19,22 @@ The name combines **Grok** (the agent lineage) with **Ptah** (Egyptian craftsman
 
 ## What is this?
 
-GrokPtah is a **local coding agent harness** with two clients over the same kind of workflow:
+GrokPtah is a **local-first coding and persistent-agent harness** with two
+execution hosts plus the preserved upstream client:
 
-1. **Desktop app (primary for this fork)** — a fullscreen Tauri application with a React UI: sessions, streaming replies, tool cards, permissions, plan mode, file tree, git, MCP/plugins/skills, settings, subagents, background tasks, and multi-tab terminal.
-2. **CLI / TUI (upstream path)** — the original terminal UI from Grok Build (`xai-grok-pager`), still buildable from this tree for people who prefer the ratatui pager.
+1. **Desktop app (primary interactive client and local host)** — a fullscreen
+   Tauri application with a React UI: sessions, streaming replies, tool cards,
+   permissions, plan mode, files/git, persistent agents, remote runs,
+   MCP/plugins/skills, and a multi-tab terminal.
+2. **Headless service (local or hosted persistent home)** — the same bridge
+   runtime and authenticated control plane without Tauri, suitable for a local
+   service or private VM that remains available while laptops are offline.
+3. **CLI / TUI (upstream path)** — the original terminal UI from Grok Build
+   (`xai-grok-pager`), still buildable for people who prefer the ratatui pager.
+
+A deployment has one authoritative durable home. Desktop and other authorized
+clients connect through the service protocol; they do not synchronize or
+concurrently write copies of `GROKPTAH_HOME`.
 
 The agent can read and edit files, search the codebase, run shell commands (with approval), and — when you provide an xAI API key — call live models for the reply. Shell tool runs stream into the UI as a **single live process** (the terminal attaches to that stream; it does not re-run the command).
 
@@ -28,12 +42,15 @@ The agent can read and edit files, search the codebase, run shell commands (with
 
 ## Why this fork exists
 
-Upstream **Grok Build** is a strong terminal agent (ACP, tools, MCP, sessions). GrokPtah’s purpose is to take that lineage and ship a **native desktop product**:
+Upstream **Grok Build** is a strong terminal agent (ACP, tools, MCP, sessions).
+GrokPtah’s purpose is to take that lineage and ship a **native operator
+experience plus a durable agent runtime**:
 
 | Goal | Approach |
 |------|----------|
 | Desktop UX | Tauri 2 window + React/Vite UI (not a terminal skin) |
 | Simple process model | **In-process** agent host (`grokptah-agent-bridge`) — no second `grok agent stdio` child on the happy path |
+| Local or hosted home | The same runtime can be owned by the desktop or `grokptah-service`; remote devices remain scoped clients |
 | Keep the TUI | Upstream CLI packages remain independently buildable |
 | Own identity | Product name **GrokPtah**, own icons/about, **no** upstream xAI CLI auto-update prompts on desktop |
 
@@ -126,18 +143,18 @@ cargo check -p xai-grok-pager-bin
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  GrokPtah desktop (desktop/)                            │
-│  React + Vite in Tauri 2 webview                        │
+│ Clients: desktop UI · MCP · future web/mobile           │
 └──────────────────────────┬──────────────────────────────┘
-                           │ commands + events
+                           │ typed IPC or authenticated protocol
 ┌──────────────────────────▼──────────────────────────────┐
-│  grokptah-desktop (src-tauri)                           │
-│  dialogs · PTY hub · thin IPC                           │
+│ Hosts: desktop/src-tauri or grokptah-service            │
+│ OS capabilities · configured roots · process lifecycle  │
 └──────────────────────────┬──────────────────────────────┘
-                           │ in-process
+                           │ shared domain API
 ┌──────────────────────────▼──────────────────────────────┐
-│  grokptah-agent-bridge                                  │
-│  sessions · stream · permissions · tools · shell kill   │
+│ grokptah-agent-bridge                                   │
+│ sessions · finite runs · agents · memory · policy       │
+│ durable events · tools · review/promotion               │
 └─────────────────────────────────────────────────────────┘
 
 Separately (same monorepo root workspace):
@@ -156,11 +173,12 @@ Full design notes: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | Path | Role |
 |------|------|
 | `desktop/` | GrokPtah app — frontend + Tauri backend |
-| `crates/codegen/grokptah-agent-bridge/` | In-process agent host (desktop happy path) |
+| `crates/codegen/grokptah-agent-bridge/` | Shared runtime/domain layer used by both hosts |
+| `crates/codegen/grokptah-service/` | Standalone local/VM/private-cloud service host |
 | `crates/codegen/xai-grok-pager*` | Upstream TUI / pager |
 | `crates/codegen/xai-grok-shell` | Upstream agent runtime (CLI/ACP) |
 | `docs/` | Architecture and developer setup |
-| `~/.grokptah/` | Local MCP, plugins, skills, hooks (created on use) |
+| `~/.grokptah/` or `GROKPTAH_HOME` | The single owning process's durable home plus local configuration |
 
 ---
 

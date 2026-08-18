@@ -74,11 +74,16 @@ It runs under a dedicated `grokptah` account, stores durable state under
 unit's `ReadWritePaths` must include every path listed in
 `GROKPTAH_SERVICE_WORKSPACES`.
 
-For a remote desktop client, terminate HTTPS at a reverse proxy and forward
-the `/mcp` SSE stream without buffering. Direct non-loopback service binding
-is supported only with `GROKPTAH_SERVICE_ALLOW_REMOTE=true` and a bearer token
-of at least 24 characters; it should be paired with an explicit firewall
-policy.
+For a remote desktop client, terminate HTTPS at a trusted reverse proxy and
+forward the `/mcp` SSE stream without buffering, or carry the loopback listener
+through a trusted encrypted tunnel. Setting
+`GROKPTAH_SERVICE_ALLOW_REMOTE=true` only enables the process to bind a
+non-loopback address; it does **not** make plaintext HTTP safe. Every
+non-loopback deployment must place TLS or a trusted encrypted tunnel in front
+of the service and use an explicit firewall policy. A firewall does not protect
+the bearer credential in transit. Run hosted instances under a dedicated
+account with systemd/container/VM policy that restricts writable paths and
+process authority.
 
 ## Desktop remote operations
 
