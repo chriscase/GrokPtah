@@ -375,6 +375,17 @@ pub struct RunRecord {
     pub approval: Option<RunApproval>,
 }
 
+impl RunRecord {
+    /// Product Lane identity during the session-to-Lane compatibility period.
+    ///
+    /// Keeping this as a derived accessor avoids changing durable Run records
+    /// or existing MCP payloads while making the Agent → Lane → Run relation
+    /// explicit to new callers.
+    pub fn lane_id(&self) -> Uuid {
+        self.session_id
+    }
+}
+
 pub const MAX_AGENT_CONTEXT_BYTES: usize = 16 * 1024;
 pub const MAX_AGENT_WORKSPACE_BYTES: usize = 4 * 1024;
 pub const MAX_AGENT_MODEL_BYTES: usize = 256;
@@ -921,6 +932,28 @@ mod tests {
         let agent: AgentRecord = serde_json::from_value(legacy).unwrap();
         assert!(agent.lane_ids.is_empty());
         assert_eq!(agent.known_lane_ids(), vec![session_id]);
+    }
+
+    #[test]
+    fn legacy_run_records_project_the_session_as_the_lane_id() {
+        let session_id = Uuid::new_v4();
+        let run: RunRecord = serde_json::from_value(serde_json::json!({
+            "runId": "run-legacy",
+            "sessionId": session_id,
+            "workspace": "/tmp/project",
+            "requestId": "request-1",
+            "state": "queued",
+            "bounds": {
+                "maxPromptBytes": 1000,
+                "maxRounds": 2,
+                "maxDurationMs": 1000
+            },
+            "promptPreview": "inspect",
+            "createdAt": Utc::now(),
+            "updatedAt": Utc::now()
+        }))
+        .unwrap();
+        assert_eq!(run.lane_id(), session_id);
     }
 
     #[test]

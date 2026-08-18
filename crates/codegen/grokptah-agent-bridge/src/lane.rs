@@ -30,6 +30,26 @@ impl Default for RuntimeTarget {
     }
 }
 
+/// Connection state for the runtime that owns a Lane.
+///
+/// This is deliberately separate from `RuntimeTarget`: a hosted Lane can be
+/// disconnected without changing ownership, and a reconnecting client must
+/// not present that Lane as local work merely because the transport is down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeConnectionState {
+    Connected,
+    Reconnecting,
+    Disconnected,
+    Error,
+}
+
+impl Default for RuntimeConnectionState {
+    fn default() -> Self {
+        Self::Connected
+    }
+}
+
 /// Stable user-facing work context, initially backed 1:1 by a Session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneSummary {
@@ -55,6 +75,8 @@ pub struct LaneSummary {
     pub workspace_status: WorkspaceStatus,
     #[serde(default)]
     pub runtime_target: RuntimeTarget,
+    #[serde(default)]
+    pub runtime_connection: RuntimeConnectionState,
 }
 
 impl From<&SessionSummary> for LaneSummary {
@@ -74,6 +96,7 @@ impl From<&SessionSummary> for LaneSummary {
             execution_mode: session.execution_mode,
             workspace_status: session.workspace_status,
             runtime_target: RuntimeTarget::LocalDesktop,
+            runtime_connection: RuntimeConnectionState::Connected,
         }
     }
 }
@@ -107,6 +130,7 @@ mod tests {
         assert_eq!(lane.session_id, session.id);
         assert_eq!(lane.agent_id.as_deref(), Some("agent-stable"));
         assert_eq!(lane.runtime_target, RuntimeTarget::LocalDesktop);
+        assert_eq!(lane.runtime_connection, RuntimeConnectionState::Connected);
     }
 
     #[test]
@@ -115,5 +139,30 @@ mod tests {
         assert_eq!(encoded, "\"hosted_service\"");
         let decoded: RuntimeTarget = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, RuntimeTarget::HostedService);
+    }
+
+    #[test]
+    fn old_lane_payloads_default_to_a_connected_runtime() {
+        let value = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "session_id": Uuid::new_v4(),
+            "title": "legacy",
+            "cwd": "/tmp/project",
+            "created_at": chrono::Utc::now(),
+            "updated_at": chrono::Utc::now(),
+            "message_count": 0,
+            "archived_at": null
+        });
+        let lane: LaneSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(lane.runtime_target, RuntimeTarget::LocalDesktop);
+        assert_eq!(lane.runtime_connection, RuntimeConnectionState::Connected);
+    }
+
+    #[test]
+    fn runtime_connection_round_trips_as_stable_wire_values() {
+        let encoded = serde_json::to_string(&RuntimeConnectionState::Reconnecting).unwrap();
+        assert_eq!(encoded, "\"reconnecting\"");
+        let decoded: RuntimeConnectionState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, RuntimeConnectionState::Reconnecting);
     }
 }

@@ -68,7 +68,9 @@ import {
 import { subscribeRemoteRunEvents } from "./lib/remoteRunEvents";
 import {
   executionTargetValue,
+  mergeLaneProjections,
   parseExecutionTargetValue,
+  projectRemoteSessionAsLane,
   remoteSubmissionMessage,
 } from "./lib/remoteExecution";
 import { displaySessionTitle } from "./lib/sessionTitle";
@@ -99,6 +101,30 @@ type WorkspaceMode = "build" | "chat";
 
 function titleCaseComputerState(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function runtimeConnectionLabel(value: LaneSummary["runtime_connection"]): string {
+  switch (value) {
+    case "reconnecting":
+      return "Reconnecting";
+    case "disconnected":
+      return "Disconnected";
+    case "error":
+      return "Unavailable";
+    default:
+      return "Connected";
+  }
+}
+
+function runtimeTargetLabel(value: LaneSummary["runtime_target"]): string {
+  switch (value) {
+    case "local_service":
+      return "Local service";
+    case "hosted_service":
+      return "Hosted service";
+    default:
+      return "Local desktop";
+  }
 }
 
 type RightTab =
@@ -337,6 +363,7 @@ export default function App() {
   const [persistentAgentsError, setPersistentAgentsError] = useState<string | null>(null);
   const [remoteServiceStatus, setRemoteServiceStatus] = useState<import("./lib/protocol").RemoteServiceStatus>({
     connected: false,
+    connectionState: "disconnected",
   });
   const [remoteSessions, setRemoteSessions] = useState<RemoteSessionTarget[]>([]);
   const [remoteTargetSessionId, setRemoteTargetSessionId] = useState<string | null>(null);
@@ -450,6 +477,18 @@ export default function App() {
       setRuns([]);
       setRunsSessionId(scopeKey);
       setRunsError(`Could not refresh durable runs: ${String(error)}`);
+      if (remote) {
+        const message = String(error);
+        setRemoteServiceStatus((current) => ({
+          ...current,
+          connected: false,
+          connectionState: "error",
+          lastError: message,
+        }));
+        setRemoteSessions((current) =>
+          current.map((session) => ({ ...session, runtimeConnection: "error" })),
+        );
+      }
       console.warn("durable run refresh failed", error);
     } finally {
       if (runsRefreshInFlight.current?.request !== request) return;
@@ -474,14 +513,23 @@ export default function App() {
     try {
       setRemoteServiceStatus(await api.remoteServiceStatus());
     } catch {
-      setRemoteServiceStatus({ connected: false });
+      setRemoteServiceStatus({
+        connected: false,
+        connectionState: "error",
+        lastError: "Remote service status is unavailable",
+      });
     }
   }, []);
 
   const refreshRemoteSessions = useCallback(async () => {
     if (!remoteServiceStatus.connected) {
-      setRemoteSessions([]);
-      setRemoteTargetSessionId(null);
+      setRemoteSessions((current) =>
+        current.map((session) => ({
+          ...session,
+          runtimeConnection:
+            remoteServiceStatus.connectionState ?? "disconnected",
+        })),
+      );
       return;
     }
     try {
@@ -493,9 +541,18 @@ export default function App() {
           : sessions[0]?.sessionId ?? null,
       );
     } catch (error) {
-      setPersistentAgentsError(`Could not refresh remote sessions: ${String(error)}`);
+      const message = String(error);
+      setRemoteServiceStatus((current) => ({
+        ...current,
+        connected: false,
+        connectionState: "error",
+        lastError: message,
+      }));
+      setRemoteSessions((current) =>
+        current.map((session) => ({ ...session, runtimeConnection: "error" })),
+      );
     }
-  }, [remoteServiceStatus.connected]);
+  }, [remoteServiceStatus.connected, remoteServiceStatus.connectionState]);
 
   useEffect(() => {
     void refreshRemoteServiceStatus();
@@ -526,23 +583,47 @@ export default function App() {
 
   const connectRemoteService = useCallback(
     async (baseUrl: string, token: string) => {
-      const status = await api.remoteServiceConnect(baseUrl, token);
-      setRemoteServiceStatus(status);
-      setRemoteRunEvents({});
-      setRemoteRunRecoveryErrors({});
-      const sessions = await api.remoteServiceSessionList();
-      setRemoteSessions(sessions);
-      setRemoteTargetSessionId(sessions[0]?.sessionId ?? null);
-      await refreshPersistentAgents();
+      try {
+        const status = await api.remoteServiceConnect(baseUrl, token);
+        setRemoteServiceStatus(status);
+        setRemoteRunEvents({});
+        setRemoteRunRecoveryErrors({});
+        const sessions = await api.remoteServiceSessionList();
+        setRemoteSessions(sessions);
+        setRemoteTargetSessionId(sessions[0]?.sessionId ?? null);
+        await refreshPersistentAgents();
+      } catch (error) {
+        const failedStatus = await api.remoteServiceStatus().catch(() => ({
+          connected: false,
+          connectionState: "error" as const,
+          lastError: String(error),
+        }));
+        setRemoteServiceStatus({
+          ...failedStatus,
+          connected: false,
+          connectionState: failedStatus.connectionState ?? "error",
+          lastError: failedStatus.lastError ?? String(error),
+        });
+        setRemoteSessions((current) =>
+          current.map((session) => ({ ...session, runtimeConnection: "error" })),
+        );
+        throw error;
+      }
     },
     [refreshPersistentAgents],
   );
 
   const disconnectRemoteService = useCallback(async () => {
     await api.remoteServiceDisconnect();
-    setRemoteServiceStatus({ connected: false });
-    setRemoteSessions([]);
-    setRemoteTargetSessionId(null);
+    setRemoteServiceStatus((current) => ({
+      ...current,
+      connected: false,
+      connectionState: "disconnected",
+      lastError: null,
+    }));
+    setRemoteSessions((current) =>
+      current.map((session) => ({ ...session, runtimeConnection: "disconnected" })),
+    );
     setExecutionTarget("local");
     setRemoteRunEvents({});
     setRemoteRunRecoveryErrors({});
@@ -694,6 +775,18 @@ export default function App() {
   const activeSummary = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
     [sessions, activeSessionId],
+  );
+  const remoteLanes = useMemo(
+    () => remoteSessions.map((session) => projectRemoteSessionAsLane(session, remoteServiceStatus)),
+    [remoteSessions, remoteServiceStatus],
+  );
+  const visibleLanes = useMemo(
+    () => mergeLaneProjections(lanes, remoteLanes),
+    [lanes, remoteLanes],
+  );
+  const selectedRemoteLane = useMemo(
+    () => remoteLanes.find((lane) => lane.id === remoteTargetSessionId) ?? null,
+    [remoteLanes, remoteTargetSessionId],
   );
   const effortOptions = useMemo(
     () => effortOptionsForModel(models, status?.model),
@@ -2806,10 +2899,15 @@ export default function App() {
               {activeSummary?.agent_id ? `Agent ${activeSummary.agent_id}` : "Ad hoc Agent"}
             </span>
             <span className="lane-context-badge">
-              {executionTarget === "remote" && remoteServiceStatus.connected
-                ? "Remote service"
-                : "Local desktop"}
+              {executionTarget === "remote" && selectedRemoteLane
+                ? `${runtimeTargetLabel(selectedRemoteLane.runtime_target)} · ${runtimeConnectionLabel(selectedRemoteLane.runtime_connection)}`
+                : "Local desktop · Connected"}
             </span>
+            {executionTarget === "remote" && selectedRemoteLane && (
+              <span className="lane-context-badge" title={selectedRemoteLane.cwd}>
+                Run Lane: {selectedRemoteLane.title || selectedRemoteLane.cwd}
+              </span>
+            )}
             {activeSummary?.archived && (
               <span className="lane-context-badge warning">Archived</span>
             )}
@@ -3721,7 +3819,7 @@ export default function App() {
         {rightTab === "agents" && (
             <PersistentAgentPanel
               agents={persistentAgents}
-              lanes={lanes}
+              lanes={visibleLanes}
               activeLaneId={activeLaneId}
               busy={persistentAgentsBusy}
               error={persistentAgentsError}
@@ -3745,27 +3843,33 @@ export default function App() {
         {rightTab === "tasks" && (
           <>
             <RunInspector
+              laneTitle={
+                executionTarget === "remote" && selectedRemoteLane
+                  ? `${activeSummary?.title ?? activeTab?.title ?? "Current work"} · Run Lane ${selectedRemoteLane.title || selectedRemoteLane.cwd}`
+                  : activeSummary?.title ?? activeTab?.title ?? null
+              }
+              runtimeLabel={
+                executionTarget === "remote" && selectedRemoteLane
+                  ? `${runtimeTargetLabel(selectedRemoteLane.runtime_target)} · ${runtimeConnectionLabel(selectedRemoteLane.runtime_connection)}`
+                  : "Local desktop · Connected"
+              }
               runs={
-                remoteServiceStatus.connected
-                  ? runsSessionId === "__remote__"
-                    ? runs
-                    : []
+                runsSessionId === "__remote__"
+                  ? runs
                   : runsSessionId === activeSessionId
                     ? runs
                     : []
               }
               error={
-                remoteServiceStatus.connected
-                  ? runsSessionId === "__remote__"
-                    ? Object.values(remoteRunRecoveryErrors)[0] ?? runsError
-                    : null
+                runsSessionId === "__remote__"
+                  ? Object.values(remoteRunRecoveryErrors)[0] ?? runsError
                   : runsSessionId === activeSessionId
                     ? runsError
                     : null
               }
               busy={runsBusy}
               watching={runsWatching}
-              remote={remoteServiceStatus.connected}
+              remote={runsSessionId === "__remote__" || remoteServiceStatus.connected}
               liveEvents={remoteServiceStatus.connected ? remoteRunEvents : undefined}
               onWatchingChange={setRunsWatching}
               onRefresh={() => void refreshRuns()}

@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
-import type { RemoteSessionTarget, RemoteTaskSubmission } from "./protocol";
+import type {
+  RemoteSessionTarget,
+  RemoteTaskSubmission,
+  RemoteServiceStatus,
+} from "./protocol";
 import {
   executionTargetValue,
+  laneIdForRun,
+  mergeLaneProjections,
   parseExecutionTargetValue,
+  projectRemoteSessionAsLane,
   remoteSubmissionMessage,
 } from "./remoteExecution";
 
@@ -12,6 +19,13 @@ const session: RemoteSessionTarget = {
   workspace: "/srv/grokptah",
   updatedAt: "2026-08-17T12:00:00Z",
   busy: false,
+};
+
+const connectedHostedStatus: RemoteServiceStatus = {
+  connected: true,
+  baseUrl: "https://grokptah.example/mcp",
+  runtimeTarget: "hosted_service",
+  connectionState: "connected",
 };
 
 const submission: RemoteTaskSubmission = {
@@ -62,5 +76,41 @@ describe("remote execution target mapping", () => {
     expect(
       remoteSubmissionMessage(session, { ...submission, state: "completed", queuedPosition: null }),
     ).toBe("Submitted to VM Build. Run remote-run-1 is completed.");
+  });
+
+  it("projects a service session into a service-owned Lane", () => {
+    expect(projectRemoteSessionAsLane(session, connectedHostedStatus)).toMatchObject({
+      id: session.sessionId,
+      session_id: session.sessionId,
+      cwd: session.workspace,
+      runtime_target: "hosted_service",
+      runtime_connection: "connected",
+    });
+  });
+
+  it("preserves a cached service Lane as disconnected after transport loss", () => {
+    const lane = projectRemoteSessionAsLane(session, {
+      ...connectedHostedStatus,
+      connected: false,
+      connectionState: "error",
+      lastError: "service unavailable",
+    });
+    expect(lane.runtime_target).toBe("hosted_service");
+    expect(lane.runtime_connection).toBe("error");
+  });
+
+  it("keeps local Lane ownership when a remote projection has a duplicate id", () => {
+    const local = projectRemoteSessionAsLane(session, {
+      connected: false,
+      runtimeTarget: "local_desktop",
+      connectionState: "connected",
+    });
+    const remote = projectRemoteSessionAsLane(session, connectedHostedStatus);
+    expect(mergeLaneProjections([local], [remote])).toEqual([local]);
+  });
+
+  it("derives a Run Lane id from legacy session payloads", () => {
+    expect(laneIdForRun({ sessionId: "legacy-session" })).toBe("legacy-session");
+    expect(laneIdForRun({ sessionId: "legacy-session", laneId: "lane-1" })).toBe("lane-1");
   });
 });

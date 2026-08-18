@@ -65,6 +65,11 @@ export type PersistentAgentState =
   | "completed";
 
 export type RuntimeTarget = "local_desktop" | "local_service" | "hosted_service";
+export type RuntimeConnectionState =
+  | "connected"
+  | "reconnecting"
+  | "disconnected"
+  | "error";
 
 /** User-facing Lane projection; `id === session_id` during migration. */
 export interface LaneSummary {
@@ -82,6 +87,7 @@ export interface LaneSummary {
   execution_mode?: RunExecutionMode;
   workspace_status?: WorkspaceStatus;
   runtime_target?: RuntimeTarget;
+  runtime_connection?: RuntimeConnectionState;
 }
 
 export interface PersistentAgent {
@@ -123,6 +129,9 @@ export interface PersistentAgentResumePlan {
 export interface RemoteServiceStatus {
   connected: boolean;
   baseUrl?: string | null;
+  runtimeTarget?: RuntimeTarget | null;
+  connectionState?: RuntimeConnectionState;
+  lastError?: string | null;
 }
 
 export interface RemoteSessionTarget {
@@ -131,6 +140,8 @@ export interface RemoteSessionTarget {
   workspace: string;
   updatedAt: string;
   busy: boolean;
+  runtimeTarget?: RuntimeTarget;
+  runtimeConnection?: RuntimeConnectionState;
 }
 
 export interface RemoteTaskSubmission {
@@ -216,6 +227,8 @@ export interface DurableRunEventPage {
 export interface DurableRun {
   runId: string;
   sessionId: string;
+  /** Compatibility projection; old payloads derive this from sessionId. */
+  laneId?: string | null;
   workspace: string;
   requestId: string;
   clientId?: string | null;

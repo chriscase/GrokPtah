@@ -264,7 +264,8 @@ describe("RunInspector", () => {
       />,
     );
 
-    expect(screen.getByRole("alert")).toHaveTextContent("bridge unavailable");
+    expect(screen.getByRole("alert")).toHaveTextContent("Task history could not be refreshed");
+    expect(screen.getByText(/bridge unavailable/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Retry refresh" }));
     expect(onRefresh).toHaveBeenCalledTimes(1);
   });

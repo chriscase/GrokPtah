@@ -177,8 +177,10 @@ export function PersistentAgentPanel({
           <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
             <div style={{ fontSize: 11, color: "var(--muted)" }}>
               {remoteStatus.connected
-                ? `Remote service connected${remoteStatus.baseUrl ? ` · ${remoteStatus.baseUrl}` : ""}`
-                : "Local service mode"}
+                ? `${remoteStatus.runtimeTarget === "local_service" ? "Local" : "Hosted"} service connected${remoteStatus.baseUrl ? ` · ${remoteStatus.baseUrl}` : ""}`
+                : remoteStatus.connectionState === "error"
+                  ? "Remote service unavailable · cached Lanes are marked unavailable"
+                  : "No remote service connected"}
             </div>
             {remoteStatus.connected ? (
               <button type="button" onClick={() => void disconnectRemote()} disabled={remoteBusy}>
