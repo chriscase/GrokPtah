@@ -1507,7 +1507,7 @@ impl OrchestrationService {
                 )
             })?;
         let agent_workspace = canonical_workspace(Path::new(&agent.workspace))?;
-        if agent.session_id != session_id || agent_workspace != claimed {
+        if !agent.known_lane_ids().contains(&session_id) || agent_workspace != claimed {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
                 "persistent agent is not available in the requested scope",
@@ -2544,7 +2544,7 @@ impl OrchestrationService {
             return Err(finish_err(self, e));
         }
         let ceiling = self.config.lock().bounds.clone();
-        let bounds = match merge_bounds(&ceiling, bounds_json.as_ref()) {
+        let mut bounds = match merge_bounds(&ceiling, bounds_json.as_ref()) {
             Ok(b) => b,
             Err(e) => return Err(finish_err(self, e)),
         };
@@ -2582,6 +2582,43 @@ impl OrchestrationService {
             IdempotencyStart::Perform(lease) => lease,
         };
 
+        let agent = match self.host.ensure_session_agent(session_id) {
+            Ok(agent) => agent,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                ));
+            }
+        };
+        let agent_bounds = match agent.current_spec() {
+            Ok(spec) => &spec.default_run_bounds,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
+        };
+        bounds.max_prompt_bytes = bounds.max_prompt_bytes.min(agent_bounds.max_prompt_bytes);
+        bounds.max_rounds = bounds.max_rounds.min(agent_bounds.max_rounds);
+        bounds.max_duration_ms = bounds.max_duration_ms.min(agent_bounds.max_duration_ms);
+        bounds.max_total_tokens = match (bounds.max_total_tokens, agent_bounds.max_total_tokens) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
+        if prompt.len() > bounds.max_prompt_bytes {
+            let error = OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                format!(
+                    "prompt exceeds persistent Agent max_prompt_bytes ({})",
+                    bounds.max_prompt_bytes
+                ),
+            );
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+
         // Give older queued work first claim on any newly available capacity.
         self.pump_pending();
         let run_id = Uuid::new_v4().to_string();
@@ -2616,7 +2653,7 @@ impl OrchestrationService {
             } else {
                 RunState::Running
             },
-            agent_id: None,
+            agent_id: Some(agent.agent_id),
             retry_of: retry_of.map(str::to_string),
             parent_run_id: None,
             queue_position: None,

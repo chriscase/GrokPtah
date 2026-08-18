@@ -150,7 +150,14 @@ async fn compatible_gateway(
         }
         _ => return Err(StatusCode::BAD_REQUEST),
     };
-    Ok(Json(serde_json::json!({"choices": [{"message": message}]})))
+    Ok(Json(serde_json::json!({
+        "choices": [{"message": message}],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15
+        }
+    })))
 }
 
 async fn drain_until_turn_complete(

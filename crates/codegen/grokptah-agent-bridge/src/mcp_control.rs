@@ -3026,6 +3026,7 @@ mod tests {
             agent_id: agent.agent_id.clone(),
             session_id: session.id,
             run_id: "desktop-run-scope-1".into(),
+            agent_spec_revision: Some(agent.current_spec().unwrap().revision),
             parent_checkpoint_id: None,
             ordinal: 1,
             workspace: agent.workspace.clone(),

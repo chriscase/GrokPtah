@@ -583,13 +583,13 @@ impl RemoteServiceClient {
         let agents = self.list_persistent_agents().await?;
         let agent = agents
             .into_iter()
-            .find(|agent| agent.session_id == session_id)
+            .find(|agent| agent.known_lane_ids().contains(&session_id))
             .ok_or_else(|| anyhow::anyhow!("remote session has no persistent agent"))?;
         let value = self
             .call_tool(
                 "ptah_get_persistent_agent",
                 json!({
-                    "session_id": agent.session_id,
+                    "session_id": session_id,
                     "workspace": agent.workspace,
                     "agent_id": agent.agent_id,
                 }),
@@ -608,14 +608,14 @@ impl RemoteServiceClient {
         let agents = self.list_persistent_agents().await?;
         let agent = agents
             .into_iter()
-            .find(|agent| agent.session_id == session_id)
+            .find(|agent| agent.known_lane_ids().contains(&session_id))
             .ok_or_else(|| anyhow::anyhow!("remote session has no persistent agent"))?;
         let value = self
             .call_tool(
                 "ptah_resume_persistent_agent",
                 json!({
                     "request_id": request_id,
-                    "session_id": agent.session_id,
+                    "session_id": session_id,
                     "workspace": agent.workspace,
                     "agent_id": agent.agent_id,
                     "prompt": prompt,

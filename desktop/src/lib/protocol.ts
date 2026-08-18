@@ -84,6 +84,56 @@ export type RuntimeConnectionState =
   | "disconnected"
   | "error";
 
+export interface PersistentAgentRunBounds {
+  maxPromptBytes: number;
+  maxRounds: number;
+  maxDurationMs: number;
+  maxTotalTokens?: number | null;
+}
+
+export interface PersistentAgentAuthorityPolicy {
+  sandboxProfile: string;
+  bypassPermissions: boolean;
+  allowedTools: string[];
+  allowedMcpServers: string[];
+  computerUseAllowed: boolean;
+  autoAllowedTools: string[];
+  allowRules: string[];
+  denyRules: string[];
+}
+
+export interface PersistentAgentSpec {
+  schemaVersion: number;
+  revision: number;
+  previousRevision?: number | null;
+  displayName: string;
+  role: string;
+  sourceWorkspace: string;
+  model: {
+    selectionKey: string;
+    providerId: string;
+    modelId: string;
+  };
+  defaultRunBounds: PersistentAgentRunBounds;
+  authority: PersistentAgentAuthorityPolicy;
+  memory: {
+    projectScope: boolean;
+    agentPrivateScope: boolean;
+    teamIds: string[];
+  };
+  createdAt: string;
+  createdBy: string;
+}
+
+export interface PersistentAgentLaneAssociation {
+  laneId: string;
+  sourceWorkspace: string;
+  attachedAt: string;
+  attachedBy: string;
+  detachedAt?: string | null;
+  detachedBy?: string | null;
+}
+
 /** User-facing Lane projection; `id === session_id` during migration. */
 export interface LaneSummary {
   id: string;
@@ -108,10 +158,14 @@ export interface PersistentAgent {
   sessionId: string;
   /** All durable Lanes attached to this Agent; old records expose the primary Lane. */
   laneIds?: string[];
+  laneAssociations?: PersistentAgentLaneAssociation[];
   workspace: string;
   model: string;
+  spec?: PersistentAgentSpec;
   state: PersistentAgentState;
   currentRunId?: string | null;
+  lastRunId?: string | null;
+  lastLaneId?: string | null;
   latestCheckpointId?: string | null;
   continuationOrdinal: number;
   createdAt: string;
@@ -123,6 +177,7 @@ export interface PersistentAgentCheckpoint {
   agentId: string;
   sessionId: string;
   runId: string;
+  agentSpecRevision?: number | null;
   parentCheckpointId?: string | null;
   ordinal: number;
   workspace: string;

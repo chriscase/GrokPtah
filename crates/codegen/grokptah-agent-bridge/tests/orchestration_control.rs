@@ -12,7 +12,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    hash_payload, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
+    hash_payload, AgentModelSpec, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
     RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
@@ -1450,6 +1450,12 @@ async fn submit_task_reaches_terminal_offline() {
     let run_id = resp["runId"].as_str().unwrap().to_string();
     let state = wait_run_terminal(&orch, &auth, &run_id, Duration::from_secs(10)).await;
     assert_eq!(state, RunState::Completed);
+    let run = orch.get_run(&auth, &run_id).unwrap();
+    assert!(run["agentId"].as_str().is_some());
+    assert_eq!(
+        run["bounds"]["maxTotalTokens"],
+        grokptah_agent_bridge::DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS
+    );
     let handoff = orch.get_handoff(&auth, &run_id).unwrap();
     assert!(handoff["finalResponse"].as_str().is_some());
     // Idempotent retry
@@ -2731,7 +2737,18 @@ async fn bounded_compaction_uses_durable_admission_and_stops_before_the_main_mod
     guard.remove("GROKPTAH_AGENT_OFFLINE");
     guard.set("GROKPTAH_API_BASE", format!("http://{address}/v1"));
     guard.set("GROKPTAH_API_KEY", "synthetic-compatible-key");
-    host.set_model(model_selection_key("env-grokptah", "synthetic-cheap-code"));
+    let synthetic_model = model_selection_key("env-grokptah", "synthetic-cheap-code");
+    host.set_model(synthetic_model.clone());
+    let agent = host.ensure_session_agent(session.id).unwrap();
+    host.ensure_orchestration_store()
+        .unwrap()
+        .revise_agent_spec(&agent.agent_id, "test:bounded-compaction-model", |spec| {
+            spec.model = AgentModelSpec::from_selection_key(&synthetic_model)
+                .expect("synthetic model selection must be valid");
+            Ok(())
+        })
+        .unwrap()
+        .expect("persistent Agent must exist");
     let orch = OrchestrationService::new(
         host.clone(),
         host.event_bus(),

@@ -41,9 +41,10 @@ use crate::lane::LaneSummary;
 use crate::local_tools;
 use crate::memory::{MemoryAccess, MemoryAddress, MemoryScope};
 use crate::orchestration::{
-    apply_run_aggregate, prompt_preview, AgentRecord, AgentResumePlan, AgentState,
-    ContinuationCheckpoint, ContinuationReason, OrchStore, PromotionState, RunAggregates,
-    RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
+    apply_run_aggregate, prompt_preview, AgentAuthorityPolicy, AgentLaneAssociation, AgentRecord,
+    AgentResumePlan, AgentSpec, AgentState, ContinuationCheckpoint, ContinuationReason, OrchStore,
+    PromotionState, RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
+    RunStopCause, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::prompt_queue::{
@@ -913,6 +914,12 @@ impl AgentHostHandle {
     /// remain manual-only unless a durable provider profile or this process's
     /// explicit simulator qualification grants semantic authority.
     pub fn computer_agent_eligibility(&self, session_id: Uuid) -> Result<ComputerAgentEligibility> {
+        if self
+            .session_agent_authority(session_id)?
+            .is_some_and(|policy| !policy.computer_use_allowed)
+        {
+            bail!("Computer Use is not allowed by this Agent specification");
+        }
         let (model, _) = self.selected_computer_model(session_id)?;
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
@@ -1059,11 +1066,18 @@ impl AgentHostHandle {
     }
 
     fn selected_computer_model(&self, session_id: Uuid) -> Result<(String, EffortLevel)> {
-        let inner = self.inner.lock();
-        if !inner.sessions.contains_key(&session_id) {
-            bail!("unknown session");
-        }
-        Ok((inner.model.clone(), inner.effort))
+        let (ambient_model, effort) = {
+            let inner = self.inner.lock();
+            if !inner.sessions.contains_key(&session_id) {
+                bail!("unknown session");
+            }
+            (inner.model.clone(), inner.effort)
+        };
+        let model = self
+            .session_agent_spec(session_id)?
+            .map(|spec| spec.model.selection_key)
+            .unwrap_or(ambient_model);
+        Ok((model, effort))
     }
 
     fn begin_computer_agent_operation(
@@ -1071,6 +1085,12 @@ impl AgentHostHandle {
         session_id: Uuid,
     ) -> Result<(String, CancellationToken, ComputerAgentBusyGuard)> {
         self.ensure_session_accepts_new_work(session_id)?;
+        if self
+            .session_agent_authority(session_id)?
+            .is_some_and(|policy| !policy.computer_use_allowed)
+        {
+            bail!("Computer Use is not allowed by this Agent specification");
+        }
         let operation_id = Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
         {
@@ -1170,17 +1190,52 @@ impl AgentHostHandle {
     /// session owns the binding, while the orchestration store owns lifecycle
     /// state; this keeps transport adapters from inventing identity.
     pub fn ensure_session_agent(&self, session_id: Uuid) -> Result<AgentRecord> {
-        let (cwd, model, kind, existing_id) = {
+        let (cwd, model, kind, existing_id, authority, default_bounds) = {
             let g = self.inner.lock();
+            let selected_model = g.model.clone();
             let session = g
                 .sessions
                 .get(&session_id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
+            let mut auto_allowed_tools = g.always_allowed_tools.iter().cloned().collect::<Vec<_>>();
+            auto_allowed_tools.sort();
+            let mut allowed_mcp_servers = g
+                .mcp_servers
+                .iter()
+                .filter(|server| server.enabled)
+                .map(|server| server.name.clone())
+                .collect::<Vec<_>>();
+            allowed_mcp_servers.sort();
+            allowed_mcp_servers.dedup();
+            let mut default_bounds = RunBounds {
+                max_total_tokens: Some(
+                    crate::orchestration::DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
+                ),
+                ..RunBounds::default()
+            };
+            if let Some(max_rounds) = g.max_agent_rounds {
+                default_bounds.max_rounds = max_rounds.max(1);
+            }
             (
                 session.cwd.clone(),
-                session.model.clone(),
+                selected_model,
                 session.kind,
                 session.agent_id.clone(),
+                AgentAuthorityPolicy {
+                    sandbox_profile: normalize_sandbox_profile(&g.sandbox_profile).into(),
+                    bypass_permissions: g.always_approve
+                        || g.permission_mode == "bypassPermissions",
+                    allowed_tools: DEFAULT_AGENT_TOOL_IDS
+                        .iter()
+                        .map(|tool| (*tool).to_string())
+                        .collect(),
+                    allowed_mcp_servers,
+                    computer_use_allowed: false,
+                    auto_allowed_tools,
+                    allow_rules: g.allow_rules.clone(),
+                    deny_rules: g.deny_rules.clone(),
+                },
+                default_bounds,
             )
         };
         if kind != SessionKind::Build {
@@ -1194,35 +1249,66 @@ impl AgentHostHandle {
         let now = Utc::now();
         let mut agent = match store.load_agent(&agent_id)? {
             Some(agent) => {
-                if agent.session_id != session_id || agent.workspace != workspace {
+                if !agent.known_lane_ids().contains(&session_id) || agent.workspace != workspace {
                     bail!("session is bound to a different persistent agent workspace");
                 }
                 agent
             }
-            None => AgentRecord {
-                agent_id: agent_id.clone(),
-                session_id,
-                lane_ids: vec![session_id],
-                workspace: workspace.clone(),
-                model: model.clone(),
-                state: AgentState::Waiting,
-                current_run_id: None,
-                latest_checkpoint_id: None,
-                continuation_ordinal: 0,
-                created_at: now,
-                updated_at: now,
-            },
+            None => {
+                let mut spec =
+                    AgentSpec::initial(&agent_id, &workspace, &model, authority, now, "desktop")
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                spec.default_run_bounds = default_bounds;
+                spec.validate()
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                AgentRecord {
+                    agent_id: agent_id.clone(),
+                    session_id,
+                    lane_ids: vec![session_id],
+                    lane_associations: vec![AgentLaneAssociation {
+                        lane_id: session_id,
+                        source_workspace: workspace.clone(),
+                        attached_at: now,
+                        attached_by: "desktop".into(),
+                        detached_at: None,
+                        detached_by: None,
+                    }],
+                    workspace: workspace.clone(),
+                    model: model.clone(),
+                    spec: Some(spec),
+                    state: AgentState::Waiting,
+                    current_run_id: None,
+                    last_run_id: None,
+                    last_lane_id: Some(session_id),
+                    latest_checkpoint_id: None,
+                    continuation_ordinal: 0,
+                    created_at: now,
+                    updated_at: now,
+                }
+            }
         };
+        let was_associated = agent.known_lane_ids().contains(&session_id);
+        let mut association_changed = false;
         if !agent.lane_ids.contains(&session_id) {
             agent.lane_ids.push(session_id);
+            association_changed = true;
+        }
+        if !was_associated {
+            agent.lane_associations.push(AgentLaneAssociation {
+                lane_id: session_id,
+                source_workspace: agent.workspace.clone(),
+                attached_at: Utc::now(),
+                attached_by: "desktop".into(),
+                detached_at: None,
+                detached_by: None,
+            });
+            association_changed = true;
+        }
+        if association_changed {
             agent.updated_at = now;
             store.save_agent(&agent)?;
         }
-        if agent.model != model {
-            agent.model = model;
-            agent.updated_at = now;
-            store.save_agent(&agent)?;
-        } else if store.load_agent(&agent_id)?.is_none() {
+        if store.load_agent(&agent_id)?.is_none() {
             store.save_agent(&agent)?;
         }
         if existing_id.is_none() {
@@ -1261,26 +1347,86 @@ impl AgentHostHandle {
         if kind != SessionKind::Build {
             bail!("persistent agents are available only for Build sessions");
         }
+        if let Some(existing) = session.agent_id.as_deref() {
+            if existing != agent_id {
+                bail!(
+                    "Lane is already attached to a different Agent; detach it explicitly before reassignment"
+                );
+            }
+        }
         let store = self.ensure_orchestration_store()?;
         let mut agent = store
             .load_agent(agent_id)?
             .ok_or_else(|| anyhow!("unknown persistent agent: {agent_id}"))?;
+        if session.cwd.display().to_string() != agent.workspace {
+            bail!("Lane workspace does not match the Agent source workspace");
+        }
+        let original_agent = agent.clone();
+        let was_associated = agent.known_lane_ids().contains(&session_id);
+        let mut association_changed = false;
         if !agent.lane_ids.contains(&session_id) {
             agent.lane_ids.push(session_id);
+            association_changed = true;
+        }
+        if !was_associated {
+            agent.lane_associations.push(AgentLaneAssociation {
+                lane_id: session_id,
+                source_workspace: agent.workspace.clone(),
+                attached_at: Utc::now(),
+                attached_by: "desktop".into(),
+                detached_at: None,
+                detached_by: None,
+            });
+            association_changed = true;
+        }
+        if association_changed {
             agent.updated_at = Utc::now();
             store.save_agent(&agent)?;
         }
         if session.agent_id.as_deref() != Some(agent_id) {
-            let updated = {
+            let (persist_result, rollback_result) = {
                 let mut g = self.inner.lock();
                 let current = g
                     .sessions
                     .get_mut(&session_id)
                     .ok_or_else(|| anyhow!("unknown session"))?;
                 current.agent_id = Some(agent_id.to_string());
-                current.clone()
+                let updated = current.clone();
+                let persist_result = session_store::save_session_meta(&updated);
+                let rollback_result = if persist_result.is_err() {
+                    current.agent_id = session.agent_id.clone();
+                    if association_changed {
+                        store
+                            .update_agent(agent_id, |durable| {
+                                durable.lane_ids.retain(|lane| *lane != session_id);
+                                if original_agent.lane_ids.contains(&session_id) {
+                                    durable.lane_ids.push(session_id);
+                                }
+                                durable
+                                    .lane_associations
+                                    .retain(|association| association.lane_id != session_id);
+                                durable.lane_associations.extend(
+                                    original_agent
+                                        .lane_associations
+                                        .iter()
+                                        .filter(|association| association.lane_id == session_id)
+                                        .cloned(),
+                                );
+                                Ok(())
+                            })
+                            .map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                };
+                (persist_result, rollback_result)
             };
-            session_store::save_session_meta(&updated).context("persist Lane Agent binding")?;
+            if let Err(error) = persist_result {
+                rollback_result.context("roll back Agent Lane association")?;
+                return Err(error).context("persist Lane Agent binding");
+            }
         }
         Ok(agent)
     }
@@ -1335,6 +1481,11 @@ impl AgentHostHandle {
         let checkpoint = store
             .load_checkpoint(checkpoint_id)?
             .ok_or_else(|| anyhow!("latest persistent checkpoint is missing"))?;
+        if let Some(revision) = checkpoint.agent_spec_revision {
+            if store.load_agent_spec(&agent.agent_id, revision)?.is_none() {
+                bail!("checkpoint Agent specification revision is missing");
+            }
+        }
         let plan = AgentResumePlan {
             parent_run_id: checkpoint.run_id.clone(),
             agent,
@@ -1703,7 +1854,7 @@ impl AgentHostHandle {
         session_id: Uuid,
         cwd: &Path,
         prompt: &str,
-        max_rounds: Option<u32>,
+        bounds: RunBounds,
         start_seq: u64,
         turn_id: Uuid,
         execution: Option<RunExecution>,
@@ -1718,10 +1869,6 @@ impl AgentHostHandle {
             }
         };
         let run_id = format!("desktop-{turn_id}");
-        let mut bounds = RunBounds::default();
-        if let Some(rounds) = max_rounds {
-            bounds.max_rounds = rounds.max(1);
-        }
         let now = Utc::now();
         let run = RunRecord {
             run_id: run_id.clone(),
@@ -1862,6 +2009,7 @@ impl AgentHostHandle {
             "completed" => ContinuationReason::TurnCompleted,
             "cancelled" => ContinuationReason::Cancelled,
             "limit_reached"
+            | "max_duration_reached"
             | "max_rounds_reached"
             | "stationarity"
             | "recovery_exhausted"
@@ -1875,6 +2023,7 @@ impl AgentHostHandle {
             agent_id: agent_id.to_string(),
             session_id: run.session_id,
             run_id: run.run_id.clone(),
+            agent_spec_revision: Some(agent.current_spec()?.revision),
             parent_checkpoint_id: agent.latest_checkpoint_id.clone(),
             ordinal: agent.continuation_ordinal.saturating_add(1),
             workspace: run.workspace.clone(),
@@ -1889,6 +2038,8 @@ impl AgentHostHandle {
         store
             .update_agent(agent_id, |current| {
                 current.current_run_id = None;
+                current.last_run_id = Some(run.run_id.clone());
+                current.last_lane_id = Some(run.session_id);
                 current.latest_checkpoint_id = Some(checkpoint.checkpoint_id.clone());
                 current.continuation_ordinal = checkpoint.ordinal;
                 current.state = if outcome == "failed" {
@@ -1931,6 +2082,7 @@ impl AgentHostHandle {
             "completed" => RunState::Completed,
             "cancelled" => RunState::Cancelled,
             "limit_reached"
+            | "max_duration_reached"
             | "max_rounds_reached"
             | "stationarity"
             | "recovery_exhausted"
@@ -1955,6 +2107,7 @@ impl AgentHostHandle {
                 "completed" => Some(RunStopCause::Completed),
                 "cancelled" => Some(RunStopCause::Cancelled),
                 "failed" => Some(RunStopCause::Failed),
+                "max_duration_reached" => Some(RunStopCause::DurationLimit),
                 _ => None,
             };
         }
@@ -3516,8 +3669,139 @@ impl AgentHostHandle {
         g.deny_rules = deny;
     }
 
-    /// Consult YOLO / always-allowed tools / allow+deny rules for a tool gate.
-    fn tool_gate(&self, tool_name: &str) -> ToolGate {
+    fn session_agent_spec(&self, session_id: Uuid) -> Result<Option<AgentSpec>> {
+        let agent_id = {
+            let g = self.inner.lock();
+            g.sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?
+                .agent_id
+                .clone()
+        };
+        let Some(agent_id) = agent_id else {
+            return Ok(None);
+        };
+        let store = self.orchestration_store.lock().clone();
+        let store = store.ok_or_else(|| anyhow!("persistent Agent store is unavailable"))?;
+        let agent = store
+            .load_agent(&agent_id)?
+            .ok_or_else(|| anyhow!("persistent Agent record is missing"))?;
+        Ok(Some(agent.current_spec()?.clone()))
+    }
+
+    fn session_agent_authority(&self, session_id: Uuid) -> Result<Option<AgentAuthorityPolicy>> {
+        Ok(self
+            .session_agent_spec(session_id)?
+            .map(|spec| spec.authority))
+    }
+
+    /// Intersect mutable host policy with the Agent's captured ceiling. Either
+    /// side may deny or require approval; auto-approval requires both.
+    fn tool_gate(&self, session_id: Uuid, tool_name: &str) -> ToolGate {
+        self.tool_gate_inner(session_id, tool_name, true)
+    }
+
+    fn tool_gate_inner(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        enforce_tool_allowlist: bool,
+    ) -> ToolGate {
+        let ambient = {
+            let g = self.inner.lock();
+            evaluate_tool_gate(
+                tool_name,
+                g.always_approve,
+                &g.always_allowed_tools,
+                &g.permission_mode,
+                &g.allow_rules,
+                &g.deny_rules,
+            )
+        };
+        let captured = match self.session_agent_authority(session_id) {
+            Ok(Some(policy)) => {
+                if enforce_tool_allowlist
+                    && !policy.allowed_tools.iter().any(|tool| tool == tool_name)
+                {
+                    return ToolGate::AutoDeny;
+                }
+                let allowed = policy
+                    .auto_allowed_tools
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                evaluate_tool_gate(
+                    tool_name,
+                    policy.bypass_permissions,
+                    &allowed,
+                    if policy.bypass_permissions {
+                        "bypassPermissions"
+                    } else {
+                        "default"
+                    },
+                    &policy.allow_rules,
+                    &policy.deny_rules,
+                )
+            }
+            Ok(None) => return ambient,
+            Err(_) => return ToolGate::AutoDeny,
+        };
+        match (ambient, captured) {
+            (ToolGate::AutoDeny, _) | (_, ToolGate::AutoDeny) => ToolGate::AutoDeny,
+            (ToolGate::AutoAllow, ToolGate::AutoAllow) => ToolGate::AutoAllow,
+            _ => ToolGate::Prompt,
+        }
+    }
+
+    fn session_sandbox_is_readonly(&self, session_id: Uuid) -> bool {
+        let ambient = self.inner.lock().sandbox_profile.clone();
+        sandbox_is_readonly(&ambient)
+            || match self.session_agent_authority(session_id) {
+                Ok(Some(policy)) => sandbox_is_readonly(&policy.sandbox_profile),
+                Ok(None) => false,
+                Err(_) => true,
+            }
+    }
+
+    fn session_sandbox_blocks_shell(&self, session_id: Uuid, command: &str) -> bool {
+        let ambient = self.inner.lock().sandbox_profile.clone();
+        if sandbox_blocks_shell(&ambient, command) {
+            return true;
+        }
+        match self.session_agent_authority(session_id) {
+            Ok(Some(policy)) => sandbox_blocks_shell(&policy.sandbox_profile, command),
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+
+    fn session_exec_risk_policy(&self, session_id: Uuid) -> (String, bool) {
+        let (ambient_profile, ambient_bypass) = {
+            let g = self.inner.lock();
+            (g.sandbox_profile.clone(), g.always_approve)
+        };
+        match self.session_agent_authority(session_id) {
+            Ok(Some(policy)) => {
+                let profile = if sandbox_is_readonly(&ambient_profile)
+                    || sandbox_is_readonly(&policy.sandbox_profile)
+                {
+                    "read-only".into()
+                } else if ambient_profile == "workspace-write"
+                    || policy.sandbox_profile == "workspace-write"
+                {
+                    "workspace-write".into()
+                } else {
+                    ambient_profile
+                };
+                (profile, ambient_bypass && policy.bypass_permissions)
+            }
+            Ok(None) => (ambient_profile, ambient_bypass),
+            Err(_) => ("read-only".into(), false),
+        }
+    }
+
+    #[cfg(test)]
+    fn ambient_tool_gate(&self, tool_name: &str) -> ToolGate {
         let g = self.inner.lock();
         evaluate_tool_gate(
             tool_name,
@@ -5775,6 +6059,50 @@ impl AgentHostHandle {
         self.ensure_session_accepts_new_work(session_id)?;
         self.ensure_transcript_loaded(session_id)?;
         self.ensure_build_workspace_ready(session_id)?;
+        let persistent_agent = {
+            let kind = self
+                .inner
+                .lock()
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?
+                .kind;
+            if kind == SessionKind::Build {
+                Some(self.ensure_session_agent(session_id)?)
+            } else {
+                None
+            }
+        };
+        let agent_default_bounds = persistent_agent
+            .as_ref()
+            .map(|agent| {
+                agent
+                    .current_spec()
+                    .map(|spec| spec.default_run_bounds.clone())
+                    .map_err(|error| anyhow!(error.to_string()))
+            })
+            .transpose()?;
+        if let Some(bounds) = agent_default_bounds.as_ref() {
+            if prompt.len() > bounds.max_prompt_bytes {
+                bail!(
+                    "prompt exceeds persistent Agent max_prompt_bytes ({})",
+                    bounds.max_prompt_bytes
+                );
+            }
+        }
+        let effective_max_rounds = if let Some(bounds) = agent_default_bounds.as_ref() {
+            let default = bounds.max_rounds;
+            let ambient = self.inner.lock().max_agent_rounds.unwrap_or(default);
+            Some(
+                max_rounds
+                    .unwrap_or(default)
+                    .min(default)
+                    .min(ambient)
+                    .max(1),
+            )
+        } else {
+            max_rounds
+        };
         if let Some(plan) = resume.as_ref() {
             let (workspace, agent_id) = {
                 let g = self.inner.lock();
@@ -5820,13 +6148,23 @@ impl AgentHostHandle {
                 }
                 None => {}
             }
-            // Keep session model in sync with host selection
-            let model = g.model.clone();
+            // Persistent Agent model selection is revisioned and must not
+            // drift with the currently focused desktop model.
+            let model = persistent_agent
+                .as_ref()
+                .map(|agent| {
+                    agent
+                        .current_spec()
+                        .map(|spec| spec.model.selection_key.clone())
+                        .map_err(|error| anyhow!(error.to_string()))
+                })
+                .transpose()?
+                .unwrap_or_else(|| g.model.clone());
             let effort = g.effort;
             let cancel = CancellationToken::new();
             g.turn_cancels.insert(session_id, cancel.clone());
             g.begin_turn_generation(session_id);
-            if let Some(n) = max_rounds {
+            if let Some(n) = effective_max_rounds {
                 g.turn_max_rounds.insert(session_id, n.max(1));
             } else {
                 g.turn_max_rounds.remove(&session_id);
@@ -5870,11 +6208,7 @@ impl AgentHostHandle {
         let start_seq = event_tx.current_seq();
         let usage_before = self.session_usage_snapshot(session_id);
         let turn_id = Uuid::new_v4();
-        let agent = if kind == SessionKind::Build {
-            Some(self.ensure_session_agent(session_id)?)
-        } else {
-            None
-        };
+        let agent = persistent_agent;
         let requested_execution_mode = external_run
             .as_ref()
             .map(|run| run.execution_mode)
@@ -5941,11 +6275,15 @@ impl AgentHostHandle {
             .map(|execution| PathBuf::from(&execution.execution_workspace))
             .unwrap_or_else(|| cwd.clone());
         let desktop_run = if external_run.is_none() && kind == SessionKind::Build {
+            let mut bounds = agent_default_bounds.clone().unwrap_or_default();
+            if let Some(rounds) = effective_max_rounds {
+                bounds.max_rounds = bounds.max_rounds.min(rounds).max(1);
+            }
             self.begin_desktop_run(
                 session_id,
                 &cwd,
                 &prompt,
-                max_rounds,
+                bounds,
                 start_seq,
                 turn_id,
                 run_execution.clone(),
@@ -5981,19 +6319,39 @@ impl AgentHostHandle {
             turn_id,
         });
 
-        let mut result = self
-            .run_turn(
-                session_id,
-                &execution_cwd,
-                &model,
-                effort,
-                plan_mode,
-                kind,
-                &prompt,
-                cancel.clone(),
-                event_tx.clone(),
-            )
-            .await;
+        let run_turn = self.run_turn(
+            session_id,
+            &execution_cwd,
+            &model,
+            effort,
+            plan_mode,
+            kind,
+            &prompt,
+            cancel.clone(),
+            event_tx.clone(),
+        );
+        tokio::pin!(run_turn);
+        let mut duration_limited = false;
+        let mut result = if let Some(duration_ms) = desktop_run
+            .as_ref()
+            .and_then(|(run_id, store)| store.load_run(run_id).ok().flatten())
+            .map(|run| run.bounds.max_duration_ms)
+        {
+            tokio::select! {
+                result = &mut run_turn => result,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(duration_ms.max(1))) => {
+                    duration_limited = true;
+                    cancel.cancel();
+                    let message = format!(
+                        "Stopped at the persistent Agent duration limit of {duration_ms} ms"
+                    );
+                    emit_message(&event_tx, session_id, &message);
+                    Err(anyhow!(message))
+                }
+            }
+        } else {
+            run_turn.await
+        };
         if let Some(tracker) = run_usage_tracker.as_ref() {
             if let Err(error) = self
                 .quiesce_bounded_run_subagents(session_id, tracker)
@@ -6105,7 +6463,9 @@ impl AgentHostHandle {
             }
             Err(e) => Err(e),
         };
-        let outcome = if cancelled {
+        let outcome = if duration_limited {
+            "max_duration_reached"
+        } else if cancelled {
             "cancelled"
         } else if let Some(code) = durable_stop_code.as_deref() {
             code
@@ -6950,7 +7310,7 @@ impl AgentHostHandle {
                 let path = path.trim().to_string();
                 let content = content.trim().to_string();
                 let path_rec = path.clone();
-                if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
+                if self.session_sandbox_is_readonly(session_id) {
                     let msg = "ERROR: tool safety profile is read-only; write_file denied";
                     emit_message(event_tx, session_id, msg);
                     // still finish turn below
@@ -7926,7 +8286,7 @@ impl AgentHostHandle {
                 .await
             }
             "write_file" => {
-                if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
+                if self.session_sandbox_is_readonly(session_id) {
                     return Ok("ERROR: tool safety profile is read-only; write_file denied".into());
                 }
                 let path = args
@@ -7963,7 +8323,7 @@ impl AgentHostHandle {
                 out
             }
             "write_files" => {
-                if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
+                if self.session_sandbox_is_readonly(session_id) {
                     return Ok("ERROR: tool safety profile is read-only; write_files denied".into());
                 }
                 let files_val = args
@@ -8016,7 +8376,7 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("run_terminal_cmd requires command"))?
                     .to_string();
-                if sandbox_blocks_shell(&self.inner.lock().sandbox_profile, &command) {
+                if self.session_sandbox_blocks_shell(session_id, &command) {
                     return Ok(format!(
                         "ERROR: tool safety profile forbids this shell command \
                          (soft denylist, not an OS sandbox): {command}"
@@ -8065,7 +8425,7 @@ impl AgentHostHandle {
                 Ok(out)
             }
             "apply_patch" => {
-                if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
+                if self.session_sandbox_is_readonly(session_id) {
                     return Ok(
                         "ERROR: tool safety profile is read-only; apply_patch denied".into(),
                     );
@@ -8078,7 +8438,7 @@ impl AgentHostHandle {
                     .to_string();
                 let input = args.clone();
                 let needs = true;
-                let gate = self.tool_gate("apply_patch");
+                let gate = self.tool_gate(session_id, "apply_patch");
                 if gate == ToolGate::AutoDeny {
                     return Ok("DENIED by deny rule: apply_patch".into());
                 }
@@ -8414,7 +8774,7 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("web_fetch requires url"))?
                     .to_string();
-                if sandbox_is_readonly(&self.inner.lock().sandbox_profile) {
+                if self.session_sandbox_is_readonly(session_id) {
                     return Ok("ERROR: tool safety profile is read-only; web_fetch denied".into());
                 }
                 self.run_tool_for_output(
@@ -9082,7 +9442,23 @@ impl AgentHostHandle {
         if cancel.is_cancelled() {
             return Ok("(cancelled)".into());
         }
-        let gate = self.tool_gate(wire_name);
+        match self.session_agent_authority(session_id) {
+            Ok(Some(policy))
+                if !policy
+                    .allowed_mcp_servers
+                    .iter()
+                    .any(|allowed| allowed == "*" || allowed == server) =>
+            {
+                return Ok(format!(
+                    "DENIED by Agent capability policy: MCP server `{server}`"
+                ));
+            }
+            Err(_) => {
+                return Ok("DENIED: persistent Agent policy is unavailable".into());
+            }
+            _ => {}
+        }
+        let gate = self.tool_gate_inner(session_id, wire_name, false);
         if gate == ToolGate::AutoDeny {
             return Ok(format!("DENIED by deny rule: MCP `{wire_name}`"));
         }
@@ -9201,7 +9577,7 @@ impl AgentHostHandle {
         if matches!(
             tool_name,
             "write_file" | "write_files" | "apply_patch" | "memory_write"
-        ) && sandbox_is_readonly(&self.inner.lock().sandbox_profile)
+        ) && self.session_sandbox_is_readonly(session_id)
         {
             return Ok(format!(
                 "ERROR: tool safety profile is read-only; {tool_name} denied"
@@ -9243,7 +9619,7 @@ impl AgentHostHandle {
             tool_name,
             "run_terminal_cmd" | "write_file" | "write_files" | "apply_patch" | "memory_write"
         );
-        let gate = self.tool_gate(tool_name);
+        let gate = self.tool_gate(session_id, tool_name);
         if gate == ToolGate::AutoDeny {
             return Ok(format!("DENIED by deny rule: tool `{tool_name}`"));
         }
@@ -9383,10 +9759,7 @@ impl AgentHostHandle {
 
         // #155 exec-risk preflight (not OS sandbox)
         let risk = crate::exec_risk::assess_shell_risk(command);
-        let (sandbox_profile, yolo) = {
-            let g = self.inner.lock();
-            (g.sandbox_profile.clone(), g.always_approve)
-        };
+        let (sandbox_profile, yolo) = self.session_exec_risk_policy(session_id);
         if risk.tier == crate::exec_risk::RiskTier::Deny
             && crate::exec_risk::should_block_deny_tier(&sandbox_profile, yolo)
         {
@@ -9420,7 +9793,7 @@ impl AgentHostHandle {
             return Ok(msg);
         }
 
-        let gate = self.tool_gate("run_terminal_cmd");
+        let gate = self.tool_gate(session_id, "run_terminal_cmd");
         if gate == ToolGate::AutoDeny {
             // #156: feed clear reason to the model
             let msg = format!(
@@ -9647,10 +10020,7 @@ impl AgentHostHandle {
         }
         let call_id = Uuid::new_v4().to_string();
         let risk = crate::exec_risk::assess_shell_risk(command);
-        let (sandbox_profile, yolo) = {
-            let g = self.inner.lock();
-            (g.sandbox_profile.clone(), g.always_approve)
-        };
+        let (sandbox_profile, yolo) = self.session_exec_risk_policy(session_id);
         if risk.tier == crate::exec_risk::RiskTier::Deny
             && crate::exec_risk::should_block_deny_tier(&sandbox_profile, yolo)
         {
@@ -9669,7 +10039,7 @@ impl AgentHostHandle {
             return Ok(());
         }
         let needs_perm = true;
-        let gate = self.tool_gate("run_terminal_cmd");
+        let gate = self.tool_gate(session_id, "run_terminal_cmd");
         if gate == ToolGate::AutoDeny {
             let _ = event_tx.send(SessionUpdate::ToolCall {
                 session_id,
@@ -9844,7 +10214,7 @@ impl AgentHostHandle {
         }
         let call_id = Uuid::new_v4().to_string();
         let needs_perm = matches!(tool_name, "run_terminal_cmd" | "write_file" | "write_files");
-        let gate = self.tool_gate(tool_name);
+        let gate = self.tool_gate(session_id, tool_name);
         if gate == ToolGate::AutoDeny {
             let _ = event_tx.send(SessionUpdate::ToolCall {
                 session_id,
@@ -10129,6 +10499,36 @@ mod tests {
     impl Drop for TestHome {
         fn drop(&mut self) {
             set_grokptah_home_override(None);
+        }
+    }
+
+    struct TestEnvOverride {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvOverride {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate process-wide host configuration hold
+            // `home_override_serial`, and CI runs this suite with one thread.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TestEnvOverride {
+        fn drop(&mut self) {
+            // SAFETY: see `TestEnvOverride::set`; this restores the exact
+            // process state observed before the scoped override.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
         }
     }
 
@@ -10751,5 +11151,90 @@ mod tests {
         assert!(error.contains("workspace is missing"));
         assert_eq!(after.active_lane_id, before.active_lane_id);
         assert_eq!(after.project_cwd, before.project_cwd);
+    }
+
+    #[test]
+    fn persistent_agent_authority_can_narrow_but_ambient_settings_cannot_widen_it() {
+        let (_home, host, lane_id) = test_host();
+        host.set_permission_mode("default".into());
+        host.set_sandbox("read-only".into());
+        let agent = host.ensure_session_agent(lane_id).unwrap();
+        let captured_model = agent.model.clone();
+        let captured = &agent.current_spec().unwrap().authority;
+        assert!(!captured.bypass_permissions);
+        assert!(sandbox_is_readonly(&captured.sandbox_profile));
+
+        host.set_permission_mode("bypassPermissions".into());
+        host.set_sandbox("full".into());
+        assert_eq!(
+            host.ambient_tool_gate("run_terminal_cmd"),
+            ToolGate::AutoAllow
+        );
+        assert_eq!(
+            host.tool_gate(lane_id, "run_terminal_cmd"),
+            ToolGate::Prompt
+        );
+        assert_eq!(
+            host.tool_gate(lane_id, "future_unreviewed_mutator"),
+            ToolGate::AutoDeny
+        );
+        assert!(host.session_sandbox_is_readonly(lane_id));
+        assert!(host
+            .computer_agent_eligibility(lane_id)
+            .unwrap_err()
+            .to_string()
+            .contains("not allowed by this Agent specification"));
+
+        host.set_model("grok-a-different-focused-model".into());
+        let reloaded = host.ensure_session_agent(lane_id).unwrap();
+        assert_eq!(reloaded.model, captured_model);
+        assert_eq!(
+            reloaded.current_spec().unwrap().model.selection_key,
+            captured_model
+        );
+
+        host.set_allow_deny_rules(Vec::new(), vec!["run_terminal_cmd".into()]);
+        assert_eq!(
+            host.tool_gate(lane_id, "run_terminal_cmd"),
+            ToolGate::AutoDeny
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_agent_prompt_and_duration_bounds_are_enforced_as_recorded() {
+        let (_home, host, lane_id) = test_host();
+        let agent = host.ensure_session_agent(lane_id).unwrap();
+        let store = host.ensure_orchestration_store().unwrap();
+        store
+            .revise_agent_spec(&agent.agent_id, "test:prompt-bound", |spec| {
+                spec.default_run_bounds.max_prompt_bytes = 4;
+                Ok(())
+            })
+            .unwrap();
+        let error = host
+            .session_prompt(lane_id, "too long".into())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_prompt_bytes"));
+        assert!(host.list_session_runs(lane_id).unwrap().is_empty());
+
+        store
+            .revise_agent_spec(&agent.agent_id, "test:duration-bound", |spec| {
+                spec.default_run_bounds.max_prompt_bytes = 10_000;
+                spec.default_run_bounds.max_duration_ms = 50;
+                Ok(())
+            })
+            .unwrap();
+        let offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        let outcome = host.session_prompt(lane_id, "run sleep 5".into()).await;
+        drop(offline);
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.contains("duration limit"));
+        let runs = host.list_session_runs(lane_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].state, RunState::LimitReached);
+        assert_eq!(runs[0].stop_cause, Some(RunStopCause::DurationLimit));
+        assert_eq!(runs[0].bounds.max_duration_ms, 50);
     }
 }

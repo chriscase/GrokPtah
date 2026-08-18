@@ -11,7 +11,7 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 
 use super::types::{
-    safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
+    safe_id_filename, AgentRecord, AgentSpec, AgentState, AuditEntry, ContinuationCheckpoint,
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
     RunStopCause,
 };
@@ -90,6 +90,7 @@ impl OrchStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
         fs::create_dir_all(root.join("agents"))?;
+        fs::create_dir_all(root.join("agent-specs"))?;
         fs::create_dir_all(root.join("checkpoints"))?;
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
@@ -180,6 +181,22 @@ impl OrchStore {
         Ok(self.inner.root.join("agents").join(format!("{safe}.json")))
     }
 
+    fn agent_spec_path(&self, agent_id: &str, revision: u64) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(agent_id)?;
+        if revision == 0 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "agent specification revision must be greater than zero",
+            ));
+        }
+        Ok(self
+            .inner
+            .root
+            .join("agent-specs")
+            .join(safe)
+            .join(format!("{revision}.json")))
+    }
+
     fn checkpoint_path(&self, checkpoint_id: &str) -> Result<PathBuf, OrchError> {
         let safe = safe_id_filename(checkpoint_id)?;
         Ok(self
@@ -260,6 +277,10 @@ impl OrchStore {
 
     /// Persist one transport-neutral durable agent identity.
     pub fn save_agent(&self, agent: &AgentRecord) -> anyhow::Result<()> {
+        let mut agent = agent.clone();
+        agent
+            .migrate_legacy_spec()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         agent
             .validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -267,7 +288,19 @@ impl OrchStore {
         let path = self
             .agent_path(&agent.agent_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        atomic_write_json(&path, agent)
+        if path.is_file() {
+            let mut existing: AgentRecord = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            existing
+                .migrate_legacy_spec()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if existing.current_spec()?.revision != agent.current_spec()?.revision {
+                anyhow::bail!(
+                    "Agent specification changes must use the attributable revision operation"
+                );
+            }
+        }
+        self.save_agent_spec_unlocked(&agent.agent_id, agent.current_spec()?)?;
+        atomic_write_json(&path, &agent)
     }
 
     pub fn load_agent(&self, agent_id: &str) -> anyhow::Result<Option<AgentRecord>> {
@@ -279,10 +312,17 @@ impl OrchStore {
         if !path.is_file() {
             return Ok(None);
         }
-        let agent: AgentRecord = serde_json::from_str(&fs::read_to_string(path)?)?;
+        let mut agent: AgentRecord = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        let migrated = agent
+            .migrate_legacy_spec()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         agent
             .validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.save_agent_spec_unlocked(&agent.agent_id, agent.current_spec()?)?;
+        if migrated {
+            atomic_write_json(&path, &agent)?;
+        }
         Ok(Some(agent))
     }
 
@@ -298,10 +338,17 @@ impl OrchStore {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let agent: AgentRecord = serde_json::from_str(&fs::read_to_string(path)?)?;
+            let mut agent: AgentRecord = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            let migrated = agent
+                .migrate_legacy_spec()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             agent
                 .validate()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            self.save_agent_spec_unlocked(&agent.agent_id, agent.current_spec()?)?;
+            if migrated {
+                atomic_write_json(&path, &agent)?;
+            }
             out.push(agent);
         }
         out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -321,13 +368,165 @@ impl OrchStore {
         }
         let mut agent: AgentRecord = serde_json::from_str(&fs::read_to_string(&path)?)?;
         agent
+            .migrate_legacy_spec()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        agent
             .validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let original_spec = agent.current_spec()?.clone();
         update(&mut agent)?;
+        if agent.current_spec()? != &original_spec {
+            anyhow::bail!(
+                "Agent specification changes must use the attributable revision operation"
+            );
+        }
         agent
             .validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         agent.updated_at = Utc::now();
+        self.save_agent_spec_unlocked(&agent.agent_id, agent.current_spec()?)?;
+        atomic_write_json(&path, &agent)?;
+        Ok(Some(agent))
+    }
+
+    fn save_agent_spec_unlocked(&self, agent_id: &str, spec: &AgentSpec) -> anyhow::Result<()> {
+        spec.validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let path = self
+            .agent_spec_path(agent_id, spec.revision)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if path.is_file() {
+            let existing: AgentSpec = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            if existing != *spec {
+                anyhow::bail!(
+                    "agent specification revision {} is immutable",
+                    spec.revision
+                );
+            }
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write_json(&path, spec)
+    }
+
+    pub fn load_agent_spec(
+        &self,
+        agent_id: &str,
+        revision: u64,
+    ) -> anyhow::Result<Option<AgentSpec>> {
+        let _g = self.inner.lock.lock();
+        let path = match self.agent_spec_path(agent_id, revision) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let spec: AgentSpec = serde_json::from_str(&fs::read_to_string(path)?)?;
+        spec.validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(Some(spec))
+    }
+
+    pub fn list_agent_specs(&self, agent_id: &str) -> anyhow::Result<Vec<AgentSpec>> {
+        let _g = self.inner.lock.lock();
+        let dir = self
+            .agent_spec_path(agent_id, 1)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .parent()
+            .expect("agent spec path has a parent")
+            .to_path_buf();
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut specs = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let spec: AgentSpec = serde_json::from_str(&fs::read_to_string(path)?)?;
+            spec.validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            specs.push(spec);
+        }
+        specs.sort_by_key(|spec| spec.revision);
+        Ok(specs)
+    }
+
+    /// Install an attributable replacement specification. The immutable
+    /// revision is written before the Agent pointer, so a crash cannot leave a
+    /// record referring to a missing revision.
+    pub fn revise_agent_spec<F>(
+        &self,
+        agent_id: &str,
+        actor: &str,
+        revise: F,
+    ) -> anyhow::Result<Option<AgentRecord>>
+    where
+        F: FnOnce(&mut AgentSpec) -> anyhow::Result<()>,
+    {
+        let _g = self.inner.lock.lock();
+        let path = self
+            .agent_path(agent_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let mut agent: AgentRecord = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        agent
+            .migrate_legacy_spec()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let current = agent.current_spec()?.clone();
+        let mut next = current.clone();
+        revise(&mut next)?;
+        let mut revision = current
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("agent specification revision counter overflowed"))?;
+        if next.source_workspace != current.source_workspace {
+            anyhow::bail!("an Agent source workspace cannot change through a spec revision");
+        }
+        loop {
+            next.revision = revision;
+            next.previous_revision = Some(current.revision);
+            next.created_by = actor.to_string();
+            let revision_path = self
+                .agent_spec_path(agent_id, revision)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if revision_path.is_file() {
+                let existing: AgentSpec =
+                    serde_json::from_str(&fs::read_to_string(&revision_path)?)?;
+                existing
+                    .validate()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                next.created_at = existing.created_at;
+                next.validate()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                if existing == next {
+                    next = existing;
+                    break;
+                }
+                revision = revision.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!("agent specification revision counter overflowed")
+                })?;
+                continue;
+            }
+            next.created_at = Utc::now();
+            next.validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            self.save_agent_spec_unlocked(agent_id, &next)?;
+            break;
+        }
+        agent.workspace = next.source_workspace.clone();
+        agent.model = next.model.selection_key.clone();
+        agent.spec = Some(next);
+        agent.updated_at = Utc::now();
+        agent
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         atomic_write_json(&path, &agent)?;
         Ok(Some(agent))
     }
@@ -813,6 +1012,7 @@ impl OrchStore {
             let _ = self.update_agent(&agent_id, |agent| {
                 if agent.current_run_id.as_deref() == Some(run_id.as_str()) {
                     agent.current_run_id = None;
+                    agent.last_run_id = Some(run_id.clone());
                     agent.state = AgentState::Interrupted;
                 }
                 Ok(())
@@ -832,6 +1032,7 @@ impl OrchStore {
             let _ = self.update_agent(&agent.agent_id, |current| {
                 if current.current_run_id.as_deref() == Some(run_id.as_str()) {
                     current.current_run_id = None;
+                    current.last_run_id = Some(run_id.clone());
                     current.state = next_state;
                 }
                 Ok(())
@@ -1080,6 +1281,7 @@ mod tests {
             agent_id: agent_id.into(),
             session_id,
             run_id: run_id.into(),
+            agent_spec_revision: None,
             parent_checkpoint_id: None,
             ordinal: 1,
             workspace: "/tmp/w".into(),
@@ -1203,10 +1405,14 @@ mod tests {
                 agent_id: agent_id.into(),
                 session_id,
                 lane_ids: vec![session_id],
+                lane_associations: Vec::new(),
                 workspace: "/tmp/w".into(),
                 model: "grok".into(),
+                spec: None,
                 state: AgentState::Active,
                 current_run_id: Some("r-agent".into()),
+                last_run_id: None,
+                last_lane_id: Some(session_id),
                 latest_checkpoint_id: Some(cp.checkpoint_id.clone()),
                 continuation_ordinal: 1,
                 created_at: Utc::now(),
@@ -1244,10 +1450,14 @@ mod tests {
                 agent_id: agent_id.into(),
                 session_id,
                 lane_ids: vec![session_id],
+                lane_associations: Vec::new(),
                 workspace: "/tmp/w".into(),
                 model: "grok".into(),
+                spec: None,
                 state: AgentState::Active,
                 current_run_id: Some("terminal-gap".into()),
+                last_run_id: None,
+                last_lane_id: Some(session_id),
                 latest_checkpoint_id: None,
                 continuation_ordinal: 0,
                 created_at: Utc::now(),
@@ -1278,6 +1488,167 @@ mod tests {
         value["contextSummary"] = serde_json::Value::String("tampered".into());
         fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         assert!(store.load_checkpoint(&cp.checkpoint_id).is_err());
+    }
+
+    #[test]
+    fn legacy_agent_is_migrated_to_an_attributable_revision_and_lane_association() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let session_id = Uuid::new_v4();
+        let agent_id = "agent-legacy-spec";
+        let path = store.agent_path(agent_id).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agentId": agent_id,
+                "sessionId": session_id,
+                "workspace": "/tmp/project",
+                "model": "grok",
+                "state": "waiting",
+                "createdAt": Utc::now(),
+                "updatedAt": Utc::now()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let migrated = store.load_agent(agent_id).unwrap().unwrap();
+        let spec = migrated.current_spec().unwrap();
+        assert_eq!(spec.revision, 1);
+        assert_eq!(spec.created_by, "legacy_migration");
+        assert_eq!(spec.model.provider_id, "xai");
+        assert_eq!(spec.authority.allowed_mcp_servers, vec!["*"]);
+        assert_eq!(migrated.known_lane_ids(), vec![session_id]);
+        assert_eq!(migrated.lane_associations.len(), 1);
+        assert_eq!(
+            store.list_agent_specs(agent_id).unwrap(),
+            vec![spec.clone()]
+        );
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(rewritten["spec"]["revision"], 1);
+        assert_eq!(
+            rewritten["laneAssociations"][0]["laneId"],
+            session_id.to_string()
+        );
+    }
+
+    #[test]
+    fn agent_spec_revisions_are_append_only_and_attributable() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let session_id = Uuid::new_v4();
+        let now = Utc::now();
+        let mut agent = AgentRecord {
+            agent_id: "agent-revisions".into(),
+            session_id,
+            lane_ids: vec![session_id],
+            lane_associations: Vec::new(),
+            workspace: "/tmp/project".into(),
+            model: "grok".into(),
+            spec: None,
+            state: AgentState::Waiting,
+            current_run_id: None,
+            last_run_id: None,
+            last_lane_id: Some(session_id),
+            latest_checkpoint_id: None,
+            continuation_ordinal: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        store.save_agent(&agent).unwrap();
+        let revised = store
+            .revise_agent_spec("agent-revisions", "operator:test", |spec| {
+                spec.role = "Release steward".into();
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        let current = revised.current_spec().unwrap();
+        assert_eq!(current.revision, 2);
+        assert_eq!(current.previous_revision, Some(1));
+        assert_eq!(current.created_by, "operator:test");
+        assert_eq!(current.role, "Release steward");
+        let specs = store.list_agent_specs("agent-revisions").unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].role, "Software development agent");
+
+        agent.migrate_legacy_spec().unwrap();
+        assert!(store.save_agent(&agent).is_err());
+        agent.spec.as_mut().unwrap().role = "tampered".into();
+        assert!(store.save_agent(&agent).is_err());
+    }
+
+    #[test]
+    fn orphaned_agent_spec_revision_is_reused_or_skipped_without_wedging() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let session_id = Uuid::new_v4();
+        let now = Utc::now();
+        let agent = AgentRecord {
+            agent_id: "agent-orphan-revision".into(),
+            session_id,
+            lane_ids: vec![session_id],
+            lane_associations: Vec::new(),
+            workspace: "/tmp/project".into(),
+            model: "grok".into(),
+            spec: None,
+            state: AgentState::Waiting,
+            current_run_id: None,
+            last_run_id: None,
+            last_lane_id: Some(session_id),
+            latest_checkpoint_id: None,
+            continuation_ordinal: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        store.save_agent(&agent).unwrap();
+        let current = store
+            .load_agent("agent-orphan-revision")
+            .unwrap()
+            .unwrap()
+            .current_spec()
+            .unwrap()
+            .clone();
+        let mut orphan = current.clone();
+        orphan.revision = 2;
+        orphan.previous_revision = Some(1);
+        orphan.role = "First attempted role".into();
+        orphan.created_by = "operator:test".into();
+        orphan.created_at = Utc::now();
+        store
+            .save_agent_spec_unlocked("agent-orphan-revision", &orphan)
+            .unwrap();
+
+        let reused = store
+            .revise_agent_spec("agent-orphan-revision", "operator:test", |spec| {
+                spec.role = "First attempted role".into();
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(reused.current_spec().unwrap().revision, 2);
+
+        // Simulate another orphan after the pointer remains on revision 2.
+        let current = reused.current_spec().unwrap().clone();
+        let mut conflicting = current.clone();
+        conflicting.revision = 3;
+        conflicting.previous_revision = Some(2);
+        conflicting.role = "Abandoned role".into();
+        conflicting.created_by = "operator:abandoned".into();
+        conflicting.created_at = Utc::now();
+        store
+            .save_agent_spec_unlocked("agent-orphan-revision", &conflicting)
+            .unwrap();
+        let advanced = store
+            .revise_agent_spec("agent-orphan-revision", "operator:test", |spec| {
+                spec.role = "Final role".into();
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(advanced.current_spec().unwrap().revision, 4);
+        assert_eq!(advanced.current_spec().unwrap().previous_revision, Some(2));
     }
 
     #[test]
