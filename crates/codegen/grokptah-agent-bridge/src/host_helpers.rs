@@ -121,13 +121,12 @@ pub(crate) fn emit_thought(tx: &crate::event_bus::EventBus, session_id: Uuid, te
 pub(crate) fn tool_kind(name: &str) -> ToolCallKind {
     match name {
         "read_file" | "list_dir" | "memory_read" => ToolCallKind::Read,
-        "write_file" | "write_files" | "apply_patch" => ToolCallKind::Edit,
+        "write_file" | "write_files" | "apply_patch" | "memory_write" => ToolCallKind::Edit,
         "grep" | "glob_files" => ToolCallKind::Search,
         "run_terminal_cmd" | "web_fetch" => ToolCallKind::Execute,
         "todo_write" | "spawn_explore" | "spawn_general_purpose" | "spawn_subagent" => {
             ToolCallKind::Think
         }
-        "memory_write" => ToolCallKind::Other,
         n if n.starts_with("mcp__") => ToolCallKind::Other,
         _ => ToolCallKind::Other,
     }
@@ -1346,12 +1345,22 @@ pub(crate) fn build_agent_messages(
             "role": "system",
             "content": memory_scope_note
         }));
-        let mem = crate::memory::inject_context(&access.project());
-        if !mem.is_empty() {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": mem
-            }));
+        match crate::memory::inject_context(&access.project()) {
+            Ok(mem) if !mem.is_empty() => {
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": mem
+                }));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": format!(
+                        "Project memory is unavailable because its durable store could not be read or verified safely. No memory facts were injected for this turn. Error: {error:#}"
+                    )
+                }));
+            }
         }
     }
     if let Some((goal, steps)) = active_plan {

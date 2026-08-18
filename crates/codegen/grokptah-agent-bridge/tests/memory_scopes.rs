@@ -11,7 +11,7 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, AgentHost, AgentHostHandle, HostConfig,
-    MemoryScope,
+    MemoryScope, PermissionDecision, SessionUpdate,
 };
 
 struct IsolatedProcess {
@@ -249,4 +249,111 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
             "fact retained through promotion",
         ]
     );
+}
+
+#[tokio::test]
+async fn memory_write_obeys_read_only_and_explicit_deny_while_reads_remain_available() {
+    let _process = IsolatedProcess::install();
+    let workspace = fixture_repo();
+    let host = started_host(workspace.path());
+    let session = host.session_new().unwrap();
+
+    host.set_sandbox("read-only".into());
+    host.session_prompt(session.id, "remember blocked by read only".into())
+        .await
+        .unwrap();
+    assert!(host
+        .memory_list(session.id, MemoryScope::Project)
+        .unwrap()
+        .is_empty());
+
+    host.set_sandbox("workspace-write".into());
+    host.set_allow_deny_rules(vec![], vec!["memory_write".into()]);
+    host.session_prompt(session.id, "remember blocked by explicit deny".into())
+        .await
+        .unwrap();
+    assert!(host
+        .memory_list(session.id, MemoryScope::Project)
+        .unwrap()
+        .is_empty());
+
+    host.set_allow_deny_rules(vec![], vec![]);
+    host.memory_remember(session.id, MemoryScope::Project, "readable seed")
+        .unwrap();
+    host.set_sandbox("read-only".into());
+    assert_eq!(
+        host.memory_list(session.id, MemoryScope::Project).unwrap()[0].text,
+        "readable seed"
+    );
+}
+
+#[tokio::test]
+async fn memory_write_uses_the_permission_gate_and_honors_user_denial() {
+    let _process = IsolatedProcess::install();
+    let workspace = fixture_repo();
+    let host = AgentHost::create(HostConfig {
+        always_approve: false,
+        ..HostConfig::default()
+    });
+    let mut events = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(workspace.path()).unwrap();
+    let session = host.session_new().unwrap();
+    let writer = {
+        let host = host.clone();
+        tokio::spawn(async move {
+            host.session_prompt(session.id, "remember permission denied".into())
+                .await
+        })
+    };
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("permission event timeout")
+            .expect("event stream closed")
+        {
+            SessionUpdate::PermissionRequired { request, .. }
+                if request.tool_name == "memory_write" =>
+            {
+                host.permission_respond(request.id, PermissionDecision::Deny)
+                    .unwrap();
+                break;
+            }
+            _ => {}
+        }
+    }
+    writer.await.unwrap().unwrap();
+    assert!(host
+        .memory_list(session.id, MemoryScope::Project)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn memory_write_obeys_pre_tool_hooks() {
+    let _process = IsolatedProcess::install();
+    let workspace = fixture_repo();
+    fs::create_dir_all(workspace.path().join(".grokptah")).unwrap();
+    fs::write(
+        workspace.path().join(".grokptah/hooks.json"),
+        r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "memory_write", "deny": true, "message": "memory is locked" }
+    ],
+    "PostToolUse": []
+  }
+}"#,
+    )
+    .unwrap();
+    let host = started_host(workspace.path());
+    let session = host.session_new().unwrap();
+    host.session_prompt(session.id, "remember blocked by hook".into())
+        .await
+        .unwrap();
+    assert!(host
+        .memory_list(session.id, MemoryScope::Project)
+        .unwrap()
+        .is_empty());
 }

@@ -90,6 +90,11 @@ pub fn evaluate_tool_gate(
     allow_rules: &[String],
     deny_rules: &[String],
 ) -> ToolGate {
+    // Explicit deny is an operator policy boundary, including in YOLO or
+    // bypass mode. Those modes suppress prompts; they do not erase denies.
+    if deny_rules.iter().any(|r| rule_matches(r, tool_name)) {
+        return ToolGate::AutoDeny;
+    }
     if permission_mode == "bypassPermissions" || always_approve {
         return ToolGate::AutoAllow;
     }
@@ -100,10 +105,6 @@ pub fn evaluate_tool_gate(
     if tool_name.starts_with("mcp__") && always_allowed_tools.contains("mcp") {
         // Legacy blanket — still honor if present, but new AlwaysAllow no longer sets it.
         return ToolGate::AutoAllow;
-    }
-    // Deny wins.
-    if deny_rules.iter().any(|r| rule_matches(r, tool_name)) {
-        return ToolGate::AutoDeny;
     }
     if allow_rules.iter().any(|r| rule_matches(r, tool_name)) {
         return ToolGate::AutoAllow;
@@ -149,15 +150,21 @@ mod tests {
     }
 
     #[test]
-    fn yolo_bypasses_rules() {
+    fn yolo_suppresses_prompts_when_no_explicit_deny_exists() {
+        let g = evaluate_tool_gate("write_file", true, &HashSet::new(), "default", &[], &[]);
+        assert_eq!(g, ToolGate::AutoAllow);
+    }
+
+    #[test]
+    fn explicit_deny_remains_effective_in_yolo_mode() {
         let g = evaluate_tool_gate(
-            "write_file",
+            "memory_write",
             true,
             &HashSet::new(),
             "default",
             &[],
-            &["write_file".into()],
+            &["memory_write".into()],
         );
-        assert_eq!(g, ToolGate::AutoAllow);
+        assert_eq!(g, ToolGate::AutoDeny);
     }
 }

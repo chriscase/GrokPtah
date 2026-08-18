@@ -49,6 +49,7 @@ Every capability is **shipped**, **via shell**, or **explicitly deferred**. Noth
 | `mcp__*` | Prompt unless YOLO | N/A |
 | read/search/todo | No prompt | File tools use execution cwd |
 | memory_read | No prompt | Explicit authorized scope under the Lane's durable source workspace, never an isolated execution cwd |
+| memory_write | Prompt unless YOLO; explicit deny always wins | Durable mutation; denied in `read-only`, denied to plan agents, and subject to PreToolUse hooks |
 
 ## Offline test hooks
 

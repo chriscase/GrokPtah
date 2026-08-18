@@ -2918,6 +2918,7 @@ impl AgentHostHandle {
     /// offline paths can still assert wire context quality after `/compact`.
     pub fn wire_messages_preview(&self, id: Uuid) -> Result<Vec<serde_json::Value>> {
         self.ensure_transcript_loaded(id)?;
+        let memory_access = self.memory_access_for_session(id)?;
         let g = self.inner.lock();
         let s = g
             .sessions
@@ -2934,7 +2935,6 @@ impl AgentHostHandle {
         } else {
             None
         };
-        let memory_access = MemoryAccess::new(&s.cwd, s.agent_id.clone());
         Ok(build_agent_messages(
             &history,
             s.compacted_summary.as_deref(),
@@ -2981,12 +2981,31 @@ impl AgentHostHandle {
     /// Resolve memory from the session's durable source workspace. Execution
     /// worktrees and focused desktop chrome are intentionally not consulted.
     fn memory_access_for_session(&self, session_id: Uuid) -> Result<MemoryAccess> {
-        let g = self.inner.lock();
-        let session = g
-            .sessions
-            .get(&session_id)
-            .ok_or_else(|| anyhow!("unknown session"))?;
-        Ok(MemoryAccess::new(&session.cwd, session.agent_id.clone()))
+        let session = {
+            let g = self.inner.lock();
+            g.sessions
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown session"))?
+        };
+        let actor_agent_id = match session.agent_id.as_deref() {
+            None => None,
+            Some(agent_id) => {
+                let agent = self
+                    .ensure_orchestration_store()?
+                    .load_agent(agent_id)?
+                    .ok_or_else(|| {
+                        anyhow!("session Agent binding has no durable Agent record: {agent_id}")
+                    })?;
+                if !agent.known_lane_ids().contains(&session_id) {
+                    bail!(
+                        "session Agent binding mismatch: Lane {session_id} is not owned by {agent_id}"
+                    );
+                }
+                Some(agent.agent_id)
+            }
+        };
+        Ok(MemoryAccess::new(&session.cwd, actor_agent_id))
     }
 
     fn memory_address_for_session(
@@ -3016,7 +3035,7 @@ impl AgentHostHandle {
         scope: MemoryScope,
     ) -> Result<Vec<crate::memory::MemoryFact>> {
         let address = self.memory_address_for_session(session_id, scope)?;
-        Ok(crate::memory::list_facts(&address))
+        crate::memory::list_facts(&address)
     }
 
     pub fn memory_remember(
@@ -7621,33 +7640,26 @@ impl AgentHostHandle {
                     })
                     .unwrap_or_default();
                 let address = self.memory_address_from_args(session_id, &args)?;
-                let id =
-                    crate::memory::remember(&address, &text, &tags).map_err(|e| anyhow!(e))?;
-                let out = format!("Remembered fact {id}: {text}");
-                let call_id = Uuid::new_v4().to_string();
-                let _ = event_tx.send(SessionUpdate::ToolCall {
+                self.run_tool_for_output(
                     session_id,
-                    call_id: call_id.clone(),
-                    title: "memory_write".into(),
-                    kind: ToolCallKind::Other,
-                    status: ToolCallStatus::Completed,
-                    input: args.clone(),
-                });
-                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
-                    session_id,
-                    call_id: call_id.clone(),
-                    status: ToolCallStatus::Completed,
-                    output: Some(out.clone()),
-                });
-                push_tool(
-                    self,
-                    session_id,
-                    &call_id,
                     "memory_write",
-                    ToolCallStatus::Completed,
-                    Some(out.clone()),
-                );
-                Ok(out)
+                    &args,
+                    || async move {
+                        let id = crate::memory::remember(&address, &text, &tags)?;
+                        let out = format!("Remembered fact {id}: {text}");
+                        Ok(local_tools::ToolResult::basic(
+                            "memory_write".into(),
+                            ToolCallKind::Edit,
+                            serde_json::json!({}),
+                            out,
+                            true,
+                            "Allow durable memory mutation?".into(),
+                        ))
+                    },
+                    cancel,
+                    event_tx,
+                )
+                .await
             }
             "kill_task" | "cancel_task" => {
                 let id = args
@@ -7728,7 +7740,7 @@ impl AgentHostHandle {
                     .unwrap_or("")
                     .to_string();
                 let address = self.memory_address_from_args(session_id, &args)?;
-                let facts = crate::memory::search(&address, &query);
+                let facts = crate::memory::search(&address, &query)?;
                 let out = if facts.is_empty() {
                     format!("(no matching {} memory)", address.scope().label())
                 } else {
@@ -8251,16 +8263,7 @@ impl AgentHostHandle {
                         // #161 capability modes: plan is non-mutating (explore is separate path).
                         let out = if tc.name.starts_with("spawn_") {
                             format!("DENIED: nested {} not allowed inside subagent", tc.name)
-                        } else if kind == "plan"
-                            && matches!(
-                                tc.name.as_str(),
-                                "write_file"
-                                    | "write_files"
-                                    | "apply_patch"
-                                    | "run_terminal_cmd"
-                                    | "memory_write"
-                            )
-                        {
+                        } else if kind == "plan" && plan_subagent_denies_tool(&tc.name) {
                             format!(
                                 "DENIED by capability mode `plan`: tool `{}` is not allowed. \
                                  Plan agents may only research (list/read/grep/glob) and produce a plan.",
@@ -8466,8 +8469,10 @@ impl AgentHostHandle {
         }
 
         // Tool safety profile: deny writes in read-only for shared tool path.
-        if matches!(tool_name, "write_file" | "write_files" | "apply_patch")
-            && sandbox_is_readonly(&self.inner.lock().sandbox_profile)
+        if matches!(
+            tool_name,
+            "write_file" | "write_files" | "apply_patch" | "memory_write"
+        ) && sandbox_is_readonly(&self.inner.lock().sandbox_profile)
         {
             return Ok(format!(
                 "ERROR: tool safety profile is read-only; {tool_name} denied"
@@ -8499,7 +8504,7 @@ impl AgentHostHandle {
         let call_id = Uuid::new_v4().to_string();
         let needs_perm = matches!(
             tool_name,
-            "run_terminal_cmd" | "write_file" | "write_files" | "apply_patch"
+            "run_terminal_cmd" | "write_file" | "write_files" | "apply_patch" | "memory_write"
         );
         let gate = self.tool_gate(tool_name);
         if gate == ToolGate::AutoDeny {
@@ -9208,9 +9213,22 @@ fn effective_subagent_isolation(
     }
 }
 
+fn plan_subagent_denies_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "write_file" | "write_files" | "apply_patch" | "run_terminal_cmd" | "memory_write"
+    )
+}
+
 #[cfg(test)]
 mod computer_agent_host_tests {
     use super::*;
+
+    #[test]
+    fn plan_subagent_cannot_mutate_durable_memory() {
+        assert!(plan_subagent_denies_tool("memory_write"));
+        assert!(!plan_subagent_denies_tool("memory_read"));
+    }
 
     #[test]
     fn ephemeral_computer_authority_is_session_scoped_and_model_changes_revoke_it() {
@@ -9334,6 +9352,36 @@ mod tests {
             }
             other => panic!("unexpected queue recovery event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn memory_authorization_fails_closed_on_forged_session_agent_binding() {
+        let (_home, host, first_lane_id) = test_host();
+        let second_lane = host.session_new_kind(SessionKind::Build).unwrap();
+        let first_agent = host.ensure_session_agent(first_lane_id).unwrap();
+        let second_agent = host.ensure_session_agent(second_lane.id).unwrap();
+        assert_ne!(first_agent.agent_id, second_agent.agent_id);
+
+        host.inner
+            .lock()
+            .sessions
+            .get_mut(&first_lane_id)
+            .unwrap()
+            .agent_id = Some(second_agent.agent_id);
+
+        let error = host
+            .memory_list(
+                first_lane_id,
+                MemoryScope::AgentPrivate {
+                    agent_id: first_agent.agent_id,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("binding mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
