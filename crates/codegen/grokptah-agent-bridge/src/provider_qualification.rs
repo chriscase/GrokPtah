@@ -7,7 +7,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::computer_use::{ComputerBackend, ComputerUseLimits, SemanticAction, SimulatorBackend};
-use crate::gateway_config::{CapabilitySource, ComputerUseTier, ProviderKind};
+use crate::gateway_config::{CapabilitySource, ComputerUseTier};
 
 const GENERATION_MARKER: &str = "PTAH_QUALIFY_OK_V1";
 const TOOL_NAME: &str = "ptah_qualify_echo";
@@ -79,6 +79,101 @@ struct NativeToolCall {
     arguments: String,
 }
 
+struct QualificationCredentials {
+    current: Option<crate::auth_store::WireCredentials>,
+    expected_provider_id: String,
+    expected_credential_fingerprint: Option<String>,
+    expected_oidc_token_auth: Option<bool>,
+    allow_xai_oidc_refresh: bool,
+    forced_refresh_used: bool,
+    #[cfg(test)]
+    forced_refresh_override: Option<crate::auth_store::WireCredentials>,
+}
+
+impl QualificationCredentials {
+    fn new(
+        current: Option<crate::auth_store::WireCredentials>,
+        profile: &crate::gateway_config::ProviderProfile,
+    ) -> Result<Self> {
+        validate_qualification_credential_binding(profile, current.as_ref())?;
+        Ok(Self {
+            allow_xai_oidc_refresh: profile.id == crate::gateway_config::XAI_PROVIDER_ID
+                && profile.managed_by_host,
+            expected_provider_id: profile.id.clone(),
+            expected_credential_fingerprint: current
+                .as_ref()
+                .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint),
+            expected_oidc_token_auth: current
+                .as_ref()
+                .map(|credentials| credentials.oidc_token_auth),
+            current,
+            forced_refresh_used: false,
+            #[cfg(test)]
+            forced_refresh_override: None,
+        })
+    }
+
+    fn current(&self) -> Option<&crate::auth_store::WireCredentials> {
+        self.current.as_ref()
+    }
+
+    async fn refresh_after_unauthorized(&mut self) -> Result<bool> {
+        let Some(current) = self.current.as_ref() else {
+            return Ok(false);
+        };
+        if !self.allow_xai_oidc_refresh || !current.oidc_token_auth || self.forced_refresh_used {
+            return Ok(false);
+        }
+        self.forced_refresh_used = true;
+        #[cfg(test)]
+        let refreshed = if let Some(refreshed) = self.forced_refresh_override.take() {
+            refreshed
+        } else {
+            crate::auth_store::force_refresh(current)
+                .await
+                .map_err(anyhow::Error::msg)
+                .context("refresh xAI OIDC credential after qualification HTTP 401")?
+        };
+        #[cfg(not(test))]
+        let refreshed = crate::auth_store::force_refresh(current)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("refresh xAI OIDC credential after qualification HTTP 401")?;
+        if refreshed.provider_id != self.expected_provider_id {
+            bail!("refreshed provider credential identity mismatch");
+        }
+        if Some(refreshed.oidc_token_auth) != self.expected_oidc_token_auth
+            || Some(refreshed.qualification_identity_fingerprint())
+                != self.expected_credential_fingerprint
+        {
+            bail!("refreshed provider credential principal or mode changed during qualification");
+        }
+        self.current = Some(refreshed);
+        Ok(true)
+    }
+}
+
+fn validate_qualification_credential_binding(
+    profile: &crate::gateway_config::ProviderProfile,
+    credentials: Option<&crate::auth_store::WireCredentials>,
+) -> Result<()> {
+    if let Some(credentials) = credentials {
+        if credentials.provider_id != profile.id {
+            bail!("provider credential identity does not match the qualification profile");
+        }
+    }
+    if (profile.kind == crate::gateway_config::ProviderKind::Xai
+        || profile.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions)
+        && (profile.id != crate::gateway_config::XAI_PROVIDER_ID
+            || !profile.managed_by_host
+            || profile.kind != crate::gateway_config::ProviderKind::Xai
+            || profile.dialect != crate::gateway_config::ProviderDialect::XaiChatCompletions)
+    {
+        bail!("xAI qualification is restricted to the synthesized host-managed `xai` profile");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ComputerProbeArguments {
@@ -92,27 +187,58 @@ pub async fn qualify_provider_model(
     provider_id: &str,
     model_id: &str,
 ) -> Result<ProviderQualificationReport> {
-    let provider_id =
-        crate::gateway_config::normalized_profile_id(provider_id).map_err(anyhow::Error::msg)?;
     if model_id.trim().is_empty() {
         bail!("model id is required");
     }
-    let config = crate::gateway_config::load();
-    let profile = config
-        .profile(&provider_id)
-        .cloned()
-        .ok_or_else(|| anyhow!("unknown provider profile `{provider_id}`"))?;
-    if profile.kind != ProviderKind::OpenAiCompatible {
-        bail!("only OpenAI-compatible profiles use this qualification flow");
+    let provider_id = if provider_id.trim() == crate::gateway_config::XAI_PROVIDER_ID {
+        crate::gateway_config::XAI_PROVIDER_ID.to_string()
+    } else {
+        crate::gateway_config::normalized_profile_id(provider_id).map_err(anyhow::Error::msg)?
+    };
+    let selection = crate::gateway_config::ModelSelection {
+        provider_id: provider_id.clone(),
+        model_id: model_id.to_string(),
+    };
+    let model_selection = crate::gateway_config::model_selection_key(&provider_id, model_id);
+    let mut resolved_credentials =
+        crate::auth_store::resolve_wire_credentials_for_model(&model_selection)
+            .map_err(anyhow::Error::msg)?;
+    if resolved_credentials
+        .as_ref()
+        .is_some_and(|credentials| credentials.provider_id != provider_id)
+    {
+        bail!("provider credential identity does not match the qualification selection");
     }
+    if provider_id == crate::gateway_config::XAI_PROVIDER_ID {
+        if let Some(credentials) = resolved_credentials.take() {
+            resolved_credentials =
+                Some(crate::auth_store::ensure_fresh_credentials(credentials).await);
+        }
+    }
+    let credential_fingerprint = resolved_credentials
+        .as_ref()
+        .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint);
+    let profile = crate::gateway_config::resolve_profile_for_selection(
+        &selection,
+        resolved_credentials
+            .as_ref()
+            .is_some_and(|credentials| credentials.oidc_token_auth),
+        credential_fingerprint.as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let mut credentials = QualificationCredentials::new(resolved_credentials, &profile)?;
     if profile.managed_by_env {
         bail!("environment-managed profiles cannot persist measured capabilities");
     }
-    if !profile.models.iter().any(|model| model.id == model_id) {
-        bail!("model `{model_id}` is not registered on provider `{provider_id}`");
-    }
-    let credentials = crate::auth_store::resolve_provider_credentials(&provider_id, Some(model_id))
-        .map_err(anyhow::Error::msg)?;
+    let provider_model = profile
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!("model `{model_id}` is not registered on provider `{provider_id}`")
+        })?;
+    let wire_model_id = provider_model.wire_model_id().to_string();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
         .connect_timeout(Duration::from_secs(10))
@@ -123,9 +249,9 @@ pub async fn qualify_provider_model(
     let basic_value = completion(
         &client,
         &profile.base_url,
-        credentials.as_ref(),
+        &mut credentials,
         serde_json::json!({
-            "model": model_id,
+            "model": wire_model_id,
             "messages": [{
                 "role": "user",
                 "content": format!("GrokPtah synthetic qualification. Reply with exactly: {GENERATION_MARKER}")
@@ -152,9 +278,9 @@ pub async fn qualify_provider_model(
     let tool_value = completion(
         &client,
         &profile.base_url,
-        credentials.as_ref(),
+        &mut credentials,
         serde_json::json!({
-            "model": model_id,
+            "model": wire_model_id,
             "messages": [{
                 "role": "user",
                 "content": format!("GrokPtah synthetic tool probe. Call {TOOL_NAME} with token {TOOL_TOKEN}.")
@@ -186,9 +312,9 @@ pub async fn qualify_provider_model(
         completion(
             &client,
             &profile.base_url,
-            credentials.as_ref(),
+            &mut credentials,
             serde_json::json!({
-                "model": model_id,
+                "model": wire_model_id,
                 "messages": [
                     {"role": "user", "content": "GrokPtah synthetic tool continuation probe."},
                     {"role": "assistant", "content": null, "tool_calls": [{
@@ -216,7 +342,7 @@ pub async fn qualify_provider_model(
     };
 
     let streaming =
-        match streaming_probe(&client, &profile.base_url, credentials.as_ref(), model_id).await {
+        match streaming_probe(&client, &profile.base_url, &mut credentials, &wire_model_id).await {
             Ok(true) => QualificationCheck::pass("SSE deltas preserved the synthetic marker"),
             Ok(false) => QualificationCheck::fail("Stream completed without the marker"),
             Err(error) => QualificationCheck::fail(safe_probe_error(&error)),
@@ -224,7 +350,7 @@ pub async fn qualify_provider_model(
     let coding_ready =
         basic_generation.passed() && native_tool_call.passed() && tool_result_continuation.passed();
     let (semantic_observation, stale_observation_recovery, computer_use_tier) = if coding_ready {
-        match computer_semantic_probe(&client, &profile.base_url, credentials.as_ref(), model_id)
+        match computer_semantic_probe(&client, &profile.base_url, &mut credentials, &wire_model_id)
             .await
         {
             Ok(result) => result,
@@ -242,24 +368,40 @@ pub async fn qualify_provider_model(
         )
     };
 
-    let mut updated = crate::gateway_config::load_for_update()
-        .context("read provider profiles for qualification")?;
-    let target = updated
-        .profile_mut(&provider_id)
-        .and_then(|item| item.models.iter_mut().find(|model| model.id == model_id))
-        .ok_or_else(|| anyhow!("provider/model disappeared during qualification"))?;
-    target.capabilities.chat = basic_generation.passed();
-    target.capabilities.tools = coding_ready;
-    target.capabilities.stream = streaming.passed();
-    target.capabilities.parallel_tool_calls = false;
-    target.capabilities.source = CapabilitySource::Measured;
-    target.capabilities.qualification_schema =
+    let mut measured_model = provider_model;
+    let target = &mut measured_model.capabilities;
+    target.chat = basic_generation.passed();
+    target.tools = coding_ready;
+    target.stream = streaming.passed();
+    target.parallel_tool_calls = false;
+    target.source = CapabilitySource::Measured;
+    target.qualification_schema =
         Some(crate::gateway_config::CAPABILITY_QUALIFICATION_SCHEMA.into());
-    target.capabilities.computer_use_tier = computer_use_tier;
-    target.capabilities.computer_capability_source = CapabilitySource::Measured;
-    target.capabilities.computer_qualification_schema =
+    target.computer_use_tier = computer_use_tier;
+    target.computer_capability_source = CapabilitySource::Measured;
+    target.computer_qualification_schema =
         Some(crate::gateway_config::COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA.into());
-    crate::gateway_config::save(&updated).context("save measured model capabilities")?;
+    if profile.managed_by_host {
+        let credential_fingerprint = credentials
+            .current()
+            .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint)
+            .unwrap_or_else(|| "anonymous".into());
+        crate::gateway_config::save_managed_profile_capabilities(
+            &profile,
+            &measured_model,
+            &credential_fingerprint,
+        )
+        .context("save managed measured model capabilities")?;
+    } else {
+        let mut updated = crate::gateway_config::load_for_update()
+            .context("read provider profiles for qualification")?;
+        let stored_model = updated
+            .profile_mut(&provider_id)
+            .and_then(|item| item.models.iter_mut().find(|model| model.id == model_id))
+            .ok_or_else(|| anyhow!("provider/model disappeared during qualification"))?;
+        *stored_model = measured_model;
+        crate::gateway_config::save(&updated).context("save measured model capabilities")?;
+    }
 
     Ok(ProviderQualificationReport {
         provider_id,
@@ -278,7 +420,7 @@ pub async fn qualify_provider_model(
 async fn computer_semantic_probe(
     client: &reqwest::Client,
     base_url: &str,
-    credentials: Option<&crate::auth_store::WireCredentials>,
+    credentials: &mut QualificationCredentials,
     model_id: &str,
 ) -> Result<(QualificationCheck, QualificationCheck, ComputerUseTier)> {
     let simulator = SimulatorBackend::new();
@@ -538,7 +680,7 @@ fn safe_probe_error(error: &anyhow::Error) -> String {
 async fn completion(
     client: &reqwest::Client,
     base_url: &str,
-    credentials: Option<&crate::auth_store::WireCredentials>,
+    credentials: &mut QualificationCredentials,
     mut body: serde_json::Value,
     allow_tool_choice_fallback: bool,
 ) -> Result<serde_json::Value> {
@@ -550,7 +692,7 @@ async fn completion(
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json");
-        if let Some(credentials) = credentials {
+        if let Some(credentials) = credentials.current() {
             request = crate::auth_store::apply_auth_headers(request, credentials, base_url);
         }
         let response = request
@@ -561,6 +703,11 @@ async fn completion(
         let status = response.status();
         if status.is_redirection() {
             bail!("provider redirect refused");
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && credentials.refresh_after_unauthorized().await?
+        {
+            continue;
         }
         if status.as_u16() == 400 && allow_tool_choice_fallback && !removed_tool_choice {
             if let Some(object) = body.as_object_mut() {
@@ -586,29 +733,38 @@ async fn completion(
 async fn streaming_probe(
     client: &reqwest::Client,
     base_url: &str,
-    credentials: Option<&crate::auth_store::WireCredentials>,
+    credentials: &mut QualificationCredentials,
     model_id: &str,
 ) -> Result<bool> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let mut request = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream");
-    if let Some(credentials) = credentials {
-        request = crate::auth_store::apply_auth_headers(request, credentials, base_url);
-    }
-    let response = request
-        .json(&serde_json::json!({
-            "model": model_id,
-            "messages": [{
-                "role": "user",
-                "content": format!("GrokPtah synthetic stream probe. Reply with exactly: {GENERATION_MARKER}")
-            }],
-            "stream": true
-        }))
-        .send()
-        .await
-        .map_err(classify_transport)?;
+    let body = serde_json::json!({
+        "model": model_id,
+        "messages": [{
+            "role": "user",
+            "content": format!("GrokPtah synthetic stream probe. Reply with exactly: {GENERATION_MARKER}")
+        }],
+        "stream": true
+    });
+    let response = loop {
+        let mut request = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+        if let Some(current) = credentials.current() {
+            request = crate::auth_store::apply_auth_headers(request, current, base_url);
+        }
+        let response = request
+            .json(&body)
+            .send()
+            .await
+            .map_err(classify_transport)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && credentials.refresh_after_unauthorized().await?
+        {
+            continue;
+        }
+        break response;
+    };
     if !response.status().is_success() {
         bail!(
             "provider stream failed (HTTP {})",
@@ -688,7 +844,7 @@ mod tests {
 
     use axum::body::Body;
     use axum::extract::State;
-    use axum::http::{header, Response, StatusCode};
+    use axum::http::{header, HeaderMap, Response, StatusCode};
     use axum::routing::post;
     use axum::{Json, Router};
     use bytes::Bytes;
@@ -825,6 +981,89 @@ mod tests {
         (format!("http://{address}/v1"), task)
     }
 
+    fn wire_credentials(
+        provider_id: &str,
+        bearer: &str,
+        oidc_token_auth: bool,
+    ) -> crate::auth_store::WireCredentials {
+        crate::auth_store::WireCredentials {
+            provider_id: provider_id.into(),
+            bearer: bearer.into(),
+            oidc_token_auth,
+            display_name: "test".into(),
+            method: if oidc_token_auth {
+                "grok_build:test".into()
+            } else {
+                "api_key".into()
+            },
+            user_id: None,
+            team_id: None,
+            auth_scope: None,
+            refresh_token: Some("test-refresh".into()),
+            oidc_issuer: None,
+            oidc_client_id: Some("test-client".into()),
+            principal_type: None,
+            principal_id: None,
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        }
+    }
+
+    fn host_xai_profile(base_url: &str) -> crate::gateway_config::ProviderProfile {
+        crate::gateway_config::ProviderProfile {
+            id: crate::gateway_config::XAI_PROVIDER_ID.into(),
+            label: "xAI".into(),
+            kind: crate::gateway_config::ProviderKind::Xai,
+            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
+            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
+            base_url: base_url.into(),
+            credential_ref: Some("managed:xai:oidc".into()),
+            models: Vec::new(),
+            managed_by_env: false,
+            managed_by_host: true,
+        }
+    }
+
+    async fn bearer_gateway_handler(
+        State((expected, requests)): State<(String, Arc<AtomicUsize>)>,
+        headers: HeaderMap,
+        Json(_body): Json<serde_json::Value>,
+    ) -> Response<Body> {
+        requests.fetch_add(1, Ordering::SeqCst);
+        if headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            != Some(format!("Bearer {expected}").as_str())
+        {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::from("expired"))
+                .unwrap();
+        }
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"choices": [{"message": {"content": GENERATION_MARKER}}]})
+                    .to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn start_bearer_gateway(
+        expected: &str,
+        requests: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(bearer_gateway_handler))
+            .with_state((expected.to_string(), requests));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
     fn install_profile(home: &std::path::Path, base_url: &str, profile_id: &str) {
         crate::discover::set_grokptah_home_override(Some(home.to_path_buf()));
         let mut config = crate::gateway_config::GatewayConfig::default();
@@ -903,6 +1142,149 @@ mod tests {
     }
 
     #[test]
+    fn qualification_rejects_forged_profile_and_credential_identity() {
+        let mut forged = crate::gateway_config::ProviderProfile::openai_compatible(
+            "attacker",
+            "Attacker",
+            "https://attacker.example/v1",
+        );
+        forged.kind = crate::gateway_config::ProviderKind::Xai;
+        forged.dialect = crate::gateway_config::ProviderDialect::XaiChatCompletions;
+        let credential = wire_credentials("xai", "secret", false);
+        assert!(validate_qualification_credential_binding(&forged, Some(&credential)).is_err());
+
+        let profile = host_xai_profile("https://api.x.ai/v1");
+        let wrong_owner = wire_credentials("attacker", "secret", false);
+        assert!(validate_qualification_credential_binding(&profile, Some(&wrong_owner)).is_err());
+    }
+
+    #[test]
+    fn qualifying_a_persisted_xai_impersonator_sends_no_request() {
+        let _lock = crate::discover::home_override_serial();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let request_count = Arc::new(AtomicUsize::new(0));
+                let (base_url, server) = start_gateway(GatewayState {
+                    prose_tools: false,
+                    json_for_stream: false,
+                    reject_first_tool_choice: false,
+                    tool_choice_rejections: Arc::new(AtomicUsize::new(0)),
+                    rate_limits_remaining: Arc::new(AtomicUsize::new(0)),
+                    request_count: request_count.clone(),
+                })
+                .await;
+                let temp = tempfile::tempdir().unwrap();
+                let home = temp.path().join(".grokptah");
+                std::fs::create_dir_all(&home).unwrap();
+                crate::discover::set_grokptah_home_override(Some(home.clone()));
+                std::fs::write(
+                    home.join("gateway.json"),
+                    serde_json::json!({
+                        "version": 2,
+                        "active_profile_id": "attacker",
+                        "profiles": [{
+                            "id": "attacker",
+                            "label": "Attacker",
+                            "kind": "xai",
+                            "dialect": "xai_chat_completions",
+                            "base_url": base_url,
+                            "models": [{"id": "grok-4.5"}]
+                        }]
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let previous_key = std::env::var_os("XAI_API_KEY");
+                unsafe { std::env::set_var("XAI_API_KEY", "must-not-leak") };
+
+                let error = qualify_provider_model("attacker", "grok-4.5")
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("unknown provider profile"));
+                assert_eq!(request_count.load(Ordering::SeqCst), 0);
+
+                unsafe {
+                    if let Some(value) = previous_key {
+                        std::env::set_var("XAI_API_KEY", value);
+                    } else {
+                        std::env::remove_var("XAI_API_KEY");
+                    }
+                }
+                server.abort();
+            });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xai_qualification_forces_at_most_one_refresh_after_401() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = start_bearer_gateway("fresh-token", requests.clone()).await;
+        let profile = host_xai_profile(&base_url);
+        let mut credentials = QualificationCredentials::new(
+            Some(wire_credentials("xai", "expired-token", true)),
+            &profile,
+        )
+        .unwrap();
+        credentials.forced_refresh_override = Some(wire_credentials("xai", "fresh-token", true));
+        let client = reqwest::Client::new();
+
+        let value = completion(
+            &client,
+            &base_url,
+            &mut credentials,
+            serde_json::json!({
+                "model": "grok-4.5",
+                "messages": [{"role": "user", "content": "synthetic"}],
+                "stream": false
+            }),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(message_content(&value), Some(GENERATION_MARKER));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(credentials.current().unwrap().bearer, "fresh-token");
+        assert!(credentials.forced_refresh_used);
+        assert!(!credentials.refresh_after_unauthorized().await.unwrap());
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xai_qualification_rejects_a_refresh_that_changes_principal() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = start_bearer_gateway("fresh-token", requests.clone()).await;
+        let profile = host_xai_profile(&base_url);
+        let mut initial = wire_credentials("xai", "expired-token", true);
+        initial.user_id = Some("user-a".into());
+        initial.principal_id = Some("user-a".into());
+        let mut refreshed = wire_credentials("xai", "fresh-token", true);
+        refreshed.user_id = Some("user-b".into());
+        refreshed.principal_id = Some("user-b".into());
+        let mut credentials = QualificationCredentials::new(Some(initial), &profile).unwrap();
+        credentials.forced_refresh_override = Some(refreshed);
+
+        let error = completion(
+            &reqwest::Client::new(),
+            &base_url,
+            &mut credentials,
+            serde_json::json!({
+                "model": "grok-4.5",
+                "messages": [{"role": "user", "content": "synthetic"}],
+                "stream": false
+            }),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("principal or mode changed"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[test]
     fn live_synthetic_suite_qualifies_real_tools_and_tool_choice_fallback() {
         let _lock = crate::discover::home_override_serial();
         tokio::runtime::Builder::new_multi_thread()
@@ -949,6 +1331,126 @@ mod tests {
                     CapabilitySource::Measured
                 );
 
+                server.abort();
+            });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn built_in_xai_qualification_replaces_declared_capabilities_on_the_exact_route() {
+        let _lock = crate::discover::home_override_serial();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (base_url, server) = start_gateway(GatewayState {
+                    prose_tools: false,
+                    json_for_stream: false,
+                    reject_first_tool_choice: false,
+                    tool_choice_rejections: Arc::new(AtomicUsize::new(0)),
+                    rate_limits_remaining: Arc::new(AtomicUsize::new(0)),
+                    request_count: Arc::new(AtomicUsize::new(0)),
+                })
+                .await;
+                let temp = tempfile::tempdir().unwrap();
+                crate::discover::set_grokptah_home_override(Some(temp.path().join(".grokptah")));
+                let previous_base = std::env::var_os("XAI_API_BASE");
+                let previous_key = std::env::var_os("XAI_API_KEY");
+                unsafe {
+                    std::env::set_var("XAI_API_BASE", &base_url);
+                    std::env::set_var("XAI_API_KEY", "synthetic-xai-qualification-key");
+                }
+
+                let selection = crate::gateway_config::ModelSelection {
+                    provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
+                    model_id: "grok-4.5".into(),
+                };
+                let unqualified =
+                    crate::gateway_config::resolve_profile_for_selection(&selection, false, None)
+                        .unwrap();
+                assert!(unqualified.managed_by_host);
+                assert_eq!(
+                    unqualified.models[0].capabilities.source,
+                    CapabilitySource::Declared
+                );
+                assert!(unqualified.models[0].capabilities.tools);
+
+                let report = qualify_provider_model("xai", "grok-4.5").await.unwrap();
+                assert!(report.coding_ready);
+                assert_eq!(report.provider_id, "xai");
+                assert_eq!(report.computer_use_tier, ComputerUseTier::SemanticAct);
+
+                let credentials = crate::auth_store::resolve_wire_credentials_for_model("grok-4.5")
+                    .unwrap()
+                    .unwrap();
+                let credential_fingerprint = credentials.qualification_identity_fingerprint();
+
+                let qualified = crate::gateway_config::resolve_profile_for_selection(
+                    &selection,
+                    false,
+                    Some(&credential_fingerprint),
+                )
+                .unwrap();
+                let capabilities = &qualified.models[0].capabilities;
+                assert_eq!(capabilities.source, CapabilitySource::Measured);
+                assert_eq!(
+                    capabilities.qualification_schema.as_deref(),
+                    Some(crate::gateway_config::CAPABILITY_QUALIFICATION_SCHEMA)
+                );
+                assert!(capabilities.tools);
+                assert!(capabilities.stream);
+                assert_eq!(capabilities.computer_use_tier, ComputerUseTier::SemanticAct);
+
+                let different_auth =
+                    crate::gateway_config::resolve_profile_for_selection(&selection, true, None)
+                        .unwrap();
+                assert_eq!(
+                    different_auth.models[0].capabilities.source,
+                    CapabilitySource::Declared,
+                    "API-key qualification must not cross into the OIDC route"
+                );
+
+                let target =
+                    crate::host_helpers::resolve_model_target(&credentials, "grok-4.5").unwrap();
+                assert_eq!(target.capabilities.source, CapabilitySource::Measured);
+                let host = crate::host::AgentHost::create(crate::host::HostConfig::default());
+                let projected = host
+                    .models()
+                    .into_iter()
+                    .find(|model| model.id == "grok-4.5")
+                    .unwrap();
+                assert_eq!(projected.capability_source, "measured");
+                assert!(projected.supports_tools);
+                drop(host);
+
+                unsafe {
+                    std::env::set_var("XAI_API_BASE", "http://127.0.0.1:9/different-route");
+                }
+                let changed_route = crate::gateway_config::resolve_profile_for_selection(
+                    &selection,
+                    false,
+                    Some(&credential_fingerprint),
+                )
+                .unwrap();
+                assert_eq!(
+                    changed_route.models[0].capabilities.source,
+                    CapabilitySource::Declared,
+                    "measured capability must not cross route boundaries"
+                );
+
+                unsafe {
+                    if let Some(value) = previous_base {
+                        std::env::set_var("XAI_API_BASE", value);
+                    } else {
+                        std::env::remove_var("XAI_API_BASE");
+                    }
+                    if let Some(value) = previous_key {
+                        std::env::set_var("XAI_API_KEY", value);
+                    } else {
+                        std::env::remove_var("XAI_API_KEY");
+                    }
+                }
                 server.abort();
             });
         crate::discover::set_grokptah_home_override(None);
@@ -1009,10 +1511,13 @@ mod tests {
         })
         .await;
         let client = reqwest::Client::new();
+        let profile =
+            crate::gateway_config::ProviderProfile::openai_compatible("test", "Test", &base_url);
+        let mut credentials = QualificationCredentials::new(None, &profile).unwrap();
         let value = completion(
             &client,
             &base_url,
-            None,
+            &mut credentials,
             serde_json::json!({
                 "model": "cheap-code-model",
                 "messages": [{"role": "user", "content": "synthetic"}],
@@ -1039,7 +1544,7 @@ mod tests {
         let error = completion(
             &client,
             &base_url,
-            None,
+            &mut credentials,
             serde_json::json!({
                 "model": "cheap-code-model",
                 "messages": [{"role": "user", "content": "synthetic"}],

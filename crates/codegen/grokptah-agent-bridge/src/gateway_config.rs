@@ -8,7 +8,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::discover::grokptah_home;
@@ -19,6 +21,7 @@ pub const MODEL_SELECTION_PREFIX: &str = "ptah.model.v1:";
 pub const CAPABILITY_QUALIFICATION_SCHEMA: &str = "grokptah.provider-qualification.v1";
 pub const COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA: &str = "grokptah.computer-qualification.v1";
 pub const MAX_QUALIFIED_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MANAGED_QUALIFICATIONS_VERSION: u32 = 1;
 const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp"];
 
 fn current_version() -> u32 {
@@ -210,6 +213,8 @@ pub struct ProviderModel {
     pub id: String,
     #[serde(default)]
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_model_id: Option<String>,
     #[serde(default)]
     pub capabilities: ModelCapabilities,
 }
@@ -220,8 +225,13 @@ impl ProviderModel {
         Self {
             display_name: id.clone(),
             id,
+            wire_model_id: None,
             capabilities: ModelCapabilities::default(),
         }
+    }
+
+    pub fn wire_model_id(&self) -> &str {
+        self.wire_model_id.as_deref().unwrap_or(&self.id)
     }
 }
 
@@ -243,6 +253,9 @@ pub struct ProviderProfile {
     /// Runtime-only profile synthesized from paired endpoint/credential env vars.
     #[serde(default, skip_serializing_if = "is_false")]
     pub managed_by_env: bool,
+    /// Runtime-only profile synthesized and owned by the native host.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed_by_host: bool,
 }
 
 impl ProviderProfile {
@@ -261,6 +274,7 @@ impl ProviderProfile {
             credential_ref: None,
             models: Vec::new(),
             managed_by_env: false,
+            managed_by_host: false,
         }
     }
 
@@ -295,6 +309,50 @@ impl ProviderProfile {
             }
         }
         self.base_url = base_url.to_string();
+    }
+
+    pub fn accepts_effort(&self, model_id: &str, effort: &str) -> bool {
+        if self.dialect == ProviderDialect::XaiChatCompletions {
+            return true;
+        }
+        self.models
+            .iter()
+            .find(|model| model.id == model_id)
+            .is_some_and(|model| {
+                model
+                    .capabilities
+                    .effort_options
+                    .iter()
+                    .any(|value| value == effort)
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ManagedQualification {
+    provider_id: String,
+    model_id: String,
+    base_url: String,
+    wire_model_id: String,
+    credential_ref: String,
+    #[serde(default)]
+    credential_fingerprint: String,
+    capabilities: ModelCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ManagedQualificationStore {
+    version: u32,
+    #[serde(default)]
+    qualifications: Vec<ManagedQualification>,
+}
+
+impl Default for ManagedQualificationStore {
+    fn default() -> Self {
+        Self {
+            version: MANAGED_QUALIFICATIONS_VERSION,
+            qualifications: Vec::new(),
+        }
     }
 }
 
@@ -365,6 +423,11 @@ impl GatewayConfig {
 
         let mut seen = BTreeSet::new();
         self.profiles.retain_mut(|profile| {
+            // Host-managed xAI routing is synthesized after config loading.
+            // Persisted profiles may never opt into its credential or dialect.
+            if !is_valid_stored_profile(profile) {
+                return false;
+            }
             let Ok(id) = normalized_profile_id(&profile.id) else {
                 return false;
             };
@@ -465,6 +528,7 @@ impl GatewayConfig {
     }
 
     pub fn upsert_profile(&mut self, mut profile: ProviderProfile) -> Result<(), String> {
+        validate_stored_profile(&profile)?;
         profile.id = normalized_profile_id(&profile.id)?;
         validate_base_url(&profile.base_url)?;
         profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
@@ -505,6 +569,22 @@ impl GatewayConfig {
     }
 }
 
+fn is_valid_stored_profile(profile: &ProviderProfile) -> bool {
+    !profile.managed_by_host
+        && profile.kind == ProviderKind::OpenAiCompatible
+        && profile.dialect == ProviderDialect::OpenAiChatCompletions
+}
+
+fn validate_stored_profile(profile: &ProviderProfile) -> Result<(), String> {
+    if !is_valid_stored_profile(profile) {
+        return Err(
+            "xAI provider kind and dialect are reserved for the synthesized host-managed `xai` profile"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSelection {
     pub provider_id: String,
@@ -542,6 +622,284 @@ pub fn parse_model_selection(value: &str) -> Result<ModelSelection, String> {
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
     })
+}
+
+/// Resolve one selection to the same profile-shaped runtime contract whether
+/// the profile is host-managed or stored in `gateway.json`.
+pub(crate) fn resolve_profile_for_selection(
+    selection: &ModelSelection,
+    xai_oidc_token_auth: bool,
+    credential_fingerprint: Option<&str>,
+) -> Result<ProviderProfile, String> {
+    if selection.provider_id == XAI_PROVIDER_ID {
+        return synthesized_xai_profile(
+            &selection.model_id,
+            xai_oidc_token_auth,
+            credential_fingerprint,
+        );
+    }
+    load()
+        .profile(&selection.provider_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown provider profile `{}`", selection.provider_id))
+}
+
+fn synthesized_xai_profile(
+    model_id: &str,
+    oidc_token_auth: bool,
+    credential_fingerprint: Option<&str>,
+) -> Result<ProviderProfile, String> {
+    let catalog_entry = crate::models_catalog::lookup(model_id);
+    let wire_model_id = catalog_entry
+        .as_ref()
+        .map(|entry| entry.wire_model.clone())
+        .unwrap_or_else(|| model_id.to_string());
+    let base_url = std::env::var("XAI_API_BASE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            if oidc_token_auth {
+                catalog_entry
+                    .as_ref()
+                    .and_then(|entry| entry.base_url.clone())
+                    .filter(|url| url.contains("cli-chat-proxy") || url.contains("x.ai"))
+                    .unwrap_or_else(|| "https://cli-chat-proxy.grok.com/v1".into())
+            } else {
+                catalog_entry
+                    .as_ref()
+                    .and_then(|entry| entry.base_url.clone())
+                    .unwrap_or_else(|| "https://api.x.ai/v1".into())
+            }
+        });
+    let effort_options = catalog_entry
+        .as_ref()
+        .map(|entry| entry.info.effort_options.clone())
+        .unwrap_or_default();
+    let credential_ref = if oidc_token_auth {
+        "managed:xai:oidc"
+    } else {
+        "managed:xai:api-key"
+    };
+    let mut capabilities = ModelCapabilities {
+        chat: true,
+        tools: true,
+        stream: true,
+        parallel_tool_calls: true,
+        effort_options,
+        source: CapabilitySource::Declared,
+        qualification_schema: None,
+        ..ModelCapabilities::default()
+    };
+    let store = load_managed_qualifications()
+        .map_err(|error| format!("read managed xAI qualifications: {error}"))?;
+    if let Some(measured) = store.qualifications.iter().find(|record| {
+        record.provider_id == XAI_PROVIDER_ID
+            && record.model_id == model_id
+            && record.base_url == base_url
+            && record.wire_model_id == wire_model_id
+            && record.credential_ref == credential_ref
+            && credential_fingerprint
+                .is_some_and(|fingerprint| record.credential_fingerprint == fingerprint)
+            && record.capabilities.source == CapabilitySource::Measured
+            && record.capabilities.qualification_schema.as_deref()
+                == Some(CAPABILITY_QUALIFICATION_SCHEMA)
+    }) {
+        let effort_options = capabilities.effort_options;
+        capabilities = measured.capabilities.clone();
+        capabilities.effort_options = effort_options;
+        if capabilities.computer_capability_source == CapabilitySource::Measured
+            && capabilities.computer_qualification_schema.as_deref()
+                != Some(COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA)
+        {
+            capabilities.computer_use_tier = ComputerUseTier::None;
+            capabilities.computer_capability_source = CapabilitySource::Unknown;
+            capabilities.computer_qualification_schema = None;
+        }
+    }
+    let display_name = catalog_entry
+        .as_ref()
+        .map(|entry| entry.info.display_name.clone())
+        .unwrap_or_else(|| model_id.to_string());
+    Ok(ProviderProfile {
+        id: XAI_PROVIDER_ID.into(),
+        label: "xAI / Grok Build".into(),
+        kind: ProviderKind::Xai,
+        dialect: ProviderDialect::XaiChatCompletions,
+        deadline_class: ProviderDeadlineClass::Standard,
+        base_url,
+        credential_ref: Some(credential_ref.into()),
+        models: vec![ProviderModel {
+            id: model_id.to_string(),
+            display_name,
+            wire_model_id: Some(wire_model_id),
+            capabilities,
+        }],
+        managed_by_env: false,
+        managed_by_host: true,
+    })
+}
+
+pub(crate) fn save_managed_profile_capabilities(
+    profile: &ProviderProfile,
+    model: &ProviderModel,
+    credential_fingerprint: &str,
+) -> io::Result<()> {
+    if profile.id != XAI_PROVIDER_ID
+        || !profile.managed_by_host
+        || profile.kind != ProviderKind::Xai
+        || profile.dialect != ProviderDialect::XaiChatCompletions
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only the host-managed xAI profile uses managed qualification storage",
+        ));
+    }
+    let _guard = managed_qualifications_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_guard = acquire_managed_qualifications_file_lock()?;
+    let mut store = load_managed_qualifications()?;
+    store.version = MANAGED_QUALIFICATIONS_VERSION;
+    let replacement = ManagedQualification {
+        provider_id: profile.id.clone(),
+        model_id: model.id.clone(),
+        base_url: profile.base_url.clone(),
+        wire_model_id: model.wire_model_id().to_string(),
+        credential_ref: profile.credential_ref.clone().unwrap_or_default(),
+        credential_fingerprint: credential_fingerprint.to_string(),
+        capabilities: model.capabilities.clone(),
+    };
+    store
+        .qualifications
+        .retain(|record| !record.has_same_route_key(&replacement));
+    store.qualifications.push(replacement);
+    store
+        .qualifications
+        .sort_by(|a, b| a.route_key().cmp(&b.route_key()));
+    save_managed_qualifications(&store)
+}
+
+impl ManagedQualification {
+    fn route_key(
+        &self,
+    ) -> (
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        Option<&str>,
+        Option<&str>,
+    ) {
+        (
+            &self.provider_id,
+            &self.model_id,
+            &self.base_url,
+            &self.wire_model_id,
+            &self.credential_ref,
+            &self.credential_fingerprint,
+            self.capabilities.qualification_schema.as_deref(),
+            self.capabilities.computer_qualification_schema.as_deref(),
+        )
+    }
+
+    fn has_same_route_key(&self, other: &Self) -> bool {
+        self.route_key() == other.route_key()
+    }
+}
+
+fn managed_qualifications_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn managed_qualifications_path() -> PathBuf {
+    grokptah_home().join("provider-qualifications.json")
+}
+
+fn acquire_managed_qualifications_file_lock() -> io::Result<fs::File> {
+    let path = grokptah_home().join(".provider-qualifications.lock");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
+    file.lock_exclusive()?;
+    set_private_permissions(&path)?;
+    Ok(file)
+}
+
+fn load_managed_qualifications() -> io::Result<ManagedQualificationStore> {
+    let path = managed_qualifications_path();
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ManagedQualificationStore::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let store: ManagedQualificationStore = serde_json::from_str(&raw)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if store.version != MANAGED_QUALIFICATIONS_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported managed provider qualification version",
+        ));
+    }
+    Ok(store)
+}
+
+fn save_managed_qualifications(store: &ManagedQualificationStore) -> io::Result<()> {
+    let path = managed_qualifications_path();
+    if path.exists() {
+        load_managed_qualifications()?;
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let raw = serde_json::to_vec_pretty(store)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("provider-qualifications.json");
+    let temporary = loop {
+        let candidate = path.with_file_name(format!(
+            ".{file_name}.{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        match write_private_new_file(&candidate, &raw) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                let _ = fs::remove_file(&candidate);
+                return Err(error);
+            }
+        }
+    };
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    set_private_permissions(&path)?;
+    sync_parent_directory(&path)?;
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn encode_component(value: &str) -> String {
@@ -688,7 +1046,7 @@ fn save_to_path(path: &Path, config: &GatewayConfig) -> io::Result<()> {
     let mut normalized = config.clone();
     normalized
         .profiles
-        .retain(|profile| !profile.managed_by_env);
+        .retain(|profile| !profile.managed_by_env && !profile.managed_by_host);
     if normalized
         .active_profile_id
         .as_ref()
@@ -729,6 +1087,22 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn write_private_new_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn set_private_permissions(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -742,6 +1116,8 @@ fn set_private_permissions(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::discover::{home_override_serial, set_grokptah_home_override};
+
+    const TEST_CREDENTIAL_FINGERPRINT: &str = "v1-sha256:test-credential";
 
     #[test]
     fn legacy_shape_loads_as_profile_but_raw_secret_cannot_be_saved() {
@@ -875,6 +1251,337 @@ mod tests {
         assert!(validate_base_url("http://127.0.0.1:8080/v1").is_ok());
         assert!(validate_base_url("http://[::1]:8080/v1").is_ok());
         assert!(validate_base_url("https://gateway.example/v1?token=value").is_err());
+    }
+
+    #[test]
+    fn persisted_and_upserted_xai_impersonators_are_rejected() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        fs::create_dir_all(&home).unwrap();
+        set_grokptah_home_override(Some(home.clone()));
+
+        fs::write(
+            home.join("gateway.json"),
+            r#"{
+                "version": 2,
+                "active_profile_id": "attacker",
+                "profiles": [{
+                    "id": "attacker",
+                    "label": "Attacker",
+                    "kind": "xai",
+                    "dialect": "xai_chat_completions",
+                    "base_url": "https://attacker.example/v1",
+                    "models": [{"id": "grok-4.5"}]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let loaded = load_for_update().unwrap();
+        assert!(loaded.profile("attacker").is_none());
+        assert!(loaded.active_profile_id.is_none());
+
+        let mut forged_kind =
+            ProviderProfile::openai_compatible("corp", "Corp", "https://corp.example/v1");
+        forged_kind.kind = ProviderKind::Xai;
+        assert!(GatewayConfig::default()
+            .upsert_profile(forged_kind)
+            .is_err());
+
+        let mut forged_dialect =
+            ProviderProfile::openai_compatible("corp", "Corp", "https://corp.example/v1");
+        forged_dialect.dialect = ProviderDialect::XaiChatCompletions;
+        assert!(GatewayConfig::default()
+            .upsert_profile(forged_dialect)
+            .is_err());
+
+        let mut forged_host =
+            ProviderProfile::openai_compatible("corp", "Corp", "https://corp.example/v1");
+        forged_host.managed_by_host = true;
+        assert!(GatewayConfig::default()
+            .upsert_profile(forged_host)
+            .is_err());
+
+        set_grokptah_home_override(None);
+    }
+
+    fn measured_managed_profile(
+        model_id: &str,
+        base_url: &str,
+        credential_ref: &str,
+        chat: bool,
+        tools: bool,
+    ) -> (ProviderProfile, ProviderModel) {
+        let mut capabilities = ModelCapabilities {
+            chat,
+            tools,
+            stream: tools,
+            source: CapabilitySource::Measured,
+            qualification_schema: Some(CAPABILITY_QUALIFICATION_SCHEMA.into()),
+            ..ModelCapabilities::default()
+        };
+        capabilities.computer_capability_source = CapabilitySource::Measured;
+        capabilities.computer_qualification_schema =
+            Some(COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA.into());
+        let model = ProviderModel {
+            id: model_id.into(),
+            display_name: model_id.into(),
+            wire_model_id: Some(model_id.into()),
+            capabilities,
+        };
+        let profile = ProviderProfile {
+            id: XAI_PROVIDER_ID.into(),
+            label: "xAI".into(),
+            kind: ProviderKind::Xai,
+            dialect: ProviderDialect::XaiChatCompletions,
+            deadline_class: ProviderDeadlineClass::Standard,
+            base_url: base_url.into(),
+            credential_ref: Some(credential_ref.into()),
+            models: vec![model.clone()],
+            managed_by_env: false,
+            managed_by_host: true,
+        };
+        (profile, model)
+    }
+
+    #[test]
+    fn managed_qualification_replaces_only_the_exact_route() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        set_grokptah_home_override(Some(home));
+        let previous_base = std::env::var_os("XAI_API_BASE");
+
+        let (api_profile, failed_api) = measured_managed_profile(
+            "grok-route",
+            "https://api.x.ai/v1",
+            "managed:xai:api-key",
+            false,
+            false,
+        );
+        save_managed_profile_capabilities(&api_profile, &failed_api, TEST_CREDENTIAL_FINGERPRINT)
+            .unwrap();
+        let (oidc_profile, oidc) = measured_managed_profile(
+            "grok-route",
+            "https://cli-chat-proxy.grok.com/v1",
+            "managed:xai:oidc",
+            true,
+            true,
+        );
+        save_managed_profile_capabilities(&oidc_profile, &oidc, TEST_CREDENTIAL_FINGERPRINT)
+            .unwrap();
+        let (alternate_profile, alternate) = measured_managed_profile(
+            "grok-route",
+            "https://alternate.x.ai/v1",
+            "managed:xai:api-key",
+            true,
+            true,
+        );
+        save_managed_profile_capabilities(
+            &alternate_profile,
+            &alternate,
+            TEST_CREDENTIAL_FINGERPRINT,
+        )
+        .unwrap();
+
+        let mut updated_oidc = oidc.clone();
+        updated_oidc.capabilities.tools = false;
+        save_managed_profile_capabilities(
+            &oidc_profile,
+            &updated_oidc,
+            TEST_CREDENTIAL_FINGERPRINT,
+        )
+        .unwrap();
+
+        let store = load_managed_qualifications().unwrap();
+        assert_eq!(store.qualifications.len(), 3);
+        let failed = store
+            .qualifications
+            .iter()
+            .find(|record| {
+                record.credential_ref == "managed:xai:api-key"
+                    && record.base_url == "https://api.x.ai/v1"
+            })
+            .unwrap();
+        assert!(!failed.capabilities.chat);
+        assert!(!failed.capabilities.tools);
+        let oidc_record = store
+            .qualifications
+            .iter()
+            .find(|record| record.credential_ref == "managed:xai:oidc")
+            .unwrap();
+        assert!(!oidc_record.capabilities.tools);
+        assert!(store
+            .qualifications
+            .iter()
+            .any(|record| record.base_url == "https://alternate.x.ai/v1"
+                && record.capabilities.tools));
+
+        unsafe { std::env::set_var("XAI_API_BASE", "https://api.x.ai/v1") };
+        let failed_projection = resolve_profile_for_selection(
+            &ModelSelection {
+                provider_id: XAI_PROVIDER_ID.into(),
+                model_id: "grok-route".into(),
+            },
+            false,
+            Some(TEST_CREDENTIAL_FINGERPRINT),
+        )
+        .unwrap();
+        assert_eq!(
+            failed_projection.models[0].capabilities.source,
+            CapabilitySource::Measured
+        );
+        assert!(!failed_projection.models[0].capabilities.chat);
+        assert!(!failed_projection.models[0].capabilities.tools);
+        let rotated_credential_projection = resolve_profile_for_selection(
+            &ModelSelection {
+                provider_id: XAI_PROVIDER_ID.into(),
+                model_id: "grok-route".into(),
+            },
+            false,
+            Some("v1-sha256:rotated-credential"),
+        )
+        .unwrap();
+        assert_eq!(
+            rotated_credential_projection.models[0].capabilities.source,
+            CapabilitySource::Declared,
+            "measured authority must not cross credential identities"
+        );
+
+        unsafe {
+            if let Some(value) = previous_base {
+                std::env::set_var("XAI_API_BASE", value);
+            } else {
+                std::env::remove_var("XAI_API_BASE");
+            }
+        }
+
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn concurrent_managed_qualification_writes_preserve_every_route() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        set_grokptah_home_override(Some(home.clone()));
+
+        let threads: Vec<_> = (0..16)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let (profile, model) = measured_managed_profile(
+                        &format!("grok-{index}"),
+                        &format!("https://route-{index}.x.ai/v1"),
+                        if index % 2 == 0 {
+                            "managed:xai:api-key"
+                        } else {
+                            "managed:xai:oidc"
+                        },
+                        true,
+                        index % 3 != 0,
+                    );
+                    save_managed_profile_capabilities(
+                        &profile,
+                        &model,
+                        TEST_CREDENTIAL_FINGERPRINT,
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let store = load_managed_qualifications().unwrap();
+        assert_eq!(store.qualifications.len(), 16);
+        for index in 0..16 {
+            assert!(store
+                .qualifications
+                .iter()
+                .any(|record| record.model_id == format!("grok-{index}")));
+        }
+        let temporary_files = fs::read_dir(&home)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temporary_files, 0);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(home.join("provider-qualifications.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn managed_qualification_lock_is_enforced_by_the_filesystem() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        set_grokptah_home_override(Some(home.clone()));
+
+        let first = acquire_managed_qualifications_file_lock().unwrap();
+        let second = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(home.join(".provider-qualifications.lock"))
+            .unwrap();
+        assert!(FileExt::try_lock_exclusive(&second).is_err());
+        drop(first);
+        FileExt::try_lock_exclusive(&second).unwrap();
+        FileExt::unlock(&second).unwrap();
+
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn corrupt_managed_qualification_store_is_never_overwritten() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        fs::create_dir_all(&home).unwrap();
+        let path = home.join("provider-qualifications.json");
+        fs::write(&path, "{recovery-data").unwrap();
+        set_grokptah_home_override(Some(home));
+
+        let (profile, model) = measured_managed_profile(
+            "grok-4.5",
+            "https://api.x.ai/v1",
+            "managed:xai:api-key",
+            true,
+            true,
+        );
+        assert_eq!(
+            save_managed_profile_capabilities(&profile, &model, TEST_CREDENTIAL_FINGERPRINT,)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let resolution = resolve_profile_for_selection(
+            &ModelSelection {
+                provider_id: XAI_PROVIDER_ID.into(),
+                model_id: "grok-4.5".into(),
+            },
+            false,
+            Some(TEST_CREDENTIAL_FINGERPRINT),
+        );
+        assert!(resolution
+            .unwrap_err()
+            .contains("read managed xAI qualifications"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "{recovery-data");
+
+        set_grokptah_home_override(None);
     }
 
     #[test]
@@ -1058,6 +1765,147 @@ mod tests {
             std::env::remove_var("GROKPTAH_API_BASE");
             std::env::remove_var("OPENAI_BASE_URL");
         }
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn synthesized_xai_profile_preserves_catalog_routing_for_every_entry() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        set_grokptah_home_override(Some(temp.path().join(".grokptah")));
+        let previous_override = std::env::var_os("XAI_API_BASE");
+        unsafe { std::env::remove_var("XAI_API_BASE") };
+
+        for entry in crate::models_catalog::load_catalog() {
+            for oidc_token_auth in [false, true] {
+                let selection = ModelSelection {
+                    provider_id: XAI_PROVIDER_ID.into(),
+                    model_id: entry.info.id.clone(),
+                };
+                let profile =
+                    resolve_profile_for_selection(&selection, oidc_token_auth, None).unwrap();
+                let model = &profile.models[0];
+                let expected_base = if oidc_token_auth {
+                    entry
+                        .base_url
+                        .clone()
+                        .filter(|url| url.contains("cli-chat-proxy") || url.contains("x.ai"))
+                        .unwrap_or_else(|| "https://cli-chat-proxy.grok.com/v1".into())
+                } else {
+                    entry
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.x.ai/v1".into())
+                };
+                assert_eq!(profile.id, XAI_PROVIDER_ID);
+                assert!(profile.managed_by_host);
+                assert_eq!(profile.kind, ProviderKind::Xai);
+                assert_eq!(profile.dialect, ProviderDialect::XaiChatCompletions);
+                assert_eq!(profile.deadline_class, ProviderDeadlineClass::Standard);
+                assert_eq!(profile.base_url.as_bytes(), expected_base.as_bytes());
+                assert_eq!(model.id.as_bytes(), entry.info.id.as_bytes());
+                assert_eq!(
+                    model.wire_model_id().as_bytes(),
+                    entry.wire_model.as_bytes()
+                );
+                assert_eq!(
+                    model.capabilities.effort_options.as_slice(),
+                    entry.info.effort_options.as_slice()
+                );
+                assert!(model.capabilities.chat);
+                assert!(model.capabilities.tools);
+                assert!(model.capabilities.stream);
+                assert!(model.capabilities.parallel_tool_calls);
+                assert_eq!(model.capabilities.source, CapabilitySource::Declared);
+                assert!(profile.accepts_effort(&entry.info.id, "max"));
+            }
+        }
+
+        unsafe {
+            if let Some(value) = previous_override {
+                std::env::set_var("XAI_API_BASE", value);
+            } else {
+                std::env::remove_var("XAI_API_BASE");
+            }
+        }
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn xai_override_and_unknown_model_fallback_preserve_legacy_bytes() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        set_grokptah_home_override(Some(temp.path().join(".grokptah")));
+        let previous_override = std::env::var_os("XAI_API_BASE");
+        unsafe { std::env::set_var("XAI_API_BASE", "  http://127.0.0.1:9876/custom/  ") };
+        let selection = ModelSelection {
+            provider_id: XAI_PROVIDER_ID.into(),
+            model_id: "unknown/model:opaque".into(),
+        };
+
+        for oidc_token_auth in [false, true] {
+            let profile = resolve_profile_for_selection(&selection, oidc_token_auth, None).unwrap();
+            let model = &profile.models[0];
+            assert_eq!(profile.base_url, "http://127.0.0.1:9876/custom/");
+            assert_eq!(model.id, "unknown/model:opaque");
+            assert_eq!(model.wire_model_id(), "unknown/model:opaque");
+            assert!(model.capabilities.effort_options.is_empty());
+            assert_eq!(model.capabilities.source, CapabilitySource::Declared);
+        }
+
+        unsafe {
+            if let Some(value) = previous_override {
+                std::env::set_var("XAI_API_BASE", value);
+            } else {
+                std::env::remove_var("XAI_API_BASE");
+            }
+        }
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn xai_id_cannot_be_created_renamed_mutated_or_persisted() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        set_grokptah_home_override(Some(home.clone()));
+
+        let create = ProviderProfile::openai_compatible(
+            XAI_PROVIDER_ID,
+            "user xAI",
+            "https://example.com/v1",
+        );
+        let mut config = GatewayConfig::default();
+        assert!(config
+            .upsert_profile(create)
+            .unwrap_err()
+            .contains("reserved"));
+
+        let mut renamed =
+            ProviderProfile::openai_compatible("corp", "Corp", "https://example.com/v1");
+        renamed.id = XAI_PROVIDER_ID.into();
+        assert!(config
+            .upsert_profile(renamed)
+            .unwrap_err()
+            .contains("reserved"));
+
+        let selection = ModelSelection {
+            provider_id: XAI_PROVIDER_ID.into(),
+            model_id: "grok-4.5".into(),
+        };
+        let mut managed = resolve_profile_for_selection(&selection, false, None).unwrap();
+        managed.label = "mutated".into();
+        assert!(config
+            .upsert_profile(managed.clone())
+            .unwrap_err()
+            .contains("reserved"));
+
+        config.profiles.push(managed);
+        save(&config).unwrap();
+        let persisted = fs::read_to_string(home.join("gateway.json")).unwrap();
+        assert!(!persisted.contains("mutated"));
+        assert!(load().profile(XAI_PROVIDER_ID).is_none());
+
         set_grokptah_home_override(None);
     }
 }

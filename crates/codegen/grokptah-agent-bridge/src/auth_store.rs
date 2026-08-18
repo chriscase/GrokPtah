@@ -20,6 +20,7 @@ use std::time::Duration;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use keyring::Entry;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::types::AuthState;
 
@@ -117,6 +118,69 @@ pub struct WireCredentials {
     pub principal_type: Option<String>,
     pub principal_id: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl WireCredentials {
+    /// Stable, non-secret identity used to bind measured provider capabilities
+    /// to the credential principal that was actually qualified. OIDC access
+    /// token rotation does not change the fingerprint when durable principal
+    /// fields are available. API keys and legacy OIDC records fall back to a
+    /// one-way digest of high-entropy credential material.
+    pub(crate) fn qualification_identity_fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"grokptah.provider-qualification-identity.v1\0");
+        update_fingerprint_field(&mut digest, "provider", Some(&self.provider_id));
+        update_fingerprint_field(
+            &mut digest,
+            "mode",
+            Some(if self.oidc_token_auth {
+                "oidc"
+            } else {
+                "api_key"
+            }),
+        );
+        if self.oidc_token_auth {
+            let has_stable_principal = self.principal_id.is_some()
+                || self.user_id.is_some()
+                || self.team_id.is_some()
+                || self.auth_scope.is_some();
+            if has_stable_principal {
+                update_fingerprint_field(&mut digest, "issuer", self.oidc_issuer.as_deref());
+                update_fingerprint_field(&mut digest, "client", self.oidc_client_id.as_deref());
+                update_fingerprint_field(
+                    &mut digest,
+                    "principal_type",
+                    self.principal_type.as_deref(),
+                );
+                update_fingerprint_field(&mut digest, "principal_id", self.principal_id.as_deref());
+                update_fingerprint_field(&mut digest, "user", self.user_id.as_deref());
+                update_fingerprint_field(&mut digest, "team", self.team_id.as_deref());
+                update_fingerprint_field(&mut digest, "scope", self.auth_scope.as_deref());
+            } else {
+                update_fingerprint_field(
+                    &mut digest,
+                    "legacy_secret",
+                    self.refresh_token.as_deref().or(Some(&self.bearer)),
+                );
+            }
+        } else {
+            update_fingerprint_field(&mut digest, "api_key", Some(&self.bearer));
+        }
+        format!("v1-sha256:{:x}", digest.finalize())
+    }
+}
+
+fn update_fingerprint_field(digest: &mut Sha256, label: &str, value: Option<&str>) {
+    digest.update(label.len().to_be_bytes());
+    digest.update(label.as_bytes());
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.len().to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        None => digest.update([0]),
+    }
 }
 
 /// Avoid concurrent refresh stampedes (async-friendly).
@@ -392,24 +456,60 @@ pub fn resolve_wire_credentials_for_model(
     model_selection: &str,
 ) -> Result<Option<WireCredentials>, String> {
     let selection = crate::gateway_config::parse_model_selection(model_selection)?;
-    if selection.provider_id == crate::gateway_config::XAI_PROVIDER_ID {
-        return Ok(resolve_xai_credentials());
-    }
+    let profile = crate::gateway_config::resolve_profile_for_selection(&selection, false, None)?;
+    resolve_profile_credentials(&profile, Some(&selection.model_id))
+}
 
-    resolve_provider_credentials(&selection.provider_id, Some(&selection.model_id))
+fn resolve_profile_credentials(
+    profile: &crate::gateway_config::ProviderProfile,
+    legacy_model_id: Option<&str>,
+) -> Result<Option<WireCredentials>, String> {
+    use crate::gateway_config::{ProviderDialect, ProviderKind, XAI_PROVIDER_ID};
+
+    match (profile.kind, profile.dialect) {
+        (ProviderKind::Xai, ProviderDialect::XaiChatCompletions)
+            if profile.id == XAI_PROVIDER_ID && profile.managed_by_host =>
+        {
+            Ok(resolve_xai_credentials())
+        }
+        (ProviderKind::OpenAiCompatible, ProviderDialect::OpenAiChatCompletions)
+            if !profile.managed_by_host =>
+        {
+            resolve_stored_provider_credentials(&profile.id, legacy_model_id)
+        }
+        _ => Err(
+            "xAI credentials are available only to the synthesized host-managed `xai` profile"
+                .into(),
+        ),
+    }
 }
 
 pub fn resolve_provider_credentials(
     provider_id: &str,
     legacy_model_id: Option<&str>,
 ) -> Result<Option<WireCredentials>, String> {
-    let provider_id = crate::gateway_config::normalized_profile_id(provider_id)?;
+    let provider_id = if provider_id.trim() == crate::gateway_config::XAI_PROVIDER_ID {
+        crate::gateway_config::XAI_PROVIDER_ID.to_string()
+    } else {
+        crate::gateway_config::normalized_profile_id(provider_id)?
+    };
+    let selection = crate::gateway_config::ModelSelection {
+        provider_id,
+        model_id: legacy_model_id.unwrap_or_default().to_string(),
+    };
+    let profile = crate::gateway_config::resolve_profile_for_selection(&selection, false, None)?;
+    resolve_profile_credentials(&profile, legacy_model_id)
+}
 
+fn resolve_stored_provider_credentials(
+    provider_id: &str,
+    legacy_model_id: Option<&str>,
+) -> Result<Option<WireCredentials>, String> {
     let mut config = crate::gateway_config::load_for_update()
         .map_err(|error| format!("read provider profiles: {error}"))?;
     if config.has_pending_legacy_secret() {
         let profile = config
-            .profile_mut(&provider_id)
+            .profile_mut(provider_id)
             .ok_or_else(|| format!("unknown provider profile `{provider_id}`"))?;
         if let Some(model_id) = legacy_model_id
             .filter(|model_id| !profile.models.iter().any(|model| model.id == **model_id))
@@ -425,7 +525,7 @@ pub fn resolve_provider_credentials(
         }
     }
     let profile = config
-        .profile(&provider_id)
+        .profile(provider_id)
         .cloned()
         .ok_or_else(|| format!("unknown provider profile `{provider_id}`"))?;
 
@@ -824,6 +924,58 @@ mod tests {
         }
     }
 
+    fn fingerprint_credentials(
+        bearer: &str,
+        oidc: bool,
+        user_id: Option<&str>,
+        team_id: Option<&str>,
+    ) -> WireCredentials {
+        WireCredentials {
+            provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
+            bearer: bearer.into(),
+            oidc_token_auth: oidc,
+            display_name: "test".into(),
+            method: if oidc { "oidc" } else { "api_key" }.into(),
+            user_id: user_id.map(str::to_string),
+            team_id: team_id.map(str::to_string),
+            auth_scope: Some("test-scope".into()),
+            refresh_token: Some("refresh-secret".into()),
+            oidc_issuer: Some("https://auth.x.ai".into()),
+            oidc_client_id: Some("test-client".into()),
+            principal_type: Some("user".into()),
+            principal_id: user_id.map(str::to_string),
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn qualification_fingerprint_tracks_principal_without_persisting_secrets() {
+        let api_a = fingerprint_credentials("api-secret-a", false, None, None);
+        let api_b = fingerprint_credentials("api-secret-b", false, None, None);
+        let api_a_fingerprint = api_a.qualification_identity_fingerprint();
+        assert_ne!(
+            api_a_fingerprint,
+            api_b.qualification_identity_fingerprint()
+        );
+        assert!(!api_a_fingerprint.contains("api-secret-a"));
+
+        let oidc_before =
+            fingerprint_credentials("access-before", true, Some("user-a"), Some("team-a"));
+        let oidc_after =
+            fingerprint_credentials("access-after", true, Some("user-a"), Some("team-a"));
+        let other_principal =
+            fingerprint_credentials("access-after", true, Some("user-b"), Some("team-a"));
+        assert_eq!(
+            oidc_before.qualification_identity_fingerprint(),
+            oidc_after.qualification_identity_fingerprint(),
+            "access-token rotation for one durable principal must keep its qualification"
+        );
+        assert_ne!(
+            oidc_before.qualification_identity_fingerprint(),
+            other_principal.qualification_identity_fingerprint()
+        );
+    }
+
     #[test]
     fn credentials_are_bound_to_the_selected_provider_profile() {
         let _lock = home_override_serial();
@@ -850,6 +1002,9 @@ mod tests {
         let xai = resolve_wire_credentials_for_model("grok-4.5")
             .unwrap()
             .unwrap();
+        let xai_by_profile = resolve_provider_credentials("xai", Some("grok-4.5"))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             (a.provider_id.as_str(), a.bearer.as_str()),
             ("env-grokptah", "synthetic-a")
@@ -862,6 +1017,11 @@ mod tests {
             (xai.provider_id.as_str(), xai.bearer.as_str()),
             ("xai", "synthetic-xai")
         );
+        assert_eq!(xai_by_profile.provider_id, xai.provider_id);
+        assert_eq!(xai_by_profile.bearer, xai.bearer);
+        assert_eq!(xai_by_profile.oidc_token_auth, xai.oidc_token_auth);
+        assert_eq!(xai_by_profile.method, xai.method);
+        assert_eq!(xai_by_profile.display_name, xai.display_name);
 
         let mismatch = crate::host_helpers::resolve_model_target(
             &a,
