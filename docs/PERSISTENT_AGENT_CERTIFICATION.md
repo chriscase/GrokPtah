@@ -190,6 +190,12 @@ field is omitted and the scenario records metadata-only evidence.
 
 Evidence mode never changes provider behavior or Agent authority.
 
+The existing live parity runner accepts `--observation-out <path>` for a
+bounded metadata-only smoke report. The report is opt-in, capped at 512 KiB,
+and contains only the structural observations retained by the production
+provider seam; it does not retain prompts, completions, URLs, credentials,
+source paths, or arbitrary header values.
+
 ## Bounded campaign profiles
 
 Every campaign sets all bounds explicitly. A runner must reject zero,

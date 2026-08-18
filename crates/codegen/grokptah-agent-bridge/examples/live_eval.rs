@@ -5,11 +5,16 @@
 //! GROKPTAH_LIVE_EVAL=1 cargo run --example live_eval -- \
 //!   --tasks ../../../evals/tasks.json \
 //!   --fixtures ../../../evals/fixtures \
-//!   --out /tmp/ptah-eval.json
+//!   --out /tmp/ptah-eval.json \
+//!   --observation-out /tmp/ptah-provider-observations.json
 //! ```
 //!
 //! Does **not** set `GROKPTAH_AGENT_OFFLINE` — requires real credentials
 //! (`XAI_API_KEY` or `~/.grok/auth.json`).
+//!
+//! `--observation-out` is opt-in and writes only bounded metadata about
+//! physical provider attempts. It never writes prompts, completions, URLs,
+//! credentials, source paths, or arbitrary headers.
 
 use std::collections::HashSet;
 use std::fs;
@@ -22,11 +27,15 @@ use grokptah_agent_bridge::eval_report::{
     diff_workspace, path_is_within_workspace, report_path, snapshot_workspace, summarize_handoff,
     HandoffEvidence, WorkspaceChangeSummary,
 };
+use grokptah_agent_bridge::provider_observation::{
+    EvidenceMode, InMemoryObservationRecorder, OpaqueScopeId, ProviderObservationSession,
+};
 use grokptah_agent_bridge::{
     set_grokptah_home_override, AgentHost, HostConfig, SessionUpdate, ToolCallStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 struct Task {
@@ -115,6 +124,16 @@ struct RunSummary {
     safety_findings: u32,
 }
 
+const MAX_OBSERVATION_REPORT_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Serialize)]
+struct ObservationReport {
+    schema: &'static str,
+    evidence_mode: EvidenceMode,
+    observations: Vec<grokptah_agent_bridge::provider_observation::ProviderObservation>,
+    dropped_observations: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if std::env::var_os("GROKPTAH_LIVE_EVAL").is_none() {
@@ -130,12 +149,18 @@ async fn main() -> Result<()> {
     let mut fixtures_root = PathBuf::from("../../../evals/fixtures");
     let mut out_path = PathBuf::from("live_eval_ptah.json");
     let mut model = String::from("grok-build");
+    let mut observation_out = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--tasks" => tasks_path = PathBuf::from(args.next().context("--tasks value")?),
             "--fixtures" => fixtures_root = PathBuf::from(args.next().context("--fixtures value")?),
             "--out" => out_path = PathBuf::from(args.next().context("--out value")?),
             "--model" => model = args.next().context("--model value")?,
+            "--observation-out" => {
+                observation_out = Some(PathBuf::from(
+                    args.next().context("--observation-out value")?,
+                ))
+            }
             other => bail!("unknown arg: {other}"),
         }
     }
@@ -151,9 +176,19 @@ async fn main() -> Result<()> {
     set_grokptah_home_override(Some(home));
 
     let started_at = chrono::Utc::now().to_rfc3339();
+    let observation_recorder = observation_out.as_ref().map(|_| {
+        InMemoryObservationRecorder::new(4_096).expect("bounded observation recorder capacity")
+    });
+    let observation_session = observation_recorder.as_ref().map(|_| {
+        ProviderObservationSession::new(
+            EvidenceMode::MetadataOnly,
+            OpaqueScopeId::new(&Uuid::new_v4().to_string()).expect("UUID is an opaque scope id"),
+            observation_recorder.as_ref().unwrap().observer(),
+        )
+    });
     let mut results = Vec::new();
     for task in &tasks {
-        let r = run_one(task, &fixtures_root, &model).await;
+        let r = run_one(task, &fixtures_root, &model, observation_session.clone()).await;
         results.push(r);
     }
 
@@ -180,11 +215,32 @@ async fn main() -> Result<()> {
     };
     let json = serde_json::to_string_pretty(&report)?;
     fs::write(&out_path, &json)?;
+    if let (Some(path), Some(recorder)) = (observation_out, observation_recorder) {
+        let observation_report = ObservationReport {
+            schema: "grokptah.provider_observations.v1",
+            evidence_mode: EvidenceMode::MetadataOnly,
+            observations: recorder.snapshot(),
+            dropped_observations: recorder.dropped_count(),
+        };
+        let observation_json = serde_json::to_vec_pretty(&observation_report)?;
+        if observation_json.len() > MAX_OBSERVATION_REPORT_BYTES {
+            bail!(
+                "provider observation report exceeds {} bytes",
+                MAX_OBSERVATION_REPORT_BYTES
+            );
+        }
+        fs::write(path, observation_json)?;
+    }
     println!("{json}");
     Ok(())
 }
 
-async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
+async fn run_one(
+    task: &Task,
+    fixtures_root: &Path,
+    model: &str,
+    provider_observation: Option<ProviderObservationSession>,
+) -> TaskResult {
     let t0 = Instant::now();
     let fixture_src = fixtures_root.join(&task.fixture);
     let work = match tempfile::tempdir() {
@@ -203,6 +259,7 @@ async fn run_one(task: &Task, fixtures_root: &Path, model: &str) -> TaskResult {
 
     let host = AgentHost::create(HostConfig {
         always_approve: true,
+        provider_observation,
         // Align host loop budget with task max_turns so the model sees real scarcity
         // (CLI --max-turns) instead of the default 24-step ceiling (#187/#188).
         max_agent_rounds: Some(task.max_turns.max(1)),
