@@ -64,9 +64,37 @@ export type PersistentAgentState =
   | "failed"
   | "completed";
 
+export type RuntimeTarget = "local_desktop" | "local_service" | "hosted_service";
+export type RuntimeConnectionState =
+  | "connected"
+  | "reconnecting"
+  | "disconnected"
+  | "error";
+
+/** User-facing Lane projection; `id === session_id` during migration. */
+export interface LaneSummary {
+  id: string;
+  session_id: string;
+  agent_id?: string | null;
+  title: string;
+  cwd: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+  archived?: boolean;
+  archived_at?: string | null;
+  kind?: SessionKind;
+  execution_mode?: RunExecutionMode;
+  workspace_status?: WorkspaceStatus;
+  runtime_target?: RuntimeTarget;
+  runtime_connection?: RuntimeConnectionState;
+}
+
 export interface PersistentAgent {
   agentId: string;
   sessionId: string;
+  /** All durable Lanes attached to this Agent; old records expose the primary Lane. */
+  laneIds?: string[];
   workspace: string;
   model: string;
   state: PersistentAgentState;
@@ -101,6 +129,9 @@ export interface PersistentAgentResumePlan {
 export interface RemoteServiceStatus {
   connected: boolean;
   baseUrl?: string | null;
+  runtimeTarget?: RuntimeTarget | null;
+  connectionState?: RuntimeConnectionState;
+  lastError?: string | null;
 }
 
 export interface RemoteSessionTarget {
@@ -109,6 +140,8 @@ export interface RemoteSessionTarget {
   workspace: string;
   updatedAt: string;
   busy: boolean;
+  runtimeTarget?: RuntimeTarget;
+  runtimeConnection?: RuntimeConnectionState;
 }
 
 export interface RemoteTaskSubmission {
@@ -194,6 +227,8 @@ export interface DurableRunEventPage {
 export interface DurableRun {
   runId: string;
   sessionId: string;
+  /** Compatibility projection; old payloads derive this from sessionId. */
+  laneId?: string | null;
   workspace: string;
   requestId: string;
   clientId?: string | null;
@@ -421,10 +456,13 @@ export interface SearchHit {
 export interface WorkspaceUiState {
   project_cwd?: string | null;
   active_session?: string | null;
+  /** Explicit Lane context; equal to active_session during compatibility projection. */
+  active_lane_id?: string | null;
   open_tab_ids: string[];
   model: string;
   effort: string;
   sessions: SessionSummary[];
+  lanes?: LaneSummary[];
 }
 
 /** Attention badge for tabs/sidebar when this session isn't focused. */

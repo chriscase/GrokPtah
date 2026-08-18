@@ -15,6 +15,7 @@ import {
   type TranscriptItem,
   type DurableRun,
   type DurableRunEvent,
+  type LaneSummary,
   type RemoteSessionTarget,
   type RunOrigin,
   type WorkspaceStatus,
@@ -67,7 +68,9 @@ import {
 import { subscribeRemoteRunEvents } from "./lib/remoteRunEvents";
 import {
   executionTargetValue,
+  mergeLaneProjections,
   parseExecutionTargetValue,
+  projectRemoteSessionAsLane,
   remoteSubmissionMessage,
 } from "./lib/remoteExecution";
 import { displaySessionTitle } from "./lib/sessionTitle";
@@ -98,6 +101,30 @@ type WorkspaceMode = "build" | "chat";
 
 function titleCaseComputerState(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function runtimeConnectionLabel(value: LaneSummary["runtime_connection"]): string {
+  switch (value) {
+    case "reconnecting":
+      return "Reconnecting";
+    case "disconnected":
+      return "Disconnected";
+    case "error":
+      return "Unavailable";
+    default:
+      return "Connected";
+  }
+}
+
+function runtimeTargetLabel(value: LaneSummary["runtime_target"]): string {
+  switch (value) {
+    case "local_service":
+      return "Local service";
+    case "hosted_service":
+      return "Hosted service";
+    default:
+      return "Local desktop";
+  }
 }
 
 type RightTab =
@@ -263,9 +290,17 @@ export default function App() {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [auth, setAuth] = useState<AuthState>({ signed_in: false });
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [lanes, setLanes] = useState<LaneSummary[]>([]);
   /** Open concurrent workspaces (tabs). Multiple can be busy at once. */
   const [tabs, setTabs] = useState<SessionTab[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  /**
+   * Explicit product context. During the compatibility projection a Lane id
+   * equals its backing session id, so the existing session-oriented bridge
+   * calls can continue to use the local alias below.
+   */
+  const [activeLaneId, setActiveLaneId] = useState<string | null>(null);
+  const activeSessionId = activeLaneId;
+  const setActiveSessionId = setActiveLaneId;
   const [models, setModels] = useState<ModelInfo[]>([]);
   const {
     composer,
@@ -328,6 +363,7 @@ export default function App() {
   const [persistentAgentsError, setPersistentAgentsError] = useState<string | null>(null);
   const [remoteServiceStatus, setRemoteServiceStatus] = useState<import("./lib/protocol").RemoteServiceStatus>({
     connected: false,
+    connectionState: "disconnected",
   });
   const [remoteSessions, setRemoteSessions] = useState<RemoteSessionTarget[]>([]);
   const [remoteTargetSessionId, setRemoteTargetSessionId] = useState<string | null>(null);
@@ -441,6 +477,18 @@ export default function App() {
       setRuns([]);
       setRunsSessionId(scopeKey);
       setRunsError(`Could not refresh durable runs: ${String(error)}`);
+      if (remote) {
+        const message = String(error);
+        setRemoteServiceStatus((current) => ({
+          ...current,
+          connected: false,
+          connectionState: "error",
+          lastError: message,
+        }));
+        setRemoteSessions((current) =>
+          current.map((session) => ({ ...session, runtimeConnection: "error" })),
+        );
+      }
       console.warn("durable run refresh failed", error);
     } finally {
       if (runsRefreshInFlight.current?.request !== request) return;
@@ -465,14 +513,23 @@ export default function App() {
     try {
       setRemoteServiceStatus(await api.remoteServiceStatus());
     } catch {
-      setRemoteServiceStatus({ connected: false });
+      setRemoteServiceStatus({
+        connected: false,
+        connectionState: "error",
+        lastError: "Remote service status is unavailable",
+      });
     }
   }, []);
 
   const refreshRemoteSessions = useCallback(async () => {
     if (!remoteServiceStatus.connected) {
-      setRemoteSessions([]);
-      setRemoteTargetSessionId(null);
+      setRemoteSessions((current) =>
+        current.map((session) => ({
+          ...session,
+          runtimeConnection:
+            remoteServiceStatus.connectionState ?? "disconnected",
+        })),
+      );
       return;
     }
     try {
@@ -484,9 +541,18 @@ export default function App() {
           : sessions[0]?.sessionId ?? null,
       );
     } catch (error) {
-      setPersistentAgentsError(`Could not refresh remote sessions: ${String(error)}`);
+      const message = String(error);
+      setRemoteServiceStatus((current) => ({
+        ...current,
+        connected: false,
+        connectionState: "error",
+        lastError: message,
+      }));
+      setRemoteSessions((current) =>
+        current.map((session) => ({ ...session, runtimeConnection: "error" })),
+      );
     }
-  }, [remoteServiceStatus.connected]);
+  }, [remoteServiceStatus.connected, remoteServiceStatus.connectionState]);
 
   useEffect(() => {
     void refreshRemoteServiceStatus();
@@ -517,23 +583,47 @@ export default function App() {
 
   const connectRemoteService = useCallback(
     async (baseUrl: string, token: string) => {
-      const status = await api.remoteServiceConnect(baseUrl, token);
-      setRemoteServiceStatus(status);
-      setRemoteRunEvents({});
-      setRemoteRunRecoveryErrors({});
-      const sessions = await api.remoteServiceSessionList();
-      setRemoteSessions(sessions);
-      setRemoteTargetSessionId(sessions[0]?.sessionId ?? null);
-      await refreshPersistentAgents();
+      try {
+        const status = await api.remoteServiceConnect(baseUrl, token);
+        setRemoteServiceStatus(status);
+        setRemoteRunEvents({});
+        setRemoteRunRecoveryErrors({});
+        const sessions = await api.remoteServiceSessionList();
+        setRemoteSessions(sessions);
+        setRemoteTargetSessionId(sessions[0]?.sessionId ?? null);
+        await refreshPersistentAgents();
+      } catch (error) {
+        const failedStatus = await api.remoteServiceStatus().catch(() => ({
+          connected: false,
+          connectionState: "error" as const,
+          lastError: String(error),
+        }));
+        setRemoteServiceStatus({
+          ...failedStatus,
+          connected: false,
+          connectionState: failedStatus.connectionState ?? "error",
+          lastError: failedStatus.lastError ?? String(error),
+        });
+        setRemoteSessions((current) =>
+          current.map((session) => ({ ...session, runtimeConnection: "error" })),
+        );
+        throw error;
+      }
     },
     [refreshPersistentAgents],
   );
 
   const disconnectRemoteService = useCallback(async () => {
     await api.remoteServiceDisconnect();
-    setRemoteServiceStatus({ connected: false });
-    setRemoteSessions([]);
-    setRemoteTargetSessionId(null);
+    setRemoteServiceStatus((current) => ({
+      ...current,
+      connected: false,
+      connectionState: "disconnected",
+      lastError: null,
+    }));
+    setRemoteSessions((current) =>
+      current.map((session) => ({ ...session, runtimeConnection: "disconnected" })),
+    );
     setExecutionTarget("local");
     setRemoteRunEvents({});
     setRemoteRunRecoveryErrors({});
@@ -686,6 +776,37 @@ export default function App() {
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
     [sessions, activeSessionId],
   );
+  const remoteAgentByLane = useMemo(() => {
+    const byLane = new Map<string, string>();
+    for (const agent of persistentAgents) {
+      const laneIds = agent.laneIds?.length ? agent.laneIds : [agent.sessionId];
+      for (const laneId of laneIds) byLane.set(laneId, agent.agentId);
+    }
+    return byLane;
+  }, [persistentAgents]);
+  const remoteLanes = useMemo(
+    () =>
+      remoteSessions.map((session) =>
+        projectRemoteSessionAsLane(
+          session,
+          remoteServiceStatus,
+          remoteAgentByLane.get(session.sessionId),
+        ),
+      ),
+    [remoteAgentByLane, remoteSessions, remoteServiceStatus],
+  );
+  const visibleLanes = useMemo(
+    () => mergeLaneProjections(lanes, remoteLanes),
+    [lanes, remoteLanes],
+  );
+  const selectedRemoteLane = useMemo(
+    () => remoteLanes.find((lane) => lane.id === remoteTargetSessionId) ?? null,
+    [remoteLanes, remoteTargetSessionId],
+  );
+  const activeContextAgentId =
+    executionTarget === "remote" && selectedRemoteLane
+      ? selectedRemoteLane.agent_id
+      : activeSummary?.agent_id;
   const effortOptions = useMemo(
     () => effortOptionsForModel(models, status?.model),
     [models, status?.model],
@@ -833,7 +954,22 @@ export default function App() {
   }, []);
 
   const focusSession = useCallback((id: string) => {
-    setActiveSessionId(id);
+    setActiveLaneId(id);
+    // Make the bridge's project/tool scope follow the selected Lane as well
+    // as the visible tab. This prevents Git, MCP, files, and Terminal from
+    // silently describing the previously loaded Lane when multiple lanes are
+    // open.
+    void api.sessionLoad(id).then((loaded) => {
+      setSessions((current) =>
+        current.map((session) => (session.id === loaded.id ? loaded : session)),
+      );
+      if (loaded.cwd && loaded.workspace_status === "ready") {
+        projectCwdHintRef.current = loaded.cwd;
+      }
+    }).catch(() => {
+      // The tab remains selectable; its existing activity/error surface is
+      // the recovery path for a failed scope promotion.
+    });
   }, []);
 
   const hideLiveRail = useCallback(() => {
@@ -844,6 +980,7 @@ export default function App() {
   const refreshSessions = useCallback(async () => {
     try {
       setSessions(await api.sessionListByKind(workspaceMode, false));
+      setLanes(await api.laneList(true));
     } catch {
       /* bridge down */
     }
@@ -1049,6 +1186,7 @@ export default function App() {
         const ws = await api.workspaceState();
         if (cancelled) return;
         setSessions(ws.sessions);
+        setLanes(ws.lanes ?? []);
         const byId = new Map(ws.sessions.map((s) => [s.id, s]));
         // Drop tabs for sessions that no longer exist on disk (test garbage, deletes).
         let tabIds = (ws.open_tab_ids ?? []).filter((id) => byId.has(id));
@@ -1061,13 +1199,15 @@ export default function App() {
         // Persist the prune so a deleted/missing session doesn't keep reappearing.
         if (
           tabIds.length !== (ws.open_tab_ids ?? []).length ||
-          (ws.active_session && !byId.has(ws.active_session))
+          ((ws.active_lane_id ?? ws.active_session) &&
+            !byId.has(ws.active_lane_id ?? ws.active_session ?? ""))
         ) {
           try {
             await api.setOpenTabs(
               tabIds,
-              ws.active_session && byId.has(ws.active_session)
-                ? ws.active_session
+              (ws.active_lane_id ?? ws.active_session) &&
+              byId.has(ws.active_lane_id ?? ws.active_session ?? "")
+                ? (ws.active_lane_id ?? ws.active_session)
                 : (tabIds[0] ?? null),
             );
           } catch {
@@ -1080,8 +1220,9 @@ export default function App() {
           await openTab(summary, true);
         }
         const active =
-          (ws.active_session && byId.has(ws.active_session)
-            ? ws.active_session
+          ((ws.active_lane_id ?? ws.active_session) &&
+          byId.has(ws.active_lane_id ?? ws.active_session ?? "")
+            ? (ws.active_lane_id ?? ws.active_session)
             : null) ??
           tabIds[0] ??
           null;
@@ -2609,7 +2750,7 @@ export default function App() {
         }`}
       >
         {tabs.length > 0 && (
-          <div className="session-tabs" role="tablist" aria-label="Open sessions">
+          <div className="session-tabs" role="tablist" aria-label="Open Lanes">
             {tabs.map((t) => (
               <div
                 key={t.id}
@@ -2767,6 +2908,31 @@ export default function App() {
           </div>
         )}
 
+        {activeSessionId && (
+          <div className="lane-context-bar" role="status" aria-label="Current Lane context">
+            <div className="lane-context-primary">
+              <span className="lane-context-label">Lane</span>
+              <strong>{activeSummary?.title ?? activeTab?.title ?? "Current work"}</strong>
+            </div>
+            <span className="lane-context-badge">
+              {activeContextAgentId ? `Agent ${activeContextAgentId}` : "Ad hoc Agent"}
+            </span>
+            <span className="lane-context-badge">
+              {executionTarget === "remote" && selectedRemoteLane
+                ? `${runtimeTargetLabel(selectedRemoteLane.runtime_target)} · ${runtimeConnectionLabel(selectedRemoteLane.runtime_connection)}`
+                : "Local desktop · Connected"}
+            </span>
+            {executionTarget === "remote" && selectedRemoteLane && (
+              <span className="lane-context-badge" title={selectedRemoteLane.cwd}>
+                Run Lane: {selectedRemoteLane.title || selectedRemoteLane.cwd}
+              </span>
+            )}
+            {activeSummary?.archived && (
+              <span className="lane-context-badge warning">Archived</span>
+            )}
+          </div>
+        )}
+
         <div
           ref={stageRef}
           className={`pane-row zones-${Math.max(1, docks.length)} ${
@@ -2918,8 +3084,8 @@ export default function App() {
               <div className="terminal-slot-bar">
                 <span className="terminal-slot-title">
                   {toolShell?.command
-                    ? `Tool shell · ${toolShell.command.slice(0, 48)}${toolShell.command.length > 48 ? "…" : ""}`
-                    : "Terminal"}
+                    ? `Lane Terminal · ${toolShell.command.slice(0, 48)}${toolShell.command.length > 48 ? "…" : ""}`
+                    : `Lane Terminal · ${activeTab?.title ?? "Current Lane"}`}
                 </span>
                 <button
                   type="button"
@@ -2958,7 +3124,7 @@ export default function App() {
             className={`composer-shell ${busy ? "is-busy" : ""} ${composerExpanded ? "is-expanded" : ""}`}
           >
             {activeTab && (
-              <div className="composer-target" title="Composer sends to this session">
+              <div className="composer-target" title="Composer sends to this Lane">
                 <span className="composer-target-label">→</span>
                 <span className={`kind-chip ${kindForTab(activeTab, sessions, workspaceMode)}`}>
                   {kindForTab(activeTab, sessions, workspaceMode)}
@@ -3359,6 +3525,11 @@ export default function App() {
             ▸
           </button>
           <span className="panel-chrome-title">Tools</span>
+          {activeSessionId && (
+            <span className="panel-context-scope" title="All tool panels are scoped to the selected Lane">
+              Lane: {activeSummary?.title ?? activeTab?.title ?? "Current work"}
+            </span>
+          )}
         </div>
         <div className="tabs">
           {(
@@ -3667,7 +3838,8 @@ export default function App() {
         {rightTab === "agents" && (
             <PersistentAgentPanel
               agents={persistentAgents}
-              activeSessionId={activeSessionId}
+              lanes={visibleLanes}
+              activeLaneId={activeLaneId}
               busy={persistentAgentsBusy}
               error={persistentAgentsError}
               remoteStatus={remoteServiceStatus}
@@ -3690,27 +3862,33 @@ export default function App() {
         {rightTab === "tasks" && (
           <>
             <RunInspector
+              laneTitle={
+                executionTarget === "remote" && selectedRemoteLane
+                  ? `${activeSummary?.title ?? activeTab?.title ?? "Current work"} · Run Lane ${selectedRemoteLane.title || selectedRemoteLane.cwd}`
+                  : activeSummary?.title ?? activeTab?.title ?? null
+              }
+              runtimeLabel={
+                executionTarget === "remote" && selectedRemoteLane
+                  ? `${runtimeTargetLabel(selectedRemoteLane.runtime_target)} · ${runtimeConnectionLabel(selectedRemoteLane.runtime_connection)}`
+                  : "Local desktop · Connected"
+              }
               runs={
-                remoteServiceStatus.connected
-                  ? runsSessionId === "__remote__"
-                    ? runs
-                    : []
+                runsSessionId === "__remote__"
+                  ? runs
                   : runsSessionId === activeSessionId
                     ? runs
                     : []
               }
               error={
-                remoteServiceStatus.connected
-                  ? runsSessionId === "__remote__"
-                    ? Object.values(remoteRunRecoveryErrors)[0] ?? runsError
-                    : null
+                runsSessionId === "__remote__"
+                  ? Object.values(remoteRunRecoveryErrors)[0] ?? runsError
                   : runsSessionId === activeSessionId
                     ? runsError
                     : null
               }
               busy={runsBusy}
               watching={runsWatching}
-              remote={remoteServiceStatus.connected}
+              remote={runsSessionId === "__remote__" || remoteServiceStatus.connected}
               liveEvents={remoteServiceStatus.connected ? remoteRunEvents : undefined}
               onWatchingChange={setRunsWatching}
               onRefresh={() => void refreshRuns()}

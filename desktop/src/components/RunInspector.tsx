@@ -6,9 +6,12 @@ import type {
   RunReview,
   SessionUpdate,
 } from "../lib/protocol";
+import { StateCard } from "./StateCard";
 
 type RunInspectorProps = {
   runs: DurableRun[];
+  laneTitle?: string | null;
+  runtimeLabel?: string | null;
   error?: string | null;
   busy?: boolean;
   remote?: boolean;
@@ -121,6 +124,8 @@ function eventLabel(update: SessionUpdate): string {
 
 export function RunInspector({
   runs,
+  laneTitle = null,
+  runtimeLabel = null,
   error,
   busy,
   remote = false,
@@ -325,6 +330,11 @@ export function RunInspector({
           <p className="run-inspector-subtitle">
             Durable progress and verification from desktop and MCP activity.
           </p>
+          {laneTitle && (
+            <div className="panel-context-scope">
+              Lane: {laneTitle}{runtimeLabel ? ` · ${runtimeLabel}` : ""}
+            </div>
+          )}
         </div>
         <button
           type="button"
@@ -365,28 +375,35 @@ export function RunInspector({
         </label>
       </div>
 
-      {error && (
-        <div className="run-error run-inspector-refresh-error" role="alert">
-          <span>{error}</span>
-          <button
-            type="button"
-            className="composer-chip quiet"
-            onClick={onRefresh}
-            disabled={busy}
-          >
-            Retry refresh
-          </button>
-        </div>
-      )}
-
-      {runs.length === 0 ? (
-        <div className="panel-block run-inspector-empty">
-          No durable Build runs for this session yet.
-        </div>
+      {error ? (
+        <StateCard
+          variant="error"
+          title={remote ? "Remote task history is unavailable" : "Task history could not be refreshed"}
+          description={
+            remote
+              ? "The service-owned Lane is still identified, but its durable Runs could not be read. Retry when the service is available."
+              : "Your durable Run history is unchanged. Retry the refresh, or open the technical details if support needs the diagnostic."
+          }
+          actionLabel="Retry refresh"
+          onAction={onRefresh}
+          technicalDetail={error}
+        />
+      ) : runs.length === 0 ? (
+        <StateCard
+          variant="empty"
+          title="No durable Build runs yet"
+          description={
+            remote
+              ? "Submit work to the selected service-owned Lane to see its queued and completed Runs here."
+              : "Submit a Build prompt to see its queued, running, and completed Runs here."
+          }
+        />
       ) : visibleRuns.length === 0 ? (
-        <div className="panel-block run-inspector-empty">
-          No runs match this source filter.
-        </div>
+        <StateCard
+          variant="empty"
+          title="No Runs match this filter"
+          description="Choose another Run source or clear the filter to see the available history."
+        />
       ) : (
         <div className="run-list">
           {visibleRuns.map((run) => {

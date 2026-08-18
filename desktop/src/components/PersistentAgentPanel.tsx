@@ -2,13 +2,16 @@ import { useEffect, useMemo, useState } from "react";
 import type {
   PersistentAgent,
   PersistentAgentResumePlan,
+  LaneSummary,
   RemoteSessionTarget,
   RemoteServiceStatus,
 } from "../lib/protocol";
+import { StateCard } from "./StateCard";
 
 export type PersistentAgentPanelProps = {
   agents: PersistentAgent[];
-  activeSessionId: string | null;
+  lanes?: LaneSummary[];
+  activeLaneId: string | null;
   busy?: boolean;
   error?: string | null;
   onRefresh: () => void;
@@ -45,7 +48,8 @@ function canResume(agent: PersistentAgent): boolean {
 
 export function PersistentAgentPanel({
   agents,
-  activeSessionId,
+  lanes = [],
+  activeLaneId,
   busy = false,
   error,
   onRefresh,
@@ -173,8 +177,10 @@ export function PersistentAgentPanel({
           <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
             <div style={{ fontSize: 11, color: "var(--muted)" }}>
               {remoteStatus.connected
-                ? `Remote service connected${remoteStatus.baseUrl ? ` · ${remoteStatus.baseUrl}` : ""}`
-                : "Local service mode"}
+                ? `${remoteStatus.runtimeTarget === "local_service" ? "Local" : "Hosted"} service connected${remoteStatus.baseUrl ? ` · ${remoteStatus.baseUrl}` : ""}`
+                : remoteStatus.connectionState === "error"
+                  ? "Remote service unavailable · cached Lanes are marked unavailable"
+                  : "No remote service connected"}
             </div>
             {remoteStatus.connected ? (
               <button type="button" onClick={() => void disconnectRemote()} disabled={remoteBusy}>
@@ -275,21 +281,29 @@ export function PersistentAgentPanel({
         )}
       </div>
 
-      {error && (
-        <div className="panel-block" role="alert">
-          {error}
-        </div>
-      )}
-      {!busy && sortedAgents.length === 0 && (
-        <div className="panel-block" style={{ color: "var(--muted)" }}>
-          No persistent agents yet. Complete a Build turn to create one.
-        </div>
-      )}
+      {error ? (
+        <StateCard
+          variant="error"
+          title="Persistent Agents could not be refreshed"
+          description="Your saved Agent identities are unchanged. Try again, or open the technical details if support needs the diagnostic."
+          actionLabel="Refresh"
+          onAction={onRefresh}
+          technicalDetail={error}
+        />
+      ) : !busy && sortedAgents.length === 0 ? (
+        <StateCard
+          variant="empty"
+          title="No durable Agents yet"
+          description="Complete a Build turn to create an identity that can own Lanes and resume from verified checkpoints."
+        />
+      ) : null}
 
       {sortedAgents.map((agent) => {
         const plan = plans[agent.agentId];
         const isSelected = selectedAgentId === agent.agentId;
-        const isCurrent = activeSessionId === agent.sessionId;
+        const laneIds = agent.laneIds?.length ? agent.laneIds : [agent.sessionId];
+        const isCurrent = Boolean(activeLaneId && laneIds.includes(activeLaneId));
+        const ownedLanes = lanes.filter((lane) => lane.agent_id === agent.agentId);
         const resumeAllowed = canResume(agent) && Boolean(agent.latestCheckpointId);
         return (
           <article
@@ -302,11 +316,20 @@ export function PersistentAgentPanel({
               <span className={`agent-state ${agent.state}`}>{stateLabel(agent.state)}</span>
             </div>
             <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 4 }}>
-              {agent.model} · continuation {agent.continuationOrdinal} · updated {timeLabel(agent.updatedAt)}
+              {agent.model} · {laneIds.length} {laneIds.length === 1 ? "Lane" : "Lanes"} · continuation {agent.continuationOrdinal} · updated {timeLabel(agent.updatedAt)}
             </div>
             <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 3, wordBreak: "break-word" }}>
               {agent.workspace}
             </div>
+            {ownedLanes.length > 0 && (
+              <div
+                aria-label={`Lanes owned by ${agent.agentId}`}
+                style={{ color: "var(--muted)", fontSize: 11, marginTop: 4 }}
+              >
+                Lanes: {ownedLanes.slice(0, 3).map((lane) => lane.title).join(" · ")}
+                {ownedLanes.length > 3 ? ` · +${ownedLanes.length - 3} more` : ""}
+              </div>
+            )}
             <div className="worktree-create-actions" style={{ marginTop: 7 }}>
               {!isCurrent && !remoteStatus.connected && (
                 <button type="button" onClick={() => onOpenSession(agent)}>

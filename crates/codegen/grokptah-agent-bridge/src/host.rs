@@ -37,6 +37,7 @@ use crate::host_helpers::{
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
     IdenticalToolCallRun, McpToolIndex,
 };
+use crate::lane::LaneSummary;
 use crate::local_tools;
 use crate::orchestration::{
     apply_run_aggregate, prompt_preview, AgentRecord, AgentResumePlan, AgentState,
@@ -61,15 +62,23 @@ use crate::types::{
     SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
 };
 
-/// UI restore payload: open tabs + active session + project (sessions live in list).
+/// UI restore payload: open tabs + active Lane + project.
+///
+/// `active_session` and `sessions` remain in the payload for older desktop
+/// clients. During the compatibility migration, each Lane id equals its
+/// backing session id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceUiState {
     pub project_cwd: Option<String>,
     pub active_session: Option<Uuid>,
+    #[serde(default)]
+    pub active_lane_id: Option<Uuid>,
     pub open_tab_ids: Vec<Uuid>,
     pub model: String,
     pub effort: EffortLevel,
     pub sessions: Vec<SessionSummary>,
+    #[serde(default)]
+    pub lanes: Vec<LaneSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -923,6 +932,7 @@ impl AgentHostHandle {
             None => AgentRecord {
                 agent_id: agent_id.clone(),
                 session_id,
+                lane_ids: vec![session_id],
                 workspace: workspace.clone(),
                 model: model.clone(),
                 state: AgentState::Waiting,
@@ -933,6 +943,11 @@ impl AgentHostHandle {
                 updated_at: now,
             },
         };
+        if !agent.lane_ids.contains(&session_id) {
+            agent.lane_ids.push(session_id);
+            agent.updated_at = now;
+            store.save_agent(&agent)?;
+        }
         if agent.model != model {
             agent.model = model;
             agent.updated_at = now;
@@ -957,8 +972,65 @@ impl AgentHostHandle {
         Ok(agent)
     }
 
+    /// Attach an existing Build session to a durable Agent identity.
+    ///
+    /// This is the first explicit many-Lanes bridge: the legacy
+    /// `AgentRecord.session_id` remains the primary resume session, while
+    /// `lane_ids` records every attached Lane. A Lane keeps its own workspace
+    /// and transcript; attaching it never rewrites the Agent's legacy primary
+    /// workspace or silently resumes a Run.
+    pub fn attach_session_to_agent(&self, session_id: Uuid, agent_id: &str) -> Result<AgentRecord> {
+        let (kind, session) = {
+            let g = self.inner.lock();
+            let session = g
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            (session.kind, session.clone())
+        };
+        if kind != SessionKind::Build {
+            bail!("persistent agents are available only for Build sessions");
+        }
+        let store = self.ensure_orchestration_store()?;
+        let mut agent = store
+            .load_agent(agent_id)?
+            .ok_or_else(|| anyhow!("unknown persistent agent: {agent_id}"))?;
+        if !agent.lane_ids.contains(&session_id) {
+            agent.lane_ids.push(session_id);
+            agent.updated_at = Utc::now();
+            store.save_agent(&agent)?;
+        }
+        if session.agent_id.as_deref() != Some(agent_id) {
+            let updated = {
+                let mut g = self.inner.lock();
+                let current = g
+                    .sessions
+                    .get_mut(&session_id)
+                    .ok_or_else(|| anyhow!("unknown session"))?;
+                current.agent_id = Some(agent_id.to_string());
+                current.clone()
+            };
+            session_store::save_session_meta(&updated).context("persist Lane Agent binding")?;
+        }
+        Ok(agent)
+    }
+
     pub fn list_persistent_agents(&self) -> Result<Vec<AgentRecord>> {
         self.ensure_orchestration_store()?.list_agents()
+    }
+
+    /// List the product-facing Lane projection, including archived Lanes when
+    /// requested. The backing session records remain the source of truth.
+    pub fn list_lanes(&self, include_archived: bool) -> Vec<LaneSummary> {
+        let g = self.inner.lock();
+        let mut lanes: Vec<_> = g
+            .sessions
+            .values()
+            .filter(|session| include_archived || !session.archived)
+            .map(|session| LaneSummary::from(&session.summary()))
+            .collect();
+        lanes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        lanes
     }
 
     pub fn get_persistent_agent(&self, agent_id: &str) -> Result<Option<AgentRecord>> {
@@ -1719,13 +1791,20 @@ impl AgentHostHandle {
             .map(|s| s.summary())
             .collect();
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        // Lanes are the archive-aware product projection; the legacy
+        // `sessions` list remains active-only for restore compatibility.
+        let mut all_sessions: Vec<_> = g.sessions.values().map(|s| s.summary()).collect();
+        all_sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let lanes = all_sessions.iter().map(LaneSummary::from).collect();
         WorkspaceUiState {
             project_cwd: g.project_cwd.as_ref().map(|p| p.display().to_string()),
             active_session: g.active_session,
+            active_lane_id: g.active_session,
             open_tab_ids: g.open_tab_ids.clone(),
             model: g.model.clone(),
             effort: g.effort,
             sessions,
+            lanes,
         }
     }
 
@@ -9304,5 +9383,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(changed.contains("idempotency") || changed.contains("payload"));
+    }
+
+    #[test]
+    fn one_agent_can_own_multiple_lanes_while_archive_preserves_the_binding() {
+        let (_home, host, primary_lane_id) = test_host();
+        let secondary = host
+            .session_new_kind(SessionKind::Build)
+            .expect("create second Lane");
+        let agent = host
+            .ensure_session_agent(primary_lane_id)
+            .expect("create durable Agent");
+
+        let attached = host
+            .attach_session_to_agent(secondary.id, &agent.agent_id)
+            .expect("attach second Lane");
+        assert_eq!(attached.known_lane_ids().len(), 2);
+        assert!(attached.known_lane_ids().contains(&primary_lane_id));
+        assert!(attached.known_lane_ids().contains(&secondary.id));
+
+        let workspace = host.workspace_ui_state();
+        assert_eq!(workspace.active_lane_id, Some(secondary.id));
+        assert_eq!(workspace.lanes.len(), 2);
+        assert!(workspace
+            .lanes
+            .iter()
+            .all(|lane| lane.agent_id.as_deref() == Some(agent.agent_id.as_str())));
+        assert_eq!(host.list_lanes(false).len(), 2);
+
+        host.session_archive(secondary.id, true)
+            .expect("archive secondary Lane");
+        assert_eq!(host.list_lanes(false).len(), 1);
+        assert_eq!(host.list_lanes(true).len(), 2);
+        let archived_workspace = host.workspace_ui_state();
+        let archived_lane = archived_workspace
+            .lanes
+            .iter()
+            .find(|lane| lane.id == secondary.id)
+            .expect("archived Lane remains in the archive-aware projection");
+        assert!(archived_lane.archived);
+        let archived = host
+            .list_all_sessions()
+            .into_iter()
+            .find(|session| session.id == secondary.id)
+            .expect("archived Lane remains durable");
+        assert!(archived.archived);
+        assert_eq!(archived.agent_id.as_deref(), Some(agent.agent_id.as_str()));
     }
 }

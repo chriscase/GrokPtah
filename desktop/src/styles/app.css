@@ -535,6 +535,7 @@ button:disabled {
 
 .main > .session-tabs,
 .main > .session-cwd-bar,
+.main > .lane-context-bar,
 .main > .terminal-slot,
 .main > .activity-strip,
 .main > .composer-wrap,
@@ -741,6 +742,141 @@ button:disabled {
 .session-cwd-btn:hover .session-cwd-change {
   opacity: 1;
   color: var(--accent);
+}
+
+/* Product-facing context bridge: make the selected Lane and its owner/runtime
+ * visible without changing the existing session-backed navigation yet. */
+.lane-context-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  padding: 0.24rem 0.65rem;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-panel);
+  color: var(--muted);
+  font-size: 11px;
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+
+.lane-context-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  color: var(--text);
+}
+
+.lane-context-primary strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.lane-context-label {
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.lane-context-badge {
+  flex-shrink: 0;
+  padding: 0.12rem 0.38rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.lane-context-badge.warning {
+  color: var(--warning, #f6c453);
+  border-color: color-mix(in srgb, var(--warning, #f6c453) 45%, transparent);
+}
+
+.panel-context-scope {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.state-card {
+  display: flex;
+  gap: 0.55rem;
+  margin: 0.5rem 0;
+  padding: 0.65rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  color: var(--muted);
+}
+
+.state-card-mark {
+  display: grid;
+  place-items: center;
+  flex: 0 0 1.35rem;
+  width: 1.35rem;
+  height: 1.35rem;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.state-card-body {
+  min-width: 0;
+}
+
+.state-card-body strong {
+  display: block;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.state-card-body p {
+  margin: 0.25rem 0 0.5rem;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.state-card-error {
+  border-color: color-mix(in srgb, var(--danger, #e85d5d) 45%, var(--border-soft));
+}
+
+.state-card-error .state-card-mark {
+  color: var(--danger, #e85d5d);
+}
+
+.state-card-archived .state-card-mark,
+.state-card-stale .state-card-mark {
+  color: var(--warning, #e0ad4f);
+}
+
+.state-card-details {
+  margin: 0.35rem 0 0.5rem;
+  font-size: 10px;
+}
+
+.state-card-details summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.state-card-details pre {
+  max-height: 100px;
+  margin: 0.35rem 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 10px;
 }
 
 /* ── Multi-session tabs (Claude Code–style concurrent workspaces) ── */
@@ -4144,6 +4280,7 @@ button:disabled {
 }
 
 .main.computer-open > .session-cwd-bar,
+.main.computer-open > .lane-context-bar,
 .main.computer-open > .pane-row,
 .main.computer-open > .fleet-strip,
 .main.computer-open > .terminal-peek,

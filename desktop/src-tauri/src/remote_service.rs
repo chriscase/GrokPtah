@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::{
     AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RunExecutionMode, RunRecord,
-    RunScope, RunState, SessionUpdate,
+    RunScope, RunState, RuntimeConnectionState, RuntimeTarget, SessionUpdate,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -18,6 +18,9 @@ use uuid::Uuid;
 pub struct RemoteServiceStatus {
     pub connected: bool,
     pub base_url: Option<String>,
+    pub runtime_target: Option<RuntimeTarget>,
+    pub connection_state: RuntimeConnectionState,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +31,10 @@ pub struct RemoteSessionTarget {
     pub workspace: String,
     pub updated_at: String,
     pub busy: bool,
+    #[serde(default)]
+    pub runtime_target: RuntimeTarget,
+    #[serde(default)]
+    pub runtime_connection: RuntimeConnectionState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +66,8 @@ impl From<RemoteSessionWire> for RemoteSessionTarget {
             workspace: session.cwd,
             updated_at: session.updated_at,
             busy: session.busy,
+            runtime_target: RuntimeTarget::LocalService,
+            runtime_connection: RuntimeConnectionState::Connected,
         }
     }
 }
@@ -105,6 +114,7 @@ impl From<RemoteRunScope> for RunScope {
 pub struct RemoteServiceState {
     client: Mutex<Option<RemoteServiceClient>>,
     watchers: Mutex<std::collections::HashMap<String, watch::Sender<bool>>>,
+    status: Mutex<RemoteServiceStatus>,
 }
 
 impl RemoteServiceState {
@@ -112,25 +122,54 @@ impl RemoteServiceState {
         Arc::new(Self {
             client: Mutex::new(None),
             watchers: Mutex::new(std::collections::HashMap::new()),
+            status: Mutex::new(RemoteServiceStatus {
+                connected: false,
+                base_url: None,
+                runtime_target: None,
+                connection_state: RuntimeConnectionState::Disconnected,
+                last_error: None,
+            }),
         })
     }
 
     pub async fn status(&self) -> RemoteServiceStatus {
-        let client = self.client.lock().await;
-        RemoteServiceStatus {
-            connected: client.is_some(),
-            base_url: client.as_ref().map(|client| client.base_url.clone()),
-        }
+        self.status.lock().await.clone()
     }
 
     pub async fn connect(&self, base_url: String, token: String) -> Result<RemoteServiceStatus> {
-        let client = RemoteServiceClient::connect(base_url, token).await?;
+        let base_url_hint = normalize_base_url(&base_url).ok();
+        {
+            let mut status = self.status.lock().await;
+            status.connected = false;
+            status.base_url = base_url_hint.clone();
+            status.runtime_target = base_url_hint.as_deref().map(runtime_target_for_base_url);
+            status.connection_state = RuntimeConnectionState::Reconnecting;
+            status.last_error = None;
+        }
+        let client = match RemoteServiceClient::connect(base_url, token).await {
+            Ok(client) => client,
+            Err(error) => {
+                self.client.lock().await.take();
+                let mut status = self.status.lock().await;
+                status.connected = false;
+                status.connection_state = RuntimeConnectionState::Error;
+                status.last_error = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        let base_url = client.base_url.clone();
+        let runtime_target = runtime_target_for_base_url(&base_url);
         let mut current = self.client.lock().await;
         *current = Some(client);
-        Ok(RemoteServiceStatus {
+        let mut status = self.status.lock().await;
+        *status = RemoteServiceStatus {
             connected: true,
-            base_url: current.as_ref().map(|client| client.base_url.clone()),
-        })
+            base_url: Some(base_url),
+            runtime_target: Some(runtime_target),
+            connection_state: RuntimeConnectionState::Connected,
+            last_error: None,
+        };
+        Ok(status.clone())
     }
 
     pub async fn disconnect(&self) {
@@ -139,22 +178,36 @@ impl RemoteServiceState {
             let _ = cancel.send(true);
         }
         self.client.lock().await.take();
+        let mut status = self.status.lock().await;
+        status.connected = false;
+        status.connection_state = RuntimeConnectionState::Disconnected;
+        status.last_error = None;
     }
 
     pub async fn list_persistent_agents(&self) -> Result<Option<Vec<AgentRecord>>> {
         let mut client = self.client.lock().await;
-        let Some(client) = client.as_mut() else {
-            return Ok(None);
+        let result = {
+            let Some(client) = client.as_mut() else {
+                return Ok(None);
+            };
+            client.list_persistent_agents().await
         };
-        Ok(Some(client.list_persistent_agents().await?))
+        drop(client);
+        self.record_remote_result(&result).await;
+        Ok(Some(result?))
     }
 
     pub async fn list_sessions(&self) -> Result<Option<Vec<RemoteSessionTarget>>> {
         let mut client = self.client.lock().await;
-        let Some(client) = client.as_mut() else {
-            return Ok(None);
+        let result = {
+            let Some(client) = client.as_mut() else {
+                return Ok(None);
+            };
+            client.list_sessions().await
         };
-        Ok(Some(client.list_sessions().await?))
+        drop(client);
+        self.record_remote_result(&result).await;
+        Ok(Some(result?))
     }
 
     pub async fn create_session(
@@ -163,10 +216,15 @@ impl RemoteServiceState {
         title: Option<String>,
     ) -> Result<Option<RemoteSessionTarget>> {
         let mut client = self.client.lock().await;
-        let Some(client) = client.as_mut() else {
-            return Ok(None);
+        let result = {
+            let Some(client) = client.as_mut() else {
+                return Ok(None);
+            };
+            client.create_session(workspace, title).await
         };
-        Ok(Some(client.create_session(workspace, title).await?))
+        drop(client);
+        self.record_remote_result(&result).await;
+        Ok(Some(result?))
     }
 
     pub async fn submit_task(
@@ -326,6 +384,25 @@ impl RemoteServiceState {
         }
         Ok(())
     }
+
+    async fn record_remote_result<T>(&self, result: &Result<T>) {
+        let mut status = self.status.lock().await;
+        match result {
+            Ok(_) => {
+                if status.connection_state != RuntimeConnectionState::Disconnected {
+                    status.connected = true;
+                    status.connection_state = RuntimeConnectionState::Connected;
+                    status.last_error = None;
+                }
+            }
+            Err(error) if should_reconnect_remote_error(error) => {
+                status.connected = false;
+                status.connection_state = RuntimeConnectionState::Error;
+                status.last_error = Some(error.to_string());
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 struct RemoteServiceClient {
@@ -427,7 +504,16 @@ impl RemoteServiceClient {
                 .ok_or_else(|| anyhow::anyhow!("remote session list omitted sessions"))?,
         )
         .context("decode remote session list")?;
-        Ok(sessions.into_iter().map(Into::into).collect())
+        let runtime_target = runtime_target_for_base_url(&self.base_url);
+        Ok(sessions
+            .into_iter()
+            .map(|session| {
+                let mut target = RemoteSessionTarget::from(session);
+                target.runtime_target = runtime_target;
+                target.runtime_connection = RuntimeConnectionState::Connected;
+                target
+            })
+            .collect())
     }
 
     async fn create_session(
@@ -440,7 +526,11 @@ impl RemoteServiceClient {
             args["title"] = json!(title);
         }
         let value = self.call_tool("ptah_create_session", args).await?;
-        serde_json::from_value(value).context("decode remote session creation")
+        let mut session: RemoteSessionTarget =
+            serde_json::from_value(value).context("decode remote session creation")?;
+        session.runtime_target = runtime_target_for_base_url(&self.base_url);
+        session.runtime_connection = RuntimeConnectionState::Connected;
+        Ok(session)
     }
 
     async fn submit_task(
@@ -903,6 +993,20 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+fn runtime_target_for_base_url(base_url: &str) -> RuntimeTarget {
+    Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(is_loopback_host))
+        .map(|loopback| {
+            if loopback {
+                RuntimeTarget::LocalService
+            } else {
+                RuntimeTarget::HostedService
+            }
+        })
+        .unwrap_or(RuntimeTarget::HostedService)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -910,11 +1014,15 @@ mod tests {
     use grokptah_agent_bridge::{
         home_override_serial, set_grokptah_home_override, start_control_server,
         start_control_server_with_bind, AgentHost, ControlServerLimits, HostConfig, OrchStore,
-        OrchestrationConfig, OrchestrationService, RunBounds, RunExecutionMode, WorkspaceAllowlist,
+        OrchestrationConfig, OrchestrationService, RunBounds, RunExecutionMode,
+        RuntimeConnectionState, RuntimeTarget, WorkspaceAllowlist,
     };
     use tempfile::tempdir;
 
-    use super::{normalize_base_url, should_reconnect_remote_error, RemoteServiceClient};
+    use super::{
+        normalize_base_url, runtime_target_for_base_url, should_reconnect_remote_error,
+        RemoteServiceClient, RemoteServiceState,
+    };
 
     #[test]
     fn local_http_is_allowed_but_remote_http_and_embedded_credentials_are_not() {
@@ -947,6 +1055,31 @@ mod tests {
         assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
             "MCP error: invalid request"
         )));
+    }
+
+    #[test]
+    fn service_url_projects_local_and_hosted_runtime_ownership() {
+        assert_eq!(
+            runtime_target_for_base_url("http://127.0.0.1:39200"),
+            RuntimeTarget::LocalService
+        );
+        assert_eq!(
+            runtime_target_for_base_url("https://grokptah.example/mcp"),
+            RuntimeTarget::HostedService
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_connect_is_exposed_as_error_without_claiming_connected() {
+        let state = RemoteServiceState::new();
+        assert!(state
+            .connect("http://127.0.0.1:1".into(), "test-token".into())
+            .await
+            .is_err());
+        let status = state.status().await;
+        assert!(!status.connected);
+        assert_eq!(status.connection_state, RuntimeConnectionState::Error);
+        assert!(status.last_error.is_some());
     }
 
     #[tokio::test]

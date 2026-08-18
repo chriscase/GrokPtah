@@ -375,6 +375,17 @@ pub struct RunRecord {
     pub approval: Option<RunApproval>,
 }
 
+impl RunRecord {
+    /// Product Lane identity during the session-to-Lane compatibility period.
+    ///
+    /// Keeping this as a derived accessor avoids changing durable Run records
+    /// or existing MCP payloads while making the Agent → Lane → Run relation
+    /// explicit to new callers.
+    pub fn lane_id(&self) -> Uuid {
+        self.session_id
+    }
+}
+
 pub const MAX_AGENT_CONTEXT_BYTES: usize = 16 * 1024;
 pub const MAX_AGENT_WORKSPACE_BYTES: usize = 4 * 1024;
 pub const MAX_AGENT_MODEL_BYTES: usize = 256;
@@ -409,7 +420,12 @@ pub enum ContinuationReason {
 #[serde(rename_all = "camelCase")]
 pub struct AgentRecord {
     pub agent_id: String,
+    /// Legacy primary session retained for resume and wire compatibility.
     pub session_id: Uuid,
+    /// All Lanes owned by this durable identity. Old records deserialize with
+    /// an empty list and are normalized to include `session_id` on access.
+    #[serde(default)]
+    pub lane_ids: Vec<Uuid>,
     pub workspace: String,
     pub model: String,
     pub state: AgentState,
@@ -424,6 +440,15 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
+    /// Return the compatibility-complete Lane set without mutating storage.
+    pub fn known_lane_ids(&self) -> Vec<Uuid> {
+        let mut ids = self.lane_ids.clone();
+        if !ids.contains(&self.session_id) {
+            ids.insert(0, self.session_id);
+        }
+        ids
+    }
+
     pub fn validate(&self) -> Result<(), OrchError> {
         validate_id(&self.agent_id, "agent_id")?;
         validate_workspace(&self.workspace)?;
@@ -890,11 +915,54 @@ mod tests {
     }
 
     #[test]
+    fn legacy_agent_records_project_the_primary_session_as_a_lane() {
+        let session_id = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "agentId": "agent-legacy",
+            "sessionId": session_id,
+            "workspace": "/tmp/project",
+            "model": "grok",
+            "state": "waiting",
+            "currentRunId": null,
+            "latestCheckpointId": null,
+            "continuationOrdinal": 0,
+            "createdAt": Utc::now(),
+            "updatedAt": Utc::now()
+        });
+        let agent: AgentRecord = serde_json::from_value(legacy).unwrap();
+        assert!(agent.lane_ids.is_empty());
+        assert_eq!(agent.known_lane_ids(), vec![session_id]);
+    }
+
+    #[test]
+    fn legacy_run_records_project_the_session_as_the_lane_id() {
+        let session_id = Uuid::new_v4();
+        let run: RunRecord = serde_json::from_value(serde_json::json!({
+            "runId": "run-legacy",
+            "sessionId": session_id,
+            "workspace": "/tmp/project",
+            "requestId": "request-1",
+            "state": "queued",
+            "bounds": {
+                "maxPromptBytes": 1000,
+                "maxRounds": 2,
+                "maxDurationMs": 1000
+            },
+            "promptPreview": "inspect",
+            "createdAt": Utc::now(),
+            "updatedAt": Utc::now()
+        }))
+        .unwrap();
+        assert_eq!(run.lane_id(), session_id);
+    }
+
+    #[test]
     fn resume_plan_rejects_workspace_or_active_agent_mismatch() {
         let session_id = Uuid::new_v4();
         let mut agent = AgentRecord {
             agent_id: "agent-1".into(),
             session_id,
+            lane_ids: vec![session_id],
             workspace: "/tmp/project".into(),
             model: "grok".into(),
             state: AgentState::Waiting,
@@ -939,6 +1007,7 @@ mod tests {
         let agent = AgentRecord {
             agent_id: "agent-adapter".into(),
             session_id,
+            lane_ids: vec![session_id],
             workspace: "/tmp/project".into(),
             model: "grok".into(),
             state: AgentState::Interrupted,

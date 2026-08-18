@@ -1080,6 +1080,7 @@ mod tests {
             .save_agent(&AgentRecord {
                 agent_id: agent_id.into(),
                 session_id,
+                lane_ids: vec![session_id],
                 workspace: "/tmp/w".into(),
                 model: "grok".into(),
                 state: AgentState::Active,
@@ -1120,6 +1121,7 @@ mod tests {
             .save_agent(&AgentRecord {
                 agent_id: agent_id.into(),
                 session_id,
+                lane_ids: vec![session_id],
                 workspace: "/tmp/w".into(),
                 model: "grok".into(),
                 state: AgentState::Active,
