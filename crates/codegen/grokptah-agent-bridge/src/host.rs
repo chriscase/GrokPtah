@@ -24,15 +24,16 @@ use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
-    auto_cargo_reverify_command, build_agent_messages, build_compact_summary, call_xai_agent_step,
-    call_xai_chat, cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
-    cargo_test_reverify_coaching, coding_agent_tools, count_cargo_test_failures, emit_message,
-    emit_thought, filter_tools_batch_edit_only, filter_tools_edit_and_shell,
-    filter_tools_edit_only, is_incomplete_stop_message, is_round_limit_stop_message,
-    is_true_noop_tool_step, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
-    offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
-    push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
-    resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
+    call_xai_agent_step_observed, call_xai_chat, cargo_test_failure_coaching,
+    cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
+    coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
+    filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
+    is_incomplete_stop_message, is_round_limit_stop_message, is_true_noop_tool_step,
+    multi_failure_partial_edit_coaching, normalize_sandbox_profile, offline_plan_steps,
+    parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model, push_assistant,
+    push_thought, push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
+    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
     IdenticalToolCallRun, McpToolIndex,
@@ -54,6 +55,7 @@ use crate::prompt_queue::{
     PromptQueueSnapshot, PromptQueueTakeResult, SessionPromptQueue, SteeringDisposition,
     SteeringReceipt,
 };
+use crate::provider_observation::{ProviderObservationContext, ProviderObservationSession};
 use crate::run_promotion::{self, RunReview};
 use crate::search_engine::{self, SearchHit, SearchQuery};
 use crate::session::{
@@ -92,6 +94,9 @@ pub struct HostConfig {
     pub always_approve: bool,
     /// Cap model steps per user turn (live eval / tight budgets). None = default 24.
     pub max_agent_rounds: Option<u32>,
+    /// Optional bounded structural observation of physical provider attempts.
+    /// Disabled by default and never required for provider execution.
+    pub provider_observation: Option<ProviderObservationSession>,
 }
 
 impl Default for HostConfig {
@@ -103,6 +108,7 @@ impl Default for HostConfig {
             default_effort: EffortLevel::Medium,
             always_approve: false,
             max_agent_rounds: None,
+            provider_observation: None,
         }
     }
 }
@@ -431,6 +437,10 @@ impl RunUsageTracker {
         self.state.lock().stop.map(RunTokenStop::message)
     }
 
+    fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
     #[cfg(test)]
     fn stop_code(&self) -> Option<&'static str> {
         self.state.lock().stop.map(RunTokenStop::code)
@@ -726,6 +736,7 @@ pub struct AgentHostHandle {
     /// Explicit run-scoped accounting shared by the parent model loop and any
     /// children it spawns. A session counter is not a safe run identity.
     run_usage_trackers: Arc<Mutex<HashMap<Uuid, Arc<RunUsageTracker>>>>,
+    provider_observation: Option<ProviderObservationSession>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
 }
@@ -892,12 +903,19 @@ impl AgentHost {
             reviewed_runs: Arc::new(Mutex::new(HashSet::new())),
             orchestration_wakeup: Arc::new(Notify::new()),
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
+            provider_observation: config.provider_observation,
             _instance_lock: instance_lock,
         }
     }
 }
 
 impl AgentHostHandle {
+    fn provider_observation_context(&self, session_id: Uuid) -> Option<ProviderObservationContext> {
+        let session = self.provider_observation.as_ref()?;
+        let tracker = self.run_usage_trackers.lock().get(&session_id).cloned()?;
+        session.context(tracker.run_id(), session_id).ok()
+    }
+
     pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {
         self.event_rx_factory.lock().take()
     }
@@ -8058,7 +8076,8 @@ impl AgentHostHandle {
                     return Err(error);
                 }
             };
-            let step = match call_xai_agent_step(
+            let provider_observation = self.provider_observation_context(session_id);
+            let step = match call_xai_agent_step_observed(
                 creds,
                 model,
                 effort,
@@ -8066,6 +8085,7 @@ impl AgentHostHandle {
                 &tools_this_round,
                 !self.run_tokens_bounded(session_id),
                 cancel,
+                provider_observation.as_ref(),
                 |delta| {
                     emit_message(event_tx, session_id, delta);
                 },
@@ -9597,7 +9617,8 @@ impl AgentHostHandle {
                         break;
                     }
                 };
-            let step = call_xai_agent_step(
+            let provider_observation = self.provider_observation_context(session_id);
+            let step = call_xai_agent_step_observed(
                 &creds,
                 &model,
                 effort,
@@ -9607,6 +9628,7 @@ impl AgentHostHandle {
                     .as_ref()
                     .is_some_and(|tracker| tracker.is_bounded()),
                 &cancel,
+                provider_observation.as_ref(),
                 |_d| {},
                 |_t| {},
             )

@@ -11,6 +11,8 @@ use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
+use std::time::Instant;
+use uuid::Uuid;
 
 pub const MAX_ATTEMPT_NUMBER: u32 = 1_000_000;
 pub const MAX_OBSERVED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -165,6 +167,7 @@ pub enum ObservationError {
     InconsistentProviderRoute,
     InconsistentResponseMetadata,
     RecorderCapacityExceeded,
+    AttemptBudgetExceeded,
 }
 
 impl fmt::Display for ObservationError {
@@ -183,6 +186,7 @@ impl fmt::Display for ObservationError {
             Self::InconsistentProviderRoute => "inconsistent provider route metadata",
             Self::InconsistentResponseMetadata => "inconsistent provider response metadata",
             Self::RecorderCapacityExceeded => "observation recorder capacity exceeds its bound",
+            Self::AttemptBudgetExceeded => "observation attempt budget exceeds its bound",
         })
     }
 }
@@ -443,7 +447,9 @@ impl ResponseMetadata {
         }
         let requires_status = matches!(
             disposition,
-            AttemptDisposition::Completed | AttemptDisposition::HttpError
+            AttemptDisposition::Completed
+                | AttemptDisposition::HttpError
+                | AttemptDisposition::ProtocolError
         );
         if requires_status != status_code.is_some()
             || matches!(content_class, Some(ResponseContentClass::EventStream))
@@ -647,6 +653,143 @@ impl ProviderObserver {
 impl fmt::Debug for ProviderObserver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ProviderObserver([sink])")
+    }
+}
+
+/// Opt-in campaign-wide allocator for physical provider attempts. The
+/// session owns only opaque scope IDs and a sink; it has no access to request
+/// payloads, credentials, URLs, or host paths.
+#[derive(Clone)]
+pub struct ProviderObservationSession {
+    mode: EvidenceMode,
+    campaign_id: OpaqueScopeId,
+    observer: ProviderObserver,
+    next_attempt: Arc<AtomicU64>,
+}
+
+impl ProviderObservationSession {
+    pub fn new(mode: EvidenceMode, campaign_id: OpaqueScopeId, observer: ProviderObserver) -> Self {
+        Self {
+            mode,
+            campaign_id,
+            observer,
+            next_attempt: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub const fn mode(&self) -> EvidenceMode {
+        self.mode
+    }
+
+    pub fn context(
+        &self,
+        run_id: &str,
+        lane_id: Uuid,
+    ) -> Result<ProviderObservationContext, ObservationError> {
+        Ok(ProviderObservationContext {
+            mode: self.mode,
+            observer: self.observer.clone(),
+            scope: ObservationScope::new(
+                self.campaign_id.clone(),
+                OpaqueScopeId::new(run_id)?,
+                OpaqueScopeId::new(&lane_id.to_string())?,
+            ),
+            next_attempt: self.next_attempt.clone(),
+        })
+    }
+}
+
+impl fmt::Debug for ProviderObservationSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderObservationSession")
+            .field("mode", &self.mode)
+            .field("campaign_id", &"[opaque]")
+            .finish()
+    }
+}
+
+/// A run/lane-scoped view over an observation session.
+#[derive(Clone)]
+pub struct ProviderObservationContext {
+    mode: EvidenceMode,
+    observer: ProviderObserver,
+    scope: ObservationScope,
+    next_attempt: Arc<AtomicU64>,
+}
+
+impl fmt::Debug for ProviderObservationContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderObservationContext")
+            .field("mode", &self.mode)
+            .field("scope", &"[opaque]")
+            .finish()
+    }
+}
+
+impl ProviderObservationContext {
+    pub fn begin_attempt(&self) -> Result<ProviderObservationAttempt, ObservationError> {
+        let attempt_number = loop {
+            let current = self.next_attempt.load(Ordering::Relaxed);
+            if current >= MAX_ATTEMPT_NUMBER as u64 {
+                return Err(ObservationError::AttemptBudgetExceeded);
+            }
+            if self
+                .next_attempt
+                .compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break (current + 1) as u32;
+            }
+        };
+        Ok(ProviderObservationAttempt {
+            mode: self.mode,
+            observer: self.observer.clone(),
+            scope: self.scope.clone(),
+            attempt_number,
+            started_at: Instant::now(),
+        })
+    }
+}
+
+/// One physical HTTP attempt. The caller supplies validated structural
+/// metadata; this type supplies the shared scope, attempt number, and bounded
+/// elapsed time.
+pub struct ProviderObservationAttempt {
+    mode: EvidenceMode,
+    observer: ProviderObserver,
+    scope: ObservationScope,
+    attempt_number: u32,
+    started_at: Instant,
+}
+
+impl ProviderObservationAttempt {
+    pub const fn attempt_number(&self) -> u32 {
+        self.attempt_number
+    }
+
+    pub fn scope(&self) -> &ObservationScope {
+        &self.scope
+    }
+
+    pub const fn evidence_mode(&self) -> EvidenceMode {
+        self.mode
+    }
+
+    pub fn elapsed_millis(&self) -> u64 {
+        self.started_at
+            .elapsed()
+            .as_millis()
+            .min(MAX_LATENCY_MILLIS as u128) as u64
+    }
+
+    pub fn notify(&self, observation: ProviderObservation) -> DeliveryDisposition {
+        if observation.attempt_number() != self.attempt_number || observation.scope() != &self.scope
+        {
+            return DeliveryDisposition::Dropped;
+        }
+        self.observer.notify(observation)
     }
 }
 
