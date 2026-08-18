@@ -10502,6 +10502,36 @@ mod tests {
         }
     }
 
+    struct TestEnvOverride {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvOverride {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate process-wide host configuration hold
+            // `home_override_serial`, and CI runs this suite with one thread.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TestEnvOverride {
+        fn drop(&mut self) {
+            // SAFETY: see `TestEnvOverride::set`; this restores the exact
+            // process state observed before the scoped override.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     fn test_host() -> (TestHome, AgentHostHandle, Uuid) {
         let lock = home_override_serial();
         let tmp = tempfile::tempdir().expect("test home");
@@ -11196,11 +11226,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let error = host
-            .session_prompt(lane_id, "run sleep 5".into())
-            .await
-            .unwrap_err()
-            .to_string();
+        let offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        let outcome = host.session_prompt(lane_id, "run sleep 5".into()).await;
+        drop(offline);
+        let error = outcome.unwrap_err().to_string();
         assert!(error.contains("duration limit"));
         let runs = host.list_session_runs(lane_id).unwrap();
         assert_eq!(runs.len(), 1);
