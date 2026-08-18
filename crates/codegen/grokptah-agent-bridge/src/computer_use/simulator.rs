@@ -75,6 +75,7 @@ impl ComputerBackend for SimulatorBackend {
     async fn observe(
         &self,
         run_id: &str,
+        observation_id: &str,
         target: &ComputerTarget,
         limits: &ComputerUseLimits,
     ) -> ComputerResult<ComputerObservation> {
@@ -88,7 +89,6 @@ impl ComputerBackend for SimulatorBackend {
         let target = state.target.clone();
         let run = state.runs.entry(run_id.into()).or_default();
         run.sequence = run.sequence.saturating_add(1);
-        let observation_id = format!("sim-observation-{}", run.sequence);
         let name_id = format!("{observation_id}-name");
         let submit_id = format!("{observation_id}-submit");
         let status_id = format!("{observation_id}-status");
@@ -100,7 +100,7 @@ impl ComputerBackend for SimulatorBackend {
             scale_factor: 1.0,
         };
         let observation = ComputerObservation {
-            observation_id,
+            observation_id: observation_id.to_string(),
             sequence: run.sequence,
             target,
             captured_at: Utc::now(),
@@ -233,11 +233,21 @@ mod tests {
         let backend = SimulatorBackend::new();
         let target = SimulatorBackend::demo_target();
         let first = backend
-            .observe("run", &target, &ComputerUseLimits::default())
+            .observe(
+                "run",
+                "observation-1",
+                &target,
+                &ComputerUseLimits::default(),
+            )
             .await
             .unwrap();
         let _second = backend
-            .observe("run", &target, &ComputerUseLimits::default())
+            .observe(
+                "run",
+                "observation-2",
+                &target,
+                &ComputerUseLimits::default(),
+            )
             .await
             .unwrap();
         let error = backend
@@ -252,11 +262,21 @@ mod tests {
         let backend = SimulatorBackend::new();
         let target = SimulatorBackend::demo_target();
         let first = backend
-            .observe("run-one", &target, &ComputerUseLimits::default())
+            .observe(
+                "run-one",
+                "run-one-observation-1",
+                &target,
+                &ComputerUseLimits::default(),
+            )
             .await
             .unwrap();
         let second = backend
-            .observe("run-two", &target, &ComputerUseLimits::default())
+            .observe(
+                "run-two",
+                "run-two-observation-1",
+                &target,
+                &ComputerUseLimits::default(),
+            )
             .await
             .unwrap();
         assert_eq!(first.sequence, 1);
@@ -273,7 +293,12 @@ mod tests {
             .await
             .unwrap();
         let second_again = backend
-            .observe("run-two", &target, &ComputerUseLimits::default())
+            .observe(
+                "run-two",
+                "run-two-observation-2",
+                &target,
+                &ComputerUseLimits::default(),
+            )
             .await
             .unwrap();
         assert!(second_again.elements[0].value.is_none());

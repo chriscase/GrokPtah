@@ -469,6 +469,10 @@ pub struct AgentHostHandle {
     /// It is opened lazily so library users can still construct a host for
     /// tests that provide their own orchestration store.
     orchestration_store: Arc<Mutex<Option<OrchStore>>>,
+    /// One process-owned durable Computer Run ledger (#271). The store holds
+    /// an exclusive file lock, so the desktop cockpit and the MCP control
+    /// plane must share this handle instead of opening their own.
+    computer_store: Arc<Mutex<Option<crate::computer_use::ComputerStore>>>,
     /// Prevent concurrent desktop promotion/discard operations for one run.
     promotion_locks: Arc<Mutex<HashSet<String>>>,
     reviewed_runs: Arc<Mutex<HashSet<String>>>,
@@ -647,6 +651,7 @@ impl AgentHost {
             inner: Arc::new(Mutex::new(inner)),
             event_rx_factory: Arc::new(Mutex::new(Some(event_rx))),
             orchestration_store: Arc::new(Mutex::new(None)),
+            computer_store: Arc::new(Mutex::new(None)),
             promotion_locks: Arc::new(Mutex::new(HashSet::new())),
             reviewed_runs: Arc::new(Mutex::new(HashSet::new())),
             orchestration_wakeup: Arc::new(Notify::new()),
@@ -888,6 +893,27 @@ impl AgentHostHandle {
         let opened = OrchStore::open(crate::discover::grokptah_home().join("orchestration"))?;
         *store = Some(opened.clone());
         Ok(opened)
+    }
+
+    /// Open (or return) the single durable Computer Run ledger (#271). The
+    /// store holds an exclusive file lock, so every surface — desktop cockpit
+    /// and embedded MCP control plane alike — must share this handle; a
+    /// second open in the same process would fail on the lock.
+    pub fn ensure_computer_store(&self) -> Result<crate::computer_use::ComputerStore> {
+        let mut store = self.computer_store.lock();
+        if let Some(existing) = store.as_ref() {
+            return Ok(existing.clone());
+        }
+        let opened = crate::computer_use::ComputerStore::open(
+            crate::discover::grokptah_home().join("computer-use"),
+        )?;
+        *store = Some(opened.clone());
+        Ok(opened)
+    }
+
+    /// Return the already-open Computer Run ledger without filesystem work.
+    pub fn computer_store(&self) -> Option<crate::computer_use::ComputerStore> {
+        self.computer_store.lock().clone()
     }
 
     /// Install a store supplied by the orchestration service when the host has

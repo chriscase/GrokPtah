@@ -46,10 +46,12 @@ impl ComputerUseService {
         self.store.load_run(run_id)
     }
 
-    /// Authoritative projection of every run owned by one session, newest
-    /// first. This is the read the desktop cockpit and any coordinator surface
-    /// share; neither sees another session's runs.
-    pub fn list_run_projections(
+    /// Local-operator projection of every run owned by one session, newest
+    /// first. The desktop cockpit uses this gate, including unbound runs.
+    /// Coordinator surfaces must not call this: they take
+    /// [`super::reads::ComputerReadBinding`] on [`super::reads::ComputerRunReads`]
+    /// so workspace binding is the authorization identity.
+    pub fn list_session_run_projections(
         &self,
         owner_session_id: Uuid,
         now: DateTime<Utc>,
@@ -63,12 +65,13 @@ impl ComputerUseService {
             .collect())
     }
 
-    /// Authoritative projection of one owned run.
+    /// Local-operator projection of one session-owned run.
     ///
     /// Fails closed: an unknown run and a run owned by another session return
     /// the identical error, so a caller cannot use this to probe whether a run
-    /// id exists outside its own session.
-    pub fn project_owned_run(
+    /// id exists outside its own session. Coordinator surfaces must use
+    /// [`super::reads::ComputerRunReads`] with a [`super::reads::ComputerReadBinding`].
+    pub fn project_session_run(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -78,11 +81,12 @@ impl ComputerUseService {
             .map(|run| project_run_at(&run, now))
     }
 
-    /// One bounded page of an owned run's durable event journal.
+    /// One bounded page of a session-owned run's durable event journal.
     ///
     /// A cursor older than the retained window is reported as expired rather
-    /// than silently resuming mid-journal.
-    pub fn owned_run_events(
+    /// than silently resuming mid-journal. Coordinator surfaces must use
+    /// [`super::reads::ComputerRunReads`].
+    pub fn session_run_events(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
@@ -93,8 +97,9 @@ impl ComputerUseService {
             .map(|run| project_events(&run, after_seq, limit))
     }
 
-    /// Ledger capacity, with the per-session figures scoped to the caller.
-    pub fn capacity(&self, owner_session_id: Uuid) -> ComputerResult<ComputerRunCapacity> {
+    /// Local-operator ledger occupancy. Host-wide figures stay on this type
+    /// and must not be served after a workspace gate.
+    pub fn session_capacity(&self, owner_session_id: Uuid) -> ComputerResult<ComputerRunCapacity> {
         let runs = self.store.list_runs()?;
         let session_runs = runs
             .iter()
@@ -161,6 +166,7 @@ impl ComputerUseService {
         &self,
         request_id: &str,
         owner_session_id: Uuid,
+        workspace: Option<String>,
         target: ComputerTarget,
         limits: ComputerUseLimits,
     ) -> ComputerResult<ComputerRun> {
@@ -168,6 +174,7 @@ impl ComputerUseService {
         limits.validate()?;
         let payload = json!({
             "ownerSessionId": owner_session_id,
+            "workspace": workspace.as_deref(),
             "target": target,
             "limits": limits,
         });
@@ -176,7 +183,7 @@ impl ComputerUseService {
         }
         let result = (|| {
             self.store.can_create_run()?;
-            let mut run = ComputerRun::new(owner_session_id, target, limits)?;
+            let mut run = ComputerRun::new(owner_session_id, workspace, target, limits)?;
             run.record_audit("create_run", "accepted", None, None, None);
             self.store.save_run(&run)?;
             Ok(run)
@@ -265,16 +272,27 @@ impl ComputerUseService {
         let result = match (prepared, budget_error) {
             (Ok(_), Some(error)) => Err(error),
             (Ok(prepared), None) => {
+                // Observation identities cross the GUI/MCP projection boundary,
+                // so they are minted by the host before capture. A backend may
+                // use the ID to bind its element handles, but may not choose an
+                // identifier that could carry observed document content.
+                let observation_id = format!("observation-{}", Uuid::new_v4());
                 let observed = self
                     .backend
-                    .observe(run_id, &prepared.target, &prepared.limits)
+                    .observe(run_id, &observation_id, &prepared.target, &prepared.limits)
                     .await;
                 match observed {
                     Ok(observation) => {
-                        let validated = observation
-                            .validate(&prepared.limits)
-                            .and_then(|()| self.policy.authorize_observation_exposure(&observation))
-                            .map(|()| observation);
+                        let validated = if observation.observation_id != observation_id {
+                            Err(ComputerError::new(
+                                ComputerErrorCode::BackendFailure,
+                                "backend returned an observation identity it did not receive",
+                            ))
+                        } else {
+                            observation.validate(&prepared.limits)
+                        }
+                        .and_then(|()| self.policy.authorize_observation_exposure(&observation))
+                        .map(|()| observation);
                         match validated {
                             Ok(observation) => match self.commit_observation(run_id, observation) {
                                 Ok(observation) => Ok(observation),
@@ -827,6 +845,11 @@ mod tests {
         bytes: parking_lot::Mutex<Vec<u8>>,
     }
 
+    #[derive(Debug, Default)]
+    struct MismatchedObservationBackend {
+        inner: SimulatorBackend,
+    }
+
     impl Default for EvidenceBackend {
         fn default() -> Self {
             Self {
@@ -845,10 +868,14 @@ mod tests {
         async fn observe(
             &self,
             run_id: &str,
+            observation_id: &str,
             target: &ComputerTarget,
             limits: &ComputerUseLimits,
         ) -> ComputerResult<ComputerObservation> {
-            let mut observation = self.inner.observe(run_id, target, limits).await?;
+            let mut observation = self
+                .inner
+                .observe(run_id, observation_id, target, limits)
+                .await?;
             let bytes = self.bytes.lock();
             observation.screenshot = Some(EvidenceRef {
                 content_sha256: format!("{:x}", Sha256::digest(&*bytes)),
@@ -895,10 +922,13 @@ mod tests {
         async fn observe(
             &self,
             run_id: &str,
+            observation_id: &str,
             target: &ComputerTarget,
             limits: &ComputerUseLimits,
         ) -> ComputerResult<ComputerObservation> {
-            self.inner.observe(run_id, target, limits).await
+            self.inner
+                .observe(run_id, observation_id, target, limits)
+                .await
         }
 
         async fn act(
@@ -915,6 +945,41 @@ mod tests {
 
         async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
             self.release_action.notify_waiters();
+            self.inner.cancel(run_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for MismatchedObservationBackend {
+        fn capabilities(&self) -> ComputerCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn observe(
+            &self,
+            run_id: &str,
+            observation_id: &str,
+            target: &ComputerTarget,
+            limits: &ComputerUseLimits,
+        ) -> ComputerResult<ComputerObservation> {
+            let mut observation = self
+                .inner
+                .observe(run_id, observation_id, target, limits)
+                .await?;
+            observation.observation_id = "PRIVATE_BACKEND_OBSERVATION_ID".into();
+            Ok(observation)
+        }
+
+        async fn act(
+            &self,
+            run_id: &str,
+            observation: &ComputerObservation,
+            action: &ComputerAction,
+        ) -> ComputerResult<ActionOutcome> {
+            self.inner.act(run_id, observation, action).await
+        }
+
+        async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
             self.inner.cancel(run_id).await
         }
     }
@@ -945,12 +1010,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_cannot_replace_the_host_minted_observation_identity() {
+        let dir = tempdir().unwrap();
+        let service = ComputerUseService::new(
+            Arc::new(MismatchedObservationBackend::default()),
+            ComputerStore::open(dir.path()).unwrap(),
+        );
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-host-id",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize("grant-host-id", &run.run_id, run.version, grant(&run))
+            .unwrap();
+
+        let error = service
+            .observe("observe-host-id", &run.run_id, run.version)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::BackendFailure);
+
+        let stored = service.get_run(&run.run_id).unwrap().unwrap();
+        let projection = service
+            .project_session_run(owner, &run.run_id, Utc::now())
+            .unwrap();
+        let events = service
+            .session_run_events(owner, &run.run_id, None, 100)
+            .unwrap();
+        for encoded in [
+            serde_json::to_string(&stored).unwrap(),
+            serde_json::to_string(&projection).unwrap(),
+            serde_json::to_string(&events).unwrap(),
+        ] {
+            assert!(!encoded.contains("PRIVATE_BACKEND_OBSERVATION_ID"));
+        }
+    }
+
+    #[tokio::test]
     async fn simulator_run_is_durable_bounded_and_replay_safe() {
         let (backend, service) = service();
         let run = service
             .create_run(
                 "create-1",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 ComputerUseLimits::default(),
             )
@@ -1025,6 +1134,7 @@ mod tests {
             .create_run(
                 "create-conflict",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1074,6 +1184,7 @@ mod tests {
             .create_run(
                 "create-pause",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1105,6 +1216,7 @@ mod tests {
             .create_run(
                 "create-takeover",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1135,6 +1247,7 @@ mod tests {
             .create_run(
                 "create-takeover-fence",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1189,6 +1302,7 @@ mod tests {
             .create_run(
                 "create-denied",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1274,6 +1388,7 @@ mod tests {
             .create_run(
                 "create-evidence-limit",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 limits,
             )
@@ -1309,6 +1424,7 @@ mod tests {
             .create_run(
                 "create-evidence-read",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1356,6 +1472,7 @@ mod tests {
             .create_run(
                 "create-duration-limit",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1392,6 +1509,7 @@ mod tests {
             .create_run(
                 "create-one-use",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1441,6 +1559,7 @@ mod tests {
             .create_run(
                 "create-race",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1506,6 +1625,7 @@ mod tests {
             .create_run(
                 "create-cancel-race",
                 Uuid::new_v4(),
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1568,6 +1688,7 @@ mod tests {
             .create_run(
                 "create-scope",
                 owner,
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1575,13 +1696,13 @@ mod tests {
         let now = Utc::now();
 
         let cross_session = service
-            .project_owned_run(intruder, &run.run_id, now)
+            .project_session_run(intruder, &run.run_id, now)
             .unwrap_err();
         let unknown_run = service
-            .project_owned_run(intruder, "no-such-run", now)
+            .project_session_run(intruder, "no-such-run", now)
             .unwrap_err();
         let unknown_to_owner = service
-            .project_owned_run(owner, "no-such-run", now)
+            .project_session_run(owner, "no-such-run", now)
             .unwrap_err();
 
         assert_eq!(cross_session.code, ComputerErrorCode::Unauthorized);
@@ -1592,11 +1713,11 @@ mod tests {
 
         assert_eq!(
             service
-                .owned_run_events(intruder, &run.run_id, None, 10)
+                .session_run_events(intruder, &run.run_id, None, 10)
                 .unwrap_err(),
             cross_session
         );
-        assert!(service.project_owned_run(owner, &run.run_id, now).is_ok());
+        assert!(service.project_session_run(owner, &run.run_id, now).is_ok());
     }
 
     #[tokio::test]
@@ -1605,7 +1726,7 @@ mod tests {
         let owner = Uuid::new_v4();
         for probe in ["../escape", "runs/../../etc/passwd", "", "  "] {
             let error = service
-                .project_owned_run(owner, probe, Utc::now())
+                .project_session_run(owner, probe, Utc::now())
                 .unwrap_err();
             assert_eq!(
                 error.code,
@@ -1624,6 +1745,7 @@ mod tests {
             .create_run(
                 "create-mine",
                 owner,
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1632,17 +1754,20 @@ mod tests {
             .create_run(
                 "create-theirs",
                 other,
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
             .unwrap();
 
-        let listed = service.list_run_projections(owner, Utc::now()).unwrap();
+        let listed = service
+            .list_session_run_projections(owner, Utc::now())
+            .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].run_id, mine.run_id);
         assert_eq!(listed[0].owner_session_id, owner);
 
-        let capacity = service.capacity(owner).unwrap();
+        let capacity = service.session_capacity(owner).unwrap();
         assert_eq!(capacity.stored_runs, 2);
         assert_eq!(capacity.session_runs, 1);
         assert_eq!(capacity.session_active_runs, 1);
@@ -1653,18 +1778,25 @@ mod tests {
 
         // Cancelling the owner's run must not change the other session's view.
         service.cancel("cancel-mine", &mine.run_id).await.unwrap();
-        assert_eq!(service.capacity(owner).unwrap().session_active_runs, 0);
-        assert_eq!(service.capacity(other).unwrap().session_active_runs, 1);
+        assert_eq!(
+            service.session_capacity(owner).unwrap().session_active_runs,
+            0
+        );
+        assert_eq!(
+            service.session_capacity(other).unwrap().session_active_runs,
+            1
+        );
     }
 
     #[tokio::test]
-    async fn gui_and_coordinator_projections_are_byte_identical() {
+    async fn session_scoped_read_matches_direct_projection() {
         let (_backend, service) = service();
         let owner = Uuid::new_v4();
         let run = service
             .create_run(
                 "create-parity",
                 owner,
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1679,19 +1811,22 @@ mod tests {
 
         let now = Utc::now();
         // The desktop path projects the durable record it already holds; the
-        // scoped read path reloads it. Both must serialize identically.
+        // session-scoped local read reloads it. Both must serialize identically.
+        // Coordinator reads take ComputerReadBinding on ComputerRunReads.
         let gui = crate::computer_use::project_run_at(
             &service.get_run(&run.run_id).unwrap().unwrap(),
             now,
         );
-        let coordinator = service.project_owned_run(owner, &run.run_id, now).unwrap();
+        let session = service
+            .project_session_run(owner, &run.run_id, now)
+            .unwrap();
         assert_eq!(
             serde_json::to_string(&gui).unwrap(),
-            serde_json::to_string(&coordinator).unwrap()
+            serde_json::to_string(&session).unwrap()
         );
         assert_eq!(
-            coordinator,
-            service.list_run_projections(owner, now).unwrap()[0]
+            session,
+            service.list_session_run_projections(owner, now).unwrap()[0]
         );
     }
 
@@ -1703,6 +1838,7 @@ mod tests {
             .create_run(
                 "create-redaction",
                 owner,
+                None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
@@ -1720,7 +1856,7 @@ mod tests {
         );
 
         let projection = service
-            .project_owned_run(owner, &run.run_id, Utc::now())
+            .project_session_run(owner, &run.run_id, Utc::now())
             .unwrap();
         let encoded = serde_json::to_value(&projection).unwrap();
 
@@ -1783,6 +1919,18 @@ mod tests {
             projection.observation.as_ref().unwrap().element_count,
             observation.elements.len() as u32
         );
+
+        if let Some(last_outcome) = encoded
+            .get("lastOutcome")
+            .and_then(|value| value.as_object())
+        {
+            let keys: BTreeSet<&str> = last_outcome.keys().map(String::as_str).collect();
+            assert_eq!(keys, BTreeSet::from(["expectedPostconditionMet"]));
+        }
+        if let Some(last_error) = encoded.get("lastError").and_then(|value| value.as_object()) {
+            let keys: BTreeSet<&str> = last_error.keys().map(String::as_str).collect();
+            assert_eq!(keys, BTreeSet::from(["code"]));
+        }
     }
 
     #[tokio::test]
@@ -1799,6 +1947,7 @@ mod tests {
                 .create_run(
                     "create-restart",
                     owner,
+                    None,
                     SimulatorBackend::demo_target(),
                     Default::default(),
                 )
@@ -1814,7 +1963,7 @@ mod tests {
             ComputerStore::open(dir.join("computer-use")).unwrap(),
         );
         let recovered = service
-            .project_owned_run(owner, &run_id, Utc::now())
+            .project_session_run(owner, &run_id, Utc::now())
             .unwrap();
         assert_eq!(recovered.state, ComputerRunState::Interrupted);
         assert_eq!(
@@ -1829,9 +1978,15 @@ mod tests {
             "authority must not survive restart"
         );
         assert!(recovered.observation.is_none());
+        assert!(
+            recovered.last_outcome.is_none(),
+            "restart must not keep a leaky last_outcome"
+        );
 
         // Durable events survive the restart and stay replayable from the start.
-        let page = service.owned_run_events(owner, &run_id, None, 500).unwrap();
+        let page = service
+            .session_run_events(owner, &run_id, None, 500)
+            .unwrap();
         assert!(!page.cursor_expired);
         assert!(page
             .entries
@@ -1842,7 +1997,7 @@ mod tests {
 
         // Replaying from the final sequence is a valid empty tail, not a gap.
         let tail = service
-            .owned_run_events(owner, &run_id, Some(range.end_seq), 500)
+            .session_run_events(owner, &run_id, Some(range.end_seq), 500)
             .unwrap();
         assert!(tail.entries.is_empty());
         assert!(!tail.cursor_expired);

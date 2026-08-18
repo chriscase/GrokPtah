@@ -198,8 +198,10 @@ function projectionFor(runValue: ComputerRun): ComputerRunProjection {
           stale: false,
         }
       : null,
-    lastOutcome: runValue.lastOutcome ?? null,
-    lastError: runValue.lastError ?? null,
+    lastOutcome: runValue.lastOutcome
+      ? { expectedPostconditionMet: runValue.lastOutcome.expectedPostconditionMet ?? null }
+      : null,
+    lastError: runValue.lastError ? { code: runValue.lastError.code } : null,
     eventRange: runValue.audit.length
       ? {
           startSeq: runValue.audit[0].sequence,

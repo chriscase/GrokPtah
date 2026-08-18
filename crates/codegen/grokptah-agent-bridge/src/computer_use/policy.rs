@@ -281,7 +281,8 @@ mod tests {
             display_name: "Demo".into(),
             sensitivity: Sensitivity::None,
         };
-        let mut run = ComputerRun::new(Uuid::new_v4(), target.clone(), Default::default()).unwrap();
+        let mut run =
+            ComputerRun::new(Uuid::new_v4(), None, target.clone(), Default::default()).unwrap();
         let now = Utc::now();
         run.grant = Some(ActionGrant {
             grant_id: "grant-1".into(),
@@ -415,6 +416,7 @@ mod tests {
     fn grant_lifetime_cannot_exceed_run_limit() {
         let run = ComputerRun::new(
             Uuid::new_v4(),
+            None,
             ready_run().target,
             ComputerUseLimits::default(),
         )

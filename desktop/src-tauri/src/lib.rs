@@ -34,7 +34,7 @@ pub fn run() {
             host: host.clone(),
             pty: pty_host::PtyHub::new(),
             control: Mutex::new(None),
-            computer_use: computer_use::DesktopComputerUse::new(),
+            computer_use: computer_use::DesktopComputerUse::new(&host),
             remote_service: remote_service::RemoteServiceState::new(),
         })
         .setup(move |app| {

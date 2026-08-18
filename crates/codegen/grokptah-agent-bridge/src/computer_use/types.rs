@@ -616,6 +616,12 @@ impl ActionGrant {
 pub struct ComputerRun {
     pub run_id: String,
     pub owner_session_id: Uuid,
+    /// Canonical workspace path bound at creation and preserved through
+    /// restart recovery (#271). `None` on records created before the binding
+    /// existed; workspace-scoped MCP reads fail closed on `None` instead of
+    /// inferring a workspace from current process state.
+    #[serde(default)]
+    pub workspace: Option<String>,
     pub parent_run_id: Option<String>,
     pub campaign_id: Option<String>,
     pub target: ComputerTarget,
@@ -644,15 +650,18 @@ pub struct ComputerRun {
 impl ComputerRun {
     pub fn new(
         owner_session_id: Uuid,
+        workspace: Option<String>,
         target: ComputerTarget,
         limits: ComputerUseLimits,
     ) -> ComputerResult<Self> {
         target.validate()?;
         let limits = limits.validate()?;
+        validate_workspace(workspace.as_deref())?;
         let now = Utc::now();
         Ok(Self {
             run_id: Uuid::new_v4().to_string(),
             owner_session_id,
+            workspace,
             parent_run_id: None,
             campaign_id: None,
             target,
@@ -777,6 +786,7 @@ pub trait ComputerBackend: Send + Sync + std::fmt::Debug {
     async fn observe(
         &self,
         run_id: &str,
+        observation_id: &str,
         target: &ComputerTarget,
         limits: &ComputerUseLimits,
     ) -> ComputerResult<ComputerObservation>;
@@ -812,6 +822,21 @@ pub(super) fn validate_id(name: &str, value: &str) -> ComputerResult<()> {
             ComputerErrorCode::InvalidRequest,
             format!("invalid {name}"),
         ));
+    }
+    Ok(())
+}
+
+/// A durable workspace binding must be a plausible canonical path string; it
+/// is compared for exact equality, never interpreted, so only shape is
+/// validated here.
+pub(super) fn validate_workspace(workspace: Option<&str>) -> ComputerResult<()> {
+    if let Some(workspace) = workspace {
+        if workspace.trim().is_empty() || workspace.len() > 4096 || workspace.contains('\0') {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "invalid workspace binding",
+            ));
+        }
     }
     Ok(())
 }
@@ -854,7 +879,7 @@ mod tests {
 
     #[test]
     fn state_machine_never_leaves_terminal_state() {
-        let mut run = ComputerRun::new(Uuid::new_v4(), target(), Default::default()).unwrap();
+        let mut run = ComputerRun::new(Uuid::new_v4(), None, target(), Default::default()).unwrap();
         run.transition(ComputerRunState::Ready).unwrap();
         run.transition(ComputerRunState::Cancelled).unwrap();
         assert!(run.transition(ComputerRunState::Ready).is_err());

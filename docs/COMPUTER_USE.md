@@ -61,23 +61,50 @@ and geometry, plus the evidence asset token and content hash, are absent from th
 than filtered at a transport boundary, so a coordinator learns that an observation exists, how
 many elements it held, whether a screenshot was captured, and whether it is stale — never what
 it contained. Element IDs are observation-scoped capabilities and are likewise not projected.
+`lastOutcome` and `lastError` follow the same bar: they are dedicated summary types
+(`ActionOutcomeSummary` / `ComputerErrorSummary`). Backend-chosen summary text and error
+messages stay on the local `ComputerRun` record; the projection carries only
+`expectedPostconditionMet` and the closed `code` enum. Restart recovery clears
+`last_outcome` so a leaky action summary cannot survive a process restart.
 
-`project_run_at` takes an explicit instant instead of reading an ambient clock. One durable
-record therefore serializes identically on both surfaces, and staleness and duration assertions
-are deterministic under test.
+`project_run_at` takes an explicit instant instead of reading an ambient clock. Given the same
+`(record, now)`, GUI and coordinator serialize identically — including clock-derived fields
+(`progress.elapsedMillis`, `observation.stale`, `grant.expired`). Live MCP calls pass
+`Utc::now()` independently, so those three fields are **not** promised byte-identical across
+surfaces or across duplicate live calls. Durable fields (state, disposition, epoch, event
+range, last-outcome/error summaries, observation metadata other than staleness) do not depend
+on the call instant.
 
-Scoped reads on `ComputerUseService` fail closed:
+The two read gates share the projection type, not an API:
 
-| Read | Scope |
-|---|---|
-| `list_run_projections` | Runs owned by exactly one session |
-| `project_owned_run` | One owned run |
-| `owned_run_events` | Bounded event page for one owned run |
-| `capacity` | Ledger totals plus per-session counts |
+| Surface | Type | Authorization identity |
+|---|---|---|
+| Local cockpit | `ComputerUseService::{list_session_run_projections, project_session_run, session_run_events, session_capacity}` | Owning session (includes unbound runs) |
+| Coordinator / MCP | `ComputerRunReads` taking `ComputerReadBinding` | Session **and** durable workspace binding |
 
-An unknown run and a run owned by another session return the **identical** `unauthorized`
-error, so a scoped read cannot be used as a run-existence oracle. Traversal-shaped and empty
-run ids fail the same way rather than surfacing a distinct validation error.
+Session-only service methods do not accept `ComputerReadBinding`, so a coordinator
+surface cannot be wired to them. An unknown run and a run outside the caller's
+authorization identity return the **identical** `unauthorized` error, so a scoped
+read cannot be used as a run-existence oracle. Traversal-shaped and empty run ids
+fail the same way rather than surfacing a distinct validation error.
+
+### Workspace binding and the MCP read surface
+
+Every Computer Run now carries a **durable workspace binding**: the owning session's
+canonical project cwd, stamped at creation, preserved verbatim through restart recovery,
+and never rewritten. The authenticated loopback control plane exposes four read-only
+tools over this contract — `ptah_list_computer_runs`, `ptah_get_computer_run`,
+`ptah_get_computer_run_events`, and `ptah_get_computer_capacity` — each requiring the
+owning `session_id` plus the claimed allowlisted workspace, which must equal the run's
+binding exactly. A run without a binding (created before the field existed) is invisible
+to MCP: authorization fails closed rather than inferring a workspace from current process
+state. Unknown session, a mismatched allowlisted workspace, cross-session, unbound,
+unknown run, and traversal-shaped reads all collapse into the same
+`unauthorized`/`forbidden_scope` failure. The desktop and the
+control plane share one `ComputerStore` handle through `AgentHost::ensure_computer_store`
+because the ledger holds an exclusive file lock. No mutation, grant, evidence byte, or
+screenshot crosses MCP; see `docs/MCP_CONTROL_COORDINATOR.md` for the wire contract and
+the independent live smoke.
 
 ### Event cursors and gaps
 
@@ -87,8 +114,9 @@ more entries remain. A cursor pointing below the retained window is reported as 
 with an empty page: once the ring evicts entries, those sequences never return, and a gap is
 never presented as a complete stream. `afterSeq == startSeq - 1` is exact continuity, not a gap.
 
-Restart keeps events readable. Recovery marks the run `interrupted`, clears authority, and
-increments `controlEpoch`; the durable journal remains replayable from its retained start.
+Restart keeps events readable. Recovery marks the run `interrupted`, clears authority,
+clears `last_outcome`, and increments `controlEpoch`; the durable journal remains
+replayable from its retained start.
 
 ### Visible activity states
 

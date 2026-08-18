@@ -286,6 +286,7 @@ async fn computer_semantic_probe(
     let first = simulator
         .observe(
             "provider-qualification",
+            "provider-qualification-observation-1",
             &target,
             &ComputerUseLimits::default(),
         )
@@ -343,6 +344,7 @@ async fn computer_semantic_probe(
     let second = simulator
         .observe(
             "provider-qualification",
+            "provider-qualification-observation-2",
             &target,
             &ComputerUseLimits::default(),
         )
@@ -763,6 +765,7 @@ mod tests {
             })
         } else if requested_tool == Some(COMPUTER_TOOL_NAME) {
             let sequence = if has_tool_result { 2 } else { 1 };
+            let observation_id = format!("provider-qualification-observation-{sequence}");
             serde_json::json!({
                 "content": null,
                 "tool_calls": [{
@@ -771,9 +774,9 @@ mod tests {
                     "function": {
                         "name": COMPUTER_TOOL_NAME,
                         "arguments": serde_json::json!({
-                            "observation_id": format!("sim-observation-{sequence}"),
+                            "observation_id": observation_id,
                             "action": "set_value",
-                            "element_id": format!("sim-observation-{sequence}-name"),
+                            "element_id": format!("provider-qualification-observation-{sequence}-name"),
                             "text": COMPUTER_TEXT
                         }).to_string()
                     }

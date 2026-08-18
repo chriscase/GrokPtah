@@ -862,6 +862,27 @@ struct EventsArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ComputerScopeArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComputerEventsArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+    /// Omitted = read from the start of the retained journal. A present
+    /// cursor gets strict continuity semantics, including expiry.
+    #[serde(default)]
+    after_seq: Option<u64>,
+    #[serde(default = "default_computer_event_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SubmitArgs {
     request_id: String,
     session_id: Uuid,
@@ -975,6 +996,10 @@ fn empty_object() -> Value {
 
 fn default_event_limit() -> usize {
     50
+}
+
+fn default_computer_event_limit() -> usize {
+    crate::computer_use::DEFAULT_EVENT_PAGE
 }
 
 #[derive(Debug, Serialize)]
@@ -1311,6 +1336,12 @@ fn status_for(e: &OrchError) -> StatusCode {
 }
 
 fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
+    let mut data = json!({ "code": e.code.as_str() });
+    if let Some(extra) = e.data.as_ref().and_then(Value::as_object) {
+        for (key, value) in extra {
+            data[key] = value.clone();
+        }
+    }
     (
         status,
         Json(JsonRpcResp {
@@ -1320,7 +1351,7 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
             error: Some(json!({
                 "code": -32000,
                 "message": e.message,
-                "data": { "code": e.code.as_str() },
+                "data": data,
             })),
         }),
     )
@@ -1400,7 +1431,8 @@ fn tool_input_schema(name: &str) -> Value {
         | "ptah_get_changes"
         | "ptah_get_test_results"
         | "ptah_get_handoff"
-        | "ptah_review_run" => json!({
+        | "ptah_review_run"
+        | "ptah_get_computer_run" => json!({
             "type": "object",
             "required": ["session_id", "workspace", "run_id"],
             "additionalProperties": false,
@@ -1408,6 +1440,31 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "run_id": run_id
+            }
+        }),
+        "ptah_list_computer_runs" | "ptah_get_computer_capacity" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
+            }
+        }),
+        "ptah_get_computer_run_events" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "run_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id,
+                "after_seq": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Durable cursor. Omit to read from the start of the retained journal; a cursor below the retained window fails with cursor_expired and includes eventRange."
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500}
             }
         }),
         "ptah_get_events" => json!({
@@ -1743,6 +1800,37 @@ async fn dispatch_tool(
             let args: RunArgs = parse_value(args)?;
             require_nonempty(&args.run_id, "run_id")?;
             orch.review_run(auth, args.session_id, &args.workspace, &args.run_id)
+        }
+        "ptah_list_computer_runs" => {
+            let args: ComputerScopeArgs = parse_value(args)?;
+            orch.list_computer_runs_scoped(auth, args.session_id, &args.workspace)
+        }
+        "ptah_get_computer_run" => {
+            let args: RunArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            orch.get_computer_run_scoped(auth, args.session_id, &args.workspace, &args.run_id)
+        }
+        "ptah_get_computer_run_events" => {
+            let args: ComputerEventsArgs = parse_value(args)?;
+            require_nonempty(&args.run_id, "run_id")?;
+            if !(1..=500).contains(&args.limit) {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "limit must be between 1 and 500",
+                ));
+            }
+            orch.get_computer_run_events_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
+                args.after_seq,
+                args.limit,
+            )
+        }
+        "ptah_get_computer_capacity" => {
+            let args: ComputerScopeArgs = parse_value(args)?;
+            orch.get_computer_capacity_scoped(auth, args.session_id, &args.workspace)
         }
         "ptah_submit_task" => {
             let args: SubmitArgs = parse_value(args)?;
@@ -2150,6 +2238,8 @@ mod tests {
             "ptah_get_test_results",
             "ptah_get_handoff",
             "ptah_review_run",
+            "ptah_get_computer_run",
+            "ptah_get_computer_run_events",
         ] {
             let schema = tool_input_schema(name);
             let required = schema["required"]
@@ -2162,6 +2252,688 @@ mod tests {
                 );
             }
         }
+        for name in ["ptah_list_computer_runs", "ptah_get_computer_capacity"] {
+            let schema = tool_input_schema(name);
+            let required = schema["required"]
+                .as_array()
+                .expect("computer scope schema required list");
+            for key in ["session_id", "workspace"] {
+                assert!(
+                    required.iter().any(|item| item == key),
+                    "{name} missing {key}"
+                );
+            }
+        }
+    }
+
+    use crate::computer_use::{
+        canonical_workspace_string, ActionClass, ActionGrant, ComputerStore, ComputerUseService,
+        GrantIssuer, SimulatorBackend,
+    };
+
+    struct ComputerFixture {
+        srv: ControlServerHandle,
+        url: String,
+        client: reqwest::Client,
+    }
+
+    fn operator_workspace_snapshot(host: &crate::host::AgentHostHandle) -> Value {
+        json!({
+            "workspace": host.workspace_ui_state(),
+            "mcpServers": host.mcp_list(),
+            "skills": host.skills(),
+        })
+    }
+
+    async fn call_tool(
+        fixture: &ComputerFixture,
+        id: u64,
+        name: &str,
+        arguments: Value,
+    ) -> (reqwest::StatusCode, Value) {
+        let response = fixture
+            .client
+            .post(&fixture.url)
+            .header("Authorization", "Bearer computer-token")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, response.json().await.unwrap())
+    }
+
+    fn computer_orch(
+        host: &crate::host::AgentHostHandle,
+        home: &std::path::Path,
+        roots: Vec<std::path::PathBuf>,
+    ) -> Arc<OrchestrationService> {
+        OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            OrchStore::open(home.join("orch")).unwrap(),
+            OrchestrationConfig {
+                bearer_token: "computer-token".into(),
+                allowlist: WorkspaceAllowlist::new(roots),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn computer_read_tools_are_scoped_and_fail_indistinguishably() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let ws_a = tempdir().unwrap();
+        let ws_b = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        host.start().unwrap();
+        host.set_project_cwd(ws_a.path()).unwrap();
+        let session_a = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session_a.id, ws_a.path()).unwrap();
+        let session_b = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session_b.id, ws_b.path()).unwrap();
+
+        let canon_a = canonical_workspace_string(ws_a.path()).unwrap();
+        let canon_b = canonical_workspace_string(ws_b.path()).unwrap();
+        let computer = ComputerUseService::new(
+            Arc::new(SimulatorBackend::new()),
+            host.ensure_computer_store().unwrap(),
+        );
+        let run_a = computer
+            .create_run(
+                "create-a",
+                session_a.id,
+                Some(canon_a.clone()),
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        computer
+            .create_run(
+                "create-b",
+                session_b.id,
+                Some(canon_b.clone()),
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let unbound = computer
+            .create_run(
+                "create-unbound",
+                session_a.id,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+
+        let orch = computer_orch(
+            &host,
+            home.path(),
+            vec![ws_a.path().to_path_buf(), ws_b.path().to_path_buf()],
+        );
+        let srv = start_control_server(orch, 0).await.unwrap();
+        let fixture = ComputerFixture {
+            url: format!("http://{}/mcp", srv.addr),
+            srv,
+            client: reqwest::Client::new(),
+        };
+
+        // Coordinator reads inspect a Lane; they must never open it in the
+        // local operator cockpit. Keep session_b focused while exercising all
+        // four reads against session_a and pin the complete workspace chrome
+        // plus its project-derived MCP/skill discovery after every call.
+        let operator_before = operator_workspace_snapshot(&host);
+        let nullipotent_reads = [
+            (
+                "ptah_list_computer_runs",
+                json!({"session_id": session_a.id, "workspace": ws_a.path()}),
+            ),
+            (
+                "ptah_get_computer_run",
+                json!({
+                    "session_id": session_a.id,
+                    "workspace": ws_a.path(),
+                    "run_id": run_a.run_id,
+                }),
+            ),
+            (
+                "ptah_get_computer_run_events",
+                json!({
+                    "session_id": session_a.id,
+                    "workspace": ws_a.path(),
+                    "run_id": run_a.run_id,
+                }),
+            ),
+            (
+                "ptah_get_computer_capacity",
+                json!({"session_id": session_a.id, "workspace": ws_a.path()}),
+            ),
+        ];
+        for (index, (name, arguments)) in nullipotent_reads.into_iter().enumerate() {
+            let (status, _) = call_tool(&fixture, 100 + index as u64, name, arguments).await;
+            assert_eq!(status, StatusCode::OK, "{name} must remain readable");
+            assert_eq!(
+                operator_workspace_snapshot(&host),
+                operator_before,
+                "{name} must not change local operator workspace state"
+            );
+        }
+
+        // Archiving ends execution but preserves durable evidence. The same
+        // scoped reads remain available without restoring or promoting the
+        // Lane, and the operator's workspace remains untouched.
+        host.session_archive(session_a.id, true).unwrap();
+        let archived_before = operator_workspace_snapshot(&host);
+        let (status, _) = call_tool(
+            &fixture,
+            110,
+            "ptah_get_computer_run",
+            json!({
+                "session_id": session_a.id,
+                "workspace": ws_a.path(),
+                "run_id": run_a.run_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(operator_workspace_snapshot(&host), archived_before);
+        host.session_archive(session_a.id, false).unwrap();
+
+        // Discovery includes exactly the read tools, never a computer mutation.
+        let list = fixture
+            .client
+            .post(&fixture.url)
+            .header("Authorization", "Bearer computer-token")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        for name in [
+            "ptah_list_computer_runs",
+            "ptah_get_computer_run",
+            "ptah_get_computer_run_events",
+            "ptah_get_computer_capacity",
+        ] {
+            assert!(names.contains(&name), "{name} must be discoverable");
+        }
+        assert!(
+            !names.iter().any(|name| name.contains("computer")
+                && !name.contains("get")
+                && !name.contains("list")),
+            "no computer mutation may be discoverable"
+        );
+
+        // Listing is scoped to the session AND the durable workspace binding:
+        // the unbound run is invisible even to its own session.
+        let (status, body) = call_tool(
+            &fixture,
+            2,
+            "ptah_list_computer_runs",
+            json!({"session_id": session_a.id, "workspace": ws_a.path()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let runs = body["result"]["structuredContent"]["runs"]
+            .as_array()
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["runId"], run_a.run_id.as_str());
+
+        // Given the same (record, now), GUI and MCP serialize identically.
+        // This unstarted run has no clock-derived fields; see the bound-read
+        // clock test for a started record. Live MCP calls use Utc::now()
+        // independently and do not promise cross-surface identity for
+        // elapsedMillis / stale / expired.
+        let (status, body) = call_tool(
+            &fixture,
+            3,
+            "ptah_get_computer_run",
+            json!({"session_id": session_a.id, "workspace": ws_a.path(), "run_id": run_a.run_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let gui = crate::computer_use::project_run_at(
+            &computer.get_run(&run_a.run_id).unwrap().unwrap(),
+            chrono::Utc::now(),
+        );
+        assert_eq!(
+            body["result"]["structuredContent"],
+            serde_json::to_value(&gui).unwrap()
+        );
+
+        // Unknown run, another session's run, and an unbound run must produce
+        // byte-identical error responses, or the read is an existence oracle.
+        let mut error_bodies = Vec::new();
+        for run_id in ["no-such-run", "create-b-run", &unbound.run_id] {
+            let run_id = if run_id == "create-b-run" {
+                // A real run owned by session_b, probed through session_a's scope.
+                let listed = call_tool(
+                    &fixture,
+                    90,
+                    "ptah_list_computer_runs",
+                    json!({"session_id": session_b.id, "workspace": ws_b.path()}),
+                )
+                .await
+                .1;
+                listed["result"]["structuredContent"]["runs"][0]["runId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            } else {
+                run_id.to_string()
+            };
+            let (status, body) = call_tool(
+                &fixture,
+                7,
+                "ptah_get_computer_run",
+                json!({"session_id": session_a.id, "workspace": ws_a.path(), "run_id": run_id}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            error_bodies.push(body);
+        }
+        assert_eq!(error_bodies[0], error_bodies[1]);
+        assert_eq!(error_bodies[0], error_bodies[2]);
+        assert_eq!(error_bodies[0]["error"]["data"]["code"], "forbidden_scope");
+
+        // Claiming another allowlisted workspace, or an unknown session, is
+        // the same unauthorized error as an unknown run — session existence
+        // is not distinguishable from cross-scope.
+        let (status, cross_workspace) = call_tool(
+            &fixture,
+            7,
+            "ptah_get_computer_run",
+            json!({"session_id": session_a.id, "workspace": ws_b.path(), "run_id": run_a.run_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, unknown_session) = call_tool(
+            &fixture,
+            7,
+            "ptah_get_computer_run",
+            json!({"session_id": Uuid::new_v4(), "workspace": ws_a.path(), "run_id": run_a.run_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(cross_workspace, error_bodies[0]);
+        assert_eq!(unknown_session, error_bodies[0]);
+        assert_eq!(unknown_session["error"]["data"]["code"], "forbidden_scope");
+
+        // Capacity is scoped to the (session, workspace) binding. Host-wide
+        // occupancy is absent so the tool cannot count other sessions' runs.
+        let (status, body) = call_tool(
+            &fixture,
+            10,
+            "ptah_get_computer_capacity",
+            json!({"session_id": session_a.id, "workspace": ws_a.path()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let capacity = &body["result"]["structuredContent"];
+        assert_eq!(capacity["boundRuns"], 1);
+        assert_eq!(capacity["boundActiveRuns"], 1);
+        assert_eq!(capacity["maxRunRecords"], 256);
+        assert!(capacity.get("storedRuns").is_none());
+        assert!(capacity.get("activeRuns").is_none());
+        assert!(capacity.get("sessionRuns").is_none());
+
+        // Events: bounded page, exact tail, and reads are nullipotent — the
+        // same request twice returns the identical body.
+        let events_args = json!({
+            "session_id": session_a.id,
+            "workspace": ws_a.path(),
+            "run_id": run_a.run_id
+        });
+        let (status, first) = call_tool(
+            &fixture,
+            11,
+            "ptah_get_computer_run_events",
+            events_args.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page = &first["result"]["structuredContent"];
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(page["entries"][0]["operation"], "create_run");
+        assert_eq!(page["nextCursor"], Value::Null);
+        assert_eq!(page["cursorExpired"], false);
+        let (_, second) = call_tool(
+            &fixture,
+            11,
+            "ptah_get_computer_run_events",
+            events_args.clone(),
+        )
+        .await;
+        assert_eq!(first, second);
+        let end_seq = page["range"]["endSeq"].as_u64().unwrap();
+        let (status, tail) = call_tool(
+            &fixture,
+            12,
+            "ptah_get_computer_run_events",
+            json!({
+                "session_id": session_a.id,
+                "workspace": ws_a.path(),
+                "run_id": run_a.run_id,
+                "after_seq": end_seq
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(tail["result"]["structuredContent"]["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(tail["result"]["structuredContent"]["cursorExpired"], false);
+
+        // Limit bounds are validated before any read happens.
+        for bad_limit in [0, 501] {
+            let (status, _) = call_tool(
+                &fixture,
+                13,
+                "ptah_get_computer_run_events",
+                json!({
+                    "session_id": session_a.id,
+                    "workspace": ws_a.path(),
+                    "run_id": run_a.run_id,
+                    "limit": bad_limit
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        // Auth still runs before the body is interpreted for the new tools.
+        let unauthenticated = fixture
+            .client
+            .post(&fixture.url)
+            .header("Content-Type", "application/json")
+            .body("{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"ptah_list_computer_runs\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        fixture.srv.stop();
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn computer_event_cursor_below_retention_returns_410() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let ws = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        host.start().unwrap();
+        host.set_project_cwd(ws.path()).unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+
+        let canon = canonical_workspace_string(ws.path()).unwrap();
+        let store = host.ensure_computer_store().unwrap();
+        let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store.clone());
+        let run = computer
+            .create_run(
+                "create-ring",
+                session.id,
+                Some(canon),
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        // Push the bounded audit ring past its 1024-entry retention so the
+        // earliest sequences are genuinely evicted.
+        store
+            .update_run(&run.run_id, |run| {
+                for _ in 0..1100 {
+                    run.record_audit("op", "accepted", None, None, None);
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
+        let srv = start_control_server(orch, 0).await.unwrap();
+        let fixture = ComputerFixture {
+            url: format!("http://{}/mcp", srv.addr),
+            srv,
+            client: reqwest::Client::new(),
+        };
+
+        // A cursor below the retained window is a hard 410, mirroring
+        // ptah_get_events; the gap is never silently skipped. The retained
+        // window rides the error so recovery does not need a second get.
+        let (status, body) = call_tool(
+            &fixture,
+            1,
+            "ptah_get_computer_run_events",
+            json!({
+                "session_id": session.id,
+                "workspace": ws.path(),
+                "run_id": run.run_id,
+                "after_seq": 0
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["error"]["data"]["code"], "cursor_expired");
+        let start_seq = body["error"]["data"]["eventRange"]["startSeq"]
+            .as_u64()
+            .unwrap();
+        assert!(start_seq > 1, "eviction must have advanced the window");
+        let (status, body) = call_tool(
+            &fixture,
+            3,
+            "ptah_get_computer_run_events",
+            json!({
+                "session_id": session.id,
+                "workspace": ws.path(),
+                "run_id": run.run_id,
+                "after_seq": start_seq - 1,
+                "limit": 500
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page = &body["result"]["structuredContent"];
+        assert_eq!(page["cursorExpired"], false);
+        assert_eq!(page["entries"][0]["sequence"].as_u64().unwrap(), start_seq);
+        // Omitting the cursor reads from the retained start without expiry.
+        let (status, body) = call_tool(
+            &fixture,
+            4,
+            "ptah_get_computer_run_events",
+            json!({"session_id": session.id, "workspace": ws.path(), "run_id": run.run_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["structuredContent"]["cursorExpired"], false);
+
+        fixture.srv.stop();
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn computer_reads_project_interrupted_after_store_restart() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let ws = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        host.start().unwrap();
+        host.set_project_cwd(ws.path()).unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+        let canon = canonical_workspace_string(ws.path()).unwrap();
+
+        // First lifetime: a live authorized run, then every store handle is
+        // dropped, modeling a process exit. The host's lazy slot is untouched
+        // so its later ensure re-opens the ledger and runs recovery.
+        let run_id;
+        {
+            let store =
+                ComputerStore::open(crate::discover::grokptah_home().join("computer-use")).unwrap();
+            let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store);
+            let run = computer
+                .create_run(
+                    "create-restart",
+                    session.id,
+                    Some(canon.clone()),
+                    SimulatorBackend::demo_target(),
+                    Default::default(),
+                )
+                .unwrap();
+            run_id = run.run_id.clone();
+            let now = chrono::Utc::now();
+            computer
+                .authorize(
+                    "grant-restart",
+                    &run.run_id,
+                    run.version,
+                    ActionGrant {
+                        grant_id: "grant-restart".into(),
+                        run_id: run.run_id.clone(),
+                        target: run.target.clone(),
+                        action_classes: std::collections::BTreeSet::from([ActionClass::Semantic]),
+                        issued_by: GrantIssuer::LocalUser,
+                        issued_at: now,
+                        expires_at: now + chrono::Duration::minutes(5),
+                        uses_remaining: None,
+                        revoked_at: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
+        let srv = start_control_server(orch, 0).await.unwrap();
+        let fixture = ComputerFixture {
+            url: format!("http://{}/mcp", srv.addr),
+            srv,
+            client: reqwest::Client::new(),
+        };
+
+        let (status, body) = call_tool(
+            &fixture,
+            1,
+            "ptah_get_computer_run",
+            json!({"session_id": session.id, "workspace": ws.path(), "run_id": run_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let projection = &body["result"]["structuredContent"];
+        assert_eq!(projection["state"], "interrupted");
+        assert_eq!(projection["controlDisposition"], "interrupted");
+        assert_eq!(projection["terminal"], true);
+        assert_eq!(projection["agentActive"], false);
+        assert_eq!(
+            projection["grant"],
+            Value::Null,
+            "authority must not survive restart"
+        );
+        assert_eq!(
+            projection["lastOutcome"],
+            Value::Null,
+            "restart must not keep a leaky last_outcome"
+        );
+        assert_eq!(projection["lastError"]["code"], "interrupted");
+        assert!(
+            projection["lastError"].get("message").is_none(),
+            "lastError must be a code-only summary"
+        );
+
+        // The journal itself shows the interruption and stays replayable.
+        let (status, body) = call_tool(
+            &fixture,
+            2,
+            "ptah_get_computer_run_events",
+            json!({"session_id": session.id, "workspace": ws.path(), "run_id": run_id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let operations: Vec<&str> = body["result"]["structuredContent"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["operation"].as_str())
+            .collect();
+        assert!(operations.contains(&"create_run"));
+        assert!(operations.contains(&"authorize"));
+        assert!(operations.contains(&"recover"));
+
+        fixture.srv.stop();
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn computer_reads_fail_closed_when_the_ledger_is_unavailable() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let ws = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        host.start().unwrap();
+        host.set_project_cwd(ws.path()).unwrap();
+        let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+
+        // Hold the exclusive store lock outside the host so its ensure fails.
+        let _outside =
+            ComputerStore::open(crate::discover::grokptah_home().join("computer-use")).unwrap();
+
+        let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
+        let srv = start_control_server(orch, 0).await.unwrap();
+        let fixture = ComputerFixture {
+            url: format!("http://{}/mcp", srv.addr),
+            srv,
+            client: reqwest::Client::new(),
+        };
+        let (status, body) = call_tool(
+            &fixture,
+            1,
+            "ptah_list_computer_runs",
+            json!({"session_id": session.id, "workspace": ws.path()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(body["error"]["data"]["code"], "unsupported");
+
+        fixture.srv.stop();
+        set_grokptah_home_override(None);
     }
 
     #[test]

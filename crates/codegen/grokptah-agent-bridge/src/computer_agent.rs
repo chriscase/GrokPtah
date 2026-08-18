@@ -123,6 +123,7 @@ pub(crate) async fn qualify_semantic_model(
     let first = crate::computer_use::ComputerBackend::observe(
         &simulator,
         "computer-agent-qualification",
+        "qualification-observation-1",
         &target,
         &ComputerUseLimits::default(),
     )
@@ -159,6 +160,7 @@ pub(crate) async fn qualify_semantic_model(
     let second = crate::computer_use::ComputerBackend::observe(
         &simulator,
         "computer-agent-qualification",
+        "qualification-observation-2",
         &target,
         &ComputerUseLimits::default(),
     )
