@@ -16,7 +16,7 @@ implementation review can diff against something concrete.
 | `banner` | ui.js | Lane-level condition strip: what happened, what is preserved, one primary action | warn, danger, info, review, muted |
 | `contextHeader` | ui.js | The ownership rule: Lane · Agent · Runtime · Workspace · Run, each with a state chip | full + compact variants |
 | `transcript` / `turn-*` | ui.js | User, agent, tool, test, event turns | test turns carry pass/fail tone |
-| `composer` | ui.js | One prompt box; target line "Sends to *Lane* on *Runtime*"; self-disables with a stated reason | ready, blocked (archived / missing workspace / disconnected / retired-agent) |
+| `composer` | ui.js | One prompt box; target line "Sends to *Lane* on *Runtime*"; self-disables with a stated reason. "Continue on another Runtime…" opens a D11 dialog: continuing creates or selects a different Lane, nothing moves | ready, blocked (archived / missing workspace / disconnected / retired-agent) |
 | `drawerDock` + `drawer-panel` | views.js | Right-edge dock of seven Lane-scoped drawers; one open at a time; `aria-expanded`, Escape closes | open/closed; badges for approvals + queue counts |
 | `drawerScopeLine` | ui.js | Mandatory first line of every drawer: "Scoped to *Lane* · *Agent/Ad hoc*" | — |
 | Queue & steering drawer | ui.js | Steering note to the active Run; ordered queued prompts with positions | running (steering visible), idle |
@@ -24,10 +24,10 @@ implementation review can diff against something concrete.
 | Approvals drawer | ui.js | Approval card bound to Run id + file fingerprint; Review diff first / Approve / Deny | pending, none |
 | Terminal drawer | ui.js | Terminal labeled with the Lane's workspace path | static representation |
 | MCP & tools drawer | ui.js | Trust gate first, servers, doctor behind details | untrusted (fixture) |
-| Computer Use drawer | ui.js | The audited unavailable state only: permissions + store lock behind Technical details, named repair | unavailable (per evidence boundary) |
+| Computer Use drawer | ui.js | Two tabs. "Observed today": the audited unavailable state (permissions + store lock behind Technical details, named repair). "Contract illustration (#273)": contract-labelled operator control — Lane + Run, local app/window target, grant scope/expiry, model/provider, origin, action/time budgets, current action, observation freshness, sticky always-reachable Pause / Stop / Take over / non-cancelling Steer, approval bound to Lane + Run + action + target + fresh evidence, invalidation statement | unavailable (observed); operator-control (contract illustration, local only, never hosted) |
 | Run history drawer | ui.js | Durable Runs with state, origin, execution mode, lineage (continues / retry-of), checkpoint inspect, progress | queued, running, completed, interrupted, awaiting approval |
-| `agentCard` | views.js | Roster card: role, lifecycle **and** health chips, runtime, lane counts, current Lane, checkpoint or "none yet", actions | active/paused/retired; needs-attention |
-| Agent detail | views.js | Identity + Start-Lane form (runtime radio with live connection chips) + grouped Lanes + ad-hoc adoption | active, paused, retired (banner + blocked form) |
+| `agentCard` | views.js | Roster card: role, lifecycle **and** health chips, **current/last Lane runtime or aggregate** (never an Agent-wide Runtime — runtime belongs to Lanes), lane counts, current Lane, checkpoint or "none yet", actions with a visible "Proposed" marker on Pause/Retire | active/paused/retired; needs-attention (derived, C15) |
+| Agent detail | views.js | Identity + Start-Lane form (runtime radio with live connection chips) + grouped Lanes + ad-hoc adoption; lifecycle actions marked "Proposed"; retired shows "Proposed: unretire…" | active, paused, retired (banner + blocked form) |
 | `laneRow` | views.js | Work record: title, objective, Agent/Ad hoc, workspace display name, runtime chip, status + next action, activity, indicator badges, Open/Archive/Restore | active, attention, archived (dashed + Restore) |
 | Lane list toolbar | views.js | Active/Attention/Archived/All tabs with counts; identity-preserving search with live result count (`aria-live`) | — |
 | Runtime target card | views.js | Name, connection, workspace authority, "What syncs", supports matrix, last seen, Technical details | connected, disconnected (+ Reconnect) |
@@ -40,8 +40,12 @@ implementation review can diff against something concrete.
 |---|---|---|---|
 | Continue | Open, Focus, Resume from checkpoint, Retry run | Primary buttons on rows/banners | none |
 | Organize | Archive, Restore | Row/banner secondary | Archive dialog states what is preserved and that it is reversible |
-| End of life | Retire (Agent), Unretire | Agent surfaces only | Retire dialog contrasts itself with Archive and counts affected active Lanes |
+| End of life *(proposed lifecycle — not implemented; visibly marked "Proposed")* | Retire (Agent), Proposed: unretire | Agent surfaces only | Retire dialog carries a "Proposed lifecycle contract (D05)" banner, contrasts itself with Archive, states that nothing is archived/deleted/moved/reassigned/rewritten, and **blocks confirmation** while the Agent has queued/running Runs or live isolated approvals (cancel, wait, or deny first) |
 | Destructive | Delete permanently | **Not present** on rows/cards in any direction; reserved for a separate data-retention surface | out of scope this phase |
+
+Pause/Unpause are likewise proposed lifecycle actions and carry the same
+"Proposed" marker. Operational health (what is happening now) is always a
+separate chip and is never affected by these actions.
 
 ## State machine coverage (handoff §6 → prototype)
 
@@ -57,7 +61,8 @@ implementation review can diff against something concrete.
 | Awaiting approval, isolated diff | `#/d1/lane/lane-2?drawer=approvals` — bound to Run + fingerprint |
 | Interrupted Run with verified checkpoint | `#/d1/lane/lane-4` — Resume vs Retry distinguished in copy |
 | Archived Lane | `#/d2/lane/lane-6` and `lane-7` (scratch label hygiene), `lane-8` |
-| Retired Agent | `#/d2/agent/agent-4` and its Lane `lane-8` |
+| Retired Agent | `#/d2/agent/agent-4` and its Lane `lane-8` (proposed lifecycle, marked) |
+| Computer Use operator control (contract, #273/S14) | `#/d1/lane/lane-1?drawer=computer&cu=contract` — contract-labelled, local only; audited unavailable state remains the default tab |
 
 ## Accessibility notes
 
@@ -104,7 +109,7 @@ Deferred to a production pass (not claimable from a static prototype):
 |---|---|
 | ≥ 1160px | Full layout: rail + main + drawer panel/Inspector inline |
 | 880–1160px | Drawer panel becomes a right overlay (scrim-free, Escape closes); D3 zones stack vertically; Inspector moves below zones full-width; Agent detail columns stack |
-| ≤ 880px | Rail becomes a horizontal scrollable strip under the app bar; lane rows single-column; context header wraps (chips stay adjacent to their values); composer stacks; dock is icon-only with names preserved for AT; direction switcher collapses to numbers |
+| ≤ 880px | Rail becomes a horizontal scrollable strip under the app bar; lane rows single-column; context header wraps (chips stay adjacent to their values); composer stacks; dock is icon-only with names preserved for AT; direction switcher collapses to numbers. In the Computer Use contract state, the target block is sticky at the top and the Pause/Stop/Take over/Steer controls are sticky at the bottom of the drawer, so target and controls stay visible at every width |
 
 The narrow layout was exercised at 760×1000 in headless Chrome (see
 [captures](captures/CAPTURES.md)); no horizontal body scroll occurs at

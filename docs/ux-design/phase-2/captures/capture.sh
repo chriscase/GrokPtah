@@ -39,6 +39,11 @@ shot d2-lane-disconnected-vm        "/d2/lane/lane-10"                   1440,90
 shot d3-supervision-workspace       "/d3/workspace"                      1440,900
 shot d3-runtime-targets             "/d3/runtime"                        1440,900
 
+# Computer Use — audited unavailable state is the drawer default;
+# the contract illustration (#273 / S14) is behind an explicit tab.
+shot d1-computer-use-contract       "/d1/lane/lane-1?drawer=computer&cu=contract" 1440,900
+
 # Narrow-window behavior
 shot narrow-d1-focused-lane         "/d1/lane/lane-1"                    760,1000
 shot narrow-d2-agent-roster         "/d2/agents"                         760,1000
+shot narrow-d1-computer-contract    "/d1/lane/lane-1?drawer=computer&cu=contract" 760,1000

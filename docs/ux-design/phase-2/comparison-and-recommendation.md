@@ -4,6 +4,11 @@ This document is opinion built on top of the Phase 1 evidence. Section 1
 restates the observed facts relied on; everything after it is design
 judgment and is labeled as such.
 
+Update 2026-08-18: aligned with the independent product-contract review
+(`delegated/GROK-BUILD-CONTRACT-REVIEW.md`) and the integration record
+(`integration/CONTRACT-INTEGRATION.md`). See §6 for the decisions those
+artifacts settle and the constraints they add.
+
 ## 1. Observed facts relied on (from Phase 1 / Fable review — not new claims)
 
 - The current default is a dense, session-first cockpit (103 sessions, 8
@@ -95,8 +100,35 @@ Suggested sequence (aligned with the runtime model's migration strategy):
    (opt-in convenience vs hard rule).
 4. Home behavior for single-Agent and zero-Agent users in a D2-led world.
 5. Where "Delete permanently" ultimately lives (a retention/settings
-   surface is proposed; it must not return to row menus).
+   surface is proposed; it must not return to row menus). Per the contract
+   review, its confirmation must state that durable Agent/Run history may
+   remain in the orchestration store.
 6. Recovery ownership for the locked orchestration/computer-use store —
    the Phase 1 question 4 remains open and gates the final copy of the
    load-failed state ("close the other GrokPtah window" vs an automatic
    repair path).
+
+## 6. Contract-review update (2026-08-18)
+
+The independent contract review settles several items this document
+previously left open, and adds constraints the recommendation must respect:
+
+- **Settled dispositions:** Agents and Lanes both permanently reachable
+  (D02); Assign Agent on ad-hoc Build Lanes, explicit and non-rewriting, no
+  routine Agent-to-Agent transfer (D04); Retire blocked while queued/running
+  Runs or live isolated approvals exist, never auto-archiving Lanes (D05);
+  bulk archive is Lane-only (D06); runtime change is never a silent retarget
+  — continuing elsewhere is a different Lane (D11); the Resume vocabulary
+  (Reconnect / Resume from checkpoint / Retry interrupted Run / Start new
+  Run / Start on another Runtime) is authoritative (D15); per-zone Lane
+  ownership in any grid (D18).
+- **Constraints on the recommendation:** the implementation sequence in §3
+  holds, with the contract's sharper gate — explicit Lane scope, state
+  grammar, and the archive inspect-without-restore correction land **before**
+  visual IA slices, and resume must be unbound from the Agent's primary
+  session before any Agent-home surface implies many-Lane continuation
+  (contract migration step 6 / D20).
+- **Proposed vs implemented:** Agent lifecycle (Pause/Retire/Unretire) is a
+  proposed contract; the prototype now marks it "Proposed" everywhere, and
+  production must not ship the chrome before the lifecycle field and
+  mutation gates exist.

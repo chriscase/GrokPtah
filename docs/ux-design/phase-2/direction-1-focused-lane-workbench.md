@@ -47,8 +47,11 @@ Expert Grid (opt-in, rail bottom)
 ## Key interactions
 
 1. **Single composer with explicit target.** The composer header always
-   reads "Sends to *Lane* on *Runtime*" with a "Change runtime…" affordance.
-   When the Lane cannot execute (archived, missing workspace, disconnected
+   reads "Sends to *Lane* on *Runtime*" with a "Continue on another
+   Runtime…" affordance — per contract D11 this is never a silent retarget:
+   the dialog states that continuing creates or selects a different Lane and
+   that files, terminals, credentials, and in-flight Runs do not move. When
+   the Lane cannot execute (archived, missing workspace, disconnected
    runtime, retired Agent), the composer visibly disables itself and states
    the one reason and the one repair — the same copy as the Lane banner.
 2. **State banner = single next action.** Blocked, interrupted, awaiting
@@ -63,8 +66,10 @@ Expert Grid (opt-in, rail bottom)
    prompts), Changes & tests (files + observed test evidence), Approvals
    (bound to Run + fingerprint, with Review diff first as the safe default),
    Terminal (labeled with the Lane's workspace path), MCP & tools (trust
-   gate first), Computer Use (audited unavailable state with recovery
-   steps), Run history (lineage: continues / retry-of; checkpoint inspect).
+   gate first), Computer Use (audited unavailable state by default, plus a
+   contract-labelled #273/S14 operator-control illustration behind an
+   explicit tab), Run history (lineage: continues / retry-of; checkpoint
+   inspect).
 4. **Badges, not panels, carry urgency.** The dock shows small counts for
    pending approvals and queued prompts; the rail shows per-Lane state dots
    with text labels. Nothing pulses for attention except the Running state.
@@ -82,8 +87,8 @@ Expert Grid (opt-in, rail bottom)
 | F-03 zone ownership | Default has one Lane; Grid zones each carry header + composer; drawers open Lane-scoped |
 | F-04 density | Default surface: header, banner, transcript, composer. Nothing else until asked |
 | F-05 flat lifecycle actions | Open on the row; Archive behind an explicit confirm stating preservation; Delete not present on rows at all |
-| F-06 Computer terminology | One noun, "Computer Use," one drawer, one state — the audited unavailable state with named repair |
-| F-07 runtime visibility | Header chip + composer target line + Runtime screen |
+| F-06 Computer terminology | One noun, "Computer Use," one drawer; the audited unavailable state with named repair, plus the contract-labelled operator-control tab |
+| F-07 runtime visibility | Header chip + composer target line + Runtime screen; runtime is per-Lane, and "Continue on another Runtime…" makes retargeting explicit (D11) |
 | F-08 ambiguous search | Lane search filters on title/Agent/workspace and says so |
 | F-09 intimidating internals | MCP trust copy is consequence-first; doctor output behind details |
 | F-10 state grammar | The shared grammar is the only state vocabulary used |

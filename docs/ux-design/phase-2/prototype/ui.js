@@ -228,7 +228,7 @@ function composer(lane, opts) {
   let blockedMsg = "";
   if (lane.archived) blockedMsg = "This Lane is archived. Restore it before sending a new prompt.";
   else if (lane.workspace.status === "missing") blockedMsg = "Workspace missing — choose a valid folder before sending.";
-  else if (conn === "disconnected") blockedMsg = "Runtime disconnected — reconnect or switch target before sending.";
+  else if (conn === "disconnected") blockedMsg = "Runtime disconnected — reconnect, or continue this objective in another Lane on a different Runtime.";
   else if (blocked) blockedMsg = "This Agent is retired and cannot start new Runs.";
 
   const composerId = "composer-" + lane.id + (o.zone ? "-" + o.zone : "");
@@ -239,7 +239,7 @@ function composer(lane, opts) {
       esc(target.name) + "</strong>" +
       (conn !== "connected" ? " · " + esc((STATE_GRAMMAR[conn] || {}).label || conn) : "") +
       "</span>" +
-      '<button type="button" class="btn btn-ghost btn-sm" data-demo="open-runtime" aria-haspopup="dialog">Change runtime…</button>' +
+      '<button type="button" class="btn btn-ghost btn-sm" data-modal="continue:' + esc(lane.id) + '" aria-haspopup="dialog">Continue on another Runtime…</button>' +
     "</div>" +
     (blocked
       ? '<p class="composer-blocked" role="status">' + icon("warn") + esc(blockedMsg) + "</p>"
@@ -365,19 +365,64 @@ function drawerBody(drawerId, lane) {
           '<span class="soft"> · ' + esc(s.note) + "</span></li>").join("") +
         "</ul><details class=\"tech\"><summary>Doctor</summary><pre>" + esc(MCP.doctor) + "</pre></details></div>"
       );
-    case "computer":
+    case "computer": {
+      const tab = APP.ui.cuTab === "contract" ? "contract" : "observed";
+      const tabs =
+        '<nav class="tabs tabs-sm cu-tabs" aria-label="Computer Use states">' +
+        '<button type="button" class="tab' + (tab === "observed" ? " is-active" : "") + '" data-cu-tab="observed"' +
+        (tab === "observed" ? ' aria-current="true"' : "") + ">Observed today</button>" +
+        '<button type="button" class="tab' + (tab === "contract" ? " is-active" : "") + '" data-cu-tab="contract"' +
+        (tab === "contract" ? ' aria-current="true"' : "") + ">Contract illustration (#273)</button></nav>";
+      if (tab === "observed") {
+        return (
+          drawerScopeLine(lane) + tabs +
+          '<div class="panel-block">' +
+          stateCard("error", {
+            title: COMPUTER_USE.message,
+            body: COMPUTER_USE.action,
+            technical:
+              COMPUTER_USE.reasons.map((r) => r.label + ": " + r.value).join("\n") + "\n" + COMPUTER_USE.technical,
+          }) +
+          '<p class="soft evidence-note">The Phase 1 audit observed this unavailable state; a successful capture has not been observed and is not depicted.</p>' +
+          "</div>"
+        );
+      }
+      /* Contract illustration for issue #273 / rubric S14 — local only. */
+      const cu = COMPUTER_USE_CONTRACT;
       return (
-        drawerScopeLine(lane) +
-        '<div class="panel-block">' +
-        stateCard("error", {
-          title: COMPUTER_USE.message,
-          body: COMPUTER_USE.action,
-          technical:
-            COMPUTER_USE.reasons.map((r) => r.label + ": " + r.value).join("\n") + "\n" + COMPUTER_USE.technical,
-        }) +
-        '<p class="soft evidence-note">The Phase 1 audit observed this unavailable state; a successful capture has not been observed and is not depicted.</p>' +
+        drawerScopeLine(lane) + tabs +
+        '<div class="panel-block cu-contract">' +
+        '<p class="chip tone-review cu-contract-tag">' + icon("shield") +
+          "<span>Design contract — #273 / S14 · local only · not an observed capture</span></p>" +
+        '<div class="cu-target" role="group" aria-label="Computer Run identity and target">' +
+          '<dl class="kv">' +
+          "<div><dt>Lane · Run</dt><dd><strong>" + esc(getLane(cu.laneId).title) + "</strong> · Computer Run <strong>" +
+            esc(cu.computerRun) + "</strong> (attributed to " + esc(cu.attributedRun) + ")</dd></div>" +
+          "<div><dt>Target</dt><dd>" + esc(cu.target) + "</dd></div>" +
+          "<div><dt>Grant</dt><dd>" + esc(cu.grantScope) + " · " + esc(cu.grantExpiry) + "</dd></div>" +
+          "<div><dt>Model</dt><dd>" + esc(cu.model) + " · origin: " + esc(cu.origin) + "</dd></div>" +
+          "<div><dt>Budgets</dt><dd>Actions " + cu.actionBudget.used + " of " + cu.actionBudget.max +
+            " · Time " + esc(cu.timeBudget.used) + " of " + esc(cu.timeBudget.max) + "</dd></div>" +
+          "<div><dt>Now</dt><dd>" + esc(cu.currentAction) + "</dd></div>" +
+          '<div><dt>Observation</dt><dd><span class="chip tone-good">' + icon("check") + "<span>" + esc(cu.freshness) + "</span></span></dd></div>" +
+          "</dl></div>" +
+        '<div class="approval-card cu-approval"><h4>' + icon("shield") + "Action needs review</h4>" +
+          "<p><strong>" + esc(cu.pendingApproval.action) + "</strong></p>" +
+          '<dl class="kv"><div><dt>Bound to</dt><dd>' + esc(cu.pendingApproval.boundTo) + "</dd></div>" +
+          "<div><dt>Evidence</dt><dd>" + esc(cu.pendingApproval.evidence) + "</dd></div></dl>" +
+          '<div class="row-gap"><button type="button" class="btn btn-secondary btn-sm">Review evidence</button>' +
+          '<button type="button" class="btn btn-primary btn-sm">Approve action</button>' +
+          '<button type="button" class="btn btn-danger-ghost btn-sm">Deny</button></div></div>' +
+        '<p class="soft cu-invalidation">' + icon("warn") + esc(cu.invalidation) + "</p>" +
+        "</div>" +
+        '<div class="cu-controls" role="group" aria-label="Operator controls — always reachable">' +
+          '<button type="button" class="btn btn-secondary btn-sm">Pause</button>' +
+          '<button type="button" class="btn btn-secondary btn-sm">Stop</button>' +
+          '<button type="button" class="btn btn-danger btn-sm">Take over</button>' +
+          '<button type="button" class="btn btn-ghost btn-sm" title="Steering guides the run without cancelling it">Steer (non-cancelling)</button>' +
         "</div>"
       );
+    }
     case "runs": {
       const runs = laneRuns(lane.id);
       return (
@@ -446,9 +491,9 @@ function laneNextAction(lane, connOverride) {
     return banner(
       "danger", "unplug",
       esc(t.name) + " is disconnected. Live controls are paused.",
-      "Durable history stays on the service and will be readable after reconnect. Last seen " + t.lastSeen + ".",
+      "Durable history stays on the service and will be readable after reconnect. Last seen " + t.lastSeen + ". This Lane stays on " + t.name + " — disconnecting never relabels it.",
       '<div class="banner-actions"><button type="button" class="btn btn-primary btn-sm">Reconnect</button>' +
-      '<button type="button" class="btn btn-ghost btn-sm" data-demo="open-runtime">Switch runtime…</button></div>'
+      '<button type="button" class="btn btn-ghost btn-sm" data-modal="continue:' + esc(lane.id) + '">Continue on another Runtime…</button></div>'
     );
   }
   if (conn === "stale") {
@@ -492,9 +537,9 @@ function laneNextAction(lane, connOverride) {
     if (agent.lifecycle === "retired") {
       return banner(
         "muted", "moon",
-        agent.name + " is retired. New work in this Lane is blocked.",
-        "Historical Runs, checkpoints, and memory remain inspectable. Reassign the Lane or unretire the Agent to continue.",
-        '<div class="banner-actions"><button type="button" class="btn btn-secondary btn-sm">Reassign Lane…</button></div>'
+        agent.name + " is retired (proposed lifecycle). New work in this Lane is blocked.",
+        "Every Run, checkpoint, transcript, and memory record is preserved exactly as it is — retirement archives, deletes, moves, and rewrites nothing. Agent-to-Agent reassignment is not a routine action in this phase.",
+        ""
       );
     }
   }

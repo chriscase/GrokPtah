@@ -27,11 +27,14 @@ Runtime                    Need attention                  checkpoint lineage
 ATTENTION                Agent cards:                    Start a new Lane
   (lanes needing           name, role                      objective + runtime
    a decision)             lifecycle ≠ health chips        target chosen up front
-                           runtime + connection          Lanes grouped:
-                           active/archived counts          Attention needed
-                           current Lane → link             Active
-                           checkpoint (or "none yet")      Archived (collapsed)
-                           Open / Pause / Retire…        Adopt ad-hoc work
+                           current-Lane runtime          Lanes grouped:
+                             (or aggregate — runtime       Attention needed
+                             belongs to Lanes)             Active
+                           active/archived counts          Archived (collapsed)
+                           current Lane → link           Adopt ad-hoc work
+                           checkpoint (or "none yet")
+                           Open / Pause / Retire…
+                             (marked Proposed)
                          Ad-hoc work section
 ```
 
@@ -44,10 +47,13 @@ ATTENTION                Agent cards:                    Start a new Lane
   empty roster ("No durable Agents yet") and the failed load ("Couldn't
   refresh durable Agents") are different screens that can never co-render —
   see `#/d2/agents?demo=empty` vs `#/d2/agents?demo=error`.
-- **Retire lives here, and only here.** Retire is an Agent-level action with
-  consequence copy (blocks new work; preserves memory, checkpoints, and all
-  historical Lanes; names how many active Lanes would be blocked). Archive
-  never appears on an Agent; Retire never appears on a Lane.
+- **Retire lives here, and only here — as a proposed contract.** Retire is
+  an Agent-level action, visibly marked "Proposed" (the lifecycle enum is
+  not implemented today). Its dialog states that everything is preserved —
+  nothing archived, deleted, moved, reassigned, or rewritten — and blocks
+  confirmation while the Agent has queued/running Runs or live isolated
+  approvals (D05). Archive never appears on an Agent; Retire never appears
+  on a Lane.
 - The focused Lane workspace is the same surface as Direction 1 (shared
   component) reached with a breadcrumb: *Agents › Release Warden › Gateway
   model qualification*.
@@ -70,9 +76,11 @@ ATTENTION                Agent cards:                    Start a new Lane
    (approval, interruption, blockage) across all Agents, so identity-first
    never hides urgency.
 5. **Retired is a readable past, not a hole.** `#/d2/agent/agent-4` shows
-   the retired banner, blocked Start-Lane form with reason, and the archived
-   Lane history intact; its archived Lane (`#/d2/lane/lane-8`) blocks the
-   composer with "reassign or unretire" guidance.
+   the retired banner (marked proposed), a blocked Start-Lane form with
+   reason, "Proposed: unretire…" as explicitly-labelled future behavior, and
+   the archived Lane history intact; its archived Lane (`#/d2/lane/lane-8`)
+   blocks the composer and states that everything is preserved and that
+   Agent-to-Agent reassignment is not a routine action in this phase.
 
 ## How the audit findings are applied
 
@@ -82,9 +90,9 @@ ATTENTION                Agent cards:                    Start a new Lane
 | F-02 | Answered structurally: Agents are home |
 | F-03 | Lane surfaces shared with D1; every drawer scope-labeled |
 | F-04 | Home is a readable roster of ~cards, not a cockpit; work surfaces open one Lane |
-| F-05 | Pause/Retire on Agents with consequence copy; Archive/Restore on Lanes; Delete nowhere near either |
-| F-06 | Computer Use unchanged from D1 (single drawer, audited state) |
-| F-07 | Runtime chip on every card, in Start Lane, in Lane header, and a Runtime screen with sync boundaries |
+| F-05 | Pause/Retire on Agents with consequence copy and a visible "Proposed" marker (lifecycle is not implemented); Archive/Restore on Lanes; Delete nowhere near either |
+| F-06 | Computer Use unchanged from D1 (audited state default + contract-labelled #273 tab) |
+| F-07 | Current-Lane runtime (or aggregate) on cards — runtime belongs to Lanes — plus runtime chosen in Start Lane, shown in the Lane header, and a Runtime screen with sync boundaries |
 | F-08 | Lane search returns identity-bearing rows (title, Agent, workspace, state, last activity) |
 | F-10 | Same shared grammar |
 | Fable 6 (.tmp noise) | Scratch Lane displays "Scratch workspace" with the `.tmp` path behind Technical details |
@@ -96,8 +104,10 @@ ATTENTION                Agent cards:                    Start a new Lane
   handoff's acceptance criteria ask.
 - Retire vs Archive separation is structural, not just copy — they live on
   different object types with different confirmation dialogs.
-- Best fit for hosted/service operation: connection state, checkpoint
-  recency, and needs-attention roll up naturally per identity.
+- Best fit for hosted/service operation: per-Lane connection state,
+  checkpoint recency, and derived needs-attention roll up naturally per
+  identity. (Roster health honesty additionally depends on the cross-Lane
+  resume restriction being lifted — see migration below.)
 - Scales with the roster: four agents or forty, the summary strip and
   attention rail keep triage constant-time.
 
@@ -120,7 +130,10 @@ Requires the Agent-side contract earlier than the other directions:
 
 1. `AgentRecord.session_id` one-to-one must become Agent→Lane association
    (runtime-model migration step 2) before the roster can honestly show
-   counts and current-Lane pointers.
+   counts and current-Lane pointers. Checkpoint resume is additionally still
+   bound to the Agent's primary session and workspace (contract review
+   §1.3); until that unbind ships, Agent surfaces must not promise "resume
+   this Agent in any of its Lanes."
 2. Roster health/lifecycle needs the normalized state projection; the
    audited lock error must map to the load-failed card.
 3. Lanes list, focused Lane, and drawers are shared with D1 (same

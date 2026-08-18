@@ -39,6 +39,42 @@ function agentHealthLine(agent) {
   );
 }
 
+/* Runtime belongs to a Lane, not an Agent (contract §2.7). Agent
+ * surfaces show the current Lane's runtime, the last Lane's runtime,
+ * or a mixed aggregate — never one Agent-wide Runtime target. */
+function agentLaneRuntimes(agent) {
+  const current = agent.currentLane ? getLane(agent.currentLane) : null;
+  if (current) {
+    return {
+      label: "Current Lane runtime",
+      html: runtimeChip(current.runtime, current.connection),
+    };
+  }
+  const active = lanesForAgent(agent.id).filter((l) => !l.archived);
+  if (active.length) {
+    const counts = {};
+    active.forEach((l) => { counts[l.runtime] = (counts[l.runtime] || 0) + 1; });
+    const parts = Object.keys(counts).map(
+      (k) => counts[k] + " × " + RUNTIME_TARGETS[k].name
+    );
+    return { label: "Lane runtimes", html: "<span>" + esc(parts.join(" · ")) + "</span>" };
+  }
+  const archived = lanesForAgent(agent.id).filter((l) => l.archived);
+  if (archived.length) {
+    return {
+      label: "Last Lane runtime",
+      html: "<span>" + esc(RUNTIME_TARGETS[archived[0].runtime].name) + " (archived Lane)</span>",
+    };
+  }
+  return { label: "Lane runtimes", html: '<span class="soft">No Lanes yet</span>' };
+}
+
+/* Proposed-lifecycle marker (contract §2.4): Pause / Retire / Unretire
+ * are design exploration, not implemented runtime behavior. */
+function proposedTag() {
+  return '<span class="chip tone-muted chip-xs chip-proposed"><span>Proposed</span></span>';
+}
+
 function checkpointLine(agent) {
   if (!agent.checkpoint) {
     return '<p class="soft">' + icon("flag") + "No checkpoint yet — the first completed Run creates one.</p>";
@@ -69,7 +105,10 @@ function agentCard(dir, agent) {
       agentHealthLine(agent) +
     "</header>" +
     '<dl class="agent-facts">' +
-      "<div><dt>Runtime</dt><dd>" + runtimeChip(agent.runtime, retired ? "connected" : undefined) + "</dd></div>" +
+      (function () {
+        const rt = agentLaneRuntimes(agent);
+        return "<div><dt>" + esc(rt.label) + "</dt><dd>" + rt.html + "</dd></div>";
+      })() +
       "<div><dt>Lanes</dt><dd>" + active.length + " active · " + archived.length + " archived</dd></div>" +
       "<div><dt>Now</dt><dd>" +
         (current
@@ -83,7 +122,8 @@ function agentCard(dir, agent) {
       '<a class="btn btn-secondary btn-sm" href="#/' + dir + "/agent/" + agent.id + '">Open details</a>' +
       (retired
         ? '<span class="soft">History preserved</span>'
-        : '<button type="button" class="btn btn-ghost btn-sm">' + (agent.lifecycle === "paused" ? "Unpause" : "Pause") + "</button>" +
+        : proposedTag() +
+          '<button type="button" class="btn btn-ghost btn-sm">' + (agent.lifecycle === "paused" ? "Unpause" : "Pause") + "</button>" +
           '<button type="button" class="btn btn-ghost btn-sm" data-modal="retire:' + agent.id + '">Retire…</button>') +
     "</footer></article>"
   );
@@ -178,8 +218,9 @@ function screenAgentDetail(dir, agentId) {
       '<div class="agent-detail-id"><h1 tabindex="-1">' + esc(agent.name) + "</h1>" +
       '<p class="screen-sub">' + esc(agent.role) + "</p>" + agentHealthLine(agent) + "</div>" +
       '<div class="row-gap head-actions">' +
+        proposedTag() +
         (retired
-          ? '<button type="button" class="btn btn-secondary">Unretire…</button>'
+          ? '<button type="button" class="btn btn-secondary">Proposed: unretire…</button>'
           : '<button type="button" class="btn btn-ghost">' + (agent.lifecycle === "paused" ? "Unpause" : "Pause") + "</button>" +
             '<button type="button" class="btn btn-ghost" data-modal="retire:' + agent.id + '">Retire…</button>') +
       "</div>" +
@@ -188,8 +229,8 @@ function screenAgentDetail(dir, agentId) {
     (retired
       ? banner(
           "muted", "moon",
-          "This Agent is retired.",
-          "It cannot start new Lanes or Runs. Its memory, checkpoints, and every historical Lane below remain inspectable. Retiring did not archive or delete anything.",
+          "This Agent is retired (proposed lifecycle).",
+          "It cannot start new Lanes or Runs. Its memory, checkpoints, and every historical Lane below remain inspectable. Retiring did not archive, delete, move, or rewrite anything.",
           ""
         )
       : "") +
@@ -200,8 +241,12 @@ function screenAgentDetail(dir, agentId) {
         "<div><dt>Model</dt><dd><code>" + esc(agent.model) + "</code></dd></div>" +
         "<div><dt>Policy</dt><dd>" + esc(agent.policy) + "</dd></div>" +
         "<div><dt>Memory</dt><dd>" + esc(agent.memory) + "</dd></div>" +
-        "<div><dt>Runtime</dt><dd>" + runtimeChip(agent.runtime) + "</dd></div>" +
+        (function () {
+          const rt = agentLaneRuntimes(agent);
+          return "<div><dt>" + esc(rt.label) + "</dt><dd>" + rt.html + "</dd></div>";
+        })() +
         "</dl>" + checkpointLine(agent) +
+        '<p class="soft">Runtime belongs to each Lane, not to the Agent. Per-Lane targets are shown on the Lane rows below.</p>' +
       "</section>" +
       '<section class="card" aria-labelledby="start-h"><h3 id="start-h">Start a new Lane</h3>' +
         (retired
@@ -343,8 +388,16 @@ function connOverrideFor(lane) {
 function laneWorkspaceCore(dir, lane, opts) {
   const o = opts || {};
   const connOverride = connOverrideFor(lane);
+  /* Evidence boundary must be visible at the hosted/service surface
+   * itself, not only in a page footer (contract integration note). */
+  const evidence =
+    lane.runtime !== "local_desktop"
+      ? '<p class="evidence-inline">' + icon("question") +
+        "<span>Service fixture: illustrates the documented service contract — not observed end to end in Phase 1. No transcripts, source files, terminals, credentials, clipboard, or Computer Use authority synchronize.</span></p>"
+      : "";
   return (
     contextHeader(lane, { compact: o.compact, connOverride: connOverride }) +
+    evidence +
     laneNextAction(lane, connOverride) +
     transcript(lane) +
     composer(lane, { connOverride: connOverride, zone: o.zone })
@@ -482,6 +535,10 @@ function screenRuntime(dir) {
         "<div><dt>What syncs</dt><dd>" + esc(t.syncPolicy) + "</dd></div>" +
         "<div><dt>Supports</dt><dd>" + t.supports.map((x) => '<span class="chip tone-neutral chip-xs"><span>' + esc(x) + "</span></span>").join(" ") + "</dd></div>" +
         "</dl>" +
+        (tid !== "local_desktop"
+          ? '<p class="evidence-inline">' + icon("question") +
+            "<span>Documented contract — not observed end to end in Phase 1.</span></p>"
+          : "") +
         '<details class="tech"><summary>Technical details</summary><pre>' + esc(t.detail) + "</pre></details>" +
         "</article>"
       );
@@ -504,7 +561,7 @@ function screenRuntime(dir) {
   return (
     '<div class="screen">' +
     '<header class="screen-head"><div><h1 tabindex="-1">Runtime targets</h1>' +
-    '<p class="screen-sub">Where Lanes execute. Every Lane shows its target in its header, and the composer names the target before each prompt.</p></div></header>' +
+    '<p class="screen-sub">Where Lanes execute. A Lane has one Runtime at a time; the Lane header and composer name it before each prompt. Continuing an objective on another Runtime creates or selects a different Lane — files, terminals, credentials, and in-flight Runs never move (contract D11).</p></div></header>' +
     '<div class="runtime-grid">' + cards + "</div>" +
     '<section class="card"><h3>Where each active Lane runs</h3>' +
     '<div class="table-wrap"><table class="data-table"><caption class="visually-hidden">Active Lanes and their runtime targets</caption>' +
@@ -539,18 +596,53 @@ function modalContent(kind, arg) {
   }
   if (kind === "retire") {
     const agent = getAgent(arg);
-    const active = lanesForAgent(agent.id).filter((l) => !l.archived).length;
+    /* Retirement eligibility per the proposed contract (D05): blocked
+     * while the Agent has queued/running Runs or a live isolated
+     * approval. The operator cancels, waits, or denies first. */
+    const blockers = lanesForAgent(agent.id)
+      .filter((l) => !l.archived)
+      .map((l) => {
+        if (l.status === "running") return "a Run is running in “" + l.title + "”";
+        if (l.status === "queued") return "a Run is queued in “" + l.title + "”";
+        if (l.approvals && l.approvals.pending) return "an isolated approval is live in “" + l.title + "”";
+        return null;
+      })
+      .filter(Boolean);
     return {
       title: "Retire Agent “" + agent.name + "”?",
       body:
+        '<p class="chip tone-muted chip-proposed-line"><span>Proposed lifecycle contract (D05) — not implemented in the current runtime.</span></p>' +
         "<p>Retiring ends this identity’s working life. It is <strong>not</strong> the same as archiving Lanes:</p>" +
         '<ul class="modal-list">' +
         "<li>" + icon("x") + "No new Lanes or Runs can start under this Agent.</li>" +
-        "<li>" + icon("check") + "Memory, checkpoints, and all " + lanesForAgent(agent.id).length + " historical Lanes stay inspectable.</li>" +
-        "<li>" + icon("warn") + (active ? active + " active Lane(s) will be blocked from new work until reassigned." : "No active Lanes are affected.") + "</li>" +
+        "<li>" + icon("check") + "Every Lane, Run, checkpoint, transcript, and memory record is preserved exactly as it is — nothing is archived, deleted, moved, reassigned, or rewritten.</li>" +
+        (blockers.length
+          ? "<li>" + icon("warn") + "Blocked right now under the proposed contract: " + esc(blockers.join("; ")) +
+            ". Cancel, wait, or deny those first.</li>"
+          : "<li>" + icon("check") + "No queued or running Runs and no live approvals — eligible under the proposed contract.</li>") +
         "</ul>",
-      confirm: "Retire Agent",
+      confirm: blockers.length ? null : "Retire Agent",
       confirmClass: "btn-danger",
+    };
+  }
+  if (kind === "continue") {
+    const lane = getLane(arg);
+    const t = RUNTIME_TARGETS[lane.runtime];
+    return {
+      title: "Continue this objective on another Runtime?",
+      body:
+        '<p class="chip tone-muted chip-proposed-line"><span>Design contract (D11) — changing Runtime is never a silent retarget.</span></p>' +
+        "<p>“" + esc(lane.title) + "” stays on <strong>" + esc(t.name) + "</strong>" +
+        (lane.currentRun ? ", and its in-flight Run finishes there" : "") +
+        ". Continuing elsewhere <strong>creates or selects a different Lane</strong> on the Runtime you choose" +
+        (lane.agentId ? ", optionally owned by the same Agent" : "") + ".</p>" +
+        '<ul class="modal-list">' +
+        "<li>" + icon("x") + "Files, terminals, credentials, clipboard, and Computer Use grants do not move.</li>" +
+        "<li>" + icon("check") + "The composer will then clearly target the new Lane — the Lane that executes is the Lane that is named.</li>" +
+        "<li>" + icon("check") + "This Lane keeps its Runtime, transcript, and Runs unchanged.</li>" +
+        "</ul>",
+      confirm: "Choose Runtime for a new Lane…",
+      confirmClass: "btn-primary",
     };
   }
   if (kind === "assign") {

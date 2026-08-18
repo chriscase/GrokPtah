@@ -8,6 +8,13 @@ This package answers the [Phase 2 design handoff](../../ux-audit/PHASE-2-DESIGN-
 with three coherent, meaningfully different design directions, one shared
 product model, and a clickable dependency-free prototype.
 
+Contract alignment: the package has been corrected against the independent
+Grok Build product-contract review (`delegated/GROK-BUILD-CONTRACT-REVIEW.md`)
+and the integration decision record (`integration/CONTRACT-INTEGRATION.md`).
+Where those artifacts and this package disagree, the contract review's
+repository facts win; decision IDs cited below (D05, D11, C15, S14, …) refer
+to it.
+
 ## Package contents
 
 | Artifact | What it is |
@@ -42,7 +49,8 @@ python3 -m http.server -d docs/ux-design/phase-2/prototype 8123
   override (stale / disconnected) for Lanes on service runtimes.
 - Every state is also deep-linkable, e.g.
   `#/d2/agents?demo=error`, `#/d1/lane/lane-2?conn=stale`,
-  `#/d1/lane/lane-2?drawer=approvals`.
+  `#/d1/lane/lane-2?drawer=approvals`, and the Computer Use contract
+  illustration `#/d1/lane/lane-1?drawer=computer&cu=contract`.
 
 Representative fixtures: a running Lane (`lane-1`), an approval-gated
 isolated diff (`lane-2`), an ad-hoc Lane (`lane-3`), an interrupted Run with
@@ -58,9 +66,9 @@ directions differ in **hierarchy**, not vocabulary.
 
 | Term | Meaning | Source of truth |
 |---|---|---|
-| **Agent** | A durable identity: name, role, policy, memory, default model, checkpoint lineage. Lives across many Lanes. | `AgentRecord` + [runtime model](../../AGENT_LANE_RUNTIME_MODEL.md) |
-| **Lifecycle** (Agent) | A user decision: Active, Paused, Retired. | runtime model |
-| **Health** (Agent) | What is happening now: Ready, Running, Waiting, Interrupted, Failed, Needs attention. Never conflated with lifecycle. | runtime model |
+| **Agent** | A durable identity: name, role, policy, memory, default model, checkpoint lineage. Lives across many Lanes. An Agent has no Runtime of its own — Runtime belongs to each Lane; Agent surfaces show the current/last Lane's runtime or an aggregate. | `AgentRecord` + [runtime model](../../AGENT_LANE_RUNTIME_MODEL.md) |
+| **Lifecycle** (Agent) | A user decision: Active, Paused, Retired. **Proposed contract, not implemented** — the runtime's enum today is operational health only (`active\|waiting\|interrupted\|failed\|completed`). Pause/Retire/Unretire are marked "Proposed" throughout the prototype. | contract review §2.4 |
+| **Health** (Agent) | What is happening now: Ready, Running, Waiting, Interrupted, Failed. "Needs attention" is derived from Lane state for presentation, never stored on the Agent (C15). Never conflated with lifecycle. | runtime model + contract review |
 | **Lane** | A high-turnover work context: objective, workspace, branch/worktree, transcript, queue, Runs, approvals, changes, tests, runtime target. Frequently archived. May be **ad hoc** (no Agent). | Lane projection over `SessionSummary` |
 | **Run** | One durable execution inside a Lane, with progress, interruption, checkpoint, retry/continuation lineage, diff/test evidence, and approval state. | `RunRecord` |
 | **Checkpoint** | A verified continuation boundary produced by a Run; belongs to Agent continuity, attributable to the Lane/Run that made it. Resume from it is always explicit. | `ContinuationCheckpoint`, [persistent agent protocol](../../PERSISTENT_AGENT_PROTOCOL.md) |
@@ -88,10 +96,15 @@ review; each principle names the findings it answers.
    Resume, Fork) ≠ organize (Archive/Restore) ≠ end-of-life (Retire, Delete).
    Different groups, different visual weight, different confirmations, and
    confirmation copy that states what is preserved. *(F-05)*
-5. **Runtime is visible before it matters.** The target and its connection
-   state appear in the Lane header, in the composer ("Sends to X on Y"), and
-   at Lane creation — never only in a settings panel. Sync claims are limited
-   to what the service contract documents. *(F-06, F-07)*
+5. **Runtime is visible before it matters — and belongs to the Lane.** The
+   target and its connection state appear in the Lane header, in the composer
+   ("Sends to X on Y"), and at Lane creation — never only in a settings panel
+   and never as an Agent-wide property. Continuing an objective on another
+   Runtime is an explicit action that creates or selects a different Lane;
+   nothing is silently retargeted and no files, terminals, credentials, or
+   live Runs move (D11). Sync claims are limited to what the service contract
+   documents; local-desktop copy distinguishes local persistence from prompts
+   sent to the configured model provider. *(F-06, F-07)*
 6. **Progressive disclosure, not capability removal.** Terminal, MCP,
    Computer Use, queue/steering, diffs/tests/approvals, worktrees, and run
    history all remain reachable within two interactions from a focused Lane —
@@ -108,8 +121,9 @@ Shared spine (all directions expose these objects and screens; the
 
 ```text
 GrokPtah
-├── Agents ................ durable roster; lifecycle + health, runtime, lane counts,
-│   │                       checkpoint; Create / Pause / Retire (separate from Archive)
+├── Agents ................ durable roster; lifecycle + health, current-Lane runtime,
+│   │                       lane counts, checkpoint; Create / Pause / Retire
+│   │                       (proposed lifecycle; always separate from Archive)
 │   └── Agent detail ...... identity + memory/policy; Lanes grouped Active /
 │                           Attention / Archived; Start Lane (runtime chosen here);
 │                           adopt ad-hoc Lanes
@@ -150,7 +164,7 @@ never the only channel — every state has an icon and a text label.
 | Awaiting approval | purple | Lane banner, Approvals drawer, roster badges | review diff → approve / deny |
 | Blocked / Workspace missing | orange | Lane banner + header chip | the named repair (e.g. Choose folder) |
 | Interrupted | orange | Lane banner, Run history | resume from verified checkpoint / retry / inspect |
-| Reconnecting (stale) | orange | Lane banner | refresh; data labeled "from last durable cursor" |
+| Reconnecting (stale) | orange | Lane banner | refresh; data labeled "from last durable cursor". Note: `reconnecting` is the wire value; "stale" is presentation of last-known data, never a stored connection state (C2) |
 | Disconnected | red | runtime chip, Lane banner | reconnect / switch runtime |
 | Failed | red | Run, refresh errors | retry + Technical details |
 | Unverified | orange | tests/changes | run or observe tests |
@@ -180,9 +194,24 @@ validated in a product walkthrough:
   reconnecting, disconnected) illustrate the documented
   [headless service contract](../../HEADLESS_SERVICE.md) — durable ledger,
   allowlisted workspaces, cursor recovery, explicit resume — not observed
-  product behavior.
-- Computer Use appears **only** in its audited unavailable state; the
-  prototype deliberately does not depict a successful capture.
+  product behavior. Every service/hosted Lane surface carries this note
+  inline, in the viewport, not only in a footer. Nothing claims that
+  transcripts, source files, terminals, credentials, clipboard, or Computer
+  Use authority synchronize.
+- Agent Pause / Retire / Unretire are **proposed lifecycle behavior**
+  (contract review §2.4), visibly marked "Proposed" in the prototype. The
+  retire dialog demonstrates the proposed D05 eligibility gate: retirement
+  is blocked while queued/running Runs or live isolated approvals exist.
+- Computer Use appears in its audited unavailable state (default), plus one
+  **contract-labelled operator-control illustration** for issue #273 /
+  rubric S14 (`?drawer=computer&cu=contract`): exact Lane + Run, local
+  app/window target, grant scope and expiry, model/provider, origin,
+  action/time budgets, current action, observation freshness,
+  always-reachable Pause / Stop / Take over / non-cancelling Steer, and a
+  review state bound to Lane, Run, action, target, and fresh evidence.
+  Restart, target change, or stale observation invalidates authority. This
+  is design-contract illustration, never an observed capture, and never
+  hosted.
 - All fixture content (agents, lanes, runs, transcripts, timestamps) is
   illustrative.
 

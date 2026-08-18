@@ -30,10 +30,12 @@ docs/ux-design/phase-2/captures/capture.sh
 | `d2-lane-archived.png` | `#/d2/lane/lane-6` | Archived Lane: preservation copy, Restore action, composer blocked with restore guidance |
 | `d2-lanes-archived-view.png` | `#/d2/lanes/archived` | Archive view: preservation banner, archived rows (incl. "Scratch workspace" label hygiene), Restore actions |
 | `d2-lane-disconnected-vm.png` | `#/d2/lane/lane-10` | Disconnected local service/VM: last-seen, reconnect or switch-runtime, durable-history copy |
-| `d3-supervision-workspace.png` | `#/d3/workspace` | Direction 3 default: scope bar, two self-labeled zones with composers, Inspector pinned to a named Lane |
-| `d3-runtime-targets.png` | `#/d3/runtime` | Runtime targets: connection, workspace authority, "what syncs" boundaries, support matrix, per-Lane runtime table |
+| `d3-supervision-workspace.png` | `#/d3/workspace` | Direction 3 default: scope bar, two self-labeled zones with composers, Inspector pinned to a named Lane; hosted zone carries an inline documented-contract note |
+| `d3-runtime-targets.png` | `#/d3/runtime` | Runtime targets: connection, workspace authority, "what syncs" boundaries (local desktop distinguishes local persistence from provider traffic), support matrix, per-Lane runtime table, D11 continuation rule |
+| `d1-computer-use-contract.png` | `#/d1/lane/lane-1?drawer=computer&cu=contract` | Contract-labelled Computer Use operator control (#273 / S14): Lane + Run, local app/window target, grant scope/expiry, model/provider/origin, budgets, current action, observation freshness, approval bound to Lane·Run·action·target·evidence, invalidation statement, sticky Pause/Stop/Take over/Steer. Design contract, local only, not an observed capture |
 | `narrow-d1-focused-lane.png` | `#/d1/lane/lane-1` @760px | Narrow-window behavior: horizontal rail strip, icon-only dock (names preserved for AT), stacked composer |
-| `narrow-d2-agent-roster.png` | `#/d2/agents` @760px | Narrow roster: single-column cards, collapsed direction switcher |
+| `narrow-d2-agent-roster.png` | `#/d2/agents` @760px | Narrow roster: single-column cards, current/last Lane runtime rows, "Proposed" lifecycle markers, collapsed direction switcher |
+| `narrow-d1-computer-contract.png` | `#/d1/lane/lane-1?drawer=computer&cu=contract` @760px | Computer Use contract state at narrow width: target block and operator controls remain visible (sticky) inside the overlay drawer |
 
 Evidence note: these are renders of fixture data in a static prototype.
 They demonstrate design intent only — in particular, hosted-service and

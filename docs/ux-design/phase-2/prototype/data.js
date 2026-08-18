@@ -64,7 +64,8 @@ const RUNTIME_TARGETS = {
     icon: "laptop",
     connection: "connected",
     workspaceAuthority: "This desktop chooses workspace folders directly.",
-    syncPolicy: "Everything stays on this Mac. Nothing is uploaded.",
+    syncPolicy:
+      "Transcripts, Runs, and checkpoints persist only on this Mac. Prompts and any workspace content included in a turn are still sent to the configured model provider.",
     supports: ["Queue", "Steering", "Terminal", "Approvals", "Diffs & tests", "Computer Use (when granted)"],
     lastSeen: "now",
     detail: "In-process bridge in the desktop app.",
@@ -99,9 +100,16 @@ const RUNTIME_TARGETS = {
 
 /* ---------------------------------------------------------------- *
  * Agents — durable identities
- * lifecycle: active | paused | retired      (a decision the user made)
- * health:    ready | running | waiting | interrupted | failed
- *            | needs_attention               (what is happening right now)
+ *
+ * lifecycle: active | paused | retired — PROPOSED product contract
+ *   (GROK-BUILD-CONTRACT-REVIEW §2.4). The implemented runtime enum is
+ *   operational health only: active|waiting|interrupted|failed|completed.
+ *   Pause / Retire / Unretire are design exploration, marked "Proposed"
+ *   in the UI, and are kept separate from operational health.
+ * health: what is happening right now. "needs_attention" is DERIVED
+ *   presentation from Lane state (contract C15), never a stored enum.
+ * Runtime belongs to a LANE, not an Agent. Agents carry no runtime
+ *   field; cards show the current/last Lane's runtime or an aggregate.
  * ---------------------------------------------------------------- */
 
 const AGENTS = [
@@ -114,7 +122,6 @@ const AGENTS = [
     model: "grok-4.5",
     policy: "Workspace writes allowed · shell allowed · network denied",
     memory: "12 memory notes · scoped to crates/codegen",
-    runtime: "local_desktop",
     checkpoint: { id: "c-12", verified: true, at: "2026-08-16 22:04", reason: "Terminal run completed" },
     currentLane: "lane-1",
     laneIds: ["lane-1", "lane-6"],
@@ -128,7 +135,6 @@ const AGENTS = [
     model: "grok-4.5",
     policy: "Isolated worktrees only · promotion requires approval",
     memory: "31 memory notes · release rituals and gateway quirks",
-    runtime: "hosted_service",
     checkpoint: { id: "c-77", verified: true, at: "2026-08-17 06:48", reason: "Run interrupted by service restart" },
     currentLane: "lane-2",
     laneIds: ["lane-2", "lane-4", "lane-9"],
@@ -142,7 +148,6 @@ const AGENTS = [
     model: "grok-4-mini",
     policy: "Read-mostly · docs/ writes only · no shell",
     memory: "6 memory notes · terminology decisions",
-    runtime: "local_service",
     checkpoint: null, // "No checkpoint yet" case
     currentLane: null,
     laneIds: ["lane-10", "lane-5"],
@@ -156,7 +161,6 @@ const AGENTS = [
     model: "grok-4",
     policy: "Retired — cannot start new Lanes or Runs",
     memory: "18 memory notes · preserved, read-only",
-    runtime: "local_desktop",
     checkpoint: { id: "c-41", verified: true, at: "2026-07-30 18:22", reason: "Final migration run completed" },
     currentLane: null,
     laneIds: ["lane-8"],
@@ -529,6 +533,36 @@ const COMPUTER_USE = {
   ],
   action: "Grant both permissions to GrokPtah in macOS System Settings, then restart the app.",
   technical: "computer-use store ~/.grokptah/computer-use is already open (Resource temporarily unavailable, os error 35)",
+};
+
+/*
+ * Contract illustration for issue #273 / rubric S14: what a local
+ * Computer Run in operator control SHOULD show. This is design-contract
+ * illustration only — no successful Computer Use capture was observed in
+ * Phase 1, and this state is never depicted on a hosted Lane. Authority
+ * is local and non-transferable; restart, target change, or a stale
+ * observation invalidates it. Operator takeover is absorbing.
+ */
+const COMPUTER_USE_CONTRACT = {
+  laneId: "lane-1",
+  computerRun: "cr-42",
+  attributedRun: "r-311",
+  target: "Xcode — window “GrokPtah.xcodeproj — queue.rs”",
+  grantScope: "Observe screen + pointer input in the selected window only",
+  grantExpiry: "expires in 04:32 of 10:00",
+  model: "grok-4.5 via xAI",
+  origin: "desktop",
+  actionBudget: { used: 12, max: 40 },
+  timeBudget: { used: "05:28", max: "10:00" },
+  currentAction: "Reading the build log panel (observation only)",
+  freshness: "Last observation 2 s ago — fresh",
+  pendingApproval: {
+    action: "Action #13 — click “Run” in the toolbar",
+    boundTo: "Lane lane-1 · Computer Run cr-42 · target window above",
+    evidence: "Screenshot 2 s old (fresh)",
+  },
+  invalidation:
+    "Restart, target change, or a stale observation invalidates this authority. Take over is absorbing — agent authority does not return without a new grant.",
 };
 
 /* ---------------------------------------------------------------- *

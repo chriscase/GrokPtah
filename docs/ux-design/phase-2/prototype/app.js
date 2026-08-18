@@ -10,7 +10,7 @@
 
 const APP = {
   demo: { agents: "loaded", conn: "" }, // prototype-state controls
-  ui: { drawer: null, pinned: "lane-1", inspectorTab: "changes" },
+  ui: { drawer: null, pinned: "lane-1", inspectorTab: "changes", cuTab: "observed" },
 };
 
 const DEFAULT_ROUTE = { d1: "/d1/lane/lane-1", d2: "/d2/agents", d3: "/d3/workspace" };
@@ -27,6 +27,7 @@ function parseHash() {
     if (params.has("demo")) APP.demo.agents = params.get("demo");
     if (params.has("conn")) APP.demo.conn = params.get("conn");
     if (params.has("drawer")) APP.ui.drawer = params.get("drawer");
+    if (params.has("cu")) APP.ui.cuTab = params.get("cu"); // observed | contract
   }
   const parts = path.split("/").filter(Boolean);
   const dir = DIRECTIONS[parts[0]] ? parts[0] : "d1";
@@ -255,8 +256,16 @@ function openDemoDialog() {
 }
 
 document.addEventListener("click", function (ev) {
-  const t = ev.target.closest("[data-drawer], [data-drawer-close], [data-modal], [data-open-demo], [data-demo], [data-inspector-tab]");
+  const t = ev.target.closest("[data-drawer], [data-drawer-close], [data-modal], [data-open-demo], [data-demo], [data-inspector-tab], [data-cu-tab]");
   if (!t) return;
+
+  if (t.hasAttribute("data-cu-tab")) {
+    APP.ui.cuTab = t.getAttribute("data-cu-tab");
+    render();
+    const btn = document.querySelector('[data-cu-tab="' + APP.ui.cuTab + '"]');
+    if (btn) btn.focus();
+    return;
+  }
 
   if (t.hasAttribute("data-drawer")) {
     const id = t.getAttribute("data-drawer");
@@ -294,7 +303,6 @@ document.addEventListener("click", function (ev) {
     const action = t.getAttribute("data-demo");
     if (action === "demo-agents-loaded") { APP.demo.agents = "loaded"; render(); }
     else if (action === "open-drawer-approvals") { APP.ui.drawer = "approvals"; render(); }
-    else if (action === "open-runtime") { location.hash = "#/" + parseHash().dir + "/runtime"; }
     else if (action === "assign-agent") { openModal("assign", parseHash().id + ":agent-1"); }
   }
 });
