@@ -30,7 +30,13 @@ import { FleetStrip } from "./components/FleetStrip";
 import { SearchPanel } from "./components/SearchPanel";
 import { SessionBrowser } from "./components/SessionBrowser";
 import { SessionPane } from "./components/SessionPane";
+import {
+  LaneContextHeader,
+  runtimeConnectionLabel,
+  runtimeTargetLabel,
+} from "./components/LaneContextHeader";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { StateCard } from "./components/StateCard";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
 import { PromptQueuePanel } from "./components/PromptQueuePanel";
@@ -101,30 +107,6 @@ type WorkspaceMode = "build" | "chat";
 
 function titleCaseComputerState(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
-}
-
-function runtimeConnectionLabel(value: LaneSummary["runtime_connection"]): string {
-  switch (value) {
-    case "reconnecting":
-      return "Reconnecting";
-    case "disconnected":
-      return "Disconnected";
-    case "error":
-      return "Unavailable";
-    default:
-      return "Connected";
-  }
-}
-
-function runtimeTargetLabel(value: LaneSummary["runtime_target"]): string {
-  switch (value) {
-    case "local_service":
-      return "Local service";
-    case "hosted_service":
-      return "Hosted service";
-    default:
-      return "Local desktop";
-  }
 }
 
 type RightTab =
@@ -301,6 +283,13 @@ export default function App() {
   const [activeLaneId, setActiveLaneId] = useState<string | null>(null);
   const activeSessionId = activeLaneId;
   const setActiveSessionId = setActiveLaneId;
+  const [laneScopePendingId, setLaneScopePendingId] = useState<string | null>(null);
+  const [laneScopeBlocked, setLaneScopeBlocked] = useState<{
+    id: string;
+    message: string;
+  } | null>(null);
+  const laneScopeRequestRef = useRef(0);
+  const laneScopeChainRef = useRef<Promise<void>>(Promise.resolve());
   const [models, setModels] = useState<ModelInfo[]>([]);
   const {
     composer,
@@ -799,6 +788,22 @@ export default function App() {
     () => mergeLaneProjections(lanes, remoteLanes),
     [lanes, remoteLanes],
   );
+  const activeLane = useMemo(
+    () => visibleLanes.find((lane) => lane.id === activeSessionId) ?? null,
+    [activeSessionId, visibleLanes],
+  );
+  const archivedLaneIds = useMemo(
+    () => new Set(visibleLanes.filter((lane) => lane.archived).map((lane) => lane.id)),
+    [visibleLanes],
+  );
+  const activeLaneArchived = Boolean(
+    activeLane?.archived ?? activeSummary?.archived,
+  );
+  const laneWorkspaceInteractionBlocked =
+    activeLaneArchived ||
+    laneScopePendingId === activeSessionId ||
+    laneScopeBlocked?.id === activeSessionId;
+  const computerCockpitVisible = computerOpen && !laneWorkspaceInteractionBlocked;
   const selectedRemoteLane = useMemo(
     () => remoteLanes.find((lane) => lane.id === remoteTargetSessionId) ?? null,
     [remoteLanes, remoteTargetSessionId],
@@ -806,7 +811,7 @@ export default function App() {
   const activeContextAgentId =
     executionTarget === "remote" && selectedRemoteLane
       ? selectedRemoteLane.agent_id
-      : activeSummary?.agent_id;
+      : activeLane?.agent_id ?? activeSummary?.agent_id;
   const effortOptions = useMemo(
     () => effortOptionsForModel(models, status?.model),
     [models, status?.model],
@@ -815,7 +820,13 @@ export default function App() {
   const currentModelInfo = models.find((model) => model.id === status?.model);
   const activeTabKind = kindForTab(activeTab, sessions, workspaceMode);
   const activeIsBuild = activeTabKind === "build";
-  const activeCwd = activeSummary?.cwd || activeTab?.cwd;
+  const activeCwd = activeLane?.cwd || activeSummary?.cwd || activeTab?.cwd;
+
+  useEffect(() => {
+    if (!laneWorkspaceInteractionBlocked) return;
+    setComputerOpen(false);
+    setShowTerm(false);
+  }, [laneWorkspaceInteractionBlocked]);
 
   const patchTab = useCallback(
     (id: string, patch: (tab: SessionTab) => SessionTab) => {
@@ -825,6 +836,20 @@ export default function App() {
     },
     [],
   );
+
+  const queueLaneScopePromotion = useCallback((id: string, archived: boolean) => {
+    const request = ++laneScopeRequestRef.current;
+    setLaneScopePendingId(id);
+    setLaneScopeBlocked(null);
+    const promotion = laneScopeChainRef.current.then(() =>
+      archived ? api.sessionInspect(id) : api.sessionLoad(id),
+    );
+    laneScopeChainRef.current = promotion.then(
+      () => undefined,
+      () => undefined,
+    );
+    return { request, promotion };
+  }, []);
 
   const openTab = useCallback(
     async (summary: SessionSummary, hydrate = true) => {
@@ -856,13 +881,26 @@ export default function App() {
         ];
       });
       if (!hydrate) return;
+      const inspectOnly = Boolean(summary.archived);
+      const { request: scopeRequest, promotion } = queueLaneScopePromotion(
+        summary.id,
+        inspectOnly,
+      );
       try {
-        // Resume: promote backend active session + cwd, then hydrate transcript (#38).
-        const loaded = await api.sessionLoad(summary.id);
+        // Archived Lanes hydrate for inspection without changing the bridge's
+        // active workspace/tool scope. Live Lanes retain resume semantics.
+        const loaded = await promotion;
+        if (scopeRequest !== laneScopeRequestRef.current) {
+          return;
+        }
+        setLaneScopeBlocked(null);
         const entries = await api.sessionTranscript(loaded.id);
         const completionHistory = await api
           .sessionCompletionHistory(loaded.id)
           .catch(() => []);
+        if (scopeRequest !== laneScopeRequestRef.current) {
+          return;
+        }
         const latestCompletion = completionHistory[completionHistory.length - 1];
         const restoredTranscript = entriesToTranscriptItems(entries);
         const interrupted = hasInterruptedTurn(entries);
@@ -899,24 +937,29 @@ export default function App() {
             };
           }),
         );
-        if (loaded.cwd && loaded.workspace_status === "ready") {
+        if (!inspectOnly && loaded.cwd && loaded.workspace_status === "ready") {
           projectCwdHintRef.current = loaded.cwd;
         }
-        setStatus((st) =>
-          st
-            ? {
-                ...st,
-                active_session: loaded.id,
-                project_cwd:
-                  loaded.workspace_status === "ready"
-                    ? loaded.cwd || st.project_cwd
-                    : st.project_cwd,
-              }
-            : st,
-        );
+        if (!inspectOnly) {
+          setStatus((st) =>
+            st
+              ? {
+                  ...st,
+                  active_session: loaded.id,
+                  project_cwd:
+                    loaded.workspace_status === "ready"
+                      ? loaded.cwd || st.project_cwd
+                      : st.project_cwd,
+                }
+              : st,
+          );
+        }
         // #152: show historical subagent summary after reopen (host loads from disk).
         setSubagents(await api.subagentsList());
       } catch (error) {
+        if (scopeRequest === laneScopeRequestRef.current) {
+          setLaneScopeBlocked({ id: summary.id, message: String(error) });
+        }
         setTabs((prev) =>
           prev.map((t) =>
             t.id === summary.id
@@ -928,23 +971,14 @@ export default function App() {
               : t,
           ),
         );
+      } finally {
+        if (scopeRequest === laneScopeRequestRef.current) {
+          setLaneScopePendingId(null);
+        }
       }
     },
-    [],
+    [queueLaneScopePromotion],
   );
-
-  const closeTab = useCallback((id: string) => {
-    setDocks((d) => d.filter((x) => x !== id));
-    forgetComposerSession(id);
-    setTabs((prev) => {
-      const next = prev.filter((t) => t.id !== id);
-      setActiveSessionId((cur) => {
-        if (cur !== id) return cur;
-        return next[next.length - 1]?.id ?? null;
-      });
-      return next;
-    });
-  }, [forgetComposerSession]);
 
   const undockSession = useCallback((id: string) => {
     setDocks((d) => {
@@ -955,22 +989,68 @@ export default function App() {
 
   const focusSession = useCallback((id: string) => {
     setActiveLaneId(id);
+    const archived = Boolean(
+      visibleLanes.find((lane) => lane.id === id)?.archived ??
+        sessions.find((session) => session.id === id)?.archived,
+    );
+    const { request, promotion } = queueLaneScopePromotion(id, archived);
     // Make the bridge's project/tool scope follow the selected Lane as well
     // as the visible tab. This prevents Git, MCP, files, and Terminal from
     // silently describing the previously loaded Lane when multiple lanes are
     // open.
-    void api.sessionLoad(id).then((loaded) => {
+    return promotion.then((loaded) => {
+      if (request !== laneScopeRequestRef.current) {
+        return;
+      }
+      setLaneScopeBlocked(null);
       setSessions((current) =>
         current.map((session) => (session.id === loaded.id ? loaded : session)),
       );
-      if (loaded.cwd && loaded.workspace_status === "ready") {
+      if (!archived && loaded.cwd && loaded.workspace_status === "ready") {
         projectCwdHintRef.current = loaded.cwd;
       }
-    }).catch(() => {
-      // The tab remains selectable; its existing activity/error surface is
-      // the recovery path for a failed scope promotion.
+      if (!archived) {
+        setStatus((current) =>
+          current
+            ? {
+                ...current,
+                active_session: loaded.id,
+                project_cwd:
+                  loaded.workspace_status === "ready"
+                    ? loaded.cwd || current.project_cwd
+                    : current.project_cwd,
+              }
+            : current,
+        );
+      }
+    }).catch((error) => {
+      if (request === laneScopeRequestRef.current) {
+        setLaneScopeBlocked({ id, message: String(error) });
+        patchTab(id, (tab) => ({ ...tab, activity: errorActivity(String(error)) }));
+      }
+    }).finally(() => {
+      if (request === laneScopeRequestRef.current) {
+        setLaneScopePendingId(null);
+      }
     });
-  }, []);
+  }, [patchTab, queueLaneScopePromotion, sessions, visibleLanes]);
+
+  const closeTab = useCallback((id: string) => {
+    const next = tabs.filter((tab) => tab.id !== id);
+    const replacement = next[next.length - 1] ?? null;
+    setDocks((d) => d.filter((x) => x !== id));
+    forgetComposerSession(id);
+    setTabs(next);
+    if (activeSessionId !== id) return;
+    if (replacement) {
+      focusSession(replacement.id);
+    } else {
+      ++laneScopeRequestRef.current;
+      setLaneScopePendingId(null);
+      setLaneScopeBlocked(null);
+      setActiveSessionId(null);
+    }
+  }, [activeSessionId, focusSession, forgetComposerSession, tabs]);
 
   const hideLiveRail = useCallback(() => {
     setLiveHidden(true);
@@ -986,6 +1066,15 @@ export default function App() {
     }
   }, [workspaceMode]);
 
+  const restoreLane = useCallback(
+    async (id: string) => {
+      const restored = await api.sessionArchive(id, false);
+      await openTab(restored, true);
+      await refreshSessions();
+    },
+    [openTab, refreshSessions],
+  );
+
   useEffect(() => {
     if (!workspaceRestored) return;
     void refreshSessions();
@@ -994,14 +1083,6 @@ export default function App() {
   /** Open from browser or sidebar; drop from tabs if deleted. */
   const handleSessionBrowserOpen = useCallback(
     async (s: SessionSummary) => {
-      if (s.archived) {
-        // Unarchive when opening so it re-enters the active list.
-        try {
-          s = await api.sessionArchive(s.id, false);
-        } catch {
-          /* keep trying load */
-        }
-      }
       if (s.kind === "chat" || s.kind === "build") {
         setWorkspaceMode(s.kind);
       }
@@ -1014,21 +1095,14 @@ export default function App() {
 
   const handleSessionBrowserChanged = useCallback(async () => {
     await refreshSessions();
-    // Drop tabs for deleted / archived sessions
+    // Drop deleted tabs. Archived tabs remain available for read-only inspection.
     try {
       const live = await api.sessionListAll();
       const liveIds = new Set(live.map((s) => s.id));
-      const archivedIds = new Set(
-        live.filter((s) => s.archived).map((s) => s.id),
-      );
-      setTabs((prev) =>
-        prev.filter((t) => liveIds.has(t.id) && !archivedIds.has(t.id)),
-      );
+      setTabs((prev) => prev.filter((t) => liveIds.has(t.id)));
       setActiveSessionId((cur) => {
         if (!cur) return cur;
-        if (!liveIds.has(cur) || archivedIds.has(cur)) {
-          return null;
-        }
+        if (!liveIds.has(cur)) return null;
         return cur;
       });
       // Refresh tab titles after rename
@@ -1038,10 +1112,16 @@ export default function App() {
           return s ? { ...t, title: s.title } : t;
         }),
       );
+      const active = activeSessionId
+        ? live.find((session) => session.id === activeSessionId)
+        : null;
+      if (active && activeLaneArchived && !active.archived) {
+        await focusSession(active.id);
+      }
     } catch {
       /* ignore */
     }
-  }, [refreshSessions]);
+  }, [activeLaneArchived, activeSessionId, focusSession, refreshSessions]);
 
   const refreshChrome = useCallback(async () => {
     const request = chromeRefreshGuard.begin();
@@ -1184,12 +1264,15 @@ export default function App() {
           /* already running from Tauri setup */
         }
         const ws = await api.workspaceState();
+        const allSessions = await api.sessionListAll();
         if (cancelled) return;
         setSessions(ws.sessions);
         setLanes(ws.lanes ?? []);
-        const byId = new Map(ws.sessions.map((s) => [s.id, s]));
+        const byId = new Map(allSessions.map((s) => [s.id, s]));
         // Drop tabs for sessions that no longer exist on disk (test garbage, deletes).
-        let tabIds = (ws.open_tab_ids ?? []).filter((id) => byId.has(id));
+        let tabIds = (ws.open_tab_ids ?? []).filter(
+          (id) => byId.has(id),
+        );
         if (tabIds.length === 0) {
           tabIds = ws.sessions
             .filter((s) => s.message_count > 0)
@@ -1200,13 +1283,15 @@ export default function App() {
         if (
           tabIds.length !== (ws.open_tab_ids ?? []).length ||
           ((ws.active_lane_id ?? ws.active_session) &&
-            !byId.has(ws.active_lane_id ?? ws.active_session ?? ""))
+            (!byId.has(ws.active_lane_id ?? ws.active_session ?? "") ||
+              byId.get(ws.active_lane_id ?? ws.active_session ?? "")?.archived))
         ) {
           try {
             await api.setOpenTabs(
               tabIds,
               (ws.active_lane_id ?? ws.active_session) &&
-              byId.has(ws.active_lane_id ?? ws.active_session ?? "")
+              byId.has(ws.active_lane_id ?? ws.active_session ?? "") &&
+              !byId.get(ws.active_lane_id ?? ws.active_session ?? "")?.archived
                 ? (ws.active_lane_id ?? ws.active_session)
                 : (tabIds[0] ?? null),
             );
@@ -1221,19 +1306,19 @@ export default function App() {
         }
         const active =
           ((ws.active_lane_id ?? ws.active_session) &&
-          byId.has(ws.active_lane_id ?? ws.active_session ?? "")
+          byId.has(ws.active_lane_id ?? ws.active_session ?? "") &&
+          !byId.get(ws.active_lane_id ?? ws.active_session ?? "")?.archived
             ? (ws.active_lane_id ?? ws.active_session)
             : null) ??
           tabIds[0] ??
           null;
         if (active) {
-          setActiveSessionId(active);
           const activeSummary = byId.get(active);
           if (activeSummary?.kind === "chat" || activeSummary?.kind === "build") {
             setWorkspaceMode(activeSummary.kind);
           }
           try {
-            await api.sessionLoad(active);
+            await focusSession(active);
           } catch {
             /* missing */
           }
@@ -1273,11 +1358,14 @@ export default function App() {
   const openTabIdsKey = tabs.map((t) => t.id).join(",");
   useEffect(() => {
     if (!workspaceRestored) return;
+    const persistableIds = openTabIdsKey ? openTabIdsKey.split(",") : [];
     void api.setOpenTabs(
-      openTabIdsKey ? openTabIdsKey.split(",") : [],
-      activeSessionId,
+      persistableIds,
+      activeSessionId && !archivedLaneIds.has(activeSessionId)
+        ? activeSessionId
+        : null,
     );
-  }, [openTabIdsKey, activeSessionId, workspaceRestored]);
+  }, [openTabIdsKey, activeSessionId, archivedLaneIds, workspaceRestored]);
 
   const slashOpen = composer.startsWith("/") && !composer.includes(" ");
   const slashHits = useMemo(
@@ -1421,7 +1509,7 @@ export default function App() {
           } else {
             const s = await createSession(workspaceMode);
             if (!s) return;
-            if (primary) setActiveSessionId(primary);
+            if (primary) focusSession(primary);
             targetId = s.id;
           }
         }
@@ -1434,14 +1522,14 @@ export default function App() {
         let summary = sessions.find((s) => s.id === targetId);
         if (!summary) {
           try {
-            summary = await api.sessionLoad(targetId);
+            summary = await api.sessionInspect(targetId);
           } catch {
             return;
           }
         }
         const keepFocus = primary;
         await openTab(summary, true);
-        if (keepFocus) setActiveSessionId(keepFocus);
+        if (keepFocus) focusSession(keepFocus);
       }
 
       setDocks((d) => {
@@ -1475,6 +1563,7 @@ export default function App() {
       openTab,
       createSession,
       workspaceMode,
+      focusSession,
     ],
   );
 
@@ -1512,7 +1601,7 @@ export default function App() {
         const idx = Number(e.key) - 1;
         if (docks[idx]) {
           e.preventDefault();
-          setActiveSessionId(docks[idx]);
+          focusSession(docks[idx]);
         }
         return;
       }
@@ -1527,7 +1616,7 @@ export default function App() {
           e.key === "ArrowLeft"
             ? docks[(i - 1 + docks.length) % docks.length]
             : docks[(i + 1) % docks.length];
-        setActiveSessionId(next);
+        focusSession(next);
         return;
       }
 
@@ -1540,7 +1629,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [docks, activeSessionId, maxDocks, openBeside]);
+  }, [docks, activeSessionId, maxDocks, openBeside, focusSession]);
 
   async function ensureSession(): Promise<string> {
     // Prefer the active tab only when its kind matches Builds/Chats mode.
@@ -1550,7 +1639,7 @@ export default function App() {
       let kind = fromList?.kind;
       if (!kind) {
         try {
-          const loaded = await api.sessionLoad(activeSessionId);
+          const loaded = await api.sessionInspect(activeSessionId);
           kind = loaded.kind;
         } catch {
           // Missing/deleted session (e.g. cleaned test garbage) — create fresh.
@@ -1564,12 +1653,7 @@ export default function App() {
     // Reuse any already-open tab of the right kind.
     const openMatch = findTabOfKind(tabs, workspaceMode);
     if (openMatch) {
-      setActiveSessionId(openMatch.id);
-      try {
-        await api.sessionLoad(openMatch.id);
-      } catch {
-        /* ignore */
-      }
+      await focusSession(openMatch.id);
       return openMatch.id;
     }
     const s = await createSession(workspaceMode);
@@ -1580,6 +1664,10 @@ export default function App() {
   const openSessionContextMenu = useCallback(
     (sessionId: string, x: number, y: number) => {
       const current = sessions.find((s) => s.id === sessionId);
+      const isArchived = Boolean(
+        current?.archived ??
+          visibleLanes.find((lane) => lane.id === sessionId)?.archived,
+      );
       const isBuild =
         (current?.kind ?? workspaceMode) === "build";
       setCtxMenu({
@@ -1617,7 +1705,7 @@ export default function App() {
               void openBeside(sessionId);
             },
           },
-          ...(isBuild
+          ...(isBuild && !isArchived
             ? ([
                 {
                   type: "item" as const,
@@ -1633,10 +1721,11 @@ export default function App() {
             type: "item",
             id: "resume",
             label: "Resume (load history)",
+            disabled: isArchived,
             onClick: () => {
               void (async () => {
                 try {
-                  const s = await api.sessionLoad(sessionId);
+                  const s = await api.sessionInspect(sessionId);
                   await openTab(s, true);
                   setSessions(
                     await api.sessionListByKind(workspaceMode, false),
@@ -1677,6 +1766,7 @@ export default function App() {
             type: "item",
             id: "rewind-conv",
             label: "Rewind chat only",
+            disabled: isArchived,
             onClick: () => {
               void (async () => {
                 const tab = tabs.find((t) => t.id === sessionId);
@@ -1693,6 +1783,7 @@ export default function App() {
             type: "item",
             id: "rewind-files",
             label: "Rewind files only (agent edits)",
+            disabled: isArchived,
             onClick: () => {
               void (async () => {
                 const tab = tabs.find((t) => t.id === sessionId);
@@ -1707,6 +1798,7 @@ export default function App() {
             type: "item",
             id: "rewind-all",
             label: "Rewind chat + files",
+            disabled: isArchived,
             onClick: () => {
               void (async () => {
                 const tab = tabs.find((t) => t.id === sessionId);
@@ -1724,6 +1816,7 @@ export default function App() {
             type: "item",
             id: "compact",
             label: "Compact server context",
+            disabled: isArchived,
             onClick: () => {
               void (async () => {
                 await api.sessionCompact(sessionId);
@@ -1743,11 +1836,15 @@ export default function App() {
           {
             type: "item",
             id: "archive",
-            label: "Archive",
+            label: isArchived ? "Restore Lane" : "Archive",
             onClick: () => {
               void (async () => {
-                await api.sessionArchive(sessionId, true);
-                closeTab(sessionId);
+                const updated = await api.sessionArchive(sessionId, !isArchived);
+                if (isArchived) {
+                  await openTab(updated, true);
+                } else {
+                  closeTab(sessionId);
+                }
                 setSessions(
                   await api.sessionListByKind(workspaceMode, false),
                 );
@@ -1780,7 +1877,7 @@ export default function App() {
           {
             type: "item",
             id: "browse",
-            label: "Browse all sessions…",
+            label: "Browse all Lanes…",
             onClick: () => setSessionBrowserOpen(true),
           },
         ],
@@ -1788,6 +1885,7 @@ export default function App() {
     },
     [
       sessions,
+      visibleLanes,
       tabs,
       workspaceMode,
       openTab,
@@ -1883,6 +1981,32 @@ export default function App() {
   ) {
     const prompt = (text ?? composer).trim();
     if (!prompt) return;
+    const targetSessionId = opts?.sessionId ?? activeSessionId;
+    if (targetSessionId && archivedLaneIds.has(targetSessionId)) {
+      const message =
+        "Archived Lanes are inspection-only. Restore this Lane before starting or steering work.";
+      if (opts?.fromQueue) throw new Error(message);
+      patchTab(targetSessionId, (tab) => ({
+        ...tab,
+        activity: errorActivity(message),
+      }));
+      return;
+    }
+    if (
+      targetSessionId &&
+      (laneScopePendingId === targetSessionId || laneScopeBlocked?.id === targetSessionId)
+    ) {
+      const message =
+        laneScopeBlocked?.id === targetSessionId
+          ? laneScopeBlocked.message
+          : "Wait for the selected Lane workspace to finish switching.";
+      if (opts?.fromQueue) throw new Error(message);
+      patchTab(targetSessionId, (tab) => ({
+        ...tab,
+        activity: errorActivity(message),
+      }));
+      return;
+    }
     const fromComposer = text === undefined;
     if (fromComposer) {
       clearComposerFor(activeSessionId);
@@ -2339,6 +2463,18 @@ export default function App() {
 
   async function loadRight(tab: RightTab) {
     setRightTab(tab);
+    const needsWorkspaceScope = ["files", "git", "mcp", "rules"].includes(tab);
+    if (needsWorkspaceScope && laneWorkspaceInteractionBlocked) {
+      setFiles([]);
+      setFuzzyHits([]);
+      setGitStatus("");
+      setGitDiff("");
+      setWorktrees("");
+      setMcp([]);
+      setMcpDoctor([]);
+      setRules([]);
+      return;
+    }
     try {
       if (tab === "files") setFiles(await api.fileTree());
       if (tab === "git") {
@@ -2364,6 +2500,19 @@ export default function App() {
     }
   }
 
+  const rightTabNeedsWorkspaceScope = ["files", "git", "mcp", "rules"].includes(
+    rightTab,
+  );
+  const rightTabWorkspaceUnavailable =
+    rightTabNeedsWorkspaceScope && laneWorkspaceInteractionBlocked;
+
+  useEffect(() => {
+    if (!workspaceRestored || !activeSessionId) return;
+    void loadRight(rightTab);
+    // Refresh workspace-scoped panels only after Lane promotion settles.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessionId, laneWorkspaceInteractionBlocked, workspaceRestored]);
+
   const openPersistentAgentSession = useCallback(
     async (agent: import("./lib/protocol").PersistentAgent) => {
       if (remoteServiceStatus.connected) {
@@ -2373,7 +2522,7 @@ export default function App() {
         return;
       }
       try {
-        const session = await api.sessionLoad(agent.sessionId);
+        const session = await api.sessionInspect(agent.sessionId);
         setWorkspaceMode("build");
         await openTab(session, true);
       } catch (error) {
@@ -2392,7 +2541,7 @@ export default function App() {
         crypto.randomUUID(),
       );
       try {
-        const session = await api.sessionLoad(agent.sessionId);
+        const session = await api.sessionInspect(agent.sessionId);
         await openTab(session, true);
       } catch {
         /* The event stream still updates an already-open tab. */
@@ -2449,8 +2598,8 @@ export default function App() {
               className={`chrome-toggle ${sidebarCollapsed ? "" : "is-on"}`}
               title={
                 sidebarCollapsed
-                  ? "Show sessions sidebar (⌘B)"
-                  : "Hide sessions sidebar (⌘B)"
+                  ? "Show Lanes sidebar (⌘B)"
+                  : "Hide Lanes sidebar (⌘B)"
               }
               aria-pressed={!sidebarCollapsed}
               onClick={() => setSidebarCollapsed((v) => !v)}
@@ -2458,7 +2607,7 @@ export default function App() {
               <span className="chrome-toggle-icon" aria-hidden>
                 {sidebarCollapsed ? "▏" : "◂"}
               </span>
-              Sessions
+              Lanes
             </button>
             <button
               type="button"
@@ -2491,9 +2640,14 @@ export default function App() {
             </button>
             <button
               type="button"
-              className={`chrome-toggle ${computerOpen ? "is-on" : ""}`}
-              aria-pressed={computerOpen}
-              title="Open Computer Run cockpit"
+              className={`chrome-toggle ${computerCockpitVisible ? "is-on" : ""}`}
+              aria-pressed={computerCockpitVisible}
+              disabled={laneWorkspaceInteractionBlocked}
+              title={
+                laneWorkspaceInteractionBlocked
+                  ? "Wait for the selected Lane workspace, or restore this archived Lane"
+                  : "Open Computer Run cockpit"
+              }
               onClick={() => setComputerOpen((open) => !open)}
             >
               {computerRunState &&
@@ -2557,23 +2711,23 @@ export default function App() {
         <button
           type="button"
           className="rail-expand"
-          title="Show sessions sidebar (⌘B)"
-          aria-label="Show sessions sidebar"
+          title="Show Lanes sidebar (⌘B)"
+          aria-label="Show Lanes sidebar"
           onClick={() => setSidebarCollapsed(false)}
         >
           <span className="rail-expand-chevron" aria-hidden>
             ▸
           </span>
-          <span className="rail-expand-label">Sessions</span>
+          <span className="rail-expand-label">Lanes</span>
         </button>
         <div className="panel-body">
         <div className="panel-chrome">
-          <span className="panel-chrome-title">Sessions</span>
+          <span className="panel-chrome-title">Lanes</span>
           <button
             type="button"
             className="panel-collapse-btn"
-            title="Hide sessions sidebar (⌘B)"
-            aria-label="Hide sessions sidebar"
+            title="Hide Lanes sidebar (⌘B)"
+            aria-label="Hide Lanes sidebar"
             onClick={() => setSidebarCollapsed(true)}
           >
             ◂
@@ -2593,7 +2747,7 @@ export default function App() {
               setWorkspaceMode("build");
               // Don't keep answering in a chat tab while Builds is selected.
               const buildTab = findTabOfKind(tabs, "build");
-              if (buildTab) setActiveSessionId(buildTab.id);
+              if (buildTab) focusSession(buildTab.id);
               else if (
                 activeSummary &&
                 (activeSummary.kind ?? "build") !== "build"
@@ -2610,7 +2764,7 @@ export default function App() {
             onClick={() => {
               setWorkspaceMode("chat");
               const chatTab = findTabOfKind(tabs, "chat");
-              if (chatTab) setActiveSessionId(chatTab.id);
+              if (chatTab) focusSession(chatTab.id);
               else if (activeSummary?.kind !== "chat") {
                 // Force ensureSession to create a chat on next send.
                 setActiveSessionId(null);
@@ -2622,8 +2776,9 @@ export default function App() {
         </div>
         <button
           type="button"
-          className={`computer-mode-entry ${computerOpen ? "active" : ""}`}
-          aria-pressed={computerOpen}
+          className={`computer-mode-entry ${computerCockpitVisible ? "active" : ""}`}
+          aria-pressed={computerCockpitVisible}
+          disabled={laneWorkspaceInteractionBlocked}
           onClick={() => setComputerOpen(true)}
         >
           <span>Computer Run</span>
@@ -2646,7 +2801,7 @@ export default function App() {
               type="button"
               className="sidebar-action-ghost"
               onClick={() => setSearchOpen(true)}
-              title="Search sessions"
+              title="Search Lanes"
             >
               Search
             </button>
@@ -2654,7 +2809,7 @@ export default function App() {
               type="button"
               className="sidebar-action-ghost"
               onClick={() => setSessionBrowserOpen(true)}
-              title="Browse all sessions"
+              title="Browse all Lanes"
             >
               Browse
             </button>
@@ -2683,8 +2838,8 @@ export default function App() {
                   type="button"
                   className="session-item-main"
                   onClick={async () => {
-                    await api.sessionLoad(s.id);
-                    await openTab(s, !open);
+                    if (open) await focusSession(s.id);
+                    else await openTab(s, true);
                   }}
                   onDoubleClick={() => setSessionBrowserOpen(true)}
                 >
@@ -2745,7 +2900,7 @@ export default function App() {
       </aside>
 
       <main
-        className={`main density-${layoutDensity} ${computerOpen ? "computer-open" : ""} ${
+        className={`main density-${layoutDensity} ${computerCockpitVisible ? "computer-open" : ""} ${
           docks.length > 1 ? "is-split" : ""
         }`}
       >
@@ -2770,7 +2925,7 @@ export default function App() {
                 <button
                   type="button"
                   className="session-tab-label"
-                  onClick={() => setActiveSessionId(t.id)}
+                  onClick={() => focusSession(t.id)}
                   title={t.title}
                 >
                   {t.needsPermission ? (
@@ -2855,7 +3010,7 @@ export default function App() {
             )}
           </div>
         )}
-        {computerOpen && (
+        {computerCockpitVisible && (
           <ComputerCockpit
             sessionId={activeSessionId}
             sessionTitle={activeTab?.title ?? activeSummary?.title}
@@ -2887,50 +3042,40 @@ export default function App() {
             }}
           />
         )}
-        {activeIsBuild && activeSessionId && (
-          <div className="session-cwd-bar">
-            <button
-              type="button"
-              className="session-cwd-btn"
-              title={
-                activeSummary?.cwd
-                  ? `${activeSummary.cwd}\nClick to change working directory`
-                  : "Choose a working directory for this build"
-              }
-              onClick={() => void setWorkingDirectory(activeSessionId)}
-            >
-              <span className="session-cwd-label">cwd</span>
-              <span className="session-cwd-path">
-                {shortPath(activeCwd)}
-              </span>
-              <span className="session-cwd-change">Change</span>
-            </button>
-          </div>
-        )}
-
         {activeSessionId && (
-          <div className="lane-context-bar" role="status" aria-label="Current Lane context">
-            <div className="lane-context-primary">
-              <span className="lane-context-label">Lane</span>
-              <strong>{activeSummary?.title ?? activeTab?.title ?? "Current work"}</strong>
-            </div>
-            <span className="lane-context-badge">
-              {activeContextAgentId ? `Agent ${activeContextAgentId}` : "Ad hoc Agent"}
-            </span>
-            <span className="lane-context-badge">
-              {executionTarget === "remote" && selectedRemoteLane
-                ? `${runtimeTargetLabel(selectedRemoteLane.runtime_target)} · ${runtimeConnectionLabel(selectedRemoteLane.runtime_connection)}`
-                : "Local desktop · Connected"}
-            </span>
-            {executionTarget === "remote" && selectedRemoteLane && (
-              <span className="lane-context-badge" title={selectedRemoteLane.cwd}>
-                Run Lane: {selectedRemoteLane.title || selectedRemoteLane.cwd}
-              </span>
-            )}
-            {activeSummary?.archived && (
-              <span className="lane-context-badge warning">Archived</span>
-            )}
-          </div>
+          <LaneContextHeader
+            lane={activeLane}
+            fallbackTitle={activeSummary?.title ?? activeTab?.title ?? "Current work"}
+            agentId={activeContextAgentId}
+            runLane={
+              executionTarget === "remote" && selectedRemoteLane
+                ? selectedRemoteLane
+                : null
+            }
+            runLabel={
+              laneScopePendingId === activeSessionId
+                ? "Switching workspace…"
+                : laneScopeBlocked?.id === activeSessionId
+                  ? "Workspace blocked"
+                : activity.label
+            }
+            runLive={activity.live}
+            scopeError={
+              laneScopeBlocked?.id === activeSessionId
+                ? laneScopeBlocked.message
+                : null
+            }
+            onChangeWorkspace={
+              activeIsBuild && !laneWorkspaceInteractionBlocked
+                ? () => void setWorkingDirectory(activeSessionId)
+                : undefined
+            }
+            onRestore={
+              activeLaneArchived
+                ? () => void restoreLane(activeSessionId)
+                : undefined
+            }
+          />
         )}
 
         <div
@@ -2990,7 +3135,7 @@ export default function App() {
                       }
                       return clampDocks(next, maxDocks, activeSessionId);
                     });
-                    setActiveSessionId(sid);
+                    focusSession(sid);
                   }}
                 >
                   <SessionPane
@@ -3039,7 +3184,7 @@ export default function App() {
           )}
 
         {/* Tool shell: compact peek by default; expand only when user wants it */}
-        {!showTerm && (termPeek || toolShell) && (
+        {!laneWorkspaceInteractionBlocked && !showTerm && (termPeek || toolShell) && (
           <div className="terminal-peek">
             <button
               type="button"
@@ -3075,7 +3220,7 @@ export default function App() {
           </div>
         )}
         {/* #136: keep TerminalPane mounted after first open; CSS-hide on collapse. */}
-        {(showTerm || termEverOpened) && (
+        {(showTerm || termEverOpened) && !laneWorkspaceInteractionBlocked && (
           <div
             className={`terminal-slot ${showTerm ? "is-expanded" : "is-collapsed"}`}
             aria-hidden={!showTerm}
@@ -3142,8 +3287,15 @@ export default function App() {
               className="composer-input"
               value={composer}
               rows={composerExpanded ? 10 : 2}
+              disabled={laneWorkspaceInteractionBlocked}
               placeholder={
-                busy
+                activeLaneArchived
+                  ? "Archived Lane — restore it to start or steer work"
+                  : laneScopePendingId === activeSessionId
+                    ? "Switching Lane workspace…"
+                    : laneScopeBlocked?.id === activeSessionId
+                      ? "Lane workspace unavailable — choose a valid workspace to continue"
+                    : busy
                   ? "Turn running — Enter queues · Steer now guides without stopping"
                   : workspaceMode === "chat"
                     ? "Message Grok… (drafts keep per session · Shift+Enter newline)"
@@ -3158,7 +3310,7 @@ export default function App() {
                 }
               }}
             />
-            {activeSessionId && (
+            {activeSessionId && !laneWorkspaceInteractionBlocked && (
               <PromptQueuePanel
                 entries={queueFor(activeSessionId)}
                 busy={busy}
@@ -3335,7 +3487,7 @@ export default function App() {
                     />
                   </label>
                 )}
-                {activeIsBuild && activeSummary && (
+                {activeIsBuild && activeSummary && !activeLaneArchived && (
                   <button
                     type="button"
                     className={`composer-chip ${activeSummary.execution_mode === "isolated_worktree" ? "on" : ""}`}
@@ -3390,8 +3542,11 @@ export default function App() {
                 <button
                   type="button"
                   className={`composer-chip ${showTerm ? "on" : ""}`}
+                  disabled={laneWorkspaceInteractionBlocked}
                   title={
-                    showTerm
+                    laneWorkspaceInteractionBlocked
+                      ? "Wait for the selected Lane workspace, or restore this archived Lane"
+                      : showTerm
                       ? "Collapse terminal"
                       : "Show terminal (collapsed by default during tool shells)"
                   }
@@ -3432,7 +3587,7 @@ export default function App() {
                 )}
               </div>
               <div className="composer-toolbar-right">
-                {busy && (
+                {busy && !laneWorkspaceInteractionBlocked && (
                   <button
                     type="button"
                     className="composer-stop"
@@ -3442,7 +3597,7 @@ export default function App() {
                     Stop
                   </button>
                 )}
-                {busy && composer.trim() && (
+                {busy && composer.trim() && !laneWorkspaceInteractionBlocked && (
                   <>
                     <button
                       type="button"
@@ -3467,9 +3622,18 @@ export default function App() {
                 <button
                   type="button"
                   className="composer-send"
-                  disabled={!composer.trim()}
+                  disabled={
+                    !composer.trim() ||
+                    laneWorkspaceInteractionBlocked
+                  }
                   title={
-                    busy
+                    activeLaneArchived
+                      ? "Restore this archived Lane before sending work"
+                      : laneScopePendingId === activeSessionId
+                        ? "Wait for the selected Lane workspace to finish switching"
+                        : laneScopeBlocked?.id === activeSessionId
+                          ? laneScopeBlocked.message
+                        : busy
                       ? "Queue prompt (turn running) · use Steer now for guidance"
                       : "Send (Enter) · newline with Shift+Enter"
                   }
@@ -3555,7 +3719,23 @@ export default function App() {
           ))}
         </div>
 
-        {rightTab === "files" && (
+        {rightTabWorkspaceUnavailable && (
+          <StateCard
+            variant={activeLaneArchived ? "archived" : "loading"}
+            title={
+              activeLaneArchived
+                ? "Archived Lane — workspace tools paused"
+                : "Switching Lane workspace"
+            }
+            description={
+              activeLaneArchived
+                ? "Inspect the transcript and saved evidence here, or restore the Lane before using live Files, Git, MCP, or project Rules."
+                : "Files, Git, MCP, and project Rules will refresh when the selected Lane owns the workspace scope."
+            }
+          />
+        )}
+
+        {rightTab === "files" && !rightTabWorkspaceUnavailable && (
           <>
             <input
               placeholder="Fuzzy open…"
@@ -3583,7 +3763,7 @@ export default function App() {
           </>
         )}
 
-        {rightTab === "git" && (
+        {rightTab === "git" && !rightTabWorkspaceUnavailable && (
           <>
             <div className="panel-block">
               <strong>Status</strong>
@@ -3745,7 +3925,7 @@ export default function App() {
           </>
         )}
 
-        {rightTab === "mcp" && (
+        {rightTab === "mcp" && !rightTabWorkspaceUnavailable && (
           <>
             <div className="panel-block">
               <strong>Project MCP trust</strong>
@@ -4023,7 +4203,7 @@ export default function App() {
                       onClick={() => {
                         void (async () => {
                           try {
-                            const s = await api.sessionLoad(String(t.session_id));
+                            const s = await api.sessionInspect(String(t.session_id));
                             await openTab(s, true);
                             // Surface shell work outside the transcript.
                             setRightTab("tasks");
@@ -4075,7 +4255,7 @@ export default function App() {
           </>
         )}
 
-        {rightTab === "rules" && (
+        {rightTab === "rules" && !rightTabWorkspaceUnavailable && (
           <div className="panel-block">
             <strong>Project rules</strong>
             <ul>
@@ -4239,13 +4419,13 @@ export default function App() {
         open={searchOpen}
         defaultKind={workspaceMode === "chat" ? "chat" : "build"}
         onClose={() => setSearchOpen(false)}
-        onOpenSession={(sessionId, kind) => {
+        onOpenSession={(sessionId, kind, _archived) => {
           void (async () => {
             try {
               if (kind === "chat" || kind === "build") {
                 setWorkspaceMode(kind);
               }
-              const s = await api.sessionLoad(sessionId);
+              const s = await api.sessionInspect(sessionId);
               await openTab(s, true);
               setSearchOpen(false);
               await refreshSessions();

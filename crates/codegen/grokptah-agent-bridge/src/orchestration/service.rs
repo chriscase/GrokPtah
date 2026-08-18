@@ -631,7 +631,7 @@ impl OrchestrationService {
             ));
         }
         // Session must still match claimed workspace when present.
-        if let Ok(session) = self.host.session_load(run.session_id) {
+        if let Ok(session) = self.host.session_inspect(run.session_id) {
             if !session.cwd.is_empty() {
                 let _ = require_workspace_match(&allowlist, Some(Path::new(&session.cwd)), &ws)
                     .map_err(|_| {
@@ -1287,8 +1287,14 @@ impl OrchestrationService {
     ) -> Result<crate::session::SessionSummary, OrchError> {
         let session = self
             .host
-            .session_load(session_id)
+            .session_inspect(session_id)
             .map_err(|_| OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"))?;
+        if session.archived {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "archived Lane is inspection-only; restore it before controlling it",
+            ));
+        }
         if session.kind != SessionKind::Build {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
@@ -2931,7 +2937,7 @@ impl OrchestrationService {
         if let Err(e) = self.require_build_session(session_id) {
             return Err(fail(self, e));
         }
-        let session = self.host.session_load(session_id).unwrap();
+        let session = self.host.session_inspect(session_id).unwrap();
         let cwd = if session.cwd.is_empty() {
             None
         } else {
@@ -3030,7 +3036,7 @@ impl OrchestrationService {
         if let Err(e) = self.require_build_session(session_id) {
             return Err(fail(self, e));
         }
-        let session = self.host.session_load(session_id).unwrap();
+        let session = self.host.session_inspect(session_id).unwrap();
         let cwd = if session.cwd.is_empty() {
             None
         } else {
@@ -3159,7 +3165,7 @@ impl OrchestrationService {
                 ),
             ));
         }
-        let session = match self.host.session_load(session_id) {
+        let session = match self.host.session_inspect(session_id) {
             Ok(s) => s,
             Err(_) => {
                 return Err(fail(

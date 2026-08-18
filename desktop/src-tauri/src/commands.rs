@@ -400,6 +400,15 @@ fn computer_owner(state: &AppState, session_id: &str) -> Result<Uuid, String> {
         .ok_or_else(|| "Computer Use requires an existing local session".to_string())
 }
 
+fn computer_work_owner(state: &AppState, session_id: &str) -> Result<Uuid, String> {
+    let owner = computer_owner(state, session_id)?;
+    state
+        .host
+        .ensure_session_accepts_new_work(owner)
+        .map_err(map_err)?;
+    Ok(owner)
+}
+
 #[tauri::command]
 pub fn computer_use_cockpit_snapshot(
     state: State<'_, AppState>,
@@ -479,7 +488,7 @@ pub async fn computer_use_cockpit_start_simulator(
     state
         .computer_use
         .start_simulator(
-            computer_owner(&state, &session_id)?,
+            computer_work_owner(&state, &session_id)?,
             &reviewed_target_app_id,
         )
         .await
@@ -495,7 +504,7 @@ pub async fn computer_use_cockpit_start_native(
     state
         .computer_use
         .start_native(
-            computer_owner(&state, &session_id)?,
+            computer_work_owner(&state, &session_id)?,
             &selection_token,
             &reviewed_target_app_id,
         )
@@ -512,7 +521,7 @@ pub async fn computer_use_cockpit_refresh(
     state
         .computer_use
         .refresh_simulator(
-            computer_owner(&state, &session_id)?,
+            computer_work_owner(&state, &session_id)?,
             &run_id,
             expected_version,
         )
@@ -531,7 +540,7 @@ pub async fn computer_use_cockpit_stage_action(
     state
         .computer_use
         .stage_simulator_action(
-            computer_owner(&state, &session_id)?,
+            computer_work_owner(&state, &session_id)?,
             &run_id,
             expected_version,
             &observation_id,
@@ -550,7 +559,7 @@ pub async fn computer_use_cockpit_approve(
     state
         .computer_use
         .approve_simulator_action(
-            computer_owner(&state, &session_id)?,
+            computer_work_owner(&state, &session_id)?,
             &approval_id,
             &request_id,
         )
@@ -694,6 +703,16 @@ pub async fn session_load(
     let host = state.host.clone();
     let id = Uuid::parse_str(&id).map_err(map_err)?;
     run_blocking(move || host.session_load(id).map_err(map_err)).await
+}
+
+#[tauri::command]
+pub async fn session_inspect(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<SessionSummary, String> {
+    let host = state.host.clone();
+    let id = Uuid::parse_str(&id).map_err(map_err)?;
+    run_blocking(move || host.session_inspect(id).map_err(map_err)).await
 }
 
 #[tauri::command]

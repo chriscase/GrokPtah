@@ -31,6 +31,11 @@
   --overlay-soft: rgba(0, 0, 0, 0.2);
   --overlay-faint: rgba(255, 255, 255, 0.05);
   --overlay-mid: rgba(255, 255, 255, 0.06);
+  --focus-ring: #7db8ff;
+  --state-neutral: #9aa5b5;
+  --state-info: #7db8ff;
+  --state-attention: #f0b429;
+  --state-danger: #f07178;
   --radius: 6px;
   /* Body / prose — proportional so code pops against it (#125) */
   --font: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
@@ -71,6 +76,11 @@
   --overlay-soft: rgba(0, 0, 0, 0.06);
   --overlay-faint: rgba(0, 0, 0, 0.04);
   --overlay-mid: rgba(0, 0, 0, 0.05);
+  --focus-ring: #155fc1;
+  --state-neutral: #5c6573;
+  --state-info: #155fc1;
+  --state-attention: #8a6508;
+  --state-danger: #c23b44;
 }
 
 * {
@@ -125,6 +135,23 @@ button.danger {
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+:where(button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
 }
 
 /* Layout: agent workstation — fill viewport; only inner regions scroll.
@@ -441,6 +468,7 @@ button:disabled {
     padding: 0.2rem 0.3rem;
     font-size: 10px;
   }
+
 }
 
 .titlebar {
@@ -536,6 +564,7 @@ button:disabled {
 .main > .session-tabs,
 .main > .session-cwd-bar,
 .main > .lane-context-bar,
+.main > .lane-context-header,
 .main > .terminal-slot,
 .main > .activity-strip,
 .main > .composer-wrap,
@@ -796,6 +825,138 @@ button:disabled {
   border-color: color-mix(in srgb, var(--warning, #f6c453) 45%, transparent);
 }
 
+.lane-context-header {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 0.55rem 0.7rem;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-panel);
+}
+
+.lane-context-heading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.lane-context-heading {
+  min-width: 0;
+}
+
+.lane-context-eyebrow {
+  display: block;
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.lane-context-heading h1 {
+  margin: 0.08rem 0 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lane-context-state {
+  flex: 0 0 auto;
+  padding: 0.15rem 0.45rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  color: var(--state-neutral);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.lane-context-state.is-running,
+.lane-context-state.is-reconnecting {
+  color: var(--state-attention);
+}
+
+.lane-context-state.is-error,
+.lane-context-state.is-disconnected {
+  color: var(--state-danger);
+}
+
+.lane-context-facts {
+  display: grid;
+  grid-template-columns: minmax(7rem, 0.8fr) minmax(10rem, 1fr) minmax(12rem, 1.4fr) minmax(7rem, 0.8fr);
+  gap: 0.4rem 0.8rem;
+  margin: 0.45rem 0 0;
+}
+
+.lane-context-facts > div {
+  min-width: 0;
+}
+
+.lane-context-facts dt {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.lane-context-facts dd {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+  margin: 0.08rem 0 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lane-context-facts dd > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lane-context-facts button {
+  flex: 0 0 auto;
+  padding: 0.12rem 0.35rem;
+  font-size: 10px;
+}
+
+.lane-context-run-lane {
+  grid-column: span 2;
+}
+
+.lane-context-header > .state-card {
+  margin-bottom: 0;
+}
+
+/* The native window cannot shrink below 900px, so this breakpoint must sit
+ * above that floor to be reachable in the real desktop app. */
+@media (max-width: 960px) {
+  .lane-context-header {
+    padding: 0.45rem 0.55rem;
+  }
+
+  .lane-context-facts {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .lane-context-run-lane {
+    grid-column: auto;
+  }
+
+  .lane-context-facts dd {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
 .panel-context-scope {
   min-width: 0;
   margin-left: auto;
@@ -815,6 +976,35 @@ button:disabled {
   border-radius: 8px;
   background: var(--bg-panel);
   color: var(--muted);
+}
+
+.state-card-tone-neutral {
+  border-color: color-mix(in srgb, var(--state-neutral) 35%, var(--border-soft));
+}
+
+.state-card-tone-info {
+  border-color: color-mix(in srgb, var(--state-info) 42%, var(--border-soft));
+}
+
+.state-card-tone-attention {
+  border-color: color-mix(in srgb, var(--state-attention) 45%, var(--border-soft));
+}
+
+.state-card-tone-danger {
+  border-color: color-mix(in srgb, var(--state-danger) 48%, var(--border-soft));
+}
+
+.state-card-tone-neutral .state-card-mark {
+  color: var(--state-neutral);
+}
+.state-card-tone-info .state-card-mark {
+  color: var(--state-info);
+}
+.state-card-tone-attention .state-card-mark {
+  color: var(--state-attention);
+}
+.state-card-tone-danger .state-card-mark {
+  color: var(--state-danger);
 }
 
 .state-card-mark {
@@ -844,19 +1034,6 @@ button:disabled {
   margin: 0.25rem 0 0.5rem;
   font-size: 11px;
   line-height: 1.45;
-}
-
-.state-card-error {
-  border-color: color-mix(in srgb, var(--danger, #e85d5d) 45%, var(--border-soft));
-}
-
-.state-card-error .state-card-mark {
-  color: var(--danger, #e85d5d);
-}
-
-.state-card-archived .state-card-mark,
-.state-card-stale .state-card-mark {
-  color: var(--warning, #e0ad4f);
 }
 
 .state-card-details {
@@ -4281,6 +4458,7 @@ button:disabled {
 
 .main.computer-open > .session-cwd-bar,
 .main.computer-open > .lane-context-bar,
+.main.computer-open > .lane-context-header,
 .main.computer-open > .pane-row,
 .main.computer-open > .fleet-strip,
 .main.computer-open > .terminal-peek,

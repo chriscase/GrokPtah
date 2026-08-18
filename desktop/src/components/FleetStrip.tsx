@@ -76,10 +76,10 @@ export const FleetStrip = memo(function FleetStrip({
   if (tabs.length === 0) return null;
 
   return (
-    <div className="fleet-strip" role="region" aria-label="Live sessions">
+    <div className="fleet-strip" role="region" aria-label="Live Lanes">
       <div
         className="fleet-strip-label"
-        title="Open sessions — click to focus, Alt-click to dock"
+        title="Open Lanes — click to focus, Alt-click to dock"
       >
         Live
         <span className="fleet-strip-count">{tabs.length}</span>

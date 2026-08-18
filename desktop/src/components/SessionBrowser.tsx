@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
 import type { SessionSummary } from "../lib/protocol";
+import { StateCard } from "./StateCard";
 import { StyledSelect } from "./StyledSelect";
 
 export type SessionBrowserProps = {
@@ -35,7 +36,7 @@ function normalizeTags(raw: string): string[] {
 }
 
 /**
- * Full-screen session manager: rename, delete, archive, folders, tags.
+ * Full-screen Lane manager: rename, delete, archive, folders, tags.
  */
 export function SessionBrowser({
   open,
@@ -54,6 +55,7 @@ export function SessionBrowser({
   const [tagFilter, setTagFilter] = useState<string | "">("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Edit drawers
@@ -65,6 +67,7 @@ export function SessionBrowser({
   const [tagsDraft, setTagsDraft] = useState("");
 
   const refresh = useCallback(async () => {
+    setLoading(true);
     setError(null);
     try {
       const includeArchived = scope !== "active";
@@ -95,6 +98,8 @@ export function SessionBrowser({
       setAllTags(t);
     } catch (e) {
       setError(String(e));
+    } finally {
+      setLoading(false);
     }
   }, [scope, kindFilter]);
 
@@ -242,12 +247,12 @@ export function SessionBrowser({
   if (!open) return null;
 
   return (
-    <div className="session-browser" role="dialog" aria-modal="true" aria-label="Sessions">
+    <div className="session-browser" role="dialog" aria-modal="true" aria-label="Lanes">
       <header className="sb-header">
         <div className="sb-title-block">
-          <h2>Sessions</h2>
+          <h2>Lanes</h2>
           <span className="sb-sub">
-            Rename · archive · folders · tags · delete
+            Organize active work and inspect archived work
           </span>
         </div>
         <div className="sb-header-actions">
@@ -261,7 +266,7 @@ export function SessionBrowser({
       </header>
 
       <div className="sb-toolbar">
-        <div className="sb-scopes" role="tablist">
+        <div className="sb-scopes" role="group" aria-label="Lane archive scope">
           {(
             [
               ["active", "Active"],
@@ -272,7 +277,7 @@ export function SessionBrowser({
             <button
               key={id}
               type="button"
-              role="tab"
+              aria-pressed={scope === id}
               className={scope === id ? "active" : ""}
               onClick={() => {
                 setScope(id);
@@ -338,7 +343,7 @@ export function SessionBrowser({
           disabled={!selected.size || busy}
           onClick={() => void archive([...selected], scope !== "archive")}
         >
-          {scope === "archive" ? "Unarchive selected" : "Archive selected"}
+          {scope === "archive" ? "Restore selected" : "Archive selected"}
         </button>
         <button
           type="button"
@@ -368,13 +373,36 @@ export function SessionBrowser({
         )}
       </div>
 
-      {error && <div className="sb-error">{error}</div>}
+      <div className="sr-only" role="status" aria-live="polite">
+        {!loading && !error ? `${filtered.length} Lanes in this view` : ""}
+      </div>
+
+      {error && (
+        <StateCard
+          variant="error"
+          title="Lanes could not be loaded"
+          description={error}
+          actionLabel="Try again"
+          onAction={() => void refresh()}
+        />
+      )}
 
       <div className="sb-body">
-        {byFolder.length === 0 && (
-          <div className="sb-empty">No sessions match this view.</div>
+        {loading && (
+          <StateCard
+            variant="loading"
+            title="Loading Lanes"
+            description="Reading active and archived work…"
+          />
         )}
-        {byFolder.map(({ folder, items }) => (
+        {!loading && !error && byFolder.length === 0 && (
+          <StateCard
+            variant="empty"
+            title="No Lanes match this view"
+            description="Change the filters or choose another archive scope."
+          />
+        )}
+        {!loading && !error && byFolder.map(({ folder, items }) => (
           <section key={folder} className="sb-folder-group">
             <h3 className="sb-folder-heading">
               <span className="sb-folder-icon" aria-hidden>
@@ -425,7 +453,8 @@ export function SessionBrowser({
                             type="button"
                             className="sb-title-btn"
                             onClick={() => onOpen(s)}
-                            title="Open session"
+                            aria-label={`${s.archived ? "Inspect archived" : "Open"} Lane ${s.title}`}
+                            title={s.archived ? "Inspect archived Lane" : "Open Lane"}
                           >
                             <span className={`sp-kind ${s.kind ?? "build"}`}>
                               {s.kind ?? "build"}
@@ -546,7 +575,7 @@ export function SessionBrowser({
                           disabled={busy}
                           onClick={() => void archive([s.id], !s.archived)}
                         >
-                          {s.archived ? "Unarchive" : "Archive"}
+                          {s.archived ? "Restore" : "Archive"}
                         </button>
                         <button
                           type="button"
@@ -561,7 +590,7 @@ export function SessionBrowser({
                           className="primary"
                           onClick={() => onOpen(s)}
                         >
-                          Open
+                          {s.archived ? "Inspect" : "Open"}
                         </button>
                       </div>
                     </li>

@@ -7,7 +7,7 @@ export type SearchPanelProps = {
   open: boolean;
   defaultKind?: "all" | "chat" | "build";
   onClose: () => void;
-  onOpenSession: (sessionId: string, kind: string) => void;
+  onOpenSession: (sessionId: string, kind: string, archived: boolean) => void;
 };
 
 /**
@@ -152,7 +152,7 @@ export function SearchPanel({
               <button
                 type="button"
                 className="sp-hit"
-                onClick={() => onOpenSession(h.session_id, h.kind)}
+                onClick={() => onOpenSession(h.session_id, h.kind, h.archived)}
               >
                 <div className="sp-hit-top">
                   <span className={`sp-kind ${h.kind}`}>{h.kind}</span>

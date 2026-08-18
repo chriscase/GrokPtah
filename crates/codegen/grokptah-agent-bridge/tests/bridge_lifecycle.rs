@@ -2052,7 +2052,7 @@ async fn rewind_files_isolated_per_session() {
 }
 
 #[tokio::test]
-async fn session_load_preserves_missing_cwd_without_rebinding() {
+async fn session_load_blocks_missing_cwd_without_rebinding() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     let host = AgentHost::create(HostConfig {
@@ -2070,9 +2070,11 @@ async fn session_load_preserves_missing_cwd_without_rebinding() {
         host.set_project_cwd(dir.path()).unwrap();
         drop(live); // delete
     }
-    // Project is still open at dir, but loading must preserve the missing
-    // session workspace instead of silently changing repository ownership.
-    let sum = host.session_load(s.id).unwrap();
+    // Project is still open at dir, but loading must fail closed instead of
+    // silently changing repository ownership or enabling tools on `dir`.
+    let error = host.session_load(s.id).unwrap_err().to_string();
+    assert!(error.contains("workspace is missing"));
+    let sum = host.session_inspect(s.id).unwrap();
     assert_eq!(sum.workspace_status.as_str(), "missing");
     assert!(!std::path::Path::new(&sum.cwd).is_dir());
     assert_eq!(

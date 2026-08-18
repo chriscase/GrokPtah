@@ -367,20 +367,30 @@ async fn live_get_delivers_events_while_a_run_is_still_active() {
         .unwrap();
     assert_eq!(response.status(), 200);
     let mut chunks = response.bytes_stream();
-    let first = tokio::time::timeout(Duration::from_secs(3), chunks.next())
-        .await
-        .expect("active stream produced no first event")
-        .unwrap()
-        .unwrap();
-    let second = tokio::time::timeout(Duration::from_secs(3), chunks.next())
-        .await
-        .expect("active stream did not deliver a subsequent event")
-        .unwrap()
-        .unwrap();
-    let first = String::from_utf8(first.to_vec()).unwrap();
-    let second = String::from_utf8(second.to_vec()).unwrap();
-    assert!(first.contains("notifications/ptah_event"));
-    assert!(second.contains("notifications/ptah_event"));
+    let notifications = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut notifications = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+            // Keep-alive comments are valid SSE chunks and may arrive before
+            // the first durable event, especially when admission is fast.
+            if chunk.contains("notifications/ptah_event") {
+                notifications.push(chunk);
+                if notifications.len() == 2 {
+                    break;
+                }
+            }
+        }
+        notifications
+    })
+    .await
+    .expect("active stream did not deliver two events");
+    assert_eq!(
+        notifications.len(),
+        2,
+        "active stream closed before two events"
+    );
+    let first = &notifications[0];
+    let second = &notifications[1];
     assert_ne!(first, second, "live stream must deliver distinct updates");
 
     let _ = wait_terminal(&mut client, owner.id, workspace.path(), &run_id).await;
