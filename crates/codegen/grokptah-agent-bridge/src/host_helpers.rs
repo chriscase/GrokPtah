@@ -1429,62 +1429,9 @@ pub(crate) fn resolve_model_target(
         );
     }
 
-    if selection.provider_id == crate::gateway_config::XAI_PROVIDER_ID {
-        let entry = crate::models_catalog::lookup(&selection.model_id);
-        let wire_model = entry
-            .as_ref()
-            .map(|item| item.wire_model.clone())
-            .unwrap_or(selection.model_id);
-        let base_url = if let Ok(value) = std::env::var("XAI_API_BASE") {
-            let value = value.trim();
-            if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            }
-        } else {
-            None
-        }
-        .unwrap_or_else(|| {
-            if creds.oidc_token_auth {
-                entry
-                    .as_ref()
-                    .and_then(|item| item.base_url.clone())
-                    .filter(|url| url.contains("cli-chat-proxy") || url.contains("x.ai"))
-                    .unwrap_or_else(|| "https://cli-chat-proxy.grok.com/v1".into())
-            } else {
-                entry
-                    .as_ref()
-                    .and_then(|item| item.base_url.clone())
-                    .unwrap_or_else(|| "https://api.x.ai/v1".into())
-            }
-        });
-        let effort_options = entry
-            .as_ref()
-            .map(|item| item.info.effort_options.clone())
-            .unwrap_or_default();
-        return Ok(ResolvedModelTarget {
-            base_url,
-            wire_model,
-            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
-            capabilities: crate::gateway_config::ModelCapabilities {
-                chat: true,
-                tools: true,
-                stream: true,
-                parallel_tool_calls: true,
-                effort_options,
-                source: crate::gateway_config::CapabilitySource::Declared,
-                qualification_schema: None,
-                ..crate::gateway_config::ModelCapabilities::default()
-            },
-            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
-        });
-    }
-
-    let config = crate::gateway_config::load();
-    let profile = config
-        .profile(&selection.provider_id)
-        .ok_or_else(|| anyhow!("unknown provider profile `{}`", selection.provider_id))?;
+    let profile =
+        crate::gateway_config::resolve_profile_for_selection(&selection, creds.oidc_token_auth)
+            .map_err(anyhow::Error::msg)?;
     let provider_model = profile
         .models
         .iter()
@@ -1512,7 +1459,7 @@ pub(crate) fn resolve_model_target(
         })?;
     Ok(ResolvedModelTarget {
         base_url: profile.base_url.clone(),
-        wire_model: provider_model.id,
+        wire_model: provider_model.wire_model_id().to_string(),
         dialect: profile.dialect,
         capabilities: provider_model.capabilities,
         deadline_class: profile.deadline_class,
@@ -2065,6 +2012,66 @@ mod compatible_stream_tests {
         config.upsert_profile(profile).unwrap();
         crate::gateway_config::save(&config).unwrap();
         crate::gateway_config::model_selection_key("cancel-test", "test-model")
+    }
+
+    #[test]
+    fn xai_targets_keep_api_key_oidc_wire_mapping_and_effort_contract() {
+        let _lock = crate::discover::home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        crate::discover::set_grokptah_home_override(Some(temp.path().join(".grokptah")));
+        let previous_override = std::env::var_os("XAI_API_BASE");
+        unsafe { std::env::remove_var("XAI_API_BASE") };
+
+        for entry in crate::models_catalog::load_catalog() {
+            for oidc_token_auth in [false, true] {
+                let mut credentials = compatible_credentials("xai");
+                credentials.oidc_token_auth = oidc_token_auth;
+                let target = resolve_model_target(&credentials, &entry.info.id).unwrap();
+                let expected_base = if oidc_token_auth {
+                    entry
+                        .base_url
+                        .clone()
+                        .filter(|url| url.contains("cli-chat-proxy") || url.contains("x.ai"))
+                        .unwrap_or_else(|| "https://cli-chat-proxy.grok.com/v1".into())
+                } else {
+                    entry
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.x.ai/v1".into())
+                };
+                assert_eq!(target.base_url.as_bytes(), expected_base.as_bytes());
+                assert_eq!(target.wire_model.as_bytes(), entry.wire_model.as_bytes());
+                assert_eq!(
+                    target.capabilities.effort_options.as_slice(),
+                    entry.info.effort_options.as_slice()
+                );
+                assert_eq!(
+                    target.deadline_class,
+                    crate::gateway_config::ProviderDeadlineClass::Standard
+                );
+            }
+        }
+
+        let credentials = compatible_credentials("xai");
+        let target = resolve_model_target(&credentials, "grok-4.5").unwrap();
+        let mut body = serde_json::json!({});
+        apply_effort_to_agent_body(&mut body, &target, EffortLevel::High).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "effort": "high",
+                "reasoning": {"effort": "high"}
+            })
+        );
+
+        unsafe {
+            if let Some(value) = previous_override {
+                std::env::set_var("XAI_API_BASE", value);
+            } else {
+                std::env::remove_var("XAI_API_BASE");
+            }
+        }
+        crate::discover::set_grokptah_home_override(None);
     }
 
     #[test]

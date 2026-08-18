@@ -544,24 +544,12 @@ impl AgentHost {
         }
         let mut effort = chrome.effort;
         if let Ok(selection) = crate::gateway_config::parse_model_selection(&model) {
-            if selection.provider_id != crate::gateway_config::XAI_PROVIDER_ID {
-                let supports_current_effort = provider_config
-                    .profile(&selection.provider_id)
-                    .and_then(|profile| {
-                        profile
-                            .models
-                            .iter()
-                            .find(|item| item.id == selection.model_id)
-                    })
-                    .is_some_and(|item| {
-                        item.capabilities
-                            .effort_options
-                            .iter()
-                            .any(|value| value == effort.as_str())
-                    });
-                if !supports_current_effort {
-                    effort = EffortLevel::None;
-                }
+            let supports_current_effort = crate::gateway_config::resolve_profile_for_selection(
+                &selection, false,
+            )
+            .is_ok_and(|profile| profile.accepts_effort(&selection.model_id, effort.as_str()));
+            if !supports_current_effort {
+                effort = EffortLevel::None;
             }
         }
         let mut open_tab_ids = chrome.open_tab_ids.clone();
@@ -3167,9 +3155,61 @@ impl AgentHostHandle {
 
     pub fn models(&self) -> Vec<ModelInfo> {
         let selected = self.inner.lock().model.clone();
-        let mut models: Vec<ModelInfo> = crate::models_catalog::load_catalog()
+        let catalog = crate::models_catalog::load_catalog();
+        let xai_credential_selection = crate::gateway_config::parse_model_selection(&selected)
+            .ok()
+            .filter(|selection| selection.provider_id == crate::gateway_config::XAI_PROVIDER_ID)
+            .map(|_| selected.clone())
+            .or_else(|| catalog.first().map(|entry| entry.info.id.clone()));
+        // Resolve once through the same live source used by execution so env,
+        // keychain, and Grok Build session changes are reflected immediately.
+        let xai_oidc_token_auth = xai_credential_selection
+            .as_deref()
+            .and_then(|selection| {
+                crate::auth_store::resolve_wire_credentials_for_model(selection)
+                    .ok()
+                    .flatten()
+            })
+            .is_some_and(|credentials| credentials.oidc_token_auth);
+        let mut models: Vec<ModelInfo> = catalog
             .into_iter()
-            .map(|m| m.info)
+            .map(|catalog_model| {
+                let mut info = catalog_model.info;
+                let selection = crate::gateway_config::ModelSelection {
+                    provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
+                    model_id: info.id.clone(),
+                };
+                if let Ok(profile) = crate::gateway_config::resolve_profile_for_selection(
+                    &selection,
+                    xai_oidc_token_auth,
+                ) {
+                    if let Some(model) = profile.models.first() {
+                        let capabilities = &model.capabilities;
+                        info.wire_model_id = model.wire_model_id().to_string();
+                        info.supports_tools = capabilities.tools;
+                        info.supports_stream = capabilities.stream;
+                        info.supports_image_input = capabilities.image_input;
+                        info.computer_use_tier =
+                            capabilities.effective_computer_use_tier().as_str().into();
+                        info.computer_capability_source =
+                            match capabilities.computer_capability_source {
+                                crate::gateway_config::CapabilitySource::Declared => "declared",
+                                crate::gateway_config::CapabilitySource::Measured => "measured",
+                                crate::gateway_config::CapabilitySource::Unknown => "unknown",
+                            }
+                            .into();
+                        info.capability_source = match capabilities.source {
+                            crate::gateway_config::CapabilitySource::Declared => "declared",
+                            crate::gateway_config::CapabilitySource::Measured => "measured",
+                            crate::gateway_config::CapabilitySource::Unknown => "unknown",
+                        }
+                        .into();
+                        info.supports_effort = !capabilities.effort_options.is_empty();
+                        info.effort_options.clone_from(&capabilities.effort_options);
+                    }
+                }
+                info
+            })
             .collect();
         let selected = crate::gateway_config::parse_model_selection(&selected).ok();
         let config = crate::gateway_config::load();
@@ -9288,6 +9328,86 @@ mod computer_agent_host_tests {
         host.stop().unwrap();
         assert!(restarted_token.is_cancelled());
 
+        drop(host);
+        crate::set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn model_projection_uses_live_credential_route_not_cached_auth_state() {
+        let _serial = crate::home_override_serial();
+        let home = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let previous_base = std::env::var_os("XAI_API_BASE");
+        let previous_key = std::env::var_os("XAI_API_KEY");
+        unsafe {
+            std::env::set_var("XAI_API_BASE", "https://projection-route.example/v1");
+            std::env::set_var("XAI_API_KEY", "live-api-key");
+        }
+
+        let catalog = crate::models_catalog::lookup("grok-4.5").unwrap();
+        let measured_model = |tools: bool| crate::gateway_config::ProviderModel {
+            id: "grok-4.5".into(),
+            display_name: "Grok 4.5".into(),
+            wire_model_id: Some(catalog.wire_model.clone()),
+            capabilities: crate::gateway_config::ModelCapabilities {
+                chat: tools,
+                tools,
+                stream: tools,
+                source: crate::gateway_config::CapabilitySource::Measured,
+                qualification_schema: Some(
+                    crate::gateway_config::CAPABILITY_QUALIFICATION_SCHEMA.into(),
+                ),
+                ..crate::gateway_config::ModelCapabilities::default()
+            },
+        };
+        let managed_profile =
+            |credential_ref: &str, model| crate::gateway_config::ProviderProfile {
+                id: crate::gateway_config::XAI_PROVIDER_ID.into(),
+                label: "xAI".into(),
+                kind: crate::gateway_config::ProviderKind::Xai,
+                dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
+                deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
+                base_url: "https://projection-route.example/v1".into(),
+                credential_ref: Some(credential_ref.into()),
+                models: vec![model],
+                managed_by_env: false,
+                managed_by_host: true,
+            };
+        let api_model = measured_model(false);
+        let api_profile = managed_profile("managed:xai:api-key", api_model.clone());
+        crate::gateway_config::save_managed_profile_capabilities(&api_profile, &api_model).unwrap();
+        let oidc_model = measured_model(true);
+        let oidc_profile = managed_profile("managed:xai:oidc", oidc_model.clone());
+        crate::gateway_config::save_managed_profile_capabilities(&oidc_profile, &oidc_model)
+            .unwrap();
+
+        let host = AgentHost::create(HostConfig::default());
+        host.inner.lock().auth = AuthState {
+            signed_in: true,
+            display_name: Some("stale Grok Build session".into()),
+            method: Some("grok_build:oidc".into()),
+        };
+        let projected = host
+            .models()
+            .into_iter()
+            .find(|model| model.id == "grok-4.5")
+            .unwrap();
+        assert_eq!(projected.capability_source, "measured");
+        assert!(!projected.supports_tools);
+        assert!(!projected.supports_stream);
+
+        unsafe {
+            if let Some(value) = previous_base {
+                std::env::set_var("XAI_API_BASE", value);
+            } else {
+                std::env::remove_var("XAI_API_BASE");
+            }
+            if let Some(value) = previous_key {
+                std::env::set_var("XAI_API_KEY", value);
+            } else {
+                std::env::remove_var("XAI_API_KEY");
+            }
+        }
         drop(host);
         crate::set_grokptah_home_override(None);
     }

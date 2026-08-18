@@ -392,24 +392,60 @@ pub fn resolve_wire_credentials_for_model(
     model_selection: &str,
 ) -> Result<Option<WireCredentials>, String> {
     let selection = crate::gateway_config::parse_model_selection(model_selection)?;
-    if selection.provider_id == crate::gateway_config::XAI_PROVIDER_ID {
-        return Ok(resolve_xai_credentials());
-    }
+    let profile = crate::gateway_config::resolve_profile_for_selection(&selection, false)?;
+    resolve_profile_credentials(&profile, Some(&selection.model_id))
+}
 
-    resolve_provider_credentials(&selection.provider_id, Some(&selection.model_id))
+fn resolve_profile_credentials(
+    profile: &crate::gateway_config::ProviderProfile,
+    legacy_model_id: Option<&str>,
+) -> Result<Option<WireCredentials>, String> {
+    use crate::gateway_config::{ProviderDialect, ProviderKind, XAI_PROVIDER_ID};
+
+    match (profile.kind, profile.dialect) {
+        (ProviderKind::Xai, ProviderDialect::XaiChatCompletions)
+            if profile.id == XAI_PROVIDER_ID && profile.managed_by_host =>
+        {
+            Ok(resolve_xai_credentials())
+        }
+        (ProviderKind::OpenAiCompatible, ProviderDialect::OpenAiChatCompletions)
+            if !profile.managed_by_host =>
+        {
+            resolve_stored_provider_credentials(&profile.id, legacy_model_id)
+        }
+        _ => Err(
+            "xAI credentials are available only to the synthesized host-managed `xai` profile"
+                .into(),
+        ),
+    }
 }
 
 pub fn resolve_provider_credentials(
     provider_id: &str,
     legacy_model_id: Option<&str>,
 ) -> Result<Option<WireCredentials>, String> {
-    let provider_id = crate::gateway_config::normalized_profile_id(provider_id)?;
+    let provider_id = if provider_id.trim() == crate::gateway_config::XAI_PROVIDER_ID {
+        crate::gateway_config::XAI_PROVIDER_ID.to_string()
+    } else {
+        crate::gateway_config::normalized_profile_id(provider_id)?
+    };
+    let selection = crate::gateway_config::ModelSelection {
+        provider_id,
+        model_id: legacy_model_id.unwrap_or_default().to_string(),
+    };
+    let profile = crate::gateway_config::resolve_profile_for_selection(&selection, false)?;
+    resolve_profile_credentials(&profile, legacy_model_id)
+}
 
+fn resolve_stored_provider_credentials(
+    provider_id: &str,
+    legacy_model_id: Option<&str>,
+) -> Result<Option<WireCredentials>, String> {
     let mut config = crate::gateway_config::load_for_update()
         .map_err(|error| format!("read provider profiles: {error}"))?;
     if config.has_pending_legacy_secret() {
         let profile = config
-            .profile_mut(&provider_id)
+            .profile_mut(provider_id)
             .ok_or_else(|| format!("unknown provider profile `{provider_id}`"))?;
         if let Some(model_id) = legacy_model_id
             .filter(|model_id| !profile.models.iter().any(|model| model.id == **model_id))
@@ -425,7 +461,7 @@ pub fn resolve_provider_credentials(
         }
     }
     let profile = config
-        .profile(&provider_id)
+        .profile(provider_id)
         .cloned()
         .ok_or_else(|| format!("unknown provider profile `{provider_id}`"))?;
 
@@ -850,6 +886,9 @@ mod tests {
         let xai = resolve_wire_credentials_for_model("grok-4.5")
             .unwrap()
             .unwrap();
+        let xai_by_profile = resolve_provider_credentials("xai", Some("grok-4.5"))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             (a.provider_id.as_str(), a.bearer.as_str()),
             ("env-grokptah", "synthetic-a")
@@ -862,6 +901,11 @@ mod tests {
             (xai.provider_id.as_str(), xai.bearer.as_str()),
             ("xai", "synthetic-xai")
         );
+        assert_eq!(xai_by_profile.provider_id, xai.provider_id);
+        assert_eq!(xai_by_profile.bearer, xai.bearer);
+        assert_eq!(xai_by_profile.oidc_token_auth, xai.oidc_token_auth);
+        assert_eq!(xai_by_profile.method, xai.method);
+        assert_eq!(xai_by_profile.display_name, xai.display_name);
 
         let mismatch = crate::host_helpers::resolve_model_target(
             &a,
