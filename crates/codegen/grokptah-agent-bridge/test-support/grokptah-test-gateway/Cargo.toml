@@ -1,0 +1,19 @@
+[package]
+name = "grokptah-test-gateway"
+description = "Hermetic scripted HTTP/1.1 gateway for GrokPtah provider conformance tests"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# This crate is a dev-dependency of the bridge and is never linked into a
+# shipped binary.
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }

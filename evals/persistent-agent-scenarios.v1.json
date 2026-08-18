@@ -1,0 +1,371 @@
+{
+  "schema": "grokptah.persistent_agent_scenarios.v1",
+  "catalog_id": "persistent-agent-certification-v1",
+  "catalog_version": 1,
+  "contract_document": "docs/PERSISTENT_AGENT_CERTIFICATION.md",
+  "assertion_policy": {
+    "exact_prose_assertions": false,
+    "live_assertions": [
+      "protocol_shape",
+      "typed_outcome",
+      "durable_state",
+      "authoritative_usage",
+      "bounded_resources",
+      "synthetic_workspace_oracle"
+    ]
+  },
+  "provider_phases": [
+    {
+      "id": "native-xai-grok-build-oidc",
+      "order": 1,
+      "route_class": "grok_build_proxy",
+      "credential_class": "grok_build_oidc",
+      "default_evidence_mode": "synthetic_payloads",
+      "fixture_promotion": "human_review_required"
+    },
+    {
+      "id": "provider-neutral-corporate-gateway",
+      "order": 2,
+      "route_class": "compatible_corporate_gateway",
+      "credential_class": "externally_managed",
+      "default_evidence_mode": "metadata_only",
+      "fixture_promotion": "forbidden_unless_independently_synthetic_and_human_approved"
+    }
+  ],
+  "artifact_policy": {
+    "raw_root": "evals/runs/persistent-agent-cert",
+    "raw_git_policy": "ignored",
+    "versioned_fixture_root": "evals/provider-contracts/xai/v1",
+    "fixture_git_policy": "sanitized_reviewed",
+    "fixture_promotion": {
+      "automatic": false,
+      "human_review_required": true,
+      "promotion_manifest_required": true,
+      "secret_scan_required": true,
+      "positive_allowlist_required": true
+    },
+    "forbidden_data_classes": [
+      "authorization_headers",
+      "api_keys",
+      "access_refresh_or_id_tokens",
+      "cookies_or_signing_material",
+      "grok_auth_file_contents",
+      "oidc_user_team_principal_or_account_values",
+      "arbitrary_request_or_response_headers",
+      "unfiltered_environment_or_process_arguments",
+      "personal_or_corporate_source_content",
+      "personal_or_corporate_prompts_or_completions",
+      "private_memory_terminal_clipboard_or_computer_use_content",
+      "private_or_corporate_endpoints_and_routing_metadata",
+      "private_error_bodies",
+      "real_home_workspace_or_repository_paths",
+      "machine_or_user_identifiers",
+      "embeddings_vectors_or_opaque_binary_payloads"
+    ]
+  },
+  "bound_profiles": {
+    "smoke": {
+      "per_run_token_ceiling": 20000,
+      "campaign_token_ceiling": 100000,
+      "provider_request_ceiling": 40,
+      "continuation_ceiling": 4,
+      "duration_seconds": 1800,
+      "raw_artifact_byte_ceiling": 134217728,
+      "response_byte_ceiling_per_request": 8388608,
+      "missing_usage_policy": "fail_closed"
+    },
+    "standard": {
+      "per_run_token_ceiling": 100000,
+      "campaign_token_ceiling": 500000,
+      "provider_request_ceiling": 160,
+      "continuation_ceiling": 16,
+      "duration_seconds": 7200,
+      "raw_artifact_byte_ceiling": 536870912,
+      "response_byte_ceiling_per_request": 16777216,
+      "missing_usage_policy": "fail_closed"
+    },
+    "extended": {
+      "per_run_token_ceiling": 250000,
+      "campaign_token_ceiling": 2000000,
+      "provider_request_ceiling": 800,
+      "continuation_ceiling": 96,
+      "duration_seconds": 86400,
+      "raw_artifact_byte_ceiling": 2147483648,
+      "response_byte_ceiling_per_request": 33554432,
+      "missing_usage_policy": "fail_closed"
+    }
+  },
+  "lifecycle_contract": {
+    "agent_lifetime": "months_or_years",
+    "lane_lifetime": "frequently_archived_work_context",
+    "run_lifetime": "finite_and_bounded",
+    "long_operation_model": "sequence_of_checkpointed_finite_runs",
+    "lane_archive_effect": "preserve_agent_memory_runs_checkpoints_and_associations",
+    "agent_retirement_equivalent_to_lane_archive": false
+  },
+  "scenarios": [
+    {
+      "id": "xai-route-oidc-001",
+      "group": "provider",
+      "title": "Native Grok Build OIDC route",
+      "required_layers": ["live_native_xai"],
+      "default_bound_profile": "smoke",
+      "live_checks": [
+        "qualified_builtin_xai_profile",
+        "public_grok_build_route_class",
+        "authoritative_usage_present"
+      ],
+      "replay_checks": [
+        "required_public_client_headers_present",
+        "authorization_excluded_from_evidence",
+        "account_identity_excluded_from_evidence"
+      ]
+    },
+    {
+      "id": "sse-stream-001",
+      "group": "streaming",
+      "title": "SSE framing and completion",
+      "required_layers": ["hermetic_replay", "live_native_xai"],
+      "default_bound_profile": "smoke",
+      "live_checks": [
+        "ordered_text_or_tool_deltas",
+        "terminal_frame_observed",
+        "authoritative_usage_present"
+      ],
+      "replay_checks": [
+        "arbitrary_byte_fragmentation",
+        "split_utf8_code_points",
+        "usage_only_final_frame",
+        "done_marker",
+        "no_duplicate_deltas"
+      ]
+    },
+    {
+      "id": "native-tools-001",
+      "group": "tools",
+      "title": "Native tool call continuation",
+      "required_layers": ["hermetic_replay", "live_native_xai"],
+      "default_bound_profile": "smoke",
+      "live_checks": [
+        "synthetic_tool_requested",
+        "tool_result_consumed",
+        "run_terminal_state_durable"
+      ],
+      "replay_checks": [
+        "role_order_preserved",
+        "call_id_preserved",
+        "arguments_preserved",
+        "exactly_once_tool_execution"
+      ]
+    },
+    {
+      "id": "retry-transient-001",
+      "group": "reliability",
+      "title": "Bounded retries and compatibility downgrade",
+      "required_layers": ["hermetic_replay", "live_native_xai"],
+      "default_bound_profile": "smoke",
+      "live_checks": [
+        "bounded_transient_recovery_or_typed_failure",
+        "campaign_limits_preserved"
+      ],
+      "replay_checks": [
+        "http_429",
+        "http_5xx",
+        "timeout",
+        "connection_reset",
+        "truncated_stream",
+        "optional_field_rejection",
+        "no_fabricated_success"
+      ]
+    },
+    {
+      "id": "agent-initial-run-001",
+      "group": "agent_lifecycle",
+      "title": "Initial finite persistent-Agent Run",
+      "required_layers": ["persistent_lifecycle"],
+      "default_bound_profile": "smoke",
+      "live_checks": [
+        "agent_durable",
+        "run_durable",
+        "terminal_state_durable",
+        "checkpoint_durable"
+      ],
+      "replay_checks": [
+        "lifecycle_transition_order",
+        "terminal_evidence_order",
+        "finite_bounds_recorded"
+      ]
+    },
+    {
+      "id": "restart-between-runs-001",
+      "group": "recovery",
+      "title": "Restart between finite Runs",
+      "required_layers": ["persistent_lifecycle"],
+      "default_bound_profile": "standard",
+      "live_checks": [
+        "agent_resumable_after_host_recreation",
+        "verified_checkpoint_retained"
+      ],
+      "replay_checks": [
+        "continuation_context_byte_identical_after_restart",
+        "continuation_hashes_identical_after_restart"
+      ]
+    },
+    {
+      "id": "resume-same-lane-001",
+      "group": "continuation",
+      "title": "Resume in the same Lane",
+      "required_layers": ["persistent_lifecycle"],
+      "default_bound_profile": "standard",
+      "live_checks": [
+        "new_finite_run_created",
+        "verified_checkpoint_used"
+      ],
+      "replay_checks": [
+        "parent_run_matches",
+        "checkpoint_matches",
+        "agent_spec_revision_matches",
+        "continuation_id_and_hash_match",
+        "effective_bounds_match"
+      ]
+    },
+    {
+      "id": "resume-cross-lane-001",
+      "group": "continuation",
+      "title": "Resume the same Agent in another associated Lane",
+      "required_layers": ["persistent_lifecycle"],
+      "default_bound_profile": "standard",
+      "live_checks": [
+        "same_agent_identity",
+        "different_associated_target_lane",
+        "permitted_source_workspace"
+      ],
+      "replay_checks": [
+        "target_lane_attributable",
+        "lineage_preserved",
+        "ui_focus_not_authority"
+      ]
+    },
+    {
+      "id": "archive-lane-001",
+      "group": "lane_lifecycle",
+      "title": "Archived Lane does not retire its Agent",
+      "required_layers": ["persistent_lifecycle"],
+      "default_bound_profile": "standard",
+      "live_checks": [
+        "old_lane_archived",
+        "agent_remains_usable",
+        "other_valid_lane_remains_usable"
+      ],
+      "replay_checks": [
+        "agent_identity_preserved",
+        "memory_preserved",
+        "runs_and_checkpoints_preserved",
+        "lane_associations_preserved",
+        "archive_not_agent_retirement"
+      ]
+    },
+    {
+      "id": "interrupt-recover-001",
+      "group": "recovery",
+      "title": "Interruption and explicit recovery",
+      "required_layers": ["persistent_lifecycle"],
+      "default_bound_profile": "standard",
+      "live_checks": [
+        "cancel_or_restart_marks_interrupted",
+        "no_implicit_model_restart",
+        "explicit_resume_succeeds"
+      ],
+      "replay_checks": [
+        "one_new_run_on_explicit_resume",
+        "valid_parent_lineage",
+        "no_fabricated_success"
+      ]
+    },
+    {
+      "id": "resume-idempotency-001",
+      "group": "admission",
+      "title": "Idempotent duplicate resume",
+      "required_layers": ["persistent_lifecycle"],
+      "default_bound_profile": "standard",
+      "live_checks": [
+        "duplicate_request_returns_original_run"
+      ],
+      "replay_checks": [
+        "one_durable_run",
+        "one_provider_execution",
+        "receipt_uses_actual_run_id",
+        "replay_survives_checkpoint_advancement"
+      ]
+    },
+    {
+      "id": "memory-scopes-001",
+      "group": "memory",
+      "title": "Project, private, and team memory scopes",
+      "required_layers": ["persistent_lifecycle"],
+      "default_bound_profile": "standard",
+      "live_checks": [
+        "enabled_synthetic_facts_remain_useful_across_runs"
+      ],
+      "replay_checks": [
+        "disabled_scopes_absent",
+        "unreadable_scopes_explicitly_degraded",
+        "private_membership_enforced",
+        "team_membership_enforced"
+      ]
+    },
+    {
+      "id": "spec-revision-001",
+      "group": "authority",
+      "title": "Agent specification revision is frozen per Run",
+      "required_layers": ["persistent_lifecycle"],
+      "default_bound_profile": "standard",
+      "live_checks": [
+        "later_revision_affects_later_run_only"
+      ],
+      "replay_checks": [
+        "provider_model_frozen",
+        "tool_authority_frozen",
+        "memory_membership_frozen",
+        "run_bounds_frozen"
+      ]
+    },
+    {
+      "id": "token-ceiling-001",
+      "group": "bounds",
+      "title": "Run-level and campaign token ceilings",
+      "required_layers": ["hermetic_replay", "live_native_xai", "persistent_lifecycle"],
+      "default_bound_profile": "standard",
+      "live_checks": [
+        "authoritative_usage_accumulates_across_rounds",
+        "configured_ceiling_stops_run"
+      ],
+      "replay_checks": [
+        "missing_usage_fails_closed",
+        "usage_overflow_fails_closed",
+        "over_limit_usage_cannot_produce_success"
+      ]
+    },
+    {
+      "id": "endurance-finite-runs-001",
+      "group": "endurance",
+      "title": "Sustained operation as bounded finite Runs",
+      "required_layers": ["endurance"],
+      "default_bound_profile": "extended",
+      "live_checks": [
+        "many_bounded_continuations",
+        "selected_synthetic_facts_retained",
+        "scheduled_restart_recovery"
+      ],
+      "replay_checks": [
+        "run_count_bounded",
+        "lineage_window_bounded",
+        "journal_growth_bounded",
+        "artifact_growth_bounded",
+        "disk_growth_bounded",
+        "memory_growth_bounded",
+        "file_descriptor_growth_bounded"
+      ]
+    }
+  ]
+}
