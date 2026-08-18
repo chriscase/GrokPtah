@@ -6,6 +6,7 @@ import type {
   RemoteSessionTarget,
   RemoteServiceStatus,
 } from "../lib/protocol";
+import { StateCard } from "./StateCard";
 
 export type PersistentAgentPanelProps = {
   agents: PersistentAgent[];
@@ -278,16 +279,22 @@ export function PersistentAgentPanel({
         )}
       </div>
 
-      {error && (
-        <div className="panel-block" role="alert">
-          {error}
-        </div>
-      )}
-      {!busy && sortedAgents.length === 0 && (
-        <div className="panel-block" style={{ color: "var(--muted)" }}>
-          No persistent agents yet. Complete a Build turn to create one.
-        </div>
-      )}
+      {error ? (
+        <StateCard
+          variant="error"
+          title="Persistent Agents could not be refreshed"
+          description="Your saved Agent identities are unchanged. Try again, or open the technical details if support needs the diagnostic."
+          actionLabel="Refresh"
+          onAction={onRefresh}
+          technicalDetail={error}
+        />
+      ) : !busy && sortedAgents.length === 0 ? (
+        <StateCard
+          variant="empty"
+          title="No durable Agents yet"
+          description="Complete a Build turn to create an identity that can own Lanes and resume from verified checkpoints."
+        />
+      ) : null}
 
       {sortedAgents.map((agent) => {
         const plan = plans[agent.agentId];

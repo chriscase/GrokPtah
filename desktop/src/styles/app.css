@@ -806,6 +806,79 @@ button:disabled {
   font-size: 10px;
 }
 
+.state-card {
+  display: flex;
+  gap: 0.55rem;
+  margin: 0.5rem 0;
+  padding: 0.65rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  color: var(--muted);
+}
+
+.state-card-mark {
+  display: grid;
+  place-items: center;
+  flex: 0 0 1.35rem;
+  width: 1.35rem;
+  height: 1.35rem;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.state-card-body {
+  min-width: 0;
+}
+
+.state-card-body strong {
+  display: block;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.state-card-body p {
+  margin: 0.25rem 0 0.5rem;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.state-card-error {
+  border-color: color-mix(in srgb, var(--danger, #e85d5d) 45%, var(--border-soft));
+}
+
+.state-card-error .state-card-mark {
+  color: var(--danger, #e85d5d);
+}
+
+.state-card-archived .state-card-mark,
+.state-card-stale .state-card-mark {
+  color: var(--warning, #e0ad4f);
+}
+
+.state-card-details {
+  margin: 0.35rem 0 0.5rem;
+  font-size: 10px;
+}
+
+.state-card-details summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.state-card-details pre {
+  max-height: 100px;
+  margin: 0.35rem 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 10px;
+}
+
 /* ── Multi-session tabs (Claude Code–style concurrent workspaces) ── */
 .session-tabs {
   display: flex;
