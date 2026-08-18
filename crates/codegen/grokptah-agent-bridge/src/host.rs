@@ -92,6 +92,9 @@ pub struct HostConfig {
     pub always_approve: bool,
     /// Cap model steps per user turn (live eval / tight budgets). None = default 24.
     pub max_agent_rounds: Option<u32>,
+    /// Override the bounded event journal capacity for deterministic harnesses.
+    /// Production callers leave this unset and use the standard capacity.
+    pub event_bus_capacity: Option<usize>,
 }
 
 impl Default for HostConfig {
@@ -103,6 +106,7 @@ impl Default for HostConfig {
             default_effort: EffortLevel::Medium,
             always_approve: false,
             max_agent_rounds: None,
+            event_bus_capacity: None,
         }
     }
 }
@@ -749,8 +753,11 @@ impl AgentHost {
                 None
             }
         };
-        let mut event_tx =
-            crate::event_bus::EventBus::new(crate::event_bus::DEFAULT_JOURNAL_CAPACITY);
+        let mut event_tx = crate::event_bus::EventBus::new(
+            config
+                .event_bus_capacity
+                .unwrap_or(crate::event_bus::DEFAULT_JOURNAL_CAPACITY),
+        );
         {
             let home = crate::discover::grokptah_home();
             event_tx = event_tx.with_persist_dir(home.join("orchestration"));
