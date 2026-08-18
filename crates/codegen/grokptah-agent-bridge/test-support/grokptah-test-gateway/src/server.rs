@@ -10,7 +10,8 @@ use tokio::net::TcpStream;
 use crate::request::{read_request, RecordedRequest};
 use crate::script::{Body, Response, Step};
 
-/// Running loopback gateway. Dropping it aborts the accept loop.
+/// Running loopback gateway. Dropping it aborts the accept loop and every
+/// connection task owned by that loop, including permanently stalled tasks.
 pub struct MockGateway {
     base_url: String,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
@@ -71,25 +72,35 @@ impl MockGateway {
         let task_accepted = Arc::clone(&accepted);
         let task = tokio::spawn(async move {
             let listener = tokio::net::TcpListener::from_std(listener).expect("Tokio listener");
+            let mut connections = tokio::task::JoinSet::new();
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let seq = task_accepted.fetch_add(1, Ordering::SeqCst);
-                let connection_requests = Arc::clone(&task_requests);
-                let connection_route = Arc::clone(&route);
-                tokio::spawn(async move {
-                    let Some(mut request) = read_request(&mut stream).await else {
-                        return;
-                    };
-                    request.seq = seq;
-                    let step = connection_route(&request);
-                    connection_requests
-                        .lock()
-                        .expect("request recording lock")
-                        .push(request);
-                    perform_step(stream, step).await;
-                });
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else {
+                            break;
+                        };
+                        let seq = task_accepted.fetch_add(1, Ordering::SeqCst);
+                        let connection_requests = Arc::clone(&task_requests);
+                        let connection_route = Arc::clone(&route);
+                        connections.spawn(async move {
+                            let Some(mut request) = read_request(&mut stream).await else {
+                                return;
+                            };
+                            request.seq = seq;
+                            let step = connection_route(&request);
+                            connection_requests
+                                .lock()
+                                .expect("request recording lock")
+                                .push(request);
+                            perform_step(stream, step).await;
+                        });
+                    }
+                    completed = connections.join_next(), if !connections.is_empty() => {
+                        if completed.is_none() {
+                            break;
+                        }
+                    }
+                }
             }
         });
         Self {
@@ -114,11 +125,15 @@ impl MockGateway {
         self.accepted.load(Ordering::SeqCst)
     }
 
+    /// Complete, parseable requests in stable connection-acceptance order.
     pub fn requests(&self) -> Vec<RecordedRequest> {
-        self.requests
+        let mut requests = self
+            .requests
             .lock()
             .expect("request recording lock")
-            .clone()
+            .clone();
+        requests.sort_by_key(|request| request.seq);
+        requests
     }
 }
 

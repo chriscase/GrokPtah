@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use grokptah_test_gateway::{split_at, Body, Frame, MockGateway, Response, Step};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 #[tokio::test]
 async fn ordered_steps_preserve_request_and_response_order() {
@@ -76,6 +78,59 @@ async fn routed_steps_allow_a_fast_request_to_pass_a_delayed_one() {
     assert_eq!(fast.headers()["x-route"], "fast");
     assert_eq!(slow.await.unwrap().unwrap().status(), 200);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn routed_requests_are_reported_in_acceptance_order() {
+    let gateway = MockGateway::start_routed(|_| Step::respond(Response::status_only(204))).await;
+    let address = gateway.base_url().trim_start_matches("http://");
+
+    let mut first = TcpStream::connect(address).await.expect("first connection");
+    wait_until(|| gateway.accepted_count() == 1).await;
+    let mut second = TcpStream::connect(address)
+        .await
+        .expect("second connection");
+    wait_until(|| gateway.accepted_count() == 2).await;
+
+    second
+        .write_all(b"GET /second HTTP/1.1\r\nhost: localhost\r\n\r\n")
+        .await
+        .expect("second request");
+    wait_until(|| gateway.request_count() == 1).await;
+    first
+        .write_all(b"GET /first HTTP/1.1\r\nhost: localhost\r\n\r\n")
+        .await
+        .expect("first request");
+    wait_until(|| gateway.request_count() == 2).await;
+
+    let requests = gateway.requests();
+    assert_eq!(requests[0].seq, 0);
+    assert_eq!(requests[0].path, "/first");
+    assert_eq!(requests[1].seq, 1);
+    assert_eq!(requests[1].path, "/second");
+}
+
+#[tokio::test]
+async fn dropping_routed_gateway_cancels_stalled_connection_tasks() {
+    let gateway = MockGateway::start_routed(|_| Step::stall()).await;
+    let address = gateway.base_url().trim_start_matches("http://");
+    let mut connection = TcpStream::connect(address).await.expect("connection");
+    connection
+        .write_all(b"GET /stall HTTP/1.1\r\nhost: localhost\r\n\r\n")
+        .await
+        .expect("request");
+    wait_until(|| gateway.request_count() == 1).await;
+
+    drop(gateway);
+
+    let mut byte = [0_u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(1), connection.read(&mut byte))
+        .await
+        .expect("stalled child should be cancelled when gateway drops");
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "connection unexpectedly produced response data: {closed:?}"
+    );
 }
 
 #[tokio::test]
@@ -202,10 +257,27 @@ async fn default_request_debug_never_logs_raw_auth() {
         .get(gateway.base_url())
         .header("authorization", "Bearer must-not-appear")
         .header("x-api-key", "must-not-appear-either")
+        .header("x-userid", "grok-user-must-not-appear")
+        .header("x-teamid", "grok-team-must-not-appear")
+        .header("x-request-id", "request-id-must-not-appear")
+        .header("x-forwarded-host", "routing-must-not-appear")
+        .header("x-unknown-provider-metadata", "unknown-must-not-appear")
+        .header("content-type", "application/json")
         .send()
         .await
         .unwrap();
     let rendered = format!("{:?}", gateway.requests());
     assert!(!rendered.contains("must-not-appear"));
     assert!(rendered.contains("<redacted>"));
+    assert!(rendered.contains("application/json"));
+}
+
+async fn wait_until(mut predicate: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !predicate() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("condition should become true");
 }

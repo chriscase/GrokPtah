@@ -14,7 +14,7 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Header order and duplicate names are preserved. Raw header values remain
 /// accessible for assertions, but the custom [`Debug`] implementation
-/// redacts credential-like headers and never renders the body.
+/// reveals only allowlisted protocol-header values and never renders the body.
 #[derive(Clone, Default)]
 pub struct RecordedRequest {
     pub method: String,
@@ -136,12 +136,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn debug_redacts_auth_and_omits_body() {
+    fn debug_uses_header_allowlist_and_omits_body() {
         let request = RecordedRequest {
             method: "POST".into(),
             path: "/v1/chat/completions".into(),
             headers: vec![
                 ("Authorization".into(), "Bearer never-print-me".into()),
+                ("x-userid".into(), "grok-user-never-print-me".into()),
+                ("x-teamid".into(), "grok-team-never-print-me".into()),
+                ("x-request-id".into(), "request-never-print-me".into()),
+                ("x-forwarded-host".into(), "route-never-print-me".into()),
+                ("x-unrecognized".into(), "unknown-never-print-me".into()),
                 ("content-type".into(), "application/json".into()),
             ],
             body: b"body-secret-never-print-me".to_vec(),
@@ -151,6 +156,7 @@ mod tests {
         assert!(!rendered.contains("never-print-me"));
         assert!(!rendered.contains("body-secret"));
         assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("application/json"));
         assert!(rendered.contains("body_len"));
     }
 

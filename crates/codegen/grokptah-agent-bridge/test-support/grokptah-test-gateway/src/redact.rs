@@ -12,37 +12,40 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
     output
 }
 
-/// Whether a header value should be hidden from default diagnostics.
+/// Whether a header value is safe to print in default diagnostics.
 ///
-/// Matching is intentionally conservative. Test logs do not need the value
-/// of any header whose name suggests credentials or session authority.
-pub fn is_sensitive_header(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
+/// This is deliberately a small positive allowlist. Provider-specific,
+/// identity, routing, request-ID, credential, and otherwise unknown headers
+/// are redacted even when their names do not look secret.
+pub fn is_printable_header(name: &str) -> bool {
     matches!(
-        name.as_str(),
-        "authorization"
-            | "proxy-authorization"
-            | "cookie"
-            | "set-cookie"
-            | "x-api-key"
-            | "api-key"
-            | "x-goog-api-key"
-            | "x-auth-token"
-    ) || name.contains("token")
-        || name.contains("secret")
-        || name.contains("credential")
-        || name.ends_with("-key")
+        name.to_ascii_lowercase().as_str(),
+        "accept"
+            | "accept-encoding"
+            | "connection"
+            | "content-length"
+            | "content-type"
+            | "transfer-encoding"
+    )
 }
 
-/// Copy headers while replacing sensitive values with `<redacted>`.
+/// Whether a header value is hidden from default diagnostics.
+///
+/// Kept as the inverse of [`is_printable_header`] for callers that want to
+/// assert the diagnostic policy directly.
+pub fn is_sensitive_header(name: &str) -> bool {
+    !is_printable_header(name)
+}
+
+/// Copy headers while revealing values only from the positive allowlist.
 pub fn redacted_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     headers
         .iter()
         .map(|(name, value)| {
-            let value = if is_sensitive_header(name) {
-                "<redacted>".to_owned()
-            } else {
+            let value = if is_printable_header(name) {
                 value.clone()
+            } else {
+                "<redacted>".to_owned()
             };
             (name.clone(), value)
         })
@@ -74,17 +77,36 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_header_matching_is_conservative() {
+    fn printable_header_matching_is_a_small_positive_allowlist() {
+        for name in [
+            "Accept",
+            "accept-encoding",
+            "Connection",
+            "content-length",
+            "CONTENT-TYPE",
+            "transfer-encoding",
+        ] {
+            assert!(is_printable_header(name), "expected {name} to be printable");
+            assert!(!is_sensitive_header(name));
+        }
+
         for name in [
             "Authorization",
             "x-api-key",
             "Cookie",
             "x-session-token",
             "provider-secret",
+            "x-userid",
+            "x-teamid",
+            "x-request-id",
+            "request-id",
+            "host",
+            "x-forwarded-host",
+            "x-client-version",
+            "user-agent",
         ] {
             assert!(is_sensitive_header(name), "expected {name} to be sensitive");
+            assert!(!is_printable_header(name));
         }
-        assert!(!is_sensitive_header("content-type"));
-        assert!(!is_sensitive_header("x-request-id"));
     }
 }

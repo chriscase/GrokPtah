@@ -7,10 +7,11 @@
 //!
 //! Recorded requests retain raw values so tests can prove that production
 //! clients sent the expected synthetic credentials. Their [`Debug`] output
-//! is safe by default: authentication, cookie, token, secret, and API-key
-//! header values are replaced with `<redacted>`, and request bodies are
-//! represented by length rather than content. Use [`redact`] before placing
-//! any other credential-bearing string in assertion or diagnostic output.
+//! is safe by default: only a small allowlist of protocol-header values is
+//! printable. Identity, routing, request-ID, credential, and unknown header
+//! values are replaced with `<redacted>`, and request bodies are represented
+//! by length rather than content. Use [`redact`] before placing any other
+//! credential-bearing string in assertion or diagnostic output.
 //!
 //! # Example
 //!
@@ -36,7 +37,7 @@ mod request;
 mod script;
 mod server;
 
-pub use redact::{is_sensitive_header, redact, redacted_headers};
+pub use redact::{is_printable_header, is_sensitive_header, redact, redacted_headers};
 pub use request::RecordedRequest;
 pub use script::{split_at, split_evenly, Body, Frame, Response, Step};
 pub use server::MockGateway;
