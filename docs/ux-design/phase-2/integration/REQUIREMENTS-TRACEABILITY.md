@@ -14,8 +14,8 @@ direct evidence; plans and model claims are not proof.
 | Expert multi-Lane operation explored | Prototype preserves supervision power while showing scope on every zone | Awaiting prototype | Pending |
 | Representative local workflows evaluated | S01–S03, S05–S07, and S09–S14 have prototype locators and findings | `SCENARIO-RUBRIC.md` defines the test | Pending review |
 | Representative hosted workflows evaluated | S04 and S08 are evaluated against documented contracts without claiming unobserved success | `SCENARIO-RUBRIC.md` defines the evidence boundary | Pending review |
-| Shared lifecycle/state model | Agent, Lane, Run, Runtime, workspace, archive, interruption, checkpoint, and retirement states are mapped | Grok Build analysis in flight | Pending |
-| Local/hosted ownership boundaries | Matrix distinguishes desktop-owned, local-service-owned, hosted-service-owned, and client-only state | Grok Build analysis in flight | Pending |
+| Shared lifecycle/state model | Agent, Lane, Run, Runtime, workspace, archive, interruption, checkpoint, and retirement states are mapped | `../delegated/GROK-BUILD-CONTRACT-REVIEW.md` §§1–3 plus `CONTRACT-INTEGRATION.md` | Contract complete; prototype conformance pending |
+| Local/hosted ownership boundaries | Matrix distinguishes desktop-owned, local-service-owned, hosted-service-owned, and client-only state | `../delegated/GROK-BUILD-CONTRACT-REVIEW.md` §4 plus `CONTRACT-INTEGRATION.md` | Complete for documented contracts; hosted observation still pending |
 | Comparable evaluation | All directions receive hard-gate and weighted score evidence | `SCENARIO-RUBRIC.md` and `REVIEW-WORKSHEET.md` | Framework complete; scoring pending |
 | Recommended direction selected | Decision record names a direction or hybrid and explains rejected alternatives | Awaiting completed prototypes and scoring | Pending |
 | Accessibility and narrow behavior specified | Prototype and design package cover keyboard, focus, semantics, contrast, zoom, reduced motion, and narrow widths | Requirements defined in rubric | Pending prototype review |
