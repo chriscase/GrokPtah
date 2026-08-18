@@ -82,6 +82,8 @@ struct NativeToolCall {
 struct QualificationCredentials {
     current: Option<crate::auth_store::WireCredentials>,
     expected_provider_id: String,
+    expected_credential_fingerprint: Option<String>,
+    expected_oidc_token_auth: Option<bool>,
     allow_xai_oidc_refresh: bool,
     forced_refresh_used: bool,
     #[cfg(test)]
@@ -98,6 +100,12 @@ impl QualificationCredentials {
             allow_xai_oidc_refresh: profile.id == crate::gateway_config::XAI_PROVIDER_ID
                 && profile.managed_by_host,
             expected_provider_id: profile.id.clone(),
+            expected_credential_fingerprint: current
+                .as_ref()
+                .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint),
+            expected_oidc_token_auth: current
+                .as_ref()
+                .map(|credentials| credentials.oidc_token_auth),
             current,
             forced_refresh_used: false,
             #[cfg(test)]
@@ -133,6 +141,12 @@ impl QualificationCredentials {
             .context("refresh xAI OIDC credential after qualification HTTP 401")?;
         if refreshed.provider_id != self.expected_provider_id {
             bail!("refreshed provider credential identity mismatch");
+        }
+        if Some(refreshed.oidc_token_auth) != self.expected_oidc_token_auth
+            || Some(refreshed.qualification_identity_fingerprint())
+                != self.expected_credential_fingerprint
+        {
+            bail!("refreshed provider credential principal or mode changed during qualification");
         }
         self.current = Some(refreshed);
         Ok(true)
@@ -201,11 +215,15 @@ pub async fn qualify_provider_model(
                 Some(crate::auth_store::ensure_fresh_credentials(credentials).await);
         }
     }
+    let credential_fingerprint = resolved_credentials
+        .as_ref()
+        .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint);
     let profile = crate::gateway_config::resolve_profile_for_selection(
         &selection,
         resolved_credentials
             .as_ref()
             .is_some_and(|credentials| credentials.oidc_token_auth),
+        credential_fingerprint.as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
     let mut credentials = QualificationCredentials::new(resolved_credentials, &profile)?;
@@ -364,8 +382,16 @@ pub async fn qualify_provider_model(
     target.computer_qualification_schema =
         Some(crate::gateway_config::COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA.into());
     if profile.managed_by_host {
-        crate::gateway_config::save_managed_profile_capabilities(&profile, &measured_model)
-            .context("save managed measured model capabilities")?;
+        let credential_fingerprint = credentials
+            .current()
+            .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint)
+            .unwrap_or_else(|| "anonymous".into());
+        crate::gateway_config::save_managed_profile_capabilities(
+            &profile,
+            &measured_model,
+            &credential_fingerprint,
+        )
+        .context("save managed measured model capabilities")?;
     } else {
         let mut updated = crate::gateway_config::load_for_update()
             .context("read provider profiles for qualification")?;
@@ -1226,6 +1252,38 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xai_qualification_rejects_a_refresh_that_changes_principal() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = start_bearer_gateway("fresh-token", requests.clone()).await;
+        let profile = host_xai_profile(&base_url);
+        let mut initial = wire_credentials("xai", "expired-token", true);
+        initial.user_id = Some("user-a".into());
+        initial.principal_id = Some("user-a".into());
+        let mut refreshed = wire_credentials("xai", "fresh-token", true);
+        refreshed.user_id = Some("user-b".into());
+        refreshed.principal_id = Some("user-b".into());
+        let mut credentials = QualificationCredentials::new(Some(initial), &profile).unwrap();
+        credentials.forced_refresh_override = Some(refreshed);
+
+        let error = completion(
+            &reqwest::Client::new(),
+            &base_url,
+            &mut credentials,
+            serde_json::json!({
+                "model": "grok-4.5",
+                "messages": [{"role": "user", "content": "synthetic"}],
+                "stream": false
+            }),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("principal or mode changed"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     #[test]
     fn live_synthetic_suite_qualifies_real_tools_and_tool_choice_fallback() {
         let _lock = crate::discover::home_override_serial();
@@ -1309,7 +1367,7 @@ mod tests {
                     model_id: "grok-4.5".into(),
                 };
                 let unqualified =
-                    crate::gateway_config::resolve_profile_for_selection(&selection, false)
+                    crate::gateway_config::resolve_profile_for_selection(&selection, false, None)
                         .unwrap();
                 assert!(unqualified.managed_by_host);
                 assert_eq!(
@@ -1323,9 +1381,17 @@ mod tests {
                 assert_eq!(report.provider_id, "xai");
                 assert_eq!(report.computer_use_tier, ComputerUseTier::SemanticAct);
 
-                let qualified =
-                    crate::gateway_config::resolve_profile_for_selection(&selection, false)
-                        .unwrap();
+                let credentials = crate::auth_store::resolve_wire_credentials_for_model("grok-4.5")
+                    .unwrap()
+                    .unwrap();
+                let credential_fingerprint = credentials.qualification_identity_fingerprint();
+
+                let qualified = crate::gateway_config::resolve_profile_for_selection(
+                    &selection,
+                    false,
+                    Some(&credential_fingerprint),
+                )
+                .unwrap();
                 let capabilities = &qualified.models[0].capabilities;
                 assert_eq!(capabilities.source, CapabilitySource::Measured);
                 assert_eq!(
@@ -1337,16 +1403,14 @@ mod tests {
                 assert_eq!(capabilities.computer_use_tier, ComputerUseTier::SemanticAct);
 
                 let different_auth =
-                    crate::gateway_config::resolve_profile_for_selection(&selection, true).unwrap();
+                    crate::gateway_config::resolve_profile_for_selection(&selection, true, None)
+                        .unwrap();
                 assert_eq!(
                     different_auth.models[0].capabilities.source,
                     CapabilitySource::Declared,
                     "API-key qualification must not cross into the OIDC route"
                 );
 
-                let credentials = crate::auth_store::resolve_wire_credentials_for_model("grok-4.5")
-                    .unwrap()
-                    .unwrap();
                 let target =
                     crate::host_helpers::resolve_model_target(&credentials, "grok-4.5").unwrap();
                 assert_eq!(target.capabilities.source, CapabilitySource::Measured);
@@ -1363,9 +1427,12 @@ mod tests {
                 unsafe {
                     std::env::set_var("XAI_API_BASE", "http://127.0.0.1:9/different-route");
                 }
-                let changed_route =
-                    crate::gateway_config::resolve_profile_for_selection(&selection, false)
-                        .unwrap();
+                let changed_route = crate::gateway_config::resolve_profile_for_selection(
+                    &selection,
+                    false,
+                    Some(&credential_fingerprint),
+                )
+                .unwrap();
                 assert_eq!(
                     changed_route.models[0].capabilities.source,
                     CapabilitySource::Declared,

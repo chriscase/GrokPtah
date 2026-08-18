@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::discover::grokptah_home;
@@ -334,6 +335,8 @@ struct ManagedQualification {
     base_url: String,
     wire_model_id: String,
     credential_ref: String,
+    #[serde(default)]
+    credential_fingerprint: String,
     capabilities: ModelCapabilities,
 }
 
@@ -626,9 +629,14 @@ pub fn parse_model_selection(value: &str) -> Result<ModelSelection, String> {
 pub(crate) fn resolve_profile_for_selection(
     selection: &ModelSelection,
     xai_oidc_token_auth: bool,
+    credential_fingerprint: Option<&str>,
 ) -> Result<ProviderProfile, String> {
     if selection.provider_id == XAI_PROVIDER_ID {
-        return synthesized_xai_profile(&selection.model_id, xai_oidc_token_auth);
+        return synthesized_xai_profile(
+            &selection.model_id,
+            xai_oidc_token_auth,
+            credential_fingerprint,
+        );
     }
     load()
         .profile(&selection.provider_id)
@@ -639,6 +647,7 @@ pub(crate) fn resolve_profile_for_selection(
 fn synthesized_xai_profile(
     model_id: &str,
     oidc_token_auth: bool,
+    credential_fingerprint: Option<&str>,
 ) -> Result<ProviderProfile, String> {
     let catalog_entry = crate::models_catalog::lookup(model_id);
     let wire_model_id = catalog_entry
@@ -690,6 +699,8 @@ fn synthesized_xai_profile(
             && record.base_url == base_url
             && record.wire_model_id == wire_model_id
             && record.credential_ref == credential_ref
+            && credential_fingerprint
+                .is_some_and(|fingerprint| record.credential_fingerprint == fingerprint)
             && record.capabilities.source == CapabilitySource::Measured
             && record.capabilities.qualification_schema.as_deref()
                 == Some(CAPABILITY_QUALIFICATION_SCHEMA)
@@ -732,6 +743,7 @@ fn synthesized_xai_profile(
 pub(crate) fn save_managed_profile_capabilities(
     profile: &ProviderProfile,
     model: &ProviderModel,
+    credential_fingerprint: &str,
 ) -> io::Result<()> {
     if profile.id != XAI_PROVIDER_ID
         || !profile.managed_by_host
@@ -746,6 +758,7 @@ pub(crate) fn save_managed_profile_capabilities(
     let _guard = managed_qualifications_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_guard = acquire_managed_qualifications_file_lock()?;
     let mut store = load_managed_qualifications()?;
     store.version = MANAGED_QUALIFICATIONS_VERSION;
     let replacement = ManagedQualification {
@@ -754,6 +767,7 @@ pub(crate) fn save_managed_profile_capabilities(
         base_url: profile.base_url.clone(),
         wire_model_id: model.wire_model_id().to_string(),
         credential_ref: profile.credential_ref.clone().unwrap_or_default(),
+        credential_fingerprint: credential_fingerprint.to_string(),
         capabilities: model.capabilities.clone(),
     };
     store
@@ -767,13 +781,25 @@ pub(crate) fn save_managed_profile_capabilities(
 }
 
 impl ManagedQualification {
-    fn route_key(&self) -> (&str, &str, &str, &str, &str, Option<&str>, Option<&str>) {
+    fn route_key(
+        &self,
+    ) -> (
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        Option<&str>,
+        Option<&str>,
+    ) {
         (
             &self.provider_id,
             &self.model_id,
             &self.base_url,
             &self.wire_model_id,
             &self.credential_ref,
+            &self.credential_fingerprint,
             self.capabilities.qualification_schema.as_deref(),
             self.capabilities.computer_qualification_schema.as_deref(),
         )
@@ -791,6 +817,24 @@ fn managed_qualifications_lock() -> &'static Mutex<()> {
 
 fn managed_qualifications_path() -> PathBuf {
     grokptah_home().join("provider-qualifications.json")
+}
+
+fn acquire_managed_qualifications_file_lock() -> io::Result<fs::File> {
+    let path = grokptah_home().join(".provider-qualifications.lock");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
+    file.lock_exclusive()?;
+    set_private_permissions(&path)?;
+    Ok(file)
 }
 
 fn load_managed_qualifications() -> io::Result<ManagedQualificationStore> {
@@ -1073,6 +1117,8 @@ mod tests {
     use super::*;
     use crate::discover::{home_override_serial, set_grokptah_home_override};
 
+    const TEST_CREDENTIAL_FINGERPRINT: &str = "v1-sha256:test-credential";
+
     #[test]
     fn legacy_shape_loads_as_profile_but_raw_secret_cannot_be_saved() {
         let _lock = home_override_serial();
@@ -1313,7 +1359,8 @@ mod tests {
             false,
             false,
         );
-        save_managed_profile_capabilities(&api_profile, &failed_api).unwrap();
+        save_managed_profile_capabilities(&api_profile, &failed_api, TEST_CREDENTIAL_FINGERPRINT)
+            .unwrap();
         let (oidc_profile, oidc) = measured_managed_profile(
             "grok-route",
             "https://cli-chat-proxy.grok.com/v1",
@@ -1321,7 +1368,8 @@ mod tests {
             true,
             true,
         );
-        save_managed_profile_capabilities(&oidc_profile, &oidc).unwrap();
+        save_managed_profile_capabilities(&oidc_profile, &oidc, TEST_CREDENTIAL_FINGERPRINT)
+            .unwrap();
         let (alternate_profile, alternate) = measured_managed_profile(
             "grok-route",
             "https://alternate.x.ai/v1",
@@ -1329,11 +1377,21 @@ mod tests {
             true,
             true,
         );
-        save_managed_profile_capabilities(&alternate_profile, &alternate).unwrap();
+        save_managed_profile_capabilities(
+            &alternate_profile,
+            &alternate,
+            TEST_CREDENTIAL_FINGERPRINT,
+        )
+        .unwrap();
 
         let mut updated_oidc = oidc.clone();
         updated_oidc.capabilities.tools = false;
-        save_managed_profile_capabilities(&oidc_profile, &updated_oidc).unwrap();
+        save_managed_profile_capabilities(
+            &oidc_profile,
+            &updated_oidc,
+            TEST_CREDENTIAL_FINGERPRINT,
+        )
+        .unwrap();
 
         let store = load_managed_qualifications().unwrap();
         assert_eq!(store.qualifications.len(), 3);
@@ -1366,6 +1424,7 @@ mod tests {
                 model_id: "grok-route".into(),
             },
             false,
+            Some(TEST_CREDENTIAL_FINGERPRINT),
         )
         .unwrap();
         assert_eq!(
@@ -1374,6 +1433,20 @@ mod tests {
         );
         assert!(!failed_projection.models[0].capabilities.chat);
         assert!(!failed_projection.models[0].capabilities.tools);
+        let rotated_credential_projection = resolve_profile_for_selection(
+            &ModelSelection {
+                provider_id: XAI_PROVIDER_ID.into(),
+                model_id: "grok-route".into(),
+            },
+            false,
+            Some("v1-sha256:rotated-credential"),
+        )
+        .unwrap();
+        assert_eq!(
+            rotated_credential_projection.models[0].capabilities.source,
+            CapabilitySource::Declared,
+            "measured authority must not cross credential identities"
+        );
 
         unsafe {
             if let Some(value) = previous_base {
@@ -1407,7 +1480,12 @@ mod tests {
                         true,
                         index % 3 != 0,
                     );
-                    save_managed_profile_capabilities(&profile, &model).unwrap();
+                    save_managed_profile_capabilities(
+                        &profile,
+                        &model,
+                        TEST_CREDENTIAL_FINGERPRINT,
+                    )
+                    .unwrap();
                 })
             })
             .collect();
@@ -1447,6 +1525,27 @@ mod tests {
     }
 
     #[test]
+    fn managed_qualification_lock_is_enforced_by_the_filesystem() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        set_grokptah_home_override(Some(home.clone()));
+
+        let first = acquire_managed_qualifications_file_lock().unwrap();
+        let second = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(home.join(".provider-qualifications.lock"))
+            .unwrap();
+        assert!(FileExt::try_lock_exclusive(&second).is_err());
+        drop(first);
+        FileExt::try_lock_exclusive(&second).unwrap();
+        FileExt::unlock(&second).unwrap();
+
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
     fn corrupt_managed_qualification_store_is_never_overwritten() {
         let _lock = home_override_serial();
         let temp = tempfile::tempdir().unwrap();
@@ -1464,7 +1563,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            save_managed_profile_capabilities(&profile, &model)
+            save_managed_profile_capabilities(&profile, &model, TEST_CREDENTIAL_FINGERPRINT,)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
@@ -1475,6 +1574,7 @@ mod tests {
                 model_id: "grok-4.5".into(),
             },
             false,
+            Some(TEST_CREDENTIAL_FINGERPRINT),
         );
         assert!(resolution
             .unwrap_err()
@@ -1682,7 +1782,8 @@ mod tests {
                     provider_id: XAI_PROVIDER_ID.into(),
                     model_id: entry.info.id.clone(),
                 };
-                let profile = resolve_profile_for_selection(&selection, oidc_token_auth).unwrap();
+                let profile =
+                    resolve_profile_for_selection(&selection, oidc_token_auth, None).unwrap();
                 let model = &profile.models[0];
                 let expected_base = if oidc_token_auth {
                     entry
@@ -1743,7 +1844,7 @@ mod tests {
         };
 
         for oidc_token_auth in [false, true] {
-            let profile = resolve_profile_for_selection(&selection, oidc_token_auth).unwrap();
+            let profile = resolve_profile_for_selection(&selection, oidc_token_auth, None).unwrap();
             let model = &profile.models[0];
             assert_eq!(profile.base_url, "http://127.0.0.1:9876/custom/");
             assert_eq!(model.id, "unknown/model:opaque");
@@ -1792,7 +1893,7 @@ mod tests {
             provider_id: XAI_PROVIDER_ID.into(),
             model_id: "grok-4.5".into(),
         };
-        let mut managed = resolve_profile_for_selection(&selection, false).unwrap();
+        let mut managed = resolve_profile_for_selection(&selection, false, None).unwrap();
         managed.label = "mutated".into();
         assert!(config
             .upsert_profile(managed.clone())

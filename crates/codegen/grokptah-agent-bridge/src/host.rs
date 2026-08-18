@@ -544,10 +544,11 @@ impl AgentHost {
         }
         let mut effort = chrome.effort;
         if let Ok(selection) = crate::gateway_config::parse_model_selection(&model) {
-            let supports_current_effort = crate::gateway_config::resolve_profile_for_selection(
-                &selection, false,
-            )
-            .is_ok_and(|profile| profile.accepts_effort(&selection.model_id, effort.as_str()));
+            let supports_current_effort =
+                crate::gateway_config::resolve_profile_for_selection(&selection, false, None)
+                    .is_ok_and(|profile| {
+                        profile.accepts_effort(&selection.model_id, effort.as_str())
+                    });
             if !supports_current_effort {
                 effort = EffortLevel::None;
             }
@@ -3163,14 +3164,17 @@ impl AgentHostHandle {
             .or_else(|| catalog.first().map(|entry| entry.info.id.clone()));
         // Resolve once through the same live source used by execution so env,
         // keychain, and Grok Build session changes are reflected immediately.
-        let xai_oidc_token_auth = xai_credential_selection
-            .as_deref()
-            .and_then(|selection| {
-                crate::auth_store::resolve_wire_credentials_for_model(selection)
-                    .ok()
-                    .flatten()
-            })
+        let xai_credentials = xai_credential_selection.as_deref().and_then(|selection| {
+            crate::auth_store::resolve_wire_credentials_for_model(selection)
+                .ok()
+                .flatten()
+        });
+        let xai_oidc_token_auth = xai_credentials
+            .as_ref()
             .is_some_and(|credentials| credentials.oidc_token_auth);
+        let xai_credential_fingerprint = xai_credentials
+            .as_ref()
+            .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint);
         let mut models: Vec<ModelInfo> = catalog
             .into_iter()
             .map(|catalog_model| {
@@ -3182,6 +3186,7 @@ impl AgentHostHandle {
                 if let Ok(profile) = crate::gateway_config::resolve_profile_for_selection(
                     &selection,
                     xai_oidc_token_auth,
+                    xai_credential_fingerprint.as_deref(),
                 ) {
                     if let Some(model) = profile.models.first() {
                         let capabilities = &model.capabilities;
@@ -9375,11 +9380,24 @@ mod computer_agent_host_tests {
             };
         let api_model = measured_model(false);
         let api_profile = managed_profile("managed:xai:api-key", api_model.clone());
-        crate::gateway_config::save_managed_profile_capabilities(&api_profile, &api_model).unwrap();
+        let live_credentials = crate::auth_store::resolve_wire_credentials_for_model("grok-4.5")
+            .unwrap()
+            .unwrap();
+        let live_fingerprint = live_credentials.qualification_identity_fingerprint();
+        crate::gateway_config::save_managed_profile_capabilities(
+            &api_profile,
+            &api_model,
+            &live_fingerprint,
+        )
+        .unwrap();
         let oidc_model = measured_model(true);
         let oidc_profile = managed_profile("managed:xai:oidc", oidc_model.clone());
-        crate::gateway_config::save_managed_profile_capabilities(&oidc_profile, &oidc_model)
-            .unwrap();
+        crate::gateway_config::save_managed_profile_capabilities(
+            &oidc_profile,
+            &oidc_model,
+            "v1-sha256:other-oidc-principal",
+        )
+        .unwrap();
 
         let host = AgentHost::create(HostConfig::default());
         host.inner.lock().auth = AuthState {

@@ -57,10 +57,13 @@ compatible providers. `XAI_API_BASE` remains the explicit endpoint override.
 
 Built-in xAI models follow the same behavioral qualification proof. Measured capabilities are stored
 separately from mutable provider configuration and apply only to the exact resolved endpoint, catalog
-model, wire model, credential mode, and qualification schemas. Each exact route is retained
+model, wire model, credential mode, non-secret credential/principal fingerprint, and qualification
+schemas. API-key rotation or an OIDC principal/team change therefore invalidates the measurement;
+ordinary access-token refresh for the same durable principal does not. Each exact route is retained
 independently, so qualifying an API-key route cannot remove or widen an OIDC or alternate-endpoint
-result. Store updates are serialized, written through a private unique temporary file, flushed, and
-atomically renamed; malformed recovery data is never overwritten or treated as an empty store, and
+result. Store updates are serialized across threads and processes with an OS file lock, written
+through a private unique temporary file, flushed, and atomically renamed; malformed recovery data is
+never overwritten or treated as an empty store, and
 xAI route resolution fails closed until it is repaired. Before a matching qualification
 exists—or after any of those route inputs changes—the synthesized profile retains the built-in
 route's declared coding capabilities and current behavior. The Computer cockpit's **Verify model for
@@ -105,7 +108,9 @@ does not combine one profile's endpoint with another profile's credential.
 - Qualification retries transient rate limits and server errors at most three
   times.
 - xAI qualification proactively refreshes near-expiry OIDC credentials and permits only one forced
-  refresh after an HTTP 401 across the bounded probe suite. Compatible-provider behavior is unchanged.
+  refresh after an HTTP 401 across the bounded probe suite. A refresh that changes provider,
+  credential mode, or durable principal fails the qualification instead of continuing on a stale
+  route. Compatible-provider behavior is unchanged.
 - Model-list capability projection resolves the current xAI credential route once from the same live
   environment, keychain, or Grok Build session source used by execution; cached UI auth state is not
   an authority source.

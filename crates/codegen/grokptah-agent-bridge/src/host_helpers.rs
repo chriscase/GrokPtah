@@ -1429,9 +1429,13 @@ pub(crate) fn resolve_model_target(
         );
     }
 
-    let profile =
-        crate::gateway_config::resolve_profile_for_selection(&selection, creds.oidc_token_auth)
-            .map_err(anyhow::Error::msg)?;
+    let credential_fingerprint = creds.qualification_identity_fingerprint();
+    let profile = crate::gateway_config::resolve_profile_for_selection(
+        &selection,
+        creds.oidc_token_auth,
+        Some(&credential_fingerprint),
+    )
+    .map_err(anyhow::Error::msg)?;
     let provider_model = profile
         .models
         .iter()
