@@ -12,8 +12,17 @@ use uuid::Uuid;
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host::AgentHostHandle;
 use crate::local_tools;
+use crate::provider_observation::{
+    AttemptDisposition as ObservationAttemptDisposition, AttemptMetrics, AuthoritativeUsage,
+    EndpointFingerprint, OpaqueIdentity, ProviderDialect as ObservationDialect,
+    ProviderIdentity as ObservationProviderIdentity, ProviderObservation,
+    ProviderObservationAttempt, ProviderObservationContext, ProviderRouteClass as ObservationRoute,
+    PublicModelId, RequestHeaderName, RequestRouteIdentity, ResponseContentClass, ResponseFraming,
+    ResponseMetadata,
+};
 use crate::session::{Session, SessionKind, TranscriptEntry};
 use crate::types::EffortLevel;
+use sha2::{Digest, Sha256};
 
 pub(crate) fn push_assistant(host: &AgentHostHandle, session_id: Uuid, text: &str) {
     let mut g = host.inner.lock();
@@ -1744,6 +1753,207 @@ fn ensure_stream_completed(saw_data: bool, stream_completed: bool) -> Result<()>
     Ok(())
 }
 
+struct ProviderObservationRoute {
+    route_class: ObservationRoute,
+    dialect: ObservationDialect,
+    credential_method: crate::provider_observation::CredentialMethod,
+    provider: ObservationProviderIdentity,
+    route: RequestRouteIdentity,
+    request_header_names: Vec<RequestHeaderName>,
+}
+
+fn sha256_hex(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn opaque_identity(value: &str) -> Option<OpaqueIdentity> {
+    OpaqueIdentity::new(&format!("opaque-{}", sha256_hex(value))).ok()
+}
+
+fn provider_observation_route(
+    creds: &crate::auth_store::WireCredentials,
+    target: &ResolvedModelTarget,
+) -> Option<ProviderObservationRoute> {
+    const GROK_BUILD_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
+    const XAI_API_BASE: &str = "https://api.x.ai/v1";
+    let base = target.base_url.trim_end_matches('/');
+    let public_model = PublicModelId::new(&target.wire_model).ok();
+    let mut request_header_names = vec![
+        RequestHeaderName::Accept,
+        RequestHeaderName::ContentType,
+        RequestHeaderName::UserAgent,
+    ];
+    if target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions {
+        request_header_names.push(RequestHeaderName::XGrokEffort);
+    }
+
+    if creds.provider_id == crate::gateway_config::XAI_PROVIDER_ID
+        && target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions
+        && creds.oidc_token_auth
+        && base == GROK_BUILD_BASE
+    {
+        let model = public_model?;
+        request_header_names.extend([
+            RequestHeaderName::XGrokClientVersion,
+            RequestHeaderName::XGrokClientMode,
+            RequestHeaderName::XXaiTokenAuth,
+            RequestHeaderName::XAuthenticateResponse,
+        ]);
+        return Some(ProviderObservationRoute {
+            route_class: ObservationRoute::GrokBuildProxy,
+            dialect: ObservationDialect::GrokBuild,
+            credential_method: crate::provider_observation::CredentialMethod::GrokBuildOidc,
+            provider: ObservationProviderIdentity::public(
+                model,
+                EndpointFingerprint::new(&sha256_hex(GROK_BUILD_BASE)).ok()?,
+            ),
+            route: RequestRouteIdentity::public_chat_completions(),
+            request_header_names,
+        });
+    }
+
+    if creds.provider_id == crate::gateway_config::XAI_PROVIDER_ID
+        && target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions
+        && !creds.oidc_token_auth
+        && base == XAI_API_BASE
+    {
+        let model = public_model?;
+        return Some(ProviderObservationRoute {
+            route_class: ObservationRoute::XaiApi,
+            dialect: ObservationDialect::XaiChatCompletions,
+            credential_method: crate::provider_observation::CredentialMethod::XaiApiKey,
+            provider: ObservationProviderIdentity::public(
+                model,
+                EndpointFingerprint::new(&sha256_hex(XAI_API_BASE)).ok()?,
+            ),
+            route: RequestRouteIdentity::public_chat_completions(),
+            request_header_names,
+        });
+    }
+
+    // xAI overrides and unknown xAI hosts stay out of retention entirely.
+    if creds.provider_id == crate::gateway_config::XAI_PROVIDER_ID {
+        return None;
+    }
+    if target.dialect != crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
+        return None;
+    }
+    let model = opaque_identity(&format!("model:{}", target.wire_model))?;
+    let route = opaque_identity(&format!("route:{base}/chat/completions"))?;
+    Some(ProviderObservationRoute {
+        route_class: ObservationRoute::CompatibleGateway,
+        dialect: ObservationDialect::OpenaiCompatible,
+        credential_method: if creds.method == "provider_keychain" {
+            crate::provider_observation::CredentialMethod::GatewayApiKey
+        } else {
+            crate::provider_observation::CredentialMethod::GatewayManaged
+        },
+        provider: ObservationProviderIdentity::opaque(
+            model,
+            EndpointFingerprint::new(&sha256_hex(base)).ok()?,
+        ),
+        route: RequestRouteIdentity::opaque(route),
+        request_header_names,
+    })
+}
+
+fn response_content_class(content_type: &str, response_bytes: u64) -> ResponseContentClass {
+    if content_type.contains("text/event-stream") {
+        ResponseContentClass::EventStream
+    } else if content_type.contains("json") {
+        ResponseContentClass::Json
+    } else if response_bytes == 0 {
+        ResponseContentClass::Empty
+    } else {
+        ResponseContentClass::Other
+    }
+}
+
+fn response_framing(
+    headers: &reqwest::header::HeaderMap,
+    content_class: ResponseContentClass,
+) -> ResponseFraming {
+    if content_class == ResponseContentClass::EventStream {
+        ResponseFraming::ServerSentEvents
+    } else if headers
+        .get(reqwest::header::TRANSFER_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        ResponseFraming::Chunked
+    } else if headers.contains_key(reqwest::header::CONTENT_LENGTH) {
+        ResponseFraming::FixedLength
+    } else {
+        ResponseFraming::None
+    }
+}
+
+fn response_shape(
+    headers: &reqwest::header::HeaderMap,
+    response_bytes: u64,
+) -> (Option<ResponseContentClass>, ResponseFraming) {
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let class = response_content_class(&content_type, response_bytes);
+    (Some(class), response_framing(headers, class))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_provider_attempt(
+    attempt: Option<ProviderObservationAttempt>,
+    route: &ProviderObservationRoute,
+    status_code: Option<u16>,
+    content_class: Option<ResponseContentClass>,
+    framing: ResponseFraming,
+    disposition: ObservationAttemptDisposition,
+    request_bytes: u64,
+    response_bytes: u64,
+    usage: Option<&crate::completion::CompletionUsage>,
+) {
+    let Some(attempt) = attempt else {
+        return;
+    };
+    let Ok(response) = ResponseMetadata::new(status_code, content_class, framing, disposition)
+    else {
+        return;
+    };
+    let usage = usage.and_then(|usage| {
+        AuthoritativeUsage::new(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+        )
+        .ok()
+    });
+    let Ok(metrics) = AttemptMetrics::new(
+        request_bytes,
+        response_bytes,
+        attempt.elapsed_millis(),
+        usage,
+    ) else {
+        return;
+    };
+    let Ok(observation) = ProviderObservation::new(
+        attempt.evidence_mode(),
+        attempt.scope().clone(),
+        attempt.attempt_number(),
+        route.route_class,
+        route.dialect,
+        route.credential_method,
+        route.provider.clone(),
+        route.route.clone(),
+        route.request_header_names.clone(),
+        response,
+        metrics,
+    ) else {
+        return;
+    };
+    let _ = attempt.notify(observation);
+}
+
 /// Stream one chat/completions step (tools + tokens).
 /// Content → `on_delta`; reasoning_content → `on_thought` (#149).
 /// Cancel aborts the HTTP body read within ~one chunk.
@@ -1763,8 +1973,44 @@ where
     F: FnMut(&str),
     G: FnMut(&str),
 {
+    call_xai_agent_step_observed(
+        creds,
+        model,
+        effort,
+        messages,
+        tools,
+        allow_transient_retries,
+        cancel,
+        None,
+        on_delta,
+        on_thought,
+    )
+    .await
+}
+
+/// Execute a provider step with optional bounded structural observation of
+/// every physical HTTP attempt. Observation is deliberately orthogonal to
+/// provider execution and failures in the recorder never affect the result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_xai_agent_step_observed<F, G>(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    effort: EffortLevel,
+    messages: &[serde_json::Value],
+    tools: &serde_json::Value,
+    allow_transient_retries: bool,
+    cancel: &CancellationToken,
+    observation: Option<&ProviderObservationContext>,
+    on_delta: F,
+    on_thought: G,
+) -> Result<AgentStep>
+where
+    F: FnMut(&str),
+    G: FnMut(&str),
+{
     let creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
     let target = resolve_model_target(&creds, model)?;
+    let observation_route = observation.and_then(|_| provider_observation_route(&creds, &target));
     call_provider_agent_step(
         creds,
         target,
@@ -1773,6 +2019,8 @@ where
         tools,
         allow_transient_retries,
         cancel,
+        observation,
+        observation_route.as_ref(),
         on_delta,
         on_thought,
     )
@@ -1788,6 +2036,8 @@ async fn call_provider_agent_step<F, G>(
     tools: &serde_json::Value,
     allow_transient_retries: bool,
     cancel: &CancellationToken,
+    observation: Option<&ProviderObservationContext>,
+    observation_route: Option<&ProviderObservationRoute>,
     mut on_delta: F,
     mut on_thought: G,
 ) -> Result<AgentStep>
@@ -1850,14 +2100,55 @@ where
             let req = crate::auth_store::apply_auth_headers(req, c, &base);
             req.json(&body)
         };
+        let request_bytes = serde_json::to_vec(&body)
+            .map(|body| body.len() as u64)
+            .unwrap_or_default();
+        let mut observation_attempt =
+            observation_route
+                .zip(observation)
+                .and_then(|(route, context)| {
+                    context.begin_attempt().ok().map(|attempt| (route, attempt))
+                });
 
         let resp_result = tokio::select! {
             r = send_once(&creds).send() => r,
-            _ = cancel.cancelled() => bail!("cancelled"),
+            _ = cancel.cancelled() => {
+                if let Some((route, attempt)) = observation_attempt.take() {
+                    record_provider_attempt(
+                        Some(attempt),
+                        route,
+                        None,
+                        None,
+                        ResponseFraming::None,
+                        ObservationAttemptDisposition::Cancelled,
+                        request_bytes,
+                        0,
+                        None,
+                    );
+                }
+                bail!("cancelled")
+            },
         };
         let mut resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
+                if let Some((route, attempt)) = observation_attempt.take() {
+                    record_provider_attempt(
+                        Some(attempt),
+                        route,
+                        None,
+                        None,
+                        ResponseFraming::None,
+                        if e.is_timeout() {
+                            ObservationAttemptDisposition::Timeout
+                        } else {
+                            ObservationAttemptDisposition::TransportError
+                        },
+                        request_bytes,
+                        0,
+                        None,
+                    );
+                }
                 last_err = Some(
                     if target.dialect
                         == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
@@ -1884,13 +2175,68 @@ where
         };
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
+            if let Some((route, attempt)) = observation_attempt.take() {
+                record_provider_attempt(
+                    Some(attempt),
+                    route,
+                    Some(resp.status().as_u16()),
+                    None,
+                    ResponseFraming::None,
+                    ObservationAttemptDisposition::HttpError,
+                    request_bytes,
+                    0,
+                    None,
+                );
+            }
             match crate::auth_store::force_refresh(&creds).await {
                 Ok(fresh) => {
                     creds = fresh;
+                    observation_attempt =
+                        observation_route
+                            .zip(observation)
+                            .and_then(|(route, context)| {
+                                context.begin_attempt().ok().map(|attempt| (route, attempt))
+                            });
                     resp = tokio::select! {
-                        r = send_once(&creds).send() => r
-                            .map_err(|e| anyhow!("request error after refresh: {e}"))?,
-                        _ = cancel.cancelled() => bail!("cancelled"),
+                        r = send_once(&creds).send() => match r {
+                            Ok(response) => response,
+                            Err(error) => {
+                                if let Some((route, attempt)) = observation_attempt.take() {
+                                    record_provider_attempt(
+                                        Some(attempt),
+                                        route,
+                                        None,
+                                        None,
+                                        ResponseFraming::None,
+                                        if error.is_timeout() {
+                                            ObservationAttemptDisposition::Timeout
+                                        } else {
+                                            ObservationAttemptDisposition::TransportError
+                                        },
+                                        request_bytes,
+                                        0,
+                                        None,
+                                    );
+                                }
+                                return Err(anyhow!("request error after refresh: {error}"));
+                            }
+                        },
+                        _ = cancel.cancelled() => {
+                            if let Some((route, attempt)) = observation_attempt.take() {
+                                record_provider_attempt(
+                                    Some(attempt),
+                                    route,
+                                    None,
+                                    None,
+                                    ResponseFraming::None,
+                                    ObservationAttemptDisposition::Cancelled,
+                                    request_bytes,
+                                    0,
+                                    None,
+                                );
+                            }
+                            bail!("cancelled")
+                        },
                     };
                 }
                 Err(e) => {
@@ -1910,9 +2256,24 @@ where
             || status.is_server_error()
             || status == reqwest::StatusCode::REQUEST_TIMEOUT
         {
+            let headers = resp.headers().clone();
             let text = read_bounded_response_body(resp, cancel)
                 .await
                 .unwrap_or_default();
+            let (content_class, framing) = response_shape(&headers, text.len() as u64);
+            if let Some((route, attempt)) = observation_attempt.take() {
+                record_provider_attempt(
+                    Some(attempt),
+                    route,
+                    Some(status.as_u16()),
+                    content_class,
+                    framing,
+                    ObservationAttemptDisposition::HttpError,
+                    request_bytes,
+                    text.len() as u64,
+                    None,
+                );
+            }
             let clipped: String = text.chars().take(400).collect();
             let compatible =
                 target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
@@ -1937,9 +2298,24 @@ where
         }
 
         if !status.is_success() {
+            let headers = resp.headers().clone();
             let text = read_bounded_response_body(resp, cancel)
                 .await
                 .unwrap_or_default();
+            let (content_class, framing) = response_shape(&headers, text.len() as u64);
+            if let Some((route, attempt)) = observation_attempt.take() {
+                record_provider_attempt(
+                    Some(attempt),
+                    route,
+                    Some(status.as_u16()),
+                    content_class,
+                    framing,
+                    ObservationAttemptDisposition::HttpError,
+                    request_bytes,
+                    text.len() as u64,
+                    None,
+                );
+            }
             // Some OpenAI-compatible gateways support streaming but reject
             // `stream_options`. Retry once without usage metadata; bounded
             // runs will then stop fail-closed at the response boundary.
@@ -1991,37 +2367,135 @@ where
 
         // Non-stream JSON body (fallback path). Some compatible gateways also
         // return this shape despite accepting `stream=true`.
-        let content_type = resp
-            .headers()
+        let headers = resp.headers().clone();
+        let content_type = headers
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase();
         if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
             let raw = read_bounded_response_body(resp, cancel).await?;
-            let v: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
+            let (content_class, framing) = response_shape(&headers, raw.len() as u64);
+            let v: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some((route, attempt)) = observation_attempt.take() {
+                        record_provider_attempt(
+                            Some(attempt),
+                            route,
+                            Some(status.as_u16()),
+                            content_class,
+                            framing,
+                            ObservationAttemptDisposition::ProtocolError,
+                            request_bytes,
+                            raw.len() as u64,
+                            None,
+                        );
+                    }
+                    return Err(anyhow!("provider JSON: {error}"));
+                }
+            };
             let usage = parse_completion_usage(&v).unwrap_or(None);
-            return Ok(parse_agent_step_from_message(
+            let step = match parse_agent_step_from_message(
                 &v["choices"][0]["message"],
                 false,
                 &mut on_delta,
                 &mut on_thought,
-            )?
-            .with_usage(usage));
+            ) {
+                Ok(step) => step.with_usage(usage.clone()),
+                Err(error) => {
+                    if let Some((route, attempt)) = observation_attempt.take() {
+                        record_provider_attempt(
+                            Some(attempt),
+                            route,
+                            Some(status.as_u16()),
+                            content_class,
+                            framing,
+                            ObservationAttemptDisposition::ProtocolError,
+                            request_bytes,
+                            raw.len() as u64,
+                            usage.as_ref(),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some((route, attempt)) = observation_attempt.take() {
+                record_provider_attempt(
+                    Some(attempt),
+                    route,
+                    Some(status.as_u16()),
+                    content_class,
+                    framing,
+                    ObservationAttemptDisposition::Completed,
+                    request_bytes,
+                    raw.len() as u64,
+                    usage.as_ref(),
+                );
+            }
+            return Ok(step);
         }
         if content_type.contains("application/json") {
             let raw = read_bounded_response_body(resp, cancel).await?;
-            let value: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
+            let (content_class, framing) = response_shape(&headers, raw.len() as u64);
+            let value: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some((route, attempt)) = observation_attempt.take() {
+                        record_provider_attempt(
+                            Some(attempt),
+                            route,
+                            Some(status.as_u16()),
+                            content_class,
+                            framing,
+                            ObservationAttemptDisposition::ProtocolError,
+                            request_bytes,
+                            raw.len() as u64,
+                            None,
+                        );
+                    }
+                    return Err(anyhow!("provider JSON: {error}"));
+                }
+            };
             let usage = parse_completion_usage(&value).unwrap_or(None);
-            return Ok(parse_agent_step_from_message(
+            let step = match parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
                 &mut on_delta,
                 &mut on_thought,
-            )?
-            .with_usage(usage));
+            ) {
+                Ok(step) => step.with_usage(usage.clone()),
+                Err(error) => {
+                    if let Some((route, attempt)) = observation_attempt.take() {
+                        record_provider_attempt(
+                            Some(attempt),
+                            route,
+                            Some(status.as_u16()),
+                            content_class,
+                            framing,
+                            ObservationAttemptDisposition::ProtocolError,
+                            request_bytes,
+                            raw.len() as u64,
+                            usage.as_ref(),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some((route, attempt)) = observation_attempt.take() {
+                record_provider_attempt(
+                    Some(attempt),
+                    route,
+                    Some(status.as_u16()),
+                    content_class,
+                    framing,
+                    ObservationAttemptDisposition::Completed,
+                    request_bytes,
+                    raw.len() as u64,
+                    usage.as_ref(),
+                );
+            }
+            return Ok(step);
         }
 
         // SSE stream path — cancel kills the body read promptly.
@@ -2030,19 +2504,52 @@ where
         let mut full_body = crate::sse::BoundedBodyAccumulator::new();
         let mut acc = AgentSseAccumulator::default();
         let mut done = false;
+        let mut response_bytes = 0u64;
 
         loop {
             let chunk = tokio::select! {
                 c = stream.next() => c,
                 _ = cancel.cancelled() => {
                     drop(stream);
+                    if let Some((route, attempt)) = observation_attempt.take() {
+                        record_provider_attempt(
+                            Some(attempt),
+                            route,
+                            None,
+                            None,
+                            ResponseFraming::None,
+                            ObservationAttemptDisposition::Cancelled,
+                            request_bytes,
+                            response_bytes,
+                            None,
+                        );
+                    }
                     bail!("cancelled");
                 }
             };
             let Some(chunk) = chunk else {
                 break;
             };
-            let bytes = chunk.map_err(|e| anyhow!("stream: {e}"))?;
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    if let Some((route, attempt)) = observation_attempt.take() {
+                        record_provider_attempt(
+                            Some(attempt),
+                            route,
+                            None,
+                            None,
+                            ResponseFraming::None,
+                            ObservationAttemptDisposition::TransportError,
+                            request_bytes,
+                            response_bytes,
+                            None,
+                        );
+                    }
+                    return Err(anyhow!("stream: {error}"));
+                }
+            };
+            response_bytes = response_bytes.saturating_add(bytes.len() as u64);
             if !acc.saw_data {
                 full_body.push(&bytes)?;
             }
@@ -2064,21 +2571,103 @@ where
         }
         if !acc.saw_data {
             let raw = full_body.finish()?;
-            let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|error| {
-                anyhow!("provider returned neither SSE nor valid JSON: {error}")
-            })?;
+            let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some((route, attempt)) = observation_attempt.take() {
+                        record_provider_attempt(
+                            Some(attempt),
+                            route,
+                            Some(status.as_u16()),
+                            Some(ResponseContentClass::Other),
+                            ResponseFraming::Chunked,
+                            ObservationAttemptDisposition::ProtocolError,
+                            request_bytes,
+                            response_bytes,
+                            None,
+                        );
+                    }
+                    return Err(anyhow!(
+                        "provider returned neither SSE nor valid JSON: {error}"
+                    ));
+                }
+            };
             let usage = parse_completion_usage(&value).unwrap_or(None);
-            return Ok(parse_agent_step_from_message(
+            let step = match parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
                 &mut on_delta,
                 &mut on_thought,
-            )?
-            .with_usage(usage));
+            ) {
+                Ok(step) => step.with_usage(usage.clone()),
+                Err(error) => {
+                    if let Some((route, attempt)) = observation_attempt.take() {
+                        record_provider_attempt(
+                            Some(attempt),
+                            route,
+                            Some(status.as_u16()),
+                            Some(ResponseContentClass::Other),
+                            ResponseFraming::Chunked,
+                            ObservationAttemptDisposition::ProtocolError,
+                            request_bytes,
+                            response_bytes,
+                            usage.as_ref(),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some((route, attempt)) = observation_attempt.take() {
+                record_provider_attempt(
+                    Some(attempt),
+                    route,
+                    Some(status.as_u16()),
+                    Some(ResponseContentClass::Other),
+                    ResponseFraming::Chunked,
+                    ObservationAttemptDisposition::Completed,
+                    request_bytes,
+                    response_bytes,
+                    usage.as_ref(),
+                );
+            }
+            return Ok(step);
         }
 
-        ensure_stream_completed(acc.saw_data, done)?;
-        let tool_calls = finish_streamed_tool_calls(acc.tool_calls, done)?;
+        if let Err(error) = ensure_stream_completed(acc.saw_data, done) {
+            if let Some((route, attempt)) = observation_attempt.take() {
+                record_provider_attempt(
+                    Some(attempt),
+                    route,
+                    Some(status.as_u16()),
+                    Some(ResponseContentClass::EventStream),
+                    ResponseFraming::ServerSentEvents,
+                    ObservationAttemptDisposition::ProtocolError,
+                    request_bytes,
+                    response_bytes,
+                    acc.usage.as_ref(),
+                );
+            }
+            return Err(error);
+        }
+        let tool_calls = match finish_streamed_tool_calls(acc.tool_calls, done) {
+            Ok(tool_calls) => tool_calls,
+            Err(error) => {
+                if let Some((route, attempt)) = observation_attempt.take() {
+                    record_provider_attempt(
+                        Some(attempt),
+                        route,
+                        Some(status.as_u16()),
+                        Some(ResponseContentClass::EventStream),
+                        ResponseFraming::ServerSentEvents,
+                        ObservationAttemptDisposition::ProtocolError,
+                        request_bytes,
+                        response_bytes,
+                        acc.usage.as_ref(),
+                    );
+                }
+                return Err(error);
+            }
+        };
 
         let reasoning_opt = if acc.reasoning.trim().is_empty() {
             None
@@ -2093,6 +2682,19 @@ where
             } else {
                 Some(acc.content)
             };
+            if let Some((route, attempt)) = observation_attempt.take() {
+                record_provider_attempt(
+                    Some(attempt),
+                    route,
+                    Some(status.as_u16()),
+                    Some(ResponseContentClass::EventStream),
+                    ResponseFraming::ServerSentEvents,
+                    ObservationAttemptDisposition::Completed,
+                    request_bytes,
+                    response_bytes,
+                    usage.as_ref(),
+                );
+            }
             return Ok(AgentStep::ToolCalls {
                 content: content_opt,
                 tool_calls,
@@ -2103,6 +2705,19 @@ where
         }
 
         if !acc.content.trim().is_empty() {
+            if let Some((route, attempt)) = observation_attempt.take() {
+                record_provider_attempt(
+                    Some(attempt),
+                    route,
+                    Some(status.as_u16()),
+                    Some(ResponseContentClass::EventStream),
+                    ResponseFraming::ServerSentEvents,
+                    ObservationAttemptDisposition::Completed,
+                    request_bytes,
+                    response_bytes,
+                    usage.as_ref(),
+                );
+            }
             return Ok(AgentStep::Final {
                 text: acc.content,
                 streamed: acc.streamed_any,
@@ -2112,6 +2727,19 @@ where
         }
         if let Some(r) = reasoning_opt {
             // Reasoning-only: already streamed via on_thought; no assistant text.
+            if let Some((route, attempt)) = observation_attempt.take() {
+                record_provider_attempt(
+                    Some(attempt),
+                    route,
+                    Some(status.as_u16()),
+                    Some(ResponseContentClass::EventStream),
+                    ResponseFraming::ServerSentEvents,
+                    ObservationAttemptDisposition::Completed,
+                    request_bytes,
+                    response_bytes,
+                    usage.as_ref(),
+                );
+            }
             return Ok(AgentStep::Final {
                 text: String::new(),
                 streamed: true,
@@ -2122,6 +2750,19 @@ where
         // A successful stream may legitimately carry only usage metadata.
         // It is still a billable provider response, so never hide it behind
         // an internal retry that the run ledger cannot observe.
+        if let Some((route, attempt)) = observation_attempt.take() {
+            record_provider_attempt(
+                Some(attempt),
+                route,
+                Some(status.as_u16()),
+                Some(ResponseContentClass::EventStream),
+                ResponseFraming::ServerSentEvents,
+                ObservationAttemptDisposition::Completed,
+                request_bytes,
+                response_bytes,
+                usage.as_ref(),
+            );
+        }
         return Ok(AgentStep::Final {
             text: String::new(),
             streamed: acc.streamed_any,
@@ -2208,6 +2849,8 @@ pub async fn replay_xai_provider_contract_on_loopback(
         tools,
         false,
         &CancellationToken::new(),
+        None,
+        None,
         |delta| deltas.push(delta.to_string()),
         |delta| thought_deltas.push(delta.to_string()),
     )
@@ -2561,7 +3204,24 @@ mod compatible_stream_tests {
                 let temp = tempfile::tempdir().unwrap();
                 let model =
                     install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
-                let result = call_xai_agent_step(
+                let recorder =
+                    crate::provider_observation::InMemoryObservationRecorder::new(16).unwrap();
+                let campaign = crate::provider_observation::OpaqueScopeId::new(
+                    "018f1234-5678-7abc-8def-0123456789ab",
+                )
+                .unwrap();
+                let observation = crate::provider_observation::ProviderObservationSession::new(
+                    crate::provider_observation::EvidenceMode::MetadataOnly,
+                    campaign,
+                    recorder.observer(),
+                );
+                let context = observation
+                    .context(
+                        "018f1234-5678-7abc-8def-0123456789ac",
+                        Uuid::parse_str("018f1234-5678-7abc-8def-0123456789ad").unwrap(),
+                    )
+                    .unwrap();
+                let result = call_xai_agent_step_observed(
                     &compatible_credentials("cancel-test"),
                     &model,
                     EffortLevel::None,
@@ -2569,6 +3229,7 @@ mod compatible_stream_tests {
                     &serde_json::json!([]),
                     true,
                     &CancellationToken::new(),
+                    Some(&context),
                     |_| {},
                     |_| {},
                 )
@@ -2581,6 +3242,22 @@ mod compatible_stream_tests {
                     }
                     AgentStep::ToolCalls { .. } => panic!("expected a final response"),
                 }
+
+                // The compatibility path made four physical POSTs: each
+                // rejected shape is retained as metadata, not as a payload.
+                let observations = recorder.snapshot();
+                assert_eq!(observations.len(), 4);
+                assert_eq!(
+                    observations
+                        .iter()
+                        .map(|observation| observation.attempt_number())
+                        .collect::<Vec<_>>(),
+                    vec![1, 2, 3, 4]
+                );
+                let encoded = serde_json::to_string(&observations).unwrap();
+                assert!(!encoded.contains("http://"));
+                assert!(!encoded.contains("synthetic"));
+                assert!(!encoded.to_ascii_lowercase().contains("authorization"));
 
                 let requests = observed.lock().unwrap();
                 assert_eq!(requests.len(), 4);
