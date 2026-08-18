@@ -86,6 +86,11 @@ pub enum RequestHeaderName {
     Accept,
     ContentType,
     UserAgent,
+    XAuthenticateResponse,
+    XGrokClientMode,
+    XGrokClientVersion,
+    XGrokEffort,
+    XXaiTokenAuth,
 }
 
 impl RequestHeaderName {
@@ -96,6 +101,16 @@ impl RequestHeaderName {
             Ok(Self::ContentType)
         } else if name.eq_ignore_ascii_case("user-agent") {
             Ok(Self::UserAgent)
+        } else if name.eq_ignore_ascii_case("x-authenticateresponse") {
+            Ok(Self::XAuthenticateResponse)
+        } else if name.eq_ignore_ascii_case("x-grok-client-mode") {
+            Ok(Self::XGrokClientMode)
+        } else if name.eq_ignore_ascii_case("x-grok-client-version") {
+            Ok(Self::XGrokClientVersion)
+        } else if name.eq_ignore_ascii_case("x-grok-effort") {
+            Ok(Self::XGrokEffort)
+        } else if name.eq_ignore_ascii_case("x-xai-token-auth") {
+            Ok(Self::XXaiTokenAuth)
         } else {
             Err(ObservationError::HeaderNotAllowlisted)
         }
@@ -106,6 +121,11 @@ impl RequestHeaderName {
             Self::Accept => "accept",
             Self::ContentType => "content-type",
             Self::UserAgent => "user-agent",
+            Self::XAuthenticateResponse => "x-authenticateresponse",
+            Self::XGrokClientMode => "x-grok-client-mode",
+            Self::XGrokClientVersion => "x-grok-client-version",
+            Self::XGrokEffort => "x-grok-effort",
+            Self::XXaiTokenAuth => "x-xai-token-auth",
         }
     }
 }
@@ -964,12 +984,12 @@ mod tests {
 
     impl ProviderObservationSink for PanicSink {
         fn observe(&self, _observation: ProviderObservation) -> ObservationAcceptance {
-            panic!("provider text must never escape through delivery")
+            panic!("observer callback panicked")
         }
     }
 
     #[test]
-    fn observer_contains_callback_panics_without_panic_text() {
+    fn observer_contains_callback_panics_without_returning_panic_text() {
         let observer = ProviderObserver::new(Arc::new(PanicSink));
         assert_eq!(
             observer.notify(observation(1, EvidenceMode::MetadataOnly)),

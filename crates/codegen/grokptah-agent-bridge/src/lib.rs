@@ -35,6 +35,7 @@ mod project_context;
 mod prompt_combine;
 mod prompt_queue;
 mod provider_discovery;
+pub mod provider_observation;
 mod provider_qualification;
 pub mod reliability_eval;
 mod run_promotion;
