@@ -81,7 +81,7 @@ pub use host_helpers::{
 
 pub use memory::{
     inject_context as memory_inject_context, list_facts as memory_list_facts,
-    remember as memory_remember,
+    remember as memory_remember, MemoryAccess, MemoryAddress, MemoryFact, MemoryScope,
 };
 
 pub use completion::{

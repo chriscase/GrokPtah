@@ -39,6 +39,7 @@ use crate::host_helpers::{
 };
 use crate::lane::LaneSummary;
 use crate::local_tools;
+use crate::memory::{MemoryAccess, MemoryAddress, MemoryScope};
 use crate::orchestration::{
     apply_run_aggregate, prompt_preview, AgentRecord, AgentResumePlan, AgentState,
     ContinuationCheckpoint, ContinuationReason, OrchStore, PromotionState, RunAggregates,
@@ -2750,7 +2751,7 @@ impl AgentHostHandle {
         self.ensure_session_accepts_new_work(id)?;
         self.ensure_transcript_loaded(id)?;
         const KEEP_RECENT: usize = 6;
-        let (summary, cwd, leaving_for_memory) = {
+        let (summary, leaving_for_memory) = {
             let mut g = self.inner.lock();
             let s = g
                 .sessions
@@ -2786,8 +2787,11 @@ impl AgentHostHandle {
                 }
             }
             s.updated_at = Utc::now();
-            (s.summary(), s.cwd.clone(), leaving_texts)
+            (s.summary(), leaving_texts)
         };
+        let project_memory = self
+            .memory_access_for_session(id)
+            .map(|access| access.project());
         // Best-effort memory flush of key decisions from compacted window.
         for t in leaving_for_memory.iter().take(12) {
             let lower = t.to_ascii_lowercase();
@@ -2797,7 +2801,9 @@ impl AgentHostHandle {
                 || lower.contains("prefer ")
             {
                 let clip: String = t.chars().take(400).collect();
-                let _ = crate::memory::remember(&cwd, &clip, &["compact-flush".into()]);
+                if let Ok(address) = &project_memory {
+                    let _ = crate::memory::remember(address, &clip, &["compact-flush".into()]);
+                }
             }
         }
         self.persist_session(id);
@@ -2928,10 +2934,12 @@ impl AgentHostHandle {
         } else {
             None
         };
+        let memory_access = MemoryAccess::new(&s.cwd, s.agent_id.clone());
         Ok(build_agent_messages(
             &history,
             s.compacted_summary.as_deref(),
             &s.cwd,
+            Some(&memory_access),
             plan,
         ))
     }
@@ -2970,24 +2978,55 @@ impl AgentHostHandle {
         self.inner.lock().edited_files.last().cloned()
     }
 
-    pub fn memory_list(&self) -> Result<Vec<crate::memory::MemoryFact>> {
-        let cwd = self
-            .inner
-            .lock()
-            .project_cwd
-            .clone()
-            .ok_or_else(|| anyhow!("no project open"))?;
-        Ok(crate::memory::list_facts(&cwd))
+    /// Resolve memory from the session's durable source workspace. Execution
+    /// worktrees and focused desktop chrome are intentionally not consulted.
+    fn memory_access_for_session(&self, session_id: Uuid) -> Result<MemoryAccess> {
+        let g = self.inner.lock();
+        let session = g
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        Ok(MemoryAccess::new(&session.cwd, session.agent_id.clone()))
     }
 
-    pub fn memory_remember(&self, text: &str) -> Result<String> {
-        let cwd = self
-            .inner
-            .lock()
-            .project_cwd
-            .clone()
-            .ok_or_else(|| anyhow!("no project open"))?;
-        crate::memory::remember(&cwd, text, &[]).map_err(|e| anyhow!(e))
+    fn memory_address_for_session(
+        &self,
+        session_id: Uuid,
+        scope: MemoryScope,
+    ) -> Result<MemoryAddress> {
+        self.memory_access_for_session(session_id)?.resolve(scope)
+    }
+
+    fn memory_address_from_args(
+        &self,
+        session_id: Uuid,
+        args: &serde_json::Value,
+    ) -> Result<MemoryAddress> {
+        let scope = args
+            .get("scope")
+            .ok_or_else(|| anyhow!("memory tool requires an explicit scope"))?;
+        let scope: MemoryScope = serde_json::from_value(scope.clone())
+            .context("memory tool scope descriptor is invalid")?;
+        self.memory_address_for_session(session_id, scope)
+    }
+
+    pub fn memory_list(
+        &self,
+        session_id: Uuid,
+        scope: MemoryScope,
+    ) -> Result<Vec<crate::memory::MemoryFact>> {
+        let address = self.memory_address_for_session(session_id, scope)?;
+        Ok(crate::memory::list_facts(&address))
+    }
+
+    pub fn memory_remember(
+        &self,
+        session_id: Uuid,
+        scope: MemoryScope,
+        text: &str,
+    ) -> Result<String> {
+        let address = self.memory_address_for_session(session_id, scope)?;
+        crate::memory::remember(&address, text, &[]).map_err(|error| anyhow!(error))
     }
 
     pub fn set_model(&self, model: String) {
@@ -6420,7 +6459,11 @@ impl AgentHostHandle {
                     session_id,
                     cwd,
                     "memory_write",
-                    &serde_json::json!({ "text": rest.trim() }).to_string(),
+                    &serde_json::json!({
+                        "text": rest.trim(),
+                        "scope": { "kind": "project" }
+                    })
+                    .to_string(),
                     cancel,
                     event_tx,
                     &Default::default(),
@@ -6433,7 +6476,11 @@ impl AgentHostHandle {
                     session_id,
                     cwd,
                     "memory_read",
-                    &serde_json::json!({ "query": rest.trim() }).to_string(),
+                    &serde_json::json!({
+                        "query": rest.trim(),
+                        "scope": { "kind": "project" }
+                    })
+                    .to_string(),
                     cancel,
                     event_tx,
                     &Default::default(),
@@ -6567,8 +6614,14 @@ impl AgentHostHandle {
         let plan_ref = active_plan
             .as_ref()
             .map(|(g, steps)| (g.as_str(), steps.as_slice()));
-        let mut messages =
-            build_agent_messages(history, compacted_summary.as_deref(), cwd, plan_ref);
+        let memory_access = self.memory_access_for_session(session_id)?;
+        let mut messages = build_agent_messages(
+            history,
+            compacted_summary.as_deref(),
+            cwd,
+            Some(&memory_access),
+            plan_ref,
+        );
 
         // Best-effort MCP discovery (skipped when offline env set for tests).
         let mcp_specs = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some()
@@ -7567,7 +7620,9 @@ impl AgentHostHandle {
                             .collect()
                     })
                     .unwrap_or_default();
-                let id = crate::memory::remember(cwd, &text, &tags).map_err(|e| anyhow!(e))?;
+                let address = self.memory_address_from_args(session_id, &args)?;
+                let id =
+                    crate::memory::remember(&address, &text, &tags).map_err(|e| anyhow!(e))?;
                 let out = format!("Remembered fact {id}: {text}");
                 let call_id = Uuid::new_v4().to_string();
                 let _ = event_tx.send(SessionUpdate::ToolCall {
@@ -7672,9 +7727,10 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let facts = crate::memory::search(cwd, &query);
+                let address = self.memory_address_from_args(session_id, &args)?;
+                let facts = crate::memory::search(&address, &query);
                 let out = if facts.is_empty() {
-                    "(no matching project memory)".into()
+                    format!("(no matching {} memory)", address.scope().label())
                 } else {
                     facts
                         .iter()

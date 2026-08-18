@@ -741,6 +741,23 @@ fn tool_schema_priority(tool: &serde_json::Value) -> u8 {
     }
 }
 
+fn memory_scope_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Exact authorized memory scope. agent_id is required for agent_private; team_id is required for team, and team scope is denied unless host policy approves that ID.",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["project", "agent_private", "team"]
+            },
+            "agent_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "team_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "required": ["kind"],
+        "additionalProperties": false
+    })
+}
+
 pub(crate) fn coding_agent_tools(
     mcp: &[crate::mcp_runtime::McpToolSpec],
 ) -> (serde_json::Value, McpToolIndex) {
@@ -944,14 +961,15 @@ pub(crate) fn coding_agent_tools(
             "type": "function",
             "function": {
                 "name": "memory_write",
-                "description": "Store a project-scoped fact for future sessions on this cwd.",
+                "description": "Store a fact in an explicit durable source-workspace memory scope.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "text": { "type": "string", "description": "Fact to remember" },
-                        "tags": { "type": "array", "items": { "type": "string" } }
+                        "tags": { "type": "array", "items": { "type": "string" } },
+                        "scope": memory_scope_schema()
                     },
-                    "required": ["text"]
+                    "required": ["text", "scope"]
                 }
             }
         }),
@@ -959,12 +977,14 @@ pub(crate) fn coding_agent_tools(
             "type": "function",
             "function": {
                 "name": "memory_read",
-                "description": "Search project memory facts (empty query lists recent).",
+                "description": "Search facts in an explicit durable source-workspace memory scope (empty query lists recent).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string" }
-                    }
+                        "query": { "type": "string" },
+                        "scope": memory_scope_schema()
+                    },
+                    "required": ["scope"]
                 }
             }
         }),
@@ -1257,6 +1277,7 @@ pub(crate) fn build_agent_messages(
     history: &[(String, String)],
     compacted_summary: Option<&str>,
     cwd: &Path,
+    memory_access: Option<&crate::memory::MemoryAccess>,
     active_plan: Option<(&str, &[String])>,
 ) -> Vec<serde_json::Value> {
     let (instructions, loaded) = crate::project_context::load_project_instructions(cwd);
@@ -1314,12 +1335,24 @@ pub(crate) fn build_agent_messages(
             "content": skills
         }));
     }
-    let mem = crate::memory::inject_context(cwd);
-    if !mem.is_empty() {
+    if let Some(access) = memory_access {
+        let memory_scope_note = match access.actor_agent_id() {
+            Some(agent_id) => format!(
+                "Memory tools require an explicit scope object. Use {{\"kind\":\"project\"}} for project facts or {{\"kind\":\"agent_private\",\"agent_id\":\"{agent_id}\"}} for this Agent's private facts. Team scope also requires host policy approval."
+            ),
+            None => "Memory tools require the explicit project scope object {\"kind\":\"project\"}. Agent-private and team scopes are unavailable without authorized durable identity.".into(),
+        };
         messages.push(serde_json::json!({
             "role": "system",
-            "content": mem
+            "content": memory_scope_note
         }));
+        let mem = crate::memory::inject_context(&access.project());
+        if !mem.is_empty() {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": mem
+            }));
+        }
     }
     if let Some((goal, steps)) = active_plan {
         if !steps.is_empty() {
@@ -2884,10 +2917,36 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
     }
 
     #[test]
+    fn memory_tool_schemas_require_an_explicit_scope_descriptor() {
+        let (tools, _) = coding_agent_tools(&[]);
+        for name in ["memory_write", "memory_read"] {
+            let tool = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["function"]["name"] == name)
+                .unwrap();
+            let required = tool["function"]["parameters"]["required"]
+                .as_array()
+                .unwrap();
+            assert!(required.iter().any(|field| field == "scope"));
+            assert_eq!(
+                tool["function"]["parameters"]["properties"]["scope"]["properties"]["kind"]["enum"],
+                serde_json::json!(["project", "agent_private", "team"])
+            );
+        }
+    }
+
+    #[test]
     fn build_agent_messages_embeds_efficiency_guidance() {
         let dir = tempfile::tempdir().unwrap();
-        let msgs =
-            build_agent_messages(&[("user".into(), "fix it".into())], None, dir.path(), None);
+        let msgs = build_agent_messages(
+            &[("user".into(), "fix it".into())],
+            None,
+            dir.path(),
+            None,
+            None,
+        );
         let system = msgs[0]["content"].as_str().unwrap_or("");
         assert!(
             system.contains("write_files") || system.contains("Turn budget"),

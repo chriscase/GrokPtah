@@ -1486,8 +1486,13 @@ pub async fn export_transcript(
 }
 
 #[tauri::command]
-pub fn memory_list(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
-    let facts = state.host.memory_list().map_err(map_err)?;
+pub fn memory_list(
+    state: State<'_, AppState>,
+    session_id: String,
+    scope: grokptah_agent_bridge::MemoryScope,
+) -> Result<Vec<serde_json::Value>, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let facts = state.host.memory_list(session_id, scope).map_err(map_err)?;
     Ok(facts
         .into_iter()
         .map(|f| {
@@ -1502,8 +1507,17 @@ pub fn memory_list(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>,
 }
 
 #[tauri::command]
-pub fn memory_remember(state: State<'_, AppState>, text: String) -> Result<String, String> {
-    state.host.memory_remember(&text).map_err(map_err)
+pub fn memory_remember(
+    state: State<'_, AppState>,
+    session_id: String,
+    scope: grokptah_agent_bridge::MemoryScope,
+    text: String,
+) -> Result<String, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .host
+        .memory_remember(session_id, scope, &text)
+        .map_err(map_err)
 }
 
 #[tauri::command]

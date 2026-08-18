@@ -9,7 +9,8 @@ use std::fs;
 use std::time::Duration;
 
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, AgentHost, HostConfig, SessionUpdate,
+    home_override_serial, set_grokptah_home_override, AgentHost, HostConfig, MemoryScope,
+    SessionUpdate,
 };
 use tokio::time::timeout;
 
@@ -185,7 +186,7 @@ async fn smoke_todo_and_memory_tools() {
         .await
         .unwrap();
     drain(&mut rx).await;
-    let facts = host.memory_list().unwrap();
+    let facts = host.memory_list(s2.id, MemoryScope::Project).unwrap();
     assert!(
         facts.iter().any(|f| f.text.contains("wrapping_add")),
         "project memory must persist across sessions: {facts:?}"

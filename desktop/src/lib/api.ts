@@ -492,12 +492,25 @@ export const api = {
   lastEditedPath: () => invoke<string | null>("last_edited_path"),
   exportTranscript: (sessionId: string) =>
     invoke<string>("export_transcript", { sessionId }),
-  memoryList: () =>
+  memoryList: (
+    sessionId: string,
+    scope:
+      | { kind: "project" }
+      | { kind: "agent_private"; agent_id: string }
+      | { kind: "team"; team_id: string },
+  ) =>
     invoke<{ id: string; text: string; tags: string[]; updated_at: string }[]>(
       "memory_list",
+      { sessionId, scope },
     ),
-  memoryRemember: (text: string) =>
-    invoke<string>("memory_remember", { text }),
+  memoryRemember: (
+    sessionId: string,
+    scope:
+      | { kind: "project" }
+      | { kind: "agent_private"; agent_id: string }
+      | { kind: "team"; team_id: string },
+    text: string,
+  ) => invoke<string>("memory_remember", { sessionId, scope, text }),
   gitStageAll: () => invoke<string>("git_stage_all"),
   gitCommit: (message: string) => invoke<string>("git_commit", { message }),
   listWorktrees: () => invoke<string>("list_worktrees"),
