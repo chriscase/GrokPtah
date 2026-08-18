@@ -22,7 +22,7 @@ direct evidence; plans and model claims are not proof.
 | Migration is incremental | Recommendation identifies independently reviewable vertical slices over current contracts | `IMPLEMENTATION-ROADMAP.md` | Complete |
 | Package is repository-owned | All final documents, prototype source, deterministic captures, and decision records are committed | Entire package is under `docs/ux-design/phase-2/` on the integration branch | Complete after final commit |
 | Production UI remains unchanged | Final branch diff contains design/documentation artifacts only | Current Phase 2 branch adds only `docs/ux-design/phase-2/` | Currently satisfied; recheck before publication |
-| Reviewable work is published | Clean branch, validated artifact links/captures, and PR against the correct base | Not yet published | Pending |
+| Reviewable work is published | Clean branch, validated artifact links/captures, and PR against the correct base | Draft PR [#311](https://github.com/chriscase/GrokPtah/pull/311) targets `codex/lane-context-foundation-20260817` | Complete; inherited parent CI state documented in PR |
 
 ## Issue #308 acceptance-criteria crosswalk
 
