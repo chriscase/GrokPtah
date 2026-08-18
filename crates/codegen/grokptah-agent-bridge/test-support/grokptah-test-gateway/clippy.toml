@@ -1,0 +1,2 @@
+# Keep this independent test-support crate from inheriting bridge-only Clippy
+# configuration for APIs that are intentionally not linked here.
