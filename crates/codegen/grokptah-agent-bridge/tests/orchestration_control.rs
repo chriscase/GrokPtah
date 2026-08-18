@@ -1450,6 +1450,12 @@ async fn submit_task_reaches_terminal_offline() {
     let run_id = resp["runId"].as_str().unwrap().to_string();
     let state = wait_run_terminal(&orch, &auth, &run_id, Duration::from_secs(10)).await;
     assert_eq!(state, RunState::Completed);
+    let run = orch.get_run(&auth, &run_id).unwrap();
+    assert!(run["agentId"].as_str().is_some());
+    assert_eq!(
+        run["bounds"]["maxTotalTokens"],
+        grokptah_agent_bridge::DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS
+    );
     let handoff = orch.get_handoff(&auth, &run_id).unwrap();
     assert!(handoff["finalResponse"].as_str().is_some());
     // Idempotent retry

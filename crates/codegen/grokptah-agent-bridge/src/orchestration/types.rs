@@ -1,5 +1,7 @@
 //! Shared orchestration types for #196.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -49,7 +51,7 @@ pub enum RunStopCause {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunBounds {
     pub max_prompt_bytes: usize,
@@ -479,6 +481,28 @@ impl RunRecord {
 pub const MAX_AGENT_CONTEXT_BYTES: usize = 16 * 1024;
 pub const MAX_AGENT_WORKSPACE_BYTES: usize = 4 * 1024;
 pub const MAX_AGENT_MODEL_BYTES: usize = 256;
+pub const MAX_AGENT_DISPLAY_NAME_BYTES: usize = 128;
+pub const MAX_AGENT_ROLE_BYTES: usize = 512;
+pub const MAX_AGENT_POLICY_ENTRY_BYTES: usize = 512;
+pub const AGENT_SPEC_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS: u64 = 250_000;
+pub const DEFAULT_AGENT_TOOL_IDS: &[&str] = &[
+    "list_dir",
+    "read_file",
+    "grep",
+    "write_file",
+    "write_files",
+    "run_terminal_cmd",
+    "glob_files",
+    "apply_patch",
+    "spawn_general_purpose",
+    "spawn_explore",
+    "todo_write",
+    "memory_write",
+    "memory_read",
+    "web_fetch",
+    "kill_task",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -506,6 +530,322 @@ pub enum ContinuationReason {
     LimitReached,
 }
 
+/// Frozen provider/model route for a durable Agent revision. The selection
+/// key is retained alongside its parsed parts so every adapter can display the
+/// same route without consulting mutable desktop state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelSpec {
+    pub selection_key: String,
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+impl AgentModelSpec {
+    pub fn from_selection_key(selection_key: &str) -> Result<Self, OrchError> {
+        let parsed =
+            crate::gateway_config::parse_model_selection(selection_key).map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    format!("agent model selection is invalid: {error}"),
+                )
+            })?;
+        Ok(Self {
+            selection_key: selection_key.to_string(),
+            provider_id: parsed.provider_id,
+            model_id: parsed.model_id,
+        })
+    }
+
+    fn validate(&self) -> Result<(), OrchError> {
+        validate_bounded_string(
+            &self.selection_key,
+            MAX_AGENT_MODEL_BYTES,
+            "model.selection_key",
+        )?;
+        let parsed = Self::from_selection_key(&self.selection_key)?;
+        if parsed.provider_id != self.provider_id || parsed.model_id != self.model_id {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "agent model route does not match its selection key",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Maximum authority captured when an Agent specification revision is made.
+/// Runtime settings are intersected with this ceiling; they may restrict an
+/// Agent further but can never silently expand it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAuthorityPolicy {
+    pub sandbox_profile: String,
+    pub bypass_permissions: bool,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub allowed_mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub computer_use_allowed: bool,
+    #[serde(default)]
+    pub auto_allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub allow_rules: Vec<String>,
+    #[serde(default)]
+    pub deny_rules: Vec<String>,
+}
+
+impl Default for AgentAuthorityPolicy {
+    fn default() -> Self {
+        Self {
+            // Historical Agent records predate policy capture. Preserve their
+            // workspace capability but require explicit approval for guarded
+            // tools instead of inheriting a later bypass setting.
+            sandbox_profile: "workspace-write".into(),
+            bypass_permissions: false,
+            allowed_tools: DEFAULT_AGENT_TOOL_IDS
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+            // A legacy Agent had no captured MCP inventory. Preserve access
+            // only through the existing ambient server enablement and normal
+            // permission prompt; newly created specs capture exact IDs.
+            allowed_mcp_servers: vec!["*".into()],
+            computer_use_allowed: false,
+            auto_allowed_tools: Vec::new(),
+            allow_rules: Vec::new(),
+            deny_rules: Vec::new(),
+        }
+    }
+}
+
+impl AgentAuthorityPolicy {
+    fn validate(&self) -> Result<(), OrchError> {
+        validate_bounded_string(
+            &self.sandbox_profile,
+            MAX_AGENT_POLICY_ENTRY_BYTES,
+            "authority.sandbox_profile",
+        )?;
+        if !matches!(
+            self.sandbox_profile.as_str(),
+            "read-only" | "workspace-write" | "full"
+        ) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "authority.sandbox_profile is unknown",
+            ));
+        }
+        for (field, values) in [
+            ("authority.allowed_tools", &self.allowed_tools),
+            ("authority.allowed_mcp_servers", &self.allowed_mcp_servers),
+            ("authority.auto_allowed_tools", &self.auto_allowed_tools),
+            ("authority.allow_rules", &self.allow_rules),
+            ("authority.deny_rules", &self.deny_rules),
+        ] {
+            if values.len() > 256 {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    format!("{field} exceeds its entry bound"),
+                ));
+            }
+            for value in values {
+                validate_bounded_string(value, MAX_AGENT_POLICY_ENTRY_BYTES, field)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMemoryPolicy {
+    pub project_scope: bool,
+    pub agent_private_scope: bool,
+    #[serde(default)]
+    pub team_ids: Vec<String>,
+}
+
+impl Default for AgentMemoryPolicy {
+    fn default() -> Self {
+        Self {
+            project_scope: true,
+            agent_private_scope: true,
+            team_ids: Vec::new(),
+        }
+    }
+}
+
+impl AgentMemoryPolicy {
+    fn validate(&self) -> Result<(), OrchError> {
+        if self.team_ids.len() > 64 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "memory.team_ids exceeds its entry bound",
+            ));
+        }
+        for team_id in &self.team_ids {
+            validate_id(team_id, "memory.team_ids")?;
+        }
+        Ok(())
+    }
+}
+
+/// Immutable, attributable Agent configuration. Mutable lifecycle and Lane
+/// associations remain in `AgentRecord`, while each replacement spec is
+/// persisted as a new append-only revision by `OrchStore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSpec {
+    pub schema_version: u32,
+    pub revision: u64,
+    #[serde(default)]
+    pub previous_revision: Option<u64>,
+    pub display_name: String,
+    pub role: String,
+    pub source_workspace: String,
+    pub model: AgentModelSpec,
+    pub default_run_bounds: RunBounds,
+    pub authority: AgentAuthorityPolicy,
+    pub memory: AgentMemoryPolicy,
+    pub created_at: DateTime<Utc>,
+    pub created_by: String,
+}
+
+/// Attributable relationship between a durable Agent and a frequently
+/// archived Lane. Archiving the Lane does not detach or mutate this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLaneAssociation {
+    pub lane_id: Uuid,
+    pub source_workspace: String,
+    pub attached_at: DateTime<Utc>,
+    pub attached_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detached_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detached_by: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRuntimeState {
+    pub state: AgentState,
+    #[serde(default)]
+    pub current_run_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_lane_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_checkpoint_id: Option<String>,
+    pub continuation_ordinal: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl AgentLaneAssociation {
+    pub fn is_current(&self) -> bool {
+        self.detached_at.is_none()
+    }
+
+    fn validate(&self) -> Result<(), OrchError> {
+        validate_workspace(&self.source_workspace)?;
+        validate_bounded_string(
+            &self.attached_by,
+            MAX_AGENT_POLICY_ENTRY_BYTES,
+            "lane_association.attached_by",
+        )?;
+        if self.detached_at.is_some() != self.detached_by.is_some() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "Lane detachment attribution is incomplete",
+            ));
+        }
+        if self
+            .detached_at
+            .is_some_and(|detached_at| detached_at < self.attached_at)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "Lane detachment predates attachment",
+            ));
+        }
+        if let Some(actor) = self.detached_by.as_deref() {
+            validate_bounded_string(
+                actor,
+                MAX_AGENT_POLICY_ENTRY_BYTES,
+                "lane_association.detached_by",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl AgentSpec {
+    pub fn initial(
+        agent_id: &str,
+        workspace: &str,
+        model: &str,
+        authority: AgentAuthorityPolicy,
+        created_at: DateTime<Utc>,
+        created_by: impl Into<String>,
+    ) -> Result<Self, OrchError> {
+        let default_run_bounds = RunBounds {
+            max_total_tokens: Some(DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS),
+            ..RunBounds::default()
+        };
+        let spec = Self {
+            schema_version: AGENT_SPEC_SCHEMA_VERSION,
+            revision: 1,
+            previous_revision: None,
+            display_name: agent_id.to_string(),
+            role: "Software development agent".into(),
+            source_workspace: workspace.to_string(),
+            model: AgentModelSpec::from_selection_key(model)?,
+            default_run_bounds,
+            authority,
+            memory: AgentMemoryPolicy::default(),
+            created_at,
+            created_by: created_by.into(),
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != AGENT_SPEC_SCHEMA_VERSION || self.revision == 0 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "agent specification version or revision is invalid",
+            ));
+        }
+        if self.revision == 1 && self.previous_revision.is_some()
+            || self.revision > 1
+                && !self
+                    .previous_revision
+                    .is_some_and(|previous| previous > 0 && previous < self.revision)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "agent specification revision lineage is invalid",
+            ));
+        }
+        validate_bounded_string(
+            &self.display_name,
+            MAX_AGENT_DISPLAY_NAME_BYTES,
+            "display_name",
+        )?;
+        validate_bounded_string(&self.role, MAX_AGENT_ROLE_BYTES, "role")?;
+        validate_workspace(&self.source_workspace)?;
+        self.model.validate()?;
+        self.default_run_bounds.validate()?;
+        self.authority.validate()?;
+        self.memory.validate()?;
+        validate_bounded_string(&self.created_by, MAX_AGENT_POLICY_ENTRY_BYTES, "created_by")?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRecord {
@@ -516,11 +856,21 @@ pub struct AgentRecord {
     /// an empty list and are normalized to include `session_id` on access.
     #[serde(default)]
     pub lane_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub lane_associations: Vec<AgentLaneAssociation>,
     pub workspace: String,
     pub model: String,
+    /// Current immutable specification revision. Missing only while reading a
+    /// pre-specification record; the durable store migrates it to revision 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<AgentSpec>,
     pub state: AgentState,
     #[serde(default)]
     pub current_run_id: Option<String>,
+    #[serde(default)]
+    pub last_run_id: Option<String>,
+    #[serde(default)]
+    pub last_lane_id: Option<Uuid>,
     #[serde(default)]
     pub latest_checkpoint_id: Option<String>,
     #[serde(default)]
@@ -530,9 +880,74 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
+    pub fn migrate_legacy_spec(&mut self) -> Result<bool, OrchError> {
+        let mut changed = false;
+        if self.lane_associations.is_empty() {
+            self.lane_associations = self
+                .known_lane_ids()
+                .into_iter()
+                .map(|lane_id| AgentLaneAssociation {
+                    lane_id,
+                    source_workspace: self.workspace.clone(),
+                    attached_at: self.created_at,
+                    attached_by: "legacy_migration".into(),
+                    detached_at: None,
+                    detached_by: None,
+                })
+                .collect();
+            changed = true;
+        }
+        if self.spec.is_none() {
+            self.spec = Some(AgentSpec::initial(
+                &self.agent_id,
+                &self.workspace,
+                &self.model,
+                AgentAuthorityPolicy::default(),
+                self.created_at,
+                "legacy_migration",
+            )?);
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    pub fn current_spec(&self) -> Result<&AgentSpec, OrchError> {
+        self.spec.as_ref().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "agent specification has not been migrated",
+            )
+        })
+    }
+
+    pub fn runtime_state(&self) -> AgentRuntimeState {
+        AgentRuntimeState {
+            state: self.state,
+            current_run_ids: self.current_run_id.iter().cloned().collect(),
+            last_run_id: self.last_run_id.clone(),
+            last_lane_id: self.last_lane_id,
+            latest_checkpoint_id: self.latest_checkpoint_id.clone(),
+            continuation_ordinal: self.continuation_ordinal,
+            updated_at: self.updated_at,
+        }
+    }
+
     /// Return the compatibility-complete Lane set without mutating storage.
     pub fn known_lane_ids(&self) -> Vec<Uuid> {
-        let mut ids = self.lane_ids.clone();
+        if !self.lane_associations.is_empty() {
+            return self
+                .lane_associations
+                .iter()
+                .filter(|association| association.is_current())
+                .map(|association| association.lane_id)
+                .collect();
+        }
+        let mut ids = Vec::new();
+        for lane_id in &self.lane_ids {
+            if !ids.contains(lane_id) {
+                ids.push(*lane_id);
+            }
+        }
         if !ids.contains(&self.session_id) {
             ids.insert(0, self.session_id);
         }
@@ -543,6 +958,37 @@ impl AgentRecord {
         validate_id(&self.agent_id, "agent_id")?;
         validate_workspace(&self.workspace)?;
         validate_bounded_string(&self.model, MAX_AGENT_MODEL_BYTES, "model")?;
+        if let Some(spec) = self.spec.as_ref() {
+            spec.validate()?;
+            if spec.source_workspace != self.workspace || spec.model.selection_key != self.model {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "agent compatibility fields do not match the current specification",
+                ));
+            }
+        }
+        if self.lane_associations.len() > 256 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "Agent Lane associations exceed their bound",
+            ));
+        }
+        let mut current_lanes = HashSet::new();
+        for association in &self.lane_associations {
+            association.validate()?;
+            if association.source_workspace != self.workspace {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "Lane association is outside the Agent source workspace",
+                ));
+            }
+            if association.is_current() && !current_lanes.insert(association.lane_id) {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "Agent has duplicate current Lane associations",
+                ));
+            }
+        }
         if let Some(run_id) = self.current_run_id.as_deref() {
             validate_id(run_id, "current_run_id")?;
         }
@@ -560,6 +1006,10 @@ pub struct ContinuationCheckpoint {
     pub agent_id: String,
     pub session_id: Uuid,
     pub run_id: String,
+    /// Specification revision active when this checkpoint was created.
+    /// Missing only on legacy checkpoints, which retain their v1 hash rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_spec_revision: Option<u64>,
     #[serde(default)]
     pub parent_checkpoint_id: Option<String>,
     pub ordinal: u64,
@@ -575,18 +1025,40 @@ pub struct ContinuationCheckpoint {
 
 impl ContinuationCheckpoint {
     pub fn context_hash_for(&self) -> String {
-        hash_payload(&serde_json::json!({
-            "agentId": self.agent_id,
-            "runId": self.run_id,
-            "ordinal": self.ordinal,
-            "contextSummary": self.context_summary,
-        }))
+        match self.agent_spec_revision {
+            Some(revision) => hash_payload(&serde_json::json!({
+                "schemaVersion": 2,
+                "agentId": self.agent_id,
+                "agentSpecRevision": revision,
+                "sessionId": self.session_id,
+                "runId": self.run_id,
+                "parentCheckpointId": self.parent_checkpoint_id,
+                "ordinal": self.ordinal,
+                "workspace": self.workspace,
+                "contextSummary": self.context_summary,
+                "eventSeq": self.event_seq,
+                "reason": self.reason,
+                "createdAt": self.created_at,
+            })),
+            None => hash_payload(&serde_json::json!({
+                "agentId": self.agent_id,
+                "runId": self.run_id,
+                "ordinal": self.ordinal,
+                "contextSummary": self.context_summary,
+            })),
+        }
     }
 
     pub fn validate(&self) -> Result<(), OrchError> {
         validate_id(&self.checkpoint_id, "checkpoint_id")?;
         validate_id(&self.agent_id, "agent_id")?;
         validate_id(&self.run_id, "run_id")?;
+        if self.agent_spec_revision == Some(0) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "checkpoint Agent specification revision is invalid",
+            ));
+        }
         if let Some(parent) = self.parent_checkpoint_id.as_deref() {
             validate_id(parent, "parent_checkpoint_id")?;
         }
@@ -627,8 +1099,11 @@ impl AgentResumePlan {
                 "agent is active and cannot be resumed",
             ));
         }
-        if self.agent.session_id != session_id
-            || self.checkpoint.session_id != session_id
+        if !self.agent.known_lane_ids().contains(&session_id)
+            || !self
+                .agent
+                .known_lane_ids()
+                .contains(&self.checkpoint.session_id)
             || self.agent.workspace != workspace
             || self.checkpoint.workspace != workspace
             || self.checkpoint.agent_id != self.agent.agent_id
@@ -1076,6 +1551,7 @@ mod tests {
             agent_id: "agent-1".into(),
             session_id: Uuid::new_v4(),
             run_id: "run-1".into(),
+            agent_spec_revision: None,
             parent_checkpoint_id: None,
             ordinal: 1,
             workspace: "/tmp/project".into(),
@@ -1140,10 +1616,14 @@ mod tests {
             agent_id: "agent-1".into(),
             session_id,
             lane_ids: vec![session_id],
+            lane_associations: Vec::new(),
             workspace: "/tmp/project".into(),
             model: "grok".into(),
+            spec: None,
             state: AgentState::Waiting,
             current_run_id: None,
+            last_run_id: None,
+            last_lane_id: Some(session_id),
             latest_checkpoint_id: Some("checkpoint-1".into()),
             continuation_ordinal: 1,
             created_at: Utc::now(),
@@ -1154,6 +1634,7 @@ mod tests {
             agent_id: agent.agent_id.clone(),
             session_id,
             run_id: "run-1".into(),
+            agent_spec_revision: None,
             parent_checkpoint_id: None,
             ordinal: 1,
             workspace: agent.workspace.clone(),
@@ -1170,6 +1651,38 @@ mod tests {
             parent_run_id: "run-1".into(),
         };
         assert!(plan.validate_for(session_id, "/tmp/project").is_ok());
+        let secondary_lane_id = Uuid::new_v4();
+        let mut secondary_plan = plan.clone();
+        secondary_plan.agent.lane_ids.push(secondary_lane_id);
+        assert!(secondary_plan
+            .validate_for(secondary_lane_id, "/tmp/project")
+            .is_ok());
+        let attached_at = Utc::now();
+        secondary_plan.agent.lane_associations = vec![
+            AgentLaneAssociation {
+                lane_id: session_id,
+                source_workspace: "/tmp/project".into(),
+                attached_at,
+                attached_by: "test".into(),
+                detached_at: None,
+                detached_by: None,
+            },
+            AgentLaneAssociation {
+                lane_id: secondary_lane_id,
+                source_workspace: "/tmp/project".into(),
+                attached_at,
+                attached_by: "test".into(),
+                detached_at: Some(attached_at),
+                detached_by: Some("test".into()),
+            },
+        ];
+        assert!(!secondary_plan
+            .agent
+            .known_lane_ids()
+            .contains(&secondary_lane_id));
+        assert!(secondary_plan
+            .validate_for(secondary_lane_id, "/tmp/project")
+            .is_err());
         assert!(plan.validate_for(session_id, "/tmp/other").is_err());
         agent.state = AgentState::Active;
         let active_plan = AgentResumePlan { agent, ..plan };
@@ -1185,10 +1698,14 @@ mod tests {
             agent_id: "agent-adapter".into(),
             session_id,
             lane_ids: vec![session_id],
+            lane_associations: Vec::new(),
             workspace: "/tmp/project".into(),
             model: "grok".into(),
+            spec: None,
             state: AgentState::Interrupted,
             current_run_id: None,
+            last_run_id: None,
+            last_lane_id: Some(session_id),
             latest_checkpoint_id: Some("checkpoint-adapter".into()),
             continuation_ordinal: 2,
             created_at: Utc::now(),
@@ -1199,6 +1716,7 @@ mod tests {
             agent_id: agent.agent_id.clone(),
             session_id,
             run_id: "run-adapter".into(),
+            agent_spec_revision: None,
             parent_checkpoint_id: None,
             ordinal: 2,
             workspace: agent.workspace.clone(),
