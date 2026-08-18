@@ -1,7 +1,7 @@
 # Phase 2 direction evaluation and decision record
 
-Review date: 2026-08-18  
-Scope: GrokPtah issue #308 Phase 2 static design package  
+Review date: 2026-08-18
+Scope: GrokPtah issue #308 Phase 2 static design package
 Evidence boundary: design evaluation only; no production UI, hosted end-to-end,
 or successful Computer Use run is claimed.
 
