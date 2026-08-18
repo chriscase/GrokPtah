@@ -336,6 +336,7 @@ impl ComputerBackend for MacOsObservationBackend {
     async fn observe(
         &self,
         run_id: &str,
+        observation_id: &str,
         target: &ComputerTarget,
         limits: &ComputerUseLimits,
     ) -> ComputerResult<ComputerObservation> {
@@ -376,6 +377,7 @@ impl ComputerBackend for MacOsObservationBackend {
         };
         let observation = normalize_observation(
             run_id,
+            observation_id,
             &self.target,
             raw,
             limits,
@@ -568,6 +570,7 @@ fn action_element(
 
 fn normalize_observation(
     run_id: &str,
+    observation_id: &str,
     target: &ComputerTarget,
     raw: RawMacObservation,
     limits: &ComputerUseLimits,
@@ -611,7 +614,6 @@ fn normalize_observation(
     *next_sequence = next_sequence.saturating_add(1);
     let current_sequence = *next_sequence;
     drop(next_sequence);
-    let observation_id = format!("macos-observation-{}-{}", current_sequence, Uuid::new_v4());
     let scale_factor =
         (raw.pixel_width as f64 / raw.frame.width).min(raw.pixel_height as f64 / raw.frame.height);
     let geometry = ObservationGeometry {
@@ -706,7 +708,7 @@ fn normalize_observation(
         )?)
     };
     let observation = ComputerObservation {
-        observation_id,
+        observation_id: observation_id.to_string(),
         sequence: current_sequence,
         target: target.clone(),
         captured_at: raw.captured_at,
@@ -1227,7 +1229,12 @@ mod tests {
             .unwrap();
         let run_id = Uuid::new_v4().to_string();
         let observation = backend
-            .observe(&run_id, &candidate.target, &Default::default())
+            .observe(
+                &run_id,
+                "secure-evidence-observation",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
         assert_eq!(observation.geometry.x, -1200.0);
@@ -1270,13 +1277,23 @@ mod tests {
             .unwrap();
         let run_id = Uuid::new_v4().to_string();
         let first = backend
-            .observe(&run_id, &candidate.target, &Default::default())
+            .observe(
+                &run_id,
+                "rotating-observation-1",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
         let first_element = first.elements[0].element_id.clone();
         let first_evidence = first.screenshot.unwrap();
         let second = backend
-            .observe(&run_id, &candidate.target, &Default::default())
+            .observe(
+                &run_id,
+                "rotating-observation-2",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
         let second_evidence = second.screenshot.unwrap();
@@ -1306,7 +1323,12 @@ mod tests {
             .await
             .unwrap();
         let observation = backend
-            .observe("run", &candidate.target, &Default::default())
+            .observe(
+                "run",
+                "truncated-observation",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
 
@@ -1330,7 +1352,12 @@ mod tests {
         });
         assert_eq!(
             backend
-                .observe("run", &candidate.target, &Default::default())
+                .observe(
+                    "run",
+                    "changed-target-observation",
+                    &candidate.target,
+                    &Default::default(),
+                )
                 .await
                 .unwrap_err()
                 .code,
@@ -1383,7 +1410,12 @@ mod tests {
         *source.pixel_dimensions.lock() = (1280, 960);
 
         let observation = backend
-            .observe("run", &candidate.target, &Default::default())
+            .observe(
+                "run",
+                "geometry-observation",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
         assert_eq!(observation.geometry.x, -2000.0);
@@ -1416,7 +1448,12 @@ mod tests {
         *source.observation_error.lock() = Some(ComputerErrorCode::TargetClosed);
         assert_eq!(
             backend
-                .observe("run", &second.target, &Default::default())
+                .observe(
+                    "run",
+                    "closed-target-observation",
+                    &second.target,
+                    &Default::default(),
+                )
                 .await
                 .unwrap_err()
                 .code,
@@ -1425,7 +1462,12 @@ mod tests {
         *source.observation_error.lock() = Some(ComputerErrorCode::TargetChanged);
         assert_eq!(
             backend
-                .observe("run", &second.target, &Default::default())
+                .observe(
+                    "run",
+                    "changed-target-observation",
+                    &second.target,
+                    &Default::default(),
+                )
                 .await
                 .unwrap_err()
                 .code,
@@ -1443,7 +1485,12 @@ mod tests {
             .await
             .unwrap();
         let first = backend
-            .observe("run", &candidate.target, &Default::default())
+            .observe(
+                "run",
+                "semantic-observation-1",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
         let activated = backend
@@ -1453,7 +1500,12 @@ mod tests {
         assert_eq!(activated.expected_postcondition_met, Some(true));
 
         let second = backend
-            .observe("run", &candidate.target, &Default::default())
+            .observe(
+                "run",
+                "semantic-observation-2",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
         let element_id = second.elements[0].element_id.clone();
@@ -1506,7 +1558,12 @@ mod tests {
             .await
             .unwrap();
         let observation = backend
-            .observe("run", &candidate.target, &Default::default())
+            .observe(
+                "run",
+                "truncated-action-observation",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1529,6 +1586,7 @@ mod tests {
         let semantic_observation = semantic_backend
             .observe(
                 "semantic-run",
+                "nonsemantic-input-observation",
                 &semantic_candidate.target,
                 &Default::default(),
             )
@@ -1560,7 +1618,12 @@ mod tests {
             .await
             .unwrap();
         let observation = backend
-            .observe("run", &candidate.target, &Default::default())
+            .observe(
+                "run",
+                "postcondition-observation",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
 
@@ -1593,7 +1656,12 @@ mod tests {
             .await
             .unwrap();
         let observation = backend
-            .observe("run", &candidate.target, &Default::default())
+            .observe(
+                "run",
+                "revocation-observation",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
         source.status.lock().accessibility = ComputerPermissionStatus::Revoked;
@@ -1628,7 +1696,12 @@ mod tests {
             .await
             .unwrap();
         let observation = backend
-            .observe("run", &candidate.target, &Default::default())
+            .observe(
+                "run",
+                "geometry-drift-observation",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
         let element_id = observation.elements[0].element_id.clone();
@@ -1660,7 +1733,12 @@ mod tests {
 
         source.targets.lock()[0].frame.x -= 10.0;
         let focused = backend
-            .observe("run", &candidate.target, &Default::default())
+            .observe(
+                "run",
+                "focus-drift-observation",
+                &candidate.target,
+                &Default::default(),
+            )
             .await
             .unwrap();
         let focused_element = focused.elements[0].element_id.clone();

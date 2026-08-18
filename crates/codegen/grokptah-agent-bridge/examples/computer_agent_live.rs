@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
     let observation = simulator
         .observe(
             "live-computer-model-proof",
+            "live-computer-model-observation",
             &SimulatorBackend::demo_target(),
             &ComputerUseLimits::default(),
         )

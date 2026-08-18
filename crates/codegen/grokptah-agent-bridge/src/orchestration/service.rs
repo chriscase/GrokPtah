@@ -1088,7 +1088,8 @@ impl OrchestrationService {
     /// Session + workspace gate shared by every Computer Run read. Computer
     /// Runs are owned by build and chat sessions alike, so this requires the
     /// session to exist and match the claimed allowlisted workspace — not to
-    /// be a Build session.
+    /// be a Build session. Archived Lanes remain readable through this path;
+    /// archive is an execution boundary, not deletion of durable evidence.
     ///
     /// The claimed workspace is allowlisted first (session-independent).
     /// Unknown session, missing cwd, and cwd mismatch then collapse into the
@@ -1107,7 +1108,11 @@ impl OrchestrationService {
                 "workspace not in allowlist",
             ));
         }
-        let session = self.host.session_load(session_id).ok();
+        // Authorization must never promote the requested Lane into the local
+        // operator cockpit. In particular, do not use `session_load`: it
+        // changes the active Lane, project, tab strip, MCP servers, skills,
+        // and persisted desktop chrome as part of opening a Lane for work.
+        let session = self.host.session_inspect(session_id).ok();
         let cwd = session
             .as_ref()
             .and_then(|loaded| (!loaded.cwd.is_empty()).then(|| PathBuf::from(&loaded.cwd)));

@@ -272,16 +272,27 @@ impl ComputerUseService {
         let result = match (prepared, budget_error) {
             (Ok(_), Some(error)) => Err(error),
             (Ok(prepared), None) => {
+                // Observation identities cross the GUI/MCP projection boundary,
+                // so they are minted by the host before capture. A backend may
+                // use the ID to bind its element handles, but may not choose an
+                // identifier that could carry observed document content.
+                let observation_id = format!("observation-{}", Uuid::new_v4());
                 let observed = self
                     .backend
-                    .observe(run_id, &prepared.target, &prepared.limits)
+                    .observe(run_id, &observation_id, &prepared.target, &prepared.limits)
                     .await;
                 match observed {
                     Ok(observation) => {
-                        let validated = observation
-                            .validate(&prepared.limits)
-                            .and_then(|()| self.policy.authorize_observation_exposure(&observation))
-                            .map(|()| observation);
+                        let validated = if observation.observation_id != observation_id {
+                            Err(ComputerError::new(
+                                ComputerErrorCode::BackendFailure,
+                                "backend returned an observation identity it did not receive",
+                            ))
+                        } else {
+                            observation.validate(&prepared.limits)
+                        }
+                        .and_then(|()| self.policy.authorize_observation_exposure(&observation))
+                        .map(|()| observation);
                         match validated {
                             Ok(observation) => match self.commit_observation(run_id, observation) {
                                 Ok(observation) => Ok(observation),
@@ -834,6 +845,11 @@ mod tests {
         bytes: parking_lot::Mutex<Vec<u8>>,
     }
 
+    #[derive(Debug, Default)]
+    struct MismatchedObservationBackend {
+        inner: SimulatorBackend,
+    }
+
     impl Default for EvidenceBackend {
         fn default() -> Self {
             Self {
@@ -852,10 +868,14 @@ mod tests {
         async fn observe(
             &self,
             run_id: &str,
+            observation_id: &str,
             target: &ComputerTarget,
             limits: &ComputerUseLimits,
         ) -> ComputerResult<ComputerObservation> {
-            let mut observation = self.inner.observe(run_id, target, limits).await?;
+            let mut observation = self
+                .inner
+                .observe(run_id, observation_id, target, limits)
+                .await?;
             let bytes = self.bytes.lock();
             observation.screenshot = Some(EvidenceRef {
                 content_sha256: format!("{:x}", Sha256::digest(&*bytes)),
@@ -902,10 +922,13 @@ mod tests {
         async fn observe(
             &self,
             run_id: &str,
+            observation_id: &str,
             target: &ComputerTarget,
             limits: &ComputerUseLimits,
         ) -> ComputerResult<ComputerObservation> {
-            self.inner.observe(run_id, target, limits).await
+            self.inner
+                .observe(run_id, observation_id, target, limits)
+                .await
         }
 
         async fn act(
@@ -922,6 +945,41 @@ mod tests {
 
         async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
             self.release_action.notify_waiters();
+            self.inner.cancel(run_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for MismatchedObservationBackend {
+        fn capabilities(&self) -> ComputerCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn observe(
+            &self,
+            run_id: &str,
+            observation_id: &str,
+            target: &ComputerTarget,
+            limits: &ComputerUseLimits,
+        ) -> ComputerResult<ComputerObservation> {
+            let mut observation = self
+                .inner
+                .observe(run_id, observation_id, target, limits)
+                .await?;
+            observation.observation_id = "PRIVATE_BACKEND_OBSERVATION_ID".into();
+            Ok(observation)
+        }
+
+        async fn act(
+            &self,
+            run_id: &str,
+            observation: &ComputerObservation,
+            action: &ComputerAction,
+        ) -> ComputerResult<ActionOutcome> {
+            self.inner.act(run_id, observation, action).await
+        }
+
+        async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
             self.inner.cancel(run_id).await
         }
     }
@@ -948,6 +1006,49 @@ mod tests {
             expires_at: now + Duration::minutes(5),
             uses_remaining: Some(8),
             revoked_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_cannot_replace_the_host_minted_observation_identity() {
+        let dir = tempdir().unwrap();
+        let service = ComputerUseService::new(
+            Arc::new(MismatchedObservationBackend::default()),
+            ComputerStore::open(dir.path()).unwrap(),
+        );
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-host-id",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize("grant-host-id", &run.run_id, run.version, grant(&run))
+            .unwrap();
+
+        let error = service
+            .observe("observe-host-id", &run.run_id, run.version)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::BackendFailure);
+
+        let stored = service.get_run(&run.run_id).unwrap().unwrap();
+        let projection = service
+            .project_session_run(owner, &run.run_id, Utc::now())
+            .unwrap();
+        let events = service
+            .session_run_events(owner, &run.run_id, None, 100)
+            .unwrap();
+        for encoded in [
+            serde_json::to_string(&stored).unwrap(),
+            serde_json::to_string(&projection).unwrap(),
+            serde_json::to_string(&events).unwrap(),
+        ] {
+            assert!(!encoded.contains("PRIVATE_BACKEND_OBSERVATION_ID"));
         }
     }
 

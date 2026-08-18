@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::types::{
@@ -251,7 +252,7 @@ pub fn project_run_at(run: &ComputerRun, now: DateTime<Utc>) -> ComputerRunProje
             .current_observation
             .as_ref()
             .map(|observation| ObservationSummary {
-                observation_id: observation.observation_id.clone(),
+                observation_id: projection_observation_id(&run.run_id, &observation.observation_id),
                 sequence: observation.sequence,
                 captured_at: observation.captured_at,
                 element_count: observation.elements.len() as u32,
@@ -276,6 +277,18 @@ pub fn project_run_at(run: &ComputerRun, now: DateTime<Utc>) -> ComputerRunProje
             .map(|error| ComputerErrorSummary { code: error.code }),
         event_range: event_range(run),
     }
+}
+
+/// Durable records do not carry provenance for their observation IDs. Project
+/// every ID through a run-scoped deterministic surrogate so even a legacy
+/// backend that chose a UUID-shaped value cannot encode observed content in a
+/// GUI/MCP projection. Local action paths retain the internal ID.
+fn projection_observation_id(run_id: &str, observation_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(run_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(observation_id.as_bytes());
+    format!("observation-ref-{:x}", hasher.finalize())
 }
 
 fn progress(run: &ComputerRun, now: DateTime<Utc>) -> ComputerRunProgress {
@@ -349,6 +362,13 @@ pub(super) fn project_events(
         .iter()
         .filter(|entry| after_seq.is_none_or(|after| entry.sequence > after))
         .cloned()
+        .map(|mut entry| {
+            entry.observation_id = entry
+                .observation_id
+                .as_deref()
+                .map(|observation_id| projection_observation_id(&run.run_id, observation_id));
+            entry
+        })
         .collect();
     let more = entries.len() > limit;
     entries.truncate(limit);
@@ -393,7 +413,7 @@ mod tests {
 
     fn observation_with_secrets(target: &ComputerTarget) -> ComputerObservation {
         ComputerObservation {
-            observation_id: "obs-1".into(),
+            observation_id: "observation-01234567-89ab-cdef-0123-456789abcdef".into(),
             sequence: 7,
             target: target.clone(),
             captured_at: Utc::now(),
@@ -437,10 +457,11 @@ mod tests {
 
         assert!(!encoded.contains("PRIVATE_DOCUMENT_LABEL"));
         assert!(!encoded.contains("PRIVATE_DOCUMENT_VALUE"));
+        assert!(!encoded.contains("observation-01234567-89ab-cdef-0123-456789abcdef"));
         assert!(!encoded.contains("SECRET_ASSET_TOKEN"));
         assert!(!encoded.contains(&"a".repeat(64)));
         // The safe metadata a coordinator legitimately needs is still present.
-        assert!(encoded.contains("obs-1"));
+        assert!(encoded.contains("observation-ref-"));
         assert!(encoded.contains("\"hasScreenshot\":true"));
         assert!(encoded.contains("\"elementCount\":1"));
     }
@@ -619,14 +640,26 @@ mod tests {
     #[test]
     fn event_entries_serialize_only_the_pinned_audit_keys() {
         let mut run = run();
+        run.current_observation = Some(observation_with_secrets(&run.target.clone()));
         run.record_audit(
             "create_run",
             "accepted",
             Some(ActionClass::Semantic),
-            Some("obs-1".into()),
+            Some("observation-01234567-89ab-cdef-0123-456789abcdef".into()),
             Some(ComputerErrorCode::Interrupted),
         );
         let page = project_events(&run, None, 10);
+        let wire = serde_json::to_string(&page).unwrap();
+        assert!(!wire.contains("observation-01234567-89ab-cdef-0123-456789abcdef"));
+        assert!(wire.contains("observation-ref-"));
+        assert_eq!(
+            page.entries[0].observation_id.as_deref(),
+            project_run_at(&run, Utc::now())
+                .observation
+                .as_ref()
+                .map(|observation| observation.observation_id.as_str()),
+            "run projections and event pages must use the same opaque mapping"
+        );
         let encoded = serde_json::to_value(&page).unwrap();
         let keys: BTreeSet<&str> = encoded["entries"][0]
             .as_object()

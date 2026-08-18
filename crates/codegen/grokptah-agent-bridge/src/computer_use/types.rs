@@ -786,6 +786,7 @@ pub trait ComputerBackend: Send + Sync + std::fmt::Debug {
     async fn observe(
         &self,
         run_id: &str,
+        observation_id: &str,
         target: &ComputerTarget,
         limits: &ComputerUseLimits,
     ) -> ComputerResult<ComputerObservation>;

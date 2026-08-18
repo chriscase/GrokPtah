@@ -2277,6 +2277,14 @@ mod tests {
         client: reqwest::Client,
     }
 
+    fn operator_workspace_snapshot(host: &crate::host::AgentHostHandle) -> Value {
+        json!({
+            "workspace": host.workspace_ui_state(),
+            "mcpServers": host.mcp_list(),
+            "skills": host.skills(),
+        })
+    }
+
     async fn call_tool(
         fixture: &ComputerFixture,
         id: u64,
@@ -2382,6 +2390,67 @@ mod tests {
             srv,
             client: reqwest::Client::new(),
         };
+
+        // Coordinator reads inspect a Lane; they must never open it in the
+        // local operator cockpit. Keep session_b focused while exercising all
+        // four reads against session_a and pin the complete workspace chrome
+        // plus its project-derived MCP/skill discovery after every call.
+        let operator_before = operator_workspace_snapshot(&host);
+        let nullipotent_reads = [
+            (
+                "ptah_list_computer_runs",
+                json!({"session_id": session_a.id, "workspace": ws_a.path()}),
+            ),
+            (
+                "ptah_get_computer_run",
+                json!({
+                    "session_id": session_a.id,
+                    "workspace": ws_a.path(),
+                    "run_id": run_a.run_id,
+                }),
+            ),
+            (
+                "ptah_get_computer_run_events",
+                json!({
+                    "session_id": session_a.id,
+                    "workspace": ws_a.path(),
+                    "run_id": run_a.run_id,
+                }),
+            ),
+            (
+                "ptah_get_computer_capacity",
+                json!({"session_id": session_a.id, "workspace": ws_a.path()}),
+            ),
+        ];
+        for (index, (name, arguments)) in nullipotent_reads.into_iter().enumerate() {
+            let (status, _) = call_tool(&fixture, 100 + index as u64, name, arguments).await;
+            assert_eq!(status, StatusCode::OK, "{name} must remain readable");
+            assert_eq!(
+                operator_workspace_snapshot(&host),
+                operator_before,
+                "{name} must not change local operator workspace state"
+            );
+        }
+
+        // Archiving ends execution but preserves durable evidence. The same
+        // scoped reads remain available without restoring or promoting the
+        // Lane, and the operator's workspace remains untouched.
+        host.session_archive(session_a.id, true).unwrap();
+        let archived_before = operator_workspace_snapshot(&host);
+        let (status, _) = call_tool(
+            &fixture,
+            110,
+            "ptah_get_computer_run",
+            json!({
+                "session_id": session_a.id,
+                "workspace": ws_a.path(),
+                "run_id": run_a.run_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(operator_workspace_snapshot(&host), archived_before);
+        host.session_archive(session_a.id, false).unwrap();
 
         // Discovery includes exactly the read tools, never a computer mutation.
         let list = fixture

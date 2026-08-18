@@ -930,6 +930,7 @@ mod tests {
         async fn observe(
             &self,
             _run_id: &str,
+            observation_id: &str,
             target: &ComputerTarget,
             limits: &ComputerUseLimits,
         ) -> Result<ComputerObservation, ComputerError> {
@@ -940,7 +941,7 @@ mod tests {
                 ));
             }
             let observation = ComputerObservation {
-                observation_id: Uuid::new_v4().to_string(),
+                observation_id: observation_id.to_string(),
                 sequence: 1,
                 target: self.target.clone(),
                 captured_at: Utc::now(),
