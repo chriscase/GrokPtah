@@ -31,6 +31,7 @@ prototype locators rather than relying on memory or general impressions.
 | S11 Pause and retire Agent | | | |
 | S12 Search and history | | | |
 | S13 Narrow and keyboard-first | | | |
+| S14 Computer Use operator control | | | |
 
 ## Hard gates
 

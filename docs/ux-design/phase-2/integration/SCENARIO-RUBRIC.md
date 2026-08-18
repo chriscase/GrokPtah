@@ -250,6 +250,35 @@ approval, and return to the Lane without losing context.
 - Focus order, visible focus, labels, and escape/close behavior are specified.
 - Status is never conveyed by color alone.
 
+### S14 — Computer Use operator control
+
+**Starting state:** Computer Use is off. The selected model and operating system
+support it, but no target or native permissions have been granted.
+
+**User objective:** understand the capability and risk, select the exact
+app/window, grant bounded authority, inspect an approval, steer or pause the
+Run, and take over or stop without losing durable evidence.
+
+**Required evidence:**
+
+- Computer Use has an explicit entry point and remains separate from shell/tool
+  permission or YOLO modes.
+- The selected target, grant scope and expiry, model/provider, origin, action
+  and time budgets, current action, and observation status are visible.
+- Approval binds to the current Lane, Run, action, target, and fresh evidence;
+  switching Lanes or restarting cannot satisfy an old approval.
+- Pause, Stop, Take over, and non-cancelling Steer remain reachable whenever
+  observation or input is active and have keyboard-accessible names.
+- Permission revoked, target lost, stale observation, denied sensitive surface,
+  unsupported capability, interruption, limit reached, and expired evidence are
+  distinct states with bounded recovery guidance.
+- Reload/restart may show durable history but never implies that capture or input
+  resumed; a new authorization is required.
+- Secure values and secrets are absent from preview, notifications, diagnostics,
+  and retained evidence.
+- The narrow layout keeps the operator controls and current target visible and
+  prevents approval or permission UI from obscuring user input.
+
 ## Hard gates
 
 A direction is ineligible for recommendation if any gate fails:
@@ -306,7 +335,7 @@ scenario; the decision record must explain any hybridization.
 ## Review protocol
 
 1. Review each direction without seeing the other directions' scores.
-2. Walk S01–S13 in order and record missing screens or transitions.
+2. Walk S01–S14 in order and record missing screens or transitions.
 3. Evaluate all applicable Runtime contexts.
 4. Mark hard gates pass/fail with a concrete prototype locator.
 5. Score the weighted criteria and attach one sentence of evidence per score.

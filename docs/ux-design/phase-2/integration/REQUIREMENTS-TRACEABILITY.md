@@ -12,7 +12,7 @@ direct evidence; plans and model claims are not proof.
 | Focused Lane default explored | Prototype shows one dominant Lane, explicit composer target, and contextual expert tools | Awaiting prototype | Pending |
 | Agent-centric operation explored | Prototype shows durable Agent roster/detail and one-Agent-to-many-Lanes relationship | Awaiting prototype | Pending |
 | Expert multi-Lane operation explored | Prototype preserves supervision power while showing scope on every zone | Awaiting prototype | Pending |
-| Representative local workflows evaluated | S01–S03, S05–S07, and S09–S13 have prototype locators and findings | `SCENARIO-RUBRIC.md` defines the test | Pending review |
+| Representative local workflows evaluated | S01–S03, S05–S07, and S09–S14 have prototype locators and findings | `SCENARIO-RUBRIC.md` defines the test | Pending review |
 | Representative hosted workflows evaluated | S04 and S08 are evaluated against documented contracts without claiming unobserved success | `SCENARIO-RUBRIC.md` defines the evidence boundary | Pending review |
 | Shared lifecycle/state model | Agent, Lane, Run, Runtime, workspace, archive, interruption, checkpoint, and retirement states are mapped | Grok Build analysis in flight | Pending |
 | Local/hosted ownership boundaries | Matrix distinguishes desktop-owned, local-service-owned, hosted-service-owned, and client-only state | Grok Build analysis in flight | Pending |
@@ -36,7 +36,7 @@ direct evidence; plans and model claims are not proof.
 | Local and hosted concepts are understandable without identical layouts | Runtime/ownership matrix and S04/S08 review | Pending |
 | At least two prototype directions reviewed against the same scenarios | Three directions scored with the same framework | Pending |
 | Selected direction has rationale, accessibility requirements, inventory, and migration plan | Final decision record and package index | Pending |
-| Existing functionality and expert workflows are mapped before removal | S05–S07 plus tool/component inventory | Pending |
+| Existing functionality and expert workflows are mapped before removal | S05–S07 and S14 plus tool/component inventory | Pending |
 | Implementation children follow design review | No production implementation or child slice should be opened before decision | Satisfied so far |
 | Each future slice has visual, interaction, accessibility, and regression criteria | Final migration roadmap template | Pending |
 | Computer Use requirements are integrated rather than duplicated | Prototype presents Computer Use as Lane-scoped contextual work and retains #273 ownership | Pending review |
