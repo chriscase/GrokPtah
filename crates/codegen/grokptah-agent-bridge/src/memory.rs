@@ -57,6 +57,8 @@ impl MemoryScope {
 pub(crate) struct MemoryAccess {
     source_workspace: PathBuf,
     actor_agent_id: Option<String>,
+    project_allowed: bool,
+    agent_private_allowed: bool,
     approved_team_ids: HashSet<String>,
 }
 
@@ -65,6 +67,8 @@ impl MemoryAccess {
         Self {
             source_workspace: canonical_workspace(source_workspace.as_ref()),
             actor_agent_id,
+            project_allowed: true,
+            agent_private_allowed: true,
             approved_team_ids: HashSet::new(),
         }
     }
@@ -83,12 +87,44 @@ impl MemoryAccess {
         self.actor_agent_id.as_deref()
     }
 
+    /// Narrow team capability captured from the durable Agent specification.
+    /// Invalid IDs fail before any storage address is resolved.
+    pub(crate) fn with_approved_teams(
+        mut self,
+        team_ids: impl IntoIterator<Item = String>,
+    ) -> anyhow::Result<Self> {
+        for team_id in team_ids {
+            validate_scope_id(&team_id, "team_id")?;
+            self.approved_team_ids.insert(team_id);
+        }
+        Ok(self)
+    }
+
+    /// Apply the exact memory ceiling from a frozen Agent specification.
+    pub(crate) fn with_agent_policy(
+        mut self,
+        project_allowed: bool,
+        agent_private_allowed: bool,
+        team_ids: impl IntoIterator<Item = String>,
+    ) -> anyhow::Result<Self> {
+        self.project_allowed = project_allowed;
+        self.agent_private_allowed = agent_private_allowed;
+        self.approved_team_ids.clear();
+        self.with_approved_teams(team_ids)
+    }
+
     /// Resolve and authorize the exact durable address selected by a caller.
     pub(crate) fn resolve(&self, scope: MemoryScope) -> anyhow::Result<MemoryAddress> {
         match &scope {
+            MemoryScope::Project if !self.project_allowed => {
+                bail!("project memory scope is disabled by Agent policy");
+            }
             MemoryScope::Project => {}
             MemoryScope::AgentPrivate { agent_id } => {
                 validate_scope_id(agent_id, "agent_id")?;
+                if !self.agent_private_allowed {
+                    bail!("agent-private memory scope is disabled by Agent policy");
+                }
                 if self.actor_agent_id.as_deref() != Some(agent_id.as_str()) {
                     bail!("agent-private memory scope is not owned by the current agent");
                 }
@@ -111,6 +147,10 @@ impl MemoryAccess {
             source_workspace: self.source_workspace.clone(),
             scope: MemoryScope::Project,
         }
+    }
+
+    pub(crate) fn project_if_allowed(&self) -> Option<MemoryAddress> {
+        self.project_allowed.then(|| self.project())
     }
 }
 

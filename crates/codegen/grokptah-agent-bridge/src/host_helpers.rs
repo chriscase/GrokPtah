@@ -1365,14 +1365,19 @@ pub(crate) fn build_agent_messages(
             "role": "system",
             "content": memory_scope_note
         }));
-        match crate::memory::inject_context(&access.project()) {
-            Ok(mem) if !mem.is_empty() => {
+        match access
+            .project_if_allowed()
+            .map(|address| crate::memory::inject_context(&address))
+            .transpose()
+        {
+            Ok(None) => {}
+            Ok(Some(mem)) if !mem.is_empty() => {
                 messages.push(serde_json::json!({
                     "role": "system",
                     "content": mem
                 }));
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
             Err(error) => {
                 messages.push(serde_json::json!({
                     "role": "system",

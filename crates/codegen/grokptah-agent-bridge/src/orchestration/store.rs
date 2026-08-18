@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 
+use anyhow::Context;
 use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -15,6 +16,7 @@ use super::types::{
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
     RunStopCause,
 };
+use super::{assemble_continuation_context, ContinuationContext, ContinuationInputSnapshot};
 
 #[derive(Clone)]
 pub struct OrchStore {
@@ -29,6 +31,13 @@ struct OrchStoreInner {
     last_audit_error: Arc<Mutex<Option<String>>>,
     audit_file_lock: Arc<Mutex<()>>,
     audit_writer: AuditWriter,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentActivationIntent {
+    run: RunRecord,
+    activated_agent: AgentRecord,
 }
 
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
@@ -92,6 +101,9 @@ impl OrchStore {
         fs::create_dir_all(root.join("agents"))?;
         fs::create_dir_all(root.join("agent-specs"))?;
         fs::create_dir_all(root.join("checkpoints"))?;
+        fs::create_dir_all(root.join("continuation-inputs"))?;
+        fs::create_dir_all(root.join("continuation-contexts"))?;
+        fs::create_dir_all(root.join("agent-activation"))?;
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
@@ -140,6 +152,7 @@ impl OrchStore {
                 },
             }),
         };
+        store.recover_agent_activation_intents()?;
         store.recover_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
@@ -206,6 +219,33 @@ impl OrchStore {
             .join(format!("{safe}.json")))
     }
 
+    fn continuation_input_path(&self, input_hash: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(input_hash)?;
+        Ok(self
+            .inner
+            .root
+            .join("continuation-inputs")
+            .join(format!("{safe}.json")))
+    }
+
+    fn continuation_context_path(&self, context_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(context_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("continuation-contexts")
+            .join(format!("{safe}.json")))
+    }
+
+    fn agent_activation_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("agent-activation")
+            .join(format!("{safe}.json")))
+    }
+
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
         let _g = self.inner.lock.lock();
         let result = self
@@ -214,6 +254,93 @@ impl OrchStore {
             .and_then(|path| atomic_write_json(&path, run));
         *self.inner.last_run_error.lock() = result.as_ref().err().map(ToString::to_string);
         result
+    }
+
+    /// Serialize Agent activation with durable Run creation so two Lanes
+    /// cannot both pass the active-Run check and execute under one identity.
+    pub fn save_run_and_activate_agent(
+        &self,
+        run: &RunRecord,
+        agent_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            run.agent_id.as_deref() == Some(agent_id),
+            "Run Agent identity does not match activation target"
+        );
+        let _g = self.inner.lock.lock();
+        let activation_dir = self.inner.root.join("agent-activation");
+        if fs::read_dir(&activation_dir)?.any(|entry| {
+            entry.ok().is_some_and(|entry| {
+                entry.path().extension().and_then(|v| v.to_str()) == Some("json")
+            })
+        }) {
+            anyhow::bail!("a prior Agent activation requires restart recovery");
+        }
+        let agent_path = self
+            .agent_path(agent_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(agent_path.is_file(), "persistent Agent record is missing");
+        let mut agent: AgentRecord = serde_json::from_str(&fs::read_to_string(&agent_path)?)?;
+        agent
+            .migrate_legacy_spec()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            !(agent.state == AgentState::Active && agent.current_run_id.is_some()),
+            "persistent Agent already has an active Run"
+        );
+        anyhow::ensure!(
+            agent.known_lane_ids().contains(&run.session_id),
+            "Run Lane is not currently associated with the persistent Agent"
+        );
+        let run_path = self
+            .run_path(&run.run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(!run_path.is_file(), "Run ID already exists");
+        agent.state = AgentState::Active;
+        agent.current_run_id = Some(run.run_id.clone());
+        agent.last_lane_id = Some(run.session_id);
+        agent.updated_at = Utc::now();
+        agent
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let intent_path = self
+            .agent_activation_path(&run.run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let intent = AgentActivationIntent {
+            run: run.clone(),
+            activated_agent: agent.clone(),
+        };
+        atomic_write_json(&intent_path, &intent)?;
+        if let Err(error) = atomic_write_json(&run_path, run) {
+            let run_rollback = match fs::symlink_metadata(&run_path) {
+                Ok(_) => remove_file_durable(&run_path),
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(())
+                }
+                Err(metadata_error) => Err(metadata_error.into()),
+            };
+            if run_rollback.is_err() || remove_file_durable(&intent_path).is_err() {
+                return Err(error.context(
+                    "persist Agent activation Run; durable recovery intent requires restart",
+                ));
+            }
+            return Err(error.context("persist Agent activation Run"));
+        }
+        if let Err(error) = atomic_write_json(&agent_path, &agent) {
+            if remove_file_durable(&run_path).is_err() {
+                return Err(error.context(
+                    "persist Agent activation; durable recovery intent requires restart",
+                ));
+            }
+            if remove_file_durable(&intent_path).is_err() {
+                return Err(error.context(
+                    "persist Agent activation; durable recovery intent requires restart",
+                ));
+            }
+            return Err(error.context("persist Agent activation"));
+        }
+        remove_file_durable(&intent_path).context("commit Agent activation recovery intent")?;
+        Ok(())
     }
 
     pub fn load_run(&self, run_id: &str) -> anyhow::Result<Option<RunRecord>> {
@@ -594,6 +721,125 @@ impl OrchStore {
                 .then(b.created_at.cmp(&a.created_at))
         });
         Ok(out)
+    }
+
+    /// Persist a sealed input snapshot by content hash. Existing content may
+    /// be replayed, but the same hash can never be rebound to different bytes.
+    pub fn save_continuation_input(
+        &self,
+        snapshot: &ContinuationInputSnapshot,
+    ) -> anyhow::Result<()> {
+        snapshot
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        let path = self
+            .continuation_input_path(&snapshot.input_hash)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if path.is_file() {
+            let existing: ContinuationInputSnapshot =
+                serde_json::from_str(&fs::read_to_string(&path)?)?;
+            if existing != *snapshot {
+                anyhow::bail!("continuation input hash is already bound to different content");
+            }
+            return Ok(());
+        }
+        Ok(write_json_exclusive(&path, snapshot)?)
+    }
+
+    pub fn load_continuation_input(
+        &self,
+        input_hash: &str,
+    ) -> anyhow::Result<Option<ContinuationInputSnapshot>> {
+        let _g = self.inner.lock.lock();
+        let path = match self.continuation_input_path(input_hash) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let snapshot: ContinuationInputSnapshot = serde_json::from_str(&fs::read_to_string(path)?)?;
+        snapshot
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(Some(snapshot))
+    }
+
+    /// Persist exact model-facing continuation bytes by content-derived ID.
+    pub fn save_continuation_context(&self, context: &ContinuationContext) -> anyhow::Result<()> {
+        context
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        let path = self
+            .continuation_context_path(&context.context_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let input_path = self
+            .continuation_input_path(&context.input_hash)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if !input_path.is_file() {
+            anyhow::bail!("continuation context input snapshot is missing");
+        }
+        let input: ContinuationInputSnapshot =
+            serde_json::from_str(&fs::read_to_string(&input_path)?)?;
+        input
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if input.input_hash != context.input_hash {
+            anyhow::bail!("continuation context input snapshot does not match");
+        }
+        let assembled = assemble_continuation_context(&input)
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        if assembled != *context {
+            anyhow::bail!("continuation context was not assembled from its referenced input");
+        }
+        if path.is_file() {
+            let existing: ContinuationContext = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            if existing != *context {
+                anyhow::bail!("continuation context ID is already bound to different content");
+            }
+            return Ok(());
+        }
+        Ok(write_json_exclusive(&path, context)?)
+    }
+
+    pub fn load_continuation_context(
+        &self,
+        context_id: &str,
+    ) -> anyhow::Result<Option<ContinuationContext>> {
+        let _g = self.inner.lock.lock();
+        let path = match self.continuation_context_path(context_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let context: ContinuationContext = serde_json::from_str(&fs::read_to_string(path)?)?;
+        context
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let input_path = self
+            .continuation_input_path(&context.input_hash)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if !input_path.is_file() {
+            anyhow::bail!("continuation context input snapshot is missing");
+        }
+        let input: ContinuationInputSnapshot =
+            serde_json::from_str(&fs::read_to_string(input_path)?)?;
+        input
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if input.input_hash != context.input_hash {
+            anyhow::bail!("continuation context input snapshot does not match");
+        }
+        let assembled = assemble_continuation_context(&input)
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        if assembled != context {
+            anyhow::bail!("continuation context was not assembled from its referenced input");
+        }
+        Ok(Some(context))
     }
 
     /// Apply conservative retention to the durable run and idempotency
@@ -1041,6 +1287,55 @@ impl OrchStore {
         Ok(n)
     }
 
+    fn recover_agent_activation_intents(&self) -> anyhow::Result<usize> {
+        let _guard = self.inner.lock.lock();
+        let dir = self.inner.root.join("agent-activation");
+        let mut recovered = 0;
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let intent: AgentActivationIntent = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            anyhow::ensure!(
+                intent.run.agent_id.as_deref() == Some(intent.activated_agent.agent_id.as_str())
+                    && intent.activated_agent.current_run_id.as_deref()
+                        == Some(intent.run.run_id.as_str()),
+                "Agent activation recovery intent is inconsistent"
+            );
+            let run_path = self
+                .run_path(&intent.run.run_id)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if run_path.is_file() {
+                let existing: RunRecord = serde_json::from_str(&fs::read_to_string(&run_path)?)?;
+                anyhow::ensure!(
+                    serde_json::to_value(existing)? == serde_json::to_value(&intent.run)?,
+                    "Agent activation recovery Run conflicts with durable state"
+                );
+            }
+            let agent_path = self
+                .agent_path(&intent.activated_agent.agent_id)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if agent_path.is_file() {
+                let existing: AgentRecord =
+                    serde_json::from_str(&fs::read_to_string(&agent_path)?)?;
+                anyhow::ensure!(
+                    existing.agent_id == intent.activated_agent.agent_id
+                        && existing
+                            .current_run_id
+                            .as_deref()
+                            .is_none_or(|run_id| { run_id == intent.run.run_id }),
+                    "Agent activation recovery conflicts with another active Run"
+                );
+            }
+            atomic_write_json(&run_path, &intent.run)?;
+            atomic_write_json(&agent_path, &intent.activated_agent)?;
+            remove_file_durable(&path)?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
     fn recover_finalization_intents(&self) -> anyhow::Result<usize> {
         let dir = self.inner.root.join("finalization");
         let mut recovered = 0;
@@ -1206,6 +1501,17 @@ pub enum IdempotencyClaim {
     Replay(Result<serde_json::Value, OrchError>),
 }
 
+fn remove_file_durable(path: &Path) -> anyhow::Result<()> {
+    if path.is_file() {
+        fs::remove_file(path)?;
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1227,14 +1533,31 @@ fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io:
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| std::io::Error::other("exclusive JSON path has no filename"))?;
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
     use std::io::Write;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    f.write_all(&serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?)?;
-    f.sync_all()?;
-    Ok(())
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        // A hard-link install is atomic and never replaces an existing
+        // content-addressed record. The temporary inode is removed only after
+        // the final name is durable.
+        fs::hard_link(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(&tmp);
+    result
 }
 
 #[cfg(test)]
@@ -1257,6 +1580,11 @@ mod tests {
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
             queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
@@ -1309,6 +1637,11 @@ mod tests {
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
             queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
@@ -1665,6 +1998,11 @@ mod tests {
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
             queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
@@ -1894,6 +2232,11 @@ mod tests {
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
             queue_position: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
@@ -2084,5 +2427,123 @@ mod tests {
         );
         assert_eq!(finalized.aggregates.usage_pending_requests, 0);
         assert!(!finalized.aggregates.usage_complete);
+    }
+
+    #[test]
+    fn agent_activation_serializes_competing_lane_runs() {
+        let root = tempdir().unwrap();
+        let store = OrchStore::open(root.path()).unwrap();
+        let first_lane = Uuid::new_v4();
+        let second_lane = Uuid::new_v4();
+        let now = Utc::now();
+        store
+            .save_agent(&AgentRecord {
+                agent_id: "agent-activation-race".into(),
+                session_id: first_lane,
+                lane_ids: vec![first_lane, second_lane],
+                lane_associations: Vec::new(),
+                workspace: "/tmp/w".into(),
+                model: "grok".into(),
+                spec: None,
+                state: AgentState::Waiting,
+                current_run_id: None,
+                last_run_id: None,
+                last_lane_id: None,
+                latest_checkpoint_id: None,
+                continuation_ordinal: 0,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let mut first = terminal_run("activation-first");
+        first.session_id = first_lane;
+        first.state = RunState::Running;
+        first.agent_id = Some("agent-activation-race".into());
+        first.terminal_result = None;
+        first.final_response = None;
+        first.end_seq = None;
+        let mut second = first.clone();
+        second.run_id = "activation-second".into();
+        second.request_id = "req-activation-second".into();
+        second.session_id = second_lane;
+
+        store
+            .save_run_and_activate_agent(&first, "agent-activation-race")
+            .unwrap();
+        let error = store
+            .save_run_and_activate_agent(&second, "agent-activation-race")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("active Run"), "unexpected error: {error}");
+        assert!(store.load_run(&second.run_id).unwrap().is_none());
+        assert_eq!(
+            store
+                .load_agent("agent-activation-race")
+                .unwrap()
+                .unwrap()
+                .current_run_id
+                .as_deref(),
+            Some(first.run_id.as_str())
+        );
+    }
+
+    #[test]
+    fn restart_recovers_partial_agent_activation_then_interrupts_it() {
+        let root = tempdir().unwrap();
+        let lane_id = Uuid::new_v4();
+        let run_id = "activation-crash-run";
+        {
+            let store = OrchStore::open(root.path()).unwrap();
+            let now = Utc::now();
+            store
+                .save_agent(&AgentRecord {
+                    agent_id: "agent-activation-crash".into(),
+                    session_id: lane_id,
+                    lane_ids: vec![lane_id],
+                    lane_associations: Vec::new(),
+                    workspace: "/tmp/w".into(),
+                    model: "grok".into(),
+                    spec: None,
+                    state: AgentState::Waiting,
+                    current_run_id: None,
+                    last_run_id: None,
+                    last_lane_id: None,
+                    latest_checkpoint_id: None,
+                    continuation_ordinal: 0,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+            let mut run = terminal_run(run_id);
+            run.session_id = lane_id;
+            run.state = RunState::Running;
+            run.agent_id = Some("agent-activation-crash".into());
+            run.terminal_result = None;
+            run.final_response = None;
+            run.end_seq = None;
+            let mut activated = store.load_agent("agent-activation-crash").unwrap().unwrap();
+            activated.state = AgentState::Active;
+            activated.current_run_id = Some(run_id.into());
+            activated.last_lane_id = Some(lane_id);
+            let intent = AgentActivationIntent {
+                run: run.clone(),
+                activated_agent: activated,
+            };
+            atomic_write_json(&store.agent_activation_path(run_id).unwrap(), &intent).unwrap();
+            atomic_write_json(&store.run_path(run_id).unwrap(), &run).unwrap();
+            // Simulated crash before the Agent pointer write.
+        }
+
+        let reopened = OrchStore::open(root.path()).unwrap();
+        let run = reopened.load_run(run_id).unwrap().unwrap();
+        let agent = reopened
+            .load_agent("agent-activation-crash")
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.state, RunState::Interrupted);
+        assert_eq!(agent.state, AgentState::Interrupted);
+        assert_eq!(agent.current_run_id, None);
+        assert_eq!(agent.last_run_id.as_deref(), Some(run_id));
+        assert!(!reopened.agent_activation_path(run_id).unwrap().exists());
     }
 }

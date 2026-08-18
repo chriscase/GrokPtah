@@ -3,11 +3,19 @@
 //! Pure policy + durable records live here; the MCP transport is a thin adapter.
 
 mod authz;
+mod continuation;
 mod service;
 mod store;
 mod types;
 
 pub use authz::{canonical_workspace, constant_time_eq, AuthContext, WorkspaceAllowlist};
+pub use continuation::{
+    assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,
+    ContinuationContext, ContinuationFidelity, ContinuationInputSnapshot, ContinuationMemoryFact,
+    ContinuationMemoryInput, ContinuationMemoryScope, ContinuationOmission, ContinuationReasonCode,
+    ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef,
+    CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
+};
 pub(crate) use service::apply_run_aggregate;
 pub use service::{OrchestrationConfig, OrchestrationService};
 pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
@@ -17,7 +25,7 @@ pub use types::{
     AgentModelSpec, AgentRecord, AgentResumePlan, AgentRuntimeState, AgentSpec, AgentState,
     AuditEntry, ChangeRecord, ContinuationCheckpoint, ContinuationReason, IdempotencyReceipt,
     OrchError, OrchErrorCode, PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution,
-    RunExecutionMode, RunRecord, RunState, RunStopCause, TestObservation,
+    RunExecutionMode, RunProgress, RunRecord, RunState, RunStopCause, TestObservation,
     AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
     DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
 };

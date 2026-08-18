@@ -119,13 +119,17 @@ pub use mcp_control_client::{
 pub use mcp_runtime::list_mcp_tools;
 pub use orchestration::{
     is_recognized_test_command, merge_bounds, prompt_preview, safe_id_filename,
-    AgentAuthorityPolicy, AgentLaneAssociation, AgentMemoryPolicy, AgentModelSpec, AgentRecord,
-    AgentResumePlan, AgentRuntimeState, AgentSpec, AgentState, ContinuationCheckpoint,
-    ContinuationReason, OrchStore, OrchestrationConfig, OrchestrationService, PromotionState,
-    RetentionPolicy, RetentionReport, RunApproval, RunBounds, RunExecution, RunExecutionMode,
-    RunRecord, RunState, RunStopCause, WorkspaceAllowlist, AGENT_SPEC_SCHEMA_VERSION,
-    CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
-    FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
+    AgentAuthorityPolicy, AgentContinuationPlan, AgentLaneAssociation, AgentMemoryPolicy,
+    AgentModelSpec, AgentRecord, AgentResumePlan, AgentRuntimeState, AgentSpec, AgentState,
+    ContinuationAssemblyFailure, ContinuationCheckpoint, ContinuationContext, ContinuationFidelity,
+    ContinuationInputSnapshot, ContinuationMemoryFact, ContinuationMemoryInput,
+    ContinuationMemoryScope, ContinuationOmission, ContinuationReason, ContinuationReasonCode,
+    ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef, OrchStore,
+    OrchestrationConfig, OrchestrationService, PromotionState, RetentionPolicy, RetentionReport,
+    RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
+    WorkspaceAllowlist, AGENT_SPEC_SCHEMA_VERSION, CONTINUATION_ASSEMBLER_VERSION,
+    CONTINUATION_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
+    DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
 };
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use run_promotion::RunReview;

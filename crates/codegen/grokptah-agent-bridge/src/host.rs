@@ -41,10 +41,12 @@ use crate::lane::LaneSummary;
 use crate::local_tools;
 use crate::memory::{MemoryAccess, MemoryAddress, MemoryScope};
 use crate::orchestration::{
-    apply_run_aggregate, prompt_preview, AgentAuthorityPolicy, AgentLaneAssociation, AgentRecord,
-    AgentResumePlan, AgentSpec, AgentState, ContinuationCheckpoint, ContinuationReason, OrchStore,
-    PromotionState, RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
-    RunStopCause, DEFAULT_AGENT_TOOL_IDS,
+    apply_run_aggregate, assemble_continuation_context, prompt_preview, AgentAuthorityPolicy,
+    AgentContinuationPlan, AgentLaneAssociation, AgentRecord, AgentResumePlan, AgentSpec,
+    AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
+    ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
+    ContinuationTestInput, OrchStore, PromotionState, RunAggregates, RunBounds, RunExecution,
+    RunExecutionMode, RunRecord, RunState, RunStopCause, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::prompt_queue::{
@@ -1496,6 +1498,242 @@ impl AgentHostHandle {
         Ok(plan)
     }
 
+    /// Capture and persist the exact durable inputs and byte-bounded context
+    /// for one explicit finite continuation Run.
+    pub fn prepare_agent_continuation(
+        &self,
+        session_id: Uuid,
+        instruction: &str,
+        max_rounds: Option<u32>,
+    ) -> Result<AgentContinuationPlan> {
+        let plan = self.prepare_agent_resume(session_id)?;
+        let store = self.ensure_orchestration_store()?;
+        let execution_spec = plan
+            .agent
+            .current_spec()
+            .map_err(|error| anyhow!(error.to_string()))?
+            .clone();
+        let mut effective_run_bounds = execution_spec.default_run_bounds.clone();
+        if let Some(requested) = max_rounds {
+            effective_run_bounds.max_rounds = effective_run_bounds.max_rounds.min(requested.max(1));
+        }
+        if let Some(ambient) = self.inner.lock().max_agent_rounds {
+            effective_run_bounds.max_rounds = effective_run_bounds.max_rounds.min(ambient.max(1));
+        }
+        effective_run_bounds
+            .validate()
+            .map_err(|error| anyhow!(error.to_string()))?;
+
+        let mut capture_reasons = Vec::new();
+        let checkpoint_spec = match plan.checkpoint.agent_spec_revision {
+            Some(revision) => store
+                .load_agent_spec(&plan.agent.agent_id, revision)?
+                .ok_or_else(|| anyhow!("checkpoint Agent specification revision is missing"))?,
+            None => {
+                capture_reasons.push(ContinuationReasonCode::LegacyCheckpointNoSpecRevision);
+                execution_spec.clone()
+            }
+        };
+
+        let lineage = self.capture_continuation_lineage(
+            &store,
+            &plan.agent,
+            &plan.checkpoint,
+            &mut capture_reasons,
+        )?;
+        let (memory_scopes, unavailable_memory_scopes) = self.capture_continuation_memory(
+            &execution_spec,
+            &plan.agent.agent_id,
+            &mut capture_reasons,
+        )?;
+        let snapshot = crate::orchestration::ContinuationInputSnapshot::new(
+            plan.agent.agent_id.clone(),
+            session_id,
+            execution_spec.source_workspace.clone(),
+            plan.agent.runtime_state(),
+            plan.checkpoint.clone(),
+            checkpoint_spec,
+            execution_spec,
+            effective_run_bounds.clone(),
+            instruction,
+            lineage,
+            memory_scopes,
+            unavailable_memory_scopes,
+            Vec::new(),
+            capture_reasons,
+        )
+        .map_err(|error| anyhow!(error.to_string()))?;
+        let context = assemble_continuation_context(&snapshot)
+            .map_err(|failure| anyhow!("continuation assembly failed: {}", failure.detail))?;
+        store.save_continuation_input(&snapshot)?;
+        store.save_continuation_context(&context)?;
+        Ok(AgentContinuationPlan {
+            agent: plan.agent,
+            checkpoint: plan.checkpoint,
+            parent_run_id: plan.parent_run_id,
+            effective_run_bounds,
+            input_snapshot: snapshot,
+            context,
+        })
+    }
+
+    fn capture_continuation_lineage(
+        &self,
+        store: &OrchStore,
+        agent: &AgentRecord,
+        checkpoint: &ContinuationCheckpoint,
+        capture_reasons: &mut Vec<ContinuationReasonCode>,
+    ) -> Result<Vec<ContinuationRunInput>> {
+        const MAX_LINEAGE_RUNS: usize = 8;
+        let mut lineage = Vec::new();
+        let mut next_run_id = Some(checkpoint.run_id.clone());
+        let mut seen = HashSet::new();
+        while let Some(run_id) = next_run_id.take() {
+            if !seen.insert(run_id.clone()) {
+                bail!("continuation lineage contains a cycle");
+            }
+            let Some(run) = store.load_run(&run_id)? else {
+                if lineage.is_empty() {
+                    bail!("checkpoint source Run is missing");
+                }
+                capture_reasons.push(ContinuationReasonCode::LineageAncestorMissing);
+                capture_reasons.push(ContinuationReasonCode::LineageRetentionGap);
+                break;
+            };
+            if run.agent_id.as_deref() != Some(agent.agent_id.as_str())
+                || run.workspace != agent.workspace
+                || !run.state.is_terminal()
+            {
+                bail!("continuation lineage crosses Agent/workspace scope or is nonterminal");
+            }
+            if lineage.is_empty() && run.session_id != checkpoint.session_id {
+                bail!("checkpoint source Run does not match its historical Lane");
+            }
+            next_run_id = run.parent_run_id.clone();
+            let verification = run.aggregates.verification.as_ref();
+            lineage.push(ContinuationRunInput {
+                run_id: run.run_id,
+                parent_run_id: run.parent_run_id,
+                lane_id: run.session_id,
+                state: run.state,
+                stop_cause: run.stop_cause,
+                terminal_result: run.terminal_result,
+                final_response: run.final_response,
+                progress_round: run.progress.as_ref().map(|progress| progress.round),
+                progress_detail: run.progress.map(|progress| progress.detail),
+                changed_files: run.aggregates.changes,
+                tests: run
+                    .aggregates
+                    .tests
+                    .into_iter()
+                    .map(|test| ContinuationTestInput {
+                        call_id: test.call_id,
+                        command: test.command,
+                        status: test.status,
+                        exit_code: test.exit_code,
+                        cancelled: test.cancelled,
+                    })
+                    .collect(),
+                verification_status: verification.map(|value| value.status.clone()),
+                verification_stop_reason: verification.map(|value| value.stop_reason.clone()),
+            });
+            if lineage.len() == MAX_LINEAGE_RUNS {
+                if next_run_id.is_some() {
+                    capture_reasons.push(ContinuationReasonCode::LineageLimitReached);
+                }
+                break;
+            }
+        }
+        Ok(lineage)
+    }
+
+    fn capture_continuation_memory(
+        &self,
+        spec: &AgentSpec,
+        agent_id: &str,
+        capture_reasons: &mut Vec<ContinuationReasonCode>,
+    ) -> Result<(Vec<ContinuationMemoryInput>, Vec<String>)> {
+        let access = MemoryAccess::new(&spec.source_workspace, Some(agent_id.to_string()))
+            .with_agent_policy(
+                spec.memory.project_scope,
+                spec.memory.agent_private_scope,
+                spec.memory.team_ids.clone(),
+            )?;
+        let mut requested = Vec::new();
+        if spec.memory.project_scope {
+            requested.push((MemoryScope::Project, ContinuationMemoryScope::Project, None));
+        }
+        if spec.memory.agent_private_scope {
+            requested.push((
+                MemoryScope::AgentPrivate {
+                    agent_id: agent_id.to_string(),
+                },
+                ContinuationMemoryScope::AgentPrivate,
+                Some(agent_id.to_string()),
+            ));
+        }
+        for team_id in &spec.memory.team_ids {
+            requested.push((
+                MemoryScope::Team {
+                    team_id: team_id.clone(),
+                },
+                ContinuationMemoryScope::Team,
+                Some(team_id.clone()),
+            ));
+        }
+
+        let mut scopes = Vec::new();
+        let mut unavailable = Vec::new();
+        for (scope, rendered_scope, scope_id) in requested {
+            let descriptor = match (&rendered_scope, scope_id.as_deref()) {
+                (ContinuationMemoryScope::Project, _) => "project".into(),
+                (ContinuationMemoryScope::AgentPrivate, Some(id)) => {
+                    format!("agent_private:{id}")
+                }
+                (ContinuationMemoryScope::Team, Some(id)) => format!("team:{id}"),
+                _ => "invalid".into(),
+            };
+            let facts = match access
+                .resolve(scope)
+                .and_then(|address| crate::memory::list_facts(&address))
+            {
+                Ok(facts) => facts,
+                Err(_) => {
+                    capture_reasons.push(ContinuationReasonCode::MemoryScopeUnavailable);
+                    unavailable.push(descriptor);
+                    continue;
+                }
+            };
+            let mut normalized_facts = Vec::new();
+            let mut invalid = false;
+            for fact in facts {
+                let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&fact.updated_at) else {
+                    invalid = true;
+                    break;
+                };
+                normalized_facts.push(ContinuationMemoryFact {
+                    id: fact.id,
+                    text: fact.text,
+                    tags: fact.tags,
+                    updated_at: updated_at
+                        .with_timezone(&Utc)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                });
+            }
+            if invalid {
+                capture_reasons.push(ContinuationReasonCode::MemoryScopeUnavailable);
+                unavailable.push(descriptor);
+                continue;
+            }
+            scopes.push(ContinuationMemoryInput {
+                scope: rendered_scope,
+                scope_id,
+                facts: normalized_facts,
+            });
+        }
+        Ok((scopes, unavailable))
+    }
+
     /// Explicit manual resume seam for the current desktop bridge. The caller
     /// supplies the new user instruction; the verified checkpoint is injected
     /// as auditable system context and linked through `parent_run_id`.
@@ -1521,9 +1759,17 @@ impl AgentHostHandle {
     ) -> Result<String> {
         let store = self.ensure_orchestration_store()?;
         let request_id = request_id.unwrap_or_else(|| format!("resume-{}", Uuid::new_v4()));
+        let bound_agent_id = self
+            .inner
+            .lock()
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.agent_id.clone());
         let payload_hash = crate::orchestration::hash_payload(&serde_json::json!({
-            "sessionId": session_id,
-            "prompt": prompt.clone(),
+            "agentId": bound_agent_id,
+            "targetLaneId": session_id,
+            "instructionHash": crate::orchestration::hash_payload(&serde_json::json!(&prompt)),
+            "instructionByteLength": prompt.len(),
             "maxRounds": max_rounds,
         }));
         match store.claim_idempotency("persistent_agent_resume", &request_id, &payload_hash)? {
@@ -1538,7 +1784,7 @@ impl AgentHostHandle {
                 bail!("resume request is already in progress")
             }
             crate::orchestration::IdempotencyClaim::Perform => {
-                let plan = match self.prepare_agent_resume(session_id) {
+                let plan = match self.prepare_agent_continuation(session_id, &prompt, max_rounds) {
                     Ok(plan) => plan,
                     Err(error) => {
                         let _ = store.fail_idempotency(
@@ -1554,16 +1800,28 @@ impl AgentHostHandle {
                         return Err(error);
                     }
                 };
+                let context_id = plan.context.context_id.clone();
+                let prior_run_ids: HashSet<_> = store
+                    .list_runs()?
+                    .into_iter()
+                    .map(|run| run.run_id)
+                    .collect();
                 let result = self
                     .session_prompt_inner(session_id, prompt, max_rounds, None, None, Some(plan))
                     .await;
+                let durable_run_id = store.list_runs()?.into_iter().find_map(|run| {
+                    (!prior_run_ids.contains(&run.run_id)
+                        && run.session_id == session_id
+                        && run.continuation_context_id.as_deref() == Some(context_id.as_str()))
+                    .then_some(run.run_id)
+                });
                 match result {
                     Ok(response) => {
                         store.complete_idempotency(
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
-                            None,
+                            durable_run_id,
                             serde_json::Value::String(response.clone()),
                         )?;
                         Ok(response)
@@ -1573,7 +1831,7 @@ impl AgentHostHandle {
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
-                            None,
+                            durable_run_id,
                             crate::orchestration::OrchError::new(
                                 crate::orchestration::OrchErrorCode::Internal,
                                 error.to_string(),
@@ -1859,7 +2117,9 @@ impl AgentHostHandle {
         turn_id: Uuid,
         execution: Option<RunExecution>,
         agent_id: Option<String>,
+        agent_spec_revision: Option<u64>,
         parent_run_id: Option<String>,
+        continuation: Option<&AgentContinuationPlan>,
     ) -> Option<(String, OrchStore)> {
         let store = match self.ensure_orchestration_store() {
             Ok(store) => store,
@@ -1880,6 +2140,12 @@ impl AgentHostHandle {
             agent_id: agent_id.clone(),
             retry_of: None,
             parent_run_id,
+            agent_spec_revision,
+            checkpoint_id: continuation.map(|plan| plan.checkpoint.checkpoint_id.clone()),
+            continuation_context_id: continuation.map(|plan| plan.context.context_id.clone()),
+            continuation_context_hash: continuation.map(|plan| plan.context.prompt_sha256.clone()),
+            continuation_fidelity: continuation
+                .map(|plan| format!("{:?}", plan.context.fidelity).to_ascii_lowercase()),
             queue_position: None,
             bounds,
             prompt_preview: self
@@ -1900,30 +2166,12 @@ impl AgentHostHandle {
             execution,
             approval: None,
         };
-        if let Some(agent_id) = agent_id.as_deref() {
-            if let Err(error) = store.update_agent(agent_id, |agent| {
-                if agent.state == AgentState::Active && agent.current_run_id.is_some() {
-                    bail!("persistent agent already has an active run");
-                }
-                agent.state = AgentState::Active;
-                agent.current_run_id = Some(run_id.clone());
-                Ok(())
-            }) {
-                eprintln!("[grokptah] persistent agent {agent_id} activation failed: {error:#}");
-                return None;
-            }
-        }
-        if let Err(error) = store.save_run(&run) {
+        let persisted = match agent_id.as_deref() {
+            Some(agent_id) => store.save_run_and_activate_agent(&run, agent_id),
+            None => store.save_run(&run),
+        };
+        if let Err(error) = persisted {
             eprintln!("[grokptah] desktop run {run_id} start persistence failed: {error:#}");
-            if let Some(agent_id) = agent_id.as_deref() {
-                let _ = store.update_agent(agent_id, |agent| {
-                    if agent.current_run_id.as_deref() == Some(run_id.as_str()) {
-                        agent.current_run_id = None;
-                        agent.state = AgentState::Waiting;
-                    }
-                    Ok(())
-                });
-            }
             return None;
         }
         Some((run_id, store))
@@ -2023,7 +2271,10 @@ impl AgentHostHandle {
             agent_id: agent_id.to_string(),
             session_id: run.session_id,
             run_id: run.run_id.clone(),
-            agent_spec_revision: Some(agent.current_spec()?.revision),
+            agent_spec_revision: Some(
+                run.agent_spec_revision
+                    .unwrap_or(agent.current_spec()?.revision),
+            ),
             parent_checkpoint_id: agent.latest_checkpoint_id.clone(),
             ordinal: agent.continuation_ordinal.saturating_add(1),
             workspace: run.workspace.clone(),
@@ -3206,7 +3457,7 @@ impl AgentHostHandle {
         };
         let project_memory = self
             .memory_access_for_session(id)
-            .map(|access| access.project());
+            .map(|access| access.project_if_allowed());
         // Best-effort memory flush of key decisions from compacted window.
         for t in leaving_for_memory.iter().take(12) {
             let lower = t.to_ascii_lowercase();
@@ -3216,7 +3467,7 @@ impl AgentHostHandle {
                 || lower.contains("prefer ")
             {
                 let clip: String = t.chars().take(400).collect();
-                if let Ok(address) = &project_memory {
+                if let Ok(Some(address)) = &project_memory {
                     let _ = crate::memory::remember(address, &clip, &["compact-flush".into()]);
                 }
             }
@@ -3419,7 +3670,7 @@ impl AgentHostHandle {
                 .cloned()
                 .ok_or_else(|| anyhow!("unknown session"))?
         };
-        let actor_agent_id = match session.agent_id.as_deref() {
+        let actor_agent = match session.agent_id.as_deref() {
             None => None,
             Some(agent_id) => {
                 let agent = self
@@ -3436,7 +3687,21 @@ impl AgentHostHandle {
                 Some(agent.agent_id)
             }
         };
-        Ok(MemoryAccess::new(&session.cwd, actor_agent_id))
+        let access = MemoryAccess::new(&session.cwd, actor_agent.clone());
+        if actor_agent.is_none() {
+            return Ok(access);
+        }
+        let spec = self
+            .session_agent_spec(session_id)?
+            .ok_or_else(|| anyhow!("persistent Agent specification is unavailable"))?;
+        if spec.source_workspace != session.cwd.display().to_string() {
+            bail!("persistent Agent memory scope does not match the Lane source workspace");
+        }
+        access.with_agent_policy(
+            spec.memory.project_scope,
+            spec.memory.agent_private_scope,
+            spec.memory.team_ids,
+        )
     }
 
     fn memory_address_for_session(
@@ -3686,6 +3951,20 @@ impl AgentHostHandle {
         let agent = store
             .load_agent(&agent_id)?
             .ok_or_else(|| anyhow!("persistent Agent record is missing"))?;
+        if let Some(run_id) = agent.current_run_id.as_deref() {
+            let run = store
+                .load_run(run_id)?
+                .ok_or_else(|| anyhow!("persistent Agent active Run record is missing"))?;
+            if run.agent_id.as_deref() != Some(agent_id.as_str()) {
+                bail!("persistent Agent active Run identity is inconsistent");
+            }
+            if let Some(revision) = run.agent_spec_revision {
+                return store
+                    .load_agent_spec(&agent_id, revision)?
+                    .map(Some)
+                    .ok_or_else(|| anyhow!("active Run Agent specification revision is missing"));
+            }
+        }
         Ok(Some(agent.current_spec()?.clone()))
     }
 
@@ -6054,7 +6333,7 @@ impl AgentHostHandle {
         max_rounds: Option<u32>,
         reservation_owner: Option<&str>,
         external_run: Option<ExternalRunContext>,
-        resume: Option<AgentResumePlan>,
+        resume: Option<AgentContinuationPlan>,
     ) -> Result<String> {
         self.ensure_session_accepts_new_work(session_id)?;
         self.ensure_transcript_loaded(session_id)?;
@@ -6082,15 +6361,23 @@ impl AgentHostHandle {
                     .map_err(|error| anyhow!(error.to_string()))
             })
             .transpose()?;
-        if let Some(bounds) = agent_default_bounds.as_ref() {
-            if prompt.len() > bounds.max_prompt_bytes {
+        let effective_agent_bounds = resume
+            .as_ref()
+            .map(|plan| plan.effective_run_bounds.clone())
+            .or(agent_default_bounds.clone());
+        if let Some(bounds) = effective_agent_bounds.as_ref() {
+            let continuation_bytes = resume
+                .as_ref()
+                .map(|plan| plan.context.prompt_bytes)
+                .unwrap_or_default();
+            if prompt.len().saturating_add(continuation_bytes) > bounds.max_prompt_bytes {
                 bail!(
-                    "prompt exceeds persistent Agent max_prompt_bytes ({})",
+                    "prompt plus continuation context exceeds persistent Agent max_prompt_bytes ({})",
                     bounds.max_prompt_bytes
                 );
             }
         }
-        let effective_max_rounds = if let Some(bounds) = agent_default_bounds.as_ref() {
+        let effective_max_rounds = if let Some(bounds) = effective_agent_bounds.as_ref() {
             let default = bounds.max_rounds;
             let ambient = self.inner.lock().max_agent_rounds.unwrap_or(default);
             Some(
@@ -6115,17 +6402,40 @@ impl AgentHostHandle {
             if agent_id.as_deref() != Some(plan.agent.agent_id.as_str()) {
                 bail!("resume agent does not match the session binding");
             }
-            plan.validate_for(session_id, &workspace)
-                .map_err(|error| anyhow!(error.to_string()))?;
+            AgentResumePlan {
+                agent: plan.agent.clone(),
+                checkpoint: plan.checkpoint.clone(),
+                parent_run_id: plan.parent_run_id.clone(),
+            }
+            .validate_for(session_id, &workspace)
+            .map_err(|error| anyhow!(error.to_string()))?;
+            let store = self.ensure_orchestration_store()?;
+            let current_agent = store
+                .load_agent(&plan.agent.agent_id)?
+                .ok_or_else(|| anyhow!("persistent Agent disappeared after preparation"))?;
+            if current_agent.latest_checkpoint_id.as_deref()
+                != Some(plan.checkpoint.checkpoint_id.as_str())
+                || current_agent.current_spec()?.revision
+                    != plan.input_snapshot.execution_spec.revision
+            {
+                bail!("persistent Agent specification or checkpoint changed after preparation");
+            }
+            if store
+                .load_continuation_input(&plan.input_snapshot.input_hash)?
+                .as_ref()
+                != Some(&plan.input_snapshot)
+                || store
+                    .load_continuation_context(&plan.context.context_id)?
+                    .as_ref()
+                    != Some(&plan.context)
+            {
+                bail!("prepared continuation context is missing or does not match durable input");
+            }
         }
-        let resume_context = resume.as_ref().map(|plan| {
-            format!(
-                "Verified persistent continuation checkpoint {} (ordinal {}):\n{}",
-                plan.checkpoint.checkpoint_id,
-                plan.checkpoint.ordinal,
-                plan.checkpoint.context_summary
-            )
-        });
+        let resume_context = resume
+            .as_ref()
+            .map(|plan| plan.context.rendered_context.clone());
+        let defer_resume_transcript = resume_context.is_some();
         let (cwd, model, effort, plan_mode, kind, execution_mode, cancel, event_tx) = {
             let mut g = self.inner.lock();
             if !g.running {
@@ -6177,12 +6487,11 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("unknown session"))?;
             s.model = model.clone();
             s.effort = effort;
-            if let Some(context) = resume_context.as_deref() {
-                s.transcript.push(TranscriptEntry::system(context));
-            }
-            s.transcript.push(TranscriptEntry::user(prompt.clone()));
-            if s.title == "New session" || s.title == "New chat" {
-                s.title = prompt.chars().take(48).collect();
+            if !defer_resume_transcript {
+                s.transcript.push(TranscriptEntry::user(prompt.clone()));
+                if s.title == "New session" || s.title == "New chat" {
+                    s.title = prompt.chars().take(48).collect();
+                }
             }
             s.updated_at = Utc::now();
             (
@@ -6275,7 +6584,7 @@ impl AgentHostHandle {
             .map(|execution| PathBuf::from(&execution.execution_workspace))
             .unwrap_or_else(|| cwd.clone());
         let desktop_run = if external_run.is_none() && kind == SessionKind::Build {
-            let mut bounds = agent_default_bounds.clone().unwrap_or_default();
+            let mut bounds = effective_agent_bounds.clone().unwrap_or_default();
             if let Some(rounds) = effective_max_rounds {
                 bounds.max_rounds = bounds.max_rounds.min(rounds).max(1);
             }
@@ -6288,11 +6597,35 @@ impl AgentHostHandle {
                 turn_id,
                 run_execution.clone(),
                 agent.as_ref().map(|agent| agent.agent_id.clone()),
+                agent
+                    .as_ref()
+                    .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
                 resume.as_ref().map(|plan| plan.parent_run_id.clone()),
+                resume.as_ref(),
             )
         } else {
             None
         };
+        if resume.is_some() && desktop_run.is_none() {
+            bail!("persistent continuation could not create and activate its durable Run");
+        }
+        if let Some(context) = resume_context.as_deref() {
+            let mut g = self.inner.lock();
+            let session = g
+                .sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("resume Lane disappeared after durable admission"))?;
+            session.transcript.push(TranscriptEntry::system(context));
+            session
+                .transcript
+                .push(TranscriptEntry::user(prompt.clone()));
+            if session.title == "New session" || session.title == "New chat" {
+                session.title = prompt.chars().take(48).collect();
+            }
+            session.updated_at = Utc::now();
+            drop(g);
+            self.persist_session(session_id);
+        }
         let run_usage_tracker = if let Some(external) = external_run.as_ref() {
             let store = self.ensure_orchestration_store()?;
             let run = store
@@ -10569,6 +10902,11 @@ mod tests {
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
             queue_position: None,
             bounds: RunBounds {
                 max_total_tokens,
@@ -11010,6 +11348,212 @@ mod tests {
         assert!(changed.contains("idempotency") || changed.contains("payload"));
     }
 
+    #[tokio::test]
+    async fn persistent_continuation_is_durable_deterministic_and_prompt_bounded() {
+        let (_home, host, session_id) = test_host();
+        let agent = host.ensure_session_agent(session_id).unwrap();
+        let spec = agent.current_spec().unwrap().clone();
+        let store = host.ensure_orchestration_store().unwrap();
+        let now = Utc::now();
+        let run = RunRecord {
+            run_id: "continuation-source-run".into(),
+            session_id,
+            workspace: agent.workspace.clone(),
+            request_id: "continuation-source-request".into(),
+            client_id: Some("test".into()),
+            state: RunState::Completed,
+            agent_id: Some(agent.agent_id.clone()),
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: Some(spec.revision),
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: spec.default_run_bounds.clone(),
+            prompt_preview: "previous finite run".into(),
+            start_seq: Some(1),
+            end_seq: Some(2),
+            created_at: now,
+            updated_at: now,
+            terminal_result: Some("completed".into()),
+            final_response: Some("Continue by implementing deterministic recovery.".into()),
+            error_code: None,
+            stop_cause: Some(RunStopCause::Completed),
+            aggregates: RunAggregates {
+                changes: vec![crate::orchestration::ChangeRecord {
+                    path: "src/recovery.rs".into(),
+                    summary: "Added restart recovery".into(),
+                }],
+                ..RunAggregates::default()
+            },
+            progress: Some(crate::orchestration::RunProgress {
+                round: 2,
+                max_rounds: 4,
+                last_tool: Some("apply_patch".into()),
+                detail: "Recovery implementation is ready for tests".into(),
+                updated_at: now,
+            }),
+            execution: None,
+            approval: None,
+        };
+        store.save_run(&run).unwrap();
+        let mut checkpoint = ContinuationCheckpoint {
+            checkpoint_id: "continuation-source-checkpoint".into(),
+            agent_id: agent.agent_id.clone(),
+            session_id,
+            run_id: run.run_id.clone(),
+            agent_spec_revision: Some(spec.revision),
+            parent_checkpoint_id: None,
+            ordinal: 1,
+            workspace: agent.workspace.clone(),
+            context_summary: "legacy summary is not used for assembly".into(),
+            context_hash: String::new(),
+            event_seq: 2,
+            reason: ContinuationReason::TurnCompleted,
+            created_at: now,
+        };
+        checkpoint.context_hash = checkpoint.context_hash_for();
+        store.save_checkpoint(&checkpoint).unwrap();
+        store
+            .update_agent(&agent.agent_id, |record| {
+                record.state = AgentState::Waiting;
+                record.current_run_id = None;
+                record.last_run_id = Some(run.run_id.clone());
+                record.last_lane_id = Some(session_id);
+                record.latest_checkpoint_id = Some(checkpoint.checkpoint_id.clone());
+                record.continuation_ordinal = checkpoint.ordinal;
+                Ok(())
+            })
+            .unwrap();
+
+        let first = host
+            .prepare_agent_continuation(session_id, "continue", Some(3))
+            .unwrap();
+        let second = host
+            .prepare_agent_continuation(session_id, "continue", Some(3))
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.context.prompt_bytes + "continue".len(),
+            first.context.rendered_context.len() + "continue".len()
+        );
+        assert!(
+            first.context.prompt_bytes + "continue".len()
+                <= first.effective_run_bounds.max_prompt_bytes
+        );
+        assert_eq!(
+            store
+                .load_continuation_input(&first.input_snapshot.input_hash)
+                .unwrap(),
+            Some(first.input_snapshot.clone())
+        );
+        assert_eq!(
+            store
+                .load_continuation_context(&first.context.context_id)
+                .unwrap(),
+            Some(first.context)
+        );
+
+        let offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
+        let response = host
+            .resume_agent_with_request_id(
+                session_id,
+                "continue".into(),
+                Some(3),
+                Some("deterministic-continuation-replay".into()),
+            )
+            .await
+            .unwrap();
+        let run_count = host.list_session_runs(session_id).unwrap().len();
+        let replay = host
+            .resume_agent_with_request_id(
+                session_id,
+                "continue".into(),
+                Some(3),
+                Some("deterministic-continuation-replay".into()),
+            )
+            .await
+            .unwrap();
+        drop(offline);
+        assert_eq!(replay, response);
+        assert_eq!(host.list_session_runs(session_id).unwrap().len(), run_count);
+        let receipt = store
+            .load_idempotency("deterministic-continuation-replay")
+            .unwrap()
+            .unwrap();
+        let run_id = receipt.run_id.expect("receipt records the finite Run ID");
+        let resumed_run = store.load_run(&run_id).unwrap().unwrap();
+        assert!(run_id.starts_with("desktop-"));
+        assert!(resumed_run.continuation_context_id.is_some());
+
+        let losing_plan = host
+            .prepare_agent_continuation(session_id, "must not leak", Some(1))
+            .unwrap();
+        let current_agent = store
+            .load_agent(&losing_plan.agent.agent_id)
+            .unwrap()
+            .unwrap();
+        let now = Utc::now();
+        let competing = RunRecord {
+            run_id: "competing-admission-run".into(),
+            session_id,
+            workspace: current_agent.workspace.clone(),
+            request_id: "competing-admission-request".into(),
+            client_id: Some("test".into()),
+            state: RunState::Running,
+            agent_id: Some(current_agent.agent_id.clone()),
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: Some(current_agent.current_spec().unwrap().revision),
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: current_agent
+                .current_spec()
+                .unwrap()
+                .default_run_bounds
+                .clone(),
+            prompt_preview: "competing admission".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: now,
+            updated_at: now,
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            stop_cause: None,
+            aggregates: RunAggregates::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        };
+        store
+            .save_run_and_activate_agent(&competing, &current_agent.agent_id)
+            .unwrap();
+        let transcript_before = host.export_transcript(session_id).unwrap();
+        let error = host
+            .session_prompt_inner(
+                session_id,
+                "must not leak".into(),
+                Some(1),
+                None,
+                None,
+                Some(losing_plan),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("durable Run"), "unexpected error: {error}");
+        assert_eq!(
+            host.export_transcript(session_id).unwrap(),
+            transcript_before
+        );
+    }
+
     #[test]
     fn one_agent_can_own_multiple_lanes_while_archive_preserves_the_binding() {
         let (_home, host, primary_lane_id) = test_host();
@@ -11198,6 +11742,97 @@ mod tests {
             host.tool_gate(lane_id, "run_terminal_cmd"),
             ToolGate::AutoDeny
         );
+    }
+
+    #[test]
+    fn active_run_keeps_its_frozen_spec_authority_after_revision() {
+        let (_home, host, lane_id) = test_host();
+        host.set_permission_mode("default".into());
+        let agent = host.ensure_session_agent(lane_id).unwrap();
+        let revision = agent.current_spec().unwrap().revision;
+        let store = host.ensure_orchestration_store().unwrap();
+        let now = Utc::now();
+        let run = RunRecord {
+            run_id: "frozen-spec-run".into(),
+            session_id: lane_id,
+            workspace: agent.workspace.clone(),
+            request_id: "frozen-spec-request".into(),
+            client_id: Some("test".into()),
+            state: RunState::Running,
+            agent_id: Some(agent.agent_id.clone()),
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: Some(revision),
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: agent.current_spec().unwrap().default_run_bounds.clone(),
+            prompt_preview: "freeze policy".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: now,
+            updated_at: now,
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            stop_cause: None,
+            aggregates: RunAggregates::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        };
+        store
+            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .unwrap();
+        store
+            .revise_agent_spec(&agent.agent_id, "test:deny-mid-run", |spec| {
+                spec.authority.deny_rules.push("run_terminal_cmd".into());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            host.tool_gate(lane_id, "run_terminal_cmd"),
+            ToolGate::Prompt
+        );
+        let frozen = host.session_agent_spec(lane_id).unwrap().unwrap();
+        assert_eq!(frozen.revision, revision);
+    }
+
+    #[test]
+    fn agent_memory_access_obeys_current_spec_scope_membership() {
+        let (_home, host, lane_id) = test_host();
+        let agent = host.ensure_session_agent(lane_id).unwrap();
+        let store = host.ensure_orchestration_store().unwrap();
+        store
+            .revise_agent_spec(&agent.agent_id, "test:memory-policy", |spec| {
+                spec.memory.project_scope = false;
+                spec.memory.agent_private_scope = false;
+                spec.memory.team_ids = vec!["design-team".into()];
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(host.memory_list(lane_id, MemoryScope::Project).is_err());
+        assert!(host
+            .memory_list(
+                lane_id,
+                MemoryScope::AgentPrivate {
+                    agent_id: agent.agent_id,
+                },
+            )
+            .is_err());
+        assert!(host
+            .memory_list(
+                lane_id,
+                MemoryScope::Team {
+                    team_id: "design-team".into(),
+                },
+            )
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

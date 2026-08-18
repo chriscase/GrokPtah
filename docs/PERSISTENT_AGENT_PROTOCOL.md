@@ -7,8 +7,9 @@ contract for GrokPtah Build agents.
 
 The persistent-agent contract is split into four replaceable concerns:
 
-1. `orchestration::types` defines durable identities, runs, checkpoints, and
-   resume validation.
+1. `orchestration::types` and `orchestration::continuation` define durable
+   identities, finite runs, checkpoints, deterministic continuation inputs,
+   fidelity, and resume validation.
 2. `OrchStore` provides atomic filesystem persistence, crash recovery, and
    idempotency receipts.
 3. `AgentHostHandle` is a runtime adapter. It binds Lanes to an Agent, applies
@@ -38,13 +39,51 @@ rules and the explicit-operator-resume boundary.
 - `RunRecord.parent_run_id` links a continuation to the run that produced its
   verified checkpoint. It is separate from `retry_of`, which means an explicit
   replacement of an interrupted run.
+- A continued Run also freezes `agent_spec_revision`, `checkpoint_id`, and the
+  content-addressed continuation context ID/hash/fidelity used at admission.
 - `ContinuationCheckpoint` stores a bounded redacted context summary, event
   sequence, ordinal, parent checkpoint, and a hash over its identity and
   context. A tampered checkpoint is rejected before it can be resumed.
+- `ContinuationInputSnapshot` captures only durable Agent specifications,
+  checkpoint provenance, bounded Run lineage and aggregates, scoped memory
+  facts, workload references when available, target Lane, effective bounds,
+  and the new instruction's byte length/hash. It is sealed by a canonical
+  input hash and persisted append-only under `continuation-inputs/`.
+- `ContinuationContext` is the exact model-facing UTF-8 byte string assembled
+  from that snapshot. It records `complete` or `degraded` fidelity, stable
+  reason codes, and a bounded omission ledger. It is content-addressed and
+  persisted append-only under `continuation-contexts/`. Failed assembly emits
+  no context and creates no Run.
 
-The full session transcript remains the durable conversation source. A
-checkpoint is a verified continuation boundary and audit aid, not a second
-transcript.
+The full session transcript remains a conversation record, but it is not an
+input to continuation assembly. A checkpoint is a verified boundary and audit
+aid; a continuation snapshot/context is the deterministic finite resume input.
+These records have different identities and must not be conflated.
+
+## Deterministic continuation rules
+
+- Assembly is pure after snapshot capture. It does not read the clock,
+  network, focused session/model, active tab, ambient working directory,
+  desktop permission state, live transcript tail, or live Git state.
+- Struct field order and compact JSON serialization are fixed. Dynamic maps
+  are excluded from the hashed/rendered schema. Lineage, changes, tests,
+  memory scopes/facts, reasons, omissions, and workload references have stable
+  byte-order tie breakers.
+- Lineage is bounded to eight terminal Runs and follows `parent_run_id` only;
+  `retry_of` is never continuation ancestry. Cycles, cross-Agent/workspace
+  edges, a missing source Run, or a tampered checkpoint fail closed. A missing
+  older retained ancestor degrades with an explicit reason.
+- Context is limited to 16 KiB and to the bytes remaining after the new
+  instruction under `max_prompt_bytes`. UTF-8 strings are truncated only at
+  code-point boundaries, whole low-priority records are evicted
+  deterministically, and every omission is counted and hashed. If required
+  identity/checkpoint/specification core cannot fit, no Run is created.
+- Enabled memory scopes are captured from the Agent specification. An empty
+  readable scope is complete; an unreadable, corrupt, or invalid scope is
+  omitted as a whole and degrades fidelity. Disabled scopes are absent without
+  degradation.
+- Reassembling the same persisted snapshot before or after process restart
+  produces byte-identical context and hashes.
 
 Older flat Agent records migrate deterministically to specification revision
 1 without changing `agent_id`. Migration preserves their source workspace and
@@ -72,21 +111,30 @@ new automatic tools, and records `legacy_migration` attribution.
 
 ## Lifecycle rules
 
+- Run creation and Agent activation are serialized through a durable recovery
+  intent. The intent is removed only after both records commit, or after a
+  failed admission durably rolls back the Run. Store startup reconciles any
+  remaining intent before applying interrupted-run recovery.
 - Opening the store converts queued/running runs to `interrupted` and marks
   their bound agents interrupted. The latest verified checkpoint is retained.
 - A terminal desktop Build run emits one new checkpoint and returns its agent
   to `waiting` (or `failed` for a failed run).
 - Resume is manual and always creates a new finite Run. The caller supplies a
   fresh prompt. The host validates Agent/Lane/source-workspace/checkpoint
-  identity, injects the bounded checkpoint
-  context as auditable system context, and links the new run with
-  `parent_run_id`.
+  identity, captures and persists a deterministic bounded continuation,
+  injects those exact bytes as auditable system context, and links the new Run
+  with `parent_run_id`.
 - Any currently associated Lane in the Agent's source workspace may be the
   resume target. The legacy primary `session_id` is not an authorization
   boundary.
 - An optional request id is protected by the existing durable idempotency
-  ledger. Exact retries replay the response; changed payloads cannot create a
-  second run.
+  ledger. Its request identity includes Agent, target Lane, instruction
+  hash/length, and requested round narrowing, so an exact retry still replays
+  after the first Run advances the Agent checkpoint. The sealed continuation
+  input separately binds source workspace, checkpoint/hash, execution-spec
+  revision, effective bounds, assembler version, and input hash. The receipt
+  records the actual finite Run ID. Changed request payloads cannot create a
+  second Run.
 
 ## Explicit non-goals
 

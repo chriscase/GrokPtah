@@ -419,6 +419,20 @@ pub struct RunRecord {
     /// while parent_run_id records normal agent continuation lineage.
     #[serde(default)]
     pub parent_run_id: Option<String>,
+    /// Agent specification revision frozen for this finite run.
+    #[serde(default)]
+    pub agent_spec_revision: Option<u64>,
+    /// Verified checkpoint from which this finite run was explicitly resumed.
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
+    /// Content-addressed deterministic continuation used for this run.
+    #[serde(default)]
+    pub continuation_context_id: Option<String>,
+    #[serde(default)]
+    pub continuation_context_hash: Option<String>,
+    /// `complete` or `degraded`; failed assembly never creates a Run.
+    #[serde(default)]
+    pub continuation_fidelity: Option<String>,
     /// One-based position in the bounded host-global admission queue.
     /// Cleared when the run starts, is cancelled, or is interrupted on restart.
     #[serde(default)]
@@ -846,7 +860,7 @@ impl AgentSpec {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRecord {
     pub agent_id: String,
@@ -954,6 +968,21 @@ impl AgentRecord {
         ids
     }
 
+    /// Every attributable Lane association, including detached historical
+    /// Lanes that may still be named by a verified checkpoint.
+    pub fn historical_lane_ids(&self) -> Vec<Uuid> {
+        if self.lane_associations.is_empty() {
+            return self.known_lane_ids();
+        }
+        let mut ids = Vec::new();
+        for association in &self.lane_associations {
+            if !ids.contains(&association.lane_id) {
+                ids.push(association.lane_id);
+            }
+        }
+        ids
+    }
+
     pub fn validate(&self) -> Result<(), OrchError> {
         validate_id(&self.agent_id, "agent_id")?;
         validate_workspace(&self.workspace)?;
@@ -999,7 +1028,7 @@ impl AgentRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContinuationCheckpoint {
     pub checkpoint_id: String,
@@ -1102,7 +1131,7 @@ impl AgentResumePlan {
         if !self.agent.known_lane_ids().contains(&session_id)
             || !self
                 .agent
-                .known_lane_ids()
+                .historical_lane_ids()
                 .contains(&self.checkpoint.session_id)
             || self.agent.workspace != workspace
             || self.checkpoint.workspace != workspace
