@@ -840,7 +840,22 @@ export default function App() {
   }, []);
 
   const focusSession = useCallback((id: string) => {
-    setActiveSessionId(id);
+    setActiveLaneId(id);
+    // Make the bridge's project/tool scope follow the selected Lane as well
+    // as the visible tab. This prevents Git, MCP, files, and Terminal from
+    // silently describing the previously loaded Lane when multiple lanes are
+    // open.
+    void api.sessionLoad(id).then((loaded) => {
+      setSessions((current) =>
+        current.map((session) => (session.id === loaded.id ? loaded : session)),
+      );
+      if (loaded.cwd && loaded.workspace_status === "ready") {
+        projectCwdHintRef.current = loaded.cwd;
+      }
+    }).catch(() => {
+      // The tab remains selectable; its existing activity/error surface is
+      // the recovery path for a failed scope promotion.
+    });
   }, []);
 
   const hideLiveRail = useCallback(() => {
@@ -2619,7 +2634,7 @@ export default function App() {
         }`}
       >
         {tabs.length > 0 && (
-          <div className="session-tabs" role="tablist" aria-label="Open sessions">
+          <div className="session-tabs" role="tablist" aria-label="Open Lanes">
             {tabs.map((t) => (
               <div
                 key={t.id}
@@ -2948,8 +2963,8 @@ export default function App() {
               <div className="terminal-slot-bar">
                 <span className="terminal-slot-title">
                   {toolShell?.command
-                    ? `Tool shell · ${toolShell.command.slice(0, 48)}${toolShell.command.length > 48 ? "…" : ""}`
-                    : "Terminal"}
+                    ? `Lane Terminal · ${toolShell.command.slice(0, 48)}${toolShell.command.length > 48 ? "…" : ""}`
+                    : `Lane Terminal · ${activeTab?.title ?? "Current Lane"}`}
                 </span>
                 <button
                   type="button"
@@ -2988,7 +3003,7 @@ export default function App() {
             className={`composer-shell ${busy ? "is-busy" : ""} ${composerExpanded ? "is-expanded" : ""}`}
           >
             {activeTab && (
-              <div className="composer-target" title="Composer sends to this session">
+              <div className="composer-target" title="Composer sends to this Lane">
                 <span className="composer-target-label">→</span>
                 <span className={`kind-chip ${kindForTab(activeTab, sessions, workspaceMode)}`}>
                   {kindForTab(activeTab, sessions, workspaceMode)}
@@ -3389,6 +3404,11 @@ export default function App() {
             ▸
           </button>
           <span className="panel-chrome-title">Tools</span>
+          {activeSessionId && (
+            <span className="panel-context-scope" title="All tool panels are scoped to the selected Lane">
+              Lane: {activeSummary?.title ?? activeTab?.title ?? "Current work"}
+            </span>
+          )}
         </div>
         <div className="tabs">
           {(

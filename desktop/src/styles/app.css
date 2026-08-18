@@ -796,6 +796,16 @@ button:disabled {
   border-color: color-mix(in srgb, var(--warning, #f6c453) 45%, transparent);
 }
 
+.panel-context-scope {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 10px;
+}
+
 /* ── Multi-session tabs (Claude Code–style concurrent workspaces) ── */
 .session-tabs {
   display: flex;
