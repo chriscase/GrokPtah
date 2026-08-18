@@ -3069,9 +3069,25 @@ mod tests {
             .is_some());
         let listed = orch.list_persistent_agents(&auth).unwrap();
         assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+        let desktop_agent = host
+            .list_persistent_agents()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.agent_id == agent.agent_id)
+            .unwrap();
+        assert_eq!(
+            listed["agents"][0],
+            serde_json::to_value(&desktop_agent).unwrap(),
+            "service/MCP Agent projection must match the desktop runtime record"
+        );
         let plan = orch
             .get_persistent_agent_scoped(&auth, session.id, &workspace_path, &agent.agent_id)
             .unwrap();
+        assert_eq!(
+            plan["agent"],
+            serde_json::to_value(&desktop_agent).unwrap(),
+            "scoped service Agent reads must not rewrite transport-neutral state"
+        );
         assert_eq!(
             plan["checkpoint"]["checkpointId"],
             "checkpoint-agent-scope-1"
