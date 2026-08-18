@@ -776,9 +776,24 @@ export default function App() {
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
     [sessions, activeSessionId],
   );
+  const remoteAgentByLane = useMemo(() => {
+    const byLane = new Map<string, string>();
+    for (const agent of persistentAgents) {
+      const laneIds = agent.laneIds?.length ? agent.laneIds : [agent.sessionId];
+      for (const laneId of laneIds) byLane.set(laneId, agent.agentId);
+    }
+    return byLane;
+  }, [persistentAgents]);
   const remoteLanes = useMemo(
-    () => remoteSessions.map((session) => projectRemoteSessionAsLane(session, remoteServiceStatus)),
-    [remoteSessions, remoteServiceStatus],
+    () =>
+      remoteSessions.map((session) =>
+        projectRemoteSessionAsLane(
+          session,
+          remoteServiceStatus,
+          remoteAgentByLane.get(session.sessionId),
+        ),
+      ),
+    [remoteAgentByLane, remoteSessions, remoteServiceStatus],
   );
   const visibleLanes = useMemo(
     () => mergeLaneProjections(lanes, remoteLanes),
@@ -788,6 +803,10 @@ export default function App() {
     () => remoteLanes.find((lane) => lane.id === remoteTargetSessionId) ?? null,
     [remoteLanes, remoteTargetSessionId],
   );
+  const activeContextAgentId =
+    executionTarget === "remote" && selectedRemoteLane
+      ? selectedRemoteLane.agent_id
+      : activeSummary?.agent_id;
   const effortOptions = useMemo(
     () => effortOptionsForModel(models, status?.model),
     [models, status?.model],
@@ -2896,7 +2915,7 @@ export default function App() {
               <strong>{activeSummary?.title ?? activeTab?.title ?? "Current work"}</strong>
             </div>
             <span className="lane-context-badge">
-              {activeSummary?.agent_id ? `Agent ${activeSummary.agent_id}` : "Ad hoc Agent"}
+              {activeContextAgentId ? `Agent ${activeContextAgentId}` : "Ad hoc Agent"}
             </span>
             <span className="lane-context-badge">
               {executionTarget === "remote" && selectedRemoteLane

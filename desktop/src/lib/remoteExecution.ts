@@ -60,11 +60,12 @@ function runtimeConnectionForService(
 export function projectRemoteSessionAsLane(
   session: RemoteSessionTarget,
   status: RemoteServiceStatus,
+  agentId?: string | null,
 ): LaneSummary {
   return {
     id: session.sessionId,
     session_id: session.sessionId,
-    agent_id: null,
+    agent_id: agentId ?? null,
     title: session.title,
     cwd: session.workspace,
     created_at: session.updatedAt,

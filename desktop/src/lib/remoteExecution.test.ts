@@ -79,9 +79,10 @@ describe("remote execution target mapping", () => {
   });
 
   it("projects a service session into a service-owned Lane", () => {
-    expect(projectRemoteSessionAsLane(session, connectedHostedStatus)).toMatchObject({
+    expect(projectRemoteSessionAsLane(session, connectedHostedStatus, "agent-hosted")).toMatchObject({
       id: session.sessionId,
       session_id: session.sessionId,
+      agent_id: "agent-hosted",
       cwd: session.workspace,
       runtime_target: "hosted_service",
       runtime_connection: "connected",
