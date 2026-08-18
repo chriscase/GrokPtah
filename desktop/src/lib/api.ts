@@ -95,6 +95,11 @@ export const api = {
     invoke<PersistentAgent[]>("persistent_agent_list"),
   persistentAgentGet: (agentId: string) =>
     invoke<PersistentAgent | null>("persistent_agent_get", { agentId }),
+  persistentAgentAttachSession: (sessionId: string, agentId: string) =>
+    invoke<PersistentAgent>("persistent_agent_attach_session", {
+      sessionId,
+      agentId,
+    }),
   persistentAgentResumePlan: (sessionId: string) =>
     invoke<PersistentAgentResumePlan>("persistent_agent_resume_plan", {
       sessionId,

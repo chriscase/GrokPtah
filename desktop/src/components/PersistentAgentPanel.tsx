@@ -8,7 +8,7 @@ import type {
 
 export type PersistentAgentPanelProps = {
   agents: PersistentAgent[];
-  activeSessionId: string | null;
+  activeLaneId: string | null;
   busy?: boolean;
   error?: string | null;
   onRefresh: () => void;
@@ -45,7 +45,7 @@ function canResume(agent: PersistentAgent): boolean {
 
 export function PersistentAgentPanel({
   agents,
-  activeSessionId,
+  activeLaneId,
   busy = false,
   error,
   onRefresh,
@@ -289,7 +289,8 @@ export function PersistentAgentPanel({
       {sortedAgents.map((agent) => {
         const plan = plans[agent.agentId];
         const isSelected = selectedAgentId === agent.agentId;
-        const isCurrent = activeSessionId === agent.sessionId;
+        const laneIds = agent.laneIds?.length ? agent.laneIds : [agent.sessionId];
+        const isCurrent = Boolean(activeLaneId && laneIds.includes(activeLaneId));
         const resumeAllowed = canResume(agent) && Boolean(agent.latestCheckpointId);
         return (
           <article
@@ -302,7 +303,7 @@ export function PersistentAgentPanel({
               <span className={`agent-state ${agent.state}`}>{stateLabel(agent.state)}</span>
             </div>
             <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 4 }}>
-              {agent.model} · continuation {agent.continuationOrdinal} · updated {timeLabel(agent.updatedAt)}
+              {agent.model} · {laneIds.length} {laneIds.length === 1 ? "Lane" : "Lanes"} · continuation {agent.continuationOrdinal} · updated {timeLabel(agent.updatedAt)}
             </div>
             <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 3, wordBreak: "break-word" }}>
               {agent.workspace}

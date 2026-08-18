@@ -15,6 +15,7 @@ afterEach(() => {
 const agent: PersistentAgent = {
   agentId: "agent-session-1",
   sessionId: "session-1",
+  laneIds: ["session-1"],
   workspace: "/tmp/grokptah-demo",
   model: "grok-4.6",
   state: "waiting",
@@ -53,7 +54,7 @@ describe("PersistentAgentPanel", () => {
     render(
       <PersistentAgentPanel
         agents={[agent]}
-        activeSessionId={agent.sessionId}
+        activeLaneId={agent.sessionId}
         onRefresh={vi.fn()}
         onOpenSession={vi.fn()}
         onInspect={onInspect}
@@ -86,7 +87,7 @@ describe("PersistentAgentPanel", () => {
     render(
       <PersistentAgentPanel
         agents={[active]}
-        activeSessionId={active.sessionId}
+        activeLaneId={active.sessionId}
         onRefresh={vi.fn()}
         onOpenSession={vi.fn()}
         onInspect={vi.fn(async () => ({ ...plan, agent: active }))}
@@ -107,7 +108,7 @@ describe("PersistentAgentPanel", () => {
     render(
       <PersistentAgentPanel
         agents={[]}
-        activeSessionId={null}
+        activeLaneId={null}
         onRefresh={vi.fn()}
         onOpenSession={vi.fn()}
         onInspect={vi.fn(async () => plan)}
@@ -147,7 +148,7 @@ describe("PersistentAgentPanel", () => {
     render(
       <PersistentAgentPanel
         agents={[]}
-        activeSessionId={null}
+        activeLaneId={null}
         onRefresh={vi.fn()}
         onOpenSession={vi.fn()}
         onInspect={vi.fn(async () => plan)}

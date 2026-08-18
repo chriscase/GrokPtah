@@ -409,7 +409,12 @@ pub enum ContinuationReason {
 #[serde(rename_all = "camelCase")]
 pub struct AgentRecord {
     pub agent_id: String,
+    /// Legacy primary session retained for resume and wire compatibility.
     pub session_id: Uuid,
+    /// All Lanes owned by this durable identity. Old records deserialize with
+    /// an empty list and are normalized to include `session_id` on access.
+    #[serde(default)]
+    pub lane_ids: Vec<Uuid>,
     pub workspace: String,
     pub model: String,
     pub state: AgentState,
@@ -424,6 +429,15 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
+    /// Return the compatibility-complete Lane set without mutating storage.
+    pub fn known_lane_ids(&self) -> Vec<Uuid> {
+        let mut ids = self.lane_ids.clone();
+        if !ids.contains(&self.session_id) {
+            ids.insert(0, self.session_id);
+        }
+        ids
+    }
+
     pub fn validate(&self) -> Result<(), OrchError> {
         validate_id(&self.agent_id, "agent_id")?;
         validate_workspace(&self.workspace)?;
@@ -890,11 +904,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_agent_records_project_the_primary_session_as_a_lane() {
+        let session_id = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "agentId": "agent-legacy",
+            "sessionId": session_id,
+            "workspace": "/tmp/project",
+            "model": "grok",
+            "state": "waiting",
+            "currentRunId": null,
+            "latestCheckpointId": null,
+            "continuationOrdinal": 0,
+            "createdAt": Utc::now(),
+            "updatedAt": Utc::now()
+        });
+        let agent: AgentRecord = serde_json::from_value(legacy).unwrap();
+        assert!(agent.lane_ids.is_empty());
+        assert_eq!(agent.known_lane_ids(), vec![session_id]);
+    }
+
+    #[test]
     fn resume_plan_rejects_workspace_or_active_agent_mismatch() {
         let session_id = Uuid::new_v4();
         let mut agent = AgentRecord {
             agent_id: "agent-1".into(),
             session_id,
+            lane_ids: vec![session_id],
             workspace: "/tmp/project".into(),
             model: "grok".into(),
             state: AgentState::Waiting,
@@ -939,6 +974,7 @@ mod tests {
         let agent = AgentRecord {
             agent_id: "agent-adapter".into(),
             session_id,
+            lane_ids: vec![session_id],
             workspace: "/tmp/project".into(),
             model: "grok".into(),
             state: AgentState::Interrupted,

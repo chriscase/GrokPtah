@@ -265,7 +265,14 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   /** Open concurrent workspaces (tabs). Multiple can be busy at once. */
   const [tabs, setTabs] = useState<SessionTab[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  /**
+   * Explicit product context. During the compatibility projection a Lane id
+   * equals its backing session id, so the existing session-oriented bridge
+   * calls can continue to use the local alias below.
+   */
+  const [activeLaneId, setActiveLaneId] = useState<string | null>(null);
+  const activeSessionId = activeLaneId;
+  const setActiveSessionId = setActiveLaneId;
   const [models, setModels] = useState<ModelInfo[]>([]);
   const {
     composer,
@@ -1061,13 +1068,15 @@ export default function App() {
         // Persist the prune so a deleted/missing session doesn't keep reappearing.
         if (
           tabIds.length !== (ws.open_tab_ids ?? []).length ||
-          (ws.active_session && !byId.has(ws.active_session))
+          ((ws.active_lane_id ?? ws.active_session) &&
+            !byId.has(ws.active_lane_id ?? ws.active_session ?? ""))
         ) {
           try {
             await api.setOpenTabs(
               tabIds,
-              ws.active_session && byId.has(ws.active_session)
-                ? ws.active_session
+              (ws.active_lane_id ?? ws.active_session) &&
+              byId.has(ws.active_lane_id ?? ws.active_session ?? "")
+                ? (ws.active_lane_id ?? ws.active_session)
                 : (tabIds[0] ?? null),
             );
           } catch {
@@ -1080,8 +1089,9 @@ export default function App() {
           await openTab(summary, true);
         }
         const active =
-          (ws.active_session && byId.has(ws.active_session)
-            ? ws.active_session
+          ((ws.active_lane_id ?? ws.active_session) &&
+          byId.has(ws.active_lane_id ?? ws.active_session ?? "")
+            ? (ws.active_lane_id ?? ws.active_session)
             : null) ??
           tabIds[0] ??
           null;
@@ -2767,6 +2777,26 @@ export default function App() {
           </div>
         )}
 
+        {activeSessionId && (
+          <div className="lane-context-bar" role="status" aria-label="Current Lane context">
+            <div className="lane-context-primary">
+              <span className="lane-context-label">Lane</span>
+              <strong>{activeSummary?.title ?? activeTab?.title ?? "Current work"}</strong>
+            </div>
+            <span className="lane-context-badge">
+              {activeSummary?.agent_id ? `Agent ${activeSummary.agent_id}` : "Ad hoc Agent"}
+            </span>
+            <span className="lane-context-badge">
+              {executionTarget === "remote" && remoteServiceStatus.connected
+                ? "Remote service"
+                : "Local desktop"}
+            </span>
+            {activeSummary?.archived && (
+              <span className="lane-context-badge warning">Archived</span>
+            )}
+          </div>
+        )}
+
         <div
           ref={stageRef}
           className={`pane-row zones-${Math.max(1, docks.length)} ${
@@ -3667,7 +3697,7 @@ export default function App() {
         {rightTab === "agents" && (
             <PersistentAgentPanel
               agents={persistentAgents}
-              activeSessionId={activeSessionId}
+              activeLaneId={activeLaneId}
               busy={persistentAgentsBusy}
               error={persistentAgentsError}
               remoteStatus={remoteServiceStatus}
