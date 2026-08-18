@@ -5,11 +5,14 @@
 //! module deliberately stores hashes and structural metadata instead of
 //! credentials, arbitrary headers, endpoint URLs, or model prose.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::Read;
 use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const PERSISTENT_AGENT_CAPTURE_SCHEMA: &str = "grokptah.persistent_agent_capture.v1";
@@ -18,6 +21,23 @@ pub const MAX_CAPTURE_ATTEMPTS: usize = 4_096;
 pub const MAX_CAPTURE_CHECKS: usize = 2_048;
 pub const MAX_CAPTURE_STRING_BYTES: usize = 8 * 1024;
 pub const MAX_RAW_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const PERSISTENT_AGENT_SCENARIO_IDS: &[&str] = &[
+    "xai-route-oidc-001",
+    "sse-stream-001",
+    "native-tools-001",
+    "retry-transient-001",
+    "agent-initial-run-001",
+    "restart-between-runs-001",
+    "resume-same-lane-001",
+    "resume-cross-lane-001",
+    "archive-lane-001",
+    "interrupt-recover-001",
+    "resume-idempotency-001",
+    "memory-scopes-001",
+    "spec-revision-001",
+    "token-ceiling-001",
+    "endurance-finite-runs-001",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +124,16 @@ pub struct CampaignBudgets {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CampaignActuals {
+    pub total_tokens: u64,
+    pub provider_requests: u32,
+    pub continuations: u32,
+    pub duration_seconds: u64,
+    pub raw_artifact_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UsageEvidence {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -173,6 +203,7 @@ pub struct PersistentAgentCapture {
     pub campaign: CampaignIdentity,
     pub provider: ProviderIdentity,
     pub budgets: CampaignBudgets,
+    pub actuals: CampaignActuals,
     pub attempts: Vec<ProviderAttemptEvidence>,
     pub durable_states: Vec<DurableStateEvidence>,
     pub checks: Vec<CertificationCheck>,
@@ -194,6 +225,8 @@ pub enum CertificationError {
     NotPromotable(&'static str),
     #[error("capture JSON serialization failed")]
     Serialization,
+    #[error("capture artifact could not be verified: {0}")]
+    ArtifactVerification(&'static str),
 }
 
 impl PersistentAgentCapture {
@@ -255,6 +288,7 @@ impl PersistentAgentCapture {
             validate_identifier(&check.name, "check name")?;
             validate_short_token(&check.detail_code, "check detail_code")?;
         }
+        validate_actuals(self)?;
         let value = serde_json::to_value(self).map_err(|_| CertificationError::Serialization)?;
         scan_value_for_forbidden_data(&value)?;
         let bytes = serde_json::to_vec(self).map_err(|_| CertificationError::Serialization)?;
@@ -264,10 +298,14 @@ impl PersistentAgentCapture {
         Ok(())
     }
 
-    /// Apply the stricter gate used before a capture can become a committed
-    /// xAI replay fixture. This does not write files; promotion remains an
-    /// explicit reviewed operation.
-    pub fn validate_for_xai_fixture_promotion(&self) -> Result<(), CertificationError> {
+    /// Apply the stricter, root-bound gate used before a capture can become a
+    /// committed xAI replay fixture. This opens every referenced artifact,
+    /// verifies its size and digest, and scans its structured contents. It
+    /// does not write files; promotion remains an explicit reviewed operation.
+    pub fn validate_for_xai_fixture_promotion_at(
+        &self,
+        fixture_root: &Path,
+    ) -> Result<(), CertificationError> {
         self.validate()?;
         if !self.provider.route_class.is_public_xai() {
             return Err(CertificationError::NotPromotable(
@@ -284,8 +322,98 @@ impl PersistentAgentCapture {
                 "capture has no provider attempts",
             ));
         }
+        if !PERSISTENT_AGENT_SCENARIO_IDS.contains(&self.campaign.scenario_id.as_str()) {
+            return Err(CertificationError::NotPromotable(
+                "campaign scenario is not in the versioned catalog",
+            ));
+        }
+        verify_promotion_artifacts(self, fixture_root)?;
         Ok(())
     }
+}
+
+fn validate_actuals(capture: &PersistentAgentCapture) -> Result<(), CertificationError> {
+    if capture.actuals.provider_requests as usize != capture.attempts.len() {
+        return Err(CertificationError::Identifier(
+            "provider request actual does not match attempts",
+        ));
+    }
+    if capture.actuals.provider_requests > capture.budgets.max_provider_requests {
+        return Err(CertificationError::Bound("provider request actual"));
+    }
+
+    let total_tokens = capture.attempts.iter().try_fold(0_u64, |total, attempt| {
+        total
+            .checked_add(attempt.usage.as_ref().map_or(0, |usage| usage.total_tokens))
+            .ok_or(CertificationError::Bound("aggregate token usage overflow"))
+    })?;
+    if total_tokens != capture.actuals.total_tokens {
+        return Err(CertificationError::Identifier(
+            "token actual does not match attempt usage",
+        ));
+    }
+    if capture.actuals.total_tokens > capture.budgets.max_total_tokens {
+        return Err(CertificationError::Bound("aggregate token usage"));
+    }
+
+    let continuations = capture
+        .durable_states
+        .iter()
+        .filter(|state| state.parent_run_id.is_some())
+        .count();
+    if capture.actuals.continuations as usize != continuations {
+        return Err(CertificationError::Identifier(
+            "continuation actual does not match durable states",
+        ));
+    }
+    if capture.actuals.continuations > capture.budgets.max_continuations {
+        return Err(CertificationError::Bound("continuation actual"));
+    }
+    if capture.actuals.duration_seconds > capture.budgets.max_duration_seconds {
+        return Err(CertificationError::Bound("campaign duration actual"));
+    }
+
+    let mut artifacts = BTreeMap::<&str, (&str, u64)>::new();
+    for reference in capture
+        .attempts
+        .iter()
+        .flat_map(|attempt| {
+            [
+                attempt.request_body.as_ref(),
+                attempt.response_body.as_ref(),
+            ]
+        })
+        .flatten()
+    {
+        match artifacts.get(reference.relative_path.as_str()) {
+            Some((sha256, bytes)) if *sha256 != reference.sha256 || *bytes != reference.bytes => {
+                return Err(CertificationError::Identifier(
+                    "artifact path has conflicting evidence",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                artifacts.insert(
+                    reference.relative_path.as_str(),
+                    (reference.sha256.as_str(), reference.bytes),
+                );
+            }
+        }
+    }
+    let referenced_bytes = artifacts.values().try_fold(0_u64, |total, (_, bytes)| {
+        total.checked_add(*bytes).ok_or(CertificationError::Bound(
+            "aggregate artifact bytes overflow",
+        ))
+    })?;
+    if referenced_bytes != capture.actuals.raw_artifact_bytes {
+        return Err(CertificationError::Identifier(
+            "artifact actual does not match referenced artifacts",
+        ));
+    }
+    if capture.actuals.raw_artifact_bytes > capture.budgets.max_raw_artifact_bytes {
+        return Err(CertificationError::Bound("aggregate artifact bytes"));
+    }
+    Ok(())
 }
 
 fn validate_identity(identity: &ProviderIdentity) -> Result<(), CertificationError> {
@@ -393,7 +521,10 @@ fn validate_artifact(reference: &ArtifactReference) -> Result<(), CertificationE
         || path.components().any(|component| {
             matches!(
                 component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                Component::CurDir
+                    | Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
             )
         })
     {
@@ -404,6 +535,244 @@ fn validate_artifact(reference: &ArtifactReference) -> Result<(), CertificationE
         return Err(CertificationError::Bound("artifact bytes"));
     }
     Ok(())
+}
+
+fn verify_promotion_artifacts(
+    capture: &PersistentAgentCapture,
+    fixture_root: &Path,
+) -> Result<(), CertificationError> {
+    let root = dunce::canonicalize(fixture_root)
+        .map_err(|_| CertificationError::ArtifactVerification("fixture root is unavailable"))?;
+    if !root
+        .metadata()
+        .map_err(|_| CertificationError::ArtifactVerification("fixture root is unavailable"))?
+        .is_dir()
+    {
+        return Err(CertificationError::ArtifactVerification(
+            "fixture root is not a directory",
+        ));
+    }
+
+    let mut verified = BTreeSet::new();
+    for reference in capture
+        .attempts
+        .iter()
+        .flat_map(|attempt| {
+            [
+                attempt.request_body.as_ref(),
+                attempt.response_body.as_ref(),
+            ]
+        })
+        .flatten()
+    {
+        if verified.insert(reference.relative_path.as_str()) {
+            verify_promotion_artifact(&root, reference)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_promotion_artifact(
+    canonical_root: &Path,
+    reference: &ArtifactReference,
+) -> Result<(), CertificationError> {
+    validate_artifact(reference)?;
+    let relative = Path::new(&reference.relative_path);
+    let mut candidate = canonical_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(CertificationError::UnsafeArtifactReference);
+        };
+        candidate.push(part);
+        let metadata = fs::symlink_metadata(&candidate).map_err(|_| {
+            CertificationError::ArtifactVerification("referenced artifact is unavailable")
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(CertificationError::ArtifactVerification(
+                "artifact path contains a symbolic link",
+            ));
+        }
+    }
+
+    let canonical = dunce::canonicalize(&candidate).map_err(|_| {
+        CertificationError::ArtifactVerification("referenced artifact is unavailable")
+    })?;
+    if !canonical.starts_with(canonical_root) {
+        return Err(CertificationError::ArtifactVerification(
+            "artifact resolves outside fixture root",
+        ));
+    }
+    let metadata = canonical.metadata().map_err(|_| {
+        CertificationError::ArtifactVerification("referenced artifact is unavailable")
+    })?;
+    if !metadata.is_file() {
+        return Err(CertificationError::ArtifactVerification(
+            "referenced artifact is not a regular file",
+        ));
+    }
+    if metadata.len() != reference.bytes {
+        return Err(CertificationError::ArtifactVerification(
+            "artifact byte count does not match evidence",
+        ));
+    }
+
+    let read_limit = reference
+        .bytes
+        .checked_add(1)
+        .ok_or(CertificationError::Bound("artifact read limit"))?;
+    let file = fs::File::open(&canonical).map_err(|_| {
+        CertificationError::ArtifactVerification("referenced artifact is unavailable")
+    })?;
+    let mut bytes = Vec::with_capacity(reference.bytes.min(MAX_CAPTURE_BYTES as u64) as usize);
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CertificationError::ArtifactVerification("artifact could not be read"))?;
+    if bytes.len() as u64 != reference.bytes {
+        return Err(CertificationError::ArtifactVerification(
+            "artifact changed while it was verified",
+        ));
+    }
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if digest != reference.sha256.to_ascii_lowercase() {
+        return Err(CertificationError::ArtifactVerification(
+            "artifact digest does not match evidence",
+        ));
+    }
+
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        CertificationError::ArtifactVerification("opaque binary artifacts cannot be promoted")
+    })?;
+    scan_promotable_artifact(relative, text)
+}
+
+fn scan_promotable_artifact(relative_path: &Path, text: &str) -> Result<(), CertificationError> {
+    scan_artifact_text_patterns(text)?;
+    match relative_path.extension().and_then(|value| value.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("json") => {
+            let value: Value = serde_json::from_str(text).map_err(|_| {
+                CertificationError::ArtifactVerification("artifact is not valid JSON")
+            })?;
+            scan_value_for_forbidden_data(&value)
+        }
+        Some(extension) if extension.eq_ignore_ascii_case("sse") => scan_sse_artifact(text),
+        _ => Err(CertificationError::ArtifactVerification(
+            "only structured JSON and SSE artifacts can be promoted",
+        )),
+    }
+}
+
+fn scan_sse_artifact(text: &str) -> Result<(), CertificationError> {
+    let mut data_lines = Vec::new();
+    let mut observed_data = false;
+    for line in text.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if data_lines.is_empty() {
+                continue;
+            }
+            let data = data_lines.join("\n");
+            data_lines.clear();
+            observed_data = true;
+            if data.trim() == "[DONE]" {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&data).map_err(|_| {
+                CertificationError::ArtifactVerification("SSE data is not valid JSON")
+            })?;
+            scan_value_for_forbidden_data(&value)?;
+        } else if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.strip_prefix(' ').unwrap_or(data));
+        }
+    }
+    if !observed_data {
+        return Err(CertificationError::ArtifactVerification(
+            "SSE artifact contains no data events",
+        ));
+    }
+    Ok(())
+}
+
+fn scan_artifact_text_patterns(text: &str) -> Result<(), CertificationError> {
+    let lower = text.to_ascii_lowercase();
+    let rule = if lower.contains("bearer ") {
+        Some("bearer credential")
+    } else if lower.contains("sk-")
+        || lower.contains("xai-")
+        || lower.contains("-----begin private key-----")
+    {
+        Some("credential-shaped value")
+    } else if lower.contains("/users/") || lower.contains("/home/") || lower.contains("c:\\users\\")
+    {
+        Some("host filesystem path")
+    } else if lower.contains("http://") || lower.contains("https://") {
+        Some("endpoint URL")
+    } else {
+        None
+    };
+    if let Some(rule) = rule {
+        return Err(CertificationError::ForbiddenData {
+            path: "$artifact".into(),
+            rule,
+        });
+    }
+
+    for token in text.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    }) {
+        if looks_like_hostname(token) {
+            return Err(CertificationError::ForbiddenData {
+                path: "$artifact".into(),
+                rule: "hostname-shaped value",
+            });
+        }
+        if looks_like_high_entropy_token(token) {
+            return Err(CertificationError::ForbiddenData {
+                path: "$artifact".into(),
+                rule: "high-entropy token-shaped value",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn looks_like_hostname(token: &str) -> bool {
+    let token = token.trim_matches('.');
+    let Some(suffix) = token.rsplit('.').next() else {
+        return false;
+    };
+    if !token.contains('.')
+        || !matches!(
+            suffix.to_ascii_lowercase().as_str(),
+            "ai" | "com"
+                | "net"
+                | "org"
+                | "io"
+                | "dev"
+                | "cloud"
+                | "corp"
+                | "internal"
+                | "local"
+                | "lan"
+        )
+    {
+        return false;
+    }
+    token.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn looks_like_high_entropy_token(token: &str) -> bool {
+    if token.len() < 40 || token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let has_alpha = token.bytes().any(|byte| byte.is_ascii_alphabetic());
+    let has_digit = token.bytes().any(|byte| byte.is_ascii_digit());
+    let distinct = token.bytes().collect::<BTreeSet<_>>().len();
+    has_alpha && has_digit && distinct >= 12
 }
 
 fn validate_commit(value: &str) -> Result<(), CertificationError> {
@@ -587,16 +956,52 @@ fn scan_string(text: &str, path: &str) -> Result<(), CertificationError> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::TempDir;
 
     fn hash(ch: char) -> String {
         std::iter::repeat_n(ch, 64).collect()
+    }
+
+    fn digest(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn set_artifact(reference: &mut ArtifactReference, bytes: &[u8]) {
+        reference.sha256 = digest(bytes);
+        reference.bytes = bytes.len() as u64;
+    }
+
+    fn materialize_fixture(capture: &mut PersistentAgentCapture) -> TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let attempt = directory.path().join("attempt-0001");
+        fs::create_dir_all(&attempt).unwrap();
+        let request =
+            br#"{"model":"grok-code-fast-1","messages":[{"role":"user","content":"synthetic"}]}"#;
+        let response = concat!(
+            "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",",
+            "\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",",
+            "\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n",
+            "data: [DONE]\n",
+        )
+        .as_bytes();
+        fs::write(attempt.join("request.json"), request).unwrap();
+        fs::write(attempt.join("response.sse"), response).unwrap();
+        set_artifact(capture.attempts[0].request_body.as_mut().unwrap(), request);
+        set_artifact(
+            capture.attempts[0].response_body.as_mut().unwrap(),
+            response,
+        );
+        capture.actuals.raw_artifact_bytes = (request.len() + response.len()) as u64;
+        directory
     }
 
     fn fixture() -> PersistentAgentCapture {
         PersistentAgentCapture {
             schema: PERSISTENT_AGENT_CAPTURE_SCHEMA.into(),
             campaign: CampaignIdentity {
-                scenario_id: "same_lane_resume".into(),
+                scenario_id: "resume-same-lane-001".into(),
                 repository_commit: "b6dab133".into(),
                 dirty: false,
             },
@@ -614,6 +1019,13 @@ mod tests {
                 max_duration_seconds: 7_200,
                 max_raw_artifact_bytes: 64 * 1024 * 1024,
                 max_response_bytes_per_request: 8 * 1024 * 1024,
+            },
+            actuals: CampaignActuals {
+                total_tokens: 15,
+                provider_requests: 1,
+                continuations: 1,
+                duration_seconds: 1,
+                raw_artifact_bytes: 777,
             },
             attempts: vec![ProviderAttemptEvidence {
                 attempt: 1,
@@ -665,9 +1077,12 @@ mod tests {
 
     #[test]
     fn public_xai_fixture_passes_the_capture_and_promotion_gates() {
-        let fixture = fixture();
+        let mut fixture = fixture();
+        let directory = materialize_fixture(&mut fixture);
         fixture.validate().unwrap();
-        fixture.validate_for_xai_fixture_promotion().unwrap();
+        fixture
+            .validate_for_xai_fixture_promotion_at(directory.path())
+            .unwrap();
     }
 
     #[test]
@@ -680,7 +1095,7 @@ mod tests {
         capture.attempts[0].route_identity = format!("opaque-{}", hash('2'));
         capture.validate().unwrap();
         assert!(matches!(
-            capture.validate_for_xai_fixture_promotion(),
+            capture.validate_for_xai_fixture_promotion_at(Path::new(".")),
             Err(CertificationError::NotPromotable(_))
         ));
     }
@@ -762,9 +1177,140 @@ mod tests {
         capture.campaign.dirty = true;
         capture.validate().unwrap();
         assert!(matches!(
-            capture.validate_for_xai_fixture_promotion(),
+            capture.validate_for_xai_fixture_promotion_at(Path::new(".")),
             Err(CertificationError::NotPromotable(_))
         ));
+    }
+
+    #[test]
+    fn aggregate_actuals_must_match_evidence_and_budgets() {
+        let mut capture = fixture();
+        capture.actuals.provider_requests = 2;
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier("provider request actual does not match attempts")
+        );
+
+        let mut capture = fixture();
+        capture.actuals.total_tokens = 16;
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier("token actual does not match attempt usage")
+        );
+
+        let mut capture = fixture();
+        capture.budgets.max_total_tokens = 14;
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Bound("aggregate token usage")
+        );
+
+        let mut capture = fixture();
+        capture.actuals.duration_seconds = capture.budgets.max_duration_seconds + 1;
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Bound("campaign duration actual")
+        );
+
+        let mut capture = fixture();
+        capture.actuals.raw_artifact_bytes = 776;
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier("artifact actual does not match referenced artifacts")
+        );
+    }
+
+    #[test]
+    fn conflicting_artifact_evidence_fails_closed() {
+        let mut capture = fixture();
+        let response = capture.attempts[0].response_body.as_mut().unwrap();
+        response.relative_path = "attempt-0001/request.json".into();
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier("artifact path has conflicting evidence")
+        );
+    }
+
+    #[test]
+    fn promotion_requires_a_catalog_scenario_and_verified_artifacts() {
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        capture.campaign.scenario_id = "unregistered-scenario".into();
+        assert!(matches!(
+            capture.validate_for_xai_fixture_promotion_at(directory.path()),
+            Err(CertificationError::NotPromotable(_))
+        ));
+
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        capture.attempts[0].response_body.as_mut().unwrap().sha256 = hash('f');
+        assert_eq!(
+            capture
+                .validate_for_xai_fixture_promotion_at(directory.path())
+                .unwrap_err(),
+            CertificationError::ArtifactVerification("artifact digest does not match evidence")
+        );
+
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        capture.attempts[0].response_body.as_mut().unwrap().bytes += 1;
+        capture.actuals.raw_artifact_bytes += 1;
+        assert_eq!(
+            capture
+                .validate_for_xai_fixture_promotion_at(directory.path())
+                .unwrap_err(),
+            CertificationError::ArtifactVerification("artifact byte count does not match evidence")
+        );
+    }
+
+    #[test]
+    fn promotion_scans_structured_artifact_content() {
+        for unsafe_request in [
+            br#"{"authorization":"redacted"}"#.as_slice(),
+            br#"{"host":"gateway.private-corp.com"}"#.as_slice(),
+            br#"{"value":"tokenMaterialWithManyDistinctChars0123456789abcdefghijk"}"#.as_slice(),
+        ] {
+            let mut capture = fixture();
+            let directory = materialize_fixture(&mut capture);
+            fs::write(
+                directory.path().join("attempt-0001/request.json"),
+                unsafe_request,
+            )
+            .unwrap();
+            let old_bytes = capture.attempts[0].request_body.as_ref().unwrap().bytes;
+            set_artifact(
+                capture.attempts[0].request_body.as_mut().unwrap(),
+                unsafe_request,
+            );
+            capture.actuals.raw_artifact_bytes = capture
+                .actuals
+                .raw_artifact_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(unsafe_request.len() as u64);
+            assert!(matches!(
+                capture.validate_for_xai_fixture_promotion_at(directory.path()),
+                Err(CertificationError::ForbiddenData { .. })
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promotion_rejects_symlinked_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        let response_path = directory.path().join("attempt-0001/response.sse");
+        fs::remove_file(&response_path).unwrap();
+        let external = tempfile::NamedTempFile::new().unwrap();
+        symlink(external.path(), response_path).unwrap();
+        assert_eq!(
+            capture
+                .validate_for_xai_fixture_promotion_at(directory.path())
+                .unwrap_err(),
+            CertificationError::ArtifactVerification("artifact path contains a symbolic link")
+        );
     }
 
     #[test]
@@ -781,6 +1327,11 @@ mod tests {
             .map(|scenario| scenario["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids.len(), scenarios.len(), "scenario IDs must be unique");
+        let compiled_ids: BTreeSet<&str> = PERSISTENT_AGENT_SCENARIO_IDS.iter().copied().collect();
+        assert_eq!(
+            ids, compiled_ids,
+            "compiled promotion allowlist must match the versioned catalog"
+        );
         for required in [
             "xai-route-oidc-001",
             "sse-stream-001",

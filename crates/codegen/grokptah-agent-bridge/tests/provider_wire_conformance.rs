@@ -43,9 +43,7 @@ fn fixture_directory() -> PathBuf {
 }
 
 fn load_fixture() -> (ProviderContractFixture, Vec<u8>) {
-    let root = fixture_directory()
-        .canonicalize()
-        .expect("fixture directory must exist");
+    let root = dunce::canonicalize(fixture_directory()).expect("fixture directory must exist");
     let fixture: ProviderContractFixture = serde_json::from_slice(
         &std::fs::read(root.join("fixture.json")).expect("fixture manifest must be readable"),
     )
@@ -73,10 +71,8 @@ fn load_fixture() -> (ProviderContractFixture, Vec<u8>) {
                 .all(|component| matches!(component, Component::Normal(_))),
         "fixture artifact must be a non-empty normalized relative path"
     );
-    let artifact_path = root
-        .join(relative)
-        .canonicalize()
-        .expect("fixture response artifact must exist");
+    let artifact_path =
+        dunce::canonicalize(root.join(relative)).expect("fixture response artifact must exist");
     assert!(
         artifact_path.starts_with(&root),
         "fixture artifact must remain beneath its fixture directory"
