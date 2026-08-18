@@ -38,6 +38,8 @@ pub const PERSISTENT_AGENT_SCENARIO_IDS: &[&str] = &[
     "token-ceiling-001",
     "endurance-finite-runs-001",
 ];
+const GROK_BUILD_PROXY_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
+const XAI_API_BASE: &str = "https://api.x.ai/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +53,17 @@ impl ProviderRouteClass {
     pub fn is_public_xai(&self) -> bool {
         matches!(self, Self::GrokBuildProxy | Self::XaiApi)
     }
+}
+
+/// Stable allowlisted fingerprint for a public xAI route. Captures retain
+/// this digest rather than the endpoint URL itself.
+pub fn public_xai_endpoint_fingerprint(route_class: &ProviderRouteClass) -> Option<String> {
+    let endpoint = match route_class {
+        ProviderRouteClass::GrokBuildProxy => GROK_BUILD_PROXY_BASE,
+        ProviderRouteClass::XaiApi => XAI_API_BASE,
+        ProviderRouteClass::CompatibleGateway => return None,
+    };
+    Some(format!("{:x}", Sha256::digest(endpoint.as_bytes())))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -322,6 +335,14 @@ impl PersistentAgentCapture {
                 "capture has no provider attempts",
             ));
         }
+        let expected_endpoint = public_xai_endpoint_fingerprint(&self.provider.route_class).ok_or(
+            CertificationError::NotPromotable("provider route is not a public xAI route"),
+        )?;
+        if self.provider.endpoint_fingerprint != expected_endpoint {
+            return Err(CertificationError::NotPromotable(
+                "provider endpoint is not on the public xAI allowlist",
+            ));
+        }
         if !PERSISTENT_AGENT_SCENARIO_IDS.contains(&self.campaign.scenario_id.as_str()) {
             return Err(CertificationError::NotPromotable(
                 "campaign scenario is not in the versioned catalog",
@@ -426,6 +447,13 @@ fn validate_identity(identity: &ProviderIdentity) -> Result<(), CertificationErr
             "private model identity must be opaque",
         ));
     }
+    if identity.route_class.is_public_xai()
+        && !matches!(identity.dialect, ProviderDialectClass::XaiChatCompletions)
+    {
+        return Err(CertificationError::Identifier(
+            "public xAI route requires xAI chat-completions dialect",
+        ));
+    }
     match (&identity.route_class, &identity.credential_method) {
         (ProviderRouteClass::GrokBuildProxy, CredentialMethodClass::GrokBuildOidc)
         | (ProviderRouteClass::XaiApi, CredentialMethodClass::ApiKeyReference)
@@ -477,8 +505,8 @@ fn validate_attempt(
         return Err(CertificationError::Identifier("HTTP method"));
     }
     if route_class.is_public_xai() {
-        if !attempt.route_identity.starts_with('/') || attempt.route_identity.contains('?') {
-            return Err(CertificationError::Identifier("public route identity"));
+        if attempt.method != "POST" || attempt.route_identity != "/v1/chat/completions" {
+            return Err(CertificationError::Identifier("public xAI request route"));
         }
     } else if !attempt.route_identity.starts_with("opaque-") {
         return Err(CertificationError::Identifier(
@@ -920,6 +948,18 @@ fn is_secret_key(value: &str) -> bool {
             | "password"
             | "secret"
             | "clientsecret"
+            | "userid"
+            | "username"
+            | "teamid"
+            | "organizationid"
+            | "principalid"
+            | "tenantid"
+            | "accountid"
+            | "subject"
+            | "sub"
+            | "email"
+            | "machineid"
+            | "deviceid"
     )
 }
 
@@ -1010,7 +1050,10 @@ mod tests {
                 dialect: ProviderDialectClass::XaiChatCompletions,
                 credential_method: CredentialMethodClass::GrokBuildOidc,
                 model_identity: "grok-code-fast-1".into(),
-                endpoint_fingerprint: hash('a'),
+                endpoint_fingerprint: public_xai_endpoint_fingerprint(
+                    &ProviderRouteClass::GrokBuildProxy,
+                )
+                .unwrap(),
             },
             budgets: CampaignBudgets {
                 max_total_tokens: 100_000,
@@ -1127,6 +1170,28 @@ mod tests {
     }
 
     #[test]
+    fn scanner_rejects_provider_identity_and_account_fields() {
+        for field in [
+            "user_id",
+            "teamId",
+            "organization-id",
+            "principal_id",
+            "tenantId",
+            "account_id",
+            "subject",
+            "sub",
+            "email",
+            "machine_id",
+            "deviceId",
+        ] {
+            assert!(matches!(
+                scan_value_for_forbidden_data(&json!({(field): "short-value"})),
+                Err(CertificationError::ForbiddenData { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn artifact_paths_are_relative_and_cannot_escape() {
         let mut capture = fixture();
         for unsafe_path in ["../response.sse", "/tmp/response.sse"] {
@@ -1180,6 +1245,40 @@ mod tests {
             capture.validate_for_xai_fixture_promotion_at(Path::new(".")),
             Err(CertificationError::NotPromotable(_))
         ));
+    }
+
+    #[test]
+    fn public_xai_promotion_requires_the_exact_allowlisted_wire_contract() {
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        capture.provider.endpoint_fingerprint = hash('f');
+        assert!(matches!(
+            capture.validate_for_xai_fixture_promotion_at(directory.path()),
+            Err(CertificationError::NotPromotable(_))
+        ));
+
+        let mut capture = fixture();
+        capture.provider.dialect = ProviderDialectClass::OpenAiCompatible;
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier(
+                "public xAI route requires xAI chat-completions dialect"
+            )
+        );
+
+        let mut capture = fixture();
+        capture.attempts[0].route_identity = "/private/chat/completions".into();
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier("public xAI request route")
+        );
+
+        let mut capture = fixture();
+        capture.attempts[0].method = "GET".into();
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier("public xAI request route")
+        );
     }
 
     #[test]

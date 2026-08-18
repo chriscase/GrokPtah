@@ -3,10 +3,11 @@
 use std::path::{Component, Path, PathBuf};
 
 use grokptah_agent_bridge::{
-    replay_xai_provider_contract_on_loopback, ArtifactReference, AttemptDisposition,
-    CampaignActuals, CampaignBudgets, CampaignIdentity, CertificationCheck, CredentialMethodClass,
-    PersistentAgentCapture, ProviderAttemptEvidence, ProviderDialectClass, ProviderIdentity,
-    ProviderRouteClass, StreamFraming, UsageEvidence, PERSISTENT_AGENT_CAPTURE_SCHEMA,
+    public_xai_endpoint_fingerprint, replay_xai_provider_contract_on_loopback, ArtifactReference,
+    AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity, CertificationCheck,
+    CredentialMethodClass, PersistentAgentCapture, ProviderAttemptEvidence, ProviderDialectClass,
+    ProviderIdentity, ProviderRouteClass, StreamFraming, UsageEvidence,
+    PERSISTENT_AGENT_CAPTURE_SCHEMA,
 };
 use grokptah_test_gateway::{split_at, MockGateway, Response, Step};
 use serde::Deserialize;
@@ -216,7 +217,10 @@ fn synthetic_xai_fixture_has_a_promotable_secret_free_capture() {
             dialect: ProviderDialectClass::XaiChatCompletions,
             credential_method: CredentialMethodClass::GrokBuildOidc,
             model_identity: "grok-fixture".into(),
-            endpoint_fingerprint: "a".repeat(64),
+            endpoint_fingerprint: public_xai_endpoint_fingerprint(
+                &ProviderRouteClass::GrokBuildProxy,
+            )
+            .unwrap(),
         },
         budgets: CampaignBudgets {
             max_total_tokens: 100_000,
