@@ -32,6 +32,7 @@ function run(overrides: Partial<DurableRun> = {}): DurableRun {
       permissionsGranted: 0,
       permissionsDenied: 0,
       usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3, requests: 1 },
+      usageComplete: true,
       verification: {
         status: "verified",
         stopReason: "completed",
@@ -102,9 +103,44 @@ describe("RunInspector", () => {
     expect(screen.getByText("1 files")).toBeTruthy();
     expect(screen.getByText("1/1 tests passed")).toBeTruthy();
     expect(screen.getByText("Verification: verified")).toBeTruthy();
+    expect(screen.getByText("3 tokens · measured")).toBeTruthy();
     expect(screen.getByText("Handoff")).toBeTruthy();
     expect(screen.getByText("Desktop", { selector: ".run-origin" })).toBeTruthy();
     expect(screen.getByText("Shared workspace", { selector: ".run-execution-mode" })).toBeTruthy();
+  });
+
+  it("shows the applied token ceiling, durable consumption, and typed stop cause", () => {
+    render(
+      <RunInspector
+        runs={[
+          run({
+            state: "limit_reached",
+            bounds: {
+              maxPromptBytes: 1000,
+              maxRounds: 8,
+              maxDurationMs: 1000,
+              maxTotalTokens: 500,
+            },
+            stopCause: "token_ceiling",
+            aggregates: {
+              ...run().aggregates,
+              usage: {
+                promptTokens: 410,
+                completionTokens: 105,
+                totalTokens: 515,
+                requests: 3,
+              },
+              usageComplete: true,
+            },
+          }),
+        ]}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByText("515 / 500 tokens · measured")).toBeTruthy();
+    expect(screen.getByRole("status")).toHaveTextContent("Stop cause: token ceiling");
   });
 
   it("renders live remote events and routes scoped controls", async () => {

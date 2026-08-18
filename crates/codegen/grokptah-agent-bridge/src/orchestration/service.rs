@@ -987,6 +987,8 @@ impl OrchestrationService {
             "createdAt": run.created_at,
             "updatedAt": run.updated_at,
             "terminalResult": run.terminal_result,
+            "stopCause": run.stop_cause,
+            "bounds": run.bounds,
             "errorCode": run.error_code,
         }))
     }
@@ -1396,12 +1398,16 @@ impl OrchestrationService {
             "state": run.state,
             "finalResponse": run.final_response,
             "terminalResult": run.terminal_result,
+            "stopCause": run.stop_cause,
             "startSeq": run.start_seq,
             "endSeq": run.end_seq,
+            "bounds": run.bounds,
             "changes": run.aggregates.changes,
             "tests": run.aggregates.tests,
             "verification": run.aggregates.verification,
             "usage": run.aggregates.usage,
+            "usageComplete": run.aggregates.usage_complete,
+            "usagePendingRequests": run.aggregates.usage_pending_requests,
         }))
     }
 
@@ -2623,6 +2629,7 @@ impl OrchestrationService {
             terminal_result: None,
             final_response: None,
             error_code: None,
+            stop_cause: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,
@@ -2771,6 +2778,14 @@ impl OrchestrationService {
         if source.bounds.max_prompt_bytes > server_bounds.max_prompt_bytes
             || source.bounds.max_rounds > server_bounds.max_rounds
             || source.bounds.max_duration_ms > server_bounds.max_duration_ms
+            || match (
+                source.bounds.max_total_tokens,
+                server_bounds.max_total_tokens,
+            ) {
+                (None, Some(_)) => true,
+                (Some(source), Some(server)) => source > server,
+                _ => false,
+            }
         {
             return Err(fail(
                 self,
@@ -2912,9 +2927,6 @@ impl OrchestrationService {
                 Ok(text) => Ok(bus.redact_text(text, 8_000)),
                 Err(error) => Err(bus.redact_text(&error.to_string(), 2_000)),
             };
-            let incomplete_stop = result
-                .as_ref()
-                .is_ok_and(|text| crate::host_helpers::is_incomplete_stop_message(text));
             let mut candidate = store.load_run(&rid).ok().flatten().unwrap_or(run);
             for update in &reconciliation {
                 fold_run_update(&mut candidate, update);
@@ -2926,19 +2938,29 @@ impl OrchestrationService {
                     candidate.state = RunState::LimitReached;
                     candidate.terminal_result = Some("limit_reached".into());
                     candidate.error_code = Some("limit_reached".into());
+                    candidate.stop_cause = Some(RunStopCause::DurationLimit);
                     if let Ok(text) = &durable_result {
                         candidate.final_response = Some(text.clone());
                     }
                 } else {
                     match &durable_result {
                         Ok(text) => {
-                            if incomplete_stop {
+                            if candidate
+                                .stop_cause
+                                .is_some_and(|cause| cause != RunStopCause::Completed)
+                            {
                                 candidate.state = RunState::LimitReached;
-                                candidate.terminal_result = Some("limit_reached".into());
-                                candidate.error_code = Some("limit_reached".into());
+                                let code = candidate
+                                    .error_code
+                                    .as_deref()
+                                    .unwrap_or("limit_reached")
+                                    .to_string();
+                                candidate.terminal_result = Some(code.clone());
+                                candidate.error_code = Some(code);
                             } else {
                                 candidate.state = RunState::Completed;
                                 candidate.terminal_result = Some("completed".into());
+                                candidate.stop_cause = Some(RunStopCause::Completed);
                             }
                             candidate.final_response = Some(text.clone());
                         }
@@ -2946,11 +2968,16 @@ impl OrchestrationService {
                             candidate.state = RunState::Failed;
                             candidate.terminal_result = Some("failed".into());
                             candidate.error_code = Some("internal".into());
+                            candidate.stop_cause = Some(RunStopCause::Failed);
                             candidate.final_response = Some(error.clone());
                         }
                     }
                 }
             }
+            // At this point the prompt future has either settled or its
+            // bounded teardown window has elapsed. Any remaining provider
+            // marker can no longer support a complete-accounting claim.
+            candidate.fail_closed_unresolved_provider_attempts();
             if candidate.aggregates.verification.is_none() {
                 let observations = crate::completion::observations_from_run(
                     candidate.aggregates.changes.len(),
@@ -3370,6 +3397,8 @@ impl OrchestrationService {
             current.updated_at = Utc::now();
             current.end_seq = None;
             current.terminal_result = Some("cancelled".into());
+            current.error_code = Some("cancelled".into());
+            current.stop_cause = Some(RunStopCause::Cancelled);
             Ok(())
         });
         if !matches!(cancel_update, Ok(Some(_))) {
@@ -3399,6 +3428,29 @@ impl OrchestrationService {
             .await
             .is_ok()
         };
+
+        // A completed teardown should have reconciled every provider marker.
+        // If it did not—or teardown itself timed out—persist incomplete usage
+        // before returning the terminal cancellation receipt.
+        let accounting_update = self.store.update_run(rid, |current| {
+            current.fail_closed_unresolved_provider_attempts();
+            current.updated_at = Utc::now();
+            Ok(())
+        });
+        if !matches!(accounting_update, Ok(Some(_))) {
+            let message = match accounting_update {
+                Ok(None) => "run record disappeared during cancellation teardown".into(),
+                Err(error) => error.to_string(),
+                Ok(Some(_)) => unreachable!(),
+            };
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(rid.into()),
+                session_id,
+                &claimed,
+                OrchError::new(OrchErrorCode::Internal, message),
+            ));
+        }
 
         let response = json!({
             "requestId": request_id,

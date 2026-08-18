@@ -60,6 +60,7 @@ fn orch(
                 max_prompt_bytes: 50_000,
                 max_rounds: 8,
                 max_duration_ms: 60_000,
+                max_total_tokens: None,
             },
         },
     );
@@ -314,6 +315,7 @@ fn bounds_escalation_and_zero_rejected() {
         max_prompt_bytes: 1000,
         max_rounds: 4,
         max_duration_ms: 5000,
+        max_total_tokens: None,
     };
     assert!(merge_bounds(&ceil, Some(&json!({"maxRounds": 8}))).is_err());
     assert!(merge_bounds(&ceil, Some(&json!({"maxRounds": 0}))).is_err());

@@ -1135,6 +1135,24 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
             .is_some(),
         "verification must expose a bounded trust status"
     );
+    assert_eq!(
+        handoff.structured["stopCause"], "completed",
+        "handoff must expose the host-decided typed stop cause"
+    );
+    assert!(
+        handoff.structured["bounds"].is_object(),
+        "handoff must expose the applied run bounds"
+    );
+    assert!(
+        handoff.structured["bounds"]["maxRounds"].is_number(),
+        "handoff bounds must use the durable run projection"
+    );
+    assert!(
+        handoff.structured["usage"].is_object()
+            && handoff.structured["usageComplete"].is_boolean()
+            && handoff.structured["usagePendingRequests"].is_number(),
+        "handoff must project usage and its completeness together"
+    );
 
     // Cancel of already-terminal run fails closed (no silent success).
     let cancel_term = client
@@ -1215,6 +1233,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
                 max_prompt_bytes: 10_000,
                 max_rounds: 6,
                 max_duration_ms: 30_000,
+                max_total_tokens: None,
             },
             prompt_preview: "previous attempt".into(),
             start_seq: Some(1),
@@ -1224,6 +1243,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
             terminal_result: Some("interrupted".into()),
             final_response: None,
             error_code: Some("interrupted".into()),
+            stop_cause: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,

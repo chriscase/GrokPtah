@@ -19,6 +19,29 @@ prompt preview, execution limits, journal sequence range, progress, changed
 file summaries, recognized test observations, permission counts, token usage,
 verification evidence, a bounded final response, and the terminal reason.
 
+`RunBounds.maxTotalTokens` is an additive, optional contract field. When it is
+omitted, model-token consumption remains unbounded as in older releases. When
+it is present, the server value is a ceiling and callers may only narrow it.
+GrokPtah records provider usage after every completed model response and stops
+before another parent or child model request once the cumulative total meets
+or exceeds the ceiling. The response that crosses the threshold is allowed to
+finish, and any tool batch it already returned is completed; there is no
+mid-stream or half-tool-batch interruption.
+
+Before transmission, each attributable provider attempt is durably marked as
+pending. Bounded Runs admit only one parent/child provider request at a time
+and disable ambiguous transient retries; protocol-compatibility retries are
+limited to rejected requests. A crash with an unresolved attempt makes usage
+incomplete during recovery, so consumed work can never silently reset to zero.
+
+Run reads expose both `aggregates.usage` and `aggregates.usageComplete`. The
+latter is false when any attributable provider response omitted or malformed
+its usage metadata. An unbounded run remains usable in that case but reports
+partial accounting. A bounded run fails closed as `limit_reached` with typed
+`stopCause: token_accounting_unavailable`; a measured threshold stop uses
+`stopCause: token_ceiling`. These causes are host decisions persisted on the
+run and are never inferred from model-authored prose.
+
 Build turns create a run before model work begins. Typed bridge events are
 aggregated while the turn runs and reconciled from the journal at finalization.
 The store atomically installs terminal records and marks queued or running
@@ -69,3 +92,8 @@ does not need a second event stream or a separate coordinator dashboard.
   unrestricted terminal output.
 - The existing journal, audit, idempotency, workspace allowlist, and MCP tool
   restrictions remain authoritative.
+- Provider qualification and Computer Use proposal probes are not Build-run
+  work and therefore are not charged to a Run ceiling. Model calls made by a
+  Build parent and its spawned general-purpose children share the parent Run
+  ledger. Outstanding children are cancelled and settled before a bounded Run
+  is finalized so they cannot continue spending afterward.
