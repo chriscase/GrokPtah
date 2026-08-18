@@ -306,6 +306,13 @@ export interface DurableRun {
   retryOf?: string | null;
   /** Verified continuation source, distinct from explicit retry replacement. */
   parentRunId?: string | null;
+  /** Immutable Agent specification revision frozen for this finite Run. */
+  agentSpecRevision?: number | null;
+  /** Verified checkpoint used for an explicit continuation. */
+  checkpointId?: string | null;
+  continuationContextId?: string | null;
+  continuationContextHash?: string | null;
+  continuationFidelity?: "complete" | "degraded" | null;
   /** One-based position while waiting in the bounded MCP admission queue. */
   queuePosition?: number | null;
   bounds: {

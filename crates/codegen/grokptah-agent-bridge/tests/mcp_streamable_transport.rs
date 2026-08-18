@@ -1228,6 +1228,11 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
             queue_position: None,
             bounds: RunBounds {
                 max_prompt_bytes: 10_000,

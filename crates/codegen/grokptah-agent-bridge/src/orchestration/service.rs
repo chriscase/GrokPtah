@@ -2639,6 +2639,10 @@ impl OrchestrationService {
             }
         }
         let start_seq = (!queued).then(|| self.bus.next_seq());
+        let agent_spec_revision = agent
+            .current_spec()
+            .map_err(|error| self.fail_claim(&mut lease, None, session_id, &claimed, error))?
+            .revision;
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -2656,6 +2660,11 @@ impl OrchestrationService {
             agent_id: Some(agent.agent_id),
             retry_of: retry_of.map(str::to_string),
             parent_run_id: None,
+            agent_spec_revision: Some(agent_spec_revision),
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
             queue_position: None,
             bounds: bounds.clone(),
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),
