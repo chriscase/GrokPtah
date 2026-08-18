@@ -172,7 +172,7 @@ async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
 #[tokio::test]
 async fn production_provider_path_rejects_a_fixture_without_its_terminal_marker() {
     let (fixture, response) = load_fixture();
-    let terminal = format!("data: {}\n\n", fixture.expected.terminal_marker);
+    let terminal = format!("data: {}\n", fixture.expected.terminal_marker);
     let truncated = response
         .strip_suffix(terminal.as_bytes())
         .expect("fixture terminal marker must be the final SSE event");
