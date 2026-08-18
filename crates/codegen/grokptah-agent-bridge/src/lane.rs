@@ -16,18 +16,13 @@ use crate::RunExecutionMode;
 /// The first projection is local-desktop because that is the current owner of
 /// persisted sessions. Service-owned lanes can be introduced without changing
 /// the Lane identity or the desktop's active-context contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeTarget {
+    #[default]
     LocalDesktop,
     LocalService,
     HostedService,
-}
-
-impl Default for RuntimeTarget {
-    fn default() -> Self {
-        Self::LocalDesktop
-    }
 }
 
 /// Connection state for the runtime that owns a Lane.
@@ -35,19 +30,14 @@ impl Default for RuntimeTarget {
 /// This is deliberately separate from `RuntimeTarget`: a hosted Lane can be
 /// disconnected without changing ownership, and a reconnecting client must
 /// not present that Lane as local work merely because the transport is down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeConnectionState {
+    #[default]
     Connected,
     Reconnecting,
     Disconnected,
     Error,
-}
-
-impl Default for RuntimeConnectionState {
-    fn default() -> Self {
-        Self::Connected
-    }
 }
 
 /// Stable user-facing work context, initially backed 1:1 by a Session.
