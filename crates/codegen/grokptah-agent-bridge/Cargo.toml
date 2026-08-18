@@ -45,5 +45,6 @@ libc = "0.2"
 cc = "1"
 
 [dev-dependencies]
+grokptah-test-gateway = { path = "test-support/grokptah-test-gateway" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "test-util"] }
 tempfile = "3"

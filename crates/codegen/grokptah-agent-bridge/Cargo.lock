@@ -488,6 +488,7 @@ dependencies = [
  "dunce",
  "fs2",
  "futures",
+ "grokptah-test-gateway",
  "http-body-util",
  "keyring",
  "libc",
@@ -505,6 +506,16 @@ dependencies = [
  "tower",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "grokptah-test-gateway"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

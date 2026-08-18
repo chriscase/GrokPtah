@@ -1,0 +1,6 @@
+data: {"id":"fixture-response","choices":[{"index":0,"delta":{"content":"PTAH_FIXTURE_OK"}}]}
+
+data: {"id":"fixture-response","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}
+
+data: [DONE]
+

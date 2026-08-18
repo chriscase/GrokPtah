@@ -1,0 +1,15 @@
+{
+  "schema": "grokptah.provider_contract_fixture.v1",
+  "scenarioId": "sse-stream-001",
+  "providerRouteClass": "grok_build_proxy",
+  "dialect": "xai_chat_completions",
+  "synthetic": true,
+  "responseArtifact": "response.sse",
+  "expected": {
+    "contentMarker": "PTAH_FIXTURE_OK",
+    "promptTokens": 7,
+    "completionTokens": 3,
+    "totalTokens": 10,
+    "terminalMarker": "[DONE]"
+  }
+}

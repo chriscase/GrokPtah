@@ -30,11 +30,18 @@ impl fmt::Debug for RecordedRequest {
         formatter
             .debug_struct("RecordedRequest")
             .field("method", &self.method)
-            .field("path", &self.path)
+            .field("path", &redacted_path(&self.path))
             .field("headers", &redacted_headers(&self.headers))
             .field("body_len", &self.body.len())
             .field("seq", &self.seq)
             .finish()
+    }
+}
+
+fn redacted_path(path: &str) -> std::borrow::Cow<'_, str> {
+    match path.split_once('?') {
+        Some((base, _)) => format!("{base}?<redacted>").into(),
+        None => path.into(),
     }
 }
 
@@ -145,5 +152,17 @@ mod tests {
         assert!(!rendered.contains("body-secret"));
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("body_len"));
+    }
+
+    #[test]
+    fn debug_redacts_query_values() {
+        let request = RecordedRequest {
+            method: "GET".into(),
+            path: "/v1/models?token=must-not-print".into(),
+            ..RecordedRequest::default()
+        };
+        let rendered = format!("{request:?}");
+        assert!(rendered.contains("/v1/models?<redacted>"));
+        assert!(!rendered.contains("must-not-print"));
     }
 }
