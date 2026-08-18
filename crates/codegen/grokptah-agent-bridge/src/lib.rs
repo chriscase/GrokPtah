@@ -79,10 +79,7 @@ pub use host_helpers::{
     is_edit_or_shell_tool, is_post_cargo_explore_only_burn, should_skip_tool_after_cargo_failure,
 };
 
-pub use memory::{
-    inject_context as memory_inject_context, list_facts as memory_list_facts,
-    remember as memory_remember,
-};
+pub use memory::{MemoryFact, MemoryScope};
 
 pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,

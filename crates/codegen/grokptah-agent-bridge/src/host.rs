@@ -39,6 +39,7 @@ use crate::host_helpers::{
 };
 use crate::lane::LaneSummary;
 use crate::local_tools;
+use crate::memory::{MemoryAccess, MemoryAddress, MemoryScope};
 use crate::orchestration::{
     apply_run_aggregate, prompt_preview, AgentRecord, AgentResumePlan, AgentState,
     ContinuationCheckpoint, ContinuationReason, OrchStore, PromotionState, RunAggregates,
@@ -2750,7 +2751,7 @@ impl AgentHostHandle {
         self.ensure_session_accepts_new_work(id)?;
         self.ensure_transcript_loaded(id)?;
         const KEEP_RECENT: usize = 6;
-        let (summary, cwd, leaving_for_memory) = {
+        let (summary, leaving_for_memory) = {
             let mut g = self.inner.lock();
             let s = g
                 .sessions
@@ -2786,8 +2787,11 @@ impl AgentHostHandle {
                 }
             }
             s.updated_at = Utc::now();
-            (s.summary(), s.cwd.clone(), leaving_texts)
+            (s.summary(), leaving_texts)
         };
+        let project_memory = self
+            .memory_access_for_session(id)
+            .map(|access| access.project());
         // Best-effort memory flush of key decisions from compacted window.
         for t in leaving_for_memory.iter().take(12) {
             let lower = t.to_ascii_lowercase();
@@ -2797,7 +2801,9 @@ impl AgentHostHandle {
                 || lower.contains("prefer ")
             {
                 let clip: String = t.chars().take(400).collect();
-                let _ = crate::memory::remember(&cwd, &clip, &["compact-flush".into()]);
+                if let Ok(address) = &project_memory {
+                    let _ = crate::memory::remember(address, &clip, &["compact-flush".into()]);
+                }
             }
         }
         self.persist_session(id);
@@ -2912,6 +2918,7 @@ impl AgentHostHandle {
     /// offline paths can still assert wire context quality after `/compact`.
     pub fn wire_messages_preview(&self, id: Uuid) -> Result<Vec<serde_json::Value>> {
         self.ensure_transcript_loaded(id)?;
+        let memory_access = self.memory_access_for_session(id)?;
         let g = self.inner.lock();
         let s = g
             .sessions
@@ -2932,6 +2939,7 @@ impl AgentHostHandle {
             &history,
             s.compacted_summary.as_deref(),
             &s.cwd,
+            Some(&memory_access),
             plan,
         ))
     }
@@ -2970,24 +2978,74 @@ impl AgentHostHandle {
         self.inner.lock().edited_files.last().cloned()
     }
 
-    pub fn memory_list(&self) -> Result<Vec<crate::memory::MemoryFact>> {
-        let cwd = self
-            .inner
-            .lock()
-            .project_cwd
-            .clone()
-            .ok_or_else(|| anyhow!("no project open"))?;
-        Ok(crate::memory::list_facts(&cwd))
+    /// Resolve memory from the session's durable source workspace. Execution
+    /// worktrees and focused desktop chrome are intentionally not consulted.
+    fn memory_access_for_session(&self, session_id: Uuid) -> Result<MemoryAccess> {
+        let session = {
+            let g = self.inner.lock();
+            g.sessions
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown session"))?
+        };
+        let actor_agent_id = match session.agent_id.as_deref() {
+            None => None,
+            Some(agent_id) => {
+                let agent = self
+                    .ensure_orchestration_store()?
+                    .load_agent(agent_id)?
+                    .ok_or_else(|| {
+                        anyhow!("session Agent binding has no durable Agent record: {agent_id}")
+                    })?;
+                if !agent.known_lane_ids().contains(&session_id) {
+                    bail!(
+                        "session Agent binding mismatch: Lane {session_id} is not owned by {agent_id}"
+                    );
+                }
+                Some(agent.agent_id)
+            }
+        };
+        Ok(MemoryAccess::new(&session.cwd, actor_agent_id))
     }
 
-    pub fn memory_remember(&self, text: &str) -> Result<String> {
-        let cwd = self
-            .inner
-            .lock()
-            .project_cwd
-            .clone()
-            .ok_or_else(|| anyhow!("no project open"))?;
-        crate::memory::remember(&cwd, text, &[]).map_err(|e| anyhow!(e))
+    fn memory_address_for_session(
+        &self,
+        session_id: Uuid,
+        scope: MemoryScope,
+    ) -> Result<MemoryAddress> {
+        self.memory_access_for_session(session_id)?.resolve(scope)
+    }
+
+    fn memory_address_from_args(
+        &self,
+        session_id: Uuid,
+        args: &serde_json::Value,
+    ) -> Result<MemoryAddress> {
+        let scope = args
+            .get("scope")
+            .ok_or_else(|| anyhow!("memory tool requires an explicit scope"))?;
+        let scope: MemoryScope = serde_json::from_value(scope.clone())
+            .context("memory tool scope descriptor is invalid")?;
+        self.memory_address_for_session(session_id, scope)
+    }
+
+    pub fn memory_list(
+        &self,
+        session_id: Uuid,
+        scope: MemoryScope,
+    ) -> Result<Vec<crate::memory::MemoryFact>> {
+        let address = self.memory_address_for_session(session_id, scope)?;
+        crate::memory::list_facts(&address)
+    }
+
+    pub fn memory_remember(
+        &self,
+        session_id: Uuid,
+        scope: MemoryScope,
+        text: &str,
+    ) -> Result<String> {
+        let address = self.memory_address_for_session(session_id, scope)?;
+        crate::memory::remember(&address, text, &[]).map_err(|error| anyhow!(error))
     }
 
     pub fn set_model(&self, model: String) {
@@ -6420,7 +6478,11 @@ impl AgentHostHandle {
                     session_id,
                     cwd,
                     "memory_write",
-                    &serde_json::json!({ "text": rest.trim() }).to_string(),
+                    &serde_json::json!({
+                        "text": rest.trim(),
+                        "scope": { "kind": "project" }
+                    })
+                    .to_string(),
                     cancel,
                     event_tx,
                     &Default::default(),
@@ -6433,7 +6495,11 @@ impl AgentHostHandle {
                     session_id,
                     cwd,
                     "memory_read",
-                    &serde_json::json!({ "query": rest.trim() }).to_string(),
+                    &serde_json::json!({
+                        "query": rest.trim(),
+                        "scope": { "kind": "project" }
+                    })
+                    .to_string(),
                     cancel,
                     event_tx,
                     &Default::default(),
@@ -6567,8 +6633,14 @@ impl AgentHostHandle {
         let plan_ref = active_plan
             .as_ref()
             .map(|(g, steps)| (g.as_str(), steps.as_slice()));
-        let mut messages =
-            build_agent_messages(history, compacted_summary.as_deref(), cwd, plan_ref);
+        let memory_access = self.memory_access_for_session(session_id)?;
+        let mut messages = build_agent_messages(
+            history,
+            compacted_summary.as_deref(),
+            cwd,
+            Some(&memory_access),
+            plan_ref,
+        );
 
         // Best-effort MCP discovery (skipped when offline env set for tests).
         let mcp_specs = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some()
@@ -7567,32 +7639,27 @@ impl AgentHostHandle {
                             .collect()
                     })
                     .unwrap_or_default();
-                let id = crate::memory::remember(cwd, &text, &tags).map_err(|e| anyhow!(e))?;
-                let out = format!("Remembered fact {id}: {text}");
-                let call_id = Uuid::new_v4().to_string();
-                let _ = event_tx.send(SessionUpdate::ToolCall {
+                let address = self.memory_address_from_args(session_id, &args)?;
+                self.run_tool_for_output(
                     session_id,
-                    call_id: call_id.clone(),
-                    title: "memory_write".into(),
-                    kind: ToolCallKind::Other,
-                    status: ToolCallStatus::Completed,
-                    input: args.clone(),
-                });
-                let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
-                    session_id,
-                    call_id: call_id.clone(),
-                    status: ToolCallStatus::Completed,
-                    output: Some(out.clone()),
-                });
-                push_tool(
-                    self,
-                    session_id,
-                    &call_id,
                     "memory_write",
-                    ToolCallStatus::Completed,
-                    Some(out.clone()),
-                );
-                Ok(out)
+                    &args,
+                    || async move {
+                        let id = crate::memory::remember(&address, &text, &tags)?;
+                        let out = format!("Remembered fact {id}: {text}");
+                        Ok(local_tools::ToolResult::basic(
+                            "memory_write".into(),
+                            ToolCallKind::Edit,
+                            serde_json::json!({}),
+                            out,
+                            true,
+                            "Allow durable memory mutation?".into(),
+                        ))
+                    },
+                    cancel,
+                    event_tx,
+                )
+                .await
             }
             "kill_task" | "cancel_task" => {
                 let id = args
@@ -7672,9 +7739,10 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let facts = crate::memory::search(cwd, &query);
+                let address = self.memory_address_from_args(session_id, &args)?;
+                let facts = crate::memory::search(&address, &query)?;
                 let out = if facts.is_empty() {
-                    "(no matching project memory)".into()
+                    format!("(no matching {} memory)", address.scope().label())
                 } else {
                     facts
                         .iter()
@@ -8195,16 +8263,7 @@ impl AgentHostHandle {
                         // #161 capability modes: plan is non-mutating (explore is separate path).
                         let out = if tc.name.starts_with("spawn_") {
                             format!("DENIED: nested {} not allowed inside subagent", tc.name)
-                        } else if kind == "plan"
-                            && matches!(
-                                tc.name.as_str(),
-                                "write_file"
-                                    | "write_files"
-                                    | "apply_patch"
-                                    | "run_terminal_cmd"
-                                    | "memory_write"
-                            )
-                        {
+                        } else if kind == "plan" && plan_subagent_denies_tool(&tc.name) {
                             format!(
                                 "DENIED by capability mode `plan`: tool `{}` is not allowed. \
                                  Plan agents may only research (list/read/grep/glob) and produce a plan.",
@@ -8410,8 +8469,10 @@ impl AgentHostHandle {
         }
 
         // Tool safety profile: deny writes in read-only for shared tool path.
-        if matches!(tool_name, "write_file" | "write_files" | "apply_patch")
-            && sandbox_is_readonly(&self.inner.lock().sandbox_profile)
+        if matches!(
+            tool_name,
+            "write_file" | "write_files" | "apply_patch" | "memory_write"
+        ) && sandbox_is_readonly(&self.inner.lock().sandbox_profile)
         {
             return Ok(format!(
                 "ERROR: tool safety profile is read-only; {tool_name} denied"
@@ -8419,8 +8480,16 @@ impl AgentHostHandle {
         }
 
         // PreToolUse hooks can deny before permission UI / execution.
-        let project = self.inner.lock().project_cwd.clone();
-        if let Some(msg) = crate::hooks::pre_tool_use_deny(project.as_deref(), tool_name, input) {
+        let session_workspace = {
+            let g = self.inner.lock();
+            g.sessions
+                .get(&session_id)
+                .map(|session| session.cwd.clone())
+                .ok_or_else(|| anyhow!("unknown session"))?
+        };
+        if let Some(msg) =
+            crate::hooks::pre_tool_use_deny(Some(&session_workspace), tool_name, input)
+        {
             let call_id = Uuid::new_v4().to_string();
             let _ = event_tx.send(SessionUpdate::ToolCall {
                 session_id,
@@ -8443,7 +8512,7 @@ impl AgentHostHandle {
         let call_id = Uuid::new_v4().to_string();
         let needs_perm = matches!(
             tool_name,
-            "run_terminal_cmd" | "write_file" | "write_files" | "apply_patch"
+            "run_terminal_cmd" | "write_file" | "write_files" | "apply_patch" | "memory_write"
         );
         let gate = self.tool_gate(tool_name);
         if gate == ToolGate::AutoDeny {
@@ -8521,8 +8590,12 @@ impl AgentHostHandle {
                     ToolCallStatus::Completed
                 };
                 let status_s = if tr.cancelled { "failed" } else { "completed" };
-                let _ =
-                    crate::hooks::post_tool_use_note(project.as_deref(), tool_name, status_s, &out);
+                let _ = crate::hooks::post_tool_use_note(
+                    Some(&session_workspace),
+                    tool_name,
+                    status_s,
+                    &out,
+                );
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
                     call_id: call_id.clone(),
@@ -8541,8 +8614,12 @@ impl AgentHostHandle {
             }
             Err(e) => {
                 let msg = e.to_string();
-                let _ =
-                    crate::hooks::post_tool_use_note(project.as_deref(), tool_name, "failed", &msg);
+                let _ = crate::hooks::post_tool_use_note(
+                    Some(&session_workspace),
+                    tool_name,
+                    "failed",
+                    &msg,
+                );
                 let _ = event_tx.send(SessionUpdate::ToolCallUpdate {
                     session_id,
                     call_id: call_id.clone(),
@@ -9152,9 +9229,22 @@ fn effective_subagent_isolation(
     }
 }
 
+fn plan_subagent_denies_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "write_file" | "write_files" | "apply_patch" | "run_terminal_cmd" | "memory_write"
+    )
+}
+
 #[cfg(test)]
 mod computer_agent_host_tests {
     use super::*;
+
+    #[test]
+    fn plan_subagent_cannot_mutate_durable_memory() {
+        assert!(plan_subagent_denies_tool("memory_write"));
+        assert!(!plan_subagent_denies_tool("memory_read"));
+    }
 
     #[test]
     fn ephemeral_computer_authority_is_session_scoped_and_model_changes_revoke_it() {
@@ -9278,6 +9368,36 @@ mod tests {
             }
             other => panic!("unexpected queue recovery event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn memory_authorization_fails_closed_on_forged_session_agent_binding() {
+        let (_home, host, first_lane_id) = test_host();
+        let second_lane = host.session_new_kind(SessionKind::Build).unwrap();
+        let first_agent = host.ensure_session_agent(first_lane_id).unwrap();
+        let second_agent = host.ensure_session_agent(second_lane.id).unwrap();
+        assert_ne!(first_agent.agent_id, second_agent.agent_id);
+
+        host.inner
+            .lock()
+            .sessions
+            .get_mut(&first_lane_id)
+            .unwrap()
+            .agent_id = Some(second_agent.agent_id);
+
+        let error = host
+            .memory_list(
+                first_lane_id,
+                MemoryScope::AgentPrivate {
+                    agent_id: first_agent.agent_id,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("binding mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
