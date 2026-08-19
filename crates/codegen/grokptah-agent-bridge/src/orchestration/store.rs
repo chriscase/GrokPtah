@@ -12,7 +12,9 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-use super::managed::{ManagedExecutionIntent, ManagedIntentState};
+use super::managed::{
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedIntentState, ManagedRetryCause,
+};
 use super::message::{MessagePage, WorkMessage, MAX_RETAINED_MESSAGES};
 use super::routine::{
     advance_next_fire, decide_lifecycle_skip, due_occurrences, in_flight_count,
@@ -2532,6 +2534,282 @@ impl OrchStore {
         intent.updated_at = now;
         self.save_managed_intent_unlocked(&intent)?;
         Ok(Some(intent))
+    }
+
+    pub fn find_run_by_request_id(&self, request_id: &str) -> Result<Option<RunRecord>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.find_run_by_request_id_unlocked(request_id)
+    }
+
+    fn find_run_by_request_id_unlocked(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<RunRecord>, OrchError> {
+        let dir = self.inner.root.join("runs");
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let run: RunRecord = serde_json::from_str(
+                &fs::read_to_string(path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            if run.request_id == request_id {
+                return Ok(Some(run));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Recover a Claiming intent without creating a second Run.
+    ///
+    /// If `submit_task` already committed a Run for `intent_id` as request_id,
+    /// that Run is adopted. Only a claim with no Run is released.
+    pub fn reconcile_claiming_intent(
+        &self,
+        intent_id: &str,
+        lease_secret: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(mut intent) = self.load_managed_intent_unlocked(intent_id)? else {
+            return Ok(None);
+        };
+        if intent.state != ManagedIntentState::Claiming {
+            return Ok(Some(intent));
+        }
+        let run = if let Some(run_id) = intent.run_id.as_deref() {
+            self.load_run_unlocked(run_id)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        } else {
+            let from_receipt = self
+                .load_idempotency(&intent.intent_id)
+                .ok()
+                .flatten()
+                .and_then(|receipt| receipt.run_id);
+            match from_receipt {
+                Some(run_id) => self
+                    .load_run_unlocked(&run_id)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+                None => self.find_run_by_request_id_unlocked(&intent.intent_id)?,
+            }
+        };
+        if let Some(run) = run {
+            intent.run_id = Some(run.run_id.clone());
+            if let Some(attempt_id) = intent.attempt_id.clone() {
+                if let Ok(Some(attempt)) = self.load_work_attempt_unlocked(&attempt_id) {
+                    let token = attempt.lease_token_for_secret(lease_secret);
+                    if attempt.token_matches(&token) && attempt.lease_active_at(now) {
+                        let mut linked = attempt;
+                        if !linked.linked_run_ids.iter().any(|id| id == &run.run_id) {
+                            linked.linked_run_ids.push(run.run_id.clone());
+                        }
+                        if linked.state == AttemptState::Leased {
+                            linked.state = AttemptState::Running;
+                        }
+                        linked.updated_at = now;
+                        let _ = self.save_work_attempt_unlocked(&linked);
+                    }
+                }
+            }
+            intent.state = ManagedIntentState::Admitted;
+            intent.updated_at = now;
+            self.save_managed_intent_unlocked(&intent)?;
+            return Ok(Some(intent));
+        }
+        if intent.attempt_id.is_some() {
+            drop(_guard);
+            return self.abandon_managed_intent(intent_id, now);
+        }
+        intent.state = ManagedIntentState::Abandoned;
+        intent.updated_at = now;
+        self.save_managed_intent_unlocked(&intent)?;
+        Ok(Some(intent))
+    }
+
+    pub fn close_managed_attempt(
+        &self,
+        intent_id: &str,
+        retry_eligible: bool,
+        cause: ManagedRetryCause,
+        reason: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(mut intent) = self.load_managed_intent_unlocked(intent_id)? else {
+            return Ok(None);
+        };
+        if intent.state == ManagedIntentState::Finalized
+            || intent.state == ManagedIntentState::Abandoned
+        {
+            return Ok(Some(intent));
+        }
+        let mut item = self
+            .load_work_item_unlocked(&intent.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        if let Some(attempt_id) = intent.attempt_id.as_deref() {
+            if let Ok(Some(mut attempt)) = self.load_work_attempt_unlocked(attempt_id) {
+                if attempt.state.is_active() {
+                    attempt.state = match cause {
+                        ManagedRetryCause::Expired | ManagedRetryCause::Interrupted => {
+                            AttemptState::Expired
+                        }
+                        ManagedRetryCause::Failed => AttemptState::Failed,
+                    };
+                    attempt.terminal_reason = Some(reason.to_string());
+                    attempt.updated_at = now;
+                    self.save_work_attempt_unlocked(&attempt).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })?;
+                    let next_attempt = attempt.attempt_number.saturating_add(1);
+                    let policy = ManagedExecutionPolicy {
+                        retry_eligible,
+                        ..ManagedExecutionPolicy::default()
+                    };
+                    let retry = policy.allows_auto_retry(&item, next_attempt, cause);
+                    if !item.state.is_terminal() {
+                        if retry {
+                            item.state = WorkState::Queued;
+                            item.blocked_reason = None;
+                        } else {
+                            item.state = WorkState::Failed;
+                            item.result = Some(Self::work_failure_result(reason, now));
+                        }
+                        item.bump_at(now);
+                        self.save_work_item_unlocked(&item).map_err(|error| {
+                            OrchError::new(OrchErrorCode::Internal, error.to_string())
+                        })?;
+                    }
+                } else if item.state == WorkState::Queued && !retry_eligible {
+                    item.state = WorkState::Failed;
+                    item.result = Some(Self::work_failure_result(reason, now));
+                    item.bump_at(now);
+                    self.save_work_item_unlocked(&item).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })?;
+                }
+            }
+        }
+        intent.state = ManagedIntentState::Finalized;
+        intent.updated_at = now;
+        self.save_managed_intent_unlocked(&intent)?;
+        Ok(Some(intent))
+    }
+
+    pub fn seal_queued_managed_work(
+        &self,
+        work_id: &str,
+        reason: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<WorkItem>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(mut item) = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if item.state.is_terminal() {
+            return Ok(Some(item));
+        }
+        if item.state != WorkState::Queued {
+            return Ok(Some(item));
+        }
+        item.state = WorkState::Failed;
+        item.result = Some(Self::work_failure_result(reason, now));
+        item.bump_at(now);
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(Some(item))
+    }
+
+    pub fn resolve_parked_managed_permission(
+        &self,
+        permission_id: &str,
+        session_id: Uuid,
+        workspace: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<ManagedExecutionIntent, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let intents = self.list_managed_intents_unlocked()?;
+        let Some(mut intent) = intents
+            .into_iter()
+            .find(|intent| intent.permission_request_id.as_deref() == Some(permission_id))
+        else {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "unknown permission request",
+            ));
+        };
+        if intent.session_id != session_id || !workspaces_match(&intent.workspace, workspace) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "permission is outside the requested session workspace",
+            ));
+        }
+        if intent.state != ManagedIntentState::Parked {
+            let message = if intent.permission_request_id.as_deref() == Some(permission_id) {
+                "permission is already resolved"
+            } else {
+                "permission is not parked"
+            };
+            return Err(OrchError::new(OrchErrorCode::Conflict, message));
+        }
+        let mut item = self
+            .load_work_item_unlocked(&intent.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        if item.state.is_terminal() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work is no longer awaiting input",
+            ));
+        }
+        if item.state != WorkState::AwaitingInput {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work is not awaiting input",
+            ));
+        }
+        let attempt_id = intent.attempt_id.clone().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "parked intent is missing an attempt",
+            )
+        })?;
+        let mut attempt = self
+            .load_work_attempt_unlocked(&attempt_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work attempt not found"))?;
+        if !attempt.state.is_active() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work attempt is no longer active",
+            ));
+        }
+        item.state = WorkState::Running;
+        item.blocked_reason = None;
+        item.bump_at(now);
+        attempt.state = AttemptState::Running;
+        attempt.updated_at = now;
+        intent.state = ManagedIntentState::Admitted;
+        intent.updated_at = now;
+        self.save_work_attempt_unlocked(&attempt)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.save_managed_intent_unlocked(&intent)?;
+        Ok(intent)
     }
 
     /// Manually reopen a terminal failed Work Item when its declared retry

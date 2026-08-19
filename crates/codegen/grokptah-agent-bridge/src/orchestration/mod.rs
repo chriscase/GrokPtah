@@ -27,8 +27,10 @@ pub use continuation::{
 };
 pub use managed::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
-    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedIntentState, ManagedWorkMode,
+    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionIntent,
+    ManagedExecutionPolicy, ManagedIntentState, ManagedRetryCause, ManagedWorkMode,
     NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
+    MANAGED_TRUNCATION_MARKER,
 };
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,

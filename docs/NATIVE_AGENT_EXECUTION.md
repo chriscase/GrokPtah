@@ -27,7 +27,26 @@ Defaults:
 keeps the item manual-only even when the Agent is enabled.
 
 Authority may only narrow. Computer Use and `bypassPermissions` Agents are
-rejected. The supervisor never sets global auto-approve.
+rejected. Enabling managed execution clears `bypassPermissions` on the spec.
+The supervisor never sets global auto-approve and never grants Computer Use.
+
+### `retryEligible`
+
+This flag is independent of Work retry policy and is enforced on every native
+admission and recovery path.
+
+- `false` (default): native managed execution must not automatically admit
+  attempt 2 or later. Failure, lease expiry, interruption, and process restart
+  close the current intent and leave Work in an inspectable terminal `failed`
+  state unless Work is already cancelled or succeeded.
+- `true`: the native executor may admit a **new** attempt and a **new** finite
+  Run only when Work retry policy still has budget for that cause
+  (`retryFailed` for failed/limit, `retryExpired` for interrupted/expired) and
+  `attempt_count < maxAttempts`.
+
+`ManagedExecutionPolicy.allows_auto_retry` is the single predicate. Manual
+`ptah_retry_work` can re-queue a failed item; native admission of that next
+attempt still requires `retryEligible`.
 
 ## Dispatcher ownership
 
@@ -53,8 +72,66 @@ A `ManagedExecutionIntent` binds, under the store lock:
 - source Routine/Activation when present
 - model route, intersected bounds, and input hash
 
-There is never more than one live Run for one Work attempt. Duplicate
-supervisor ticks and request-id replays return the committed relationship.
+There is never more than one live Run for one Work item. Duplicate supervisor
+ticks and request-id replays return the committed relationship. The native
+submit uses `intent_id` as `request_id` (`ptah_native_execute`) so an orphan
+Run can be rediscovered from the durable idempotency receipt or by scanning
+runs for that request ID.
+
+## Intent state machine
+
+| State | Meaning |
+| --- | --- |
+| `claiming` | Durable intent exists; claim and/or Run admission may still be in flight |
+| `admitted` | A finite Run is linked; the executor heartbeats the lease |
+| `parked` | Run asked for permission; Work and attempt are `awaiting_input` |
+| `finalized` | Terminal for this intent; does not consume concurrency |
+| `abandoned` | Admission did not commit a Run; any claim was released |
+
+Live concurrency counts only `claiming`, `admitted`, and `parked`.
+
+### Admission sequence
+
+1. Write intent `claiming` (no attempt, no Run)
+2. Claim Work (attempt + lease)
+3. Persist `attemptId` on the intent
+4. `submit_task` with `request_id = intent_id`
+5. `link_work_run`
+6. Persist `runId` and `admitted`
+
+### Claiming recovery (atomic admission)
+
+Recovery of a `claiming` intent **first** discovers any Run already created
+for that intent/request ID (`intent.runId`, then the idempotency receipt, then
+`find_run_by_request_id`). It never blindly releases a Work claim when a Run
+already exists.
+
+| Crash window | Recovery |
+| --- | --- |
+| Intent written, before Work claim | Abandon intent. Work stays `queued`. No Run. |
+| Work claimed, before submit | Abandon intent and release the attempt. Work returns to `queued`. |
+| Submit committed, before WorkAttempt link | Adopt the Run, link the attempt, mark `admitted`. |
+| WorkAttempt linked, before intent `runId`/`admitted` | Adopt the same Run (link is idempotent), mark `admitted`. |
+
+If `submit_task` returns an error after the Run was persisted, the supervisor
+reconciles instead of releasing. A later tick therefore sees at most one live
+Run and one valid Work-attempt relationship.
+
+### Interrupted-Run recovery
+
+An `admitted` or `parked` intent whose Run is `interrupted` is never left
+live. The executor:
+
+1. Does **not** resume the interrupted model invocation
+2. Closes the old intent (`finalized`) and the Work attempt (`expired`)
+3. Applies **both** `retryEligible` and Work retry (`retryExpired`)
+4. Creates a new attempt and finite Run only when both permit
+5. Otherwise leaves Work `failed` with an inspectable result
+
+The same close path is used for failed/limit Runs (`retryFailed`) and for
+restart (`OrchStore::open` marks unfinished Runs `interrupted`, then the
+native tick runs the transition above). Capacity cannot leak: a finalized
+intent no longer counts toward `maxConcurrentRuns`.
 
 ## Finite invocation and checkpoints
 
@@ -64,9 +141,31 @@ resumed. A verified checkpoint may be included as bounded context, but the
 Run is still a new invocation.
 
 Input is assembled only from durable sources: Work objective and policy,
-AgentSpec revision, parent Work, bounded messages, and routine/activation
-metadata. The focused Lane transcript, desktop model picker, and inbox
-polling are not inputs.
+AgentSpec revision, parent Work, **relevant** messages, and
+routine/activation metadata. The focused Lane transcript, desktop model
+picker, and inbox polling are not inputs.
+
+### Prompt bounds
+
+`assemble_managed_run_input` receives the **intersected** `RunBounds`
+(server ceiling ∩ Agent default ∩ managed policy ∩ Work policy). The
+assembled prompt is valid UTF-8 whose complete byte length, including the
+truncation marker, is at or below `min(effective.maxPromptBytes,
+MAX_MANAGED_CONTEXT_BYTES)` and never panics on a multi-byte boundary.
+Very small limits omit the marker when it cannot fit and truncate the
+source at a character boundary instead of panicking.
+
+### Message context
+
+The executor does **not** inject the first 16 messages from the entire Lane.
+It lists a bounded page and then `select_relevant_managed_messages`:
+
+- keep messages whose `workId` is this Work
+- keep messages with no `workId` that are from or to the assigned Agent
+- drop unrelated Work and other-Agent traffic
+- drop expired questions
+- collapse duplicate same-thread / same-kind / same-body material
+- keep the newest matching records, then emit them in deterministic `seq` order
 
 ## State mapping
 
@@ -75,30 +174,44 @@ polling are not inputs.
 | queued / running | leased / running |
 | progress event | Work progress |
 | completed | succeeded, or awaiting approval |
-| failed / limit | failed or retryable per policy |
+| failed / limit | failed, or queued for a new attempt when both retry policies allow |
 | permission/input | awaiting input + durable question |
 | cancelled | Work cancelled; late writes fail |
-| interrupted | no auto-resume; lease expiry/retry |
+| interrupted | intent finalized; Work failed or re-queued per both retry policies; no auto-resume |
 
 ## Restart and retry
 
 Crash recovery:
 
-- intent with no Run → abandon the incomplete claim; Work is queued again
+- `claiming` with no Run → abandon; Work is queued again
+- `claiming` with a Run already committed for `intent_id` → adopt that Run
 - admitted Run still live → heartbeat the existing lease
-- interrupted Run → do not resume; Work retry policy decides the next attempt
-- terminal Run → complete/fail/cancel the Work attempt
+- interrupted Run → close intent/attempt; never resume; both retry policies
+  decide whether a **new** attempt is eligible
+- terminal Run → complete/fail/cancel the Work attempt and finalize the intent
 
 Late completion after lease expiry is rejected. Retry creates a new attempt
-and a new Run only when policy allows.
+and a new Run only when policy allows. Native admission never loops a
+forbidden retry: queued Work with `attempt_count >= 1` and
+`retryEligible = false` is sealed `failed`.
 
 ## Approval and input
 
 - `requiresApproval` on Work still pauses completion for `ptah_approve_work`
 - `requiresApprovalBeforeExecution` requires `ptah_authorize_work_execution`
 - Permission requests park Work as `awaiting_input` and emit a question
-  message. They are never auto-approved. `ptah_resolve_work_input` forwards
-  the operator decision to the existing host permission oneshot.
+  message. They are never auto-approved.
+
+`ptah_resolve_work_input` locates the parked managed intent for the
+permission ID **before** calling `permission_respond`. It requires exact
+session and workspace match. Unknown, cross-session, cross-workspace,
+non-parked, stale, already-resolved, and unauthorized requests are rejected
+without mutating the host permission or durable Work/intent state.
+
+A successful resolve (allow or deny) updates WorkItem and WorkAttempt
+together back to `running` and marks the intent `admitted`, keeping the
+permission ID for replay detection. Terminal/cancelled Work is preserved
+during races. The host oneshot is signaled only after that durable commit.
 
 ## Local versus hosted
 
@@ -112,8 +225,10 @@ explicit enable/disable; it does not own dispatch.
 1. Inspect `ptah_get_capacity` and `ptah_list_execution_intents`
 2. If the supervisor reports an error, `/ready` fails closed
 3. Reopen the home in one process only
-4. Abandoned claiming intents return Work to `queued`
-5. Interrupted Runs wait for lease expiry or an explicit retry
+4. Abandoned claiming intents return Work to `queued` when no Run exists
+5. Claiming intents that already have a Run are adopted, not released
+6. Interrupted Runs are closed; a new attempt is admitted only when both
+   retry policies allow
 
 ## Follow-up
 
@@ -121,3 +236,6 @@ explicit enable/disable; it does not own dispatch.
 - Message-triggered routine activation
 - Per-principal worker credentials bound to one Agent
 - Computer Use for unattended Agents (not in this slice)
+- Binding a host permission request to a specific Run when several managed
+  Runs share one session (parking currently matches the session's live
+  managed intent)

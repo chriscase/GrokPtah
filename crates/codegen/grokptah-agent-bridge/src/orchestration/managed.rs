@@ -8,14 +8,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::message::WorkMessage;
+use super::message::{MessageKind, WorkMessage};
 use super::types::{
     hash_payload, AgentRecord, AgentSpec, OrchError, OrchErrorCode, RunBounds,
     DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
 };
 use super::workload::{
     invalid, AssignmentStatus, WorkDecision, WorkDecisionAction, WorkItem, WorkState,
-    MAX_WORK_OBJECTIVE_BYTES,
 };
 use super::workspaces_match;
 
@@ -26,6 +25,7 @@ pub const MAX_MANAGED_ROUTINE_SOURCES: usize = 64;
 pub const MAX_MANAGED_CONTEXT_BYTES: usize = 8 * 1024;
 pub const MAX_MANAGED_MESSAGES: usize = 16;
 pub const DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS: u64 = 1_000;
+pub const MANAGED_TRUNCATION_MARKER: &str = "\n...[truncated]\n";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +40,9 @@ pub struct ManagedExecutionPolicy {
     pub max_concurrent_runs: u32,
     #[serde(default = "default_managed_bounds")]
     pub bounds: RunBounds,
+    /// When `false`, native managed execution must not automatically admit
+    /// attempt 2 or later. When `true`, retries may be admitted only within
+    /// the Work retry policy and `maxAttempts`.
     #[serde(default)]
     pub retry_eligible: bool,
     #[serde(default)]
@@ -113,6 +116,28 @@ impl ManagedExecutionPolicy {
                 .any(|allowed| allowed == kind)
     }
 
+    /// Native auto-admission of attempt 2+ is allowed only when this flag is
+    /// true **and** the Work retry policy still has budget for `cause`.
+    pub fn allows_auto_retry(
+        &self,
+        work: &WorkItem,
+        next_attempt_number: u32,
+        cause: ManagedRetryCause,
+    ) -> bool {
+        if !self.retry_eligible {
+            return false;
+        }
+        if next_attempt_number == 0 || next_attempt_number > work.policy.retry.max_attempts {
+            return false;
+        }
+        match cause {
+            ManagedRetryCause::Failed => work.policy.retry.retry_failed,
+            ManagedRetryCause::Interrupted | ManagedRetryCause::Expired => {
+                work.policy.retry.retry_expired
+            }
+        }
+    }
+
     pub fn allows_routine_source(&self, source_routine_id: Option<&str>) -> bool {
         if self.allowed_source_routine_ids.is_empty() {
             return true;
@@ -123,6 +148,14 @@ impl ManagedExecutionPolicy {
                 .any(|allowed| allowed == routine_id)
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRetryCause {
+    Failed,
+    Interrupted,
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +329,18 @@ pub fn managed_execution_eligible(
             "work item is not claimable",
         ));
     }
+    if work.attempt_count >= 1 && !policy.retry_eligible {
+        return Err(OrchError::new(
+            OrchErrorCode::Conflict,
+            "managed execution retryEligible forbids another native attempt",
+        ));
+    }
+    if work.attempt_count >= work.policy.retry.max_attempts {
+        return Err(OrchError::new(
+            OrchErrorCode::Conflict,
+            "work item retry budget is exhausted",
+        ));
+    }
     if !policy.allows_kind(&work.kind)
         || !policy.allows_routine_source(work.source_routine_id.as_deref())
     {
@@ -336,9 +381,84 @@ pub fn managed_execution_eligible(
     Ok(bounds)
 }
 
+pub fn truncate_utf8_to_bytes(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if MANAGED_TRUNCATION_MARKER.len() >= max_bytes {
+        // No room for the marker plus any input. Truncate the source at a
+        // char boundary so tiny limits stay valid UTF-8 without panicking.
+        let mut end = max_bytes.min(input.len());
+        while end > 0 && !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        return input[..end].to_string();
+    }
+    let budget = max_bytes - MANAGED_TRUNCATION_MARKER.len();
+    let mut end = budget.min(input.len());
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + MANAGED_TRUNCATION_MARKER.len());
+    out.push_str(&input[..end]);
+    out.push_str(MANAGED_TRUNCATION_MARKER);
+    debug_assert!(out.len() <= max_bytes);
+    debug_assert!(out.is_char_boundary(out.len()));
+    out
+}
+
+pub fn select_relevant_managed_messages(
+    messages: &[WorkMessage],
+    work: &WorkItem,
+    agent_id: &str,
+    now: DateTime<Utc>,
+    limit: usize,
+) -> Vec<WorkMessage> {
+    let mut relevant = messages
+        .iter()
+        .filter(|message| {
+            if message.kind == MessageKind::Question && message.expired_at(now) {
+                return false;
+            }
+            match message.work_id.as_deref() {
+                Some(work_id) => work_id == work.work_id,
+                None => {
+                    message.to_agent_id.as_deref() == Some(agent_id)
+                        || message.from_agent_id.as_deref() == Some(agent_id)
+                }
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    relevant.sort_by_key(|message| message.seq);
+    let mut kept: Vec<WorkMessage> = Vec::new();
+    for message in relevant {
+        if let Some(existing) = kept.iter_mut().find(|prior| {
+            prior.thread_id.is_some()
+                && prior.thread_id == message.thread_id
+                && prior.kind == message.kind
+                && prior.body == message.body
+        }) {
+            *existing = message;
+        } else {
+            kept.push(message);
+        }
+    }
+    kept.sort_by_key(|message| message.seq);
+    if limit == 0 {
+        return Vec::new();
+    }
+    let skip = kept.len().saturating_sub(limit);
+    kept.into_iter().skip(skip).collect()
+}
+
 pub fn assemble_managed_run_input(
     work: &WorkItem,
     spec: &AgentSpec,
+    bounds: &RunBounds,
     attempt_number: u32,
     parent: Option<&WorkItem>,
     messages: &[WorkMessage],
@@ -372,13 +492,14 @@ pub fn assemble_managed_run_input(
     }
     if !messages.is_empty() {
         body.push_str("Relevant messages:\n");
-        for message in messages.iter().take(MAX_MANAGED_MESSAGES) {
+        for message in messages {
             body.push_str(&format!("- [{}] {}\n", message.kind.as_str(), message.body));
         }
     }
-    if body.len() > MAX_WORK_OBJECTIVE_BYTES.min(spec.default_run_bounds.max_prompt_bytes) {
-        body.truncate(MAX_MANAGED_CONTEXT_BYTES);
-        body.push_str("\n...[truncated]\n");
+    let max_bytes = bounds.max_prompt_bytes.clamp(1, MAX_MANAGED_CONTEXT_BYTES);
+    let body = truncate_utf8_to_bytes(&body, max_bytes);
+    if body.len() > max_bytes {
+        return Err(invalid("managed run input exceeded its prompt bound"));
     }
     let input_hash = hash_payload(&serde_json::json!({
         "workId": work.work_id,
@@ -392,6 +513,200 @@ pub fn assemble_managed_run_input(
         "sourceActivationId": work.source_activation_id,
         "messages": messages.iter().map(|message| &message.message_id).collect::<Vec<_>>(),
         "continuation": continuation_context,
+        "maxPromptBytes": bounds.max_prompt_bytes,
     }));
     Ok((body, input_hash))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::types::AgentSpec;
+    use crate::orchestration::workload::WorkPolicy;
+    use chrono::{Duration, TimeZone, Utc};
+    use uuid::Uuid;
+
+    fn spec_with_bounds(max_prompt_bytes: usize) -> AgentSpec {
+        AgentSpec::initial(
+            "agent-1",
+            "/tmp/ws",
+            "grok",
+            crate::orchestration::AgentAuthorityPolicy::default(),
+            Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            "test",
+        )
+        .unwrap()
+        .pipe(|mut spec| {
+            spec.default_run_bounds.max_prompt_bytes = max_prompt_bytes;
+            spec
+        })
+    }
+
+    trait Pipe: Sized {
+        fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R {
+            f(self)
+        }
+    }
+    impl<T> Pipe for T {}
+
+    #[test]
+    fn truncate_utf8_respects_char_boundaries_and_small_limits() {
+        assert_eq!(truncate_utf8_to_bytes("hello", 16), "hello");
+        assert_eq!(truncate_utf8_to_bytes("hello", 0), "");
+        let emoji = "😀😀😀";
+        let inside_emoji = truncate_utf8_to_bytes(emoji, 6);
+        assert!(inside_emoji.is_char_boundary(inside_emoji.len()));
+        assert!(inside_emoji.len() <= 6);
+        assert!(std::str::from_utf8(inside_emoji.as_bytes()).is_ok());
+        let before_emoji = truncate_utf8_to_bytes("hi😀", 2);
+        assert_eq!(before_emoji, "hi");
+        let cut_inside_emoji = truncate_utf8_to_bytes("hi😀", 4);
+        assert!(cut_inside_emoji.is_char_boundary(cut_inside_emoji.len()));
+        assert!(cut_inside_emoji.len() <= 4);
+        assert!(!cut_inside_emoji.contains('😀') || cut_inside_emoji == "hi");
+        let combining = "e\u{0301}e\u{0301}";
+        let out = truncate_utf8_to_bytes(combining, 2);
+        assert!(out.is_char_boundary(out.len()));
+        assert!(out.len() <= 2);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        let cjk = "漢字漢字";
+        let out = truncate_utf8_to_bytes(cjk, 5);
+        assert!(out.is_char_boundary(out.len()));
+        assert!(out.len() <= 5);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        let marker_only = truncate_utf8_to_bytes("abcdef", MANAGED_TRUNCATION_MARKER.len());
+        assert!(marker_only.len() <= MANAGED_TRUNCATION_MARKER.len());
+        assert!(std::str::from_utf8(marker_only.as_bytes()).is_ok());
+        let tiny = truncate_utf8_to_bytes("abcdef", 1);
+        assert_eq!(tiny, "a");
+        let marker_budget = MANAGED_TRUNCATION_MARKER.len() + 2;
+        let marked = truncate_utf8_to_bytes("abcdefghijklmnopqrstuvwxyz", marker_budget);
+        assert!(marked.ends_with(MANAGED_TRUNCATION_MARKER));
+        assert!(marked.len() <= marker_budget);
+    }
+
+    #[test]
+    fn assemble_honors_intersected_prompt_bound() {
+        let work = WorkItem::new(
+            "native",
+            "objective that is definitely longer than the tiny bound",
+            Uuid::from_u128(1),
+            "/tmp/ws",
+            "op",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        let spec = spec_with_bounds(100_000);
+        let bounds = RunBounds {
+            max_prompt_bytes: 64,
+            max_rounds: 2,
+            max_duration_ms: 1_000,
+            max_total_tokens: Some(100),
+        };
+        let (body, _) =
+            assemble_managed_run_input(&work, &spec, &bounds, 1, None, &[], None).unwrap();
+        assert!(body.len() <= 64);
+        assert!(body.is_char_boundary(body.len()));
+        let tiny = RunBounds {
+            max_prompt_bytes: 8,
+            ..bounds
+        };
+        let (body, _) =
+            assemble_managed_run_input(&work, &spec, &tiny, 1, None, &[], None).unwrap();
+        assert!(body.len() <= 8);
+    }
+
+    #[test]
+    fn relevant_messages_exclude_unrelated_and_expired() {
+        let now = Utc::now();
+        let session = Uuid::from_u128(7);
+        let work = WorkItem::new(
+            "native",
+            "obj",
+            session,
+            "/tmp/ws",
+            "op",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        let mk = |seq: u64,
+                  from: Option<&str>,
+                  to: Option<&str>,
+                  work_id: Option<&str>,
+                  kind: MessageKind,
+                  body: &str,
+                  expired: bool| {
+            let mut message = WorkMessage::new(
+                kind,
+                "actor",
+                from.map(str::to_string),
+                to.map(str::to_string),
+                session,
+                "/tmp/ws",
+                work_id.map(str::to_string),
+                body,
+                None,
+                now,
+            )
+            .unwrap();
+            message.seq = seq;
+            if expired {
+                message.expires_at = Some(now - Duration::minutes(1));
+            }
+            message
+        };
+        let mut messages = Vec::new();
+        for i in 1..=20 {
+            messages.push(mk(
+                i,
+                Some("other"),
+                Some("other"),
+                Some("other-work"),
+                MessageKind::Status,
+                "noise",
+                false,
+            ));
+        }
+        messages.push(mk(
+            21,
+            Some("agent-1"),
+            Some("agent-1"),
+            Some(&work.work_id),
+            MessageKind::Instruction,
+            "do this",
+            false,
+        ));
+        messages.push(mk(
+            22,
+            Some("agent-1"),
+            Some("manager"),
+            Some(&work.work_id),
+            MessageKind::Question,
+            "old q",
+            true,
+        ));
+        messages.push(mk(
+            23,
+            Some("agent-1"),
+            None,
+            None,
+            MessageKind::Status,
+            "agent chatter",
+            false,
+        ));
+        let selected = select_relevant_managed_messages(
+            &messages,
+            &work,
+            "agent-1",
+            now,
+            MAX_MANAGED_MESSAGES,
+        );
+        assert!(selected.iter().all(|message| {
+            message.work_id.as_deref() == Some(work.work_id.as_str())
+                || message.from_agent_id.as_deref() == Some("agent-1")
+        }));
+        assert!(!selected.iter().any(|message| message.body == "noise"));
+        assert!(!selected.iter().any(|message| message.body == "old q"));
+        assert!(selected.iter().any(|message| message.body == "do this"));
+    }
 }
