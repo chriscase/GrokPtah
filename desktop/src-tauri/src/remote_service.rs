@@ -4,7 +4,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::{
     AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RunExecutionMode, RunRecord,
-    RunScope, RunState, RuntimeConnectionState, RuntimeTarget, SessionUpdate,
+    RunScope, RunState, RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView,
+    WorkItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -46,6 +47,13 @@ pub struct RemoteTaskSubmission {
     pub request_id: String,
     pub execution_mode: RunExecutionMode,
     pub queued_position: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteWorkSnapshot {
+    pub work: WorkItem,
+    pub attempts: Vec<WorkAttemptView>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +303,31 @@ impl RemoteServiceState {
         Ok(Some(client.list_runs().await?))
     }
 
+    pub async fn list_work(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+    ) -> Result<Option<Vec<WorkItem>>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(client.list_work(session_id, workspace).await?))
+    }
+
+    pub async fn get_work(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        work_id: String,
+    ) -> Result<Option<RemoteWorkSnapshot>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(client.get_work(session_id, workspace, work_id).await?))
+    }
+
     pub async fn get_run(
         &self,
         session_id: Uuid,
@@ -438,6 +471,8 @@ impl RemoteServiceClient {
             "ptah_resume_persistent_agent",
             "ptah_list_runs",
             "ptah_get_run",
+            "ptah_list_work",
+            "ptah_get_work",
             "ptah_get_events",
             "ptah_steer",
             "ptah_cancel",
@@ -654,6 +689,41 @@ impl RemoteServiceClient {
         }
         runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(runs)
+    }
+
+    async fn list_work(&mut self, session_id: Uuid, workspace: String) -> Result<Vec<WorkItem>> {
+        let value = self
+            .call_tool(
+                "ptah_list_work",
+                json!({"session_id": session_id, "workspace": workspace}),
+            )
+            .await?;
+        serde_json::from_value(
+            value
+                .get("work")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote work list omitted work"))?,
+        )
+        .context("decode remote durable work list")
+    }
+
+    async fn get_work(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        work_id: String,
+    ) -> Result<RemoteWorkSnapshot> {
+        let value = self
+            .call_tool(
+                "ptah_get_work",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "work_id": work_id,
+                }),
+            )
+            .await?;
+        serde_json::from_value(value).context("decode remote durable work item")
     }
 
     async fn get_run(

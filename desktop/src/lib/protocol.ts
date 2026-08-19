@@ -221,6 +221,119 @@ export interface RemoteTaskSubmission {
   queuedPosition?: number | null;
 }
 
+export type DurableWorkState =
+  | "queued"
+  | "blocked"
+  | "leased"
+  | "running"
+  | "awaiting_input"
+  | "awaiting_approval"
+  | "review"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export type DurableWorkAttemptState =
+  | "leased"
+  | "running"
+  | "awaiting_input"
+  | "awaiting_approval"
+  | "review"
+  | "released"
+  | "expired"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export interface DurableWorkRetryPolicy {
+  maxAttempts: number;
+  retryFailed: boolean;
+  retryExpired: boolean;
+  backoffMs: number;
+}
+
+export interface DurableWorkPolicy {
+  bounds: PersistentAgentRunBounds;
+  retry: DurableWorkRetryPolicy;
+  requiresApproval: boolean;
+  maxConcurrentAttempts: number;
+}
+
+export interface DurableWorkDependency {
+  workId: string;
+  requiredState: DurableWorkState;
+}
+
+export interface DurableWorkProgress {
+  summary: string;
+  percent?: number | null;
+  updatedAt: string;
+}
+
+export interface DurableWorkArtifactRef {
+  artifactId: string;
+  kind: string;
+  label: string;
+  digest?: string | null;
+  retainedUntil?: string | null;
+}
+
+export interface DurableWorkResult {
+  summary: string;
+  evidence: string[];
+  artifacts: DurableWorkArtifactRef[];
+  failure?: string | null;
+  cancellationReason?: string | null;
+  completedAt: string;
+}
+
+export interface DurableWorkItem {
+  schemaVersion: number;
+  workId: string;
+  kind: string;
+  objective: string;
+  sessionId: string;
+  workspace: string;
+  createdBy: string;
+  assignedAgentId?: string | null;
+  priority: number;
+  deadline?: string | null;
+  parentWorkId?: string | null;
+  dependencies: DurableWorkDependency[];
+  policy: DurableWorkPolicy;
+  state: DurableWorkState;
+  revision: number;
+  attemptCount: number;
+  progress?: DurableWorkProgress | null;
+  result?: DurableWorkResult | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Desktop-safe attempt projection; lease credentials are never included. */
+export interface DurableWorkAttempt {
+  schemaVersion: number;
+  attemptId: string;
+  workId: string;
+  attemptNumber: number;
+  claimantId: string;
+  acquiredAt: string;
+  leaseExpiresAt: string;
+  lastHeartbeatAt: string;
+  state: DurableWorkAttemptState;
+  linkedRunIds: string[];
+  progress?: DurableWorkProgress | null;
+  result?: DurableWorkResult | null;
+  terminalReason?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RemoteWorkSnapshot {
+  work: DurableWorkItem;
+  attempts: DurableWorkAttempt[];
+}
+
 export interface RemoteRunScope {
   sessionId: string;
   workspace: string;

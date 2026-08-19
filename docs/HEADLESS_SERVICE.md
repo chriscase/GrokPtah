@@ -167,6 +167,7 @@ Journal expiry is forced by flooding the in-process event bus.
 | Service restart | Reopening the same `GROKPTAH_HOME` exposes the same run records. |
 | Cursor expiry | `ptah_get_events` and the live SSE channel fail closed on a cursor below the retained journal instead of silently skipping history. |
 | Desktop contract | Create/list session shape, typed submit receipt (`runId`, `sessionId`, `state`, `requestId`, `executionMode`, optional `queuedPosition`), and `ptah_list_runs` still includes cancelled history after `current_run_id` moves. |
+| Durable workloads | `ptah_list_work` / `ptah_get_work` expose the same scoped WorkItem and redacted Attempt projections used by the desktop adapter. Work mutations are idempotent, lease-token scoped, and remain readable after Lane archival while archived-Lane mutations fail closed. |
 
 The smoke tests in `tests/service_smoke.rs` remain the smaller lifecycle /
 readiness / restart checks. `tests/service_conformance.rs` is the matrix above.

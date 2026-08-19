@@ -157,6 +157,37 @@ pub async fn remote_service_run_list(
 }
 
 #[tauri::command]
+pub async fn remote_service_work_list(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+) -> Result<Vec<grokptah_agent_bridge::WorkItem>, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .list_work(session_id, workspace)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_work_get(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    work_id: String,
+) -> Result<crate::remote_service::RemoteWorkSnapshot, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .get_work(session_id, workspace, work_id)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
 pub async fn remote_service_run_get(
     state: State<'_, AppState>,
     session_id: String,

@@ -29,6 +29,8 @@ import type {
   RemoteServiceStatus,
   RemoteRunScope,
   RemoteTaskSubmission,
+  DurableWorkItem,
+  RemoteWorkSnapshot,
 } from "./protocol";
 import type {
   PromptQueueEntry,
@@ -70,6 +72,21 @@ export const api = {
     }),
   remoteServiceRunList: () =>
     invoke<DurableRun[]>("remote_service_run_list"),
+  remoteServiceWorkList: (sessionId: string, workspace: string) =>
+    invoke<DurableWorkItem[]>("remote_service_work_list", {
+      sessionId,
+      workspace,
+    }),
+  remoteServiceWorkGet: (
+    sessionId: string,
+    workspace: string,
+    workId: string,
+  ) =>
+    invoke<RemoteWorkSnapshot>("remote_service_work_get", {
+      sessionId,
+      workspace,
+      workId,
+    }),
   remoteServiceRunGet: (sessionId: string, workspace: string, runId: string) =>
     invoke<DurableRun>("remote_service_run_get", { sessionId, workspace, runId }),
   remoteServiceRunEvents: (
