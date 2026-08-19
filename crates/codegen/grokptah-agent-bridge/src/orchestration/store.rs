@@ -10,11 +10,16 @@ use anyhow::Context;
 use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
+use uuid::Uuid;
 
 use super::types::{
     safe_id_filename, AgentRecord, AgentSpec, AgentState, AuditEntry, ContinuationCheckpoint,
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
     RunStopCause,
+};
+use super::workload::{
+    lease_duration, AttemptState, WorkAttempt, WorkClaim, WorkItem, WorkProgress, WorkResult,
+    WorkState,
 };
 use super::{assemble_continuation_context, ContinuationContext, ContinuationInputSnapshot};
 
@@ -107,6 +112,8 @@ impl OrchStore {
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
+        fs::create_dir_all(root.join("work-items"))?;
+        fs::create_dir_all(root.join("work-attempts"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -243,6 +250,24 @@ impl OrchStore {
             .inner
             .root
             .join("agent-activation")
+            .join(format!("{safe}.json")))
+    }
+
+    fn work_item_path(&self, work_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(work_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("work-items")
+            .join(format!("{safe}.json")))
+    }
+
+    fn work_attempt_path(&self, attempt_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(attempt_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("work-attempts")
             .join(format!("{safe}.json")))
     }
 
@@ -400,6 +425,586 @@ impl OrchStore {
         }
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(out)
+    }
+
+    // --- Durable workloads -------------------------------------------------
+
+    fn load_work_item_unlocked(&self, work_id: &str) -> anyhow::Result<Option<WorkItem>> {
+        let path = match self.work_item_path(work_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let item: WorkItem = serde_json::from_str(&fs::read_to_string(path)?)?;
+        item.validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(Some(item))
+    }
+
+    fn save_work_item_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
+        item.validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let path = self
+            .work_item_path(&item.work_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        atomic_write_json(&path, item)
+    }
+
+    fn load_work_attempt_unlocked(&self, attempt_id: &str) -> anyhow::Result<Option<WorkAttempt>> {
+        let path = match self.work_attempt_path(attempt_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let attempt: WorkAttempt = serde_json::from_str(&fs::read_to_string(path)?)?;
+        attempt
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(Some(attempt))
+    }
+
+    fn save_work_attempt_unlocked(&self, attempt: &WorkAttempt) -> anyhow::Result<()> {
+        attempt
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let path = self
+            .work_attempt_path(&attempt.attempt_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        atomic_write_json(&path, attempt)
+    }
+
+    fn list_work_items_unlocked(&self) -> anyhow::Result<Vec<WorkItem>> {
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("work-items");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let item: WorkItem = serde_json::from_str(&fs::read_to_string(path)?)?;
+            item.validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            out.push(item);
+        }
+        out.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        Ok(out)
+    }
+
+    fn list_work_attempts_unlocked(
+        &self,
+        work_id: Option<&str>,
+    ) -> anyhow::Result<Vec<WorkAttempt>> {
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("work-attempts");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let attempt: WorkAttempt = serde_json::from_str(&fs::read_to_string(path)?)?;
+            attempt
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if work_id.is_none_or(|id| id == attempt.work_id) {
+                out.push(attempt);
+            }
+        }
+        out.sort_by(|a, b| a.attempt_number.cmp(&b.attempt_number));
+        Ok(out)
+    }
+
+    pub fn save_work_item(&self, item: &WorkItem) -> anyhow::Result<()> {
+        let _guard = self.inner.lock.lock();
+        self.save_work_item_unlocked(item)
+    }
+
+    pub fn load_work_item(&self, work_id: &str) -> anyhow::Result<Option<WorkItem>> {
+        let _guard = self.inner.lock.lock();
+        self.load_work_item_unlocked(work_id)
+    }
+
+    pub fn list_work_items(&self) -> anyhow::Result<Vec<WorkItem>> {
+        let _guard = self.inner.lock.lock();
+        self.list_work_items_unlocked()
+    }
+
+    pub fn list_work_attempts(&self, work_id: Option<&str>) -> anyhow::Result<Vec<WorkAttempt>> {
+        let _guard = self.inner.lock.lock();
+        self.list_work_attempts_unlocked(work_id)
+    }
+
+    fn work_failure_result(summary: &str, now: chrono::DateTime<Utc>) -> WorkResult {
+        WorkResult {
+            summary: summary.into(),
+            evidence: Vec::new(),
+            artifacts: Vec::new(),
+            failure: Some(summary.into()),
+            cancellation_reason: None,
+            completed_at: now,
+        }
+    }
+
+    fn refresh_work_item_unlocked(&self, item: &mut WorkItem) -> anyhow::Result<()> {
+        if item.state.is_terminal() {
+            return Ok(());
+        }
+        let dependencies_ready = item.dependencies.iter().all(|dependency| {
+            self.load_work_item_unlocked(&dependency.work_id)
+                .ok()
+                .flatten()
+                .is_some_and(|dependency_item| dependency_item.state == dependency.required_state)
+        });
+        if !dependencies_ready && matches!(item.state, WorkState::Queued) {
+            item.state = WorkState::Blocked;
+            item.bump();
+            self.save_work_item_unlocked(item)?;
+        } else if dependencies_ready && matches!(item.state, WorkState::Blocked) {
+            item.state = WorkState::Queued;
+            item.bump();
+            self.save_work_item_unlocked(item)?;
+        }
+        if item.deadline.is_some_and(|deadline| deadline <= Utc::now()) && !item.state.is_terminal()
+        {
+            let now = Utc::now();
+            item.state = WorkState::Failed;
+            item.result = Some(Self::work_failure_result(
+                "work item deadline exceeded",
+                now,
+            ));
+            item.bump();
+            self.save_work_item_unlocked(item)?;
+        }
+        Ok(())
+    }
+
+    fn expire_attempt_unlocked(
+        &self,
+        item: &mut WorkItem,
+        attempt: &mut WorkAttempt,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        attempt.state = AttemptState::Expired;
+        attempt.terminal_reason = Some("lease expired".into());
+        attempt.updated_at = now;
+        self.save_work_attempt_unlocked(attempt)?;
+        if item.policy.retry.retry_expired
+            && attempt.attempt_number < item.policy.retry.max_attempts
+        {
+            item.state = WorkState::Queued;
+        } else {
+            item.state = WorkState::Failed;
+            item.result = Some(Self::work_failure_result(
+                "work item lease expired and retry budget was exhausted",
+                now,
+            ));
+        }
+        item.bump();
+        self.save_work_item_unlocked(item)
+    }
+
+    fn active_attempt_unlocked(
+        &self,
+        work_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<Option<WorkAttempt>> {
+        Ok(self
+            .list_work_attempts_unlocked(Some(work_id))?
+            .into_iter()
+            .find(|attempt| attempt.lease_active_at(now)))
+    }
+
+    pub fn claim_work(
+        &self,
+        work_id: &str,
+        claimant_id: &str,
+        lease_ms: Option<u64>,
+    ) -> Result<WorkClaim, OrchError> {
+        self.claim_work_inner(work_id, claimant_id, lease_ms, None)
+    }
+
+    pub fn claim_work_with_lease_secret(
+        &self,
+        work_id: &str,
+        claimant_id: &str,
+        lease_ms: Option<u64>,
+        lease_secret: &str,
+    ) -> Result<WorkClaim, OrchError> {
+        if lease_secret.is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "lease_secret is required",
+            ));
+        }
+        self.claim_work_inner(work_id, claimant_id, lease_ms, Some(lease_secret))
+    }
+
+    fn claim_work_inner(
+        &self,
+        work_id: &str,
+        claimant_id: &str,
+        lease_ms: Option<u64>,
+        lease_secret: Option<&str>,
+    ) -> Result<WorkClaim, OrchError> {
+        let lease = lease_duration(lease_ms)?;
+        if claimant_id.trim().is_empty() || claimant_id.len() > 256 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "claimant_id is empty or exceeds its bound",
+            ));
+        }
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        self.refresh_work_item_unlocked(&mut item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let now = Utc::now();
+        if let Some(active) = self
+            .active_attempt_unlocked(work_id, now)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("work item already leased by {}", active.claimant_id),
+            ));
+        }
+        for mut attempt in self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            if attempt.state.is_active() && !attempt.lease_active_at(now) {
+                self.expire_attempt_unlocked(&mut item, &mut attempt, now)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            }
+        }
+        if item.state != WorkState::Queued {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("work item is not claimable in state {:?}", item.state),
+            ));
+        }
+        if item.attempt_count >= item.policy.retry.max_attempts {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work item retry budget is exhausted",
+            ));
+        }
+        let (mut attempt, lease_token) = match lease_secret {
+            Some(secret) => {
+                let attempt = WorkAttempt::new_with_lease_secret(
+                    &item.work_id,
+                    item.attempt_count + 1,
+                    claimant_id,
+                    secret,
+                );
+                let lease_token = attempt.lease_token_for_secret(secret);
+                (attempt, lease_token)
+            }
+            None => {
+                let lease_token = Uuid::new_v4().to_string();
+                let attempt = WorkAttempt::new(
+                    &item.work_id,
+                    item.attempt_count + 1,
+                    claimant_id,
+                    &lease_token,
+                );
+                (attempt, lease_token)
+            }
+        };
+        attempt.acquired_at = now;
+        attempt.last_heartbeat_at = now;
+        attempt.lease_expires_at = now + lease;
+        attempt.updated_at = now;
+        item.attempt_count = attempt.attempt_number;
+        item.state = WorkState::Leased;
+        item.bump();
+        self.save_work_attempt_unlocked(&attempt)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(WorkClaim {
+            work: item,
+            attempt,
+            lease_token,
+        })
+    }
+
+    fn load_active_attempt_for_token_unlocked(
+        &self,
+        item: &WorkItem,
+        attempt_id: &str,
+        lease_token: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<WorkAttempt, OrchError> {
+        let attempt = self
+            .load_work_attempt_unlocked(attempt_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work attempt not found"))?;
+        if attempt.work_id != item.work_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "work attempt does not belong to the work item",
+            ));
+        }
+        if !attempt.token_matches(lease_token) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "invalid work lease token",
+            ));
+        }
+        if !attempt.state.is_active() || now >= attempt.lease_expires_at {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work lease is no longer active",
+            ));
+        }
+        Ok(attempt)
+    }
+
+    pub fn renew_work_lease(
+        &self,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        lease_ms: Option<u64>,
+    ) -> Result<WorkAttempt, OrchError> {
+        let lease = lease_duration(lease_ms)?;
+        let _guard = self.inner.lock.lock();
+        let item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let now = Utc::now();
+        let mut attempt =
+            self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
+        attempt.last_heartbeat_at = now;
+        attempt.lease_expires_at = now + lease;
+        attempt.updated_at = now;
+        self.save_work_attempt_unlocked(&attempt)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(attempt)
+    }
+
+    pub fn link_work_run(
+        &self,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        run_id: &str,
+    ) -> Result<WorkAttempt, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let now = Utc::now();
+        let mut attempt =
+            self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
+        if !attempt.linked_run_ids.iter().any(|id| id == run_id) {
+            if attempt.linked_run_ids.len() >= 16 {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "work attempt cannot link more than 16 runs",
+                ));
+            }
+            attempt.linked_run_ids.push(run_id.to_string());
+        }
+        if attempt.state == AttemptState::Leased {
+            attempt.state = AttemptState::Running;
+        }
+        attempt.updated_at = now;
+        self.save_work_attempt_unlocked(&attempt)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(attempt)
+    }
+
+    pub fn report_work_progress(
+        &self,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        progress: WorkProgress,
+    ) -> Result<(WorkItem, WorkAttempt), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let now = Utc::now();
+        let mut attempt =
+            self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
+        item.progress = Some(progress.clone());
+        item.state = WorkState::Running;
+        item.bump();
+        attempt.progress = Some(progress);
+        attempt.state = AttemptState::Running;
+        attempt.last_heartbeat_at = now;
+        attempt.updated_at = now;
+        self.save_work_attempt_unlocked(&attempt)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok((item, attempt))
+    }
+
+    pub fn release_work(
+        &self,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        reason: &str,
+    ) -> Result<(WorkItem, WorkAttempt), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let now = Utc::now();
+        let mut attempt =
+            self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
+        attempt.state = AttemptState::Released;
+        attempt.terminal_reason = Some(reason.to_string());
+        attempt.updated_at = now;
+        item.state = WorkState::Queued;
+        item.bump();
+        self.save_work_attempt_unlocked(&attempt)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok((item, attempt))
+    }
+
+    pub fn complete_work(
+        &self,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        result: WorkResult,
+    ) -> Result<(WorkItem, WorkAttempt), OrchError> {
+        result.validate()?;
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let now = Utc::now();
+        let mut attempt =
+            self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
+        attempt.result = Some(result.clone());
+        attempt.state = if item.policy.requires_approval {
+            AttemptState::AwaitingApproval
+        } else {
+            AttemptState::Succeeded
+        };
+        attempt.updated_at = now;
+        item.result = Some(result);
+        item.state = if item.policy.requires_approval {
+            WorkState::AwaitingApproval
+        } else {
+            WorkState::Succeeded
+        };
+        item.bump();
+        self.save_work_attempt_unlocked(&attempt)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok((item, attempt))
+    }
+
+    pub fn fail_work(
+        &self,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        result: WorkResult,
+    ) -> Result<(WorkItem, WorkAttempt), OrchError> {
+        result.validate()?;
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let now = Utc::now();
+        let mut attempt =
+            self.load_active_attempt_for_token_unlocked(&item, attempt_id, lease_token, now)?;
+        attempt.result = Some(result.clone());
+        attempt.state = AttemptState::Failed;
+        attempt.terminal_reason = result.failure.clone();
+        attempt.updated_at = now;
+        item.result = Some(result);
+        item.state = if item.policy.retry.retry_failed
+            && attempt.attempt_number < item.policy.retry.max_attempts
+        {
+            WorkState::Queued
+        } else {
+            WorkState::Failed
+        };
+        item.bump();
+        self.save_work_attempt_unlocked(&attempt)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok((item, attempt))
+    }
+
+    pub fn cancel_work(
+        &self,
+        work_id: &str,
+        reason: &str,
+    ) -> Result<(WorkItem, Vec<WorkAttempt>), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        if item.state.is_terminal() {
+            return Ok((
+                item,
+                self.list_work_attempts_unlocked(Some(work_id))
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            ));
+        }
+        let now = Utc::now();
+        let mut attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        for attempt in &mut attempts {
+            if attempt.state.is_active() {
+                attempt.state = AttemptState::Cancelled;
+                attempt.terminal_reason = Some(reason.to_string());
+                attempt.updated_at = now;
+                self.save_work_attempt_unlocked(attempt)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            }
+        }
+        item.state = WorkState::Cancelled;
+        item.result = Some(WorkResult {
+            summary: "work item cancelled".into(),
+            evidence: Vec::new(),
+            artifacts: Vec::new(),
+            failure: None,
+            cancellation_reason: Some(reason.to_string()),
+            completed_at: now,
+        });
+        item.bump();
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok((item, attempts))
     }
 
     /// Persist one transport-neutral durable agent identity.

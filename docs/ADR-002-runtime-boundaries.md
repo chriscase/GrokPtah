@@ -45,12 +45,12 @@ does not mount or copy the home directory.
 
 ### 2. Runtime, host, transport, and client responsibilities are separate
 
-The following table is the normative ownership target, including workload
-features that have not shipped yet:
+The following table is the normative ownership target, including the durable
+workload slice shipped in issue #305:
 
 | Layer | Owns | Must not own |
 | --- | --- | --- |
-| `grokptah-agent-bridge` runtime | Sessions, finite runs, agents, memory, permissions, tools, future workload state, durable events, policy, recovery, and promotion rules | Authoritative Tauri selection state, HTTP request state, focused UI state used as domain input, or provider-specific UI behavior |
+| `grokptah-agent-bridge` runtime | Sessions, finite runs, agents, memory, permissions, tools, durable workload state, durable events, policy, recovery, and promotion rules | Authoritative Tauri selection state, HTTP request state, focused UI state used as domain input, or provider-specific UI behavior |
 | Tauri desktop host | In-process runtime lifecycle, keychain integration, PTY, dialogs, local permission decisions, locally granted Computer Use, and typed IPC adapters | A second domain state machine in commands/React, implicit remote authority, or policy that differs from the service |
 | `grokptah-service` host | Process lifecycle, configured roots, listener/auth configuration, readiness, and declared host capabilities | Desktop permissions, keychain/PTY assumptions, ambient Computer Use, or transport-specific work transitions |
 | MCP/API transport | Versioned schemas, authentication, scoped request mapping, idempotency identity, bounded responses, and cursor recovery | Business transitions implemented independently of the runtime or authority inferred from bearer authentication alone |
@@ -59,6 +59,13 @@ features that have not shipped yet:
 Tauri commands and HTTP handlers are adapters. Persistent agents, workloads,
 assignments, attempts, routines, and messages belong in transport-neutral
 runtime/domain services.
+
+Issue #305's first workload slice uses the existing single-owner, file-backed
+ledger and authenticated MCP boundary in both desktop and service hosts. It
+supports durable WorkItems and Attempt/Lease records, scoped reads, idempotent
+mutations, dependency/deadline/retry/approval-aware admission, and Lane
+archival independence. Multi-principal authority, multi-node claims, and a
+database/coordinator remain follow-on milestones.
 
 The current bridge also persists compatibility chrome (`active_session`, open
 tabs, appearance, and related desktop restore fields), and some credential
@@ -146,9 +153,10 @@ global bearer, reports credential identity `primary`, and gives every holder
 the configured allowlist and complete MCP tool surface. In particular,
 `ptah_approve_run` and `ptah_promote_run` make that bearer operator-equivalent
 for isolated-run approval and promotion. Deployments must treat possession of
-the current bearer as privileged operator access. Durable workloads and worker
-leases may not rely on the coordinator row above until separate, attributable
-operator approval and scoped principal credentials are implemented.
+the current bearer as privileged operator access. The initial durable workload
+slice uses the same operator-equivalent identity for claims and mutations;
+separate attributable operator approval and scoped principal credentials are
+required before exposing it to less-trusted workers.
 
 Every new operation must name its caller tier, durable resource scope,
 mutation authority, idempotency behavior, redaction contract, and recovery
@@ -202,7 +210,7 @@ identity is distinct from a disposable execution worktree.
 | Lane | UI/product projection of one Session; today `lane_id == session_id` one-to-one, not a separate durable record |
 | Assignment | Durable declaration that one work item is eligible for an Agent/worker under captured policy |
 | Attempt / lease | One bounded, attributable claim to execute an assignment; an assignment may have many sequential attempts, but at most one active lease |
-| Run | One finite model/tool execution linked to one Session and, when workload execution ships, one attempt; an attempt may contain multiple finite runs only when its policy says so |
+| Run | One finite model/tool execution linked to one Session and, in the workload slice, one attempt; an attempt may contain multiple finite runs only when its policy says so |
 
 Until a separate Lane record is explicitly designed, workload foreign keys use
 `session_id`; they do not persist a second `lane_id` alias.

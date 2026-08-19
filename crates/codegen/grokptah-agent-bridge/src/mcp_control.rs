@@ -33,7 +33,8 @@ use uuid::Uuid;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
     AuthContext, ChangeRecord, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
-    RunExecutionMode, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    RunExecutionMode, WorkArtifactRef, WorkDependency, WorkPolicy, WorkResult, WorkspaceAllowlist,
+    CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -990,6 +991,133 @@ struct CancelArgs {
     run_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateWorkArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    kind: String,
+    objective: String,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default)]
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    parent_work_id: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<WorkDependency>,
+    #[serde(default)]
+    policy: WorkPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkScopeArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimWorkArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    #[serde(default)]
+    lease_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkLeaseArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    attempt_id: String,
+    lease_token: String,
+    #[serde(default)]
+    lease_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinkWorkRunArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    attempt_id: String,
+    lease_token: String,
+    run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkProgressArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    attempt_id: String,
+    lease_token: String,
+    summary: String,
+    #[serde(default)]
+    percent: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkReasonArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    attempt_id: String,
+    lease_token: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkResultArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    attempt_id: String,
+    lease_token: String,
+    summary: String,
+    #[serde(default)]
+    evidence: Vec<String>,
+    #[serde(default)]
+    artifacts: Vec<WorkArtifactRef>,
+    #[serde(default)]
+    failure: Option<String>,
+    #[serde(default)]
+    cancellation_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelWorkArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    reason: String,
+}
+
 fn empty_object() -> Value {
     json!({})
 }
@@ -1515,6 +1643,141 @@ fn tool_input_schema(name: &str) -> Value {
                 "max_rounds": {"type": "integer", "minimum": 1, "maximum": 24}
             }
         }),
+        "ptah_list_work" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
+            }
+        }),
+        "ptah_get_work" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "work_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id
+            }
+        }),
+        "ptah_create_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "kind", "objective"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "kind": {"type": "string", "minLength": 1, "maxLength": 96},
+                "objective": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "priority": {"type": "integer"},
+                "deadline": {"type": "string", "format": "date-time"},
+                "parent_work_id": run_id,
+                "dependencies": {"type": "array", "maxItems": 128},
+                "policy": {"type": "object"}
+            }
+        }),
+        "ptah_claim_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "lease_ms": {"type": "integer", "minimum": 1, "maximum": 3600000}
+            }
+        }),
+        "ptah_renew_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "attempt_id", "lease_token"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "attempt_id": run_id,
+                "lease_token": {"type": "string", "minLength": 1, "maxLength": 256},
+                "lease_ms": {"type": "integer", "minimum": 1, "maximum": 3600000}
+            }
+        }),
+        "ptah_link_work_run" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "attempt_id", "lease_token", "run_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "attempt_id": run_id,
+                "lease_token": {"type": "string", "minLength": 1, "maxLength": 256},
+                "run_id": run_id
+            }
+        }),
+        "ptah_report_work_progress" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "attempt_id", "lease_token", "summary"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "attempt_id": run_id,
+                "lease_token": {"type": "string", "minLength": 1, "maxLength": 256},
+                "summary": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "percent": {"type": "integer", "minimum": 0, "maximum": 100}
+            }
+        }),
+        "ptah_release_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "attempt_id", "lease_token", "reason"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "attempt_id": run_id,
+                "lease_token": {"type": "string", "minLength": 1, "maxLength": 256},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 32768}
+            }
+        }),
+        "ptah_complete_work" | "ptah_fail_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "attempt_id", "lease_token", "summary"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "attempt_id": run_id,
+                "lease_token": {"type": "string", "minLength": 1, "maxLength": 256},
+                "summary": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "evidence": {"type": "array", "maxItems": 256, "items": {"type": "string", "maxLength": 2048}},
+                "artifacts": {"type": "array", "maxItems": 256},
+                "failure": {"type": "string", "maxLength": 32768},
+                "cancellation_reason": {"type": "string", "maxLength": 32768}
+            }
+        }),
+        "ptah_cancel_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "reason"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "reason": {"type": "string", "minLength": 1, "maxLength": 32768}
+            }
+        }),
         "ptah_retry_run" => json!({
             "type": "object",
             "required": ["request_id", "session_id", "workspace", "run_id", "prompt"],
@@ -1858,6 +2121,176 @@ async fn dispatch_tool(
                 &args.agent_id,
                 args.prompt,
                 args.max_rounds,
+            )
+            .await
+        }
+        "ptah_list_work" => {
+            let args: WorkScopeArgs = parse_value(args)?;
+            orch.list_work_scoped(auth, args.session_id, &args.workspace)
+        }
+        "ptah_get_work" => {
+            let args: WorkArgs = parse_value(args)?;
+            require_nonempty(&args.work_id, "work_id")?;
+            orch.get_work_scoped(auth, args.session_id, &args.workspace, &args.work_id)
+        }
+        "ptah_create_work" => {
+            let args: CreateWorkArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            orch.create_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                args.kind,
+                args.objective,
+                args.priority,
+                args.deadline,
+                args.parent_work_id,
+                args.dependencies,
+                args.policy,
+            )
+            .await
+        }
+        "ptah_claim_work" => {
+            let args: ClaimWorkArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            orch.claim_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.lease_ms,
+            )
+            .await
+        }
+        "ptah_renew_work" => {
+            let args: WorkLeaseArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            require_nonempty(&args.attempt_id, "attempt_id")?;
+            require_nonempty(&args.lease_token, "lease_token")?;
+            orch.renew_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                &args.attempt_id,
+                &args.lease_token,
+                args.lease_ms,
+            )
+            .await
+        }
+        "ptah_link_work_run" => {
+            let args: LinkWorkRunArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            require_nonempty(&args.attempt_id, "attempt_id")?;
+            require_nonempty(&args.lease_token, "lease_token")?;
+            require_nonempty(&args.run_id, "run_id")?;
+            orch.link_work_run(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                &args.attempt_id,
+                &args.lease_token,
+                &args.run_id,
+            )
+            .await
+        }
+        "ptah_report_work_progress" => {
+            let args: WorkProgressArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            require_nonempty(&args.attempt_id, "attempt_id")?;
+            require_nonempty(&args.lease_token, "lease_token")?;
+            orch.report_work_progress(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                &args.attempt_id,
+                &args.lease_token,
+                args.summary,
+                args.percent,
+            )
+            .await
+        }
+        "ptah_release_work" => {
+            let args: WorkReasonArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            require_nonempty(&args.attempt_id, "attempt_id")?;
+            require_nonempty(&args.lease_token, "lease_token")?;
+            orch.release_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                &args.attempt_id,
+                &args.lease_token,
+                args.reason,
+            )
+            .await
+        }
+        "ptah_complete_work" | "ptah_fail_work" => {
+            let args: WorkResultArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            require_nonempty(&args.attempt_id, "attempt_id")?;
+            require_nonempty(&args.lease_token, "lease_token")?;
+            let result = WorkResult {
+                summary: args.summary,
+                evidence: args.evidence,
+                artifacts: args.artifacts,
+                failure: args.failure,
+                cancellation_reason: args.cancellation_reason,
+                completed_at: chrono::Utc::now(),
+            };
+            if name == "ptah_complete_work" {
+                orch.complete_work(
+                    auth,
+                    &args.request_id,
+                    args.session_id,
+                    &args.workspace,
+                    &args.work_id,
+                    &args.attempt_id,
+                    &args.lease_token,
+                    result,
+                )
+                .await
+            } else {
+                orch.fail_work(
+                    auth,
+                    &args.request_id,
+                    args.session_id,
+                    &args.workspace,
+                    &args.work_id,
+                    &args.attempt_id,
+                    &args.lease_token,
+                    result,
+                )
+                .await
+            }
+        }
+        "ptah_cancel_work" => {
+            let args: CancelWorkArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            require_nonempty(&args.reason, "reason")?;
+            orch.cancel_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.reason,
             )
             .await
         }

@@ -18,6 +18,9 @@ use crate::session::{SessionKind, WorkspaceStatus};
 use super::authz::{canonical_workspace, require_workspace_match, AuthContext, WorkspaceAllowlist};
 use super::store::{IdempotencyClaim, OrchStore};
 use super::types::*;
+use super::workload::{
+    WorkAttempt, WorkAttemptView, WorkDependency, WorkItem, WorkPolicy, WorkProgress, WorkResult,
+};
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
 /// queued submissions into an unbounded in-memory prompt store.
@@ -107,6 +110,13 @@ impl Drop for AdmissionGuard {
 enum IdempotencyStart {
     Perform(IdempotencyLease),
     Replay(serde_json::Value),
+}
+
+fn redact_claim_lease_token(mut response: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = response.as_object_mut() {
+        object.remove("leaseToken");
+    }
+    response
 }
 
 struct IdempotencyLease {
@@ -761,6 +771,676 @@ impl OrchestrationService {
             })
             .collect::<Vec<_>>();
         Ok(json!({ "runs": runs }))
+    }
+
+    // ── durable workloads ----------------------------------------------
+
+    fn authorize_work_read_scope(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<PathBuf, OrchError> {
+        let session = self
+            .host
+            .session_inspect(session_id)
+            .map_err(|_| OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"))?;
+        if session.kind != SessionKind::Build {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "only Build sessions can own durable work",
+            ));
+        }
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        require_workspace_match(&allowlist, cwd.as_deref(), workspace)
+    }
+
+    fn authorize_work_mutation_scope(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<PathBuf, OrchError> {
+        let session = self.require_build_session(session_id)?;
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        require_workspace_match(&allowlist, cwd.as_deref(), workspace)
+    }
+
+    fn load_work_scoped(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        allow_archived: bool,
+    ) -> Result<(WorkItem, PathBuf), OrchError> {
+        let claimed = if allow_archived {
+            self.authorize_work_read_scope(session_id, workspace)?
+        } else {
+            self.authorize_work_mutation_scope(session_id, workspace)?
+        };
+        let item = self
+            .store
+            .load_work_item(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown work_id"))?;
+        if item.session_id != session_id || item.workspace != claimed.display().to_string() {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "work item is outside the requested session scope",
+            ));
+        }
+        Ok((item, claimed))
+    }
+
+    fn workload_value(
+        &self,
+        item: WorkItem,
+        include_attempts: bool,
+    ) -> Result<serde_json::Value, OrchError> {
+        let attempts = if include_attempts {
+            self.store
+                .list_work_attempts(Some(&item.work_id))
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .iter()
+                .map(WorkAttemptView::from)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        Ok(json!({
+            "work": item,
+            "attempts": attempts,
+        }))
+    }
+
+    async fn begin_work_mutation(
+        &self,
+        tool: &str,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        payload: &serde_json::Value,
+    ) -> Result<(PathBuf, IdempotencyStart), OrchError> {
+        let claimed = match self.authorize_work_mutation_scope(session_id, workspace) {
+            Ok(path) => path,
+            Err(error) => {
+                self.audit_err(
+                    tool,
+                    Some(request_id),
+                    Some(session_id),
+                    Some(&workspace.display().to_string()),
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+        let payload_hash = hash_payload(payload);
+        let start = self
+            .begin_idempotency(tool, request_id, &payload_hash, session_id, &claimed)
+            .await?;
+        Ok((claimed, start))
+    }
+
+    pub fn list_work_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let work = self
+            .store
+            .list_work_items()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .into_iter()
+            .filter(|item| {
+                item.session_id == session_id && item.workspace == claimed.display().to_string()
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "work": work }))
+    }
+
+    pub fn get_work_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
+        self.workload_value(item, true)
+    }
+
+    fn restore_claim_response(
+        &self,
+        mut response: serde_json::Value,
+    ) -> Result<serde_json::Value, OrchError> {
+        let attempt: WorkAttemptView =
+            serde_json::from_value(response.get("attempt").cloned().ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "claim receipt omitted its durable attempt",
+                )
+            })?)
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "claim receipt contains an invalid durable attempt",
+                )
+            })?;
+        let actual = self
+            .store
+            .list_work_attempts(Some(&attempt.work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .into_iter()
+            .find(|candidate| candidate.attempt_id == attempt.attempt_id)
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "claim receipt no longer has a durable attempt",
+                )
+            })?;
+        let lease_secret = self.config.lock().bearer_token.clone();
+        if lease_secret.is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "claim lease cannot be recovered without the service credential",
+            ));
+        }
+        let lease_token = actual.lease_token_for_secret(&lease_secret);
+        if !actual.token_matches(&lease_token) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "claim lease cannot be recovered after credential rotation",
+            ));
+        }
+        response["leaseToken"] = serde_json::Value::String(lease_token);
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        kind: String,
+        objective: String,
+        priority: i32,
+        deadline: Option<chrono::DateTime<Utc>>,
+        parent_work_id: Option<String>,
+        dependencies: Vec<WorkDependency>,
+        policy: WorkPolicy,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_create_work";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "kind": kind,
+            "objective": objective,
+            "priority": priority,
+            "deadline": deadline,
+            "parentWorkId": parent_work_id,
+            "dependencies": dependencies,
+            "policy": policy,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let mut item = match WorkItem::new(
+            kind,
+            objective,
+            session_id,
+            claimed.display().to_string(),
+            &auth.token_id,
+            policy,
+        ) {
+            Ok(item) => item,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        item.priority = priority;
+        item.deadline = deadline;
+        item.parent_work_id = parent_work_id;
+        item.dependencies = dependencies;
+        if let Err(error) = item.validate() {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        if let Err(error) = self.store.save_work_item(&item) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(item.work_id.clone()),
+                session_id,
+                &claimed,
+                OrchError::new(OrchErrorCode::Internal, error.to_string()),
+            ));
+        }
+        let response = self.workload_value(item.clone(), false)?;
+        lease
+            .complete(Some(item.work_id.clone()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(&mut lease, Some(item.work_id), session_id, &claimed, error)
+            })?;
+        self.audit(
+            tool,
+            Some(request_id),
+            Some(session_id),
+            Some(&claimed.display().to_string()),
+            "accepted",
+            None,
+            "durable work item created",
+        );
+        Ok(response)
+    }
+
+    pub async fn claim_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        lease_ms: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_claim_work";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "leaseMs": lease_ms,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return self.restore_claim_response(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let item = match self.load_work_scoped(session_id, &claimed, work_id, false) {
+            Ok((item, _)) => item,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let lease_secret = self.config.lock().bearer_token.clone();
+        let claim = match self.store.claim_work_with_lease_secret(
+            work_id,
+            &auth.token_id,
+            lease_ms,
+            &lease_secret,
+        ) {
+            Ok(claim) => claim,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({
+            "work": claim.work,
+            "attempt": WorkAttemptView::from(&claim.attempt),
+            "leaseToken": claim.lease_token,
+            "sessionId": item.session_id,
+            "workspace": claimed.display().to_string(),
+        });
+        let persisted_response = redact_claim_lease_token(response.clone());
+        lease
+            .complete(Some(work_id.to_string()), persisted_response)
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    pub async fn renew_work(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        lease_ms: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_lease_mutation(
+            "ptah_renew_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({"attemptId": attempt_id, "leaseToken": lease_token, "leaseMs": lease_ms}),
+            |store| store.renew_work_lease(work_id, attempt_id, lease_token, lease_ms),
+        )
+        .await
+    }
+
+    async fn work_lease_mutation<F>(
+        &self,
+        tool: &str,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        details: serde_json::Value,
+        operation: F,
+    ) -> Result<serde_json::Value, OrchError>
+    where
+        F: FnOnce(&OrchStore) -> Result<WorkAttempt, OrchError>,
+    {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "details": details,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let attempt = match operation(&self.store) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({
+            "workId": work_id,
+            "attempt": WorkAttemptView::from(&attempt),
+            "sessionId": session_id,
+            "workspace": claimed.display().to_string(),
+        });
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    pub async fn link_work_run(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let response = self
+            .work_lease_mutation(
+                "ptah_link_work_run",
+                request_id,
+                session_id,
+                workspace,
+                work_id,
+                json!({"attemptId": attempt_id, "leaseToken": lease_token, "runId": run_id}),
+                |store| store.link_work_run(work_id, attempt_id, lease_token, &run.run_id),
+            )
+            .await?;
+        let _ = auth;
+        Ok(response)
+    }
+
+    pub async fn report_work_progress(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        summary: String,
+        percent: Option<u8>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let progress = WorkProgress {
+            summary,
+            percent,
+            updated_at: Utc::now(),
+        };
+        let payload_details =
+            json!({"attemptId": attempt_id, "leaseToken": lease_token, "progress": progress});
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "details": payload_details,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_report_work_progress",
+                request_id,
+                session_id,
+                workspace,
+                &payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let (item, attempt) =
+            match self
+                .store
+                .report_work_progress(work_id, attempt_id, lease_token, progress)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+                }
+            };
+        let response = json!({"work": item, "attempt": WorkAttemptView::from(&attempt)});
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    pub async fn release_work(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        reason: String,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_attempt_mutation(
+            "ptah_release_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({"attemptId": attempt_id, "leaseToken": lease_token, "reason": reason}),
+            |store| store.release_work(work_id, attempt_id, lease_token, &reason),
+        )
+        .await
+    }
+
+    pub async fn complete_work(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        result: WorkResult,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_attempt_mutation(
+            "ptah_complete_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({"attemptId": attempt_id, "leaseToken": lease_token, "result": result}),
+            |store| store.complete_work(work_id, attempt_id, lease_token, result),
+        )
+        .await
+    }
+
+    pub async fn fail_work(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        attempt_id: &str,
+        lease_token: &str,
+        result: WorkResult,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_attempt_mutation(
+            "ptah_fail_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({"attemptId": attempt_id, "leaseToken": lease_token, "result": result}),
+            |store| store.fail_work(work_id, attempt_id, lease_token, result),
+        )
+        .await
+    }
+
+    async fn work_item_attempt_mutation<F>(
+        &self,
+        tool: &str,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        details: serde_json::Value,
+        operation: F,
+    ) -> Result<serde_json::Value, OrchError>
+    where
+        F: FnOnce(&OrchStore) -> Result<(WorkItem, super::workload::WorkAttempt), OrchError>,
+    {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "details": details,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let (item, attempt) = match operation(&self.store) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({"work": item, "attempt": WorkAttemptView::from(&attempt)});
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    pub async fn cancel_work(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reason: String,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_cancel_work";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "reason": reason,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let (item, attempts) = match self.store.cancel_work(work_id, &reason) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let attempts = attempts
+            .iter()
+            .map(WorkAttemptView::from)
+            .collect::<Vec<_>>();
+        let response = json!({"work": item, "attempts": attempts});
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
     }
 
     pub fn get_persistent_agent_scoped(

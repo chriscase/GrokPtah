@@ -1,0 +1,91 @@
+# Durable workloads
+
+Issue #305 adds the first transport-neutral workload contract to the shared
+`grokptah-agent-bridge` runtime. It is the common contract for a local
+desktop, a local service, and a hosted service; those hosts must not maintain
+separate workload semantics or copies of the ledger.
+
+## The ownership model
+
+| Record | Durable responsibility | Product projection |
+| --- | --- | --- |
+| `WorkItem` | The intent, policy, dependencies, deadline, retry budget, current state, and result | A workload card/list item |
+| `WorkAttempt` | One claimant's lease, heartbeat, linked finite Runs, progress, and terminal outcome | Attempt history and live ownership |
+| Agent identity | Long-lived persona, authority, and memory identity | Persistent-agent area |
+| Session/Lane | Build context and workspace scope | A frequently archived development lane |
+| Run | One bounded execution of an attempt | Run inspector, events, tests, diff, and approval UI |
+
+Archiving a Lane changes its visibility and blocks new mutations through the
+service boundary. It does not delete or hide its durable workload history from
+authorized reads, and it does not retire the Agent identity. A future scheduler
+may attach a new Lane or Run to the same WorkItem without changing this
+ownership model.
+
+## State and lease contract
+
+Work starts in `queued`. Missing or unsuccessful dependencies make it
+`blocked`; once all dependencies are `succeeded`, it becomes claimable again.
+A successful claim creates an attempt and moves the item to `leased`.
+Progress moves both item and attempt to `running`. Completion moves to
+`succeeded`, unless `requiresApproval` is set, in which case the item and
+attempt stop at `awaiting_approval`. Failure either consumes a retry and
+returns to `queued` or becomes `failed`. Release returns an active attempt to
+`queued`; cancellation is terminal.
+
+Claims are lease-token scoped. The raw token is returned only in the claim
+response; only a hash is stored, and the hash is omitted from all API,
+desktop, and durable idempotency projections. A replay reconstructs the token
+from the authenticated service credential and durable attempt identity, then
+verifies it against the stored hash. An expired active lease is recorded as an
+`expired` attempt and can be retried when policy permits.
+
+The current store is a single-owner, file-backed JSON ledger protected by the
+existing exclusive store lock and atomic writes. It supports crash/reopen
+recovery and serializes competing claims. It intentionally accepts only one
+concurrent attempt per WorkItem in this first slice; a multi-node scheduler,
+database backend, and approval-decision operation remain follow-on work.
+
+## MCP/service surface
+
+Read tools:
+
+- `ptah_list_work(session_id, workspace)`
+- `ptah_get_work(session_id, workspace, work_id)`
+
+Mutation tools:
+
+- `ptah_create_work`
+- `ptah_claim_work`
+- `ptah_renew_work`
+- `ptah_link_work_run`
+- `ptah_report_work_progress`
+- `ptah_release_work`
+- `ptah_complete_work`
+- `ptah_fail_work`
+- `ptah_cancel_work`
+
+Mutating calls use the existing durable request-id/idempotency mechanism. A
+replayed request returns the original response; the same request ID with a
+different payload is rejected. The authenticated service currently exposes a
+single operator-equivalent bearer token, so claimant identity is the current
+auth token ID. Per-principal authorization is a separate security milestone.
+
+The desktop's remote-service adapter advertises and decodes the two read tools
+into typed `DurableWorkItem`, `DurableWorkAttempt`, and `RemoteWorkSnapshot`
+projections. It uses the same authenticated MCP boundary as other remote
+sessions and runs, so local and hosted deployments share the same wire
+contract.
+
+## Conformance evidence
+
+The bridge integration tests cover:
+
+- store reopen after an expired lease;
+- exactly one winner in a concurrent claim race;
+- dependency blocking and unblocking;
+- approval-aware completion;
+- duplicate claims, wrong tokens, and durable attempt history;
+- create and claim idempotency, including conflicting replay rejection;
+- omission of `leaseTokenHash` from protocol responses;
+- progress and completion through the live loopback MCP server;
+- authorized reads surviving Lane archival and mutation rejection after archive.
