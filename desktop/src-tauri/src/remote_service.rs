@@ -4,9 +4,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
-    AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RunExecutionMode, RunRecord,
-    RunScope, RunState, RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView,
-    WorkItem,
+    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient,
+    RoutineRecord, RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState,
+    RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -435,6 +435,104 @@ impl RemoteServiceState {
         ))
     }
 
+    pub async fn list_routines(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+    ) -> Result<Option<Vec<RoutineRecord>>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(client.list_routines(session_id, workspace).await?))
+    }
+
+    pub async fn get_routine(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        routine_id: String,
+    ) -> Result<Option<RoutineSnapshot>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .get_routine(session_id, workspace, routine_id)
+                .await?,
+        ))
+    }
+
+    pub async fn create_routine(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        name: String,
+        agent_id: String,
+        objective: String,
+    ) -> Result<Option<RoutineRecord>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .create_routine(
+                    session_id,
+                    workspace,
+                    name,
+                    agent_id,
+                    objective,
+                    Uuid::new_v4().to_string(),
+                )
+                .await?,
+        ))
+    }
+
+    pub async fn set_routine_lifecycle(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        routine_id: String,
+        lifecycle: String,
+        expected_revision: Option<u64>,
+    ) -> Result<Option<RoutineRecord>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .set_routine_lifecycle(
+                    session_id,
+                    workspace,
+                    routine_id,
+                    lifecycle,
+                    expected_revision,
+                    Uuid::new_v4().to_string(),
+                )
+                .await?,
+        ))
+    }
+
+    pub async fn fire_routine(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        routine_id: String,
+    ) -> Result<Option<ActivationRecord>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .fire_routine(session_id, workspace, routine_id, Uuid::new_v4().to_string())
+                .await?,
+        ))
+    }
+
     pub async fn cancel_work(
         &self,
         session_id: Uuid,
@@ -611,6 +709,14 @@ impl RemoteServiceClient {
             "ptah_retry_work",
             "ptah_approve_work",
             "ptah_cancel_work",
+            "ptah_create_routine",
+            "ptah_list_routines",
+            "ptah_get_routine",
+            "ptah_fire_routine",
+            "ptah_pause_routine",
+            "ptah_enable_routine",
+            "ptah_disable_routine",
+            "ptah_list_activations",
             "ptah_get_events",
             "ptah_steer",
             "ptah_cancel",
@@ -1021,6 +1127,146 @@ impl RemoteServiceClient {
                 .ok_or_else(|| anyhow::anyhow!("remote cancellation omitted work"))?,
         )
         .context("decode remote work cancellation")
+    }
+
+    async fn list_routines(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+    ) -> Result<Vec<RoutineRecord>> {
+        let value = self
+            .call_tool(
+                "ptah_list_routines",
+                json!({"session_id": session_id, "workspace": workspace}),
+            )
+            .await?;
+        serde_json::from_value(
+            value
+                .get("routines")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote routine list omitted routines"))?,
+        )
+        .context("decode remote routines")
+    }
+
+    async fn get_routine(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        routine_id: String,
+    ) -> Result<RoutineSnapshot> {
+        let value = self
+            .call_tool(
+                "ptah_get_routine",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "routine_id": routine_id,
+                }),
+            )
+            .await?;
+        serde_json::from_value(value).context("decode remote routine snapshot")
+    }
+
+    async fn create_routine(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        name: String,
+        agent_id: String,
+        objective: String,
+        request_id: String,
+    ) -> Result<RoutineRecord> {
+        let template = grokptah_agent_bridge::WorkTemplate {
+            kind: "routine".into(),
+            objective,
+            priority: 0,
+            policy: WorkPolicy::default(),
+        };
+        let value = self
+            .call_tool(
+                "ptah_create_routine",
+                json!({
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "name": name,
+                    "agent_id": agent_id,
+                    "trigger": { "kind": "manual" },
+                    "work_template": template,
+                }),
+            )
+            .await?;
+        serde_json::from_value(
+            value
+                .get("routine")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote create routine omitted routine"))?,
+        )
+        .context("decode remote routine creation")
+    }
+
+    async fn set_routine_lifecycle(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        routine_id: String,
+        lifecycle: String,
+        expected_revision: Option<u64>,
+        request_id: String,
+    ) -> Result<RoutineRecord> {
+        let tool = match lifecycle.as_str() {
+            "enabled" => "ptah_enable_routine",
+            "paused" => "ptah_pause_routine",
+            "disabled" => "ptah_disable_routine",
+            _ => bail!("lifecycle must be enabled, paused, or disabled"),
+        };
+        let value = self
+            .call_tool(
+                tool,
+                json!({
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "routine_id": routine_id,
+                    "expected_revision": expected_revision,
+                }),
+            )
+            .await?;
+        serde_json::from_value(
+            value
+                .get("routine")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote routine lifecycle omitted routine"))?,
+        )
+        .context("decode remote routine lifecycle")
+    }
+
+    async fn fire_routine(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        routine_id: String,
+        request_id: String,
+    ) -> Result<ActivationRecord> {
+        let value = self
+            .call_tool(
+                "ptah_fire_routine",
+                json!({
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "routine_id": routine_id,
+                }),
+            )
+            .await?;
+        serde_json::from_value(
+            value
+                .get("activation")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote fire omitted activation"))?,
+        )
+        .context("decode remote routine fire")
     }
 
     async fn get_run(

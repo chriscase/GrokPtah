@@ -138,7 +138,11 @@ new automatic tools, and records `legacy_migration` attribution.
 
 ## Explicit non-goals
 
-This protocol does not add a scheduler, unattended auto-resume, auto-approval,
+Routine activation (#306) may create eligible Work for an Agent. It does not
+resume an interrupted model invocation, approve tools, grant Computer Use, or
+promote code. See [DURABLE_ROUTINES.md](DURABLE_ROUTINES.md).
+
+This protocol does not add unattended auto-resume, auto-approval,
 auto-promotion, or broader Computer Use permissions. A local or hosted service
 may host the same records and finite Run contract, but deployment does not
 create authority. Those boundaries are described in

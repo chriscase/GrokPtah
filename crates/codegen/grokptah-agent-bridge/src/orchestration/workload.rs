@@ -303,6 +303,13 @@ pub struct WorkItem {
     pub result: Option<WorkResult>,
     #[serde(default)]
     pub approval: Option<WorkApproval>,
+    /// Optional durable link to the routine that created this item. Absent on
+    /// operator-created work. Adding these fields is a compatible schema
+    /// extension for issue #306; existing items deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_routine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_activation_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -316,7 +323,26 @@ impl WorkItem {
         created_by: impl Into<String>,
         policy: WorkPolicy,
     ) -> Result<Self, OrchError> {
-        let now = Utc::now();
+        Self::new_at(
+            kind,
+            objective,
+            session_id,
+            workspace,
+            created_by,
+            policy,
+            Utc::now(),
+        )
+    }
+
+    pub fn new_at(
+        kind: impl Into<String>,
+        objective: impl Into<String>,
+        session_id: Uuid,
+        workspace: impl Into<String>,
+        created_by: impl Into<String>,
+        policy: WorkPolicy,
+        now: DateTime<Utc>,
+    ) -> Result<Self, OrchError> {
         let item = Self {
             schema_version: WORKLOAD_SCHEMA_VERSION,
             work_id: Uuid::new_v4().to_string(),
@@ -337,6 +363,8 @@ impl WorkItem {
             progress: None,
             result: None,
             approval: None,
+            source_routine_id: None,
+            source_activation_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -395,6 +423,12 @@ impl WorkItem {
         if let Some(approval) = &self.approval {
             approval.validate()?;
         }
+        if let Some(routine_id) = &self.source_routine_id {
+            validate_id(routine_id, "source_routine_id")?;
+        }
+        if let Some(activation_id) = &self.source_activation_id {
+            validate_id(activation_id, "source_activation_id")?;
+        }
         Ok(())
     }
 
@@ -407,8 +441,12 @@ impl WorkItem {
     }
 
     pub fn bump(&mut self) {
+        self.bump_at(Utc::now());
+    }
+
+    pub fn bump_at(&mut self, now: DateTime<Utc>) {
         self.revision = self.revision.saturating_add(1);
-        self.updated_at = Utc::now();
+        self.updated_at = now;
     }
 }
 

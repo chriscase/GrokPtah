@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use std::sync::Arc as StdArc;
+
+use super::routine::{Clock, RoutineFireReport, SystemClock};
 use super::store::OrchStore;
 use super::workload::WorkloadReconciliationReport;
 use chrono::{DateTime, Utc};
@@ -17,6 +20,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 pub const DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
+pub const DEFAULT_ROUTINE_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,6 +127,127 @@ fn reconcile_once(store: &OrchStore, state: &Arc<Mutex<SupervisorState>>) {
     let now = Utc::now();
     state.lock().status.last_run_at = Some(now);
     match store.reconcile_workloads_at(now) {
+        Ok(report) => {
+            let mut state = state.lock();
+            state.status.last_success_at = Some(now);
+            state.status.last_error = None;
+            state.status.last_report = report;
+        }
+        Err(error) => {
+            state.lock().status.last_error = Some(error.to_string());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineSupervisorStatus {
+    pub enabled: bool,
+    pub interval_ms: u64,
+    pub started_at: Option<DateTime<Utc>>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub last_report: RoutineFireReport,
+}
+
+impl RoutineSupervisorStatus {
+    pub fn disabled(interval: Duration) -> Self {
+        Self {
+            enabled: false,
+            interval_ms: interval.as_millis().min(u64::MAX as u128) as u64,
+            started_at: None,
+            last_run_at: None,
+            last_success_at: None,
+            last_error: None,
+            last_report: RoutineFireReport::default(),
+        }
+    }
+}
+
+struct RoutineSupervisorState {
+    status: RoutineSupervisorStatus,
+}
+
+/// Runtime-home owner tick loop. Desktop UI timers are not used.
+pub struct RoutineSupervisor {
+    stop: Option<SyncSender<()>>,
+    task: Option<JoinHandle<()>>,
+    state: Arc<Mutex<RoutineSupervisorState>>,
+}
+
+impl RoutineSupervisor {
+    pub fn start(store: OrchStore, interval: Duration) -> Option<Self> {
+        Self::start_with_clock(store, interval, StdArc::new(SystemClock))
+    }
+
+    pub fn start_with_clock(
+        store: OrchStore,
+        interval: Duration,
+        clock: StdArc<dyn Clock>,
+    ) -> Option<Self> {
+        let interval = if interval.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            interval
+        };
+        let started_at = clock.now();
+        let state = Arc::new(Mutex::new(RoutineSupervisorState {
+            status: RoutineSupervisorStatus {
+                enabled: true,
+                interval_ms: interval.as_millis().min(u64::MAX as u128) as u64,
+                started_at: Some(started_at),
+                last_run_at: None,
+                last_success_at: None,
+                last_error: None,
+                last_report: RoutineFireReport::default(),
+            },
+        }));
+        fire_once(&store, &state, clock.as_ref());
+        let (stop_tx, stop_rx) = sync_channel(1);
+        let task_state = state.clone();
+        let task = thread::Builder::new()
+            .name("grokptah-routine-supervisor".into())
+            .spawn(move || loop {
+                match stop_rx.recv_timeout(interval) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        fire_once(&store, &task_state, clock.as_ref())
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self {
+            stop: Some(stop_tx),
+            task: Some(task),
+            state,
+        })
+    }
+
+    pub fn status(&self) -> RoutineSupervisorStatus {
+        self.state.lock().status.clone()
+    }
+
+    pub fn stop_and_wait(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
+impl Drop for RoutineSupervisor {
+    fn drop(&mut self) {
+        self.stop_and_wait();
+    }
+}
+
+fn fire_once(store: &OrchStore, state: &Arc<Mutex<RoutineSupervisorState>>, clock: &dyn Clock) {
+    let now = clock.now();
+    state.lock().status.last_run_at = Some(now);
+    match store.fire_due_routines_at(now) {
         Ok(report) => {
             let mut state = state.lock();
             state.status.last_success_at = Some(now);

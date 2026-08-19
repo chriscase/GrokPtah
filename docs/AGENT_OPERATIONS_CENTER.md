@@ -52,3 +52,6 @@ second ledger:
    after individual Lanes are archived.
 4. Exercise local desktop, local service, and hosted service flows with restart,
    reconnect, lease expiry, archival, approval, and narrow-window fixtures.
+5. Keep the Routines panel request-only: create, inspect, manual fire, pause,
+   enable, and disable. The runtime-home owner remains the only scheduler. See
+   [DURABLE_ROUTINES.md](DURABLE_ROUTINES.md).

@@ -4,6 +4,7 @@
 
 mod authz;
 mod continuation;
+mod routine;
 mod service;
 mod store;
 mod supervisor;
@@ -21,11 +22,20 @@ pub use continuation::{
     ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef,
     CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
 };
+pub use routine::{
+    occurrence_dedupe_key, ActivationCause, ActivationDisposition, ActivationRecord,
+    ActivationRequest, CapturedActivationPolicy, Clock, ExternalAdapterKind, FakeClock,
+    MissedRunPolicy, OverlapPolicy, RoutineConcurrencyPolicy, RoutineFireReport, RoutineLifecycle,
+    RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger, SystemClock, WorkTemplate,
+    ROUTINE_SCHEMA_VERSION,
+};
 pub(crate) use service::apply_run_aggregate;
 pub use service::{OrchestrationConfig, OrchestrationService};
+pub(crate) use store::workspaces_match;
 pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
 pub use supervisor::{
-    WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
+    RoutineSupervisor, RoutineSupervisorStatus, WorkloadSupervisor, WorkloadSupervisorStatus,
+    DEFAULT_ROUTINE_TICK_INTERVAL, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
 };
 pub use types::{
     hash_payload, is_recognized_test_command, merge_bounds, prompt_preview, reject_control_prompt,

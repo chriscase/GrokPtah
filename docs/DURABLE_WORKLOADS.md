@@ -17,9 +17,9 @@ separate workload semantics or copies of the ledger.
 
 Archiving a Lane changes its visibility and blocks new mutations through the
 service boundary. It does not delete or hide its durable workload history from
-authorized reads, and it does not retire the Agent identity. A future scheduler
-may attach a new Lane or Run to the same WorkItem without changing this
-ownership model.
+authorized reads, and it does not retire the Agent identity. A routine activation
+may attach a new WorkItem to the same Agent and Lane without changing this
+ownership model. See [DURABLE_ROUTINES.md](DURABLE_ROUTINES.md).
 
 ## State and lease contract
 

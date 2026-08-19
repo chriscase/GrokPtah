@@ -60,6 +60,10 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
     assert!(
         readiness_json["capacity"]["health"]["workloadSupervisor"]["lastSuccessAt"].is_string()
     );
+    assert_eq!(
+        readiness_json["capacity"]["health"]["routineSupervisor"]["enabled"],
+        true
+    );
 
     let mut client = McpControlClient::new(base, "standalone-service-token");
     client.initialize().await.unwrap();
@@ -70,6 +74,8 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
     assert!(tools.iter().any(|tool| tool.name == "ptah_create_session"));
     assert!(tools.iter().any(|tool| tool.name == "ptah_submit_task"));
     assert!(tools.iter().any(|tool| tool.name == "ptah_list_runs"));
+    assert!(tools.iter().any(|tool| tool.name == "ptah_create_routine"));
+    assert!(tools.iter().any(|tool| tool.name == "ptah_fire_routine"));
 
     let created = client
         .call_tool(

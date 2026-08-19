@@ -34,7 +34,7 @@ locally or connect to one authoritative local/private-cloud agent home.
 ┌──────────────────────────▼───────────────────────────────┐
 │ grokptah-agent-bridge                                    │
 │ sessions · finite runs · agents · memory · policy        │
-│ durable events · isolation/review/promotion · tools      │
+│ durable events · workloads · routines · isolation/review │
 └──────────────────────────┬───────────────────────────────┘
                            │ provider/profile + tool integrations
 ┌──────────────────────────▼───────────────────────────────┐
