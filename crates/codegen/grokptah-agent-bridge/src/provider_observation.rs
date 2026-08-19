@@ -6,6 +6,7 @@
 
 use serde::ser::Serializer;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -214,6 +215,14 @@ impl OpaqueScopeId {
             return Err(ObservationError::InvalidScopeIdentifier);
         }
         Ok(Self(value.to_owned()))
+    }
+
+    /// Derive a stable opaque scope from a durable identifier that is not
+    /// itself safe to retain. Desktop Run IDs have a `desktop-` prefix, for
+    /// example; hashing keeps the observation scope deterministic without
+    /// widening the accepted wire grammar or storing the identifier.
+    pub fn from_stable_input(value: &str) -> Self {
+        Self(format!("{:x}", Sha256::digest(value.as_bytes())))
     }
 }
 
@@ -691,7 +700,7 @@ impl ProviderObservationSession {
             observer: self.observer.clone(),
             scope: ObservationScope::new(
                 self.campaign_id.clone(),
-                OpaqueScopeId::new(run_id)?,
+                OpaqueScopeId::from_stable_input(run_id),
                 OpaqueScopeId::new(&lane_id.to_string())?,
             ),
             next_attempt: self.next_attempt.clone(),
@@ -962,6 +971,23 @@ mod tests {
         assert!(OpaqueIdentity::new(&format!("opaque-{HASH_A}")).is_ok());
         assert!(EndpointFingerprint::new(HASH_B).is_ok());
         assert!(EndpointFingerprint::new("https://gateway.example").is_err());
+    }
+
+    #[test]
+    fn durable_run_ids_are_hashed_into_opaque_context_scopes() {
+        let recorder = InMemoryObservationRecorder::new(1).unwrap();
+        let session = ProviderObservationSession::new(
+            EvidenceMode::MetadataOnly,
+            OpaqueScopeId::new("018f1234-5678-7abc-8def-0123456789ab").unwrap(),
+            recorder.observer(),
+        );
+        let context = session
+            .context("desktop-018f1234-5678-7abc-8def-0123456789ac", Uuid::nil())
+            .unwrap();
+        let attempt = context.begin_attempt().unwrap();
+        let encoded = serde_json::to_string(attempt.scope().run_id()).unwrap();
+        assert!(!encoded.contains("desktop-"));
+        assert_eq!(encoded.len(), 66); // quoted 64-character SHA-256 digest
     }
 
     #[test]
