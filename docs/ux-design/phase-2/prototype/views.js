@@ -655,7 +655,7 @@ function modalContent(kind, arg) {
         '<p class="chip tone-info">D04 contract · Build Lanes only</p>' +
         "<p>The Lane keeps its transcript, Runs, and checkpoints exactly as they are. " +
         esc(agent.name) + " becomes the current owner and the Lane appears in that Agent’s Lane list.</p>" +
-        "<p class=\"soft\">This does not change the Agent’s primary resume Lane or workspace. Cross-Lane checkpoint continuation remains blocked until #297; Agent-to-Agent reassignment is not offered.</p>",
+        "<p class=\"soft\">This does not change the Agent’s primary resume Lane or source workspace. The Agent may continue from an associated Lane only when the checkpoint and workspace validate; Agent-to-Agent reassignment is not offered.</p>",
       confirm: "Assign Agent",
       confirmClass: "btn-primary",
     };
