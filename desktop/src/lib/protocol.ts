@@ -313,6 +313,8 @@ export interface DurableWorkItem {
   progress?: DurableWorkProgress | null;
   result?: DurableWorkResult | null;
   approval?: DurableWorkApproval | null;
+  sourceRoutineId?: string | null;
+  sourceActivationId?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -339,6 +341,76 @@ export interface DurableWorkAttempt {
 export interface RemoteWorkSnapshot {
   work: DurableWorkItem;
   attempts: DurableWorkAttempt[];
+}
+
+export type RoutineLifecycle = "enabled" | "paused" | "disabled";
+export type MissedRunPolicy = "skip" | "coalesce" | "catch_up";
+export type ActivationDisposition =
+  | "created_work"
+  | "deduplicated"
+  | "skipped_paused"
+  | "skipped_disabled"
+  | "skipped_overlap"
+  | "skipped_missed"
+  | "skipped_expired"
+  | "rejected"
+  | "backoff"
+  | "circuit_open";
+
+export interface DurableRoutine {
+  schemaVersion: number;
+  routineId: string;
+  name: string;
+  agentId: string;
+  sessionId: string;
+  workspace: string;
+  lifecycle: RoutineLifecycle;
+  trigger: { kind: string; [key: string]: unknown };
+  workTemplate: {
+    kind: string;
+    objective: string;
+    priority: number;
+    policy: DurableWorkPolicy;
+  };
+  missedRunPolicy: MissedRunPolicy;
+  concurrency: { maxInFlight: number; overlap: string };
+  retry: { backoffMs: number; maxBackoffMs: number; circuitFailures: number };
+  revision: number;
+  nextFireAt?: string | null;
+  lastFireAt?: string | null;
+  consecutiveFailures: number;
+  circuitOpen: boolean;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DurableActivation {
+  schemaVersion: number;
+  activationId: string;
+  routineId: string;
+  routineRevision: number;
+  triggerKind: string;
+  dedupeKey: string;
+  scheduledAt: string;
+  receivedAt: string;
+  firedAt: string;
+  workId?: string | null;
+  disposition: ActivationDisposition;
+  error?: string | null;
+  capturedPolicy: {
+    routineRevision: number;
+    agentId?: string | null;
+    agentSpecRevision?: number | null;
+    computerUseAllowed: boolean;
+    autoApproveTools: boolean;
+  };
+  createdBy: string;
+}
+
+export interface RemoteRoutineSnapshot {
+  routine: DurableRoutine;
+  activations: DurableActivation[];
 }
 
 export interface RemoteRunScope {

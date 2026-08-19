@@ -16,8 +16,10 @@ import {
   type DurableRun,
   type DurableRunEvent,
   type DurableWorkItem,
+  type DurableRoutine,
   type LaneSummary,
   type RemoteWorkSnapshot,
+  type RemoteRoutineSnapshot,
   type RemoteSessionTarget,
   type RunOrigin,
   type WorkspaceStatus,
@@ -46,6 +48,7 @@ import { PromptQueuePanel } from "./components/PromptQueuePanel";
 import { RunInspector } from "./components/RunInspector";
 import { PersistentAgentPanel } from "./components/PersistentAgentPanel";
 import { WorkBoard } from "./components/WorkBoard";
+import { RoutineBoard } from "./components/RoutineBoard";
 import { SubagentCard } from "./components/SubagentCard";
 import {
   appendDeny,
@@ -357,6 +360,11 @@ export default function App() {
   const [workSnapshot, setWorkSnapshot] = useState<RemoteWorkSnapshot | null>(null);
   const [workError, setWorkError] = useState<string | null>(null);
   const [workBusy, setWorkBusy] = useState(false);
+  const [routines, setRoutines] = useState<DurableRoutine[]>([]);
+  const [selectedRoutineId, setSelectedRoutineId] = useState<string | null>(null);
+  const [routineSnapshot, setRoutineSnapshot] = useState<RemoteRoutineSnapshot | null>(null);
+  const [routineError, setRoutineError] = useState<string | null>(null);
+  const [routineBusy, setRoutineBusy] = useState(false);
   const [persistentAgents, setPersistentAgents] = useState<import("./lib/protocol").PersistentAgent[]>([]);
   const [persistentAgentsBusy, setPersistentAgentsBusy] = useState(false);
   const [persistentAgentsError, setPersistentAgentsError] = useState<string | null>(null);
@@ -1001,6 +1009,95 @@ export default function App() {
     ],
   );
 
+  const refreshRoutineItem = useCallback(
+    async (routineId: string) => {
+      const lane =
+        executionTarget === "remote" && selectedRemoteLane
+          ? selectedRemoteLane
+          : activeLane;
+      const sessionId = lane?.session_id ?? activeSessionId;
+      if (!sessionId) {
+        setRoutineSnapshot(null);
+        return;
+      }
+      try {
+        const snapshot =
+          executionTarget === "remote" && remoteServiceStatus.connected && lane
+            ? await api.remoteServiceRoutineGet(sessionId, lane.cwd, routineId)
+            : await api.routineGet(sessionId, routineId);
+        setRoutineSnapshot(snapshot);
+        setRoutineError(null);
+      } catch (error) {
+        setRoutineSnapshot(null);
+        setRoutineError(`Could not open routine: ${String(error)}`);
+      }
+    },
+    [activeLane, activeSessionId, executionTarget, remoteServiceStatus.connected, selectedRemoteLane],
+  );
+
+  const refreshRoutines = useCallback(async () => {
+    const lane =
+      executionTarget === "remote" && selectedRemoteLane
+        ? selectedRemoteLane
+        : activeLane;
+    const sessionId = lane?.session_id ?? activeSessionId;
+    if (!sessionId) {
+      setRoutines([]);
+      setSelectedRoutineId(null);
+      setRoutineSnapshot(null);
+      setRoutineError(null);
+      return;
+    }
+    setRoutineBusy(true);
+    try {
+      const items =
+        executionTarget === "remote" && remoteServiceStatus.connected && lane
+          ? await api.remoteServiceRoutineList(sessionId, lane.cwd)
+          : await api.routineList(sessionId);
+      setRoutines(items);
+      setSelectedRoutineId((current) =>
+        current && items.some((item) => item.routineId === current)
+          ? current
+          : items[0]?.routineId ?? null,
+      );
+      setRoutineError(null);
+    } catch (error) {
+      setRoutineError(`Could not refresh routines: ${String(error)}`);
+    } finally {
+      setRoutineBusy(false);
+    }
+  }, [activeLane, activeSessionId, executionTarget, remoteServiceStatus.connected, selectedRemoteLane]);
+
+  const mutateRoutine = useCallback(
+    async (action: (sessionId: string, workspace: string, remote: boolean) => Promise<void>) => {
+      const lane =
+        executionTarget === "remote" && selectedRemoteLane
+          ? selectedRemoteLane
+          : activeLane;
+      const sessionId = lane?.session_id ?? activeSessionId;
+      const remote = executionTarget === "remote";
+      if (!sessionId || !lane?.cwd) throw new Error("Select a Build Lane with a workspace first");
+      if (remote && !remoteServiceStatus.connected) {
+        throw new Error("The remote service is disconnected");
+      }
+      await action(sessionId, lane.cwd, remote);
+      await refreshRoutines();
+      if (selectedRoutineId) await refreshRoutineItem(selectedRoutineId);
+      await refreshWork();
+    },
+    [
+      activeLane,
+      activeSessionId,
+      executionTarget,
+      refreshRoutineItem,
+      refreshRoutines,
+      refreshWork,
+      remoteServiceStatus.connected,
+      selectedRemoteLane,
+      selectedRoutineId,
+    ],
+  );
+
   useEffect(() => {
     if (rightTab !== "work" || !selectedWorkId) {
       if (!selectedWorkId) setWorkSnapshot(null);
@@ -1012,9 +1109,18 @@ export default function App() {
   useEffect(() => {
     if (rightTab !== "work") return;
     void refreshWork();
-    const timer = window.setInterval(() => void refreshWork(), 2500);
+    void refreshRoutines();
+    const timer = window.setInterval(() => {
+      void refreshWork();
+      void refreshRoutines();
+    }, 2500);
     return () => window.clearInterval(timer);
-  }, [refreshWork, rightTab]);
+  }, [refreshRoutines, refreshWork, rightTab]);
+
+  useEffect(() => {
+    if (rightTab !== "work" || !selectedRoutineId) return;
+    void refreshRoutineItem(selectedRoutineId);
+  }, [refreshRoutineItem, rightTab, selectedRoutineId]);
 
   const permissionScope = useMemo(() => {
     if (!permission) return undefined;
@@ -4316,6 +4422,58 @@ export default function App() {
               setRightTab("tasks");
               void loadRight("tasks");
             }}
+          />
+        )}
+        {rightTab === "work" && (
+          <RoutineBoard
+            items={routines}
+            selectedRoutineId={selectedRoutineId}
+            snapshot={routineSnapshot}
+            busy={routineBusy}
+            error={routineError}
+            defaultAgentId={workScope.agentLabel ?? ""}
+            mutationsEnabled={Boolean(
+              !activeLaneArchived &&
+                workScope.laneId &&
+                workScope.workspacePath &&
+                (executionTarget !== "remote" || remoteServiceStatus.connected),
+            )}
+            onRefresh={() => void refreshRoutines()}
+            onSelect={(routineId) => {
+              setSelectedRoutineId(routineId);
+              void refreshRoutineItem(routineId);
+            }}
+            onCreate={(name, agentId, objective) =>
+              mutateRoutine((sessionId, workspace, remote) =>
+                remote
+                  ? api.remoteServiceRoutineCreate(sessionId, workspace, name, agentId, objective).then(() => undefined)
+                  : api.routineCreate(sessionId, name, agentId, objective).then(() => undefined),
+              )
+            }
+            onSetLifecycle={(routineId, lifecycle, expectedRevision) =>
+              mutateRoutine((sessionId, workspace, remote) =>
+                remote
+                  ? api
+                      .remoteServiceRoutineSetLifecycle(
+                        sessionId,
+                        workspace,
+                        routineId,
+                        lifecycle,
+                        expectedRevision,
+                      )
+                      .then(() => undefined)
+                  : api
+                      .routineSetLifecycle(sessionId, routineId, lifecycle, expectedRevision)
+                      .then(() => undefined),
+              )
+            }
+            onFire={(routineId) =>
+              mutateRoutine((sessionId, workspace, remote) =>
+                remote
+                  ? api.remoteServiceRoutineFire(sessionId, workspace, routineId).then(() => undefined)
+                  : api.routineFire(sessionId, routineId).then(() => undefined),
+              )
+            }
           />
         )}
 

@@ -838,6 +838,120 @@ async fn desktop_contract_lists_history_after_active_pointer_changes() {
     handle.stop_and_wait().await;
 }
 
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn hosted_service_exposes_the_same_routine_state_as_local_store() {
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+    let handle = start_isolated(&env, vec![workspace.clone()], 2).await;
+    let mut client = mcp_client(handle.addr).await;
+    let session_id = create_build_session(&mut client, &workspace, "Routine session").await;
+    let agent = handle
+        .host()
+        .ensure_session_agent(session_id)
+        .expect("persistent agent");
+
+    let tools = client.list_tools().await.unwrap();
+    for required in [
+        "ptah_create_routine",
+        "ptah_list_routines",
+        "ptah_get_routine",
+        "ptah_fire_routine",
+        "ptah_pause_routine",
+        "ptah_enable_routine",
+        "ptah_disable_routine",
+        "ptah_list_activations",
+    ] {
+        assert!(
+            tools.iter().any(|tool| tool.name == required),
+            "missing {required}"
+        );
+    }
+
+    let created = client
+        .call_tool(
+            "ptah_create_routine",
+            json!({
+                "request_id": "service-routine-create",
+                "session_id": session_id,
+                "workspace": workspace,
+                "name": "hosted-manual",
+                "agent_id": agent.agent_id,
+                "trigger": { "kind": "manual" },
+                "work_template": {
+                    "kind": "routine",
+                    "objective": "Hosted and local paths share routine state",
+                    "policy": {
+                        "bounds": {
+                            "maxPromptBytes": 100000,
+                            "maxRounds": 4,
+                            "maxDurationMs": 60000
+                        },
+                        "retry": {
+                            "maxAttempts": 3,
+                            "retryFailed": true,
+                            "retryExpired": true,
+                            "backoffMs": 0
+                        },
+                        "requiresApproval": false,
+                        "maxConcurrentAttempts": 1
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!created.is_error, "{:?}", created.raw);
+    let routine_id = created.structured["routine"]["routineId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let local = handle
+        .host()
+        .get_routine_snapshot(session_id, &routine_id)
+        .unwrap()
+        .expect("local snapshot");
+    assert_eq!(local.routine.routine_id, routine_id);
+    assert_eq!(local.routine.name, "hosted-manual");
+
+    let fired = client
+        .call_tool(
+            "ptah_fire_routine",
+            json!({
+                "request_id": "service-routine-fire",
+                "session_id": session_id,
+                "workspace": workspace,
+                "routine_id": routine_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fired.structured["activation"]["disposition"], "created_work");
+    let work_id = fired.structured["activation"]["workId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let work = handle
+        .host()
+        .get_work_item_snapshot(session_id, &work_id)
+        .unwrap()
+        .expect("local work");
+    assert_eq!(work.work.source_routine_id.as_deref(), Some(routine_id.as_str()));
+
+    let capacity = client
+        .call_tool("ptah_get_capacity", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        capacity.structured["health"]["routineSupervisor"]["enabled"],
+        true
+    );
+
+    client.close_session().await.unwrap();
+    handle.stop_and_wait().await;
+}
+
 async fn wait_run_not_queued(
     client: &mut McpControlClient,
     session_id: Uuid,

@@ -30,7 +30,10 @@ import type {
   RemoteRunScope,
   RemoteTaskSubmission,
   DurableWorkItem,
+  DurableRoutine,
   RemoteWorkSnapshot,
+  RemoteRoutineSnapshot,
+  DurableActivation,
 } from "./protocol";
 import type {
   PromptQueueEntry,
@@ -209,6 +212,68 @@ export const api = {
       workId,
       reason,
       expectedRevision: expectedRevision ?? null,
+    }),
+  routineList: (sessionId: string) =>
+    invoke<DurableRoutine[]>("routine_list", { sessionId }),
+  routineGet: (sessionId: string, routineId: string) =>
+    invoke<RemoteRoutineSnapshot | null>("routine_get", { sessionId, routineId }),
+  routineCreate: (sessionId: string, name: string, agentId: string, objective: string) =>
+    invoke<DurableRoutine>("routine_create", { sessionId, name, agentId, objective }),
+  routineSetLifecycle: (
+    sessionId: string,
+    routineId: string,
+    lifecycle: "enabled" | "paused" | "disabled",
+    expectedRevision?: number,
+  ) =>
+    invoke<DurableRoutine>("routine_set_lifecycle", {
+      sessionId,
+      routineId,
+      lifecycle,
+      expectedRevision: expectedRevision ?? null,
+    }),
+  routineFire: (sessionId: string, routineId: string) =>
+    invoke<DurableActivation>("routine_fire", { sessionId, routineId }),
+  remoteServiceRoutineList: (sessionId: string, workspace: string) =>
+    invoke<DurableRoutine[]>("remote_service_routine_list", { sessionId, workspace }),
+  remoteServiceRoutineGet: (sessionId: string, workspace: string, routineId: string) =>
+    invoke<RemoteRoutineSnapshot>("remote_service_routine_get", {
+      sessionId,
+      workspace,
+      routineId,
+    }),
+  remoteServiceRoutineCreate: (
+    sessionId: string,
+    workspace: string,
+    name: string,
+    agentId: string,
+    objective: string,
+  ) =>
+    invoke<DurableRoutine>("remote_service_routine_create", {
+      sessionId,
+      workspace,
+      name,
+      agentId,
+      objective,
+    }),
+  remoteServiceRoutineSetLifecycle: (
+    sessionId: string,
+    workspace: string,
+    routineId: string,
+    lifecycle: "enabled" | "paused" | "disabled",
+    expectedRevision?: number,
+  ) =>
+    invoke<DurableRoutine>("remote_service_routine_set_lifecycle", {
+      sessionId,
+      workspace,
+      routineId,
+      lifecycle,
+      expectedRevision: expectedRevision ?? null,
+    }),
+  remoteServiceRoutineFire: (sessionId: string, workspace: string, routineId: string) =>
+    invoke<DurableActivation>("remote_service_routine_fire", {
+      sessionId,
+      workspace,
+      routineId,
     }),
   remoteServiceRunGet: (sessionId: string, workspace: string, runId: string) =>
     invoke<DurableRun>("remote_service_run_get", { sessionId, workspace, runId }),

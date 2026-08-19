@@ -221,6 +221,14 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_steer_queued` | mutate | `request_id`, `session_id`, `workspace`, `entry_id`, `expected_version` |
 | `ptah_steer` | mutate | `request_id`, `session_id`, `workspace`, `text` |
 | `ptah_cancel` | mutate | `request_id`, `session_id`, `workspace`, `run_id` |
+| `ptah_create_routine` | mutate | `request_id`, `session_id`, `workspace`, `name`, `agent_id`, `trigger`, `work_template` |
+| `ptah_list_routines` | read | `session_id`, `workspace` |
+| `ptah_get_routine` | read | `session_id`, `workspace`, `routine_id` |
+| `ptah_list_activations` | read | `session_id`, `workspace`, `routine_id` |
+| `ptah_fire_routine` | mutate | `request_id`, `session_id`, `workspace`, `routine_id`; optional `payload` |
+| `ptah_pause_routine` | mutate | `request_id`, `session_id`, `workspace`, `routine_id`; optional `expected_revision` |
+| `ptah_enable_routine` | mutate | `request_id`, `session_id`, `workspace`, `routine_id`; optional `expected_revision` |
+| `ptah_disable_routine` | mutate | `request_id`, `session_id`, `workspace`, `routine_id`; optional `expected_revision` |
 
 ### Forbidden (never exposed)
 

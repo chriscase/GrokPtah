@@ -32,9 +32,10 @@ use uuid::Uuid;
 
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    AuthContext, ChangeRecord, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
-    RunExecutionMode, WorkArtifactRef, WorkDependency, WorkPolicy, WorkResult, WorkspaceAllowlist,
-    CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    AuthContext, ChangeRecord, MissedRunPolicy, OrchError, OrchErrorCode, OrchestrationConfig,
+    OrchestrationService, RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRetryPolicy,
+    RoutineTrigger, RunExecutionMode, WorkArtifactRef, WorkDependency, WorkPolicy, WorkResult,
+    WorkTemplate, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -566,6 +567,7 @@ fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
         "auditPersistenceError",
         "runPersistenceError",
         "workloadSupervisorError",
+        "routineSupervisorError",
         "serviceError",
     ]
     .iter()
@@ -1019,6 +1021,61 @@ struct CreateWorkArgs {
 struct WorkScopeArgs {
     session_id: Uuid,
     workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRoutineArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    name: String,
+    agent_id: String,
+    trigger: RoutineTrigger,
+    work_template: WorkTemplate,
+    #[serde(default)]
+    missed_run_policy: MissedRunPolicy,
+    #[serde(default)]
+    concurrency: RoutineConcurrencyPolicy,
+    #[serde(default)]
+    retry: RoutineRetryPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineScopeArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    routine_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineLifecycleArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    routine_id: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FireRoutineArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    routine_id: String,
+    #[serde(default)]
+    payload: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1848,6 +1905,66 @@ fn tool_input_schema(name: &str) -> Value {
                 "expected_revision": {"type": "integer", "minimum": 1}
             }
         }),
+        "ptah_create_routine" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "name", "agent_id", "trigger", "work_template"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "name": {"type": "string", "minLength": 1, "maxLength": 128},
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "trigger": {"type": "object"},
+                "work_template": {"type": "object"},
+                "missed_run_policy": {"type": "string", "enum": ["skip", "coalesce", "catch_up"]},
+                "concurrency": {"type": "object"},
+                "retry": {"type": "object"}
+            }
+        }),
+        "ptah_list_routines" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
+            }
+        }),
+        "ptah_get_routine" | "ptah_list_activations" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "routine_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "routine_id": run_id
+            }
+        }),
+        "ptah_pause_routine" | "ptah_enable_routine" | "ptah_disable_routine" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "routine_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "routine_id": run_id,
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
+        "ptah_fire_routine" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "routine_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "routine_id": run_id,
+                "payload": {"type": "object"}
+            }
+        }),
         "ptah_approve_work" => json!({
             "type": "object",
             "required": ["request_id", "session_id", "workspace", "work_id"],
@@ -2427,6 +2544,102 @@ async fn dispatch_tool(
                 &args.work_id,
                 args.note,
                 args.expected_revision,
+            )
+            .await
+        }
+        "ptah_create_routine" => {
+            let args: CreateRoutineArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.name, "name")?;
+            require_nonempty(&args.agent_id, "agent_id")?;
+            orch.create_routine(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                args.name,
+                args.agent_id,
+                args.trigger,
+                args.work_template,
+                args.missed_run_policy,
+                args.concurrency,
+                args.retry,
+            )
+            .await
+        }
+        "ptah_list_routines" => {
+            let args: RoutineScopeArgs = parse_value(args)?;
+            orch.list_routines_scoped(auth, args.session_id, &args.workspace)
+        }
+        "ptah_get_routine" => {
+            let args: RoutineArgs = parse_value(args)?;
+            require_nonempty(&args.routine_id, "routine_id")?;
+            orch.get_routine_scoped(auth, args.session_id, &args.workspace, &args.routine_id)
+        }
+        "ptah_list_activations" => {
+            let args: RoutineArgs = parse_value(args)?;
+            require_nonempty(&args.routine_id, "routine_id")?;
+            orch.list_activations_scoped(auth, args.session_id, &args.workspace, &args.routine_id)
+        }
+        "ptah_pause_routine" => {
+            let args: RoutineLifecycleArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.routine_id, "routine_id")?;
+            orch.set_routine_lifecycle(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.routine_id,
+                RoutineLifecycle::Paused,
+                args.expected_revision,
+                "ptah_pause_routine",
+            )
+            .await
+        }
+        "ptah_enable_routine" => {
+            let args: RoutineLifecycleArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.routine_id, "routine_id")?;
+            orch.set_routine_lifecycle(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.routine_id,
+                RoutineLifecycle::Enabled,
+                args.expected_revision,
+                "ptah_enable_routine",
+            )
+            .await
+        }
+        "ptah_disable_routine" => {
+            let args: RoutineLifecycleArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.routine_id, "routine_id")?;
+            orch.set_routine_lifecycle(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.routine_id,
+                RoutineLifecycle::Disabled,
+                args.expected_revision,
+                "ptah_disable_routine",
+            )
+            .await
+        }
+        "ptah_fire_routine" => {
+            let args: FireRoutineArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.routine_id, "routine_id")?;
+            orch.fire_routine(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.routine_id,
+                args.payload,
             )
             .await
         }

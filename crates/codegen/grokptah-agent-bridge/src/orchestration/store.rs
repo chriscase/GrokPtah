@@ -12,9 +12,16 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
+use super::routine::{
+    advance_next_fire, decide_lifecycle_skip, due_occurrences, in_flight_count,
+    occurrence_dedupe_key, validate_activation_payload, ActivationCause, ActivationDisposition,
+    ActivationRecord, ActivationRequest, CapturedActivationPolicy, RoutineFireReport,
+    RoutineLifecycle, RoutineRecord, RoutineSnapshot, MAX_ACTIVATION_HISTORY,
+    ROUTINE_SCHEMA_VERSION,
+};
 use super::types::{
     safe_id_filename, AgentRecord, AgentSpec, AgentState, AuditEntry, ContinuationCheckpoint,
-    IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
+    IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunBounds, RunRecord, RunState,
     RunStopCause,
 };
 use super::workload::{
@@ -43,6 +50,23 @@ struct OrchStoreInner {
 struct AgentActivationIntent {
     run: RunRecord,
     activated_agent: AgentRecord,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutineDedupeRecord {
+    dedupe_key: String,
+    activation_id: String,
+    created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutineFireIntent {
+    routine: RoutineRecord,
+    activation: ActivationRecord,
+    work: Option<WorkItem>,
+    dedupe: Option<RoutineDedupeRecord>,
 }
 
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
@@ -114,6 +138,10 @@ impl OrchStore {
         fs::create_dir_all(root.join("finalization"))?;
         fs::create_dir_all(root.join("work-items"))?;
         fs::create_dir_all(root.join("work-attempts"))?;
+        fs::create_dir_all(root.join("routines"))?;
+        fs::create_dir_all(root.join("routine-activations"))?;
+        fs::create_dir_all(root.join("routine-dedupe"))?;
+        fs::create_dir_all(root.join("routine-intents"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -161,6 +189,7 @@ impl OrchStore {
         };
         store.recover_agent_activation_intents()?;
         store.recover_finalization_intents()?;
+        store.recover_routine_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
@@ -269,6 +298,54 @@ impl OrchStore {
             .inner
             .root
             .join("work-attempts")
+            .join(format!("{safe}.json")))
+    }
+
+    fn routine_path(&self, routine_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(routine_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("routines")
+            .join(format!("{safe}.json")))
+    }
+
+    fn routine_activation_path(
+        &self,
+        routine_id: &str,
+        activation_id: &str,
+    ) -> Result<PathBuf, OrchError> {
+        let routine_safe = safe_id_filename(routine_id)?;
+        let activation_safe = safe_id_filename(activation_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("routine-activations")
+            .join(routine_safe)
+            .join(format!("{activation_safe}.json")))
+    }
+
+    fn routine_dedupe_path(
+        &self,
+        routine_id: &str,
+        dedupe_key: &str,
+    ) -> Result<PathBuf, OrchError> {
+        let routine_safe = safe_id_filename(routine_id)?;
+        let key_safe = safe_id_filename(dedupe_key)?;
+        Ok(self
+            .inner
+            .root
+            .join("routine-dedupe")
+            .join(routine_safe)
+            .join(format!("{key_safe}.json")))
+    }
+
+    fn routine_intent_path(&self, activation_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(activation_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("routine-intents")
             .join(format!("{safe}.json")))
     }
 
@@ -546,6 +623,638 @@ impl OrchStore {
     pub fn list_work_attempts(&self, work_id: Option<&str>) -> anyhow::Result<Vec<WorkAttempt>> {
         let _guard = self.inner.lock.lock();
         self.list_work_attempts_unlocked(work_id)
+    }
+
+    // --- Durable routines -------------------------------------------------
+
+    pub fn save_routine(&self, routine: &RoutineRecord) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.save_routine_unlocked(routine)
+    }
+
+    pub fn load_routine(&self, routine_id: &str) -> Result<Option<RoutineRecord>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.load_routine_unlocked(routine_id)
+    }
+
+    pub fn list_routines(&self) -> Result<Vec<RoutineRecord>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.list_routines_unlocked()
+    }
+
+    pub fn list_activations(
+        &self,
+        routine_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ActivationRecord>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.list_activations_unlocked(routine_id, limit)
+    }
+
+    pub fn load_activation(
+        &self,
+        routine_id: &str,
+        activation_id: &str,
+    ) -> Result<Option<ActivationRecord>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.load_activation_unlocked(routine_id, activation_id)
+    }
+
+    pub fn routine_snapshot(
+        &self,
+        routine_id: &str,
+        history_limit: usize,
+    ) -> Result<Option<RoutineSnapshot>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(routine) = self.load_routine_unlocked(routine_id)? else {
+            return Ok(None);
+        };
+        let activations = self.list_activations_unlocked(routine_id, history_limit)?;
+        Ok(Some(RoutineSnapshot {
+            routine,
+            activations,
+        }))
+    }
+
+    pub fn set_routine_lifecycle(
+        &self,
+        routine_id: &str,
+        lifecycle: RoutineLifecycle,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<RoutineRecord, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut routine = self
+            .load_routine_unlocked(routine_id)?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown routine_id"))?;
+        if expected_revision.is_some_and(|expected| expected != routine.revision) {
+            return Err(OrchError::new(
+                OrchErrorCode::StaleVersion,
+                "routine revision does not match expected_revision",
+            ));
+        }
+        routine.lifecycle = lifecycle;
+        if matches!(lifecycle, RoutineLifecycle::Enabled) {
+            routine.circuit_open = false;
+            routine.consecutive_failures = 0;
+            if routine.next_fire_at.is_none() {
+                routine.next_fire_at = routine.trigger.initial_next_fire(now)?;
+            }
+        }
+        if matches!(lifecycle, RoutineLifecycle::Disabled) {
+            routine.next_fire_at = None;
+        }
+        routine.bump_at(now);
+        self.save_routine_unlocked(&routine)?;
+        Ok(routine)
+    }
+
+    pub fn activate_routine(
+        &self,
+        routine_id: &str,
+        request: ActivationRequest,
+        server_ceiling: &RunBounds,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<ActivationRecord, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.activate_routine_unlocked(routine_id, request, server_ceiling, now)
+    }
+
+    pub fn fire_due_routines_at(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<RoutineFireReport, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let routines = self.list_routines_unlocked()?;
+        let ceiling = RunBounds::default();
+        let mut report = RoutineFireReport {
+            scanned_routines: routines.len(),
+            ..RoutineFireReport::default()
+        };
+        for routine in routines {
+            if !routine.lifecycle.allows_scheduled_fire() || routine.circuit_open {
+                continue;
+            }
+            let due = match due_occurrences(&routine, now) {
+                Ok(due) => due,
+                Err(_) => {
+                    report.rejected += 1;
+                    continue;
+                }
+            };
+            if due.is_empty() {
+                if routine.next_fire_at.is_some_and(|next| next <= now) {
+                    if let Ok(Some(mut current)) = self.load_routine_unlocked(&routine.routine_id) {
+                        current.next_fire_at =
+                            advance_next_fire(&current.trigger, now, &[]).unwrap_or(None);
+                        current.updated_at = now;
+                        let _ = self.save_routine_unlocked(&current);
+                    }
+                    report.skipped += 1;
+                }
+                continue;
+            }
+            for scheduled_at in &due {
+                let request = ActivationRequest {
+                    cause: ActivationCause::Scheduled,
+                    dedupe_key: occurrence_dedupe_key(&routine.routine_id, *scheduled_at),
+                    scheduled_at: *scheduled_at,
+                    received_at: now,
+                    payload: None,
+                    created_by: format!("routine:{}", routine.routine_id),
+                };
+                match self.activate_routine_unlocked(&routine.routine_id, request, &ceiling, now) {
+                    Ok(activation) => match activation.disposition {
+                        ActivationDisposition::CreatedWork => report.created_work += 1,
+                        ActivationDisposition::Deduplicated => report.deduplicated += 1,
+                        ActivationDisposition::Rejected
+                        | ActivationDisposition::Backoff
+                        | ActivationDisposition::CircuitOpen => report.rejected += 1,
+                        _ => report.skipped += 1,
+                    },
+                    Err(_) => report.rejected += 1,
+                }
+            }
+            if let Ok(Some(mut current)) = self.load_routine_unlocked(&routine.routine_id) {
+                current.next_fire_at =
+                    advance_next_fire(&current.trigger, now, &due).unwrap_or(None);
+                current.last_fire_at = Some(now);
+                current.updated_at = now;
+                let _ = self.save_routine_unlocked(&current);
+            }
+        }
+        Ok(report)
+    }
+
+    fn recover_routine_intents(&self) -> anyhow::Result<()> {
+        let _guard = self.inner.lock.lock();
+        let dir = self.inner.root.join("routine-intents");
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let intent: RoutineFireIntent = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            self.commit_routine_intent_unlocked(&intent)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            remove_file_durable(&path)?;
+        }
+        Ok(())
+    }
+
+    fn save_routine_unlocked(&self, routine: &RoutineRecord) -> Result<(), OrchError> {
+        routine.validate()?;
+        let path = self.routine_path(&routine.routine_id)?;
+        atomic_write_json(&path, routine)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn load_routine_unlocked(&self, routine_id: &str) -> Result<Option<RoutineRecord>, OrchError> {
+        let path = match self.routine_path(routine_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let routine: RoutineRecord = serde_json::from_str(
+            &fs::read_to_string(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        routine.validate()?;
+        Ok(Some(routine))
+    }
+
+    fn list_routines_unlocked(&self) -> Result<Vec<RoutineRecord>, OrchError> {
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("routines");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let routine: RoutineRecord = serde_json::from_str(
+                &fs::read_to_string(path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            routine.validate()?;
+            out.push(routine);
+        }
+        out.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(out)
+    }
+
+    fn load_activation_unlocked(
+        &self,
+        routine_id: &str,
+        activation_id: &str,
+    ) -> Result<Option<ActivationRecord>, OrchError> {
+        let path = match self.routine_activation_path(routine_id, activation_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let activation: ActivationRecord = serde_json::from_str(
+            &fs::read_to_string(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        activation.validate()?;
+        Ok(Some(activation))
+    }
+
+    fn list_activations_unlocked(
+        &self,
+        routine_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ActivationRecord>, OrchError> {
+        let mut out = Vec::new();
+        let dir = self
+            .inner
+            .root
+            .join("routine-activations")
+            .join(safe_id_filename(routine_id)?);
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let activation: ActivationRecord = serde_json::from_str(
+                &fs::read_to_string(path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            activation.validate()?;
+            out.push(activation);
+        }
+        out.sort_by(|left, right| right.fired_at.cmp(&left.fired_at));
+        if limit > 0 && out.len() > limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
+    fn load_dedupe_unlocked(
+        &self,
+        routine_id: &str,
+        dedupe_key: &str,
+    ) -> Result<Option<String>, OrchError> {
+        let path = self.routine_dedupe_path(routine_id, dedupe_key)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let record: RoutineDedupeRecord = serde_json::from_str(
+            &fs::read_to_string(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(Some(record.activation_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn activate_routine_unlocked(
+        &self,
+        routine_id: &str,
+        request: ActivationRequest,
+        server_ceiling: &RunBounds,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<ActivationRecord, OrchError> {
+        let mut routine = self
+            .load_routine_unlocked(routine_id)?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown routine_id"))?;
+        if let Some(existing_id) = self.load_dedupe_unlocked(routine_id, &request.dedupe_key)? {
+            if let Some(existing) = self.load_activation_unlocked(routine_id, &existing_id)? {
+                return Ok(existing);
+            }
+        }
+        let payload = validate_activation_payload(request.payload.as_ref())?;
+        if matches!(
+            request.cause,
+            ActivationCause::External | ActivationCause::Scheduled
+        ) {
+            if let Some(expires) = match routine.trigger {
+                super::routine::RoutineTrigger::OneShot { expires_at, .. } => expires_at,
+                _ => None,
+            } {
+                if expires < now {
+                    return self.record_non_work_activation(
+                        &routine,
+                        &request,
+                        payload,
+                        ActivationDisposition::SkippedExpired,
+                        Some("activation expired before it could create work"),
+                        server_ceiling,
+                        now,
+                    );
+                }
+            }
+        }
+        if request.cause == ActivationCause::External {
+            return Err(OrchError::new(
+                OrchErrorCode::Unsupported,
+                "webhook, GitHub, and message adapters are reserved for a later slice",
+            ));
+        }
+        if let Some(disposition) = decide_lifecycle_skip(&routine, request.cause) {
+            return self.record_non_work_activation(
+                &routine,
+                &request,
+                payload,
+                disposition,
+                None,
+                server_ceiling,
+                now,
+            );
+        }
+        let inflight = in_flight_count(
+            &self
+                .list_work_items_unlocked()
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            routine_id,
+        );
+        if inflight >= routine.concurrency.max_in_flight as usize {
+            return self.record_non_work_activation(
+                &routine,
+                &request,
+                payload,
+                ActivationDisposition::SkippedOverlap,
+                Some("routine already has the maximum in-flight Work items"),
+                server_ceiling,
+                now,
+            );
+        }
+        let agent = self
+            .load_agent_unlocked(&routine.agent_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let spec = match &agent {
+            Some(agent) => agent.spec.clone(),
+            None => {
+                return self.fail_activation_unlocked(
+                    &mut routine,
+                    &request,
+                    payload,
+                    "owning agent is unknown",
+                    server_ceiling,
+                    now,
+                );
+            }
+        };
+        if let Some(agent) = &agent {
+            if !workspaces_match(&agent.workspace, &routine.workspace) {
+                return self.fail_activation_unlocked(
+                    &mut routine,
+                    &request,
+                    payload,
+                    "agent source workspace does not match the routine workspace",
+                    server_ceiling,
+                    now,
+                );
+            }
+        }
+        let captured = match CapturedActivationPolicy::capture(
+            routine.revision,
+            Some(&routine.agent_id),
+            spec.as_ref(),
+            &routine.work_template,
+            server_ceiling,
+        ) {
+            Ok(captured) => captured,
+            Err(error) => {
+                return self.fail_activation_unlocked(
+                    &mut routine,
+                    &request,
+                    payload,
+                    &error.message,
+                    server_ceiling,
+                    now,
+                );
+            }
+        };
+        let mut work = match WorkItem::new_at(
+            routine.work_template.kind.clone(),
+            routine.work_template.objective.clone(),
+            routine.session_id,
+            routine.workspace.clone(),
+            format!("routine:{}", routine.routine_id),
+            captured.work_policy.clone(),
+            now,
+        ) {
+            Ok(work) => work,
+            Err(error) => {
+                return self.fail_activation_unlocked(
+                    &mut routine,
+                    &request,
+                    payload,
+                    &error.message,
+                    server_ceiling,
+                    now,
+                );
+            }
+        };
+        work.priority = routine.work_template.priority;
+        work.assigned_agent_id = Some(routine.agent_id.clone());
+        work.source_routine_id = Some(routine.routine_id.clone());
+        let activation_id = Uuid::new_v4().to_string();
+        work.source_activation_id = Some(activation_id.clone());
+        work.validate()
+            .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.to_string()))?;
+        let activation = ActivationRecord {
+            schema_version: ROUTINE_SCHEMA_VERSION,
+            activation_id: activation_id.clone(),
+            routine_id: routine.routine_id.clone(),
+            routine_revision: routine.revision,
+            trigger_kind: request.cause.as_str().to_string(),
+            dedupe_key: request.dedupe_key.clone(),
+            scheduled_at: request.scheduled_at,
+            received_at: request.received_at,
+            fired_at: now,
+            work_id: Some(work.work_id.clone()),
+            disposition: ActivationDisposition::CreatedWork,
+            error: None,
+            captured_policy: captured,
+            payload,
+            created_by: request.created_by.clone(),
+        };
+        activation.validate()?;
+        let intent = RoutineFireIntent {
+            routine: routine.clone(),
+            activation: activation.clone(),
+            work: Some(work.clone()),
+            dedupe: Some(RoutineDedupeRecord {
+                dedupe_key: request.dedupe_key.clone(),
+                activation_id: activation_id.clone(),
+                created_at: now,
+            }),
+        };
+        self.persist_routine_intent_unlocked(&intent)?;
+        self.commit_routine_intent_unlocked(&intent)?;
+        self.clear_routine_intent_unlocked(&activation_id)?;
+        self.prune_activations_unlocked(routine_id)?;
+        Ok(activation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_non_work_activation(
+        &self,
+        routine: &RoutineRecord,
+        request: &ActivationRequest,
+        payload: Option<serde_json::Value>,
+        disposition: ActivationDisposition,
+        error: Option<&str>,
+        server_ceiling: &RunBounds,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<ActivationRecord, OrchError> {
+        let captured = CapturedActivationPolicy::capture(
+            routine.revision,
+            Some(&routine.agent_id),
+            None,
+            &routine.work_template,
+            server_ceiling,
+        )
+        .unwrap_or_else(|_| CapturedActivationPolicy {
+            routine_revision: routine.revision,
+            agent_id: Some(routine.agent_id.clone()),
+            agent_spec_revision: None,
+            run_bounds: routine.work_template.policy.bounds.clone(),
+            work_policy: routine.work_template.policy.clone(),
+            sandbox_profile: "workspace-write".into(),
+            computer_use_allowed: false,
+            auto_approve_tools: false,
+        });
+        let activation = ActivationRecord {
+            schema_version: ROUTINE_SCHEMA_VERSION,
+            activation_id: Uuid::new_v4().to_string(),
+            routine_id: routine.routine_id.clone(),
+            routine_revision: routine.revision,
+            trigger_kind: request.cause.as_str().to_string(),
+            dedupe_key: request.dedupe_key.clone(),
+            scheduled_at: request.scheduled_at,
+            received_at: request.received_at,
+            fired_at: now,
+            work_id: None,
+            disposition,
+            error: error.map(str::to_string),
+            captured_policy: captured,
+            payload,
+            created_by: request.created_by.clone(),
+        };
+        activation.validate()?;
+        let intent = RoutineFireIntent {
+            routine: routine.clone(),
+            activation: activation.clone(),
+            work: None,
+            dedupe: Some(RoutineDedupeRecord {
+                dedupe_key: request.dedupe_key.clone(),
+                activation_id: activation.activation_id.clone(),
+                created_at: now,
+            }),
+        };
+        self.persist_routine_intent_unlocked(&intent)?;
+        self.commit_routine_intent_unlocked(&intent)?;
+        self.clear_routine_intent_unlocked(&activation.activation_id)?;
+        self.prune_activations_unlocked(&routine.routine_id)?;
+        Ok(activation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fail_activation_unlocked(
+        &self,
+        routine: &mut RoutineRecord,
+        request: &ActivationRequest,
+        payload: Option<serde_json::Value>,
+        message: &str,
+        server_ceiling: &RunBounds,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<ActivationRecord, OrchError> {
+        routine.consecutive_failures = routine.consecutive_failures.saturating_add(1);
+        if routine.consecutive_failures >= routine.retry.circuit_failures {
+            routine.circuit_open = true;
+            routine.lifecycle = RoutineLifecycle::Paused;
+            routine.next_fire_at = None;
+        } else {
+            routine.next_fire_at =
+                Some(now + routine.retry.delay_after(routine.consecutive_failures));
+        }
+        routine.updated_at = now;
+        self.save_routine_unlocked(routine)?;
+        self.record_non_work_activation(
+            routine,
+            request,
+            payload,
+            if routine.circuit_open {
+                ActivationDisposition::CircuitOpen
+            } else {
+                ActivationDisposition::Backoff
+            },
+            Some(message),
+            server_ceiling,
+            now,
+        )
+    }
+
+    fn persist_routine_intent_unlocked(&self, intent: &RoutineFireIntent) -> Result<(), OrchError> {
+        let path = self.routine_intent_path(&intent.activation.activation_id)?;
+        atomic_write_json(&path, intent)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn commit_routine_intent_unlocked(&self, intent: &RoutineFireIntent) -> Result<(), OrchError> {
+        if let Some(work) = &intent.work {
+            self.save_work_item_unlocked(work)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        let path = self.routine_activation_path(
+            &intent.activation.routine_id,
+            &intent.activation.activation_id,
+        )?;
+        atomic_write_json(&path, &intent.activation)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if let Some(dedupe) = &intent.dedupe {
+            let dedupe_path =
+                self.routine_dedupe_path(&intent.activation.routine_id, &dedupe.dedupe_key)?;
+            atomic_write_json(&dedupe_path, dedupe)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn clear_routine_intent_unlocked(&self, activation_id: &str) -> Result<(), OrchError> {
+        let path = self.routine_intent_path(activation_id)?;
+        remove_file_durable(&path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn prune_activations_unlocked(&self, routine_id: &str) -> Result<(), OrchError> {
+        let activations = self.list_activations_unlocked(routine_id, usize::MAX)?;
+        if activations.len() <= MAX_ACTIVATION_HISTORY {
+            return Ok(());
+        }
+        for activation in activations.into_iter().skip(MAX_ACTIVATION_HISTORY) {
+            let path = self.routine_activation_path(routine_id, &activation.activation_id)?;
+            let _ = remove_file_durable(&path);
+        }
+        Ok(())
     }
 
     fn work_failure_result(summary: &str, now: chrono::DateTime<Utc>) -> WorkResult {
@@ -1257,6 +1966,10 @@ impl OrchStore {
 
     pub fn load_agent(&self, agent_id: &str) -> anyhow::Result<Option<AgentRecord>> {
         let _g = self.inner.lock.lock();
+        self.load_agent_unlocked(agent_id)
+    }
+
+    fn load_agent_unlocked(&self, agent_id: &str) -> anyhow::Result<Option<AgentRecord>> {
         let path = match self.agent_path(agent_id) {
             Ok(path) => path,
             Err(_) => return Ok(None),
@@ -2361,6 +3074,16 @@ fn remove_file_durable(path: &Path) -> anyhow::Result<()> {
         fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
+}
+
+pub(crate) fn workspaces_match(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (dunce::canonicalize(left), dunce::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {

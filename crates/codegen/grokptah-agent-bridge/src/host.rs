@@ -46,9 +46,10 @@ use crate::orchestration::{
     AgentContinuationPlan, AgentLaneAssociation, AgentRecord, AgentResumePlan, AgentSpec,
     AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
-    ContinuationTestInput, OrchStore, PromotionState, RunAggregates, RunBounds, RunExecution,
-    RunExecutionMode, RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem,
-    WorkItemSnapshot, WorkPolicy, DEFAULT_AGENT_TOOL_IDS,
+    ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, RoutineConcurrencyPolicy,
+    RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
+    RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
+    WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::prompt_queue::{
@@ -1655,6 +1656,122 @@ impl AgentHostHandle {
         store
             .cancel_work_checked(work_id, reason, expected_revision)
             .map(|(item, _)| item)
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
+    pub fn list_routines_for_session(&self, session_id: Uuid) -> Result<Vec<RoutineRecord>> {
+        let store = self.ensure_orchestration_store()?;
+        let mut routines = store
+            .list_routines()
+            .map_err(|error| anyhow!(error.to_string()))?
+            .into_iter()
+            .filter(|routine| routine.session_id == session_id)
+            .collect::<Vec<_>>();
+        routines.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(routines)
+    }
+
+    pub fn get_routine_snapshot(
+        &self,
+        session_id: Uuid,
+        routine_id: &str,
+    ) -> Result<Option<RoutineSnapshot>> {
+        let store = self.ensure_orchestration_store()?;
+        let snapshot = store
+            .routine_snapshot(routine_id, 32)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(snapshot.filter(|snapshot| snapshot.routine.session_id == session_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_routine(
+        &self,
+        session_id: Uuid,
+        name: String,
+        agent_id: String,
+        trigger: RoutineTrigger,
+        work_template: WorkTemplate,
+        missed_run_policy: MissedRunPolicy,
+        concurrency: RoutineConcurrencyPolicy,
+        retry: RoutineRetryPolicy,
+    ) -> Result<RoutineRecord> {
+        let (workspace, store) = self.local_work_mutation_scope(session_id)?;
+        if matches!(trigger, RoutineTrigger::External { .. }) {
+            bail!("webhook, GitHub, and message adapters are reserved for a later slice");
+        }
+        let agent = store
+            .load_agent(&agent_id)
+            .map_err(|error| anyhow!(error.to_string()))?
+            .ok_or_else(|| anyhow!("unknown agent_id"))?;
+        if !crate::orchestration::workspaces_match(&agent.workspace, &workspace) {
+            bail!("agent source workspace does not match the Lane workspace");
+        }
+        let now = Utc::now();
+        let routine = RoutineRecord::new(
+            name,
+            agent_id,
+            session_id,
+            workspace,
+            trigger,
+            work_template,
+            missed_run_policy,
+            concurrency,
+            retry,
+            "desktop",
+            now,
+        )
+        .map_err(|error| anyhow!(error.to_string()))?;
+        store
+            .save_routine(&routine)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(routine)
+    }
+
+    pub fn set_routine_lifecycle(
+        &self,
+        session_id: Uuid,
+        routine_id: &str,
+        lifecycle: RoutineLifecycle,
+        expected_revision: Option<u64>,
+    ) -> Result<RoutineRecord> {
+        let (_, store) = self.local_work_mutation_scope(session_id)?;
+        let routine = store
+            .load_routine(routine_id)
+            .map_err(|error| anyhow!(error.to_string()))?
+            .ok_or_else(|| anyhow!("routine not found"))?;
+        if routine.session_id != session_id {
+            bail!("routine is outside the selected Lane");
+        }
+        store
+            .set_routine_lifecycle(routine_id, lifecycle, expected_revision, Utc::now())
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
+    pub fn fire_routine(
+        &self,
+        session_id: Uuid,
+        routine_id: &str,
+        request_id: &str,
+    ) -> Result<crate::orchestration::ActivationRecord> {
+        let (_, store) = self.local_work_mutation_scope(session_id)?;
+        let routine = store
+            .load_routine(routine_id)
+            .map_err(|error| anyhow!(error.to_string()))?
+            .ok_or_else(|| anyhow!("routine not found"))?;
+        if routine.session_id != session_id {
+            bail!("routine is outside the selected Lane");
+        }
+        let now = Utc::now();
+        let request = crate::orchestration::ActivationRequest {
+            cause: crate::orchestration::ActivationCause::Manual,
+            dedupe_key: format!("manual:{routine_id}:{request_id}"),
+            scheduled_at: now,
+            received_at: now,
+            payload: None,
+            created_by: "desktop".into(),
+        };
+        store
+            .activate_routine(routine_id, request, &RunBounds::default(), now)
             .map_err(|error| anyhow!(error.to_string()))
     }
 

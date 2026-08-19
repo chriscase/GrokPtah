@@ -250,6 +250,12 @@ workload service. They do not own the workload state machine and cannot:
 Every activation is attributable and idempotent. Execution remains a finite,
 bounded run linked to a durable work item/attempt.
 
+Issue #306 ships the first routine/activation slice for manual, one-shot, and
+interval/calendar triggers. The runtime-home owner fires due routines through
+the shared workload API. Desktop UI timers are not authoritative. Webhook,
+GitHub, and message adapters share the reserved `External` trigger boundary
+and are not enabled in that slice.
+
 ## Consequences
 
 - Persistent-agent and workload features can run in either host without

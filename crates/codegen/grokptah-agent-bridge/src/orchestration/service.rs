@@ -19,9 +19,15 @@ use super::authz::{
     authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
     WorkspaceAllowlist,
 };
+use super::routine::{
+    manual_dedupe_key, ActivationCause, ActivationRequest, MissedRunPolicy,
+    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
+    WorkTemplate,
+};
 use super::store::{IdempotencyClaim, OrchStore};
 use super::supervisor::{
-    WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
+    RoutineSupervisor, RoutineSupervisorStatus, WorkloadSupervisor, WorkloadSupervisorStatus,
+    DEFAULT_ROUTINE_TICK_INTERVAL, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
 };
 use super::types::*;
 use super::workload::{
@@ -74,6 +80,7 @@ pub struct OrchestrationService {
     pending_admissions: Mutex<AdmissionQueueState>,
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     workload_supervisor: Mutex<Option<WorkloadSupervisor>>,
+    routine_supervisor: Mutex<Option<RoutineSupervisor>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -221,6 +228,8 @@ impl OrchestrationService {
         };
         let workload_supervisor =
             WorkloadSupervisor::start(store.clone(), DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL);
+        let routine_supervisor =
+            RoutineSupervisor::start(store.clone(), DEFAULT_ROUTINE_TICK_INTERVAL);
         let service = Arc::new_cyclic(|self_ref| Self {
             host,
             bus,
@@ -232,6 +241,7 @@ impl OrchestrationService {
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
             workload_supervisor: Mutex::new(workload_supervisor),
+            routine_supervisor: Mutex::new(routine_supervisor),
             join_handles: Mutex::new(Vec::new()),
         });
         service.start_scheduler_watcher();
@@ -284,6 +294,10 @@ impl OrchestrationService {
     /// wait for the supervisor task to release its store handle.
     pub async fn stop_background_tasks(&self) {
         let supervisor = self.workload_supervisor.lock().take();
+        if let Some(mut supervisor) = supervisor {
+            supervisor.stop_and_wait();
+        }
+        let supervisor = self.routine_supervisor.lock().take();
         if let Some(mut supervisor) = supervisor {
             supervisor.stop_and_wait();
         }
@@ -1631,6 +1645,384 @@ impl OrchestrationService {
         .await
     }
 
+    fn authorize_routine_read_scope(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<PathBuf, OrchError> {
+        self.authorize_work_read_scope(session_id, workspace)
+    }
+
+    fn authorize_routine_mutation_scope(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<PathBuf, OrchError> {
+        self.authorize_work_mutation_scope(session_id, workspace)
+    }
+
+    fn load_routine_scoped(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+        routine_id: &str,
+        allow_archived: bool,
+    ) -> Result<(RoutineRecord, PathBuf), OrchError> {
+        let claimed = if allow_archived {
+            self.authorize_routine_read_scope(session_id, workspace)?
+        } else {
+            self.authorize_routine_mutation_scope(session_id, workspace)?
+        };
+        let routine = self
+            .store
+            .load_routine(routine_id)?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown routine_id"))?;
+        if routine.session_id != session_id || routine.workspace != claimed.display().to_string() {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "routine is outside the requested session scope",
+            ));
+        }
+        Ok((routine, claimed))
+    }
+
+    fn routine_value(
+        &self,
+        routine: RoutineRecord,
+        include_activations: bool,
+    ) -> Result<serde_json::Value, OrchError> {
+        let activations = if include_activations {
+            self.store.list_activations(&routine.routine_id, 32)?
+        } else {
+            Vec::new()
+        };
+        Ok(json!({
+            "routine": routine,
+            "activations": activations,
+        }))
+    }
+
+    pub fn list_routines_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_routine_read_scope(session_id, workspace)?;
+        let routines = self
+            .store
+            .list_routines()?
+            .into_iter()
+            .filter(|routine| {
+                routine.session_id == session_id
+                    && routine.workspace == claimed.display().to_string()
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "routines": routines }))
+    }
+
+    pub fn get_routine_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        routine_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
+        self.routine_value(routine, true)
+    }
+
+    pub fn list_activations_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        routine_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
+        let activations = self.store.list_activations(&routine.routine_id, 128)?;
+        Ok(json!({
+            "routineId": routine.routine_id,
+            "activations": activations,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_routine(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        name: String,
+        agent_id: String,
+        trigger: RoutineTrigger,
+        work_template: WorkTemplate,
+        missed_run_policy: MissedRunPolicy,
+        concurrency: RoutineConcurrencyPolicy,
+        retry: RoutineRetryPolicy,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_create_routine";
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "name": name,
+            "agentId": agent_id,
+            "trigger": trigger,
+            "workTemplate": work_template,
+            "missedRunPolicy": missed_run_policy,
+            "concurrency": concurrency,
+            "retry": retry,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let RoutineTrigger::External { adapter } = &trigger {
+            return Err(self.fail_claim(
+                &mut lease,
+                None,
+                session_id,
+                &claimed,
+                OrchError::new(
+                    OrchErrorCode::Unsupported,
+                    format!(
+                        "{} adapters are reserved; they cannot create Work in this slice",
+                        adapter.as_str()
+                    ),
+                ),
+            ));
+        }
+        let agent = match self.store.load_agent(&agent_id) {
+            Ok(Some(agent)) => agent,
+            Ok(None) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown agent_id"),
+                ));
+            }
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                ));
+            }
+        };
+        if !super::workspaces_match(&agent.workspace, &claimed.display().to_string()) {
+            return Err(self.fail_claim(
+                &mut lease,
+                None,
+                session_id,
+                &claimed,
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "agent source workspace does not match the requested workspace",
+                ),
+            ));
+        }
+        let now = Utc::now();
+        let routine = match RoutineRecord::new(
+            name,
+            agent_id,
+            session_id,
+            claimed.display().to_string(),
+            trigger,
+            work_template,
+            missed_run_policy,
+            concurrency,
+            retry,
+            &auth.token_id,
+            now,
+        ) {
+            Ok(routine) => routine,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        if let Err(error) = self.store.save_routine(&routine) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(routine.routine_id.clone()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        let response = match self.routine_value(routine.clone(), false) {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(routine.routine_id.clone()),
+                    session_id,
+                    &claimed,
+                    error,
+                ))
+            }
+        };
+        lease
+            .complete(Some(routine.routine_id.clone()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(routine.routine_id),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_routine_lifecycle(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        routine_id: &str,
+        lifecycle: RoutineLifecycle,
+        expected_revision: Option<u64>,
+        tool: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "routineId": routine_id,
+            "lifecycle": lifecycle,
+            "expectedRevision": expected_revision,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_routine_scoped(session_id, &claimed, routine_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let routine = match self.store.set_routine_lifecycle(
+            routine_id,
+            lifecycle,
+            expected_revision,
+            Utc::now(),
+        ) {
+            Ok(routine) => routine,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = match self.routine_value(routine, false) {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(routine_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                ))
+            }
+        };
+        lease
+            .complete(Some(routine_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(routine_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    pub async fn fire_routine(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        routine_id: &str,
+        payload: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let tool = "ptah_fire_routine";
+        let idempotency_payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "routineId": routine_id,
+            "payload": payload,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                tool,
+                request_id,
+                session_id,
+                workspace,
+                &idempotency_payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let routine = match self.load_routine_scoped(session_id, &claimed, routine_id, false) {
+            Ok((routine, _)) => routine,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let now = Utc::now();
+        let request = ActivationRequest {
+            cause: ActivationCause::Manual,
+            dedupe_key: manual_dedupe_key(routine_id, request_id),
+            scheduled_at: now,
+            received_at: now,
+            payload,
+            created_by: auth.token_id.clone(),
+        };
+        let ceiling = self.config.lock().bounds.clone();
+        let activation = match self
+            .store
+            .activate_routine(routine_id, request, &ceiling, now)
+        {
+            Ok(activation) => activation,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({
+            "activation": activation,
+            "routineId": routine.routine_id,
+            "sessionId": session_id,
+            "workspace": claimed.display().to_string(),
+        });
+        lease
+            .complete(Some(routine_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(routine_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn work_item_mutation<F>(
         &self,
@@ -1851,6 +2243,16 @@ impl OrchestrationService {
             .last_error
             .as_deref()
             .map(|error| self.bus.redact_text(error, 500));
+        let routine_supervisor = self
+            .routine_supervisor
+            .lock()
+            .as_ref()
+            .map(RoutineSupervisor::status)
+            .unwrap_or_else(|| RoutineSupervisorStatus::disabled(DEFAULT_ROUTINE_TICK_INTERVAL));
+        let routine_supervisor_error = routine_supervisor
+            .last_error
+            .as_deref()
+            .map(|error| self.bus.redact_text(error, 500));
         Ok(json!({
             "maxConcurrentRuns": max,
             "activeRuns": active,
@@ -1864,6 +2266,8 @@ impl OrchestrationService {
                 "runPersistenceError": run_error,
                 "workloadSupervisorError": workload_supervisor_error,
                 "workloadSupervisor": workload_supervisor,
+                "routineSupervisorError": routine_supervisor_error,
+                "routineSupervisor": routine_supervisor,
             },
         }))
     }

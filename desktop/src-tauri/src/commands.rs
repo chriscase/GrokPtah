@@ -303,6 +303,194 @@ pub async fn work_cancel(
 }
 
 #[tauri::command]
+pub async fn routine_list(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<grokptah_agent_bridge::RoutineRecord>, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.list_routines_for_session(session_id)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn routine_get(
+    state: State<'_, AppState>,
+    session_id: String,
+    routine_id: String,
+) -> Result<Option<grokptah_agent_bridge::RoutineSnapshot>, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.get_routine_snapshot(session_id, &routine_id)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn routine_create(
+    state: State<'_, AppState>,
+    session_id: String,
+    name: String,
+    agent_id: String,
+    objective: String,
+) -> Result<grokptah_agent_bridge::RoutineRecord, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.create_routine(
+            session_id,
+            name,
+            agent_id,
+            grokptah_agent_bridge::RoutineTrigger::Manual,
+            grokptah_agent_bridge::WorkTemplate {
+                kind: "routine".into(),
+                objective,
+                priority: 0,
+                policy: grokptah_agent_bridge::WorkPolicy::default(),
+            },
+            grokptah_agent_bridge::MissedRunPolicy::Skip,
+            grokptah_agent_bridge::RoutineConcurrencyPolicy::default(),
+            grokptah_agent_bridge::RoutineRetryPolicy::default(),
+        )
+        .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn routine_set_lifecycle(
+    state: State<'_, AppState>,
+    session_id: String,
+    routine_id: String,
+    lifecycle: String,
+    expected_revision: Option<u64>,
+) -> Result<grokptah_agent_bridge::RoutineRecord, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let parsed = match lifecycle.as_str() {
+        "enabled" => grokptah_agent_bridge::RoutineLifecycle::Enabled,
+        "paused" => grokptah_agent_bridge::RoutineLifecycle::Paused,
+        "disabled" => grokptah_agent_bridge::RoutineLifecycle::Disabled,
+        _ => return Err("lifecycle must be enabled, paused, or disabled".into()),
+    };
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.set_routine_lifecycle(session_id, &routine_id, parsed, expected_revision)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn routine_fire(
+    state: State<'_, AppState>,
+    session_id: String,
+    routine_id: String,
+) -> Result<grokptah_agent_bridge::ActivationRecord, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    let request_id = Uuid::new_v4().to_string();
+    run_blocking(move || {
+        host.fire_routine(session_id, &routine_id, &request_id)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn remote_service_routine_list(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+) -> Result<Vec<grokptah_agent_bridge::RoutineRecord>, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .list_routines(session_id, workspace)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_routine_get(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    routine_id: String,
+) -> Result<grokptah_agent_bridge::RoutineSnapshot, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .get_routine(session_id, workspace, routine_id)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_routine_create(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    name: String,
+    agent_id: String,
+    objective: String,
+) -> Result<grokptah_agent_bridge::RoutineRecord, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .create_routine(session_id, workspace, name, agent_id, objective)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_routine_set_lifecycle(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    routine_id: String,
+    lifecycle: String,
+    expected_revision: Option<u64>,
+) -> Result<grokptah_agent_bridge::RoutineRecord, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .set_routine_lifecycle(
+            session_id,
+            workspace,
+            routine_id,
+            lifecycle,
+            expected_revision,
+        )
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_routine_fire(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    routine_id: String,
+) -> Result<grokptah_agent_bridge::ActivationRecord, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .fire_routine(session_id, workspace, routine_id)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
 pub async fn remote_service_work_create(
     state: State<'_, AppState>,
     session_id: String,
