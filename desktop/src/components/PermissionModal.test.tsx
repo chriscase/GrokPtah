@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi, afterEach } from "vitest";
+import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { PermissionModal } from "./PermissionModal";
 import {
@@ -9,6 +9,11 @@ import {
 } from "../lib/permissionQueue";
 import type { PermissionRequest } from "../lib/protocol";
 import type { DenyHistoryEntry } from "../lib/denyHistory";
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
 
 function makeReq(
   id: string,
@@ -88,6 +93,31 @@ describe("PermissionModal (#141)", () => {
     });
     // Must NOT use the focused session.
     expect(answers[0].sessionId).not.toBe("session-focused-bbbb");
+  });
+
+  it("shows the owning Lane scope instead of relying on focused-tab context", () => {
+    render(
+      <PermissionModal
+        request={makeReq("req-scoped", "session-background-aaaa")}
+        scope={{
+          laneId: "session-background-aaaa",
+          laneTitle: "Background migration",
+          agentLabel: "Release Warden",
+          runtimeTarget: "local_service",
+          runtimeConnection: "connected",
+          workspacePath: "/srv/grokptah/project",
+          runLabel: "Permission requested",
+        }}
+        onRespond={vi.fn()}
+      />,
+    );
+
+    const scope = screen.getByRole("group", { name: "Lane scope" });
+    expect(scope).toHaveTextContent("Lane Background migration");
+    expect(scope).toHaveTextContent("Agent Release Warden");
+    expect(scope).toHaveTextContent("Runtime Local service / VM · Connected");
+    expect(scope).toHaveTextContent("Workspace srv / grokptah / project");
+    expect(scope).toHaveTextContent("Run Permission requested");
   });
 
   it("surfaces two concurrent permission requests in order", async () => {

@@ -14,12 +14,14 @@ import type {
   ComputerSemanticElement,
   ComputerTargetCandidate,
 } from "../lib/protocol";
+import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
 
 const SIMULATOR_APP_ID = "com.grokptah.computer-use-simulator";
 
 type ComputerCockpitProps = {
   sessionId: string | null;
   sessionTitle?: string;
+  scope?: LaneScope;
   model: string;
   effort: string;
   computerUseTier?: string;
@@ -74,6 +76,7 @@ function actionText(action: ComputerAction) {
 export function ComputerCockpit({
   sessionId,
   sessionTitle,
+  scope,
   model,
   effort,
   computerUseTier = "none",
@@ -319,6 +322,7 @@ export function ComputerCockpit({
           <div className="computer-owner">
             {sessionTitle ? `Owned by ${sessionTitle}` : "Select a session to continue"}
           </div>
+          {scope && <LaneScopeLine scope={scope} compact />}
         </div>
         <div className="computer-header-actions">
           {activity && projection && (

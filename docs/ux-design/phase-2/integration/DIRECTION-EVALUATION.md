@@ -121,10 +121,10 @@ could drift into duplicated interaction patterns.
 - S14 remains owned by issue #273. The successful operator surface is a
   contract illustration; additional revoked, target-lost, sensitive-surface,
   limit, expiry, and restart states still require implementation evidence.
-- D04 permits initial ad-hoc Build assignment, but routine reassignment and
-  cross-Lane checkpoint continuation remain blocked. Agent lifecycle
-  implementation, D10 synchronization enforcement, and cross-Lane resume are
-  contract/runtime dependencies.
+- D04 permits initial ad-hoc Build assignment, but routine reassignment remains
+  blocked. Same-source workspace checkpoint continuation now has runtime
+  evidence; cross-workspace continuation and Agent lifecycle implementation
+  remain contract/runtime dependencies.
 - Real usage frequency for simultaneous supervision is unknown. Instrument
   concurrent Lane use before considering D3 as the default.
 - Static checks cannot prove VoiceOver/NVDA behavior, long-list virtualization,

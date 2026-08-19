@@ -6,12 +6,14 @@ import type {
   RunReview,
   SessionUpdate,
 } from "../lib/protocol";
+import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
 import { StateCard } from "./StateCard";
 
 type RunInspectorProps = {
   runs: DurableRun[];
   laneTitle?: string | null;
   runtimeLabel?: string | null;
+  scope?: LaneScope;
   error?: string | null;
   busy?: boolean;
   remote?: boolean;
@@ -146,6 +148,7 @@ export function RunInspector({
   runs,
   laneTitle = null,
   runtimeLabel = null,
+  scope,
   error,
   busy,
   remote = false,
@@ -350,11 +353,13 @@ export function RunInspector({
           <p className="run-inspector-subtitle">
             Durable progress and verification from desktop and MCP activity.
           </p>
-          {laneTitle && (
+          {scope ? (
+            <LaneScopeLine scope={scope} compact />
+          ) : laneTitle ? (
             <div className="panel-context-scope">
               Lane: {laneTitle}{runtimeLabel ? ` · ${runtimeLabel}` : ""}
             </div>
-          )}
+          ) : null}
         </div>
         <button
           type="button"

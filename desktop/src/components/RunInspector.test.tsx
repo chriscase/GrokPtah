@@ -109,6 +109,32 @@ describe("RunInspector", () => {
     expect(screen.getByText("Shared workspace", { selector: ".run-execution-mode" })).toBeTruthy();
   });
 
+  it("shows the complete Lane scope for Run actions", () => {
+    render(
+      <RunInspector
+        runs={[run()]}
+        scope={{
+          laneId: "session-1",
+          laneTitle: "Gateway qualification",
+          agentLabel: "Release Warden",
+          runtimeTarget: "hosted_service",
+          runtimeConnection: "connected",
+          workspacePath: "/srv/grokptah/gateway",
+          runLabel: "1 durable Run",
+        }}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    const scope = screen.getByRole("group", { name: "Lane scope" });
+    expect(scope).toHaveTextContent("Lane Gateway qualification");
+    expect(scope).toHaveTextContent("Agent Release Warden");
+    expect(scope).toHaveTextContent("Runtime Hosted service · Connected");
+    expect(scope).toHaveTextContent("Workspace srv / grokptah / gateway");
+    expect(scope).toHaveTextContent("Run 1 durable Run");
+  });
+
   it("shows the applied token ceiling, durable consumption, and typed stop cause", () => {
     render(
       <RunInspector

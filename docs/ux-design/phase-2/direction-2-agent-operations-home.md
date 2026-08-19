@@ -130,12 +130,11 @@ ATTENTION                Agent cards:                    Start a new Lane
 
 Requires the Agent-side contract earlier than the other directions:
 
-1. `AgentRecord.session_id` one-to-one must become Agent→Lane association
-   (runtime-model migration step 2) before the roster can honestly show
-   counts and current-Lane pointers. Checkpoint resume is additionally still
-   bound to the Agent's primary session and workspace (contract review
-   §1.3); until that unbind ships, Agent surfaces must not promise "resume
-   this Agent in any of its Lanes."
+1. `AgentRecord.session_id` remains a compatibility/current-context field while
+   Agent→Lane associations provide the durable roster relationship. The runtime
+   now permits same-source workspace continuation only after validating the
+   requested Lane and checkpoint; cross-workspace continuation and routine
+   Agent-to-Agent reassignment remain unavailable.
 2. Roster health/lifecycle needs the normalized state projection; the
    audited lock error must map to the load-failed card.
 3. Lanes list, focused Lane, and drawers are shared with D1 (same
