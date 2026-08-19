@@ -19,6 +19,7 @@ use super::authz::{
     authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
     WorkspaceAllowlist,
 };
+use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
 use super::routine::{
     manual_dedupe_key, ActivationCause, ActivationRequest, MissedRunPolicy,
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
@@ -30,8 +31,10 @@ use super::supervisor::{
     DEFAULT_ROUTINE_TICK_INTERVAL, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
 };
 use super::types::*;
+use super::worker::{reject_privilege_amplification, WorkerHostKind};
 use super::workload::{
-    WorkAttempt, WorkAttemptView, WorkDependency, WorkItem, WorkPolicy, WorkProgress, WorkResult,
+    WorkAttempt, WorkAttemptView, WorkDecision, WorkDependency, WorkItem, WorkPolicy, WorkProgress,
+    WorkResult,
 };
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
@@ -126,6 +129,14 @@ impl Drop for AdmissionGuard {
 enum IdempotencyStart {
     Perform(IdempotencyLease),
     Replay(serde_json::Value),
+}
+
+/// Coordinator vs worker identities for an assignment mutation.
+/// The authenticated principal remains `AuthContext.token_id`; these are
+/// durable Agent resources the principal is authorized to name.
+struct ScopedAssignment {
+    worker: AgentRecord,
+    manager: Option<AgentRecord>,
 }
 
 fn redact_claim_lease_token(mut response: serde_json::Value) -> serde_json::Value {
@@ -1147,6 +1158,7 @@ impl OrchestrationService {
         Ok(response)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn claim_work(
         &self,
         auth: &AuthContext,
@@ -1155,6 +1167,7 @@ impl OrchestrationService {
         workspace: &Path,
         work_id: &str,
         lease_ms: Option<u64>,
+        agent_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_claim_work";
         let payload = json!({
@@ -1162,6 +1175,7 @@ impl OrchestrationService {
             "workspace": workspace.display().to_string(),
             "workId": work_id,
             "leaseMs": lease_ms,
+            "agentId": agent_id,
         });
         let (claimed, start) = self
             .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
@@ -1177,9 +1191,19 @@ impl OrchestrationService {
             }
         };
         let lease_secret = self.config.lock().bearer_token.clone();
+        if let Some(agent_id) = agent_id.as_deref() {
+            if let Err(error) = self.store.require_agent_in_scope(
+                agent_id,
+                session_id,
+                &claimed.display().to_string(),
+            ) {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
+        }
+        let claimant = agent_id.unwrap_or_else(|| auth.token_id.clone());
         let claim = match self.store.claim_work_with_lease_secret(
             work_id,
-            &auth.token_id,
+            &claimant,
             lease_ms,
             &lease_secret,
         ) {
@@ -1590,6 +1614,665 @@ impl OrchestrationService {
             move |store| store.assign_work(work_id, assigned_agent_id, expected_revision),
         )
         .await
+    }
+
+    fn authorize_worker_assignment(
+        &self,
+        workspace: &Path,
+        session_id: Uuid,
+        worker_agent_id: &str,
+        work: &WorkItem,
+        manager_agent_id: Option<&str>,
+    ) -> Result<ScopedAssignment, OrchError> {
+        let claimed = workspace.display().to_string();
+        let worker = self
+            .store
+            .require_agent_in_scope(worker_agent_id, session_id, &claimed)?;
+        if !super::workspaces_match(&worker.workspace, &work.workspace) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "cross-workspace assignment is not allowed",
+            ));
+        }
+        let worker_spec = worker.current_spec()?.clone();
+        let manager = manager_agent_id
+            .map(|agent_id| {
+                self.store
+                    .require_agent_in_scope(agent_id, session_id, &claimed)
+            })
+            .transpose()?;
+        let manager_spec = manager.as_ref().and_then(|agent| agent.spec.clone());
+        let ceiling = self.config.lock().bounds.clone();
+        reject_privilege_amplification(
+            manager_spec.as_ref(),
+            &worker_spec,
+            &work.policy.bounds,
+            &ceiling,
+        )?;
+        Ok(ScopedAssignment { worker, manager })
+    }
+
+    pub fn list_workers_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let workers = self
+            .store
+            .list_workers(&claimed.display().to_string(), Utc::now())?;
+        Ok(json!({ "workers": workers }))
+    }
+
+    pub fn get_worker_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        agent_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let worker = self
+            .store
+            .get_worker(agent_id, Utc::now())?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown worker"))?;
+        if !super::workspaces_match(&worker.workspace, &claimed.display().to_string()) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "worker is outside the requested workspace",
+            ));
+        }
+        Ok(json!({ "worker": worker }))
+    }
+
+    pub async fn heartbeat_worker(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        agent_id: &str,
+        host_kind: WorkerHostKind,
+    ) -> Result<serde_json::Value, OrchError> {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "agentId": agent_id,
+            "hostKind": host_kind,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_heartbeat_worker",
+                request_id,
+                session_id,
+                workspace,
+                &payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let presence = match self.store.heartbeat_worker_scoped(
+            agent_id,
+            &auth.token_id,
+            host_kind,
+            Utc::now(),
+            session_id,
+            &claimed.display().to_string(),
+        ) {
+            Ok(presence) => presence,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({ "presence": presence });
+        lease
+            .complete(Some(presence.agent_id.clone()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(presence.agent_id),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn offer_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        agent_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+        manager_agent_id: Option<String>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "agentId": agent_id,
+            "reason": reason,
+            "expectedRevision": expected_revision,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_offer_work",
+                request_id,
+                session_id,
+                workspace,
+                &payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let work = match self.load_work_scoped(session_id, &claimed, work_id, false) {
+            Ok((work, _)) => work,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let actors = match self.authorize_worker_assignment(
+            &claimed,
+            session_id,
+            agent_id,
+            &work,
+            manager_agent_id.as_deref(),
+        ) {
+            Ok(actors) => actors,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let manager_id = actors.manager.as_ref().map(|agent| agent.agent_id.clone());
+        let (item, decision) = match self.store.offer_work(
+            work_id,
+            &actors.worker.agent_id,
+            &auth.token_id,
+            manager_id.as_deref(),
+            &reason,
+            expected_revision,
+            Utc::now(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({ "work": item, "decision": decision });
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn accept_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        agent_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.worker_identity_mutation(
+            "ptah_accept_work",
+            auth,
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            agent_id,
+            reason,
+            expected_revision,
+            |store, agent_id, actor_id, reason, expected_revision, now| {
+                store.accept_work(work_id, agent_id, actor_id, reason, expected_revision, now)
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn decline_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        agent_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.worker_identity_mutation(
+            "ptah_decline_work",
+            auth,
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            agent_id,
+            reason,
+            expected_revision,
+            |store, agent_id, actor_id, reason, expected_revision, now| {
+                store.decline_work(work_id, agent_id, actor_id, reason, expected_revision, now)
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reassign_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        agent_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+        manager_agent_id: Option<String>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "agentId": agent_id,
+            "reason": reason,
+            "expectedRevision": expected_revision,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_reassign_work",
+                request_id,
+                session_id,
+                workspace,
+                &payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let work = match self.load_work_scoped(session_id, &claimed, work_id, false) {
+            Ok((work, _)) => work,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let actors = match self.authorize_worker_assignment(
+            &claimed,
+            session_id,
+            agent_id,
+            &work,
+            manager_agent_id.as_deref(),
+        ) {
+            Ok(actors) => actors,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let manager_id = actors.manager.as_ref().map(|agent| agent.agent_id.clone());
+        let (item, decision) = match self.store.reassign_work(
+            work_id,
+            &actors.worker.agent_id,
+            &auth.token_id,
+            manager_id.as_deref(),
+            &reason,
+            expected_revision,
+            Utc::now(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({ "work": item, "decision": decision });
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reprioritize_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        priority: i32,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_mutation(
+            "ptah_reprioritize_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({"priority": priority, "reason": reason, "expectedRevision": expected_revision}),
+            move |store| {
+                store
+                    .reprioritize_work(
+                        work_id,
+                        priority,
+                        &auth.token_id,
+                        &reason,
+                        expected_revision,
+                        Utc::now(),
+                    )
+                    .map(|(item, _)| item)
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn block_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_mutation(
+            "ptah_block_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({"reason": reason, "expectedRevision": expected_revision}),
+            move |store| {
+                store
+                    .block_work(
+                        work_id,
+                        &auth.token_id,
+                        &reason,
+                        expected_revision,
+                        Utc::now(),
+                    )
+                    .map(|(item, _)| item)
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_work_review(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_mutation(
+            "ptah_request_review",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({"reason": reason, "expectedRevision": expected_revision}),
+            move |store| {
+                store
+                    .request_work_review(
+                        work_id,
+                        &auth.token_id,
+                        &reason,
+                        expected_revision,
+                        Utc::now(),
+                    )
+                    .map(|(item, _)| item)
+            },
+        )
+        .await
+    }
+
+    pub fn list_work_decisions_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
+        let decisions = self.store.list_work_decisions(&item.work_id)?;
+        Ok(json!({ "workId": item.work_id, "decisions": decisions }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_message(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        kind: MessageKind,
+        from_agent_id: Option<String>,
+        to_agent_id: Option<String>,
+        work_id: Option<String>,
+        body: String,
+        payload: Option<serde_json::Value>,
+        reply_to_id: Option<String>,
+        attempt_id: Option<String>,
+        run_id: Option<String>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let idempotency = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "kind": kind,
+            "fromAgentId": from_agent_id,
+            "toAgentId": to_agent_id,
+            "workId": work_id,
+            "body": body,
+            "payload": payload,
+            "replyToId": reply_to_id,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_send_message",
+                request_id,
+                session_id,
+                workspace,
+                &idempotency,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Some(work_id) = &work_id {
+            if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, true) {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
+        }
+        let mut message = match WorkMessage::new(
+            kind,
+            auth.token_id.clone(),
+            from_agent_id,
+            to_agent_id,
+            session_id,
+            claimed.display().to_string(),
+            work_id,
+            body,
+            payload,
+            Utc::now(),
+        ) {
+            Ok(message) => message,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        message.reply_to_id = reply_to_id;
+        message.attempt_id = attempt_id;
+        message.run_id = run_id;
+        if let Some(parent) = message.reply_to_id.as_deref() {
+            if let Ok(Some(parent)) = self.store.load_message(parent) {
+                if parent.expired_at(Utc::now()) && parent.kind == MessageKind::Question {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        None,
+                        session_id,
+                        &claimed,
+                        OrchError::new(OrchErrorCode::Conflict, "question has expired"),
+                    ));
+                }
+                message.thread_id = parent.thread_id.or(Some(parent.message_id.clone()));
+            }
+        }
+        let message = match self.store.send_message(message) {
+            Ok(message) => message,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({ "message": message });
+        lease
+            .complete(Some(message.message_id.clone()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(message.message_id),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    pub async fn ack_message(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        message_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "messageId": message_id,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_ack_message",
+                request_id,
+                session_id,
+                workspace,
+                &payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let message = match self.store.ack_message_scoped(
+            message_id,
+            &auth.token_id,
+            Utc::now(),
+            session_id,
+            &claimed.display().to_string(),
+        ) {
+            Ok(message) => message,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({ "message": message });
+        lease
+            .complete(Some(message_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(message_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    pub fn list_inbox_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        agent_id: &str,
+        after_seq: u64,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let page = self.store.list_messages(
+            session_id,
+            &claimed.display().to_string(),
+            after_seq,
+            Some(agent_id),
+            None,
+            100,
+        )?;
+        Ok(json!(page))
+    }
+
+    pub fn list_outbox_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        actor_id: &str,
+        after_seq: u64,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let page = self.store.list_messages(
+            session_id,
+            &claimed.display().to_string(),
+            after_seq,
+            None,
+            Some(actor_id),
+            100,
+        )?;
+        Ok(json!(page))
+    }
+
+    pub fn message_activation_boundary(&self) -> OrchError {
+        message_activation_unsupported()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2061,6 +2744,89 @@ impl OrchestrationService {
         };
         let response = json!({
             "work": item,
+            "sessionId": session_id,
+            "workspace": claimed.display().to_string(),
+        });
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn worker_identity_mutation<F>(
+        &self,
+        tool: &str,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        agent_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+        operation: F,
+    ) -> Result<serde_json::Value, OrchError>
+    where
+        F: FnOnce(
+            &OrchStore,
+            &str,
+            &str,
+            &str,
+            Option<u64>,
+            chrono::DateTime<Utc>,
+        ) -> Result<(WorkItem, WorkDecision), OrchError>,
+    {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "details": {
+                "agentId": agent_id,
+                "reason": reason,
+                "expectedRevision": expected_revision,
+            },
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        if let Err(error) =
+            self.store
+                .require_agent_in_scope(agent_id, session_id, &claimed.display().to_string())
+        {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let (item, decision) = match operation(
+            &self.store,
+            agent_id,
+            &auth.token_id,
+            &reason,
+            expected_revision,
+            Utc::now(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({
+            "work": item,
+            "decision": decision,
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
         });

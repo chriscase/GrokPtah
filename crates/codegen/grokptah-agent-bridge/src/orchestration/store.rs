@@ -12,6 +12,7 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
+use super::message::{MessagePage, WorkMessage, MAX_RETAINED_MESSAGES};
 use super::routine::{
     advance_next_fire, decide_lifecycle_skip, due_occurrences, in_flight_count,
     occurrence_dedupe_key, validate_activation_payload, ActivationCause, ActivationDisposition,
@@ -24,9 +25,11 @@ use super::types::{
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunBounds, RunRecord, RunState,
     RunStopCause,
 };
+use super::worker::{WorkerHostKind, WorkerPresence, WorkerProjection};
 use super::workload::{
-    lease_duration, AttemptState, WorkApproval, WorkAttempt, WorkClaim, WorkItem, WorkProgress,
-    WorkResult, WorkState, WorkloadReconciliationReport,
+    lease_duration, AssignmentStatus, AttemptState, WorkApproval, WorkAttempt, WorkClaim,
+    WorkDecision, WorkDecisionAction, WorkItem, WorkProgress, WorkResult, WorkState,
+    WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };
 use super::{assemble_continuation_context, ContinuationContext, ContinuationInputSnapshot};
 
@@ -74,6 +77,17 @@ struct RoutineFireIntent {
 }
 
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
+
+struct AssignmentMutation<'a> {
+    work_id: &'a str,
+    action: WorkDecisionAction,
+    actor_id: &'a str,
+    actor_agent_id: Option<&'a str>,
+    assigned_agent_id: Option<&'a str>,
+    reason: &'a str,
+    expected_revision: Option<u64>,
+    now: chrono::DateTime<Utc>,
+}
 
 /// Conservative bounds for the durable orchestration ledger. Retention is
 /// deliberately age- and count-bounded, but never trades away an active run,
@@ -146,6 +160,9 @@ impl OrchStore {
         fs::create_dir_all(root.join("routine-activations"))?;
         fs::create_dir_all(root.join("routine-dedupe"))?;
         fs::create_dir_all(root.join("routine-intents"))?;
+        fs::create_dir_all(root.join("work-decisions"))?;
+        fs::create_dir_all(root.join("messages"))?;
+        fs::create_dir_all(root.join("worker-presence"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -1498,12 +1515,813 @@ impl OrchStore {
                 "terminal work items cannot be reassigned",
             ));
         }
-        item.assigned_agent_id = assigned_agent_id;
+        item.assigned_agent_id = assigned_agent_id.clone();
+        item.assignment_status = if assigned_agent_id.is_some() {
+            AssignmentStatus::Accepted
+        } else {
+            AssignmentStatus::Unassigned
+        };
         item.validate()?;
         item.bump();
         self.save_work_item_unlocked(&item)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Ok(item)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn offer_work(
+        &self,
+        work_id: &str,
+        agent_id: &str,
+        actor_id: &str,
+        actor_agent_id: Option<&str>,
+        reason: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(WorkItem, WorkDecision), OrchError> {
+        self.mutate_assignment(
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Offer,
+                actor_id,
+                actor_agent_id,
+                assigned_agent_id: Some(agent_id),
+                reason,
+                expected_revision,
+                now,
+            },
+            |item| {
+                if item.state.is_terminal() {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "terminal work items cannot be offered",
+                    ));
+                }
+                item.assigned_agent_id = Some(agent_id.to_string());
+                item.assignment_status = AssignmentStatus::Offered;
+                Ok(())
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_work(
+        &self,
+        work_id: &str,
+        agent_id: &str,
+        actor_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(WorkItem, WorkDecision), OrchError> {
+        self.mutate_assignment(
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Accept,
+                actor_id,
+                actor_agent_id: Some(agent_id),
+                assigned_agent_id: Some(agent_id),
+                reason,
+                expected_revision,
+                now,
+            },
+            |item| {
+                if item.assignment_status != AssignmentStatus::Offered
+                    || item.assigned_agent_id.as_deref() != Some(agent_id)
+                {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "work offer is not pending for this worker",
+                    ));
+                }
+                item.assignment_status = AssignmentStatus::Accepted;
+                Ok(())
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decline_work(
+        &self,
+        work_id: &str,
+        agent_id: &str,
+        actor_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(WorkItem, WorkDecision), OrchError> {
+        self.mutate_assignment(
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Decline,
+                actor_id,
+                actor_agent_id: Some(agent_id),
+                assigned_agent_id: Some(agent_id),
+                reason,
+                expected_revision,
+                now,
+            },
+            |item| {
+                if item.assignment_status != AssignmentStatus::Offered
+                    || item.assigned_agent_id.as_deref() != Some(agent_id)
+                {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "work offer is not pending for this worker",
+                    ));
+                }
+                item.assigned_agent_id = None;
+                item.assignment_status = AssignmentStatus::Declined;
+                Ok(())
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reassign_work(
+        &self,
+        work_id: &str,
+        agent_id: &str,
+        actor_id: &str,
+        actor_agent_id: Option<&str>,
+        reason: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(WorkItem, WorkDecision), OrchError> {
+        self.mutate_assignment(
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Reassign,
+                actor_id,
+                actor_agent_id,
+                assigned_agent_id: Some(agent_id),
+                reason,
+                expected_revision,
+                now,
+            },
+            |item| {
+                if item.state.is_terminal()
+                    || item.state == WorkState::Leased
+                    || item.state == WorkState::Running
+                {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "active or terminal work cannot be reassigned",
+                    ));
+                }
+                item.assigned_agent_id = Some(agent_id.to_string());
+                item.assignment_status = AssignmentStatus::Accepted;
+                Ok(())
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reprioritize_work(
+        &self,
+        work_id: &str,
+        priority: i32,
+        actor_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(WorkItem, WorkDecision), OrchError> {
+        self.mutate_assignment(
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Reprioritize,
+                actor_id,
+                actor_agent_id: None,
+                assigned_agent_id: None,
+                reason,
+                expected_revision,
+                now,
+            },
+            |item| {
+                if item.state.is_terminal() {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "terminal work cannot be reprioritized",
+                    ));
+                }
+                item.priority = priority;
+                Ok(())
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn block_work(
+        &self,
+        work_id: &str,
+        actor_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(WorkItem, WorkDecision), OrchError> {
+        self.mutate_assignment(
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Block,
+                actor_id,
+                actor_agent_id: None,
+                assigned_agent_id: None,
+                reason,
+                expected_revision,
+                now,
+            },
+            |item| {
+                if item.state.is_terminal() {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "terminal work cannot be blocked",
+                    ));
+                }
+                if matches!(item.state, WorkState::Leased | WorkState::Running) {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "leased work cannot be blocked",
+                    ));
+                }
+                item.state = WorkState::Blocked;
+                item.blocked_reason = Some(reason.to_string());
+                Ok(())
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_work_review(
+        &self,
+        work_id: &str,
+        actor_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(WorkItem, WorkDecision), OrchError> {
+        self.mutate_assignment(
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::RequestReview,
+                actor_id,
+                actor_agent_id: None,
+                assigned_agent_id: None,
+                reason,
+                expected_revision,
+                now,
+            },
+            |item| {
+                if !matches!(
+                    item.state,
+                    WorkState::Succeeded | WorkState::AwaitingApproval | WorkState::Review
+                ) {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "review can be requested only for completed or approval-gated work",
+                    ));
+                }
+                item.state = WorkState::Review;
+                Ok(())
+            },
+        )
+    }
+
+    pub fn list_work_decisions(&self, work_id: &str) -> Result<Vec<WorkDecision>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.list_work_decisions_unlocked(work_id)
+    }
+
+    fn mutate_assignment(
+        &self,
+        request: AssignmentMutation<'_>,
+        mutate: impl FnOnce(&mut WorkItem) -> Result<(), OrchError>,
+    ) -> Result<(WorkItem, WorkDecision), OrchError> {
+        if request.reason.trim().is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "decision reason is required",
+            ));
+        }
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(request.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        Self::require_work_revision(&item, request.expected_revision)?;
+        let (actor_agent_id, policy_revision) = self.resolve_assignment_agents_unlocked(
+            &item,
+            request.actor_agent_id,
+            request.assigned_agent_id,
+        )?;
+        mutate(&mut item)?;
+        let decision = WorkDecision {
+            schema_version: WORKLOAD_SCHEMA_VERSION,
+            decision_id: Uuid::new_v4().to_string(),
+            work_id: request.work_id.to_string(),
+            action: request.action,
+            actor_id: request.actor_id.to_string(),
+            actor_agent_id,
+            assigned_agent_id: request
+                .assigned_agent_id
+                .map(str::to_string)
+                .or_else(|| item.assigned_agent_id.clone()),
+            policy_revision,
+            work_revision: Some(item.revision),
+            reason: request.reason.to_string(),
+            created_at: request.now,
+        };
+        item.last_decision_id = Some(decision.decision_id.clone());
+        item.bump_at(request.now);
+        item.validate()?;
+        self.save_work_decision_unlocked(&decision)?;
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok((item, decision))
+    }
+
+    fn resolve_assignment_agents_unlocked(
+        &self,
+        item: &WorkItem,
+        actor_agent_id: Option<&str>,
+        assigned_agent_id: Option<&str>,
+    ) -> Result<(Option<String>, Option<u64>), OrchError> {
+        let actor = actor_agent_id
+            .map(|agent_id| {
+                self.require_agent_in_scope_unlocked(agent_id, item.session_id, &item.workspace)
+            })
+            .transpose()?;
+        let assigned = match assigned_agent_id {
+            Some(agent_id)
+                if actor
+                    .as_ref()
+                    .is_some_and(|agent| agent.agent_id == agent_id) =>
+            {
+                actor.clone()
+            }
+            Some(agent_id) => Some(self.require_agent_in_scope_unlocked(
+                agent_id,
+                item.session_id,
+                &item.workspace,
+            )?),
+            None => None,
+        };
+        let policy_revision = actor
+            .as_ref()
+            .or(assigned.as_ref())
+            .and_then(|agent| agent.spec.as_ref().map(|spec| spec.revision));
+        Ok((actor.map(|agent| agent.agent_id), policy_revision))
+    }
+
+    /// Load an Agent and require it to belong to the requested session and
+    /// workspace and still be an active identity.
+    pub fn require_agent_in_scope(
+        &self,
+        agent_id: &str,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<AgentRecord, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.require_agent_in_scope_unlocked(agent_id, session_id, workspace)
+    }
+
+    fn require_agent_in_scope_unlocked(
+        &self,
+        agent_id: &str,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<AgentRecord, OrchError> {
+        let agent = self
+            .load_agent_unlocked(agent_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| {
+                OrchError::new(OrchErrorCode::InvalidRequest, "unknown agent identity")
+            })?;
+        if !agent.known_lane_ids().contains(&session_id)
+            || !workspaces_match(&agent.workspace, workspace)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "agent is outside the requested session workspace",
+            ));
+        }
+        if !agent.state.is_active_identity() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "agent identity is inactive",
+            ));
+        }
+        Ok(agent)
+    }
+
+    fn save_work_decision_unlocked(&self, decision: &WorkDecision) -> Result<(), OrchError> {
+        let path = self.work_decision_path(&decision.work_id, &decision.decision_id)?;
+        atomic_write_json(&path, decision)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn work_decision_path(&self, work_id: &str, decision_id: &str) -> Result<PathBuf, OrchError> {
+        Ok(self
+            .inner
+            .root
+            .join("work-decisions")
+            .join(safe_id_filename(work_id)?)
+            .join(format!("{}.json", safe_id_filename(decision_id)?)))
+    }
+
+    fn list_work_decisions_unlocked(&self, work_id: &str) -> Result<Vec<WorkDecision>, OrchError> {
+        let mut out = Vec::new();
+        let dir = self
+            .inner
+            .root
+            .join("work-decisions")
+            .join(safe_id_filename(work_id)?);
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let decision: WorkDecision = serde_json::from_str(
+                &fs::read_to_string(path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            out.push(decision);
+        }
+        out.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        Ok(out)
+    }
+
+    pub fn heartbeat_worker(
+        &self,
+        agent_id: &str,
+        credential_id: &str,
+        host_kind: WorkerHostKind,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<WorkerPresence, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.write_worker_presence_unlocked(agent_id, credential_id, host_kind, now)
+    }
+
+    pub fn heartbeat_worker_scoped(
+        &self,
+        agent_id: &str,
+        credential_id: &str,
+        host_kind: WorkerHostKind,
+        now: chrono::DateTime<Utc>,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<WorkerPresence, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let agent = self.require_agent_in_scope_unlocked(agent_id, session_id, workspace)?;
+        self.write_worker_presence_unlocked(&agent.agent_id, credential_id, host_kind, now)
+    }
+
+    fn write_worker_presence_unlocked(
+        &self,
+        agent_id: &str,
+        credential_id: &str,
+        host_kind: WorkerHostKind,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<WorkerPresence, OrchError> {
+        let presence = WorkerPresence::new(agent_id, credential_id, host_kind, now);
+        let path = self.worker_presence_path(agent_id)?;
+        atomic_write_json(&path, &presence)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(presence)
+    }
+
+    pub fn list_workers(
+        &self,
+        workspace: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<WorkerProjection>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let agents = self
+            .list_agents_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let items = self
+            .list_work_items_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let attempts = self
+            .list_work_attempts_unlocked(None)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let mut out = Vec::new();
+        for agent in agents {
+            if !workspaces_match(&agent.workspace, workspace) {
+                continue;
+            }
+            let presence = self.load_worker_presence_unlocked(&agent.agent_id)?;
+            out.push(WorkerProjection::project(
+                &agent,
+                agent.spec.as_ref(),
+                presence.as_ref(),
+                &items,
+                &attempts,
+                now,
+                None,
+            ));
+        }
+        Ok(out)
+    }
+
+    pub fn get_worker(
+        &self,
+        agent_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<WorkerProjection>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(agent) = self
+            .load_agent_unlocked(agent_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let items = self
+            .list_work_items_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let attempts = self
+            .list_work_attempts_unlocked(None)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let presence = self.load_worker_presence_unlocked(agent_id)?;
+        Ok(Some(WorkerProjection::project(
+            &agent,
+            agent.spec.as_ref(),
+            presence.as_ref(),
+            &items,
+            &attempts,
+            now,
+            None,
+        )))
+    }
+
+    fn worker_presence_path(&self, agent_id: &str) -> Result<PathBuf, OrchError> {
+        Ok(self
+            .inner
+            .root
+            .join("worker-presence")
+            .join(format!("{}.json", safe_id_filename(agent_id)?)))
+    }
+
+    fn load_worker_presence_unlocked(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<WorkerPresence>, OrchError> {
+        let path = self.worker_presence_path(agent_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let presence = serde_json::from_str(
+            &fs::read_to_string(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(Some(presence))
+    }
+
+    fn list_agents_unlocked(&self) -> anyhow::Result<Vec<AgentRecord>> {
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("agents");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let mut agent: AgentRecord = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            let _ = agent.migrate_legacy_spec();
+            if agent.validate().is_ok() {
+                out.push(agent);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn send_message(&self, mut message: WorkMessage) -> Result<WorkMessage, OrchError> {
+        let _guard = self.inner.lock.lock();
+        message.validate()?;
+        self.require_optional_agent_in_scope_unlocked(
+            message.from_agent_id.as_deref(),
+            message.session_id,
+            &message.workspace,
+        )?;
+        self.require_optional_agent_in_scope_unlocked(
+            message.to_agent_id.as_deref(),
+            message.session_id,
+            &message.workspace,
+        )?;
+        let seq = self.next_message_seq_unlocked()?;
+        message.seq = seq;
+        let path = self.message_path(&message.message_id)?;
+        atomic_write_json(&path, &message)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.prune_messages_unlocked()?;
+        Ok(message)
+    }
+
+    fn require_optional_agent_in_scope_unlocked(
+        &self,
+        agent_id: Option<&str>,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<(), OrchError> {
+        if let Some(agent_id) = agent_id {
+            self.require_agent_in_scope_unlocked(agent_id, session_id, workspace)?;
+        }
+        Ok(())
+    }
+
+    pub fn ack_message(
+        &self,
+        message_id: &str,
+        actor_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<WorkMessage, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.ack_message_unlocked(message_id, actor_id, now, None)
+    }
+
+    /// Lookup, session/workspace validation, and acknowledgement under one lock.
+    /// Out-of-scope callers fail closed without writing `acked_at`/`acked_by`.
+    pub fn ack_message_scoped(
+        &self,
+        message_id: &str,
+        actor_id: &str,
+        now: chrono::DateTime<Utc>,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<WorkMessage, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.ack_message_unlocked(message_id, actor_id, now, Some((session_id, workspace)))
+    }
+
+    fn ack_message_unlocked(
+        &self,
+        message_id: &str,
+        actor_id: &str,
+        now: chrono::DateTime<Utc>,
+        scope: Option<(Uuid, &str)>,
+    ) -> Result<WorkMessage, OrchError> {
+        let mut message = self
+            .load_message_unlocked(message_id)?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown message_id"))?;
+        if let Some((session_id, workspace)) = scope {
+            if message.session_id != session_id || !workspaces_match(&message.workspace, workspace)
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "message is out of scope",
+                ));
+            }
+        }
+        if message.acked_at.is_none() {
+            message.acked_at = Some(now);
+            message.acked_by = Some(actor_id.to_string());
+            atomic_write_json(&self.message_path(message_id)?, &message)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(message)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_messages(
+        &self,
+        session_id: Uuid,
+        workspace: &str,
+        after_seq: u64,
+        inbox_agent_id: Option<&str>,
+        outbox_actor: Option<&str>,
+        limit: usize,
+    ) -> Result<MessagePage, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut messages = self.list_messages_unlocked()?;
+        messages.retain(|message| {
+            message.session_id == session_id
+                && workspaces_match(&message.workspace, workspace)
+                && match inbox_agent_id {
+                    Some(agent) => message.to_agent_id.as_deref() == Some(agent),
+                    None => true,
+                }
+                && match outbox_actor {
+                    Some(actor) => {
+                        message.from_actor == actor
+                            || message.from_agent_id.as_deref() == Some(actor)
+                    }
+                    None => true,
+                }
+        });
+        messages.sort_by_key(|message| message.seq);
+        let retained_from_seq = messages.first().map(|message| message.seq).unwrap_or(1);
+        if after_seq > 0 && after_seq < retained_from_seq.saturating_sub(1) && !messages.is_empty()
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::CursorExpired,
+                "message cursor expired for the retained window",
+            ));
+        }
+        let messages = messages
+            .into_iter()
+            .filter(|message| message.seq > after_seq)
+            .take(limit.clamp(1, 200))
+            .collect::<Vec<_>>();
+        let next_seq = messages
+            .last()
+            .map(|message| message.seq)
+            .unwrap_or(after_seq);
+        Ok(MessagePage {
+            messages,
+            next_seq,
+            retained_from_seq,
+        })
+    }
+
+    pub fn load_message(&self, message_id: &str) -> Result<Option<WorkMessage>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.load_message_unlocked(message_id)
+    }
+
+    fn message_path(&self, message_id: &str) -> Result<PathBuf, OrchError> {
+        Ok(self
+            .inner
+            .root
+            .join("messages")
+            .join(format!("{}.json", safe_id_filename(message_id)?)))
+    }
+
+    fn next_message_seq_unlocked(&self) -> Result<u64, OrchError> {
+        let path = self.inner.root.join("messages").join("seq");
+        let current = if path.is_file() {
+            fs::read_to_string(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let next = current + 1;
+        fs::write(&path, next.to_string())
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(next)
+    }
+
+    fn load_message_unlocked(&self, message_id: &str) -> Result<Option<WorkMessage>, OrchError> {
+        let path = self.message_path(message_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let message = serde_json::from_str(
+            &fs::read_to_string(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(Some(message))
+    }
+
+    fn list_messages_unlocked(&self) -> Result<Vec<WorkMessage>, OrchError> {
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("messages");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let message: WorkMessage = serde_json::from_str(
+                &fs::read_to_string(path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            out.push(message);
+        }
+        Ok(out)
+    }
+
+    fn prune_messages_unlocked(&self) -> Result<(), OrchError> {
+        let mut messages = self.list_messages_unlocked()?;
+        if messages.len() <= MAX_RETAINED_MESSAGES {
+            return Ok(());
+        }
+        messages.sort_by_key(|message| message.seq);
+        let drop = messages.len() - MAX_RETAINED_MESSAGES;
+        for message in messages.into_iter().take(drop) {
+            let _ = remove_file_durable(&self.message_path(&message.message_id)?);
+        }
+        Ok(())
     }
 
     /// Manually reopen a terminal failed Work Item when its declared retry
@@ -1673,6 +2491,8 @@ impl OrchStore {
                 format!("work item is not claimable in state {:?}", item.state),
             ));
         }
+        item.assignment_status
+            .is_claimable_by(item.assigned_agent_id.as_deref(), claimant_id)?;
         if item.attempt_count >= item.policy.retry.max_attempts {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,

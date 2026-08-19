@@ -67,6 +67,74 @@ impl WorkState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentStatus {
+    #[default]
+    Unassigned,
+    Offered,
+    Accepted,
+    Declined,
+}
+
+impl AssignmentStatus {
+    pub fn is_claimable_by(self, assigned: Option<&str>, claimant: &str) -> Result<(), OrchError> {
+        match self {
+            Self::Offered => Err(invalid(
+                "work offer must be accepted before it can be claimed",
+            )),
+            Self::Declined | Self::Unassigned => Ok(()),
+            Self::Accepted => {
+                if assigned.is_some_and(|agent| agent != claimant) {
+                    Err(invalid("work item is assigned to a different worker"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkDecisionAction {
+    Assign,
+    Offer,
+    Accept,
+    Decline,
+    Reassign,
+    Reprioritize,
+    Block,
+    Unblock,
+    Cancel,
+    RequestReview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkDecision {
+    pub schema_version: u32,
+    pub decision_id: String,
+    pub work_id: String,
+    pub action: WorkDecisionAction,
+    /// Authenticated principal (`AuthContext.token_id`). Never rewritten to a
+    /// caller-supplied Agent id.
+    pub actor_id: String,
+    /// Durable Agent the principal acted on behalf of, when the request named
+    /// one. Absent for coordinator actions that carry only a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_agent_id: Option<String>,
+    /// `AgentSpec.revision` of the acting Agent, else of the assigned worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_revision: Option<u64>,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
@@ -310,6 +378,12 @@ pub struct WorkItem {
     pub source_routine_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_activation_id: Option<String>,
+    #[serde(default)]
+    pub assignment_status: AssignmentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_decision_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -365,6 +439,9 @@ impl WorkItem {
             approval: None,
             source_routine_id: None,
             source_activation_id: None,
+            assignment_status: AssignmentStatus::Unassigned,
+            blocked_reason: None,
+            last_decision_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -428,6 +505,12 @@ impl WorkItem {
         }
         if let Some(activation_id) = &self.source_activation_id {
             validate_id(activation_id, "source_activation_id")?;
+        }
+        if let Some(reason) = &self.blocked_reason {
+            validate_text(reason, MAX_WORK_OBJECTIVE_BYTES, "blocked_reason")?;
+        }
+        if let Some(decision_id) = &self.last_decision_id {
+            validate_id(decision_id, "last_decision_id")?;
         }
         Ok(())
     }

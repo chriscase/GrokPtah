@@ -256,6 +256,10 @@ the shared workload API. Desktop UI timers are not authoritative. Webhook,
 GitHub, and message adapters share the reserved `External` trigger boundary
 and are not enabled in that slice.
 
+Issue #307 adds coordinator/worker discovery, attributable delegation, and
+durable typed messages on the same Work API. A connected client is not a
+lease. Message-triggered activation remains the reserved routine boundary.
+
 ## Consequences
 
 - Persistent-agent and workload features can run in either host without

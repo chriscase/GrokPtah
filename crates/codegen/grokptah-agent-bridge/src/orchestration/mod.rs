@@ -4,11 +4,13 @@
 
 mod authz;
 mod continuation;
+mod message;
 mod routine;
 mod service;
 mod store;
 mod supervisor;
 mod types;
+mod worker;
 mod workload;
 
 pub use authz::{
@@ -21,6 +23,10 @@ pub use continuation::{
     ContinuationMemoryInput, ContinuationMemoryScope, ContinuationOmission, ContinuationReasonCode,
     ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef,
     CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
+};
+pub use message::{
+    message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,
+    MESSAGE_SCHEMA_VERSION,
 };
 pub use routine::{
     occurrence_dedupe_key, ActivationCause, ActivationDisposition, ActivationRecord,
@@ -47,8 +53,13 @@ pub use types::{
     AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
     DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
 };
+pub use worker::{
+    reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,
+    WorkerPresence, WorkerProjection, DEFAULT_WORKER_STALE_AFTER_MS,
+};
 pub use workload::{
-    lease_duration, AttemptState, WorkApproval, WorkArtifactRef, WorkAttempt, WorkAttemptView,
-    WorkClaim, WorkDependency, WorkItem, WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult,
-    WorkRetryPolicy, WorkState, WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
+    lease_duration, AssignmentStatus, AttemptState, WorkApproval, WorkArtifactRef, WorkAttempt,
+    WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency, WorkItem,
+    WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState,
+    WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };

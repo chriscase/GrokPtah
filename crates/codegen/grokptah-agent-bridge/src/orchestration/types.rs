@@ -533,6 +533,12 @@ impl AgentState {
     pub fn can_resume(self) -> bool {
         matches!(self, Self::Waiting | Self::Interrupted | Self::Failed)
     }
+
+    /// Whether this Agent may be named as a live worker or message party.
+    /// Failed/Completed identities remain durable history, not active actors.
+    pub fn is_active_identity(self) -> bool {
+        !matches!(self, Self::Failed | Self::Completed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1439,6 +1445,21 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_disable_routine",
     "ptah_fire_routine",
     "ptah_list_activations",
+    "ptah_list_workers",
+    "ptah_get_worker",
+    "ptah_heartbeat_worker",
+    "ptah_offer_work",
+    "ptah_accept_work",
+    "ptah_decline_work",
+    "ptah_reassign_work",
+    "ptah_reprioritize_work",
+    "ptah_block_work",
+    "ptah_request_review",
+    "ptah_list_work_decisions",
+    "ptah_send_message",
+    "ptah_ack_message",
+    "ptah_list_inbox",
+    "ptah_list_outbox",
     "ptah_retry_run",
     "ptah_approve_run",
     "ptah_promote_run",
