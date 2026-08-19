@@ -30,6 +30,7 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
     host.start().unwrap();
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let reviewer = host.ensure_session_agent(lane.id).unwrap();
     let orch = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
@@ -239,7 +240,7 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
                 "session_id": lane.id,
                 "workspace": workspace_text,
                 "work_id": approval_id,
-                "assigned_agent_id": "review-agent",
+                "assigned_agent_id": reviewer.agent_id,
                 "expected_revision": approval_revision,
             }),
         )
@@ -247,8 +248,53 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
         .unwrap();
     assert_eq!(
         assigned.structured["work"]["assignedAgentId"],
-        "review-agent"
+        reviewer.agent_id
     );
+    assert_eq!(assigned.structured["work"]["assignmentStatus"], "accepted");
+    assert!(client
+        .call_tool(
+            "ptah_claim_work",
+            json!({
+                "request_id": "work-approval-claim-omitted-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": approval_id,
+            }),
+        )
+        .await
+        .is_err());
+    assert!(client
+        .call_tool(
+            "ptah_claim_work",
+            json!({
+                "request_id": "work-approval-claim-unknown-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": approval_id,
+                "agent_id": "missing-reviewer",
+            }),
+        )
+        .await
+        .is_err());
+    let rejected_snapshot = client
+        .call_tool(
+            "ptah_get_work",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": approval_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected_snapshot.structured["work"]["state"], "queued");
+    assert_eq!(
+        rejected_snapshot.structured["work"]["assignedAgentId"],
+        reviewer.agent_id
+    );
+    assert!(rejected_snapshot.structured["attempts"]
+        .as_array()
+        .is_some_and(|attempts| attempts.is_empty()));
     let approval_claim = client
         .call_tool(
             "ptah_claim_work",
@@ -257,10 +303,28 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
                 "session_id": lane.id,
                 "workspace": workspace_text,
                 "work_id": approval_id,
+                "agent_id": reviewer.agent_id,
             }),
         )
         .await
         .unwrap();
+    let approval_claim_replay = client
+        .call_tool(
+            "ptah_claim_work",
+            json!({
+                "request_id": "work-approval-claim-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": approval_id,
+                "agent_id": reviewer.agent_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        approval_claim_replay.structured["attempt"]["attemptId"],
+        approval_claim.structured["attempt"]["attemptId"]
+    );
     let approval_attempt = approval_claim.structured["attempt"]["attemptId"]
         .as_str()
         .unwrap()
