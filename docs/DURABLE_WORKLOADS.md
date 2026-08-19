@@ -45,6 +45,28 @@ recovery and serializes competing claims. It intentionally accepts only one
 concurrent attempt per WorkItem in this first slice; a multi-node scheduler,
 database backend, and approval-decision operation remain follow-on work.
 
+## Service reconciliation
+
+Opening the ledger performs one recovery pass, and every live
+`OrchestrationService` starts the same transport-neutral workload supervisor.
+The supervisor runs every five seconds in both the desktop's embedded control
+plane and `grokptah-service`. It does not execute model turns or invent a
+second queue; it only reconciles durable state:
+
+- closes active attempts whose leases expired while a client or process was
+  disconnected;
+- returns retryable work to `queued`, or records terminal failure when its
+  retry budget is exhausted;
+- applies dependency blocking/unblocking and deadline failure; and
+- leaves Agent identities and archived Lanes untouched.
+
+`ptah_get_capacity` exposes the last reconciliation timestamp, outcome counts,
+and any supervisor error under `health.workloadSupervisor`. `/ready` fails
+closed when the latest pass reports an error. This is a single-process,
+single-writer supervisor today: hosted deployments gain the same recovery
+semantics, but multi-node ownership still requires the future database-backed
+coordinator boundary described in ADR-002.
+
 ## MCP/service surface
 
 Read tools:
@@ -89,3 +111,5 @@ The bridge integration tests cover:
 - omission of `leaseTokenHash` from protocol responses;
 - progress and completion through the live loopback MCP server;
 - authorized reads surviving Lane archival and mutation rejection after archive.
+- deterministic lease/deadline reconciliation and supervisor status;
+- service restart shutdown/reopen without a lingering ledger lock.

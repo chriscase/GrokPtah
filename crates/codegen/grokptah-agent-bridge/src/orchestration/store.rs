@@ -19,7 +19,7 @@ use super::types::{
 };
 use super::workload::{
     lease_duration, AttemptState, WorkAttempt, WorkClaim, WorkItem, WorkProgress, WorkResult,
-    WorkState,
+    WorkState, WorkloadReconciliationReport,
 };
 use super::{assemble_continuation_context, ContinuationContext, ContinuationInputSnapshot};
 
@@ -163,6 +163,7 @@ impl OrchStore {
         store.recover_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
+        store.reconcile_workloads()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
         store.prune_retention(RetentionPolicy::default())?;
@@ -559,6 +560,14 @@ impl OrchStore {
     }
 
     fn refresh_work_item_unlocked(&self, item: &mut WorkItem) -> anyhow::Result<()> {
+        self.refresh_work_item_at_unlocked(item, Utc::now())
+    }
+
+    fn refresh_work_item_at_unlocked(
+        &self,
+        item: &mut WorkItem,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<()> {
         if item.state.is_terminal() {
             return Ok(());
         }
@@ -577,9 +586,7 @@ impl OrchStore {
             item.bump();
             self.save_work_item_unlocked(item)?;
         }
-        if item.deadline.is_some_and(|deadline| deadline <= Utc::now()) && !item.state.is_terminal()
-        {
-            let now = Utc::now();
+        if item.deadline.is_some_and(|deadline| deadline <= now) && !item.state.is_terminal() {
             item.state = WorkState::Failed;
             item.result = Some(Self::work_failure_result(
                 "work item deadline exceeded",
@@ -589,6 +596,67 @@ impl OrchStore {
             self.save_work_item_unlocked(item)?;
         }
         Ok(())
+    }
+
+    /// Reconcile every durable workload at a caller-supplied instant.
+    ///
+    /// Supplying the instant makes restart, lease-expiry, and deadline
+    /// behavior deterministic in conformance tests while the no-argument
+    /// wrapper remains the normal local/hosted service entry point.
+    pub fn reconcile_workloads(&self) -> anyhow::Result<WorkloadReconciliationReport> {
+        self.reconcile_workloads_at(Utc::now())
+    }
+
+    pub fn reconcile_workloads_at(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<WorkloadReconciliationReport> {
+        let _guard = self.inner.lock.lock();
+        let mut report = WorkloadReconciliationReport::default();
+        for mut item in self.list_work_items_unlocked()? {
+            report.scanned_items += 1;
+            let previous_state = item.state;
+            self.refresh_work_item_at_unlocked(&mut item, now)?;
+            if previous_state == WorkState::Blocked && item.state == WorkState::Queued {
+                report.unblocked_items += 1;
+            } else if previous_state == WorkState::Queued && item.state == WorkState::Blocked {
+                report.blocked_items += 1;
+            }
+            if previous_state != WorkState::Failed
+                && item.state == WorkState::Failed
+                && item.deadline.is_some_and(|deadline| deadline <= now)
+            {
+                report.failed_items += 1;
+                report.deadline_failed_items += 1;
+            }
+
+            for mut attempt in self.list_work_attempts_unlocked(Some(&item.work_id))? {
+                if !attempt.state.is_active() || now < attempt.lease_expires_at {
+                    continue;
+                }
+                report.expired_attempts += 1;
+                if item.state.is_terminal() {
+                    // A deadline or explicit terminal transition may have
+                    // happened before the supervisor saw the stale attempt.
+                    // Preserve that terminal WorkItem state while closing the
+                    // attempt so no active lease survives reconciliation.
+                    attempt.state = AttemptState::Expired;
+                    attempt.terminal_reason = Some("lease expired".into());
+                    attempt.updated_at = now;
+                    self.save_work_attempt_unlocked(&attempt)?;
+                    continue;
+                }
+                let previous_state = item.state;
+                self.expire_attempt_unlocked(&mut item, &mut attempt, now)?;
+                if previous_state != WorkState::Queued && item.state == WorkState::Queued {
+                    report.retried_items += 1;
+                }
+                if previous_state != WorkState::Failed && item.state == WorkState::Failed {
+                    report.failed_items += 1;
+                }
+            }
+        }
+        Ok(report)
     }
 
     fn expire_attempt_unlocked(

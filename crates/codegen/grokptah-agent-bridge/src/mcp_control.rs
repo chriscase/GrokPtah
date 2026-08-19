@@ -302,6 +302,7 @@ impl ControlServerHandle {
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
+        self.orch.stop_background_tasks().await;
     }
 
     /// Actionable transport health snapshot for coordinators.
@@ -563,6 +564,7 @@ fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
         "eventJournalPersistenceError",
         "auditPersistenceError",
         "runPersistenceError",
+        "workloadSupervisorError",
         "serviceError",
     ]
     .iter()
