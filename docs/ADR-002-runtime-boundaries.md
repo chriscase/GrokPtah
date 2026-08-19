@@ -66,8 +66,11 @@ supports durable WorkItems and Attempt/Lease records, scoped reads, idempotent
 mutations, dependency/deadline/retry/approval-aware admission, Lane archival
 independence, and a shared startup/periodic reconciliation supervisor. The
 supervisor is recovery-only; finite Runs remain the execution boundary and
-model execution is never resumed implicitly. Multi-principal authority,
-multi-node claims, and a database/coordinator remain follow-on milestones.
+model execution is never resumed implicitly. The service boundary now accepts
+named device credentials that map to one configured Agent-owner account, so
+client attribution is distinct from durable Agent ownership without implying
+multi-tenant authority. Per-account grants, multi-node claims, and a
+database/coordinator remain follow-on milestones.
 
 The current bridge also persists compatibility chrome (`active_session`, open
 tabs, appearance, and related desktop restore fields), and some credential
@@ -116,7 +119,9 @@ firewall alone does not protect bearer credentials in transit.
 One process owns a `GROKPTAH_HOME` at a time, enforced by the existing instance
 lock and store locks. Desktop and service must not concurrently write the same
 home. Multiple clients share the owning process's protocol and durable state;
-they are not filesystem peers.
+they are not filesystem peers. Named bearer credentials identify the client
+device for audit/run attribution, while `GROKPTAH_SERVICE_AGENT_OWNER` identifies
+the account allowed to own durable Agents on that service.
 
 Copying a home while its owner is live, placing it on a multi-writer network
 filesystem, or syncing it between devices is unsupported. A future
@@ -150,12 +155,12 @@ A caller-supplied worker, Agent, session, or Lane ID is a requested resource;
 it never substitutes for authenticated principal identity. Delegation may only
 narrow the delegator's captured authority and must remain attributable.
 
-This tier separation is not fully shipped. The current service accepts one
-global bearer, reports credential identity `primary`, and gives every holder
-the configured allowlist and complete MCP tool surface. In particular,
-`ptah_approve_run` and `ptah_promote_run` make that bearer operator-equivalent
-for isolated-run approval and promotion. Deployments must treat possession of
-the current bearer as privileged operator access. The initial durable workload
+This tier separation is not fully shipped. The current service accepts a
+primary bearer plus optional named device credentials, but every credential
+still receives the configured allowlist and complete MCP tool surface. In
+particular, `ptah_approve_run` and `ptah_promote_run` remain operator-equivalent
+for every configured credential. Deployments must treat possession of any
+configured bearer as privileged operator access. The initial durable workload
 slice uses the same operator-equivalent identity for claims and mutations;
 separate attributable operator approval and scoped principal credentials are
 required before exposing it to less-trusted workers.

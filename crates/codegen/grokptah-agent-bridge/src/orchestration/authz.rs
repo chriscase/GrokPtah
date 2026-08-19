@@ -4,9 +4,64 @@ use std::path::{Path, PathBuf};
 
 use super::types::{OrchError, OrchErrorCode};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthContext {
+    /// Stable credential identity used for audit and attribution. This is not
+    /// the secret itself and may safely appear in durable records.
     pub token_id: String,
+    /// Account/Agent owner identity shared by the service's authenticated
+    /// device credentials. A later multi-tenant service can map credentials to
+    /// different owner identities without changing the protocol shape.
+    pub owner_id: String,
+}
+
+/// One named bearer credential accepted by a service instance.
+///
+/// The token remains private so accidental debug/JSON output cannot expose
+/// service secrets. The stable id is the identity carried into audits and
+/// client-attributed Run records.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthCredential {
+    pub id: String,
+    token: String,
+}
+
+impl std::fmt::Debug for AuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthCredential")
+            .field("id", &self.id)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
+impl AuthCredential {
+    pub fn new(id: impl Into<String>, token: impl Into<String>) -> Result<Self, OrchError> {
+        let id = id.into().trim().to_string();
+        let token = token.into().trim().to_string();
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "auth credential id must contain only ASCII letters, numbers, '-', '_', or '.'",
+            ));
+        }
+        if token.is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "auth credential token must not be empty",
+            ));
+        }
+        Ok(Self { id, token })
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,11 +121,15 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<AuthContext, OrchError> {
-    if expected.is_empty() {
+pub fn authenticate_bearer(
+    header: Option<&str>,
+    credentials: &[AuthCredential],
+    owner_id: &str,
+) -> Result<AuthContext, OrchError> {
+    if credentials.is_empty() || owner_id.trim().is_empty() {
         return Err(OrchError::new(
             OrchErrorCode::Internal,
-            "control plane token not configured",
+            "control plane credentials are not configured",
         ));
     }
     let Some(h) = header else {
@@ -91,15 +150,26 @@ pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<AuthContex
             "missing bearer token",
         ));
     }
-    if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+    let credential = credentials
+        .iter()
+        .find(|credential| constant_time_eq(token.as_bytes(), credential.token.as_bytes()));
+    let Some(credential) = credential else {
         return Err(OrchError::new(
             OrchErrorCode::Unauthenticated,
             "invalid bearer token",
         ));
-    }
+    };
     Ok(AuthContext {
-        token_id: "primary".into(),
+        token_id: credential.id.clone(),
+        owner_id: owner_id.trim().to_string(),
     })
+}
+
+/// Backward-compatible single-credential helper used by pure policy tests and
+/// embedders that have not adopted named credentials yet.
+pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<AuthContext, OrchError> {
+    let credential = AuthCredential::new("primary", expected)?;
+    authenticate_bearer(header, &[credential], "primary")
 }
 
 pub fn require_workspace_match(
@@ -140,7 +210,23 @@ mod tests {
         assert!(require_bearer(None, "tok").is_err());
         assert!(require_bearer(Some("tok"), "tok").is_err());
         assert!(require_bearer(Some("Bearer wrong"), "tok").is_err());
-        assert!(require_bearer(Some("Bearer tok"), "tok").is_ok());
+        assert_eq!(
+            require_bearer(Some("Bearer tok"), "tok").unwrap().token_id,
+            "primary"
+        );
+    }
+
+    #[test]
+    fn named_credentials_return_client_identity_and_shared_owner() {
+        let credentials = vec![
+            AuthCredential::new("primary", "tok").unwrap(),
+            AuthCredential::new("laptop", "other-tok").unwrap(),
+        ];
+        let auth =
+            authenticate_bearer(Some("Bearer other-tok"), &credentials, "account-1").unwrap();
+        assert_eq!(auth.token_id, "laptop");
+        assert_eq!(auth.owner_id, "account-1");
+        assert!(authenticate_bearer(Some("Bearer unknown"), &credentials, "account-1").is_err());
     }
 
     #[test]

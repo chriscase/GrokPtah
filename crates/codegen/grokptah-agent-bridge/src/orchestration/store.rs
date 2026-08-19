@@ -1155,6 +1155,32 @@ impl OrchStore {
         Ok(out)
     }
 
+    /// Claim an unowned legacy Agent for the authenticated service account,
+    /// or verify that an already-owned Agent belongs to that same account.
+    /// Device credentials intentionally share this account owner while their
+    /// individual IDs remain attributable at the transport layer.
+    pub fn claim_agent_owner(
+        &self,
+        agent_id: &str,
+        owner_principal_id: &str,
+    ) -> anyhow::Result<Option<AgentRecord>> {
+        let owner_principal_id = owner_principal_id.trim().to_string();
+        anyhow::ensure!(
+            !owner_principal_id.is_empty(),
+            "Agent owner principal id must not be empty"
+        );
+        self.update_agent(agent_id, |agent| {
+            match agent.owner_principal_id.as_deref() {
+                None => agent.owner_principal_id = Some(owner_principal_id.clone()),
+                Some(existing) if existing == owner_principal_id => {}
+                Some(existing) => {
+                    anyhow::bail!("Agent is owned by a different service account ({existing})")
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub fn update_agent<F>(&self, agent_id: &str, update: F) -> anyhow::Result<Option<AgentRecord>>
     where
         F: FnOnce(&mut AgentRecord) -> anyhow::Result<()>,
@@ -2409,6 +2435,7 @@ mod tests {
         store
             .save_agent(&AgentRecord {
                 agent_id: agent_id.into(),
+                owner_principal_id: None,
                 session_id,
                 lane_ids: vec![session_id],
                 lane_associations: Vec::new(),
@@ -2454,6 +2481,7 @@ mod tests {
         store
             .save_agent(&AgentRecord {
                 agent_id: agent_id.into(),
+                owner_principal_id: None,
                 session_id,
                 lane_ids: vec![session_id],
                 lane_associations: Vec::new(),
@@ -2547,6 +2575,7 @@ mod tests {
         let now = Utc::now();
         let mut agent = AgentRecord {
             agent_id: "agent-revisions".into(),
+            owner_principal_id: None,
             session_id,
             lane_ids: vec![session_id],
             lane_associations: Vec::new(),
@@ -2593,6 +2622,7 @@ mod tests {
         let now = Utc::now();
         let agent = AgentRecord {
             agent_id: "agent-orphan-revision".into(),
+            owner_principal_id: None,
             session_id,
             lane_ids: vec![session_id],
             lane_associations: Vec::new(),
@@ -3112,6 +3142,7 @@ mod tests {
         store
             .save_agent(&AgentRecord {
                 agent_id: "agent-activation-race".into(),
+                owner_principal_id: None,
                 session_id: first_lane,
                 lane_ids: vec![first_lane, second_lane],
                 lane_associations: Vec::new(),
@@ -3171,6 +3202,7 @@ mod tests {
             store
                 .save_agent(&AgentRecord {
                     agent_id: "agent-activation-crash".into(),
+                    owner_principal_id: None,
                     session_id: lane_id,
                     lane_ids: vec![lane_id],
                     lane_associations: Vec::new(),

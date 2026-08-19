@@ -51,8 +51,9 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
         readiness_json["capacity"]["health"]["workloadSupervisor"]["enabled"],
         true
     );
-    assert!(readiness_json["capacity"]["health"]["workloadSupervisor"]["lastSuccessAt"]
-        .is_string());
+    assert!(
+        readiness_json["capacity"]["health"]["workloadSupervisor"]["lastSuccessAt"].is_string()
+    );
 
     let mut client = McpControlClient::new(base, "standalone-service-token");
     client.initialize().await.unwrap();

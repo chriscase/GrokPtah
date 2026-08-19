@@ -8,7 +8,8 @@ mod common;
 
 use std::time::Duration;
 
-use grokptah_agent_bridge::{LiveNotification, McpControlClient, RunScope};
+use grokptah_agent_bridge::{AuthCredential, LiveNotification, McpControlClient, RunScope};
+use grokptah_service::{start_service, ServiceConfig};
 use serde_json::json;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -58,6 +59,91 @@ async fn multiple_authenticated_clients_share_one_service() {
 
     alice.close_session().await.unwrap();
     bob.close_session().await.unwrap();
+    handle.stop_and_wait().await;
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn named_device_credentials_share_agent_owner_and_attribute_runs() {
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+    let secondary_token = "secondary-device-token-with-enough-entropy";
+    let mut config = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TOKEN,
+        vec![workspace.clone()],
+        false,
+        2,
+        Duration::from_secs(8),
+    )
+    .unwrap();
+    config
+        .client_credentials
+        .push(AuthCredential::new("laptop", secondary_token).unwrap());
+    let handle = start_service(config).await.unwrap();
+    let host = handle.host();
+    let mut primary = mcp_client(handle.addr).await;
+    let mut laptop = McpControlClient::new(format!("http://{}", handle.addr), secondary_token);
+    laptop.initialize().await.unwrap();
+
+    let session_id = create_build_session(&mut primary, &workspace, "Named credentials").await;
+    let sessions = laptop
+        .call_tool("ptah_list_sessions", json!({}))
+        .await
+        .unwrap();
+    assert!(!sessions.is_error, "list sessions: {:?}", sessions.raw);
+    assert!(sessions.structured["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|session| session["sessionId"] == session_id.to_string()));
+
+    host.reserve_orchestration_turn("named-credentials-hold", session_id)
+        .unwrap();
+    let queued = laptop
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "named-credentials-submit",
+                "session_id": session_id,
+                "workspace": workspace,
+                "prompt": "attribute this queued run",
+                "allow_queue": true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.structured["state"], "queued");
+    let run_id = queued.structured["runId"].as_str().unwrap();
+    let run = laptop
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "run_id": run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(run.structured["clientId"], "laptop");
+
+    let agents = laptop
+        .call_tool("ptah_list_persistent_agents", json!({}))
+        .await
+        .unwrap();
+    assert!(!agents.is_error, "list agents: {:?}", agents.raw);
+    let agent = agents.structured["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["sessionId"] == session_id.to_string())
+        .expect("secondary device sees the shared service-owned Agent");
+    assert_eq!(agent["ownerPrincipalId"], "primary");
+
+    host.release_orchestration_turn("named-credentials-hold");
+    primary.close_session().await.unwrap();
+    laptop.close_session().await.unwrap();
     handle.stop_and_wait().await;
 }
 

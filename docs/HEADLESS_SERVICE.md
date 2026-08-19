@@ -30,6 +30,8 @@ Command-line options override their environment equivalents:
 | `--listen ADDR` | `GROKPTAH_SERVICE_LISTEN` | `127.0.0.1:39200` |
 | `--token TOKEN` | `GROKPTAH_SERVICE_TOKEN` | required |
 | `--workspace PATH` | `GROKPTAH_SERVICE_WORKSPACES` | required; repeatable |
+| `--client ID=TOKEN` | `GROKPTAH_SERVICE_CLIENTS` | primary token only; additional credentials repeatable |
+| — | `GROKPTAH_SERVICE_AGENT_OWNER` | `primary` |
 | `--allow-remote` | `GROKPTAH_SERVICE_ALLOW_REMOTE` | disabled |
 | `--max-concurrent N` | `GROKPTAH_SERVICE_MAX_CONCURRENT` | `4` |
 | `--request-timeout-ms N` | `GROKPTAH_SERVICE_REQUEST_TIMEOUT_MS` | `120000` |
@@ -43,6 +45,15 @@ embedded desktop control plane.
 Remote listeners require both `--allow-remote` and a bearer token at least 24
 characters long. Health and readiness probes are authenticated when the
 listener is non-loopback. The service never binds remotely by accident.
+
+The primary credential remains compatible with `GROKPTAH_SERVICE_TOKEN`. Add
+named device credentials with repeated `--client ID=TOKEN` options or a
+comma-separated `GROKPTAH_SERVICE_CLIENTS` value such as
+`laptop=<token>,phone=<token>`. Every credential maps to the configured
+`GROKPTAH_SERVICE_AGENT_OWNER` account (default `primary`), so devices can
+share durable Agent identities while Runs and audit entries retain the
+credential ID that initiated them. Credentials are held in process memory and
+are never written into `GROKPTAH_HOME`.
 
 ## Probes and MCP
 
@@ -74,7 +85,8 @@ is a service-owned local filesystem root, whether the service runs on a laptop,
 VM, or private host. Multiple clients share that one process through MCP; they
 must not mount or edit the durable files directly. A database-backed,
 multi-node coordinator is a later storage boundary, not an implicit property of
-the current service.
+the current service. Durable Agents now carry the service owner account, while
+frequently archived Lanes remain separate presentation/workspace projections.
 
 ## Supervised VM deployment
 
@@ -94,6 +106,16 @@ of the service and use an explicit firewall policy. A firewall does not protect
 the bearer credential in transit. Run hosted instances under a dedicated
 account with systemd/container/VM policy that restricts writable paths and
 process authority.
+
+### Backup and restore
+
+Stop the service before copying `GROKPTAH_HOME`; credentials remain in the
+deployment secret/configuration and are intentionally not included in the
+durable home. Restore the complete home with its ownership and permissions,
+then start exactly one service against it. Never copy a live home, use a
+multi-writer network filesystem, or synchronize it between active instances.
+After restore, verify `/ready`, review interrupted runs, and resume a
+persistent Agent only through an explicit operator action.
 
 ## Desktop remote operations
 

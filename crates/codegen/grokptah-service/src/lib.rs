@@ -4,6 +4,7 @@
 //! durable orchestration, MCP authorization, and event recovery remain in the
 //! shared `grokptah-agent-bridge` crate used by the desktop client.
 
+use std::collections::HashSet;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -11,9 +12,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::{
-    start_control_server_with_bind, AgentHost, AgentHostHandle, ControlServerHandle,
-    ControlServerLimits, HostConfig, OrchStore, OrchestrationConfig, OrchestrationService,
-    WorkspaceAllowlist,
+    start_control_server_with_bind, AgentHost, AgentHostHandle, AuthCredential,
+    ControlServerHandle, ControlServerLimits, HostConfig, OrchStore, OrchestrationConfig,
+    OrchestrationService, WorkspaceAllowlist,
 };
 
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -29,6 +30,13 @@ pub struct ServiceConfig {
     pub allow_remote: bool,
     pub max_concurrent: usize,
     pub request_timeout: Duration,
+    /// Named device/client credentials. `primary` remains the compatibility
+    /// credential represented by `token`.
+    pub client_credentials: Vec<AuthCredential>,
+    /// Account identity owning Agents on this service deployment. Multiple
+    /// device credentials may share one owner while remaining attributable as
+    /// distinct clients in audit and Run records.
+    pub agent_owner_id: String,
 }
 
 impl ServiceConfig {
@@ -40,13 +48,21 @@ impl ServiceConfig {
         max_concurrent: usize,
         request_timeout: Duration,
     ) -> Result<Self> {
+        let token = token.into().trim().to_string();
         let config = Self {
             listen,
-            token: token.into().trim().to_string(),
+            token: token.clone(),
             workspaces,
             allow_remote,
             max_concurrent,
             request_timeout,
+            client_credentials: if token.is_empty() {
+                Vec::new()
+            } else {
+                vec![AuthCredential::new("primary", token)
+                    .map_err(|error| anyhow::anyhow!(error.message))?]
+            },
+            agent_owner_id: "primary".into(),
         };
         config.validate()?;
         Ok(config)
@@ -71,6 +87,19 @@ impl ServiceConfig {
         let token = env::var("GROKPTAH_SERVICE_TOKEN")
             .or_else(|_| env::var("GROKPTAH_CONTROL_TOKEN"))
             .unwrap_or_default();
+        let mut client_credentials = if token.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![AuthCredential::new("primary", token.trim())
+                .map_err(|error| anyhow::anyhow!(error.message))?]
+        };
+        if let Ok(value) = env::var("GROKPTAH_SERVICE_CLIENTS") {
+            client_credentials.extend(parse_client_credentials(&value)?);
+        }
+        let agent_owner_id = env::var("GROKPTAH_SERVICE_AGENT_OWNER")
+            .unwrap_or_else(|_| "primary".into())
+            .trim()
+            .to_string();
         let workspace_value = env::var("GROKPTAH_SERVICE_WORKSPACES")
             .or_else(|_| env::var("GROKPTAH_CONTROL_WORKSPACES"))
             .unwrap_or_default();
@@ -97,12 +126,39 @@ impl ServiceConfig {
             allow_remote,
             max_concurrent,
             request_timeout: Duration::from_millis(timeout_ms),
+            client_credentials,
+            agent_owner_id,
         })
     }
 
     pub fn validate(&self) -> Result<()> {
         if self.token.is_empty() {
             bail!("a bearer token is required; set --token or GROKPTAH_SERVICE_TOKEN");
+        }
+        if self.agent_owner_id.is_empty() || self.agent_owner_id.len() > 128 {
+            bail!("GROKPTAH_SERVICE_AGENT_OWNER must be between 1 and 128 bytes");
+        }
+        if self.client_credentials.is_empty() {
+            bail!("at least one service client credential is required");
+        }
+        let mut credential_ids = HashSet::new();
+        let Some(primary) = self
+            .client_credentials
+            .iter()
+            .find(|credential| credential.id == "primary")
+        else {
+            bail!("service client credentials must include the primary credential");
+        };
+        if primary.token() != self.token {
+            bail!("the primary client credential must match the service token");
+        }
+        for credential in &self.client_credentials {
+            if !credential_ids.insert(credential.id.as_str()) {
+                bail!("duplicate service client credential id: {}", credential.id);
+            }
+            if !self.listen.ip().is_loopback() && credential.token().len() < 24 {
+                bail!("remote listeners require every bearer token to be at least 24 characters");
+            }
         }
         if self.workspaces.is_empty() {
             bail!(
@@ -150,7 +206,25 @@ where
                     .parse()
                     .context("--listen must be an address such as 127.0.0.1:39200")?
             }
-            "--token" => config.token = next_value(&mut iter, "--token")?,
+            "--token" => {
+                config.token = next_value(&mut iter, "--token")?;
+                let primary = AuthCredential::new("primary", config.token.clone())
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                if let Some(existing) = config
+                    .client_credentials
+                    .iter_mut()
+                    .find(|credential| credential.id == "primary")
+                {
+                    *existing = primary;
+                } else {
+                    config.client_credentials.push(primary);
+                }
+            }
+            "--client" => config
+                .client_credentials
+                .push(parse_client_credential(&next_value(
+                    &mut iter, "--client",
+                )?)?),
             "--workspace" => {
                 if !explicit_workspaces {
                     config.workspaces.clear();
@@ -200,8 +274,23 @@ fn env_bool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn parse_client_credential(spec: &str) -> Result<AuthCredential> {
+    let (id, token) = spec
+        .split_once('=')
+        .with_context(|| "client credential must use ID=TOKEN format")?;
+    AuthCredential::new(id, token).map_err(|error| anyhow::anyhow!(error.message))
+}
+
+fn parse_client_credentials(value: &str) -> Result<Vec<AuthCredential>> {
+    value
+        .split(',')
+        .filter(|entry| !entry.trim().is_empty())
+        .map(parse_client_credential)
+        .collect()
+}
+
 pub fn help_text() -> &'static str {
-    "GrokPtah headless service\n\nUsage: grokptah-service [options]\n\nOptions:\n  --listen ADDR                 Bind address (default 127.0.0.1:39200)\n  --token TOKEN                 Bearer token (or GROKPTAH_SERVICE_TOKEN)\n  --workspace PATH              Allowlisted workspace; repeatable\n  --allow-remote                Permit non-loopback bind; health requires auth\n  --max-concurrent N            Concurrent request/run ceiling (default 4)\n  --request-timeout-ms N        Request deadline (default 120000)\n  -h, --help                    Show this help\n      --version                 Show the service version\n\nSet GROKPTAH_HOME to choose the durable service data directory."
+    "GrokPtah headless service\n\nUsage: grokptah-service [options]\n\nOptions:\n  --listen ADDR                 Bind address (default 127.0.0.1:39200)\n  --token TOKEN                 Bearer token (or GROKPTAH_SERVICE_TOKEN)\n  --workspace PATH              Allowlisted workspace; repeatable\n  --client ID=TOKEN             Additional named device credential; repeatable\n  --allow-remote                Permit non-loopback bind; health requires auth\n  --max-concurrent N            Concurrent request/run ceiling (default 4)\n  --request-timeout-ms N        Request deadline (default 120000)\n  -h, --help                    Show this help\n      --version                 Show the service version\n\nGROKPTAH_SERVICE_CLIENTS accepts comma-separated ID=TOKEN entries.\nGROKPTAH_SERVICE_AGENT_OWNER names the durable Agent owner account.\nSet GROKPTAH_HOME to choose the durable service data directory."
 }
 
 pub struct ServiceHandle {
@@ -252,6 +341,10 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
             bounds: Default::default(),
         },
     );
+    orch.set_auth_credentials(config.client_credentials.clone())
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+    orch.set_agent_owner_id(config.agent_owner_id.clone())
+        .map_err(|error| anyhow::anyhow!(error.message))?;
     let limits = ControlServerLimits {
         max_concurrent: config.max_concurrent,
         request_timeout: config.request_timeout,
@@ -341,5 +434,33 @@ mod tests {
         );
         assert_eq!(config.max_concurrent, 7);
         assert_eq!(config.request_timeout, Duration::from_millis(900));
+    }
+
+    #[test]
+    fn command_line_named_clients_are_parsed_and_duplicate_ids_fail_closed() {
+        let action = parse_args([
+            "--listen",
+            "127.0.0.1:0",
+            "--token",
+            "primary-token",
+            "--workspace",
+            "/tmp/project",
+            "--client",
+            "laptop=secondary-token",
+        ])
+        .unwrap();
+        let StartupAction::Run(config) = action else {
+            panic!("expected run action");
+        };
+        assert!(config
+            .client_credentials
+            .iter()
+            .any(|credential| credential.id == "laptop"));
+
+        let mut duplicate = config;
+        duplicate
+            .client_credentials
+            .push(AuthCredential::new("laptop", "another-token").unwrap());
+        assert!(duplicate.validate().is_err());
     }
 }
