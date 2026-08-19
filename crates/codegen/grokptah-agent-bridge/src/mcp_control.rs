@@ -32,10 +32,11 @@ use uuid::Uuid;
 
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    AuthContext, ChangeRecord, MissedRunPolicy, OrchError, OrchErrorCode, OrchestrationConfig,
-    OrchestrationService, RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRetryPolicy,
-    RoutineTrigger, RunExecutionMode, WorkArtifactRef, WorkDependency, WorkPolicy, WorkResult,
-    WorkTemplate, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    AuthContext, ChangeRecord, MessageKind, MissedRunPolicy, OrchError, OrchErrorCode,
+    OrchestrationConfig, OrchestrationService, RoutineConcurrencyPolicy, RoutineLifecycle,
+    RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef, WorkDependency,
+    WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS,
+    FORBIDDEN_TOOLS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -1095,6 +1096,8 @@ struct ClaimWorkArgs {
     work_id: String,
     #[serde(default)]
     lease_ms: Option<u64>,
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1216,6 +1219,116 @@ struct ApproveWorkArgs {
     note: Option<String>,
     #[serde(default)]
     expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerScopeArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeartbeatWorkerArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    agent_id: String,
+    #[serde(default)]
+    host_kind: Option<WorkerHostKind>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfferWorkArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    agent_id: String,
+    reason: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+    #[serde(default)]
+    manager_agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptWorkArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    agent_id: String,
+    reason: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReprioritizeWorkArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    priority: i32,
+    reason: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendMessageArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    kind: MessageKind,
+    body: String,
+    #[serde(default)]
+    from_agent_id: Option<String>,
+    #[serde(default)]
+    to_agent_id: Option<String>,
+    #[serde(default)]
+    work_id: Option<String>,
+    #[serde(default)]
+    payload: Option<Value>,
+    #[serde(default)]
+    reply_to_id: Option<String>,
+    #[serde(default)]
+    attempt_id: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AckMessageArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    message_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    agent_id: String,
+    #[serde(default)]
+    after_seq: u64,
 }
 
 fn empty_object() -> Value {
@@ -1801,7 +1914,8 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "work_id": run_id,
-                "lease_ms": {"type": "integer", "minimum": 1, "maximum": 3600000}
+                "lease_ms": {"type": "integer", "minimum": 1, "maximum": 3600000},
+                "agent_id": {"type": "string", "maxLength": 256}
             }
         }),
         "ptah_renew_work" => json!({
@@ -1929,6 +2043,144 @@ fn tool_input_schema(name: &str) -> Value {
             "properties": {
                 "session_id": session,
                 "workspace": workspace
+            }
+        }),
+        "ptah_list_workers" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
+            }
+        }),
+        "ptah_get_worker" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "agent_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+        }),
+        "ptah_heartbeat_worker" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "agent_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "host_kind": {"type": "string", "enum": ["desktop", "service", "unknown"]}
+            }
+        }),
+        "ptah_offer_work" | "ptah_reassign_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "agent_id", "reason"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "expected_revision": {"type": "integer", "minimum": 1},
+                "manager_agent_id": {"type": "string", "maxLength": 256}
+            }
+        }),
+        "ptah_accept_work" | "ptah_decline_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "agent_id", "reason"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
+        "ptah_reprioritize_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "priority", "reason"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "priority": {"type": "integer"},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
+        "ptah_block_work" | "ptah_request_review" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "reason"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "reason": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
+        "ptah_list_work_decisions" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "work_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id
+            }
+        }),
+        "ptah_send_message" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "kind", "body"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "kind": {"type": "string"},
+                "body": {"type": "string", "minLength": 1, "maxLength": 8192},
+                "from_agent_id": {"type": "string"},
+                "to_agent_id": {"type": "string"},
+                "work_id": run_id,
+                "payload": {"type": "object"},
+                "reply_to_id": run_id,
+                "attempt_id": run_id,
+                "run_id": run_id
+            }
+        }),
+        "ptah_ack_message" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "message_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "message_id": run_id
+            }
+        }),
+        "ptah_list_inbox" | "ptah_list_outbox" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "agent_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "after_seq": {"type": "integer", "minimum": 0}
             }
         }),
         "ptah_get_routine" | "ptah_list_activations" => json!({
@@ -2380,6 +2632,7 @@ async fn dispatch_tool(
                 &args.workspace,
                 &args.work_id,
                 args.lease_ms,
+                args.agent_id,
             )
             .await
         }
@@ -2628,6 +2881,184 @@ async fn dispatch_tool(
                 "ptah_disable_routine",
             )
             .await
+        }
+        "ptah_list_workers" => {
+            let args: WorkerScopeArgs = parse_value(args)?;
+            orch.list_workers_scoped(auth, args.session_id, &args.workspace)
+        }
+        "ptah_get_worker" => {
+            let args: WorkerArgs = parse_value(args)?;
+            require_nonempty(&args.agent_id, "agent_id")?;
+            orch.get_worker_scoped(auth, args.session_id, &args.workspace, &args.agent_id)
+        }
+        "ptah_heartbeat_worker" => {
+            let args: HeartbeatWorkerArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.agent_id, "agent_id")?;
+            orch.heartbeat_worker(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.agent_id,
+                args.host_kind.unwrap_or(WorkerHostKind::Service),
+            )
+            .await
+        }
+        "ptah_offer_work" => {
+            let args: OfferWorkArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            orch.offer_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                &args.agent_id,
+                args.reason,
+                args.expected_revision,
+                args.manager_agent_id,
+            )
+            .await
+        }
+        "ptah_accept_work" => {
+            let args: AcceptWorkArgs = parse_value(args)?;
+            orch.accept_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                &args.agent_id,
+                args.reason,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_decline_work" => {
+            let args: AcceptWorkArgs = parse_value(args)?;
+            orch.decline_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                &args.agent_id,
+                args.reason,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_reassign_work" => {
+            let args: OfferWorkArgs = parse_value(args)?;
+            orch.reassign_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                &args.agent_id,
+                args.reason,
+                args.expected_revision,
+                args.manager_agent_id,
+            )
+            .await
+        }
+        "ptah_reprioritize_work" => {
+            let args: ReprioritizeWorkArgs = parse_value(args)?;
+            orch.reprioritize_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.priority,
+                args.reason,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_block_work" => {
+            let args: RetryWorkArgs = parse_value(args)?;
+            orch.block_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.reason,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_request_review" => {
+            let args: RetryWorkArgs = parse_value(args)?;
+            orch.request_work_review(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.reason,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_list_work_decisions" => {
+            let args: WorkArgs = parse_value(args)?;
+            orch.list_work_decisions_scoped(auth, args.session_id, &args.workspace, &args.work_id)
+        }
+        "ptah_send_message" => {
+            let args: SendMessageArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.body, "body")?;
+            orch.send_message(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                args.kind,
+                args.from_agent_id,
+                args.to_agent_id,
+                args.work_id,
+                args.body,
+                args.payload,
+                args.reply_to_id,
+                args.attempt_id,
+                args.run_id,
+            )
+            .await
+        }
+        "ptah_ack_message" => {
+            let args: AckMessageArgs = parse_value(args)?;
+            orch.ack_message(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.message_id,
+            )
+            .await
+        }
+        "ptah_list_inbox" => {
+            let args: InboxArgs = parse_value(args)?;
+            orch.list_inbox_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.agent_id,
+                args.after_seq,
+            )
+        }
+        "ptah_list_outbox" => {
+            let args: InboxArgs = parse_value(args)?;
+            orch.list_outbox_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.agent_id,
+                args.after_seq,
+            )
         }
         "ptah_fire_routine" => {
             let args: FireRoutineArgs = parse_value(args)?;

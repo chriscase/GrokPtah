@@ -952,6 +952,63 @@ async fn hosted_service_exposes_the_same_routine_state_as_local_store() {
     handle.stop_and_wait().await;
 }
 
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn hosted_service_exposes_worker_and_message_state() {
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+    let handle = start_isolated(&env, vec![workspace.clone()], 2).await;
+    let mut client = mcp_client(handle.addr).await;
+    let session_id = create_build_session(&mut client, &workspace, "Worker session").await;
+    let agent = handle
+        .host()
+        .ensure_session_agent(session_id)
+        .expect("persistent agent");
+    let tools = client.list_tools().await.unwrap();
+    for required in [
+        "ptah_list_workers",
+        "ptah_heartbeat_worker",
+        "ptah_offer_work",
+        "ptah_send_message",
+        "ptah_list_inbox",
+    ] {
+        assert!(
+            tools.iter().any(|tool| tool.name == required),
+            "missing {required}"
+        );
+    }
+    client
+        .call_tool(
+            "ptah_heartbeat_worker",
+            json!({
+                "request_id": "hosted-hb",
+                "session_id": session_id,
+                "workspace": workspace,
+                "agent_id": agent.agent_id,
+                "host_kind": "service"
+            }),
+        )
+        .await
+        .unwrap();
+    let listed = client
+        .call_tool(
+            "ptah_list_workers",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(listed.structured["workers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|worker| worker["agentId"] == agent.agent_id));
+    client.close_session().await.unwrap();
+    handle.stop_and_wait().await;
+}
+
 async fn wait_run_not_queued(
     client: &mut McpControlClient,
     session_id: Uuid,

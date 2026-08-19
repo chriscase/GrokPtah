@@ -229,6 +229,21 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_pause_routine` | mutate | `request_id`, `session_id`, `workspace`, `routine_id`; optional `expected_revision` |
 | `ptah_enable_routine` | mutate | `request_id`, `session_id`, `workspace`, `routine_id`; optional `expected_revision` |
 | `ptah_disable_routine` | mutate | `request_id`, `session_id`, `workspace`, `routine_id`; optional `expected_revision` |
+| `ptah_list_workers` | read | `session_id`, `workspace` |
+| `ptah_get_worker` | read | `session_id`, `workspace`, `agent_id` |
+| `ptah_heartbeat_worker` | mutate | `request_id`, `session_id`, `workspace`, `agent_id` |
+| `ptah_offer_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
+| `ptah_accept_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
+| `ptah_decline_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
+| `ptah_reassign_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `agent_id`, `reason` |
+| `ptah_reprioritize_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `priority`, `reason` |
+| `ptah_block_work` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `reason` |
+| `ptah_request_review` | mutate | `request_id`, `session_id`, `workspace`, `work_id`, `reason` |
+| `ptah_list_work_decisions` | read | `session_id`, `workspace`, `work_id` |
+| `ptah_send_message` | mutate | `request_id`, `session_id`, `workspace`, `kind`, `body` |
+| `ptah_ack_message` | mutate | `request_id`, `session_id`, `workspace`, `message_id` |
+| `ptah_list_inbox` | read | `session_id`, `workspace`, `agent_id`; optional `after_seq` |
+| `ptah_list_outbox` | read | `session_id`, `workspace`, `agent_id`; optional `after_seq` |
 
 ### Forbidden (never exposed)
 

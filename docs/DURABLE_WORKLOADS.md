@@ -19,7 +19,8 @@ Archiving a Lane changes its visibility and blocks new mutations through the
 service boundary. It does not delete or hide its durable workload history from
 authorized reads, and it does not retire the Agent identity. A routine activation
 may attach a new WorkItem to the same Agent and Lane without changing this
-ownership model. See [DURABLE_ROUTINES.md](DURABLE_ROUTINES.md).
+ownership model. See [DURABLE_ROUTINES.md](DURABLE_ROUTINES.md) and
+[COORDINATOR_WORKERS.md](COORDINATOR_WORKERS.md).
 
 ## State and lease contract
 
