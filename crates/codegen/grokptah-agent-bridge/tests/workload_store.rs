@@ -205,6 +205,88 @@ fn approval_policy_stops_completion_at_awaiting_approval() {
         grokptah_agent_bridge::orchestration::AttemptState::AwaitingApproval
     );
     assert!(!completed.state.is_terminal());
+
+    let (approved, approved_attempt) = store
+        .approve_work(
+            &item.work_id,
+            "reviewer-1",
+            Some("reviewed the evidence".into()),
+            Some(completed.revision),
+        )
+        .unwrap();
+    assert_eq!(approved.state, WorkState::Succeeded);
+    assert_eq!(
+        approved.approval.as_ref().unwrap().reviewer_id,
+        "reviewer-1"
+    );
+    assert_eq!(
+        approved_attempt.state,
+        grokptah_agent_bridge::orchestration::AttemptState::Succeeded
+    );
+}
+
+#[test]
+fn assignment_and_manual_retry_use_revision_fences_and_preserve_history() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let policy = WorkPolicy {
+        retry: grokptah_agent_bridge::orchestration::WorkRetryPolicy {
+            max_attempts: 2,
+            retry_failed: false,
+            ..Default::default()
+        },
+        ..WorkPolicy::default()
+    };
+    let item = WorkItem::new(
+        "test",
+        "retry after review",
+        Uuid::new_v4(),
+        "/tmp/project",
+        "operator",
+        policy,
+    )
+    .unwrap();
+    store.save_work_item(&item).unwrap();
+
+    let assigned = store
+        .assign_work(&item.work_id, Some("agent-1".into()), Some(item.revision))
+        .unwrap();
+    assert_eq!(assigned.assigned_agent_id.as_deref(), Some("agent-1"));
+    assert!(store
+        .assign_work(&item.work_id, None, Some(item.revision))
+        .is_err());
+
+    let claim = store.claim_work(&item.work_id, "agent-1", None).unwrap();
+    let (failed, _) = store
+        .fail_work(
+            &item.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            WorkResult {
+                summary: "worker failed".into(),
+                evidence: Vec::new(),
+                artifacts: Vec::new(),
+                failure: Some("fixture failure".into()),
+                cancellation_reason: None,
+                completed_at: Utc::now(),
+            },
+        )
+        .unwrap();
+    assert_eq!(failed.state, WorkState::Failed);
+
+    let retried = store
+        .retry_work(
+            &item.work_id,
+            "operator approved retry",
+            Some(failed.revision),
+        )
+        .unwrap();
+    assert_eq!(retried.state, WorkState::Queued);
+    assert_eq!(retried.attempt_count, 1);
+    assert_eq!(
+        store.list_work_attempts(Some(&item.work_id)).unwrap().len(),
+        1
+    );
 }
 
 #[test]

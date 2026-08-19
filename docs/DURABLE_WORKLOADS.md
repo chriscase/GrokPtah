@@ -77,6 +77,7 @@ Read tools:
 Mutation tools:
 
 - `ptah_create_work`
+- `ptah_assign_work` (human/coordinator owner change; never starts execution)
 - `ptah_claim_work`
 - `ptah_renew_work`
 - `ptah_link_work_run`
@@ -85,6 +86,8 @@ Mutation tools:
 - `ptah_complete_work`
 - `ptah_fail_work`
 - `ptah_cancel_work`
+- `ptah_retry_work` (explicitly reopens a failed item only within its retry budget)
+- `ptah_approve_work` (human decision for an approval-gated completion)
 
 Mutating calls use the existing durable request-id/idempotency mechanism. A
 replayed request returns the original response; the same request ID with a
@@ -96,7 +99,20 @@ The desktop's remote-service adapter advertises and decodes the two read tools
 into typed `DurableWorkItem`, `DurableWorkAttempt`, and `RemoteWorkSnapshot`
 projections. It uses the same authenticated MCP boundary as other remote
 sessions and runs, so local and hosted deployments share the same wire
-contract.
+contract. The desktop Work view adds a human-reviewed control surface for
+creating, assigning, retrying, approving, and cancelling Work Items. Local
+actions call the embedded ledger directly; hosted actions use fresh
+idempotent MCP request IDs. Neither path exposes lease tokens or worker-only
+claim/progress/completion controls to the UI. Every human mutation can carry a
+revision fence, and stale UI actions fail with `stale_version` rather than
+silently overwriting newer state.
+
+Approval decisions are durable and attributable. An approval-gated worker
+completion remains `awaiting_approval` until an authenticated operator calls
+`ptah_approve_work`; the resulting reviewer identity, optional note, and time
+are retained on the Work Item. Assignment never claims a lease, retry never
+exceeds `maxAttempts`, and cancel remains terminal. Archived Lanes remain
+readable but reject all of these mutation paths.
 
 ## Conformance evidence
 

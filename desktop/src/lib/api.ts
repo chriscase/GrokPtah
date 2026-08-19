@@ -91,6 +91,125 @@ export const api = {
     invoke<DurableWorkItem[]>("work_list", { sessionId }),
   workGet: (sessionId: string, workId: string) =>
     invoke<RemoteWorkSnapshot | null>("work_get", { sessionId, workId }),
+  workCreate: (
+    sessionId: string,
+    kind: string,
+    objective: string,
+    priority = 0,
+    requiresApproval = false,
+  ) =>
+    invoke<DurableWorkItem>("work_create", {
+      sessionId,
+      kind,
+      objective,
+      priority,
+      requiresApproval,
+    }),
+  workAssign: (
+    sessionId: string,
+    workId: string,
+    assignedAgentId: string | null,
+    expectedRevision?: number,
+  ) =>
+    invoke<DurableWorkItem>("work_assign", {
+      sessionId,
+      workId,
+      assignedAgentId,
+      expectedRevision: expectedRevision ?? null,
+    }),
+  workRetry: (sessionId: string, workId: string, reason: string, expectedRevision?: number) =>
+    invoke<DurableWorkItem>("work_retry", {
+      sessionId,
+      workId,
+      reason,
+      expectedRevision: expectedRevision ?? null,
+    }),
+  workApprove: (sessionId: string, workId: string, note?: string, expectedRevision?: number) =>
+    invoke<DurableWorkItem>("work_approve", {
+      sessionId,
+      workId,
+      note: note ?? null,
+      expectedRevision: expectedRevision ?? null,
+    }),
+  workCancel: (sessionId: string, workId: string, reason: string, expectedRevision?: number) =>
+    invoke<DurableWorkItem>("work_cancel", {
+      sessionId,
+      workId,
+      reason,
+      expectedRevision: expectedRevision ?? null,
+    }),
+  remoteServiceWorkCreate: (
+    sessionId: string,
+    workspace: string,
+    kind: string,
+    objective: string,
+    priority = 0,
+    requiresApproval = false,
+  ) =>
+    invoke<DurableWorkItem>("remote_service_work_create", {
+      sessionId,
+      workspace,
+      kind,
+      objective,
+      priority,
+      requiresApproval,
+    }),
+  remoteServiceWorkAssign: (
+    sessionId: string,
+    workspace: string,
+    workId: string,
+    assignedAgentId: string | null,
+    expectedRevision?: number,
+  ) =>
+    invoke<DurableWorkItem>("remote_service_work_assign", {
+      sessionId,
+      workspace,
+      workId,
+      assignedAgentId,
+      expectedRevision: expectedRevision ?? null,
+    }),
+  remoteServiceWorkRetry: (
+    sessionId: string,
+    workspace: string,
+    workId: string,
+    reason: string,
+    expectedRevision?: number,
+  ) =>
+    invoke<DurableWorkItem>("remote_service_work_retry", {
+      sessionId,
+      workspace,
+      workId,
+      reason,
+      expectedRevision: expectedRevision ?? null,
+    }),
+  remoteServiceWorkApprove: (
+    sessionId: string,
+    workspace: string,
+    workId: string,
+    note?: string,
+    expectedRevision?: number,
+  ) =>
+    invoke<DurableWorkItem>("remote_service_work_approve", {
+      sessionId,
+      workspace,
+      workId,
+      note: note ?? null,
+      expectedRevision: expectedRevision ?? null,
+    }),
+  remoteServiceWorkCancel: (
+    sessionId: string,
+    workspace: string,
+    workId: string,
+    reason: string,
+    expectedRevision?: number,
+  ) =>
+    invoke<DurableWorkItem>("remote_service_work_cancel", {
+      sessionId,
+      workspace,
+      workId,
+      reason,
+      expectedRevision: expectedRevision ?? null,
+    }),
   remoteServiceRunGet: (sessionId: string, workspace: string, runId: string) =>
     invoke<DurableRun>("remote_service_run_get", { sessionId, workspace, runId }),
   remoteServiceRunEvents: (

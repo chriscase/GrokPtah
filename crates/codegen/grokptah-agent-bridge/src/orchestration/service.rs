@@ -1502,6 +1502,7 @@ impl OrchestrationService {
         workspace: &Path,
         work_id: &str,
         reason: String,
+        expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_cancel_work";
         let payload = json!({
@@ -1509,6 +1510,7 @@ impl OrchestrationService {
             "workspace": workspace.display().to_string(),
             "workId": work_id,
             "reason": reason,
+            "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
             .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
@@ -1520,17 +1522,155 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        let (item, attempts) = match self.store.cancel_work(work_id, &reason) {
-            Ok(value) => value,
-            Err(error) => {
-                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
-            }
-        };
+        let (item, attempts) =
+            match self
+                .store
+                .cancel_work_checked(work_id, &reason, expected_revision)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+                }
+            };
         let attempts = attempts
             .iter()
             .map(WorkAttemptView::from)
             .collect::<Vec<_>>();
         let response = json!({"work": item, "attempts": attempts});
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn assign_work(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        assigned_agent_id: Option<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_mutation(
+            "ptah_assign_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({
+                "assignedAgentId": assigned_agent_id,
+                "expectedRevision": expected_revision,
+            }),
+            move |store| store.assign_work(work_id, assigned_agent_id, expected_revision),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_work(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_mutation(
+            "ptah_retry_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({
+                "reason": reason,
+                "expectedRevision": expected_revision,
+            }),
+            move |store| store.retry_work(work_id, &reason, expected_revision),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn approve_work(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        note: Option<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        self.work_item_attempt_mutation(
+            "ptah_approve_work",
+            request_id,
+            session_id,
+            workspace,
+            work_id,
+            json!({
+                "reviewerId": auth.token_id,
+                "note": note,
+                "expectedRevision": expected_revision,
+            }),
+            |store| store.approve_work(work_id, &auth.token_id, note, expected_revision),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn work_item_mutation<F>(
+        &self,
+        tool: &str,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        details: serde_json::Value,
+        operation: F,
+    ) -> Result<serde_json::Value, OrchError>
+    where
+        F: FnOnce(&OrchStore) -> Result<WorkItem, OrchError>,
+    {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "details": details,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let item = match operation(&self.store) {
+            Ok(item) => item,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({
+            "work": item,
+            "sessionId": session_id,
+            "workspace": claimed.display().to_string(),
+        });
         lease
             .complete(Some(work_id.to_string()), response.clone())
             .map_err(|error| {

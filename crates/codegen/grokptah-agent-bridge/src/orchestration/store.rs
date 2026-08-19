@@ -18,8 +18,8 @@ use super::types::{
     RunStopCause,
 };
 use super::workload::{
-    lease_duration, AttemptState, WorkAttempt, WorkClaim, WorkItem, WorkProgress, WorkResult,
-    WorkState, WorkloadReconciliationReport,
+    lease_duration, AttemptState, WorkApproval, WorkAttempt, WorkClaim, WorkItem, WorkProgress,
+    WorkResult, WorkState, WorkloadReconciliationReport,
 };
 use super::{assemble_continuation_context, ContinuationContext, ContinuationInputSnapshot};
 
@@ -695,6 +695,148 @@ impl OrchStore {
             .find(|attempt| attempt.lease_active_at(now)))
     }
 
+    fn require_work_revision(
+        item: &WorkItem,
+        expected_revision: Option<u64>,
+    ) -> Result<(), OrchError> {
+        if let Some(expected) = expected_revision {
+            if expected != item.revision {
+                return Err(OrchError::new(
+                    OrchErrorCode::StaleVersion,
+                    format!(
+                        "work item revision is {}, expected {}",
+                        item.revision, expected
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Change the durable owner without claiming a lease. Assignment is a
+    /// human/coordinator decision and never starts execution by itself.
+    pub fn assign_work(
+        &self,
+        work_id: &str,
+        assigned_agent_id: Option<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<WorkItem, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        Self::require_work_revision(&item, expected_revision)?;
+        if item.state.is_terminal() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "terminal work items cannot be reassigned",
+            ));
+        }
+        item.assigned_agent_id = assigned_agent_id;
+        item.validate()?;
+        item.bump();
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(item)
+    }
+
+    /// Manually reopen a terminal failed Work Item when its declared retry
+    /// budget still has capacity. Attempts remain durable and the next claim
+    /// receives the next attempt number.
+    pub fn retry_work(
+        &self,
+        work_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<WorkItem, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        Self::require_work_revision(&item, expected_revision)?;
+        if item.state != WorkState::Failed {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "only failed work items can be retried",
+            ));
+        }
+        if item.attempt_count >= item.policy.retry.max_attempts {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work item retry budget is exhausted",
+            ));
+        }
+        if reason.trim().is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "retry reason is required",
+            ));
+        }
+        item.state = WorkState::Queued;
+        item.result = None;
+        item.approval = None;
+        item.bump();
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(item)
+    }
+
+    /// Release an approval-gated completion into a terminal succeeded state.
+    /// No worker lease credential is accepted here: approval is an explicit
+    /// operator action authenticated by the service boundary.
+    pub fn approve_work(
+        &self,
+        work_id: &str,
+        reviewer_id: &str,
+        note: Option<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<(WorkItem, WorkAttempt), OrchError> {
+        let approval = WorkApproval {
+            reviewer_id: reviewer_id.to_string(),
+            note,
+            approved_at: Utc::now(),
+        };
+        approval.validate()?;
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        Self::require_work_revision(&item, expected_revision)?;
+        if item.state != WorkState::AwaitingApproval {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work item is not awaiting approval",
+            ));
+        }
+        let mut attempts = self
+            .list_work_attempts_unlocked(Some(work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let attempt = attempts
+            .iter_mut()
+            .rev()
+            .find(|attempt| attempt.state == AttemptState::AwaitingApproval)
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "approval-gated work item has no awaiting attempt",
+                )
+            })?;
+        attempt.state = AttemptState::Succeeded;
+        attempt.terminal_reason = Some(format!("approved by {}", reviewer_id));
+        attempt.updated_at = approval.approved_at;
+        item.state = WorkState::Succeeded;
+        item.approval = Some(approval);
+        item.bump();
+        self.save_work_attempt_unlocked(attempt)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok((item, attempt.clone()))
+    }
+
     pub fn claim_work(
         &self,
         work_id: &str,
@@ -1035,11 +1177,21 @@ impl OrchStore {
         work_id: &str,
         reason: &str,
     ) -> Result<(WorkItem, Vec<WorkAttempt>), OrchError> {
+        self.cancel_work_checked(work_id, reason, None)
+    }
+
+    pub fn cancel_work_checked(
+        &self,
+        work_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<(WorkItem, Vec<WorkAttempt>), OrchError> {
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        Self::require_work_revision(&item, expected_revision)?;
         if item.state.is_terminal() {
             return Ok((
                 item,

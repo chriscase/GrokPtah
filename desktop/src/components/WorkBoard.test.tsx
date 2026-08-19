@@ -117,4 +117,31 @@ describe("WorkBoard", () => {
     );
     expect(screen.getByText("No durable Work Items in this Lane")).toBeInTheDocument();
   });
+
+  it("keeps approval and assignment as explicit human actions", async () => {
+    const user = userEvent.setup();
+    const onAssign = vi.fn().mockResolvedValue(undefined);
+    const onApprove = vi.fn().mockResolvedValue(undefined);
+    render(
+      <WorkBoard
+        items={[item]}
+        selectedWorkId={item.workId}
+        snapshot={snapshot}
+        scope={scope}
+        mutationsEnabled
+        onAssign={onAssign}
+        onApprove={onApprove}
+        onRefresh={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    const agentInput = screen.getByRole("textbox", { name: "Assigned Agent" });
+    await user.clear(agentInput);
+    await user.type(agentInput, "review-agent");
+    await user.click(screen.getByRole("button", { name: "Update assignment" }));
+    expect(onAssign).toHaveBeenCalledWith(item.workId, "review-agent", item.revision);
+    await user.click(screen.getByRole("button", { name: "Approve completion" }));
+    expect(onApprove).toHaveBeenCalledWith(item.workId, undefined, item.revision);
+  });
 });
