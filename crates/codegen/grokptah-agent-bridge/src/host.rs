@@ -743,6 +743,10 @@ pub struct AgentHostHandle {
     provider_observation: Option<ProviderObservationSession>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
+    /// Selects the durable root for legacy modules that still resolve paths
+    /// through `grokptah_home()`. Shared by all host clones.
+    runtime_home: crate::discover::RuntimeHome,
+    _runtime_home_context: Arc<crate::discover::RuntimeHomeContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -756,8 +760,20 @@ pub struct AgentHost;
 impl AgentHost {
     /// Create a new host. Events are pulled via [`AgentHostHandle::take_event_receiver`] once.
     pub fn create(config: HostConfig) -> AgentHostHandle {
+        Self::create_with_runtime_home(config, crate::discover::RuntimeHome::discover())
+    }
+
+    /// Create a host against an explicit, validated durable runtime home.
+    /// Desktop callers may keep using [`Self::create`]; hosted callers should
+    /// inject their configured home so state selection is not implicit.
+    pub fn create_with_runtime_home(
+        config: HostConfig,
+        runtime_home: crate::discover::RuntimeHome,
+    ) -> AgentHostHandle {
+        let runtime_home_context = Arc::new(runtime_home.install());
         // Single-instance guard before any GC or writes that could race another process.
-        let instance_lock = match crate::instance_lock::InstanceLock::try_acquire() {
+        let instance_lock = match crate::instance_lock::InstanceLock::try_acquire_at(&runtime_home)
+        {
             Ok(l) => Some(Arc::new(l)),
             Err(e) => {
                 eprintln!("[grokptah] {e:#}");
@@ -770,8 +786,7 @@ impl AgentHost {
                 .unwrap_or(crate::event_bus::DEFAULT_JOURNAL_CAPACITY),
         );
         {
-            let home = crate::discover::grokptah_home();
-            event_tx = event_tx.with_persist_dir(home.join("orchestration"));
+            event_tx = event_tx.with_persist_dir(runtime_home.orchestration_root());
         }
         // Keep a dedicated channel for take_event_receiver / first GUI subscriber.
         let event_rx = event_tx.subscribe();
@@ -912,11 +927,18 @@ impl AgentHost {
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
             _instance_lock: instance_lock,
+            runtime_home,
+            _runtime_home_context: runtime_home_context,
         }
     }
 }
 
 impl AgentHostHandle {
+    /// The validated durable root owned by this host process.
+    pub fn runtime_home(&self) -> crate::discover::RuntimeHome {
+        self.runtime_home.clone()
+    }
+
     fn provider_observation_context(&self, session_id: Uuid) -> Option<ProviderObservationContext> {
         let session = self.provider_observation.as_ref()?;
         let tracker = self.run_usage_trackers.lock().get(&session_id).cloned()?;
@@ -1171,7 +1193,7 @@ impl AgentHostHandle {
         if let Some(existing) = store.as_ref() {
             return Ok(existing.clone());
         }
-        let opened = OrchStore::open(crate::discover::grokptah_home().join("orchestration"))?;
+        let opened = OrchStore::open(self.runtime_home.orchestration_root())?;
         *store = Some(opened.clone());
         Ok(opened)
     }
@@ -1185,9 +1207,7 @@ impl AgentHostHandle {
         if let Some(existing) = store.as_ref() {
             return Ok(existing.clone());
         }
-        let opened = crate::computer_use::ComputerStore::open(
-            crate::discover::grokptah_home().join("computer-use"),
-        )?;
+        let opened = crate::computer_use::ComputerStore::open(self.runtime_home.computer_root())?;
         *store = Some(opened.clone());
         Ok(opened)
     }

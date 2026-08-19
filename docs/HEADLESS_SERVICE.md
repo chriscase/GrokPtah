@@ -42,6 +42,15 @@ Command-line options override their environment equivalents:
 `GROKPTAH_CONTROL_REQUEST_TIMEOUT_MS` remain accepted for migration from the
 embedded desktop control plane.
 
+Library embedders can select the same layout explicitly with
+`ServiceConfig::with_runtime_home(path)`. The service validates and
+canonicalizes that root, creates the shared top-level layout, and keeps the
+one-writer lock for the host lifetime. This is the current portability seam:
+local desktop and hosted service use the same filesystem-backed records and
+store paths, while a future database/object-store backend can replace the
+layout behind the runtime-home contract without changing Agent/Lane protocol
+semantics.
+
 Remote listeners require both `--allow-remote` and a bearer token at least 24
 characters long. Health and readiness probes are authenticated when the
 listener is non-loopback. The service never binds remotely by accident.

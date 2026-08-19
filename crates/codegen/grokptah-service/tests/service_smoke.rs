@@ -31,8 +31,14 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
         2,
         Duration::from_secs(5),
     )
+    .unwrap()
+    .with_runtime_home(home.path())
     .unwrap();
     let handle = start_service(config).await.unwrap();
+    assert_eq!(
+        handle.host().runtime_home().path(),
+        dunce::canonicalize(home.path()).unwrap()
+    );
     let base = format!("http://{}", handle.addr);
 
     let unauthenticated = reqwest::Client::new()
@@ -109,6 +115,8 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
         2,
         Duration::from_secs(5),
     )
+    .unwrap()
+    .with_runtime_home(home.path())
     .unwrap();
     let restarted = start_service(config_after_restart).await.unwrap();
     let mut restarted_client = McpControlClient::new(

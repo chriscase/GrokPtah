@@ -113,7 +113,7 @@ pub use computer_use::{
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
-    set_grokptah_home_override, set_project_mcp_trusted,
+    set_grokptah_home_override, set_project_mcp_trusted, RuntimeHome,
 };
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};

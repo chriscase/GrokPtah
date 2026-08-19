@@ -24,6 +24,11 @@ sudo install -d -o root -g grokptah -m 0750 /etc/grokptah
 sudo install -d -o grokptah -g grokptah -m 0750 /var/lib/grokptah
 ```
 
+`GROKPTAH_HOME=/var/lib/grokptah` is the service's explicit durable runtime
+home. Keep the entire directory on the VM's local filesystem; do not split
+the orchestration, session, memory, or Computer Use subdirectories across
+mounts.
+
 Copy the environment template, set a unique token, and protect it:
 
 ```sh
