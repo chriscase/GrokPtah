@@ -17,6 +17,9 @@ use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{canonical_workspace, require_workspace_match, AuthContext, WorkspaceAllowlist};
 use super::store::{IdempotencyClaim, OrchStore};
+use super::supervisor::{
+    WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
+};
 use super::types::*;
 use super::workload::{
     WorkAttempt, WorkAttemptView, WorkDependency, WorkItem, WorkPolicy, WorkProgress, WorkResult,
@@ -65,6 +68,7 @@ pub struct OrchestrationService {
     self_ref: Weak<OrchestrationService>,
     pending_admissions: Mutex<AdmissionQueueState>,
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    workload_supervisor: Mutex<Option<WorkloadSupervisor>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -204,6 +208,8 @@ impl OrchestrationService {
         }
         config.max_concurrent_runs =
             host.configure_orchestration_capacity(config.max_concurrent_runs);
+        let workload_supervisor =
+            WorkloadSupervisor::start(store.clone(), DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL);
         let service = Arc::new_cyclic(|self_ref| Self {
             host,
             bus,
@@ -212,6 +218,7 @@ impl OrchestrationService {
             self_ref: self_ref.clone(),
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
+            workload_supervisor: Mutex::new(workload_supervisor),
             join_handles: Mutex::new(Vec::new()),
         });
         service.start_scheduler_watcher();
@@ -257,6 +264,16 @@ impl OrchestrationService {
 
     pub fn bus(&self) -> &EventBus {
         &self.bus
+    }
+
+    /// Stop background recovery before a caller reopens the shared ledger.
+    /// This is separate from `Drop` because an async service shutdown must
+    /// wait for the supervisor task to release its store handle.
+    pub async fn stop_background_tasks(&self) {
+        let supervisor = self.workload_supervisor.lock().take();
+        if let Some(mut supervisor) = supervisor {
+            supervisor.stop_and_wait();
+        }
     }
 
     pub fn store(&self) -> &OrchStore {
@@ -1602,6 +1619,18 @@ impl OrchestrationService {
             .store
             .last_run_error()
             .map(|error| self.bus.redact_text(&error, 500));
+        let workload_supervisor = self
+            .workload_supervisor
+            .lock()
+            .as_ref()
+            .map(WorkloadSupervisor::status)
+            .unwrap_or_else(|| {
+                WorkloadSupervisorStatus::disabled(DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL)
+            });
+        let workload_supervisor_error = workload_supervisor
+            .last_error
+            .as_deref()
+            .map(|error| self.bus.redact_text(error, 500));
         Ok(json!({
             "maxConcurrentRuns": max,
             "activeRuns": active,
@@ -1613,6 +1642,8 @@ impl OrchestrationService {
                 "eventJournalPersistenceError": event_error,
                 "auditPersistenceError": audit_error,
                 "runPersistenceError": run_error,
+                "workloadSupervisorError": workload_supervisor_error,
+                "workloadSupervisor": workload_supervisor,
             },
         }))
     }

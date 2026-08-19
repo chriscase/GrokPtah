@@ -23,6 +23,23 @@ pub const DEFAULT_WORK_LEASE_MS: u64 = 5 * 60 * 1_000;
 pub const MAX_WORK_LEASE_MS: u64 = 60 * 60 * 1_000;
 pub const DEFAULT_WORK_MAX_ATTEMPTS: u32 = 3;
 
+/// Counts the durable changes made by one workload reconciliation pass.
+///
+/// The report is intentionally transport-neutral: a local desktop, the
+/// headless service, and a future hosted scheduler can expose the same
+/// evidence without sharing a process-local queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadReconciliationReport {
+    pub scanned_items: usize,
+    pub expired_attempts: usize,
+    pub retried_items: usize,
+    pub failed_items: usize,
+    pub blocked_items: usize,
+    pub unblocked_items: usize,
+    pub deadline_failed_items: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkState {

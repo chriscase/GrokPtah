@@ -64,7 +64,17 @@ plane, including Build-session discovery/creation, task submission, durable
 run history, checkpoint inspection, and explicit resume. A remote coordinator
 can bootstrap a fresh allowlisted Build session with `ptah_create_session`;
 session creation never accepts an arbitrary path or model policy. The service
-does not resume model execution implicitly after restart.
+does not resume model execution implicitly after restart. It does reconcile
+durable workload leases, deadlines, dependencies, and retry admission after
+startup and every five seconds while running. The latest pass is visible in
+`ptah_get_capacity` under `health.workloadSupervisor`.
+
+The current hosted boundary is intentionally single-writer: `GROKPTAH_HOME`
+is a service-owned local filesystem root, whether the service runs on a laptop,
+VM, or private host. Multiple clients share that one process through MCP; they
+must not mount or edit the durable files directly. A database-backed,
+multi-node coordinator is a later storage boundary, not an implicit property of
+the current service.
 
 ## Supervised VM deployment
 
@@ -167,7 +177,7 @@ Journal expiry is forced by flooding the in-process event bus.
 | Service restart | Reopening the same `GROKPTAH_HOME` exposes the same run records. |
 | Cursor expiry | `ptah_get_events` and the live SSE channel fail closed on a cursor below the retained journal instead of silently skipping history. |
 | Desktop contract | Create/list session shape, typed submit receipt (`runId`, `sessionId`, `state`, `requestId`, `executionMode`, optional `queuedPosition`), and `ptah_list_runs` still includes cancelled history after `current_run_id` moves. |
-| Durable workloads | `ptah_list_work` / `ptah_get_work` expose the same scoped WorkItem and redacted Attempt projections used by the desktop adapter. Work mutations are idempotent, lease-token scoped, and remain readable after Lane archival while archived-Lane mutations fail closed. |
+| Durable workloads | `ptah_list_work` / `ptah_get_work` expose the same scoped WorkItem and redacted Attempt projections used by the desktop adapter. Work mutations are idempotent, lease-token scoped, remain readable after Lane archival while archived-Lane mutations fail closed, and are reconciled by the shared supervisor after lease expiry or restart. |
 
 The smoke tests in `tests/service_smoke.rs` remain the smaller lifecycle /
 readiness / restart checks. `tests/service_conformance.rs` is the matrix above.

@@ -63,9 +63,11 @@ runtime/domain services.
 Issue #305's first workload slice uses the existing single-owner, file-backed
 ledger and authenticated MCP boundary in both desktop and service hosts. It
 supports durable WorkItems and Attempt/Lease records, scoped reads, idempotent
-mutations, dependency/deadline/retry/approval-aware admission, and Lane
-archival independence. Multi-principal authority, multi-node claims, and a
-database/coordinator remain follow-on milestones.
+mutations, dependency/deadline/retry/approval-aware admission, Lane archival
+independence, and a shared startup/periodic reconciliation supervisor. The
+supervisor is recovery-only; finite Runs remain the execution boundary and
+model execution is never resumed implicitly. Multi-principal authority,
+multi-node claims, and a database/coordinator remain follow-on milestones.
 
 The current bridge also persists compatibility chrome (`active_session`, open
 tabs, appearance, and related desktop restore fields), and some credential

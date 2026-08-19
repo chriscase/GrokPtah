@@ -2,9 +2,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, WorkItem, WorkPolicy, WorkProgress, WorkResult, WorkState,
+    OrchStore, WorkItem, WorkPolicy, WorkProgress, WorkResult, WorkState, WorkloadSupervisor,
 };
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -269,4 +269,124 @@ fn dependency_blocks_then_unblocks_work() {
             },
         )
         .unwrap();
+}
+
+#[test]
+fn reconciliation_expires_leases_and_requeues_with_deterministic_time() {
+    let home = tempdir().unwrap();
+    let (store, item) = new_work(home.path(), "reconcile me");
+    store.save_work_item(&item).unwrap();
+    let claim = store
+        .claim_work(&item.work_id, "worker-a", Some(1))
+        .unwrap();
+
+    let report = store
+        .reconcile_workloads_at(claim.attempt.lease_expires_at + ChronoDuration::milliseconds(1))
+        .unwrap();
+    assert_eq!(report.scanned_items, 1);
+    assert_eq!(report.expired_attempts, 1);
+    assert_eq!(report.retried_items, 1);
+    assert_eq!(report.failed_items, 0);
+    assert_eq!(
+        store.load_work_item(&item.work_id).unwrap().unwrap().state,
+        WorkState::Queued
+    );
+    assert_eq!(
+        store.list_work_attempts(Some(&item.work_id)).unwrap()[0].state,
+        grokptah_agent_bridge::orchestration::AttemptState::Expired
+    );
+}
+
+#[test]
+fn reconciliation_fails_deadlines_and_reports_dependency_transitions() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let dependency = WorkItem::new(
+        "test",
+        "dependency",
+        Uuid::new_v4(),
+        "/tmp/project",
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    store.save_work_item(&dependency).unwrap();
+
+    let mut dependent = WorkItem::new(
+        "test",
+        "dependent",
+        Uuid::new_v4(),
+        "/tmp/project",
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    dependent
+        .dependencies
+        .push(grokptah_agent_bridge::orchestration::WorkDependency {
+            work_id: dependency.work_id.clone(),
+            required_state: WorkState::Succeeded,
+        });
+    store.save_work_item(&dependent).unwrap();
+
+    let first = store.reconcile_workloads_at(Utc::now()).unwrap();
+    assert_eq!(first.blocked_items, 1);
+    assert_eq!(
+        store
+            .load_work_item(&dependent.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Blocked
+    );
+
+    let dependency_claim = store
+        .claim_work(&dependency.work_id, "worker", None)
+        .unwrap();
+    store
+        .complete_work(
+            &dependency.work_id,
+            &dependency_claim.attempt.attempt_id,
+            &dependency_claim.lease_token,
+            success_result("dependency complete"),
+        )
+        .unwrap();
+    let second = store.reconcile_workloads_at(Utc::now()).unwrap();
+    assert_eq!(second.unblocked_items, 1);
+
+    let mut deadline = WorkItem::new(
+        "test",
+        "deadline",
+        Uuid::new_v4(),
+        "/tmp/project",
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    deadline.deadline = Some(Utc::now() - ChronoDuration::seconds(1));
+    store.save_work_item(&deadline).unwrap();
+    let deadline_report = store.reconcile_workloads().unwrap();
+    assert_eq!(deadline_report.deadline_failed_items, 1);
+    assert_eq!(
+        store
+            .load_work_item(&deadline.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Failed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workload_supervisor_runs_and_reports_success() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let supervisor = WorkloadSupervisor::start(store, Duration::from_millis(5))
+        .expect("workload supervisor thread should start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let status = supervisor.status();
+    assert!(status.enabled);
+    assert!(status.last_run_at.is_some());
+    assert!(status.last_success_at.is_some());
+    assert!(status.last_error.is_none());
 }
