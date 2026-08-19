@@ -23,9 +23,10 @@ pub const DEFAULT_WORK_LEASE_MS: u64 = 5 * 60 * 1_000;
 pub const MAX_WORK_LEASE_MS: u64 = 60 * 60 * 1_000;
 pub const DEFAULT_WORK_MAX_ATTEMPTS: u32 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkState {
+    #[default]
     Queued,
     Blocked,
     Leased,
@@ -36,12 +37,6 @@ pub enum WorkState {
     Succeeded,
     Failed,
     Cancelled,
-}
-
-impl Default for WorkState {
-    fn default() -> Self {
-        Self::Queued
-    }
 }
 
 impl WorkState {

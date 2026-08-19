@@ -1102,6 +1102,7 @@ impl OrchestrationService {
         Ok(response)
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP lease-renewal contract.
     pub async fn renew_work(
         &self,
         _auth: &AuthContext,
@@ -1125,6 +1126,7 @@ impl OrchestrationService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Keeps the shared lease mutation boundary explicit.
     async fn work_lease_mutation<F>(
         &self,
         tool: &str,
@@ -1180,6 +1182,7 @@ impl OrchestrationService {
         Ok(response)
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP run-link contract.
     pub async fn link_work_run(
         &self,
         auth: &AuthContext,
@@ -1207,6 +1210,7 @@ impl OrchestrationService {
         Ok(response)
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP progress-report contract.
     pub async fn report_work_progress(
         &self,
         _auth: &AuthContext,
@@ -1273,6 +1277,7 @@ impl OrchestrationService {
         Ok(response)
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP lease-release contract.
     pub async fn release_work(
         &self,
         _auth: &AuthContext,
@@ -1296,6 +1301,7 @@ impl OrchestrationService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP completion contract.
     pub async fn complete_work(
         &self,
         _auth: &AuthContext,
@@ -1319,6 +1325,7 @@ impl OrchestrationService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the authenticated MCP failure contract.
     pub async fn fail_work(
         &self,
         _auth: &AuthContext,
@@ -1342,6 +1349,7 @@ impl OrchestrationService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Keeps the shared attempt mutation boundary explicit.
     async fn work_item_attempt_mutation<F>(
         &self,
         tool: &str,
