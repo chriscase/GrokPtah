@@ -1494,6 +1494,7 @@ impl OrchestrationService {
         Ok(response)
     }
 
+    #[allow(clippy::too_many_arguments)] // Keeps the authenticated cancellation contract revision-fenced.
     pub async fn cancel_work(
         &self,
         _auth: &AuthContext,

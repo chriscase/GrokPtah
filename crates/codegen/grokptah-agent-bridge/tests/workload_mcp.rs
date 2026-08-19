@@ -206,8 +206,10 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
         .get("leaseTokenHash")
         .is_none());
 
-    let mut approval_policy = WorkPolicy::default();
-    approval_policy.requires_approval = true;
+    let approval_policy = WorkPolicy {
+        requires_approval: true,
+        ..WorkPolicy::default()
+    };
     let approval_work = client
         .call_tool(
             "ptah_create_work",
