@@ -47,7 +47,8 @@ use crate::orchestration::{
     AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
     ContinuationTestInput, OrchStore, PromotionState, RunAggregates, RunBounds, RunExecution,
-    RunExecutionMode, RunRecord, RunState, RunStopCause, DEFAULT_AGENT_TOOL_IDS,
+    RunExecutionMode, RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem,
+    WorkItemSnapshot, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::prompt_queue::{
@@ -1499,6 +1500,46 @@ impl AgentHostHandle {
 
     pub fn get_persistent_agent(&self, agent_id: &str) -> Result<Option<AgentRecord>> {
         self.ensure_orchestration_store()?.load_agent(agent_id)
+    }
+
+    /// Read durable Work Items owned by one local Build Lane. Work Items are
+    /// filtered by their persisted Lane id rather than focused UI state so
+    /// archived and background work remains correctly attributable.
+    pub fn list_work_items_for_session(&self, session_id: Uuid) -> Result<Vec<WorkItem>> {
+        let store = self.ensure_orchestration_store()?;
+        let mut items = store
+            .list_work_items()
+            .map_err(|error| anyhow!(error.to_string()))?
+            .into_iter()
+            .filter(|item| item.session_id == session_id)
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(items)
+    }
+
+    /// Read one local Work Item together with its redacted attempt history.
+    pub fn get_work_item_snapshot(
+        &self,
+        session_id: Uuid,
+        work_id: &str,
+    ) -> Result<Option<WorkItemSnapshot>> {
+        let store = self.ensure_orchestration_store()?;
+        let Some(work) = store
+            .load_work_item(work_id)
+            .map_err(|error| anyhow!(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if work.session_id != session_id {
+            return Ok(None);
+        }
+        let attempts = store
+            .list_work_attempts(Some(work_id))
+            .map_err(|error| anyhow!(error.to_string()))?
+            .iter()
+            .map(WorkAttemptView::from)
+            .collect();
+        Ok(Some(WorkItemSnapshot { work, attempts }))
     }
 
     /// Validate a manual continuation against the durable agent, session, and
@@ -10873,6 +10914,7 @@ mod tests {
     use super::*;
     use crate::discover::{home_override_serial, set_grokptah_home_override};
     use crate::event_bus::EventReceiver;
+    use crate::orchestration::WorkPolicy;
 
     struct TestHome {
         _tmp: tempfile::TempDir,
@@ -11648,6 +11690,45 @@ mod tests {
             .expect("archived Lane remains durable");
         assert!(archived.archived);
         assert_eq!(archived.agent_id.as_deref(), Some(agent.agent_id.as_str()));
+    }
+
+    #[test]
+    fn local_work_projection_is_lane_scoped_and_redacted() {
+        let (_home, host, lane_id) = test_host();
+        let other_lane = host
+            .session_new_kind(SessionKind::Build)
+            .expect("create second Lane");
+        let store = host.ensure_orchestration_store().expect("open work store");
+        let item = WorkItem::new(
+            "implementation",
+            "show durable work",
+            lane_id,
+            "/tmp/project",
+            "desktop",
+            WorkPolicy::default(),
+        )
+        .expect("create Work Item");
+        store.save_work_item(&item).expect("persist Work Item");
+
+        let visible = host
+            .list_work_items_for_session(lane_id)
+            .expect("list local Work Items");
+        assert_eq!(visible, vec![item.clone()]);
+        assert!(host
+            .list_work_items_for_session(other_lane.id)
+            .expect("list other Lane Work Items")
+            .is_empty());
+
+        let snapshot = host
+            .get_work_item_snapshot(lane_id, &item.work_id)
+            .expect("read Work Item snapshot")
+            .expect("Work Item snapshot exists");
+        assert_eq!(snapshot.work, item);
+        assert!(snapshot.attempts.is_empty());
+        assert!(host
+            .get_work_item_snapshot(other_lane.id, &snapshot.work.work_id)
+            .expect("cross-Lane Work Item read")
+            .is_none());
     }
 
     #[tokio::test]

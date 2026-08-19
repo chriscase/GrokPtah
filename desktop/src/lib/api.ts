@@ -87,6 +87,10 @@ export const api = {
       workspace,
       workId,
     }),
+  workList: (sessionId: string) =>
+    invoke<DurableWorkItem[]>("work_list", { sessionId }),
+  workGet: (sessionId: string, workId: string) =>
+    invoke<RemoteWorkSnapshot | null>("work_get", { sessionId, workId }),
   remoteServiceRunGet: (sessionId: string, workspace: string, runId: string) =>
     invoke<DurableRun>("remote_service_run_get", { sessionId, workspace, runId }),
   remoteServiceRunEvents: (

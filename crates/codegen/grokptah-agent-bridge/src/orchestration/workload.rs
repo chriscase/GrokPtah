@@ -534,6 +534,18 @@ impl From<&WorkAttempt> for WorkAttemptView {
     }
 }
 
+/// Complete desktop-safe projection for one durable Work Item.
+///
+/// The snapshot deliberately contains attempt history without the lease
+/// credential. Local and remote clients can therefore render the same
+/// operations view without gaining worker authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkItemSnapshot {
+    pub work: WorkItem,
+    pub attempts: Vec<WorkAttemptView>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkClaim {

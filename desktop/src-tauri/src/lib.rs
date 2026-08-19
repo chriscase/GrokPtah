@@ -72,6 +72,8 @@ pub fn run() {
             commands::remote_service_run_list,
             commands::remote_service_work_list,
             commands::remote_service_work_get,
+            commands::work_list,
+            commands::work_get,
             commands::remote_service_run_get,
             commands::remote_service_run_events,
             commands::remote_service_run_steer,

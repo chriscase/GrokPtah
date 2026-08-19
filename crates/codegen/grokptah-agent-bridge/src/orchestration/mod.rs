@@ -39,6 +39,6 @@ pub use types::{
 };
 pub use workload::{
     lease_duration, AttemptState, WorkArtifactRef, WorkAttempt, WorkAttemptView, WorkClaim,
-    WorkDependency, WorkItem, WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState,
-    WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
+    WorkDependency, WorkItem, WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult,
+    WorkRetryPolicy, WorkState, WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };

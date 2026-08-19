@@ -15,7 +15,9 @@ import {
   type TranscriptItem,
   type DurableRun,
   type DurableRunEvent,
+  type DurableWorkItem,
   type LaneSummary,
+  type RemoteWorkSnapshot,
   type RemoteSessionTarget,
   type RunOrigin,
   type WorkspaceStatus,
@@ -43,6 +45,7 @@ import { PermissionModal } from "./components/PermissionModal";
 import { PromptQueuePanel } from "./components/PromptQueuePanel";
 import { RunInspector } from "./components/RunInspector";
 import { PersistentAgentPanel } from "./components/PersistentAgentPanel";
+import { WorkBoard } from "./components/WorkBoard";
 import { SubagentCard } from "./components/SubagentCard";
 import {
   appendDeny,
@@ -117,6 +120,7 @@ type RightTab =
   | "plugins"
   | "skills"
   | "agents"
+  | "work"
   | "tasks"
   | "rules";
 
@@ -348,6 +352,11 @@ export default function App() {
   const [runsError, setRunsError] = useState<string | null>(null);
   const [runsBusy, setRunsBusy] = useState(false);
   const [runsWatching, setRunsWatching] = useState(true);
+  const [workItems, setWorkItems] = useState<DurableWorkItem[]>([]);
+  const [selectedWorkId, setSelectedWorkId] = useState<string | null>(null);
+  const [workSnapshot, setWorkSnapshot] = useState<RemoteWorkSnapshot | null>(null);
+  const [workError, setWorkError] = useState<string | null>(null);
+  const [workBusy, setWorkBusy] = useState(false);
   const [persistentAgents, setPersistentAgents] = useState<import("./lib/protocol").PersistentAgent[]>([]);
   const [persistentAgentsBusy, setPersistentAgentsBusy] = useState(false);
   const [persistentAgentsError, setPersistentAgentsError] = useState<string | null>(null);
@@ -864,6 +873,121 @@ export default function App() {
       runs.length,
     ],
   );
+  const workScopeLane =
+    executionTarget === "remote" && selectedRemoteLane
+      ? selectedRemoteLane
+      : activeLane;
+  const workScope = useMemo(
+    () => ({
+      laneId: workScopeLane?.id ?? activeSessionId,
+      laneTitle: workScopeLane?.title ?? activeSummary?.title ?? activeTab?.title,
+      agentLabel: workScopeLane?.agent_id,
+      runtimeTarget:
+        workScopeLane?.runtime_target ??
+        (executionTarget === "remote" ? ("hosted_service" as const) : ("local_desktop" as const)),
+      runtimeConnection:
+        workScopeLane?.runtime_connection ??
+        (executionTarget === "remote"
+          ? remoteServiceStatus.connectionState ?? ("connected" as const)
+          : ("connected" as const)),
+      workspacePath: workScopeLane?.cwd ?? activeSummary?.cwd ?? activeTab?.cwd,
+      runLabel: workItems.length
+        ? `${workItems.length} durable Work Item${workItems.length === 1 ? "" : "s"}`
+        : "No durable Work",
+    }),
+    [
+      activeSessionId,
+      activeSummary,
+      activeTab,
+      executionTarget,
+      remoteServiceStatus.connectionState,
+      workItems.length,
+      workScopeLane,
+    ],
+  );
+  const refreshWorkItem = useCallback(
+    async (workId: string) => {
+      const lane =
+        executionTarget === "remote" && selectedRemoteLane
+          ? selectedRemoteLane
+          : activeLane;
+      const sessionId = lane?.session_id ?? activeSessionId;
+      const remoteTarget = executionTarget === "remote";
+      if (!sessionId) {
+        setWorkSnapshot(null);
+        return;
+      }
+      if (remoteTarget && (!selectedRemoteLane || !remoteServiceStatus.connected)) {
+        setWorkError("The remote service is disconnected. The last Work snapshot remains available.");
+        return;
+      }
+      try {
+        const snapshot =
+          executionTarget === "remote" && remoteServiceStatus.connected && lane
+            ? await api.remoteServiceWorkGet(sessionId, lane.cwd, workId)
+            : await api.workGet(sessionId, workId);
+        setWorkSnapshot(snapshot);
+        setWorkError(null);
+      } catch (error) {
+        setWorkSnapshot(null);
+        setWorkError(`Could not open durable Work Item: ${String(error)}`);
+      }
+    },
+    [activeLane, activeSessionId, executionTarget, remoteServiceStatus.connected, selectedRemoteLane],
+  );
+  const refreshWork = useCallback(async () => {
+    const lane =
+      executionTarget === "remote" && selectedRemoteLane
+        ? selectedRemoteLane
+        : activeLane;
+    const sessionId = lane?.session_id ?? activeSessionId;
+    const remoteTarget = executionTarget === "remote";
+    if (!sessionId) {
+      setWorkItems([]);
+      setSelectedWorkId(null);
+      setWorkSnapshot(null);
+      setWorkError(null);
+      return;
+    }
+    if (remoteTarget && (!selectedRemoteLane || !remoteServiceStatus.connected)) {
+      setWorkError("The remote service is disconnected. The last Work snapshot remains available.");
+      return;
+    }
+    setWorkBusy(true);
+    try {
+      const items =
+        executionTarget === "remote" && remoteServiceStatus.connected && lane
+          ? await api.remoteServiceWorkList(sessionId, lane.cwd)
+          : await api.workList(sessionId);
+      setWorkItems(items);
+      setSelectedWorkId((current) =>
+        current && items.some((item) => item.workId === current)
+          ? current
+          : items[0]?.workId ?? null,
+      );
+      setWorkError(null);
+    } catch (error) {
+      setWorkError(`Could not refresh durable Work Items: ${String(error)}`);
+    } finally {
+      setWorkBusy(false);
+    }
+  }, [activeLane, activeSessionId, executionTarget, remoteServiceStatus.connected, selectedRemoteLane]);
+
+  useEffect(() => {
+    if (rightTab !== "work" || !selectedWorkId) {
+      if (!selectedWorkId) setWorkSnapshot(null);
+      return;
+    }
+    void refreshWorkItem(selectedWorkId);
+  }, [refreshWorkItem, rightTab, selectedWorkId]);
+
+  useEffect(() => {
+    if (rightTab !== "work") return;
+    void refreshWork();
+    const timer = window.setInterval(() => void refreshWork(), 2500);
+    return () => window.clearInterval(timer);
+  }, [refreshWork, rightTab]);
+
   const permissionScope = useMemo(() => {
     if (!permission) return undefined;
     const lane =
@@ -2562,6 +2686,7 @@ export default function App() {
       if (tab === "plugins") setPlugins(await api.pluginsList());
       if (tab === "skills") setSkills(await api.skillsList());
       if (tab === "agents") await refreshPersistentAgents();
+      if (tab === "work") await refreshWork();
       if (tab === "tasks") {
         setSubagents(await api.subagentsList());
         setBgTasks(await api.backgroundTasks());
@@ -2580,11 +2705,11 @@ export default function App() {
     rightTabNeedsWorkspaceScope && laneWorkspaceInteractionBlocked;
 
   useEffect(() => {
-    if (!workspaceRestored || !activeSessionId) return;
+    if (!workspaceRestored || (!activeSessionId && !selectedRemoteLane)) return;
     void loadRight(rightTab);
     // Refresh workspace-scoped panels only after Lane promotion settles.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSessionId, laneWorkspaceInteractionBlocked, workspaceRestored]);
+  }, [activeSessionId, laneWorkspaceInteractionBlocked, selectedRemoteLane, workspaceRestored]);
 
   const openPersistentAgentSession = useCallback(
     async (agent: import("./lib/protocol").PersistentAgent) => {
@@ -3785,6 +3910,7 @@ export default function App() {
               "plugins",
               "skills",
               "agents",
+              "work",
               "tasks",
               "rules",
             ] as RightTab[]
@@ -4094,6 +4220,39 @@ export default function App() {
               </button>
             </div>
           </>
+        )}
+
+        {rightTab === "work" && (
+          <WorkBoard
+            items={workItems}
+            selectedWorkId={selectedWorkId}
+            snapshot={workSnapshot}
+            scope={workScope}
+            busy={workBusy}
+            error={workError}
+            sourceLabel={
+              executionTarget === "remote"
+                ? `${runtimeTargetLabel(workScope.runtimeTarget ?? undefined)} · ${runtimeConnectionLabel(workScope.runtimeConnection ?? undefined)}`
+                : "Local durable store"
+            }
+            onRefresh={() => void refreshWork()}
+            onSelect={(workId) => {
+              setSelectedWorkId(workId);
+              void refreshWorkItem(workId);
+            }}
+            onOpenLane={(sessionId) => {
+              if (remoteLanes.some((lane) => lane.id === sessionId)) {
+                setRemoteTargetSessionId(sessionId);
+                setExecutionTarget("remote");
+                return;
+              }
+              focusSession(sessionId);
+            }}
+            onOpenRun={() => {
+              setRightTab("tasks");
+              void loadRight("tasks");
+            }}
+          />
         )}
 
         {rightTab === "agents" && (
