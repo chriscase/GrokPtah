@@ -117,11 +117,16 @@ pub struct WorkDecision {
     pub decision_id: String,
     pub work_id: String,
     pub action: WorkDecisionAction,
+    /// Authenticated principal (`AuthContext.token_id`). Never rewritten to a
+    /// caller-supplied Agent id.
     pub actor_id: String,
+    /// Durable Agent the principal acted on behalf of, when the request named
+    /// one. Absent for coordinator actions that carry only a credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_agent_id: Option<String>,
+    /// `AgentSpec.revision` of the acting Agent, else of the assigned worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

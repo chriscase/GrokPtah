@@ -60,9 +60,15 @@ pub struct WorkMessage {
     pub message_id: String,
     pub seq: u64,
     pub kind: MessageKind,
+    /// Authenticated principal (`AuthContext.token_id`). The service always
+    /// writes this from the bearer; callers cannot supply it.
     pub from_actor: String,
+    /// Optional Agent resource the principal addressed the message from.
+    /// Validated against durable records; not proof that the caller *is* that
+    /// Agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_agent_id: Option<String>,
+    /// Optional Agent resource the message is addressed to. Same validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_agent_id: Option<String>,
     pub session_id: Uuid,

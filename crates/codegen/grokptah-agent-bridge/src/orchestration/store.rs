@@ -78,6 +78,17 @@ struct RoutineFireIntent {
 
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
 
+struct AssignmentMutation<'a> {
+    work_id: &'a str,
+    action: WorkDecisionAction,
+    actor_id: &'a str,
+    actor_agent_id: Option<&'a str>,
+    assigned_agent_id: Option<&'a str>,
+    reason: &'a str,
+    expected_revision: Option<u64>,
+    now: chrono::DateTime<Utc>,
+}
+
 /// Conservative bounds for the durable orchestration ledger. Retention is
 /// deliberately age- and count-bounded, but never trades away an active run,
 /// a reviewable isolated run, or the source of a retry chain.
@@ -1523,18 +1534,22 @@ impl OrchStore {
         work_id: &str,
         agent_id: &str,
         actor_id: &str,
+        actor_agent_id: Option<&str>,
         reason: &str,
         expected_revision: Option<u64>,
         now: chrono::DateTime<Utc>,
     ) -> Result<(WorkItem, WorkDecision), OrchError> {
         self.mutate_assignment(
-            work_id,
-            WorkDecisionAction::Offer,
-            actor_id,
-            Some(agent_id),
-            reason,
-            expected_revision,
-            now,
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Offer,
+                actor_id,
+                actor_agent_id,
+                assigned_agent_id: Some(agent_id),
+                reason,
+                expected_revision,
+                now,
+            },
             |item| {
                 if item.state.is_terminal() {
                     return Err(OrchError::new(
@@ -1560,13 +1575,16 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<(WorkItem, WorkDecision), OrchError> {
         self.mutate_assignment(
-            work_id,
-            WorkDecisionAction::Accept,
-            actor_id,
-            Some(agent_id),
-            reason,
-            expected_revision,
-            now,
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Accept,
+                actor_id,
+                actor_agent_id: Some(agent_id),
+                assigned_agent_id: Some(agent_id),
+                reason,
+                expected_revision,
+                now,
+            },
             |item| {
                 if item.assignment_status != AssignmentStatus::Offered
                     || item.assigned_agent_id.as_deref() != Some(agent_id)
@@ -1593,13 +1611,16 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<(WorkItem, WorkDecision), OrchError> {
         self.mutate_assignment(
-            work_id,
-            WorkDecisionAction::Decline,
-            actor_id,
-            Some(agent_id),
-            reason,
-            expected_revision,
-            now,
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Decline,
+                actor_id,
+                actor_agent_id: Some(agent_id),
+                assigned_agent_id: Some(agent_id),
+                reason,
+                expected_revision,
+                now,
+            },
             |item| {
                 if item.assignment_status != AssignmentStatus::Offered
                     || item.assigned_agent_id.as_deref() != Some(agent_id)
@@ -1622,18 +1643,22 @@ impl OrchStore {
         work_id: &str,
         agent_id: &str,
         actor_id: &str,
+        actor_agent_id: Option<&str>,
         reason: &str,
         expected_revision: Option<u64>,
         now: chrono::DateTime<Utc>,
     ) -> Result<(WorkItem, WorkDecision), OrchError> {
         self.mutate_assignment(
-            work_id,
-            WorkDecisionAction::Reassign,
-            actor_id,
-            Some(agent_id),
-            reason,
-            expected_revision,
-            now,
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Reassign,
+                actor_id,
+                actor_agent_id,
+                assigned_agent_id: Some(agent_id),
+                reason,
+                expected_revision,
+                now,
+            },
             |item| {
                 if item.state.is_terminal()
                     || item.state == WorkState::Leased
@@ -1662,13 +1687,16 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<(WorkItem, WorkDecision), OrchError> {
         self.mutate_assignment(
-            work_id,
-            WorkDecisionAction::Reprioritize,
-            actor_id,
-            None,
-            reason,
-            expected_revision,
-            now,
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Reprioritize,
+                actor_id,
+                actor_agent_id: None,
+                assigned_agent_id: None,
+                reason,
+                expected_revision,
+                now,
+            },
             |item| {
                 if item.state.is_terminal() {
                     return Err(OrchError::new(
@@ -1692,13 +1720,16 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<(WorkItem, WorkDecision), OrchError> {
         self.mutate_assignment(
-            work_id,
-            WorkDecisionAction::Block,
-            actor_id,
-            None,
-            reason,
-            expected_revision,
-            now,
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::Block,
+                actor_id,
+                actor_agent_id: None,
+                assigned_agent_id: None,
+                reason,
+                expected_revision,
+                now,
+            },
             |item| {
                 if item.state.is_terminal() {
                     return Err(OrchError::new(
@@ -1729,13 +1760,16 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<(WorkItem, WorkDecision), OrchError> {
         self.mutate_assignment(
-            work_id,
-            WorkDecisionAction::RequestReview,
-            actor_id,
-            None,
-            reason,
-            expected_revision,
-            now,
+            AssignmentMutation {
+                work_id,
+                action: WorkDecisionAction::RequestReview,
+                actor_id,
+                actor_agent_id: None,
+                assigned_agent_id: None,
+                reason,
+                expected_revision,
+                now,
+            },
             |item| {
                 if !matches!(
                     item.state,
@@ -1757,19 +1791,12 @@ impl OrchStore {
         self.list_work_decisions_unlocked(work_id)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn mutate_assignment(
         &self,
-        work_id: &str,
-        action: WorkDecisionAction,
-        actor_id: &str,
-        assigned_agent_id: Option<&str>,
-        reason: &str,
-        expected_revision: Option<u64>,
-        now: chrono::DateTime<Utc>,
+        request: AssignmentMutation<'_>,
         mutate: impl FnOnce(&mut WorkItem) -> Result<(), OrchError>,
     ) -> Result<(WorkItem, WorkDecision), OrchError> {
-        if reason.trim().is_empty() {
+        if request.reason.trim().is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
                 "decision reason is required",
@@ -1777,33 +1804,113 @@ impl OrchStore {
         }
         let _guard = self.inner.lock.lock();
         let mut item = self
-            .load_work_item_unlocked(work_id)
+            .load_work_item_unlocked(request.work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
-        Self::require_work_revision(&item, expected_revision)?;
+        Self::require_work_revision(&item, request.expected_revision)?;
+        let (actor_agent_id, policy_revision) = self.resolve_assignment_agents_unlocked(
+            &item,
+            request.actor_agent_id,
+            request.assigned_agent_id,
+        )?;
         mutate(&mut item)?;
         let decision = WorkDecision {
             schema_version: WORKLOAD_SCHEMA_VERSION,
             decision_id: Uuid::new_v4().to_string(),
-            work_id: work_id.to_string(),
-            action,
-            actor_id: actor_id.to_string(),
-            actor_agent_id: None,
-            assigned_agent_id: assigned_agent_id
+            work_id: request.work_id.to_string(),
+            action: request.action,
+            actor_id: request.actor_id.to_string(),
+            actor_agent_id,
+            assigned_agent_id: request
+                .assigned_agent_id
                 .map(str::to_string)
                 .or_else(|| item.assigned_agent_id.clone()),
-            policy_revision: None,
+            policy_revision,
             work_revision: Some(item.revision),
-            reason: reason.to_string(),
-            created_at: now,
+            reason: request.reason.to_string(),
+            created_at: request.now,
         };
         item.last_decision_id = Some(decision.decision_id.clone());
-        item.bump_at(now);
+        item.bump_at(request.now);
         item.validate()?;
         self.save_work_decision_unlocked(&decision)?;
         self.save_work_item_unlocked(&item)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Ok((item, decision))
+    }
+
+    fn resolve_assignment_agents_unlocked(
+        &self,
+        item: &WorkItem,
+        actor_agent_id: Option<&str>,
+        assigned_agent_id: Option<&str>,
+    ) -> Result<(Option<String>, Option<u64>), OrchError> {
+        let actor = actor_agent_id
+            .map(|agent_id| {
+                self.require_agent_in_scope_unlocked(agent_id, item.session_id, &item.workspace)
+            })
+            .transpose()?;
+        let assigned = match assigned_agent_id {
+            Some(agent_id)
+                if actor
+                    .as_ref()
+                    .is_some_and(|agent| agent.agent_id == agent_id) =>
+            {
+                actor.clone()
+            }
+            Some(agent_id) => Some(self.require_agent_in_scope_unlocked(
+                agent_id,
+                item.session_id,
+                &item.workspace,
+            )?),
+            None => None,
+        };
+        let policy_revision = actor
+            .as_ref()
+            .or(assigned.as_ref())
+            .and_then(|agent| agent.spec.as_ref().map(|spec| spec.revision));
+        Ok((actor.map(|agent| agent.agent_id), policy_revision))
+    }
+
+    /// Load an Agent and require it to belong to the requested session and
+    /// workspace and still be an active identity.
+    pub fn require_agent_in_scope(
+        &self,
+        agent_id: &str,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<AgentRecord, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.require_agent_in_scope_unlocked(agent_id, session_id, workspace)
+    }
+
+    fn require_agent_in_scope_unlocked(
+        &self,
+        agent_id: &str,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<AgentRecord, OrchError> {
+        let agent = self
+            .load_agent_unlocked(agent_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| {
+                OrchError::new(OrchErrorCode::InvalidRequest, "unknown agent identity")
+            })?;
+        if !agent.known_lane_ids().contains(&session_id)
+            || !workspaces_match(&agent.workspace, workspace)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "agent is outside the requested session workspace",
+            ));
+        }
+        if !agent.state.is_active_identity() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "agent identity is inactive",
+            ));
+        }
+        Ok(agent)
     }
 
     fn save_work_decision_unlocked(&self, decision: &WorkDecision) -> Result<(), OrchError> {
@@ -1859,6 +1966,30 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<WorkerPresence, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.write_worker_presence_unlocked(agent_id, credential_id, host_kind, now)
+    }
+
+    pub fn heartbeat_worker_scoped(
+        &self,
+        agent_id: &str,
+        credential_id: &str,
+        host_kind: WorkerHostKind,
+        now: chrono::DateTime<Utc>,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<WorkerPresence, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let agent = self.require_agent_in_scope_unlocked(agent_id, session_id, workspace)?;
+        self.write_worker_presence_unlocked(&agent.agent_id, credential_id, host_kind, now)
+    }
+
+    fn write_worker_presence_unlocked(
+        &self,
+        agent_id: &str,
+        credential_id: &str,
+        host_kind: WorkerHostKind,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<WorkerPresence, OrchError> {
         let presence = WorkerPresence::new(agent_id, credential_id, host_kind, now);
         let path = self.worker_presence_path(agent_id)?;
         atomic_write_json(&path, &presence)
@@ -1977,6 +2108,16 @@ impl OrchStore {
     pub fn send_message(&self, mut message: WorkMessage) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
         message.validate()?;
+        self.require_optional_agent_in_scope_unlocked(
+            message.from_agent_id.as_deref(),
+            message.session_id,
+            &message.workspace,
+        )?;
+        self.require_optional_agent_in_scope_unlocked(
+            message.to_agent_id.as_deref(),
+            message.session_id,
+            &message.workspace,
+        )?;
         let seq = self.next_message_seq_unlocked()?;
         message.seq = seq;
         let path = self.message_path(&message.message_id)?;
@@ -1986,6 +2127,18 @@ impl OrchStore {
         Ok(message)
     }
 
+    fn require_optional_agent_in_scope_unlocked(
+        &self,
+        agent_id: Option<&str>,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<(), OrchError> {
+        if let Some(agent_id) = agent_id {
+            self.require_agent_in_scope_unlocked(agent_id, session_id, workspace)?;
+        }
+        Ok(())
+    }
+
     pub fn ack_message(
         &self,
         message_id: &str,
@@ -1993,9 +2146,42 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.ack_message_unlocked(message_id, actor_id, now, None)
+    }
+
+    /// Lookup, session/workspace validation, and acknowledgement under one lock.
+    /// Out-of-scope callers fail closed without writing `acked_at`/`acked_by`.
+    pub fn ack_message_scoped(
+        &self,
+        message_id: &str,
+        actor_id: &str,
+        now: chrono::DateTime<Utc>,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<WorkMessage, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.ack_message_unlocked(message_id, actor_id, now, Some((session_id, workspace)))
+    }
+
+    fn ack_message_unlocked(
+        &self,
+        message_id: &str,
+        actor_id: &str,
+        now: chrono::DateTime<Utc>,
+        scope: Option<(Uuid, &str)>,
+    ) -> Result<WorkMessage, OrchError> {
         let mut message = self
             .load_message_unlocked(message_id)?
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown message_id"))?;
+        if let Some((session_id, workspace)) = scope {
+            if message.session_id != session_id || !workspaces_match(&message.workspace, workspace)
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "message is out of scope",
+                ));
+            }
+        }
         if message.acked_at.is_none() {
             message.acked_at = Some(now);
             message.acked_by = Some(actor_id.to_string());

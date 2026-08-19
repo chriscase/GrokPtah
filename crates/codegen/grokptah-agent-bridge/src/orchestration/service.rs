@@ -33,7 +33,8 @@ use super::supervisor::{
 use super::types::*;
 use super::worker::{reject_privilege_amplification, WorkerHostKind};
 use super::workload::{
-    WorkAttempt, WorkAttemptView, WorkDependency, WorkItem, WorkPolicy, WorkProgress, WorkResult,
+    WorkAttempt, WorkAttemptView, WorkDecision, WorkDependency, WorkItem, WorkPolicy, WorkProgress,
+    WorkResult,
 };
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
@@ -128,6 +129,14 @@ impl Drop for AdmissionGuard {
 enum IdempotencyStart {
     Perform(IdempotencyLease),
     Replay(serde_json::Value),
+}
+
+/// Coordinator vs worker identities for an assignment mutation.
+/// The authenticated principal remains `AuthContext.token_id`; these are
+/// durable Agent resources the principal is authorized to name.
+struct ScopedAssignment {
+    worker: AgentRecord,
+    manager: Option<AgentRecord>,
 }
 
 fn redact_claim_lease_token(mut response: serde_json::Value) -> serde_json::Value {
@@ -1182,6 +1191,15 @@ impl OrchestrationService {
             }
         };
         let lease_secret = self.config.lock().bearer_token.clone();
+        if let Some(agent_id) = agent_id.as_deref() {
+            if let Err(error) = self.store.require_agent_in_scope(
+                agent_id,
+                session_id,
+                &claimed.display().to_string(),
+            ) {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
+        }
         let claimant = agent_id.unwrap_or_else(|| auth.token_id.clone());
         let claim = match self.store.claim_work_with_lease_secret(
             work_id,
@@ -1601,42 +1619,37 @@ impl OrchestrationService {
     fn authorize_worker_assignment(
         &self,
         workspace: &Path,
+        session_id: Uuid,
         worker_agent_id: &str,
         work: &WorkItem,
         manager_agent_id: Option<&str>,
-    ) -> Result<(), OrchError> {
+    ) -> Result<ScopedAssignment, OrchError> {
+        let claimed = workspace.display().to_string();
         let worker = self
             .store
-            .load_agent(worker_agent_id)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown worker agent"))?;
-        if !super::workspaces_match(&worker.workspace, &workspace.display().to_string())
-            || !super::workspaces_match(&worker.workspace, &work.workspace)
-        {
+            .require_agent_in_scope(worker_agent_id, session_id, &claimed)?;
+        if !super::workspaces_match(&worker.workspace, &work.workspace) {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
                 "cross-workspace assignment is not allowed",
             ));
         }
-        let worker_spec = worker.spec.as_ref().ok_or_else(|| {
-            OrchError::new(OrchErrorCode::InvalidRequest, "worker has no specification")
-        })?;
-        let manager_spec = manager_agent_id
+        let worker_spec = worker.current_spec()?.clone();
+        let manager = manager_agent_id
             .map(|agent_id| {
                 self.store
-                    .load_agent(agent_id)
-                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+                    .require_agent_in_scope(agent_id, session_id, &claimed)
             })
-            .transpose()?
-            .flatten()
-            .and_then(|agent| agent.spec);
+            .transpose()?;
+        let manager_spec = manager.as_ref().and_then(|agent| agent.spec.clone());
         let ceiling = self.config.lock().bounds.clone();
         reject_privilege_amplification(
             manager_spec.as_ref(),
-            worker_spec,
+            &worker_spec,
             &work.policy.bounds,
             &ceiling,
-        )
+        )?;
+        Ok(ScopedAssignment { worker, manager })
     }
 
     pub fn list_workers_scoped(
@@ -1701,27 +1714,13 @@ impl OrchestrationService {
             IdempotencyStart::Replay(response) => return Ok(response),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let agent = match self.store.load_agent(agent_id) {
-            Ok(Some(agent))
-                if super::workspaces_match(&agent.workspace, &claimed.display().to_string()) =>
-            {
-                agent
-            }
-            _ => {
-                return Err(self.fail_claim(
-                    &mut lease,
-                    None,
-                    session_id,
-                    &claimed,
-                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown worker agent"),
-                ));
-            }
-        };
-        let presence = match self.store.heartbeat_worker(
-            &agent.agent_id,
+        let presence = match self.store.heartbeat_worker_scoped(
+            agent_id,
             &auth.token_id,
             host_kind,
             Utc::now(),
+            session_id,
+            &claimed.display().to_string(),
         ) {
             Ok(presence) => presence,
             Err(error) => {
@@ -1730,11 +1729,11 @@ impl OrchestrationService {
         };
         let response = json!({ "presence": presence });
         lease
-            .complete(Some(agent.agent_id.clone()), response.clone())
+            .complete(Some(presence.agent_id.clone()), response.clone())
             .map_err(|error| {
                 self.fail_claim(
                     &mut lease,
-                    Some(agent.agent_id),
+                    Some(presence.agent_id),
                     session_id,
                     &claimed,
                     error,
@@ -1783,15 +1782,24 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
-        if let Err(error) =
-            self.authorize_worker_assignment(&claimed, agent_id, &work, manager_agent_id.as_deref())
-        {
-            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
-        }
+        let actors = match self.authorize_worker_assignment(
+            &claimed,
+            session_id,
+            agent_id,
+            &work,
+            manager_agent_id.as_deref(),
+        ) {
+            Ok(actors) => actors,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let manager_id = actors.manager.as_ref().map(|agent| agent.agent_id.clone());
         let (item, decision) = match self.store.offer_work(
             work_id,
-            agent_id,
+            &actors.worker.agent_id,
             &auth.token_id,
+            manager_id.as_deref(),
             &reason,
             expected_revision,
             Utc::now(),
@@ -1828,24 +1836,18 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
-        self.work_item_mutation(
+        self.worker_identity_mutation(
             "ptah_accept_work",
+            auth,
             request_id,
             session_id,
             workspace,
             work_id,
-            json!({"agentId": agent_id, "reason": reason, "expectedRevision": expected_revision}),
-            move |store| {
-                store
-                    .accept_work(
-                        work_id,
-                        agent_id,
-                        &auth.token_id,
-                        &reason,
-                        expected_revision,
-                        Utc::now(),
-                    )
-                    .map(|(item, _)| item)
+            agent_id,
+            reason,
+            expected_revision,
+            |store, agent_id, actor_id, reason, expected_revision, now| {
+                store.accept_work(work_id, agent_id, actor_id, reason, expected_revision, now)
             },
         )
         .await
@@ -1863,24 +1865,18 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
-        self.work_item_mutation(
+        self.worker_identity_mutation(
             "ptah_decline_work",
+            auth,
             request_id,
             session_id,
             workspace,
             work_id,
-            json!({"agentId": agent_id, "reason": reason, "expectedRevision": expected_revision}),
-            move |store| {
-                store
-                    .decline_work(
-                        work_id,
-                        agent_id,
-                        &auth.token_id,
-                        &reason,
-                        expected_revision,
-                        Utc::now(),
-                    )
-                    .map(|(item, _)| item)
+            agent_id,
+            reason,
+            expected_revision,
+            |store, agent_id, actor_id, reason, expected_revision, now| {
+                store.decline_work(work_id, agent_id, actor_id, reason, expected_revision, now)
             },
         )
         .await
@@ -1926,15 +1922,24 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
-        if let Err(error) =
-            self.authorize_worker_assignment(&claimed, agent_id, &work, manager_agent_id.as_deref())
-        {
-            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
-        }
+        let actors = match self.authorize_worker_assignment(
+            &claimed,
+            session_id,
+            agent_id,
+            &work,
+            manager_agent_id.as_deref(),
+        ) {
+            Ok(actors) => actors,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let manager_id = actors.manager.as_ref().map(|agent| agent.agent_id.clone());
         let (item, decision) = match self.store.reassign_work(
             work_id,
-            agent_id,
+            &actors.worker.agent_id,
             &auth.token_id,
+            manager_id.as_deref(),
             &reason,
             expected_revision,
             Utc::now(),
@@ -2199,26 +2204,18 @@ impl OrchestrationService {
             IdempotencyStart::Replay(response) => return Ok(response),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let message = match self
-            .store
-            .ack_message(message_id, &auth.token_id, Utc::now())
-        {
+        let message = match self.store.ack_message_scoped(
+            message_id,
+            &auth.token_id,
+            Utc::now(),
+            session_id,
+            &claimed.display().to_string(),
+        ) {
             Ok(message) => message,
             Err(error) => {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
-        if message.session_id != session_id
-            || !super::workspaces_match(&message.workspace, &claimed.display().to_string())
-        {
-            return Err(self.fail_claim(
-                &mut lease,
-                None,
-                session_id,
-                &claimed,
-                OrchError::new(OrchErrorCode::ForbiddenScope, "message is out of scope"),
-            ));
-        }
         let response = json!({ "message": message });
         lease
             .complete(Some(message_id.to_string()), response.clone())
@@ -2747,6 +2744,89 @@ impl OrchestrationService {
         };
         let response = json!({
             "work": item,
+            "sessionId": session_id,
+            "workspace": claimed.display().to_string(),
+        });
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn worker_identity_mutation<F>(
+        &self,
+        tool: &str,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        agent_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+        operation: F,
+    ) -> Result<serde_json::Value, OrchError>
+    where
+        F: FnOnce(
+            &OrchStore,
+            &str,
+            &str,
+            &str,
+            Option<u64>,
+            chrono::DateTime<Utc>,
+        ) -> Result<(WorkItem, WorkDecision), OrchError>,
+    {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "details": {
+                "agentId": agent_id,
+                "reason": reason,
+                "expectedRevision": expected_revision,
+            },
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        if let Err(error) =
+            self.store
+                .require_agent_in_scope(agent_id, session_id, &claimed.display().to_string())
+        {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let (item, decision) = match operation(
+            &self.store,
+            agent_id,
+            &auth.token_id,
+            &reason,
+            expected_revision,
+            Utc::now(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({
+            "work": item,
+            "decision": decision,
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
         });

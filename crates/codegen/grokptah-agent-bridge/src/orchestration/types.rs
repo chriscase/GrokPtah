@@ -533,6 +533,12 @@ impl AgentState {
     pub fn can_resume(self) -> bool {
         matches!(self, Self::Waiting | Self::Interrupted | Self::Failed)
     }
+
+    /// Whether this Agent may be named as a live worker or message party.
+    /// Failed/Completed identities remain durable history, not active actors.
+    pub fn is_active_identity(self) -> bool {
+        !matches!(self, Self::Failed | Self::Completed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
