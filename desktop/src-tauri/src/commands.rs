@@ -188,6 +188,35 @@ pub async fn remote_service_work_get(
 }
 
 #[tauri::command]
+pub async fn work_list(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<grokptah_agent_bridge::WorkItem>, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.list_work_items_for_session(session_id)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn work_get(
+    state: State<'_, AppState>,
+    session_id: String,
+    work_id: String,
+) -> Result<Option<grokptah_agent_bridge::WorkItemSnapshot>, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.get_work_item_snapshot(session_id, &work_id)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn remote_service_run_get(
     state: State<'_, AppState>,
     session_id: String,
