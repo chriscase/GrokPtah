@@ -208,9 +208,9 @@ validated in a product walkthrough:
   retire dialog demonstrates the proposed D05 eligibility gate: retirement
   is blocked while queued/running Runs or live isolated approvals exist.
 - D04 permits explicit assignment of an ad-hoc Build Lane to an Agent without
-  rewriting transcript, Runs, or checkpoints. It does not retarget the Agent's
-  primary resume Lane/workspace, and routine Agent-to-Agent reassignment stays
-  unavailable until attributable history and cross-Lane resume land.
+  rewriting transcript, Runs, or checkpoints. Same-source workspace
+  continuation now validates the associated Lane and checkpoint; cross-workspace
+  continuation and routine Agent-to-Agent reassignment remain unavailable.
 - Computer Use appears in its audited unavailable state (default), plus one
   **contract-labelled operator-control illustration** for issue #273 /
   rubric S14 (`?drawer=computer&cu=contract`): exact Lane + Run, local

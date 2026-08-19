@@ -4,6 +4,7 @@ import {
   type PermissionDecision,
 } from "../lib/permissionQueue";
 import type { DenyHistoryEntry } from "../lib/denyHistory";
+import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
 
 export type PermissionModalProps = {
   request: PermissionRequest;
@@ -22,6 +23,8 @@ export type PermissionModalProps = {
   fallbackSessionId?: string | null;
   /** Recent denials for this project/session (#175). */
   denyHistory?: DenyHistoryEntry[];
+  /** Explicit ownership context for the Lane that owns this permission. */
+  scope?: LaneScope;
 };
 
 /**
@@ -34,6 +37,7 @@ export function PermissionModal({
   onRespond,
   fallbackSessionId = null,
   denyHistory = [],
+  scope,
 }: PermissionModalProps) {
   const sessionId = sessionIdForPermission(request, fallbackSessionId);
   const detail =
@@ -61,6 +65,7 @@ export function PermissionModal({
         data-request-id={request.id}
       >
         <h3 id="permission-modal-title">Needs your response</h3>
+        {scope && <LaneScopeLine scope={scope} compact />}
         {queuedBehind > 0 && (
           <p
             className="permission-queue-hint"

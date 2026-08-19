@@ -21,14 +21,15 @@ boundary and must not turn an unobserved flow into apparent evidence.
 
 - A Lane is currently a product projection over a Session; its compatibility
   identity remains `lane_id = session_id`.
-- One Agent can list several Lanes, but checkpoint resume is still constrained
-  by the Agent's primary session and workspace. The product must not promise
-  cross-Lane resume until that runtime restriction is removed.
+- One Agent can list several Lanes. Checkpoint continuation now validates the
+  associated Agent/Lane relationship and source workspace, so same-source
+  workspace continuation is supported and cross-workspace continuation fails
+  closed. Agent-to-Agent reassignment remains unavailable.
 - Agent operational health exists today. The separate `active`, `paused`, and
   `retired` lifecycle is proposed product behavior, not an implemented enum.
-- Archive is durable and reversible at the data level, but opening an archived
-  Session currently restores it as a side effect and archived work is not yet
-  blocked from every mutation path.
+- Archive is durable and reversible. Archived Lane inspection does not promote
+  its workspace or restore it, and host/control-plane mutation paths reject new
+  work until the Lane is explicitly restored.
 - The current remote “Run on” operation submits into a different service-owned
   Session/Lane. It does not silently move the focused Lane to another Runtime.
 - Hosted service persistence, multi-client ledger access, and reconnect rules
@@ -69,12 +70,13 @@ boundary and must not turn an unobserved flow into apparent evidence.
 
 ### Archive, resume, and recovery
 
-- Inspect Archived and Restore are separate actions. The desired design must
-  not copy the current auto-restore side effect.
+- Inspect Archived and Restore are separate actions. Keep the current
+  inspection-only behavior and do not reintroduce an auto-restore side effect.
 - Reconnect, Resume from checkpoint, Retry interrupted Run, and Start new Run
   are separate actions with separate preconditions.
-- Cross-Lane Agent resume must be shown as blocked or future until the primary
-  session/workspace restriction is removed.
+- Same-source workspace continuation from an associated Lane may be shown when
+  checkpoint and workspace validation succeeds. Cross-workspace continuation
+  remains blocked, and Agent-to-Agent reassignment remains unavailable.
 
 ### Computer Use
 
@@ -110,10 +112,12 @@ boundary and must not turn an unobserved flow into apparent evidence.
 The selected visual direction should be implemented in vertical slices after
 the underlying ownership rules are honest:
 
-1. Finish explicit Lane scope and normalized state grammar.
-2. Correct archive inspect/restore behavior and block new archived mutations.
-3. Make remote Runtime presentation honest about separate service Lanes.
-4. Remove the primary-session restriction from Agent resume with fail-closed
+1. Keep explicit Lane scope and normalized state grammar consistent across every
+   secondary surface, including approvals, terminals, and Run details.
+2. Preserve archive inspect/restore behavior and regression-test every archived
+   mutation boundary.
+3. Keep remote Runtime presentation honest about separate service Lanes.
+4. Extend associated-Lane continuation evidence while retaining fail-closed
    workspace and checkpoint validation.
 5. Add separate Agent lifecycle state and mutation gates.
 6. Introduce the selected navigation and visual hierarchy incrementally.

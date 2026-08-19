@@ -35,6 +35,7 @@ import {
   runtimeConnectionLabel,
   runtimeTargetLabel,
 } from "./components/LaneContextHeader";
+import { LaneScopeLine } from "./components/LaneScopeLine";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { StateCard } from "./components/StateCard";
 import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
@@ -808,10 +809,82 @@ export default function App() {
     () => remoteLanes.find((lane) => lane.id === remoteTargetSessionId) ?? null,
     [remoteLanes, remoteTargetSessionId],
   );
-  const activeContextAgentId =
+  // A remote Run target must not rewrite the focused local Lane's identity.
+  // The Run Inspector gets the separate service-owned scope below.
+  const activeContextAgentId = activeLane?.agent_id ?? activeSummary?.agent_id;
+  const focusedLaneScope = useMemo(
+    () => ({
+      laneId: activeLane?.id ?? activeSessionId,
+      laneTitle: activeLane?.title ?? activeSummary?.title ?? activeTab?.title,
+      agentLabel: activeContextAgentId,
+      runtimeTarget: activeLane?.runtime_target ?? ("local_desktop" as const),
+      runtimeConnection: activeLane?.runtime_connection ?? ("connected" as const),
+      workspacePath: activeLane?.cwd ?? activeSummary?.cwd ?? activeTab?.cwd,
+      runLabel: busy ? activity.label : "No active Run",
+    }),
+    [
+      activeContextAgentId,
+      activeLane,
+      activeSessionId,
+      activeSummary,
+      activeTab,
+      activity.label,
+      busy,
+    ],
+  );
+  const runScopeLane =
     executionTarget === "remote" && selectedRemoteLane
-      ? selectedRemoteLane.agent_id
-      : activeLane?.agent_id ?? activeSummary?.agent_id;
+      ? selectedRemoteLane
+      : activeLane;
+  const runScope = useMemo(
+    () => ({
+      laneId: runScopeLane?.id ?? activeSessionId,
+      laneTitle: runScopeLane?.title ?? activeSummary?.title ?? activeTab?.title,
+      agentLabel: runScopeLane?.agent_id,
+      runtimeTarget:
+        runScopeLane?.runtime_target ??
+        (executionTarget === "remote" ? ("hosted_service" as const) : ("local_desktop" as const)),
+      runtimeConnection:
+        runScopeLane?.runtime_connection ??
+        (executionTarget === "remote"
+          ? remoteServiceStatus.connectionState ?? ("connected" as const)
+          : ("connected" as const)),
+      workspacePath: runScopeLane?.cwd ?? activeSummary?.cwd ?? activeTab?.cwd,
+      runLabel: runs.length
+        ? `${runs.length} durable Run${runs.length === 1 ? "" : "s"}`
+        : "No active Run",
+    }),
+    [
+      activeSessionId,
+      activeSummary,
+      activeTab,
+      executionTarget,
+      remoteServiceStatus.connectionState,
+      runScopeLane,
+      runs.length,
+    ],
+  );
+  const permissionScope = useMemo(() => {
+    if (!permission) return undefined;
+    const lane =
+      visibleLanes.find((candidate) => candidate.id === permission.session_id) ??
+      sessions.find((candidate) => candidate.id === permission.session_id);
+    return {
+      laneId: permission.session_id,
+      laneTitle: lane?.title ?? "Background Lane",
+      agentLabel: lane?.agent_id,
+      runtimeTarget:
+        lane && "runtime_target" in lane
+          ? lane.runtime_target
+          : ("local_desktop" as const),
+      runtimeConnection:
+        lane && "runtime_connection" in lane
+          ? lane.runtime_connection
+          : ("connected" as const),
+      workspacePath: lane?.cwd,
+      runLabel: "Permission requested",
+    };
+  }, [permission, sessions, visibleLanes]);
   const effortOptions = useMemo(
     () => effortOptionsForModel(models, status?.model),
     [models, status?.model],
@@ -3014,6 +3087,7 @@ export default function App() {
           <ComputerCockpit
             sessionId={activeSessionId}
             sessionTitle={activeTab?.title ?? activeSummary?.title}
+            scope={focusedLaneScope}
             model={status?.model ?? "unknown"}
             effort={status?.effort ?? "unknown"}
             computerUseTier={currentModelInfo?.computer_use_tier ?? "none"}
@@ -3232,6 +3306,11 @@ export default function App() {
                     ? `Lane Terminal · ${toolShell.command.slice(0, 48)}${toolShell.command.length > 48 ? "…" : ""}`
                     : `Lane Terminal · ${activeTab?.title ?? "Current Lane"}`}
                 </span>
+                <LaneScopeLine
+                  scope={focusedLaneScope}
+                  compact
+                  className="terminal-scope-line"
+                />
                 <button
                   type="button"
                   className="terminal-slot-collapse"
@@ -3690,9 +3769,11 @@ export default function App() {
           </button>
           <span className="panel-chrome-title">Tools</span>
           {activeSessionId && (
-            <span className="panel-context-scope" title="All tool panels are scoped to the selected Lane">
-              Lane: {activeSummary?.title ?? activeTab?.title ?? "Current work"}
-            </span>
+            <LaneScopeLine
+              scope={focusedLaneScope}
+              compact
+              className="tools-scope-line"
+            />
           )}
         </div>
         <div className="tabs">
@@ -4042,6 +4123,7 @@ export default function App() {
         {rightTab === "tasks" && (
           <>
             <RunInspector
+              scope={runScope}
               laneTitle={
                 executionTarget === "remote" && selectedRemoteLane
                   ? `${activeSummary?.title ?? activeTab?.title ?? "Current work"} · Run Lane ${selectedRemoteLane.title || selectedRemoteLane.cwd}`
@@ -4350,6 +4432,7 @@ export default function App() {
       {permission && (
         <PermissionModal
           request={permission}
+          scope={permissionScope}
           queuedBehind={Math.max(0, permissionQueue.length - 1)}
           fallbackSessionId={activeSessionId}
           denyHistory={denyHistory}

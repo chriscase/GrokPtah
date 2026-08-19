@@ -253,6 +253,30 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ComputerCockpit", () => {
+  it("keeps Computer Run ownership visible beyond the focused tab", async () => {
+    render(
+      <ComputerCockpit
+        {...props}
+        scope={{
+          laneId: "session-1",
+          laneTitle: "Demo build",
+          agentLabel: "Ad hoc",
+          runtimeTarget: "local_desktop",
+          runtimeConnection: "connected",
+          workspacePath: "/work/grokptah",
+          runLabel: "No active Run",
+        }}
+      />,
+    );
+
+    const scope = await screen.findByRole("group", { name: "Lane scope" });
+    expect(scope).toHaveTextContent("Lane Demo build");
+    expect(scope).toHaveTextContent("Agent Ad hoc");
+    expect(scope).toHaveTextContent("Runtime Local desktop · Connected");
+    expect(scope).toHaveTextContent("Workspace work / grokptah");
+    expect(scope).toHaveTextContent("Run No active Run");
+  });
+
   it("requires exact scope review before a run starts", async () => {
     mocks.start.mockResolvedValue(snapshot(run()));
     render(<ComputerCockpit {...props} />);
