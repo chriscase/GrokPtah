@@ -69,7 +69,7 @@ impl Drop for ServiceEnv {
 }
 
 pub async fn start_isolated(
-    _env: &ServiceEnv,
+    env: &ServiceEnv,
     workspaces: Vec<PathBuf>,
     max_concurrent: usize,
 ) -> ServiceHandle {
@@ -81,7 +81,9 @@ pub async fn start_isolated(
         max_concurrent,
         Duration::from_secs(8),
     )
-    .expect("valid service config");
+    .expect("valid service config")
+    .with_runtime_home(env._home.path())
+    .expect("valid runtime home");
     start_service(config).await.expect("start service")
 }
 

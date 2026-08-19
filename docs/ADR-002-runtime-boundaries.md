@@ -123,6 +123,14 @@ they are not filesystem peers. Named bearer credentials identify the client
 device for audit/run attribution, while `GROKPTAH_SERVICE_AGENT_OWNER` identifies
 the account allowed to own durable Agents on that service.
 
+The runtime now exposes a validated `RuntimeHome` context. The default desktop
+and CLI path still discovers `GROKPTAH_HOME`, while hosted/library bootstraps
+may inject an explicit root. That context owns the shared layout and remains
+held for the host lifetime, so orchestration, Computer Use, sessions, memory,
+MCP trust, provider state, and instance locking resolve against one selected
+home. This is a filesystem-backed portability seam, not yet a database or
+multi-node abstraction.
+
 Copying a home while its owner is live, placing it on a multi-writer network
 filesystem, or syncing it between devices is unsupported. A future
 local-to-hosted migration must define:

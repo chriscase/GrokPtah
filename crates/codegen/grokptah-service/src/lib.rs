@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::{
     start_control_server_with_bind, AgentHost, AgentHostHandle, AuthCredential,
     ControlServerHandle, ControlServerLimits, HostConfig, OrchStore, OrchestrationConfig,
-    OrchestrationService, WorkspaceAllowlist,
+    OrchestrationService, RuntimeHome, WorkspaceAllowlist,
 };
 
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -37,6 +37,9 @@ pub struct ServiceConfig {
     /// device credentials may share one owner while remaining attributable as
     /// distinct clients in audit and Run records.
     pub agent_owner_id: String,
+    /// Explicit durable root for embedders and hosted deployments. `None`
+    /// preserves the `GROKPTAH_HOME`/desktop discovery behavior.
+    pub runtime_home: Option<RuntimeHome>,
 }
 
 impl ServiceConfig {
@@ -63,6 +66,7 @@ impl ServiceConfig {
                     .map_err(|error| anyhow::anyhow!(error.message))?]
             },
             agent_owner_id: "primary".into(),
+            runtime_home: None,
         };
         config.validate()?;
         Ok(config)
@@ -128,6 +132,7 @@ impl ServiceConfig {
             request_timeout: Duration::from_millis(timeout_ms),
             client_credentials,
             agent_owner_id,
+            runtime_home: None,
         })
     }
 
@@ -180,6 +185,13 @@ impl ServiceConfig {
             bail!("remote listeners require a bearer token of at least 24 characters");
         }
         Ok(())
+    }
+
+    /// Select a validated durable root without changing the legacy constructor
+    /// or the environment-based desktop/service path.
+    pub fn with_runtime_home(mut self, path: impl AsRef<std::path::Path>) -> Result<Self> {
+        self.runtime_home = Some(RuntimeHome::from_path(path)?);
+        Ok(self)
     }
 }
 
@@ -325,7 +337,10 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
         bail!("every configured workspace must exist and resolve to a directory");
     }
 
-    let host = AgentHost::create(HostConfig::default());
+    let host = match config.runtime_home.clone() {
+        Some(home) => AgentHost::create_with_runtime_home(HostConfig::default(), home),
+        None => AgentHost::create(HostConfig::default()),
+    };
     host.start().context("start GrokPtah agent host")?;
     let store: OrchStore = host
         .ensure_orchestration_store()
@@ -462,5 +477,25 @@ mod tests {
             .client_credentials
             .push(AuthCredential::new("laptop", "another-token").unwrap());
         assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_runtime_home_is_validated_and_attached_without_changing_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = ServiceConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "service-token",
+            vec![PathBuf::from("/tmp/project")],
+            false,
+            2,
+            Duration::from_secs(10),
+        )
+        .unwrap()
+        .with_runtime_home(temp.path())
+        .unwrap();
+        assert_eq!(
+            config.runtime_home.unwrap().path(),
+            dunce::canonicalize(temp.path()).unwrap()
+        );
     }
 }

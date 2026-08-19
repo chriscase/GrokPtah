@@ -9,6 +9,144 @@ use walkdir::WalkDir;
 
 use crate::types::{McpServerInfo, PluginInfo, SkillInfo};
 
+/// The durable state root selected by one GrokPtah runtime.
+///
+/// Desktop and hosted processes use the same layout. The current backend is
+/// deliberately filesystem-backed, but callers now pass a validated runtime
+/// home instead of making the service invent a second persistence layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHome {
+    root: PathBuf,
+}
+
+impl RuntimeHome {
+    /// Validate, create, and canonicalize one durable runtime root.
+    pub fn from_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        if path.as_os_str().is_empty() {
+            anyhow::bail!("runtime home path must not be empty");
+        }
+        fs::create_dir_all(path)?;
+        let root = dunce::canonicalize(path)?;
+        if !root.is_dir() {
+            anyhow::bail!("runtime home is not a directory: {}", root.display());
+        }
+        let home = Self { root };
+        home.prepare()?;
+        Ok(home)
+    }
+
+    /// Discover the compatibility home from the test override, environment,
+    /// or the user's default home directory.
+    pub fn discover() -> Self {
+        Self {
+            root: grokptah_home(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn orchestration_root(&self) -> PathBuf {
+        self.root.join("orchestration")
+    }
+
+    pub fn computer_root(&self) -> PathBuf {
+        self.root.join("computer-use")
+    }
+
+    pub fn sessions_root(&self) -> PathBuf {
+        self.root.join("sessions")
+    }
+
+    pub fn workspace_state_path(&self) -> PathBuf {
+        self.root.join("workspace.json")
+    }
+
+    pub fn memory_root(&self) -> PathBuf {
+        self.root.join("memory")
+    }
+
+    pub fn agents_root(&self) -> PathBuf {
+        self.root.join("agents")
+    }
+
+    pub fn personas_root(&self) -> PathBuf {
+        self.root.join("personas")
+    }
+
+    pub fn plugins_root(&self) -> PathBuf {
+        self.root.join("plugins")
+    }
+
+    pub fn skills_root(&self) -> PathBuf {
+        self.root.join("skills")
+    }
+
+    pub fn mcp_config_path(&self) -> PathBuf {
+        self.root.join("mcp.json")
+    }
+
+    pub fn mcp_trust_path(&self) -> PathBuf {
+        self.root.join("mcp_trust.json")
+    }
+
+    pub fn hooks_path(&self) -> PathBuf {
+        self.root.join("hooks.json")
+    }
+
+    pub fn gateway_config_path(&self) -> PathBuf {
+        self.root.join("gateway.json")
+    }
+
+    pub fn provider_qualifications_path(&self) -> PathBuf {
+        self.root.join("provider-qualifications.json")
+    }
+
+    pub fn instance_lock_path(&self) -> PathBuf {
+        self.root.join(".instance.lock")
+    }
+
+    /// Create the stable top-level layout used by the current file backend.
+    pub fn prepare(&self) -> anyhow::Result<()> {
+        for path in [
+            self.plugins_root(),
+            self.skills_root(),
+            self.sessions_root(),
+            self.orchestration_root(),
+            self.computer_root(),
+            self.memory_root(),
+            self.agents_root(),
+            self.personas_root(),
+        ] {
+            fs::create_dir_all(path)?;
+        }
+        Ok(())
+    }
+
+    /// Install this home for the current process until the last host handle
+    /// using the context is dropped. AgentHost already enforces one writer per
+    /// process, so this preserves compatibility for legacy modules that still
+    /// resolve their paths through `grokptah_home()`.
+    pub(crate) fn install(&self) -> RuntimeHomeContext {
+        let _ = self.prepare();
+        RuntimeHomeContext {
+            previous: replace_home_override(Some(self.root.clone())),
+        }
+    }
+}
+
+pub(crate) struct RuntimeHomeContext {
+    previous: Option<PathBuf>,
+}
+
+impl Drop for RuntimeHomeContext {
+    fn drop(&mut self) {
+        let _ = replace_home_override(self.previous.take());
+    }
+}
+
 /// Process-wide override for the GrokPtah data directory.
 ///
 /// Integration tests set this so they never write into the developer's real
@@ -33,9 +171,14 @@ pub fn home_override_serial() -> std::sync::MutexGuard<'static, ()> {
 ///
 /// Callers that run concurrent tests must serialize access (see test helpers).
 pub fn set_grokptah_home_override(path: Option<PathBuf>) {
-    if let Ok(mut g) = home_override().lock() {
-        *g = path;
-    }
+    let _ = replace_home_override(path);
+}
+
+fn replace_home_override(path: Option<PathBuf>) -> Option<PathBuf> {
+    home_override()
+        .lock()
+        .ok()
+        .and_then(|mut current| std::mem::replace(&mut *current, path))
 }
 
 /// Resolve the GrokPtah home directory.
@@ -507,6 +650,32 @@ pub fn hooks_config_text(project: Option<&Path>) -> String {
         );
     }
     fs::read_to_string(seed).unwrap_or_else(|_| "{}".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_home_validates_layout_and_restores_previous_context() {
+        let _serial = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let previous = temp.path().join("previous");
+        let selected = temp.path().join("selected");
+        let home = RuntimeHome::from_path(&selected).unwrap();
+        assert_eq!(home.path(), dunce::canonicalize(&selected).unwrap());
+        assert!(home.orchestration_root().is_dir());
+        assert!(home.computer_root().is_dir());
+        assert!(home.sessions_root().is_dir());
+        assert!(home.memory_root().is_dir());
+
+        set_grokptah_home_override(Some(previous.clone()));
+        let context = home.install();
+        assert_eq!(grokptah_home(), home.path());
+        drop(context);
+        assert_eq!(grokptah_home(), previous);
+        set_grokptah_home_override(None);
+    }
 }
 
 // need chrono in discover - use crate chrono already in deps

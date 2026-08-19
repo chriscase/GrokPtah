@@ -9,7 +9,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use fs2::FileExt;
 
-use crate::discover::{ensure_home, grokptah_home};
+use crate::discover::{ensure_home, RuntimeHome};
 
 /// Held for the lifetime of the agent host. Drop releases the exclusive lock.
 pub struct InstanceLock {
@@ -20,9 +20,16 @@ impl InstanceLock {
     /// Try to acquire an exclusive non-blocking lock on `~/.grokptah/.instance.lock`.
     ///
     /// Returns an error if another live process already holds the lock.
+    #[allow(dead_code)]
     pub fn try_acquire() -> Result<Self> {
         ensure_home();
-        let path = grokptah_home().join(".instance.lock");
+        Self::try_acquire_at(&RuntimeHome::discover())
+    }
+
+    /// Acquire the lock for an explicitly selected runtime home.
+    pub fn try_acquire_at(home: &RuntimeHome) -> Result<Self> {
+        home.prepare()?;
+        let path = home.instance_lock_path();
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -35,7 +42,7 @@ impl InstanceLock {
             anyhow::anyhow!(
                 "another GrokPtah instance is already using {} ({e}). \
                  Quit the other app (or stale build) before starting a second one.",
-                grokptah_home().display()
+                home.path().display()
             )
         })?;
 
@@ -45,7 +52,7 @@ impl InstanceLock {
             file,
             "pid={} home={}",
             std::process::id(),
-            grokptah_home().display()
+            home.path().display()
         );
         let _ = file.sync_all();
 
