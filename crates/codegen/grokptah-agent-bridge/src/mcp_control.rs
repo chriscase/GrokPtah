@@ -557,6 +557,7 @@ fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
         .orch
         .get_capacity(&AuthContext {
             token_id: "health-probe".into(),
+            owner_id: "health-probe".into(),
         })
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));

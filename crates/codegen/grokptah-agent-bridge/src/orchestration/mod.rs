@@ -10,7 +10,10 @@ mod supervisor;
 mod types;
 mod workload;
 
-pub use authz::{canonical_workspace, constant_time_eq, AuthContext, WorkspaceAllowlist};
+pub use authz::{
+    authenticate_bearer, canonical_workspace, constant_time_eq, require_bearer, AuthContext,
+    AuthCredential, WorkspaceAllowlist,
+};
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,
     ContinuationContext, ContinuationFidelity, ContinuationInputSnapshot, ContinuationMemoryFact,

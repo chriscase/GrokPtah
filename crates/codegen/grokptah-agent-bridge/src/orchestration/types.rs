@@ -498,6 +498,7 @@ pub const MAX_AGENT_MODEL_BYTES: usize = 256;
 pub const MAX_AGENT_DISPLAY_NAME_BYTES: usize = 128;
 pub const MAX_AGENT_ROLE_BYTES: usize = 512;
 pub const MAX_AGENT_POLICY_ENTRY_BYTES: usize = 512;
+pub const MAX_AGENT_OWNER_ID_BYTES: usize = 128;
 pub const AGENT_SPEC_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS: u64 = 250_000;
 pub const DEFAULT_AGENT_TOOL_IDS: &[&str] = &[
@@ -864,6 +865,11 @@ impl AgentSpec {
 #[serde(rename_all = "camelCase")]
 pub struct AgentRecord {
     pub agent_id: String,
+    /// Account identity that owns this durable Agent across device/client
+    /// credentials. `None` is retained only for legacy records until the
+    /// first authenticated service operation claims the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_principal_id: Option<String>,
     /// Legacy primary session retained for resume and wire compatibility.
     pub session_id: Uuid,
     /// All Lanes owned by this durable identity. Old records deserialize with
@@ -985,6 +991,9 @@ impl AgentRecord {
 
     pub fn validate(&self) -> Result<(), OrchError> {
         validate_id(&self.agent_id, "agent_id")?;
+        if let Some(owner) = self.owner_principal_id.as_deref() {
+            validate_bounded_string(owner, MAX_AGENT_OWNER_ID_BYTES, "owner_principal_id")?;
+        }
         validate_workspace(&self.workspace)?;
         validate_bounded_string(&self.model, MAX_AGENT_MODEL_BYTES, "model")?;
         if let Some(spec) = self.spec.as_ref() {
@@ -1654,6 +1663,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let mut agent = AgentRecord {
             agent_id: "agent-1".into(),
+            owner_principal_id: None,
             session_id,
             lane_ids: vec![session_id],
             lane_associations: Vec::new(),
@@ -1736,6 +1746,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let agent = AgentRecord {
             agent_id: "agent-adapter".into(),
+            owner_principal_id: None,
             session_id,
             lane_ids: vec![session_id],
             lane_associations: Vec::new(),

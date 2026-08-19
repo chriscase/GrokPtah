@@ -69,7 +69,24 @@ Replace `/usr/local/bin/grokptah-service` and run `sudo systemctl restart
 grokptah-service`. The run ledger and event journal live under
 `GROKPTAH_HOME`; restart recovery marks unfinished runs interrupted and never
 silently resumes model execution. Back up `/var/lib/grokptah` as part of the
-VM's normal state backup policy.
+VM's normal state backup policy. Credentials are configured separately in
+`/etc/grokptah/grokptah-service.env` and are not part of the durable home.
+
+For a consistent backup, stop the service first, copy the complete state
+directory, and start it again:
+
+```sh
+sudo systemctl stop grokptah-service
+sudo tar --xattrs --acls -C /var/lib -czf /var/backups/grokptah-home-$(date +%Y%m%d%H%M%S).tar.gz grokptah
+sudo systemctl start grokptah-service
+```
+
+Restore only while the service is stopped, preserve ownership and mode bits,
+and restore the matching workspace paths before starting. A restored home is
+the authoritative copy; do not run two services against it, place it on a
+multi-writer network filesystem, or sync it live between devices. After a
+restore, verify `/ready` and inspect the journal for interrupted runs before
+resuming any persistent Agent explicitly.
 
 The configured workspace paths must match the unit's `ReadWritePaths`. If the
 environment file adds another workspace, add the same path to the unit before

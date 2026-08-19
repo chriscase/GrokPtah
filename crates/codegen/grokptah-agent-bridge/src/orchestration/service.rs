@@ -15,7 +15,10 @@ use crate::host::AgentHostHandle;
 use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
-use super::authz::{canonical_workspace, require_workspace_match, AuthContext, WorkspaceAllowlist};
+use super::authz::{
+    authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
+    WorkspaceAllowlist,
+};
 use super::store::{IdempotencyClaim, OrchStore};
 use super::supervisor::{
     WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
@@ -65,6 +68,8 @@ pub struct OrchestrationService {
     bus: EventBus,
     store: OrchStore,
     config: Mutex<OrchestrationConfig>,
+    auth_credentials: Mutex<Vec<AuthCredential>>,
+    agent_owner_id: Mutex<String>,
     self_ref: Weak<OrchestrationService>,
     pending_admissions: Mutex<AdmissionQueueState>,
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -208,6 +213,12 @@ impl OrchestrationService {
         }
         config.max_concurrent_runs =
             host.configure_orchestration_capacity(config.max_concurrent_runs);
+        let auth_credentials = if config.bearer_token.is_empty() {
+            Vec::new()
+        } else {
+            vec![AuthCredential::new("primary", config.bearer_token.clone())
+                .expect("non-empty bearer token should form a primary credential")]
+        };
         let workload_supervisor =
             WorkloadSupervisor::start(store.clone(), DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL);
         let service = Arc::new_cyclic(|self_ref| Self {
@@ -215,6 +226,8 @@ impl OrchestrationService {
             bus,
             store,
             config: Mutex::new(config),
+            auth_credentials: Mutex::new(auth_credentials),
+            agent_owner_id: Mutex::new("primary".into()),
             self_ref: self_ref.clone(),
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
@@ -281,10 +294,67 @@ impl OrchestrationService {
     }
 
     pub fn set_token(&self, token: String) {
+        let token = token.trim().to_string();
         if !token.is_empty() {
             self.bus.add_control_secrets([token.clone()]);
         }
-        self.config.lock().bearer_token = token;
+        self.config.lock().bearer_token = token.clone();
+        let credentials = if token.is_empty() {
+            Vec::new()
+        } else {
+            vec![AuthCredential::new("primary", token)
+                .expect("non-empty bearer token should form a primary credential")]
+        };
+        *self.auth_credentials.lock() = credentials;
+    }
+
+    /// Install named device/client credentials while retaining the existing
+    /// primary-token configuration field for compatibility with embedders.
+    pub fn set_auth_credentials(&self, credentials: Vec<AuthCredential>) -> Result<(), OrchError> {
+        if credentials.is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "at least one auth credential is required",
+            ));
+        }
+        if !credentials
+            .iter()
+            .any(|credential| credential.id == "primary")
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "auth credentials must include the primary credential",
+            ));
+        }
+        let primary_token = credentials
+            .iter()
+            .find(|credential| credential.id == "primary")
+            .expect("primary credential was checked above")
+            .token()
+            .to_string();
+        for credential in &credentials {
+            self.bus
+                .add_control_secrets([credential.token().to_string()]);
+        }
+        self.config.lock().bearer_token = primary_token;
+        *self.auth_credentials.lock() = credentials;
+        Ok(())
+    }
+
+    pub fn set_agent_owner_id(&self, owner_id: String) -> Result<(), OrchError> {
+        let owner_id = owner_id.trim().to_string();
+        if owner_id.is_empty() || owner_id.len() > 128 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "Agent owner id must be between 1 and 128 bytes",
+            ));
+        }
+        *self.agent_owner_id.lock() = owner_id;
+        Ok(())
+    }
+
+    fn agent_owner_id(&self) -> String {
+        self.agent_owner_id.lock().clone()
     }
 
     pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) {
@@ -308,8 +378,9 @@ impl OrchestrationService {
     }
 
     pub fn auth_header(&self, header: Option<&str>) -> Result<AuthContext, OrchError> {
-        let tok = self.config.lock().bearer_token.clone();
-        let res = super::authz::require_bearer(header, &tok);
+        let credentials = self.auth_credentials.lock().clone();
+        let owner_id = self.agent_owner_id();
+        let res = authenticate_bearer(header, &credentials, &owner_id);
         if let Err(ref e) = res {
             self.audit(
                 "auth",
@@ -753,7 +824,7 @@ impl OrchestrationService {
     /// scoped read so listing cannot become a transcript or workspace oracle.
     pub fn list_persistent_agents(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
     ) -> Result<serde_json::Value, OrchError> {
         let allowlist = self.config.lock().allowlist.clone();
         let agents = self
@@ -761,7 +832,13 @@ impl OrchestrationService {
             .list_persistent_agents()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .into_iter()
-            .filter(|agent| allowlist.contains(Path::new(&agent.workspace)))
+            .filter(|agent| {
+                allowlist.contains(Path::new(&agent.workspace))
+                    && agent
+                        .owner_principal_id
+                        .as_deref()
+                        .is_none_or(|owner| owner == auth.owner_id)
+            })
             .collect::<Vec<_>>();
         Ok(json!({ "agents": agents }))
     }
@@ -1470,12 +1547,13 @@ impl OrchestrationService {
 
     pub fn get_persistent_agent_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         agent_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = self.authorize_persistent_agent_request(session_id, workspace, agent_id)?;
+        let _ =
+            self.authorize_persistent_agent_request(auth, session_id, workspace, agent_id, false)?;
         let plan = self
             .host
             .prepare_agent_resume(session_id)
@@ -1496,7 +1574,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)]
     pub async fn resume_persistent_agent(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -1505,20 +1583,21 @@ impl OrchestrationService {
         max_rounds: Option<u32>,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_resume_persistent_agent";
-        let (agent, claimed) =
-            match self.authorize_persistent_agent_request(session_id, workspace, agent_id) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.audit_err(
-                        tool,
-                        Some(request_id),
-                        Some(session_id),
-                        Some(&workspace.display().to_string()),
-                        &error,
-                    );
-                    return Err(error);
-                }
-            };
+        let (agent, claimed) = match self
+            .authorize_persistent_agent_request(auth, session_id, workspace, agent_id, true)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.audit_err(
+                    tool,
+                    Some(request_id),
+                    Some(session_id),
+                    Some(&workspace.display().to_string()),
+                    &error,
+                );
+                return Err(error);
+            }
+        };
         if let Err(error) = reject_control_prompt(&prompt) {
             self.audit_err(
                 tool,
@@ -2207,9 +2286,11 @@ impl OrchestrationService {
 
     fn authorize_persistent_agent_request(
         &self,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         agent_id: &str,
+        claim_owner: bool,
     ) -> Result<(AgentRecord, PathBuf), OrchError> {
         let session = self.require_build_session(session_id)?;
         let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
@@ -2232,6 +2313,34 @@ impl OrchestrationService {
                 "persistent agent is not available in the requested scope",
             ));
         }
+        if agent
+            .owner_principal_id
+            .as_deref()
+            .is_some_and(|owner| owner != auth.owner_id)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "persistent agent is not owned by this service account",
+            ));
+        }
+        let agent = if claim_owner {
+            self.store
+                .claim_agent_owner(&agent.agent_id, &auth.owner_id)
+                .map_err(|error| {
+                    OrchError::new(
+                        OrchErrorCode::ForbiddenScope,
+                        format!("persistent agent is not owned by this service account: {error}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    OrchError::new(
+                        OrchErrorCode::ForbiddenScope,
+                        "persistent agent is not available in the requested scope",
+                    )
+                })?
+        } else {
+            agent
+        };
         Ok((agent, claimed))
     }
 
@@ -3313,6 +3422,36 @@ impl OrchestrationService {
                 ));
             }
         };
+        let agent = match self
+            .store
+            .claim_agent_owner(&agent.agent_id, &auth.owner_id)
+        {
+            Ok(Some(agent)) => agent,
+            Ok(None) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    OrchError::new(
+                        OrchErrorCode::ForbiddenScope,
+                        "persistent Agent is not available",
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    OrchError::new(
+                        OrchErrorCode::ForbiddenScope,
+                        format!("persistent Agent is owned by another service account: {error}"),
+                    ),
+                ));
+            }
+        };
         let agent_bounds = match agent.current_spec() {
             Ok(spec) => &spec.default_run_bounds,
             Err(error) => {
@@ -3370,7 +3509,14 @@ impl OrchestrationService {
             // Distinguish coordinator-owned work from desktop turns so the
             // desktop can surface external activity without guessing from
             // transport timing.
-            client_id: Some("mcp".into()),
+            client_id: Some(if auth.token_id == "primary" {
+                // Preserve the established wire value for the compatibility
+                // credential; newly named device credentials are emitted by
+                // their stable IDs.
+                "mcp".into()
+            } else {
+                auth.token_id.clone()
+            }),
             state: if queued {
                 RunState::Queued
             } else {

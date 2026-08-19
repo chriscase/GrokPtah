@@ -1290,6 +1290,7 @@ impl AgentHostHandle {
                     .map_err(|error| anyhow!(error.to_string()))?;
                 AgentRecord {
                     agent_id: agent_id.clone(),
+                    owner_principal_id: None,
                     session_id,
                     lane_ids: vec![session_id],
                     lane_associations: vec![AgentLaneAssociation {
