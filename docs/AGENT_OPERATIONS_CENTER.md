@@ -26,12 +26,13 @@ ownership lookup.
 
 ## Authority boundary
 
-The first Work view is intentionally read-oriented. It does not expose lease
-credentials, silently claim work, auto-resume an Agent, promote a Run, or widen
-Computer Use permissions. Navigation actions only select the existing Lane or
-Run inspection surface. Worker/service mutations remain behind their existing
-authenticated, idempotent contracts until a human operator policy is designed
-for them.
+The Work view exposes only human-reviewed lifecycle actions: create, assign,
+retry a failed item within its declared budget, approve an approval-gated
+completion, and cancel. It does not expose lease credentials, silently claim
+work, auto-resume an Agent, promote a Run, or widen Computer Use permissions.
+Worker actions such as claim, renew, progress, release, complete, and fail
+remain behind the authenticated MCP contract. Revision fences make stale
+desktop decisions fail closed, and archived Lanes remain inspection-only.
 
 This preserves the runtime boundary in
 [`ADR-002`](ADR-002-runtime-boundaries.md): the desktop remains the visible
@@ -45,8 +46,8 @@ second ledger:
 
 1. Add an Agent detail view that groups all owned Lanes, current Work Items,
    checkpoints, connection state, and explicit lifecycle actions.
-2. Add human-reviewed Work actions with clear ownership and compare-and-set
-   behavior for claim, release, retry, cancel, and approval.
+2. Add worker/coordinator scheduling policy around the human-reviewed Work
+   actions, including explicit assignment discovery and claim/release policy.
 3. Add a durable cross-Lane timeline so an Agent's history remains understandable
    after individual Lanes are archived.
 4. Exercise local desktop, local service, and hosted service flows with restart,

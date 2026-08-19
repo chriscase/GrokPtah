@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type {
   DurableWorkAttempt,
   DurableWorkItem,
@@ -20,6 +20,12 @@ export type WorkBoardProps = {
   sourceLabel?: string;
   onRefresh: () => void;
   onSelect: (workId: string) => void;
+  mutationsEnabled?: boolean;
+  onCreate?: (kind: string, objective: string, priority: number, requiresApproval: boolean) => Promise<void>;
+  onAssign?: (workId: string, assignedAgentId: string | null, expectedRevision: number) => Promise<void>;
+  onRetry?: (workId: string, reason: string, expectedRevision: number) => Promise<void>;
+  onApprove?: (workId: string, note: string | undefined, expectedRevision: number) => Promise<void>;
+  onCancel?: (workId: string, reason: string, expectedRevision: number) => Promise<void>;
   onOpenLane?: (sessionId: string) => void;
   onOpenRun?: (runId: string) => void;
 };
@@ -78,10 +84,25 @@ export function WorkBoard({
   sourceLabel = "Durable workload",
   onRefresh,
   onSelect,
+  mutationsEnabled = false,
+  onCreate,
+  onAssign,
+  onRetry,
+  onApprove,
+  onCancel,
   onOpenLane,
   onOpenRun,
 }: WorkBoardProps) {
   const [filter, setFilter] = useState<WorkFilter>("all");
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createKind, setCreateKind] = useState("implementation");
+  const [createObjective, setCreateObjective] = useState("");
+  const [createPriority, setCreatePriority] = useState("0");
+  const [createRequiresApproval, setCreateRequiresApproval] = useState(false);
+  const [agentId, setAgentId] = useState("");
+  const [approvalNote, setApprovalNote] = useState("");
+  const [actionBusy, setActionBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const visibleItems = useMemo(
     () =>
       items.filter((item) => {
@@ -97,6 +118,42 @@ export function WorkBoard({
   const attentionCount = items.filter((item) => needsAttention(item.state)).length;
   const completedCount = items.filter((item) => isCompleted(item.state)).length;
 
+  useEffect(() => {
+    setAgentId(selected?.assignedAgentId ?? "");
+    setApprovalNote("");
+  }, [selected?.assignedAgentId, selected?.workId]);
+
+  async function perform(action: () => Promise<void>) {
+    setActionBusy(true);
+    setActionError(null);
+    try {
+      await action();
+      return true;
+    } catch (error) {
+      setActionError(String(error));
+      return false;
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  async function submitCreate(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!onCreate || !createObjective.trim()) return;
+    const succeeded = await perform(async () => {
+      await onCreate(
+        createKind.trim() || "implementation",
+        createObjective.trim(),
+        Number.parseInt(createPriority, 10) || 0,
+        createRequiresApproval,
+      );
+    });
+    if (succeeded) {
+      setCreateObjective("");
+      setCreateOpen(false);
+    }
+  }
+
   return (
     <section className="work-board" aria-label="Durable work">
       <div className="work-board-header">
@@ -111,6 +168,11 @@ export function WorkBoard({
             <button type="button" className="run-inspector-refresh" onClick={onRefresh} disabled={busy}>
               {busy ? "…" : "↻"}
             </button>
+            {mutationsEnabled && onCreate && (
+              <button type="button" onClick={() => setCreateOpen((open) => !open)} disabled={actionBusy}>
+                {createOpen ? "Close" : "New Work"}
+              </button>
+            )}
           </div>
           <LaneScopeLine scope={scope} compact />
         </div>
@@ -137,6 +199,43 @@ export function WorkBoard({
           </button>
         ))}
       </div>
+
+      {createOpen && onCreate && (
+        <form className="work-create-form" onSubmit={(event) => void submitCreate(event)}>
+          <label>
+            Kind
+            <input value={createKind} onChange={(event) => setCreateKind(event.target.value)} maxLength={96} />
+          </label>
+          <label>
+            Objective
+            <textarea
+              value={createObjective}
+              onChange={(event) => setCreateObjective(event.target.value)}
+              placeholder="What should persist beyond this Lane?"
+              required
+              maxLength={32768}
+              rows={3}
+            />
+          </label>
+          <label>
+            Priority
+            <input type="number" value={createPriority} onChange={(event) => setCreatePriority(event.target.value)} />
+          </label>
+          <label className="work-create-check">
+            <input
+              type="checkbox"
+              checked={createRequiresApproval}
+              onChange={(event) => setCreateRequiresApproval(event.target.checked)}
+            />
+            Require human approval before completion
+          </label>
+          <button type="submit" disabled={actionBusy || !createObjective.trim()}>
+            {actionBusy ? "Creating…" : "Create durable Work"}
+          </button>
+        </form>
+      )}
+
+      {actionError && <p className="work-action-error" role="alert">Work action failed: {actionError}</p>}
 
       {error && (
         <StateCard
@@ -216,6 +315,7 @@ export function WorkBoard({
                   <div><dt>Created by</dt><dd>{selected.createdBy}</dd></div>
                   <div><dt>Attempts</dt><dd>{selected.attemptCount}</dd></div>
                   <div><dt>Approval</dt><dd>{selected.policy.requiresApproval ? "Required" : "Not required"}</dd></div>
+                  {selected.approval && <div><dt>Approved by</dt><dd>{selected.approval.reviewerId}</dd></div>}
                   <div><dt>Updated</dt><dd>{dateLabel(selected.updatedAt)}</dd></div>
                   <div><dt>Revision</dt><dd>{selected.revision}</dd></div>
                 </dl>
@@ -238,6 +338,70 @@ export function WorkBoard({
                       <ul>{selected.result.evidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul>
                     </details>
                   ) : null}
+                  {mutationsEnabled && !actionBusy && onAssign && !isCompleted(selected.state) && (
+                    <form
+                      className="work-action-form"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void perform(() => onAssign(selected.workId, agentId.trim() || null, selected.revision));
+                      }}
+                    >
+                      <label>
+                        Assigned Agent
+                        <input
+                          aria-label="Assigned Agent"
+                          value={agentId}
+                          onChange={(event) => setAgentId(event.target.value)}
+                          placeholder="agent id, or blank to unassign"
+                        />
+                      </label>
+                      <button type="submit">{selected.assignedAgentId ? "Update assignment" : "Assign"}</button>
+                    </form>
+                  )}
+                  {mutationsEnabled && selected.state === "awaiting_approval" && onApprove && (
+                    <form
+                      className="work-action-form"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void perform(() => onApprove(selected.workId, approvalNote.trim() || undefined, selected.revision));
+                      }}
+                    >
+                      <label>
+                        Review note
+                        <input
+                          aria-label="Review note"
+                          value={approvalNote}
+                          onChange={(event) => setApprovalNote(event.target.value)}
+                          placeholder="Why is this completion approved?"
+                        />
+                      </label>
+                      <button type="submit">Approve completion</button>
+                    </form>
+                  )}
+                  {mutationsEnabled && selected.state === "failed" && selected.attemptCount < selected.policy.retry.maxAttempts && onRetry && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (window.confirm("Retry this failed Work Item?")) {
+                          void perform(() => onRetry(selected.workId, "operator requested retry", selected.revision));
+                        }
+                      }}
+                    >
+                      Retry failed Work
+                    </button>
+                  )}
+                  {mutationsEnabled && !isCompleted(selected.state) && onCancel && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (window.confirm("Cancel this durable Work Item?")) {
+                          void perform(() => onCancel(selected.workId, "operator cancelled Work Item", selected.revision));
+                        }
+                      }}
+                    >
+                      Cancel Work
+                    </button>
+                  )}
                 </div>
                 <div className="work-attempts">
                   <strong>Attempt history</strong>

@@ -19,6 +19,7 @@ pub const MAX_WORK_ACTOR_BYTES: usize = 256;
 pub const MAX_WORK_ARTIFACTS: usize = 256;
 pub const MAX_WORK_ARTIFACT_BYTES: usize = 2 * 1024;
 pub const MAX_WORK_DEPENDENCIES: usize = 128;
+pub const MAX_WORK_APPROVAL_NOTE_BYTES: usize = 4 * 1024;
 pub const DEFAULT_WORK_LEASE_MS: u64 = 5 * 60 * 1_000;
 pub const MAX_WORK_LEASE_MS: u64 = 60 * 60 * 1_000;
 pub const DEFAULT_WORK_MAX_ATTEMPTS: u32 = 3;
@@ -225,6 +226,31 @@ pub struct WorkResult {
     pub completed_at: DateTime<Utc>,
 }
 
+/// Durable attribution for the human decision that releases an approval-gated
+/// Work Item. The decision is part of the Work Item record, not UI state, so a
+/// hosted client and a local desktop render the same review evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkApproval {
+    pub reviewer_id: String,
+    pub note: Option<String>,
+    pub approved_at: DateTime<Utc>,
+}
+
+impl WorkApproval {
+    pub fn validate(&self) -> Result<(), OrchError> {
+        validate_text(
+            &self.reviewer_id,
+            MAX_WORK_ACTOR_BYTES,
+            "approval.reviewer_id",
+        )?;
+        if let Some(note) = &self.note {
+            validate_text(note, MAX_WORK_APPROVAL_NOTE_BYTES, "approval.note")?;
+        }
+        Ok(())
+    }
+}
+
 impl WorkResult {
     pub fn validate(&self) -> Result<(), OrchError> {
         validate_text(&self.summary, MAX_WORK_OBJECTIVE_BYTES, "result.summary")?;
@@ -275,6 +301,8 @@ pub struct WorkItem {
     pub attempt_count: u32,
     pub progress: Option<WorkProgress>,
     pub result: Option<WorkResult>,
+    #[serde(default)]
+    pub approval: Option<WorkApproval>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -308,6 +336,7 @@ impl WorkItem {
             attempt_count: 0,
             progress: None,
             result: None,
+            approval: None,
             created_at: now,
             updated_at: now,
         };
@@ -362,6 +391,9 @@ impl WorkItem {
         }
         if let Some(result) = &self.result {
             result.validate()?;
+        }
+        if let Some(approval) = &self.approval {
+            approval.validate()?;
         }
         Ok(())
     }

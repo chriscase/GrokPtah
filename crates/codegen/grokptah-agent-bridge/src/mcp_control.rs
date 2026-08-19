@@ -1119,6 +1119,46 @@ struct CancelWorkArgs {
     workspace: PathBuf,
     work_id: String,
     reason: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignWorkArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    #[serde(default)]
+    assigned_agent_id: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryWorkArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    reason: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveWorkArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
 }
 
 fn empty_object() -> Value {
@@ -1682,6 +1722,19 @@ fn tool_input_schema(name: &str) -> Value {
                 "policy": {"type": "object"}
             }
         }),
+        "ptah_assign_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "assigned_agent_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "assigned_agent_id": {"type": ["string", "null"], "maxLength": 256},
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
         "ptah_claim_work" => json!({
             "type": "object",
             "required": ["request_id", "session_id", "workspace", "work_id"],
@@ -1778,7 +1831,34 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "work_id": run_id,
-                "reason": {"type": "string", "minLength": 1, "maxLength": 32768}
+                "reason": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
+        "ptah_retry_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "reason"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "reason": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
+        "ptah_approve_work" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "note": {"type": "string", "maxLength": 4096},
+                "expected_revision": {"type": "integer", "minimum": 1}
             }
         }),
         "ptah_retry_run" => json!({
@@ -2154,6 +2234,24 @@ async fn dispatch_tool(
             )
             .await
         }
+        "ptah_assign_work" => {
+            let args: AssignWorkArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            if let Some(agent_id) = &args.assigned_agent_id {
+                require_nonempty(agent_id, "assigned_agent_id")?;
+            }
+            orch.assign_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.assigned_agent_id,
+                args.expected_revision,
+            )
+            .await
+        }
         "ptah_claim_work" => {
             let args: ClaimWorkArgs = parse_value(args)?;
             require_nonempty(&args.request_id, "request_id")?;
@@ -2294,6 +2392,41 @@ async fn dispatch_tool(
                 &args.workspace,
                 &args.work_id,
                 args.reason,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_retry_work" => {
+            let args: RetryWorkArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            require_nonempty(&args.reason, "reason")?;
+            orch.retry_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.reason,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_approve_work" => {
+            let args: ApproveWorkArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            if let Some(note) = &args.note {
+                require_nonempty(note, "note")?;
+            }
+            orch.approve_work(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.note,
+                args.expected_revision,
             )
             .await
         }

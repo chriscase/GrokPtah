@@ -3,7 +3,8 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkPolicy, WorkRetryPolicy,
+    WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
@@ -204,6 +205,177 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
     assert!(work_snapshot.structured["attempts"][0]
         .get("leaseTokenHash")
         .is_none());
+
+    let approval_policy = WorkPolicy {
+        requires_approval: true,
+        ..WorkPolicy::default()
+    };
+    let approval_work = client
+        .call_tool(
+            "ptah_create_work",
+            json!({
+                "request_id": "work-approval-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "kind": "approval-proof",
+                "objective": "Require an explicit human completion decision",
+                "policy": approval_policy,
+            }),
+        )
+        .await
+        .unwrap();
+    let approval_id = approval_work.structured["work"]["workId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let approval_revision = approval_work.structured["work"]["revision"]
+        .as_u64()
+        .unwrap();
+    let assigned = client
+        .call_tool(
+            "ptah_assign_work",
+            json!({
+                "request_id": "work-assign-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": approval_id,
+                "assigned_agent_id": "review-agent",
+                "expected_revision": approval_revision,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        assigned.structured["work"]["assignedAgentId"],
+        "review-agent"
+    );
+    let approval_claim = client
+        .call_tool(
+            "ptah_claim_work",
+            json!({
+                "request_id": "work-approval-claim-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": approval_id,
+            }),
+        )
+        .await
+        .unwrap();
+    let approval_attempt = approval_claim.structured["attempt"]["attemptId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let approval_token = approval_claim.structured["leaseToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let awaiting = client
+        .call_tool(
+            "ptah_complete_work",
+            json!({
+                "request_id": "work-approval-complete-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": approval_id,
+                "attempt_id": approval_attempt,
+                "lease_token": approval_token,
+                "summary": "ready for human review",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(awaiting.structured["work"]["state"], "awaiting_approval");
+    let approved = client
+        .call_tool(
+            "ptah_approve_work",
+            json!({
+                "request_id": "work-approval-decision-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": approval_id,
+                "note": "Evidence reviewed by the operator",
+                "expected_revision": awaiting.structured["work"]["revision"],
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.structured["work"]["state"], "succeeded");
+    assert_eq!(
+        approved.structured["work"]["approval"]["reviewerId"],
+        "primary"
+    );
+
+    let retry_policy = WorkPolicy {
+        retry: WorkRetryPolicy {
+            max_attempts: 2,
+            retry_failed: false,
+            ..WorkRetryPolicy::default()
+        },
+        ..WorkPolicy::default()
+    };
+    let retry_work = client
+        .call_tool(
+            "ptah_create_work",
+            json!({
+                "request_id": "work-retry-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "kind": "retry-proof",
+                "objective": "Reopen a failed item with a bounded retry",
+                "policy": retry_policy,
+            }),
+        )
+        .await
+        .unwrap();
+    let retry_id = retry_work.structured["work"]["workId"].as_str().unwrap();
+    let retry_claim = client
+        .call_tool(
+            "ptah_claim_work",
+            json!({
+                "request_id": "work-retry-claim-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": retry_id,
+            }),
+        )
+        .await
+        .unwrap();
+    let retry_attempt = retry_claim.structured["attempt"]["attemptId"]
+        .as_str()
+        .unwrap();
+    let retry_token = retry_claim.structured["leaseToken"].as_str().unwrap();
+    let failed = client
+        .call_tool(
+            "ptah_fail_work",
+            json!({
+                "request_id": "work-retry-fail-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": retry_id,
+                "attempt_id": retry_attempt,
+                "lease_token": retry_token,
+                "summary": "fixture failure",
+                "failure": "deterministic failure",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.structured["work"]["state"], "failed");
+    let retried = client
+        .call_tool(
+            "ptah_retry_work",
+            json!({
+                "request_id": "work-retry-reopen-305",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": retry_id,
+                "reason": "operator approved a bounded retry",
+                "expected_revision": failed.structured["work"]["revision"],
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.structured["work"]["state"], "queued");
 
     let archived_work = client
         .call_tool(

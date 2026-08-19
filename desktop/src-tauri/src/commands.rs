@@ -217,6 +217,196 @@ pub async fn work_get(
 }
 
 #[tauri::command]
+pub async fn work_create(
+    state: State<'_, AppState>,
+    session_id: String,
+    kind: String,
+    objective: String,
+    priority: i32,
+    requires_approval: bool,
+) -> Result<grokptah_agent_bridge::WorkItem, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.create_work_item(session_id, kind, objective, priority, requires_approval)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn work_assign(
+    state: State<'_, AppState>,
+    session_id: String,
+    work_id: String,
+    assigned_agent_id: Option<String>,
+    expected_revision: Option<u64>,
+) -> Result<grokptah_agent_bridge::WorkItem, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.assign_work_item(session_id, &work_id, assigned_agent_id, expected_revision)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn work_retry(
+    state: State<'_, AppState>,
+    session_id: String,
+    work_id: String,
+    reason: String,
+    expected_revision: Option<u64>,
+) -> Result<grokptah_agent_bridge::WorkItem, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.retry_work_item(session_id, &work_id, &reason, expected_revision)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn work_approve(
+    state: State<'_, AppState>,
+    session_id: String,
+    work_id: String,
+    note: Option<String>,
+    expected_revision: Option<u64>,
+) -> Result<grokptah_agent_bridge::WorkItem, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.approve_work_item(session_id, &work_id, note, expected_revision)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn work_cancel(
+    state: State<'_, AppState>,
+    session_id: String,
+    work_id: String,
+    reason: String,
+    expected_revision: Option<u64>,
+) -> Result<grokptah_agent_bridge::WorkItem, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.cancel_work_item(session_id, &work_id, &reason, expected_revision)
+            .map_err(map_err)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn remote_service_work_create(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    kind: String,
+    objective: String,
+    priority: i32,
+    requires_approval: bool,
+) -> Result<grokptah_agent_bridge::WorkItem, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .create_work(
+            session_id,
+            workspace,
+            kind,
+            objective,
+            priority,
+            requires_approval,
+        )
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_work_assign(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    work_id: String,
+    assigned_agent_id: Option<String>,
+    expected_revision: Option<u64>,
+) -> Result<grokptah_agent_bridge::WorkItem, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .assign_work(
+            session_id,
+            workspace,
+            work_id,
+            assigned_agent_id,
+            expected_revision,
+        )
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_work_retry(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    work_id: String,
+    reason: String,
+    expected_revision: Option<u64>,
+) -> Result<grokptah_agent_bridge::WorkItem, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .retry_work(session_id, workspace, work_id, reason, expected_revision)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_work_approve(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    work_id: String,
+    note: Option<String>,
+    expected_revision: Option<u64>,
+) -> Result<grokptah_agent_bridge::WorkItem, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .approve_work(session_id, workspace, work_id, note, expected_revision)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
+pub async fn remote_service_work_cancel(
+    state: State<'_, AppState>,
+    session_id: String,
+    workspace: String,
+    work_id: String,
+    reason: String,
+    expected_revision: Option<u64>,
+) -> Result<grokptah_agent_bridge::WorkItem, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    state
+        .remote_service
+        .cancel_work(session_id, workspace, work_id, reason, expected_revision)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| "remote service is not connected".to_string())
+}
+
+#[tauri::command]
 pub async fn remote_service_run_get(
     state: State<'_, AppState>,
     session_id: String,

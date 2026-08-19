@@ -287,6 +287,12 @@ export interface DurableWorkResult {
   completedAt: string;
 }
 
+export interface DurableWorkApproval {
+  reviewerId: string;
+  note?: string | null;
+  approvedAt: string;
+}
+
 export interface DurableWorkItem {
   schemaVersion: number;
   workId: string;
@@ -306,6 +312,7 @@ export interface DurableWorkItem {
   attemptCount: number;
   progress?: DurableWorkProgress | null;
   result?: DurableWorkResult | null;
+  approval?: DurableWorkApproval | null;
   createdAt: string;
   updatedAt: string;
 }

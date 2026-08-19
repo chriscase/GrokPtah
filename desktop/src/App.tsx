@@ -973,6 +973,34 @@ export default function App() {
     }
   }, [activeLane, activeSessionId, executionTarget, remoteServiceStatus.connected, selectedRemoteLane]);
 
+  const mutateWork = useCallback(
+    async (action: (sessionId: string, workspace: string, remote: boolean) => Promise<void>) => {
+      const lane =
+        executionTarget === "remote" && selectedRemoteLane
+          ? selectedRemoteLane
+          : activeLane;
+      const sessionId = lane?.session_id ?? activeSessionId;
+      const remote = executionTarget === "remote";
+      if (!sessionId || !lane?.cwd) throw new Error("Select a Build Lane with a workspace first");
+      if (remote && !remoteServiceStatus.connected) {
+        throw new Error("The remote service is disconnected");
+      }
+      await action(sessionId, lane.cwd, remote);
+      await refreshWork();
+      if (selectedWorkId) await refreshWorkItem(selectedWorkId);
+    },
+    [
+      activeLane,
+      activeSessionId,
+      executionTarget,
+      refreshWork,
+      refreshWorkItem,
+      remoteServiceStatus.connected,
+      selectedRemoteLane,
+      selectedWorkId,
+    ],
+  );
+
   useEffect(() => {
     if (rightTab !== "work" || !selectedWorkId) {
       if (!selectedWorkId) setWorkSnapshot(null);
@@ -4230,6 +4258,12 @@ export default function App() {
             scope={workScope}
             busy={workBusy}
             error={workError}
+            mutationsEnabled={Boolean(
+              !activeLaneArchived &&
+                workScope.laneId &&
+                workScope.workspacePath &&
+                (executionTarget !== "remote" || remoteServiceStatus.connected),
+            )}
             sourceLabel={
               executionTarget === "remote"
                 ? `${runtimeTargetLabel(workScope.runtimeTarget ?? undefined)} · ${runtimeConnectionLabel(workScope.runtimeConnection ?? undefined)}`
@@ -4240,6 +4274,36 @@ export default function App() {
               setSelectedWorkId(workId);
               void refreshWorkItem(workId);
             }}
+            onCreate={(kind, objective, priority, requiresApproval) =>
+              mutateWork((sessionId, workspace, remote) =>
+                remote
+                  ? api.remoteServiceWorkCreate(sessionId, workspace, kind, objective, priority, requiresApproval).then(() => undefined)
+                  : api.workCreate(sessionId, kind, objective, priority, requiresApproval).then(() => undefined),
+              )}
+            onAssign={(workId, assignedAgentId, expectedRevision) =>
+              mutateWork((sessionId, workspace, remote) =>
+                remote
+                  ? api.remoteServiceWorkAssign(sessionId, workspace, workId, assignedAgentId, expectedRevision).then(() => undefined)
+                  : api.workAssign(sessionId, workId, assignedAgentId, expectedRevision).then(() => undefined),
+              )}
+            onRetry={(workId, reason, expectedRevision) =>
+              mutateWork((sessionId, workspace, remote) =>
+                remote
+                  ? api.remoteServiceWorkRetry(sessionId, workspace, workId, reason, expectedRevision).then(() => undefined)
+                  : api.workRetry(sessionId, workId, reason, expectedRevision).then(() => undefined),
+              )}
+            onApprove={(workId, note, expectedRevision) =>
+              mutateWork((sessionId, workspace, remote) =>
+                remote
+                  ? api.remoteServiceWorkApprove(sessionId, workspace, workId, note, expectedRevision).then(() => undefined)
+                  : api.workApprove(sessionId, workId, note, expectedRevision).then(() => undefined),
+              )}
+            onCancel={(workId, reason, expectedRevision) =>
+              mutateWork((sessionId, workspace, remote) =>
+                remote
+                  ? api.remoteServiceWorkCancel(sessionId, workspace, workId, reason, expectedRevision).then(() => undefined)
+                  : api.workCancel(sessionId, workId, reason, expectedRevision).then(() => undefined),
+              )}
             onOpenLane={(sessionId) => {
               if (remoteLanes.some((lane) => lane.id === sessionId)) {
                 setRemoteTargetSessionId(sessionId);

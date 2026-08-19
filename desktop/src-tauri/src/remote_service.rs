@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
     AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RunExecutionMode, RunRecord,
     RunScope, RunState, RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView,
@@ -328,6 +329,138 @@ impl RemoteServiceState {
         Ok(Some(client.get_work(session_id, workspace, work_id).await?))
     }
 
+    pub async fn create_work(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        kind: String,
+        objective: String,
+        priority: i32,
+        requires_approval: bool,
+    ) -> Result<Option<WorkItem>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .create_work(
+                    session_id,
+                    workspace,
+                    kind,
+                    objective,
+                    priority,
+                    requires_approval,
+                    Uuid::new_v4().to_string(),
+                )
+                .await?,
+        ))
+    }
+
+    pub async fn assign_work(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        work_id: String,
+        assigned_agent_id: Option<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<Option<WorkItem>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .assign_work(
+                    session_id,
+                    workspace,
+                    work_id,
+                    assigned_agent_id,
+                    expected_revision,
+                    Uuid::new_v4().to_string(),
+                )
+                .await?,
+        ))
+    }
+
+    pub async fn retry_work(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        work_id: String,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<Option<WorkItem>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .retry_work(
+                    session_id,
+                    workspace,
+                    work_id,
+                    reason,
+                    expected_revision,
+                    Uuid::new_v4().to_string(),
+                )
+                .await?,
+        ))
+    }
+
+    pub async fn approve_work(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        work_id: String,
+        note: Option<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<Option<WorkItem>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .approve_work(
+                    session_id,
+                    workspace,
+                    work_id,
+                    note,
+                    expected_revision,
+                    Uuid::new_v4().to_string(),
+                )
+                .await?,
+        ))
+    }
+
+    pub async fn cancel_work(
+        &self,
+        session_id: Uuid,
+        workspace: String,
+        work_id: String,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<Option<WorkItem>> {
+        let mut client = self.client.lock().await;
+        let Some(client) = client.as_mut() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            client
+                .cancel_work(
+                    session_id,
+                    workspace,
+                    work_id,
+                    reason,
+                    expected_revision,
+                    Uuid::new_v4().to_string(),
+                )
+                .await?,
+        ))
+    }
+
     pub async fn get_run(
         &self,
         session_id: Uuid,
@@ -471,8 +604,13 @@ impl RemoteServiceClient {
             "ptah_resume_persistent_agent",
             "ptah_list_runs",
             "ptah_get_run",
+            "ptah_create_work",
+            "ptah_assign_work",
             "ptah_list_work",
             "ptah_get_work",
+            "ptah_retry_work",
+            "ptah_approve_work",
+            "ptah_cancel_work",
             "ptah_get_events",
             "ptah_steer",
             "ptah_cancel",
@@ -724,6 +862,165 @@ impl RemoteServiceClient {
             )
             .await?;
         serde_json::from_value(value).context("decode remote durable work item")
+    }
+
+    async fn create_work(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        kind: String,
+        objective: String,
+        priority: i32,
+        requires_approval: bool,
+        request_id: String,
+    ) -> Result<WorkItem> {
+        let mut policy = WorkPolicy::default();
+        policy.requires_approval = requires_approval;
+        let value = self
+            .call_tool(
+                "ptah_create_work",
+                json!({
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "kind": kind,
+                    "objective": objective,
+                    "priority": priority,
+                    "policy": policy,
+                }),
+            )
+            .await?;
+        serde_json::from_value(
+            value
+                .get("work")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote create work omitted work"))?,
+        )
+        .context("decode remote work creation")
+    }
+
+    async fn assign_work(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        work_id: String,
+        assigned_agent_id: Option<String>,
+        expected_revision: Option<u64>,
+        request_id: String,
+    ) -> Result<WorkItem> {
+        let value = self
+            .call_tool(
+                "ptah_assign_work",
+                json!({
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "work_id": work_id,
+                    "assigned_agent_id": assigned_agent_id,
+                    "expected_revision": expected_revision,
+                }),
+            )
+            .await?;
+        serde_json::from_value(
+            value
+                .get("work")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote assignment omitted work"))?,
+        )
+        .context("decode remote work assignment")
+    }
+
+    async fn retry_work(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        work_id: String,
+        reason: String,
+        expected_revision: Option<u64>,
+        request_id: String,
+    ) -> Result<WorkItem> {
+        let value = self
+            .call_tool(
+                "ptah_retry_work",
+                json!({
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "work_id": work_id,
+                    "reason": reason,
+                    "expected_revision": expected_revision,
+                }),
+            )
+            .await?;
+        serde_json::from_value(
+            value
+                .get("work")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote retry omitted work"))?,
+        )
+        .context("decode remote work retry")
+    }
+
+    async fn approve_work(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        work_id: String,
+        note: Option<String>,
+        expected_revision: Option<u64>,
+        request_id: String,
+    ) -> Result<WorkItem> {
+        let value = self
+            .call_tool(
+                "ptah_approve_work",
+                json!({
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "work_id": work_id,
+                    "note": note,
+                    "expected_revision": expected_revision,
+                }),
+            )
+            .await?;
+        serde_json::from_value(
+            value
+                .get("work")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote approval omitted work"))?,
+        )
+        .context("decode remote work approval")
+    }
+
+    async fn cancel_work(
+        &mut self,
+        session_id: Uuid,
+        workspace: String,
+        work_id: String,
+        reason: String,
+        expected_revision: Option<u64>,
+        request_id: String,
+    ) -> Result<WorkItem> {
+        let value = self
+            .call_tool(
+                "ptah_cancel_work",
+                json!({
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "work_id": work_id,
+                    "reason": reason,
+                    "expected_revision": expected_revision,
+                }),
+            )
+            .await?;
+        serde_json::from_value(
+            value
+                .get("work")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("remote cancellation omitted work"))?,
+        )
+        .context("decode remote work cancellation")
     }
 
     async fn get_run(

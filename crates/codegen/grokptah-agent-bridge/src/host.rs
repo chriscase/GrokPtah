@@ -48,7 +48,7 @@ use crate::orchestration::{
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
     ContinuationTestInput, OrchStore, PromotionState, RunAggregates, RunBounds, RunExecution,
     RunExecutionMode, RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem,
-    WorkItemSnapshot, DEFAULT_AGENT_TOOL_IDS,
+    WorkItemSnapshot, WorkPolicy, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
 use crate::prompt_queue::{
@@ -1540,6 +1540,122 @@ impl AgentHostHandle {
             .map(WorkAttemptView::from)
             .collect();
         Ok(Some(WorkItemSnapshot { work, attempts }))
+    }
+
+    fn local_work_mutation_scope(&self, session_id: Uuid) -> Result<(String, OrchStore)> {
+        self.ensure_session_accepts_new_work(session_id)?;
+        let session = self.session_inspect(session_id)?;
+        if session.kind != SessionKind::Build {
+            bail!("only Build Lanes can own durable Work Items");
+        }
+        if session.cwd.trim().is_empty() {
+            bail!("Build Lane has no workspace");
+        }
+        Ok((session.cwd, self.ensure_orchestration_store()?))
+    }
+
+    pub fn create_work_item(
+        &self,
+        session_id: Uuid,
+        kind: String,
+        objective: String,
+        priority: i32,
+        requires_approval: bool,
+    ) -> Result<WorkItem> {
+        let (workspace, store) = self.local_work_mutation_scope(session_id)?;
+        let policy = WorkPolicy {
+            requires_approval,
+            ..WorkPolicy::default()
+        };
+        let mut item = WorkItem::new(kind, objective, session_id, workspace, "desktop", policy)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        item.priority = priority;
+        store
+            .save_work_item(&item)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(item)
+    }
+
+    pub fn assign_work_item(
+        &self,
+        session_id: Uuid,
+        work_id: &str,
+        assigned_agent_id: Option<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<WorkItem> {
+        let (_, store) = self.local_work_mutation_scope(session_id)?;
+        let item = store
+            .load_work_item(work_id)
+            .map_err(|error| anyhow!(error.to_string()))?
+            .ok_or_else(|| anyhow!("work item not found"))?;
+        if item.session_id != session_id {
+            bail!("work item is outside the selected Lane");
+        }
+        store
+            .assign_work(work_id, assigned_agent_id, expected_revision)
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
+    pub fn retry_work_item(
+        &self,
+        session_id: Uuid,
+        work_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<WorkItem> {
+        let (_, store) = self.local_work_mutation_scope(session_id)?;
+        let item = store
+            .load_work_item(work_id)
+            .map_err(|error| anyhow!(error.to_string()))?
+            .ok_or_else(|| anyhow!("work item not found"))?;
+        if item.session_id != session_id {
+            bail!("work item is outside the selected Lane");
+        }
+        store
+            .retry_work(work_id, reason, expected_revision)
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
+    pub fn approve_work_item(
+        &self,
+        session_id: Uuid,
+        work_id: &str,
+        note: Option<String>,
+        expected_revision: Option<u64>,
+    ) -> Result<WorkItem> {
+        let (_, store) = self.local_work_mutation_scope(session_id)?;
+        let item = store
+            .load_work_item(work_id)
+            .map_err(|error| anyhow!(error.to_string()))?
+            .ok_or_else(|| anyhow!("work item not found"))?;
+        if item.session_id != session_id {
+            bail!("work item is outside the selected Lane");
+        }
+        store
+            .approve_work(work_id, "desktop", note, expected_revision)
+            .map(|(item, _)| item)
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
+    pub fn cancel_work_item(
+        &self,
+        session_id: Uuid,
+        work_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<WorkItem> {
+        let (_, store) = self.local_work_mutation_scope(session_id)?;
+        let item = store
+            .load_work_item(work_id)
+            .map_err(|error| anyhow!(error.to_string()))?
+            .ok_or_else(|| anyhow!("work item not found"))?;
+        if item.session_id != session_id {
+            bail!("work item is outside the selected Lane");
+        }
+        store
+            .cancel_work_checked(work_id, reason, expected_revision)
+            .map(|(item, _)| item)
+            .map_err(|error| anyhow!(error.to_string()))
     }
 
     /// Validate a manual continuation against the durable agent, session, and
