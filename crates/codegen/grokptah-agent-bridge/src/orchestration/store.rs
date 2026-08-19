@@ -57,6 +57,10 @@ struct AgentActivationIntent {
 struct RoutineDedupeRecord {
     dedupe_key: String,
     activation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    disposition: Option<ActivationDisposition>,
     created_at: chrono::DateTime<Utc>,
 }
 
@@ -732,9 +736,6 @@ impl OrchStore {
             ..RoutineFireReport::default()
         };
         for routine in routines {
-            if !routine.lifecycle.allows_scheduled_fire() || routine.circuit_open {
-                continue;
-            }
             let due = match due_occurrences(&routine, now) {
                 Ok(due) => due,
                 Err(_) => {
@@ -776,11 +777,13 @@ impl OrchStore {
                 }
             }
             if let Ok(Some(mut current)) = self.load_routine_unlocked(&routine.routine_id) {
-                current.next_fire_at =
-                    advance_next_fire(&current.trigger, now, &due).unwrap_or(None);
-                current.last_fire_at = Some(now);
-                current.updated_at = now;
-                let _ = self.save_routine_unlocked(&current);
+                if current.lifecycle.allows_scheduled_fire() && !current.circuit_open {
+                    current.next_fire_at =
+                        advance_next_fire(&current.trigger, now, &due).unwrap_or(None);
+                    current.last_fire_at = Some(now);
+                    current.updated_at = now;
+                    let _ = self.save_routine_unlocked(&current);
+                }
             }
         }
         Ok(report)
@@ -919,7 +922,7 @@ impl OrchStore {
         &self,
         routine_id: &str,
         dedupe_key: &str,
-    ) -> Result<Option<String>, OrchError> {
+    ) -> Result<Option<RoutineDedupeRecord>, OrchError> {
         let path = self.routine_dedupe_path(routine_id, dedupe_key)?;
         if !path.is_file() {
             return Ok(None);
@@ -929,7 +932,56 @@ impl OrchStore {
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
         )
         .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        Ok(Some(record.activation_id))
+        Ok(Some(record))
+    }
+
+    fn replay_dedupe_unlocked(
+        &self,
+        routine: &RoutineRecord,
+        request: &ActivationRequest,
+        record: &RoutineDedupeRecord,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<ActivationRecord, OrchError> {
+        if let Some(existing) =
+            self.load_activation_unlocked(&routine.routine_id, &record.activation_id)?
+        {
+            return Ok(existing);
+        }
+        // History may have been pruned; the dedupe receipt still forbids a
+        // second Work item for this occurrence.
+        Ok(ActivationRecord {
+            schema_version: ROUTINE_SCHEMA_VERSION,
+            activation_id: record.activation_id.clone(),
+            routine_id: routine.routine_id.clone(),
+            routine_revision: routine.revision,
+            trigger_kind: request.cause.as_str().to_string(),
+            dedupe_key: request.dedupe_key.clone(),
+            scheduled_at: request.scheduled_at,
+            received_at: request.received_at,
+            fired_at: now,
+            work_id: record.work_id.clone(),
+            disposition: ActivationDisposition::Deduplicated,
+            error: None,
+            captured_policy: CapturedActivationPolicy::capture(
+                routine.revision,
+                Some(&routine.agent_id),
+                None,
+                &routine.work_template,
+                &RunBounds::default(),
+            )
+            .unwrap_or_else(|_| CapturedActivationPolicy {
+                routine_revision: routine.revision,
+                agent_id: Some(routine.agent_id.clone()),
+                agent_spec_revision: None,
+                run_bounds: routine.work_template.policy.bounds.clone(),
+                work_policy: routine.work_template.policy.clone(),
+                sandbox_profile: "workspace-write".into(),
+                computer_use_allowed: false,
+                auto_approve_tools: false,
+            }),
+            payload: None,
+            created_by: request.created_by.clone(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -943,10 +995,8 @@ impl OrchStore {
         let mut routine = self
             .load_routine_unlocked(routine_id)?
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown routine_id"))?;
-        if let Some(existing_id) = self.load_dedupe_unlocked(routine_id, &request.dedupe_key)? {
-            if let Some(existing) = self.load_activation_unlocked(routine_id, &existing_id)? {
-                return Ok(existing);
-            }
+        if let Some(existing) = self.load_dedupe_unlocked(routine_id, &request.dedupe_key)? {
+            return self.replay_dedupe_unlocked(&routine, &request, &existing, now);
         }
         let payload = validate_activation_payload(request.payload.as_ref())?;
         if matches!(
@@ -1104,6 +1154,8 @@ impl OrchStore {
             dedupe: Some(RoutineDedupeRecord {
                 dedupe_key: request.dedupe_key.clone(),
                 activation_id: activation_id.clone(),
+                work_id: Some(work.work_id.clone()),
+                disposition: Some(ActivationDisposition::CreatedWork),
                 created_at: now,
             }),
         };
@@ -1167,6 +1219,8 @@ impl OrchStore {
             dedupe: Some(RoutineDedupeRecord {
                 dedupe_key: request.dedupe_key.clone(),
                 activation_id: activation.activation_id.clone(),
+                work_id: None,
+                disposition: Some(disposition),
                 created_at: now,
             }),
         };
@@ -1254,6 +1308,8 @@ impl OrchStore {
             let path = self.routine_activation_path(routine_id, &activation.activation_id)?;
             let _ = remove_file_durable(&path);
         }
+        // Dedupe receipts outlive activation history so a late replay cannot
+        // mint a second Work item after the inspectable history window.
         Ok(())
     }
 

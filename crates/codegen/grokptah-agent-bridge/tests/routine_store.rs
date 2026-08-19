@@ -361,6 +361,19 @@ fn pause_disable_and_backoff_are_deterministic() {
     assert_eq!(paused.lifecycle, RoutineLifecycle::Paused);
     let scheduled = store.fire_due_routines_at(now).unwrap();
     assert_eq!(scheduled.created_work, 0);
+    assert!(scheduled.skipped >= 1);
+    let paused_history = store.list_activations(&routine.routine_id, 10).unwrap();
+    assert!(paused_history
+        .iter()
+        .any(|activation| activation.disposition == ActivationDisposition::SkippedPaused));
+    assert_eq!(
+        store
+            .load_routine(&routine.routine_id)
+            .unwrap()
+            .unwrap()
+            .next_fire_at,
+        Some(now)
+    );
     let manual = store
         .activate_routine(
             &routine.routine_id,
@@ -505,6 +518,67 @@ fn malformed_oversized_unauthorized_expired_input_creates_no_work() {
         ActivationDisposition::Backoff | ActivationDisposition::CircuitOpen
     ));
     assert!(failed.work_id.is_none());
+}
+
+#[test]
+fn dedupe_survives_activation_history_pruning() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session_id = Uuid::new_v4();
+    let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    save_agent(&store, session_id, "/tmp/project");
+    let routine = RoutineRecord::new(
+        "retain",
+        "agent-1",
+        session_id,
+        "/tmp/project",
+        RoutineTrigger::Manual,
+        template(),
+        MissedRunPolicy::Skip,
+        RoutineConcurrencyPolicy::default(),
+        RoutineRetryPolicy::default(),
+        "test",
+        now,
+    )
+    .unwrap();
+    store.save_routine(&routine).unwrap();
+    let first = store
+        .activate_routine(
+            &routine.routine_id,
+            manual_request(&routine.routine_id, now, "keep-me"),
+            &Default::default(),
+            now,
+        )
+        .unwrap();
+    assert_eq!(first.disposition, ActivationDisposition::CreatedWork);
+    for index in 0..128 {
+        let tick = now + Duration::seconds(index as i64 + 1);
+        let skipped = store
+            .activate_routine(
+                &routine.routine_id,
+                manual_request(&routine.routine_id, tick, &format!("overflow-{index}")),
+                &Default::default(),
+                tick,
+            )
+            .unwrap();
+        assert_eq!(skipped.disposition, ActivationDisposition::SkippedOverlap);
+    }
+    let history = store.list_activations(&routine.routine_id, 200).unwrap();
+    assert_eq!(history.len(), 128);
+    assert!(history
+        .iter()
+        .all(|activation| activation.activation_id != first.activation_id));
+    let replay = store
+        .activate_routine(
+            &routine.routine_id,
+            manual_request(&routine.routine_id, now, "keep-me"),
+            &Default::default(),
+            now,
+        )
+        .unwrap();
+    assert_eq!(replay.disposition, ActivationDisposition::Deduplicated);
+    assert_eq!(replay.work_id, first.work_id);
+    assert_eq!(store.list_work_items().unwrap().len(), 1);
 }
 
 #[test]

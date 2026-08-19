@@ -67,8 +67,12 @@ Delivery is **at-least-once with durable deduplication**.
 - Manual key: `manual:<routineId>:<requestId>`
 - The same key returns the original `ActivationRecord` and does not create a
   second Work item
+- Dedupe receipts outlive pruned activation history. A late replay after the
+  inspectable window still returns `deduplicated` and creates no Work
 - MCP `request_id` replay is a second, independent idempotency ledger for the
   control-plane call itself
+- A paused or disabled routine still writes an inspectable skip record for
+  each due occurrence. Pause does not advance `nextFireAt`; disable clears it
 
 Crash recovery uses `routine-intents/`. Opening the store commits any leftover
 intent (Work + activation + dedupe) before applying other recovery.
