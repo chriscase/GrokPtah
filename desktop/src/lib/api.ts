@@ -301,6 +301,11 @@ export const api = {
     invoke<PersistentAgent[]>("persistent_agent_list"),
   persistentAgentGet: (agentId: string) =>
     invoke<PersistentAgent | null>("persistent_agent_get", { agentId }),
+  persistentAgentSetManagedExecution: (agentId: string, enabled: boolean) =>
+    invoke<PersistentAgent | null>("persistent_agent_set_managed_execution", {
+      agentId,
+      enabled,
+    }),
   persistentAgentAttachSession: (sessionId: string, agentId: string) =>
     invoke<PersistentAgent>("persistent_agent_attach_session", {
       sessionId,

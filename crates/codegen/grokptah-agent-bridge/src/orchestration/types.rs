@@ -729,6 +729,9 @@ pub struct AgentSpec {
     pub default_run_bounds: RunBounds,
     pub authority: AgentAuthorityPolicy,
     pub memory: AgentMemoryPolicy,
+    /// Opt-in native execution. Missing on legacy records and treated as off.
+    #[serde(default)]
+    pub managed_execution: crate::orchestration::managed::ManagedExecutionPolicy,
     pub created_at: DateTime<Utc>,
     pub created_by: String,
 }
@@ -826,6 +829,7 @@ impl AgentSpec {
             default_run_bounds,
             authority,
             memory: AgentMemoryPolicy::default(),
+            managed_execution: crate::orchestration::managed::ManagedExecutionPolicy::default(),
             created_at,
             created_by: created_by.into(),
         };
@@ -862,6 +866,7 @@ impl AgentSpec {
         self.default_run_bounds.validate()?;
         self.authority.validate()?;
         self.memory.validate()?;
+        self.managed_execution.validate()?;
         validate_bounded_string(&self.created_by, MAX_AGENT_POLICY_ENTRY_BYTES, "created_by")?;
         Ok(())
     }
@@ -1460,6 +1465,11 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_ack_message",
     "ptah_list_inbox",
     "ptah_list_outbox",
+    "ptah_set_managed_execution",
+    "ptah_get_managed_execution",
+    "ptah_authorize_work_execution",
+    "ptah_resolve_work_input",
+    "ptah_list_execution_intents",
     "ptah_retry_run",
     "ptah_approve_run",
     "ptah_promote_run",

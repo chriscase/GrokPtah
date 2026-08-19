@@ -1503,6 +1503,39 @@ impl AgentHostHandle {
         self.ensure_orchestration_store()?.load_agent(agent_id)
     }
 
+    /// Attributable enable/disable for native Work execution. Defaults remain off.
+    pub fn set_managed_execution(
+        &self,
+        agent_id: &str,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<Option<AgentRecord>> {
+        let store = self.ensure_orchestration_store()?;
+        store
+            .revise_agent_spec(agent_id, actor, |spec| {
+                spec.managed_execution.enabled = enabled;
+                if enabled {
+                    spec.managed_execution.bounds.max_total_tokens = spec
+                        .managed_execution
+                        .bounds
+                        .max_total_tokens
+                        .or(spec.default_run_bounds.max_total_tokens)
+                        .or(Some(
+                            crate::orchestration::DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
+                        ));
+                    if spec.authority.computer_use_allowed {
+                        anyhow::bail!("managed execution cannot grant Computer Use");
+                    }
+                    spec.authority.bypass_permissions = false;
+                }
+                spec.managed_execution
+                    .validate()
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                Ok(())
+            })
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
     /// Read durable Work Items owned by one local Build Lane. Work Items are
     /// filtered by their persisted Lane id rather than focused UI state so
     /// archived and background work remains correctly attributable.

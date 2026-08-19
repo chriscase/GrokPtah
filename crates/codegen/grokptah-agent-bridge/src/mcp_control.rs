@@ -569,6 +569,7 @@ fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
         "runPersistenceError",
         "workloadSupervisorError",
         "routineSupervisorError",
+        "nativeExecutorError",
         "serviceError",
     ]
     .iter()
@@ -1329,6 +1330,44 @@ struct InboxArgs {
     agent_id: String,
     #[serde(default)]
     after_seq: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetManagedExecutionArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    agent_id: String,
+    policy: crate::orchestration::ManagedExecutionPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetManagedExecutionArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizeWorkExecutionArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    reason: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveWorkInputArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    permission_id: Uuid,
+    allow: bool,
 }
 
 fn empty_object() -> Value {
@@ -2170,6 +2209,60 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "message_id": run_id
+            }
+        }),
+        "ptah_set_managed_execution" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "agent_id", "policy"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "policy": {"type": "object"}
+            }
+        }),
+        "ptah_get_managed_execution" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "agent_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "agent_id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+        }),
+        "ptah_authorize_work_execution" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "work_id", "reason"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "reason": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
+        "ptah_resolve_work_input" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "permission_id", "allow"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "permission_id": session,
+                "allow": {"type": "boolean"}
+            }
+        }),
+        "ptah_list_execution_intents" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
             }
         }),
         "ptah_list_inbox" | "ptah_list_outbox" => json!({
@@ -3059,6 +3152,50 @@ async fn dispatch_tool(
                 &args.agent_id,
                 args.after_seq,
             )
+        }
+        "ptah_set_managed_execution" => {
+            let args: SetManagedExecutionArgs = parse_value(args)?;
+            require_nonempty(&args.agent_id, "agent_id")?;
+            orch.set_managed_execution(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.agent_id,
+                args.policy,
+            )
+        }
+        "ptah_get_managed_execution" => {
+            let args: GetManagedExecutionArgs = parse_value(args)?;
+            require_nonempty(&args.agent_id, "agent_id")?;
+            orch.get_managed_execution(auth, args.session_id, &args.workspace, &args.agent_id)
+        }
+        "ptah_authorize_work_execution" => {
+            let args: AuthorizeWorkExecutionArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            orch.authorize_work_execution(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                args.reason,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_resolve_work_input" => {
+            let args: ResolveWorkInputArgs = parse_value(args)?;
+            orch.resolve_work_input(
+                auth,
+                args.session_id,
+                &args.workspace,
+                args.permission_id,
+                args.allow,
+            )
+        }
+        "ptah_list_execution_intents" => {
+            let args: SessionWorkspaceArgs = parse_value(args)?;
+            orch.list_execution_intents_scoped(auth, args.session_id, &args.workspace)
         }
         "ptah_fire_routine" => {
             let args: FireRoutineArgs = parse_value(args)?;

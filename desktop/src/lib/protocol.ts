@@ -123,6 +123,14 @@ export interface PersistentAgentSpec {
   };
   createdAt: string;
   createdBy: string;
+  managedExecution?: {
+    enabled: boolean;
+    allowedWorkKinds?: string[];
+    allowedSourceRoutineIds?: string[];
+    maxConcurrentRuns?: number;
+    retryEligible?: boolean;
+    requiresApprovalBeforeExecution?: boolean;
+  };
 }
 
 export interface PersistentAgentLaneAssociation {
