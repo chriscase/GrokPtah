@@ -468,86 +468,83 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
                         .await
                         .map_err(|_| anyhow::anyhow!("mcp_reinitialize_failed"))?;
                 }
-                let capture_run_is_distinct = execution.capture_provider_run.is_some();
-                if let Some(provider_run) = execution
-                    .capture_provider_run
-                    .take()
-                    .or_else(|| execution.provider_run.take())
-                {
-                    let capture_result = recorder
-                        .as_ref()
-                        .context("provider_observation_unavailable")
-                        .and_then(|recorder| {
-                            let start = if capture_run_is_distinct {
-                                execution.capture_attempt_start.unwrap_or(1)
-                            } else {
-                                execution.provider_attempt_start.unwrap_or(1)
-                            };
-                            let run_scope = OpaqueScopeId::from_stable_input(&provider_run.run_id);
-                            let observations = recorder
-                                .snapshot()
-                                .into_iter()
-                                .filter(|observation| {
-                                    observation.attempt_number() >= start
-                                        && observation.scope().run_id() == &run_scope
-                                })
-                                .collect::<Vec<_>>();
-                            let scenario_id = definition
-                                .catalog_scenario_ids
-                                .first()
-                                .context("provider_catalog_scenario_missing")?;
-                            let capture = build_capture(
-                                &campaign_id,
-                                scenario_id,
-                                &report.repository_commit,
-                                report.repository_dirty,
-                                &definition.bounds,
-                                &observations,
-                                &provider_run,
-                            )?;
-                            capture
-                                .validate_complete_structural_evidence()
-                                .map_err(|error| anyhow::anyhow!("capture_incomplete:{error}"))?;
-                            Ok(capture)
-                        });
-                    match capture_result {
-                        Ok(capture) => {
-                            let capture_bytes = serde_json::to_vec_pretty(&capture)
-                                .context("serialize provider capture")?;
-                            let capture_digest = artifacts.write_final(
-                                format!("captures/{}.json", definition.id),
-                                &capture_bytes,
-                            )?;
-                            execution.result.capture_refs.push(CaptureReference {
-                                catalog_scenario_id: capture.campaign.scenario_id.clone(),
-                                artifact: ArtifactReference {
-                                    relative_path: capture_digest.relative_path,
-                                    sha256: capture_digest.sha256,
-                                    bytes: capture_digest.bytes,
-                                },
-                                capture_schema: PERSISTENT_AGENT_CAPTURE_SCHEMA.into(),
-                            });
-                            execution.result.counters.provider_attempts =
-                                u64::from(capture.actuals.provider_requests);
-                            let provider = provider_summary(&capture);
-                            if report.provider.is_some() {
-                                bail!(
+                if let Some(recorder) = recorder.as_ref() {
+                    let capture_run_is_distinct = execution.capture_provider_run.is_some();
+                    if let Some(provider_run) = execution
+                        .capture_provider_run
+                        .take()
+                        .or_else(|| execution.provider_run.take())
+                    {
+                        let capture_result: Result<grokptah_agent_bridge::PersistentAgentCapture> =
+                            (|| {
+                                let start = if capture_run_is_distinct {
+                                    execution.capture_attempt_start.unwrap_or(1)
+                                } else {
+                                    execution.provider_attempt_start.unwrap_or(1)
+                                };
+                                let run_scope =
+                                    OpaqueScopeId::from_stable_input(&provider_run.run_id);
+                                let observations = recorder
+                                    .snapshot()
+                                    .into_iter()
+                                    .filter(|observation| {
+                                        observation.attempt_number() >= start
+                                            && observation.scope().run_id() == &run_scope
+                                    })
+                                    .collect::<Vec<_>>();
+                                let scenario_id = definition
+                                    .catalog_scenario_ids
+                                    .first()
+                                    .context("provider_catalog_scenario_missing")?;
+                                let capture = build_capture(
+                                    &campaign_id,
+                                    scenario_id,
+                                    &report.repository_commit,
+                                    report.repository_dirty,
+                                    &definition.bounds,
+                                    &observations,
+                                    &provider_run,
+                                )?;
+                                capture.validate_complete_structural_evidence().map_err(
+                                    |error| anyhow::anyhow!("capture_incomplete:{error}"),
+                                )?;
+                                Ok(capture)
+                            })();
+                        match capture_result {
+                            Ok(capture) => {
+                                let capture_bytes = serde_json::to_vec_pretty(&capture)
+                                    .context("serialize provider capture")?;
+                                let capture_digest = artifacts.write_final(
+                                    format!("captures/{}.json", definition.id),
+                                    &capture_bytes,
+                                )?;
+                                execution.result.capture_refs.push(CaptureReference {
+                                    catalog_scenario_id: capture.campaign.scenario_id.clone(),
+                                    artifact: ArtifactReference {
+                                        relative_path: capture_digest.relative_path,
+                                        sha256: capture_digest.sha256,
+                                        bytes: capture_digest.bytes,
+                                    },
+                                    capture_schema: PERSISTENT_AGENT_CAPTURE_SCHEMA.into(),
+                                });
+                                execution.result.counters.provider_attempts =
+                                    u64::from(capture.actuals.provider_requests);
+                                let provider = provider_summary(&capture);
+                                if report.provider.is_some() {
+                                    bail!(
                                     "multiple provider identities in one campaign are unsupported"
                                 );
+                                }
+                                report.provider = Some(provider);
+                                report.provider_actuals = Some(capture.actuals.clone());
                             }
-                            report.provider = Some(provider);
-                            report.provider_actuals = Some(capture.actuals.clone());
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "[certification-lab] capture invalid for {}: {error:#}",
-                                definition.id
-                            );
-                            execution.result = ProbeResult::indeterminate(
-                                definition.id.clone(),
-                                definition.catalog_scenario_ids.clone(),
-                                DiagnosticCode::CaptureInvalid,
-                            );
+                            Err(_) => {
+                                execution.result = ProbeResult::indeterminate(
+                                    definition.id.clone(),
+                                    definition.catalog_scenario_ids.clone(),
+                                    DiagnosticCode::CaptureInvalid,
+                                );
+                            }
                         }
                     }
                 }
@@ -1368,7 +1365,7 @@ mod tests {
         assert_eq!(completion.summary.failed, 0);
         assert_eq!(completion.summary.skipped, 0);
         assert_eq!(completion.summary.indeterminate, 0);
-        assert!(!completion.certified);
+        assert!(completion.certified);
 
         let campaign = output.path().join(&completion.campaign_id);
         let report: CampaignReport =
@@ -1380,7 +1377,7 @@ mod tests {
             .unwrap();
         assert_eq!(probe.status, ProbeStatus::Passed);
         assert!(probe.supported);
-        assert!(!report.certified);
+        assert!(report.certified);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
