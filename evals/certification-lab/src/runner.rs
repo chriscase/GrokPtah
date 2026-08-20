@@ -538,7 +538,11 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
                             report.provider = Some(provider);
                             report.provider_actuals = Some(capture.actuals.clone());
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            eprintln!(
+                                "[certification-lab] capture invalid for {}: {error:#}",
+                                definition.id
+                            );
                             execution.result = ProbeResult::indeterminate(
                                 definition.id.clone(),
                                 definition.catalog_scenario_ids.clone(),
