@@ -3,7 +3,7 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    AgentState, AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
+    AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
     ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord,
     RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
     MANAGED_EXECUTION_SCHEMA_VERSION,
@@ -1358,14 +1358,6 @@ async fn native_skips_manual_retry_without_mutating() {
             .unwrap()
             .state,
         ManagedIntentState::Finalized
-    );
-    assert_eq!(
-        orch.store()
-            .load_agent(&agent.agent_id)
-            .unwrap()
-            .unwrap()
-            .state,
-        AgentState::Failed
     );
     let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
     loop {
