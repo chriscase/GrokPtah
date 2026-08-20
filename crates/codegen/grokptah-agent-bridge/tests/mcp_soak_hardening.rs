@@ -71,11 +71,11 @@ async fn ensure_npm(sdk_dir: &std::path::Path) {
         .is_dir()
     {
         let st = tokio::process::Command::new("npm")
-            .args(["install", "--no-fund", "--no-audit"])
+            .args(["ci", "--no-fund", "--no-audit", "--ignore-scripts"])
             .current_dir(sdk_dir)
             .status()
             .await
-            .expect("npm install");
+            .expect("npm ci");
         assert!(st.success());
     }
 }
