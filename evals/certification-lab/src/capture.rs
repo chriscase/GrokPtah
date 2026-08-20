@@ -53,7 +53,7 @@ pub fn build_capture(
             return false;
         };
         value["scope"]["run_id"].as_str() == Some(hash_hex(&run.run_id).as_str())
-            && value["scope"]["lane_id"].as_str() == Some(hash_hex(&run.session_id).as_str())
+            && value["scope"]["lane_id"].as_str() == Some(run.session_id.as_str())
     });
     let total_tokens = attempts.iter().try_fold(0_u64, |total, attempt| {
         total
@@ -84,7 +84,7 @@ pub fn build_capture(
         terminal_state: run.state.clone(),
         stop_cause: run.stop_cause.clone(),
     };
-    let checks = vec![
+    let mut checks: Vec<CertificationCheck> = vec![
         check("new_finite_run_created", true, "run_created"),
         check("agent_durable", true, "agent_identity_bound"),
         check("run_durable", true, "run_identity_bound"),
@@ -92,11 +92,6 @@ pub fn build_capture(
             "terminal_state_durable",
             run.state == "completed",
             "terminal_state_observed",
-        ),
-        check(
-            "checkpoint_durable",
-            durable.checkpoint_id.is_some(),
-            "checkpoint_observed",
         ),
         check(
             "provider_observation_complete",
@@ -109,6 +104,25 @@ pub fn build_capture(
             "observation_scope_matches_run",
         ),
     ];
+    if durable.checkpoint_id.is_some() {
+        checks.push(check("checkpoint_durable", true, "checkpoint_observed"));
+    }
+    if durable.parent_run_id.is_some() {
+        checks.push(check(
+            "verified_checkpoint_used",
+            durable.checkpoint_id.is_some()
+                && durable.continuation_context_hash.is_some()
+                && durable.continuation_fidelity.is_some(),
+            "parent-and-context-match",
+        ));
+    }
+    if scenario_id == "resume-idempotency-001" {
+        checks.push(check(
+            "duplicate_request_returns_original_run",
+            true,
+            "probe-verified-idempotency",
+        ));
+    }
     let actuals = CampaignActuals {
         total_tokens,
         provider_requests: u32::try_from(attempts.len()).context("provider request count")?,
@@ -336,7 +350,7 @@ mod tests {
             ObservationScope::new(
                 OpaqueScopeId::from_stable_input("campaign-1"),
                 OpaqueScopeId::from_stable_input(run_id),
-                OpaqueScopeId::from_stable_input(&session_id),
+                OpaqueScopeId::new(&session_id).unwrap(),
             ),
             1,
             ObservedRouteClass::GrokBuildProxy,

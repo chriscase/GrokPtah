@@ -258,16 +258,21 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
     validate_options(options)?;
     let manifest =
         CampaignManifest::load_checked(&options.manifest_path, &options.repository_root)?;
+    let selected = manifest.select_probes(&options.selected_probe_ids)?;
     if options.runtime_mode == RuntimeMode::Live {
+        let selected_duration_seconds = selected.iter().try_fold(0u64, |total, definition| {
+            total
+                .checked_add(definition.bounds.max_duration_seconds)
+                .context("selected campaign validity window overflow")
+        })?;
         let required_validity = ChronoDuration::seconds(
-            i64::try_from(manifest.campaign_bounds.max_duration_seconds)
-                .context("campaign validity window overflow")?,
+            i64::try_from(selected_duration_seconds)
+                .context("selected campaign validity window overflow")?,
         );
         attest_grok_build_oidc_with_min_validity(&options.model, required_validity)
             .map_err(|error| anyhow::anyhow!("live_oidc_attestation_{}", error.code()))?;
     }
     validate_artifact_budget(options, &manifest)?;
-    let selected = manifest.select_probes(&options.selected_probe_ids)?;
     // Establish sentinel ownership, confinement, and free-space headroom
     // before starting even the deterministic local host. The second open
     // below additionally checks the freshly created disposable workspace.

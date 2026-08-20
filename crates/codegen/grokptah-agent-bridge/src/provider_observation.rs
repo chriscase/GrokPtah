@@ -438,6 +438,27 @@ impl AuthoritativeUsage {
             total_tokens,
         })
     }
+
+    /// Preserve provider-reported accounting categories that are not part of
+    /// the visible input/output pair without ever undercounting the pair.
+    pub fn new_conservative(
+        input_tokens: u64,
+        output_tokens: u64,
+        reported_total_tokens: u64,
+    ) -> Result<Self, ObservationError> {
+        let computed = input_tokens
+            .checked_add(output_tokens)
+            .ok_or(ObservationError::InvalidUsage)?;
+        let total_tokens = reported_total_tokens.max(computed);
+        if total_tokens > MAX_USAGE_TOKENS {
+            return Err(ObservationError::InvalidUsage);
+        }
+        Ok(Self {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1120,6 +1141,12 @@ mod tests {
         assert_eq!(
             AuthoritativeUsage::new(2, 3, 6).unwrap_err(),
             ObservationError::InvalidUsage
+        );
+        assert_eq!(
+            AuthoritativeUsage::new_conservative(2, 3, 7)
+                .unwrap()
+                .total_tokens,
+            7
         );
         assert_eq!(
             AttemptMetrics::new(MAX_OBSERVED_BYTES + 1, 0, 0, None).unwrap_err(),

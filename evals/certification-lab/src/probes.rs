@@ -566,7 +566,7 @@ async fn native_work_to_run(
                         "maxPromptBytes": 4096,
                         "maxRounds": 2,
                         "maxDurationMs": 30000,
-                        "maxTotalTokens": 1000
+                        "maxTotalTokens": 20000
                     },
                     "retryEligible": false,
                     "requiresApprovalBeforeExecution": true
@@ -843,7 +843,7 @@ async fn native_permission_park_decisions(
                         "maxPromptBytes": 4096,
                         "maxRounds": 4,
                         "maxDurationMs": 30000,
-                        "maxTotalTokens": 1000
+                        "maxTotalTokens": 20000
                     },
                     "retryEligible": false,
                     "requiresApprovalBeforeExecution": true
@@ -864,11 +864,11 @@ async fn native_permission_park_decisions(
     let objectives = [
         (
             "allow",
-            "Request permission to use the write_file tool for one small disposable test file, then stop and report only that the permission was handled.",
+            "Use the write_file tool now to create exactly one small file named permission_probe.txt in the disposable workspace. This action is intentionally permission-gated; do not merely explain it or return until the tool call is attempted. After the permission decision, stop.",
         ),
         (
             "deny",
-            "Request permission to use the write_file tool for one small disposable test file, then stop and report only that the permission was handled.",
+            "Use the write_file tool now to create exactly one small file named permission_probe.txt in the disposable workspace. This action is intentionally permission-gated; do not merely explain it or return until the tool call is attempted. After the permission decision, stop.",
         ),
     ];
     let mut work_ids = Vec::with_capacity(objectives.len());
@@ -1288,7 +1288,7 @@ async fn native_no_duplicate_run(
                         "maxPromptBytes": 4096,
                         "maxRounds": 2,
                         "maxDurationMs": 30000,
-                        "maxTotalTokens": 1000
+                        "maxTotalTokens": 20000
                     },
                     "retryEligible": false,
                     "requiresApprovalBeforeExecution": false
@@ -1994,7 +1994,7 @@ async fn create_and_authorize_native_work(
                         "maxPromptBytes": 8192,
                         "maxRounds": 8,
                         "maxDurationMs": 60000,
-                        "maxTotalTokens": 2000
+                        "maxTotalTokens": 20000
                     },
                     "retry": {
                         "maxAttempts": 2,
@@ -3697,8 +3697,8 @@ async fn create_agent(
                 "bounds": {
                     "maxPromptBytes": 512,
                     "maxRounds": 1,
-                    "maxDurationMs": 5000,
-                    "maxTotalTokens": 1000
+                    "maxDurationMs": 15000,
+                    "maxTotalTokens": 10000
                 },
                 "execution_mode": "shared",
                 "allow_queue": true

@@ -1574,7 +1574,9 @@ struct AgentSseAccumulator {
 
 /// Parse OpenAI chat-completions or Responses-style usage without guessing.
 /// A present but malformed usage object is a protocol error; an absent/null
-/// object is reported as unavailable so bounded runs can fail closed.
+/// object is reported as unavailable so bounded runs can fail closed. When a
+/// provider reports a total that includes accounting categories not represented
+/// by the visible prompt/completion pair, retain the conservative maximum.
 pub(crate) fn parse_completion_usage(
     value: &serde_json::Value,
 ) -> Result<Option<crate::completion::CompletionUsage>> {
@@ -1599,20 +1601,16 @@ pub(crate) fn parse_completion_usage(
     let derived_total = prompt_tokens
         .checked_add(completion_tokens)
         .ok_or_else(|| anyhow!("provider usage token total overflowed"))?;
-    let total_tokens = match object.get("total_tokens") {
-        Some(value) => {
-            let reported = value
+    let total_tokens = object
+        .get("total_tokens")
+        .map(|value| {
+            value
                 .as_u64()
-                .ok_or_else(|| anyhow!("provider usage has invalid `total_tokens`"))?;
-            if reported != derived_total {
-                bail!(
-                    "provider usage has contradictory `total_tokens`: reported {reported}, derived {derived_total}"
-                );
-            }
-            reported
-        }
-        None => derived_total,
-    };
+                .ok_or_else(|| anyhow!("provider usage has invalid `total_tokens`"))
+                .map(|reported| reported.max(derived_total))
+        })
+        .transpose()?
+        .unwrap_or(derived_total);
     Ok(Some(crate::completion::CompletionUsage {
         prompt_tokens,
         completion_tokens,
@@ -1926,7 +1924,7 @@ fn record_provider_attempt(
         return;
     };
     let usage = usage.and_then(|usage| {
-        AuthoritativeUsage::new(
+        AuthoritativeUsage::new_conservative(
             usage.prompt_tokens,
             usage.completion_tokens,
             usage.total_tokens,
@@ -3109,15 +3107,16 @@ mod compatible_stream_tests {
             "usage": {"prompt_tokens": -1, "completion_tokens": 1, "total_tokens": 0}
         }))
         .is_err());
-        let contradictory = parse_completion_usage(&serde_json::json!({
+        let conservative = parse_completion_usage(&serde_json::json!({
             "usage": {
                 "prompt_tokens": 10_000,
                 "completion_tokens": 5_000,
                 "total_tokens": 1
             }
         }))
-        .unwrap_err();
-        assert!(contradictory.to_string().contains("contradictory"));
+        .unwrap()
+        .unwrap();
+        assert_eq!(conservative.total_tokens, 15_000);
         assert!(parse_completion_usage(&serde_json::json!({
             "usage": {
                 "prompt_tokens": u64::MAX,

@@ -625,6 +625,8 @@ fn classify_error(error: &anyhow::Error) -> (ExitClass, &'static str) {
         (ExitClass::SafetyRefusal, "safety_refusal")
     } else if has("campaign_not_complete") {
         (ExitClass::Indeterminate, "campaign_incomplete")
+    } else if has("live_oidc_attestation_oidc_session_expires_too_soon") {
+        (ExitClass::Indeterminate, "live_authentication_unavailable")
     } else if ["mcp_initialize_failed", "tool_discovery_failed"]
         .iter()
         .any(|needle| has(needle))
@@ -797,6 +799,12 @@ mod tests {
         assert_eq!(
             classify_error(&anyhow::anyhow!("artifact_changed_during_read")),
             (ExitClass::SafetyRefusal, "safety_refusal")
+        );
+        assert_eq!(
+            classify_error(&anyhow::anyhow!(
+                "live_oidc_attestation_oidc_session_expires_too_soon"
+            )),
+            (ExitClass::Indeterminate, "live_authentication_unavailable")
         );
     }
 

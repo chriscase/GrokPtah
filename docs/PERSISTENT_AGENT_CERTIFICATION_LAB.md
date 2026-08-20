@@ -178,6 +178,11 @@ Live execution may be enabled only after an OIDC-only resolver attests all of:
   credential storage; and
 - matching post-call provider observation for route, credential, and model.
 
+Live attestation validity is computed from the selected probe bounds. The
+bridge retains the conservative maximum when xAI reports total tokens that
+include accounting categories outside the visible prompt/completion pair, and
+still rejects missing or under-counted usage.
+
 Missing authoritative usage or any provider-observer drop makes dependent
 claims indeterminate. Observation presence alone never assigns a provider
 identity. The bounded-run probe now converts the selected finite Run and its

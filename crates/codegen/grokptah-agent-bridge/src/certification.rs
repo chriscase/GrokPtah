@@ -34,6 +34,7 @@ pub const PERSISTENT_AGENT_SCENARIO_IDS: &[&str] = &[
     "archive-lane-001",
     "interrupt-recover-001",
     "resume-idempotency-001",
+    "managed-work-run-001",
     "memory-scopes-001",
     "spec-revision-001",
     "token-ceiling-001",
@@ -688,7 +689,7 @@ fn validate_attempt(
             .prompt_tokens
             .checked_add(usage.completion_tokens)
             .ok_or(CertificationError::Bound("usage overflow"))?;
-        if usage.complete && usage.total_tokens != summed {
+        if usage.complete && usage.total_tokens < summed {
             return Err(CertificationError::Identifier("complete token usage"));
         }
     }
@@ -1671,7 +1672,7 @@ mod tests {
         );
 
         let mut capture = fixture();
-        capture.attempts[0].usage.as_mut().unwrap().total_tokens = 16;
+        capture.attempts[0].usage.as_mut().unwrap().total_tokens = 14;
         assert_eq!(
             capture.validate().unwrap_err(),
             CertificationError::Identifier("complete token usage")

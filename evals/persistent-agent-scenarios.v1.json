@@ -197,6 +197,23 @@
       ]
     },
     {
+      "id": "managed-work-run-001",
+      "group": "agent_lifecycle",
+      "title": "Native managed Work to finite Run",
+      "required_layers": ["persistent_lifecycle"],
+      "default_bound_profile": "smoke",
+      "live_checks": [
+        "agent_durable",
+        "run_durable",
+        "terminal_state_durable"
+      ],
+      "replay_checks": [
+        "work_to_run_linkage",
+        "finite_bounds_recorded",
+        "terminal_evidence_order"
+      ]
+    },
+    {
       "id": "restart-between-runs-001",
       "group": "recovery",
       "title": "Restart between finite Runs",

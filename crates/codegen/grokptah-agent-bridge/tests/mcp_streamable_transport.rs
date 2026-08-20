@@ -422,11 +422,11 @@ async fn independent_node_mcp_sdk_interop() {
         .is_dir()
     {
         let st = tokio::process::Command::new("npm")
-            .args(["ci", "--no-fund", "--no-audit", "--ignore-scripts"])
+            .args(["install", "--no-fund", "--no-audit"])
             .current_dir(&sdk_dir)
             .status()
             .await
-            .expect("npm ci");
+            .expect("npm install");
         assert!(st.success());
     }
     let output = tokio::process::Command::new("node")
@@ -1704,11 +1704,11 @@ async fn independent_node_coordinator_conformance() {
         .is_dir()
     {
         let st = tokio::process::Command::new("npm")
-            .args(["ci", "--no-fund", "--no-audit", "--ignore-scripts"])
+            .args(["install", "--no-fund", "--no-audit"])
             .current_dir(&sdk_dir)
             .status()
             .await
-            .expect("npm ci");
+            .expect("npm install");
         assert!(st.success());
     }
     let output = tokio::process::Command::new("node")
@@ -2110,11 +2110,11 @@ async fn live_desktop_bootstrap_node_smoke() {
         .is_dir()
     {
         let st = tokio::process::Command::new("npm")
-            .args(["ci", "--no-fund", "--no-audit", "--ignore-scripts"])
+            .args(["install", "--no-fund", "--no-audit"])
             .current_dir(&sdk_dir)
             .status()
             .await
-            .expect("npm ci");
+            .expect("npm install");
         assert!(st.success());
     }
     let output = tokio::process::Command::new("node")
