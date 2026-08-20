@@ -1105,10 +1105,6 @@ fn repository_dirty(root: &Path) -> Result<bool> {
     if !output.status.success() || output.stdout.len() > 1024 * 1024 {
         bail!("repository_state_unavailable");
     }
-    if !output.stdout.is_empty() {
-        let status = String::from_utf8_lossy(&output.stdout);
-        eprintln!("grokptah-cert: repository_status={}", status.trim_end());
-    }
     Ok(!output.stdout.is_empty())
 }
 
