@@ -88,6 +88,11 @@ jobs:
           cargo run --locked -- validate-manifest --repository "$GITHUB_WORKSPACE"
           cargo run --locked -- replay --fixture "$GITHUB_WORKSPACE/evals/certification-lab/replay-fixtures/provider-behaviors.v1.json"
           cargo run --locked -- preflight --repository "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/grokptah-cert-output"
+          repository_status="$(git -C "$GITHUB_WORKSPACE" status --porcelain=v1 --untracked-files=normal)"
+          if [[ -n "$repository_status" ]]; then
+            echo "Repository changes present before certification:"
+            printf '%s\n' "$repository_status"
+          fi
           cargo run --locked -- run --repository "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/grokptah-cert-output"
       - name: Offline oracle suite shape (repo root)
         working-directory: .
