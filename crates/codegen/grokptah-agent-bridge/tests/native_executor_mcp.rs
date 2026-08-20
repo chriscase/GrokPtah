@@ -3,7 +3,7 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
+    AgentState, AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
     ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord,
     RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
     MANAGED_EXECUTION_SCHEMA_VERSION,
@@ -1256,6 +1256,17 @@ async fn native_skips_manual_retry_without_mutating() {
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
     let agent = host.ensure_session_agent(lane.id).unwrap();
+    let manual_agent = {
+        let store = host.ensure_orchestration_store().unwrap();
+        let mut manual_agent = agent.clone();
+        manual_agent.agent_id = format!("manual-worker-{}", lane.id);
+        if let Some(spec) = manual_agent.spec.as_mut() {
+            spec.display_name = "manual worker".into();
+            spec.managed_execution = ManagedExecutionPolicy::default();
+        }
+        store.save_agent(&manual_agent).unwrap();
+        manual_agent
+    };
     let orch = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
@@ -1348,6 +1359,14 @@ async fn native_skips_manual_retry_without_mutating() {
             .state,
         ManagedIntentState::Finalized
     );
+    assert_eq!(
+        orch.store()
+            .load_agent(&agent.agent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        AgentState::Failed
+    );
     let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
     loop {
         let attempts = orch.store().list_work_attempts(Some(&work_id)).unwrap();
@@ -1397,7 +1416,20 @@ async fn native_skips_manual_retry_without_mutating() {
             .len(),
         original_attempts
     );
-    let claimed = match client
+    client
+        .call_tool(
+            "ptah_assign_work",
+            json!({
+                "request_id": "manual-retry-reassign",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": work_id,
+                "assigned_agent_id": manual_agent.agent_id
+            }),
+        )
+        .await
+        .unwrap();
+    let claimed = client
         .call_tool(
             "ptah_claim_work",
             json!({
@@ -1405,38 +1437,11 @@ async fn native_skips_manual_retry_without_mutating() {
                 "session_id": lane.id,
                 "workspace": workspace_text,
                 "work_id": work_id,
-                "agent_id": agent.agent_id
+                "agent_id": manual_agent.agent_id
             }),
         )
         .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            let item = orch.store().load_work_item(&work_id).unwrap().unwrap();
-            let attempts = orch.store().list_work_attempts(Some(&work_id)).unwrap();
-            let receipt = orch
-                .store()
-                .load_idempotency("manual-claim-1")
-                .unwrap()
-                .map(|receipt| {
-                    (
-                        receipt.status,
-                        receipt.tool,
-                        receipt.payload_hash,
-                        receipt.error.map(|error| (error.code, error.message)),
-                    )
-                });
-            panic!(
-                "manual claim conflict: {error}; state={:?}; assignment={:?}; assigned_matches={}; attempt_count={}; max_attempts={}; attempt_states={:?}; receipt={receipt:?}",
-                item.state,
-                item.assignment_status,
-                item.assigned_agent_id.as_deref() == Some(agent.agent_id.as_str()),
-                item.attempt_count,
-                item.policy.retry.max_attempts,
-                attempts.iter().map(|attempt| attempt.state).collect::<Vec<_>>(),
-            );
-        }
-    };
+        .unwrap();
     assert_eq!(claimed.structured["work"]["state"], "leased");
     orch.stop_background_tasks().await;
     client.close_session().await.unwrap();
