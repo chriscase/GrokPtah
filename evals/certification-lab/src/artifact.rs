@@ -1288,6 +1288,7 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
     const BUDGET: u64 = 64 * 1024;
@@ -1335,6 +1336,37 @@ mod tests {
         assert!(root.create_campaign("campaign-001").is_err());
         assert!(root.create_campaign("../escape").is_err());
         assert!(root.create_campaign("nested/campaign").is_err());
+    }
+
+    #[test]
+    fn concurrent_campaign_creation_has_one_owner_and_no_clobber() {
+        let layout = Layout::new();
+        let root = Arc::new(layout.root());
+        let barrier = Arc::new(Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let root = Arc::clone(&root);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    root.create_campaign("same-campaign")
+                })
+            })
+            .collect();
+
+        let mut owners = Vec::new();
+        for worker in workers {
+            if let Ok(Ok(campaign)) = worker.join() {
+                owners.push(campaign);
+            }
+        }
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].campaign_id(), "same-campaign");
+        assert!(root
+            .path()
+            .join("same-campaign")
+            .join(CAMPAIGN_SENTINEL)
+            .is_file());
     }
 
     #[test]

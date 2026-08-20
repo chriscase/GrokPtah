@@ -6,33 +6,42 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use grokptah_agent_bridge::provider_observation::{
     EvidenceMode, InMemoryObservationRecorder, OpaqueScopeId, ProviderObservationSession,
 };
-use grokptah_agent_bridge::McpControlClient;
+use grokptah_agent_bridge::{
+    attest_grok_build_oidc_with_min_validity, CredentialMethodClass, McpControlClient,
+    ProviderRouteClass, PERSISTENT_AGENT_CAPTURE_SCHEMA,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::artifact::{SafeOutputRoot, DEFAULT_OUTPUT_RELATIVE_PATH};
+use crate::capture::build_capture;
 use crate::local_service::{
     validate_public_model, LocalService, LocalServiceConfig, LocalServiceMode, DEFAULT_LIVE_MODEL,
 };
 use crate::manifest::{
     AttachAccess, CampaignManifest, ProbeDefinition, ProbeEffect, ProbeScope, RunnerCapability,
 };
-use crate::probes::{execute_minimal_probe, has_implementation, ProbeExecution};
+use crate::probes::{
+    execute_minimal_probe, execute_native_interruption_retry_probe, execute_native_restart_probe,
+    execute_restart_probe, has_implementation, ProbeExecution,
+};
 use crate::report::{
-    ArtifactReference, CampaignReport, DiagnosticCode, EvidenceCounters, FailureClass, ProbeResult,
-    ProbeStatus, RedactionMetadata, RedactionPolicy, ReportSummary, RuntimeMode, TransportMode,
+    ArtifactReference, CampaignReport, CaptureReference, CredentialMethodCode, DiagnosticCode,
+    EvidenceCounters, FailureClass, ProbeResult, ProbeStatus, ProviderRouteCode, ProviderSummary,
+    RedactionMetadata, RedactionPolicy, ReportSummary, RuntimeMode, TransportMode,
     TruncationMetadata, CATALOG_SCHEMA,
 };
 use crate::LAB_REPORT_SCHEMA;
 
 pub const ATTACH_TOKEN_ENV: &str = "GROKPTAH_CERT_SERVICE_TOKEN";
 pub const LIVE_OPT_IN_ENV: &str = "GROKPTAH_LIVE_CERT";
+const LIVE_PREFLIGHT_VALIDITY_SECONDS: i64 = 10 * 60;
 const LIVE_ROUTE_OVERRIDE_ENVS: &[&str] =
     &["XAI_API_KEY", "XAI_API_BASE", "GROKPTAH_TOKEN_COMMAND"];
 pub const DEFAULT_SMOKE_PROBES: &[&str] = &[
@@ -41,6 +50,8 @@ pub const DEFAULT_SMOKE_PROBES: &[&str] = &[
     "work-idempotency-conflict-v1",
     "routine-manual-activation-v1",
     "coordinator-parent-child-work-v1",
+    "core-continuation-resume-v1",
+    "native-policy-default-off-v1",
 ];
 
 #[derive(Debug, Clone)]
@@ -247,6 +258,14 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
     validate_options(options)?;
     let manifest =
         CampaignManifest::load_checked(&options.manifest_path, &options.repository_root)?;
+    if options.runtime_mode == RuntimeMode::Live {
+        let required_validity = ChronoDuration::seconds(
+            i64::try_from(manifest.campaign_bounds.max_duration_seconds)
+                .context("campaign validity window overflow")?,
+        );
+        attest_grok_build_oidc_with_min_validity(&options.model, required_validity)
+            .map_err(|error| anyhow::anyhow!("live_oidc_attestation_{}", error.code()))?;
+    }
     validate_artifact_budget(options, &manifest)?;
     let selected = manifest.select_probes(&options.selected_probe_ids)?;
     // Establish sentinel ownership, confinement, and free-space headroom
@@ -267,7 +286,7 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
         Utc::now().format("%Y%m%d%H%M%S"),
         &Uuid::new_v4().simple().to_string()[..8]
     );
-    let (transport, recorder) =
+    let (mut transport, recorder) =
         start_transport(options, &manifest, Some(campaign_id.as_str())).await?;
     let active_workspace = match &transport {
         ActiveTransport::Local { workspace, .. } => Some(Path::new(workspace)),
@@ -357,17 +376,177 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
         if result.is_none() {
             let workspace = transport
                 .workspace()
-                .or_else(|| (definition.id == "core-service-readiness-v1").then_some(""));
+                .or_else(|| (definition.id == "core-service-readiness-v1").then_some(""))
+                .map(str::to_owned);
             if let Some(workspace) = workspace {
-                let mut execution = match tokio::time::timeout(
-                    Duration::from_secs(definition.bounds.max_duration_seconds),
-                    execute_minimal_probe(definition, &mut client, workspace),
-                )
-                .await
-                {
-                    Ok(execution) => execution,
-                    Err(_) => ProbeExecution::timed_out(definition),
+                let mut execution = match &mut transport {
+                    ActiveTransport::Local { service, .. }
+                        if definition.id == "core-restart-durable-runs-events-v1" =>
+                    {
+                        match tokio::time::timeout(
+                            Duration::from_secs(definition.bounds.max_duration_seconds),
+                            execute_restart_probe(
+                                definition,
+                                service,
+                                &workspace,
+                                recorder.as_ref(),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(execution) => execution,
+                            Err(_) => ProbeExecution::timed_out(definition),
+                        }
+                    }
+                    ActiveTransport::Local { service, .. }
+                        if definition.id == "native-restart-intent-adoption-v1" =>
+                    {
+                        match tokio::time::timeout(
+                            Duration::from_secs(definition.bounds.max_duration_seconds),
+                            execute_native_restart_probe(
+                                definition,
+                                service,
+                                &workspace,
+                                recorder.as_ref(),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(execution) => execution,
+                            Err(_) => ProbeExecution::timed_out(definition),
+                        }
+                    }
+                    ActiveTransport::Local { service, .. }
+                        if definition.id == "native-interruption-retry-policy-v1" =>
+                    {
+                        match tokio::time::timeout(
+                            Duration::from_secs(definition.bounds.max_duration_seconds),
+                            execute_native_interruption_retry_probe(
+                                definition,
+                                service,
+                                &workspace,
+                                recorder.as_ref(),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(execution) => execution,
+                            Err(_) => ProbeExecution::timed_out(definition),
+                        }
+                    }
+                    _ => match tokio::time::timeout(
+                        Duration::from_secs(definition.bounds.max_duration_seconds),
+                        execute_minimal_probe(
+                            definition,
+                            &mut client,
+                            &workspace,
+                            recorder.as_ref().and_then(|recorder| {
+                                recorder
+                                    .snapshot()
+                                    .last()
+                                    .map(|observation| observation.attempt_number() + 1)
+                                    .or(Some(1))
+                            }),
+                            recorder.as_ref(),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(execution) => execution,
+                        Err(_) => ProbeExecution::timed_out(definition),
+                    },
                 };
+                if matches!(
+                    definition.id.as_str(),
+                    "core-restart-durable-runs-events-v1"
+                        | "native-restart-intent-adoption-v1"
+                        | "native-interruption-retry-policy-v1"
+                ) {
+                    client = transport.client();
+                    client
+                        .initialize()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("mcp_reinitialize_failed"))?;
+                }
+                let capture_run_is_distinct = execution.capture_provider_run.is_some();
+                if let Some(provider_run) = execution
+                    .capture_provider_run
+                    .take()
+                    .or_else(|| execution.provider_run.take())
+                {
+                    let capture_result = recorder
+                        .as_ref()
+                        .context("provider_observation_unavailable")
+                        .and_then(|recorder| {
+                            let start = if capture_run_is_distinct {
+                                execution.capture_attempt_start.unwrap_or(1)
+                            } else {
+                                execution.provider_attempt_start.unwrap_or(1)
+                            };
+                            let run_scope = OpaqueScopeId::from_stable_input(&provider_run.run_id);
+                            let observations = recorder
+                                .snapshot()
+                                .into_iter()
+                                .filter(|observation| {
+                                    observation.attempt_number() >= start
+                                        && observation.scope().run_id() == &run_scope
+                                })
+                                .collect::<Vec<_>>();
+                            let scenario_id = definition
+                                .catalog_scenario_ids
+                                .first()
+                                .context("provider_catalog_scenario_missing")?;
+                            let capture = build_capture(
+                                &campaign_id,
+                                scenario_id,
+                                &report.repository_commit,
+                                report.repository_dirty,
+                                &definition.bounds,
+                                &observations,
+                                &provider_run,
+                            )?;
+                            capture
+                                .validate_complete_structural_evidence()
+                                .map_err(|error| anyhow::anyhow!("capture_incomplete:{error}"))?;
+                            Ok(capture)
+                        });
+                    match capture_result {
+                        Ok(capture) => {
+                            let capture_bytes = serde_json::to_vec_pretty(&capture)
+                                .context("serialize provider capture")?;
+                            let capture_digest = artifacts.write_final(
+                                format!("captures/{}.json", definition.id),
+                                &capture_bytes,
+                            )?;
+                            execution.result.capture_refs.push(CaptureReference {
+                                catalog_scenario_id: capture.campaign.scenario_id.clone(),
+                                artifact: ArtifactReference {
+                                    relative_path: capture_digest.relative_path,
+                                    sha256: capture_digest.sha256,
+                                    bytes: capture_digest.bytes,
+                                },
+                                capture_schema: PERSISTENT_AGENT_CAPTURE_SCHEMA.into(),
+                            });
+                            execution.result.counters.provider_attempts =
+                                u64::from(capture.actuals.provider_requests);
+                            let provider = provider_summary(&capture);
+                            if report.provider.is_some() {
+                                bail!(
+                                    "multiple provider identities in one campaign are unsupported"
+                                );
+                            }
+                            report.provider = Some(provider);
+                            report.provider_actuals = Some(capture.actuals.clone());
+                        }
+                        Err(_) => {
+                            execution.result = ProbeResult::indeterminate(
+                                definition.id.clone(),
+                                definition.catalog_scenario_ids.clone(),
+                                DiagnosticCode::CaptureInvalid,
+                            );
+                        }
+                    }
+                }
                 let trace_bytes = execution.trace.validate()?;
                 let trace_path = format!("traces/{}.json", definition.id);
                 let digest = artifacts.write_final(&trace_path, &trace_bytes)?;
@@ -617,9 +796,37 @@ fn runner_capabilities(
         capabilities.insert(RunnerCapability::LiveProviderRoute);
         if has_observer {
             capabilities.insert(RunnerCapability::ProviderObservation);
+            capabilities.insert(RunnerCapability::AuthoritativeUsage);
         }
     }
     capabilities
+}
+
+fn provider_summary(capture: &grokptah_agent_bridge::PersistentAgentCapture) -> ProviderSummary {
+    let route_class = match capture.provider.route_class {
+        ProviderRouteClass::GrokBuildProxy => ProviderRouteCode::GrokBuildProxy,
+        ProviderRouteClass::XaiApi => ProviderRouteCode::XaiApi,
+        ProviderRouteClass::CompatibleGateway => ProviderRouteCode::CompatibleGateway,
+    };
+    let credential_method = match capture.provider.credential_method {
+        CredentialMethodClass::GrokBuildOidc => CredentialMethodCode::GrokBuildOidc,
+        CredentialMethodClass::ApiKeyReference => CredentialMethodCode::ApiKeyReference,
+        CredentialMethodClass::ManagedProviderReference => {
+            CredentialMethodCode::ManagedProviderReference
+        }
+    };
+    ProviderSummary {
+        route_class,
+        model_identity: capture.provider.model_identity.clone(),
+        credential_method,
+        endpoint_fingerprint: capture.provider.endpoint_fingerprint.clone(),
+        observation_complete: true,
+        authoritative_usage_complete: capture
+            .attempts
+            .iter()
+            .all(|attempt| attempt.usage.as_ref().is_some_and(|usage| usage.complete)),
+        observation_dropped_records: 0,
+    }
 }
 
 async fn augment_discovered_capabilities(
@@ -766,10 +973,11 @@ fn validate_options(options: &CampaignOptions) -> Result<()> {
         if ambient_live_override_present_with(|name| std::env::var_os(name).is_some()) {
             bail!("live_ambient_route_or_credential_override_present");
         }
-        // Current main cannot attest an OIDC-only resolver, the official
-        // endpoint, or safe refresh storage. Refuse before any host or network
-        // activity instead of certifying an ambient credential route.
-        bail!("live_oidc_route_attestation_unavailable");
+        attest_grok_build_oidc_with_min_validity(
+            &options.model,
+            ChronoDuration::seconds(LIVE_PREFLIGHT_VALIDITY_SECONDS),
+        )
+        .map_err(|error| anyhow::anyhow!("live_oidc_attestation_{}", error.code()))?;
     }
     if let TransportConfig::Attach {
         endpoint,
@@ -1000,6 +1208,23 @@ mod tests {
         assert!(!ambient_live_override_present_with(|_| false));
     }
 
+    #[test]
+    fn attached_mutations_require_service_issued_disposable_lease() {
+        let repository =
+            dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let mut options = default_options(&repository);
+        options.transport = TransportConfig::Attach {
+            endpoint: "https://service.example".into(),
+            token_env: ATTACH_TOKEN_ENV.into(),
+            workspace: Some("opaque-workspace".into()),
+            allow_mutations: true,
+            disposable_target_acknowledged: true,
+        };
+
+        let error = validate_options(&options).unwrap_err();
+        assert_eq!(error.to_string(), "attach_mutation_lease_unavailable");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offline_preflight_discovers_the_real_public_capacity_surface() {
         if !crate::local_service::loopback_test_available() {
@@ -1028,17 +1253,18 @@ mod tests {
         let output = tempfile::tempdir().unwrap();
         let mut options = default_options(&repository);
         options.output_root = dunce::canonicalize(output.path()).unwrap();
-        options.selected_probe_ids = vec!["work-lifecycle-v1".into()];
+        options.selected_probe_ids = vec!["core-checkpoint-inspection-v1".into()];
         let summary = preflight(&options).await.unwrap();
         assert_eq!(summary.unsupported_probe_count, 0);
         assert_eq!(summary.indeterminate_probe_count, 1);
     }
 
     #[test]
-    fn merged_native_tools_and_capability_never_promote_an_implementation_gap() {
+    fn implementation_gap_never_promotes_a_supported_probe() {
         let repository =
             dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
         let mut options = default_options(&repository);
+        options.runtime_mode = RuntimeMode::Live;
         options.transport = TransportConfig::Attach {
             endpoint: "https://service.invalid".into(),
             token_env: ATTACH_TOKEN_ENV.into(),
@@ -1052,7 +1278,7 @@ mod tests {
             workspace: Some("opaque-test-workspace".into()),
         };
         let manifest = CampaignManifest::bundled().unwrap();
-        let probe = manifest.probe("native-policy-default-off-v1").unwrap();
+        let probe = manifest.probe("core-checkpoint-inspection-v1").unwrap();
         assert!(!has_implementation(&probe.id));
         let tools: HashSet<_> = grokptah_agent_bridge::discovered_tool_names()
             .into_iter()
@@ -1072,7 +1298,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn merged_native_capability_keeps_unimplemented_probe_indeterminate() {
+    async fn merged_native_capability_runs_implemented_policy_probe() {
         if !crate::local_service::loopback_test_available() {
             return;
         }
@@ -1134,10 +1360,10 @@ mod tests {
         let completion = run_campaign(&options).await.unwrap();
         assert_eq!(completion.summary.probes, 1);
         assert_eq!(completion.summary.supported, 1);
-        assert_eq!(completion.summary.passed, 0);
+        assert_eq!(completion.summary.passed, 1);
         assert_eq!(completion.summary.failed, 0);
         assert_eq!(completion.summary.skipped, 0);
-        assert_eq!(completion.summary.indeterminate, 1);
+        assert_eq!(completion.summary.indeterminate, 0);
         assert!(!completion.certified);
 
         let campaign = output.path().join(&completion.campaign_id);
@@ -1148,13 +1374,77 @@ mod tests {
             .iter()
             .find(|probe| probe.probe_id == "native-policy-default-off-v1")
             .unwrap();
-        assert_eq!(probe.status, ProbeStatus::Indeterminate);
+        assert_eq!(probe.status, ProbeStatus::Passed);
         assert!(probe.supported);
-        assert_eq!(
-            probe.diagnostics,
-            vec![DiagnosticCode::ProbeImplementationUnavailable]
-        );
         assert!(!report.certified);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_work_probe_exercises_offline_public_executor_shape() {
+        if !crate::local_service::loopback_test_available() {
+            return;
+        }
+        let repository =
+            dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let manifest = CampaignManifest::bundled().unwrap();
+        let options = default_options(&repository);
+        let (transport, recorder) = start_transport(&options, &manifest, None).await.unwrap();
+        let workspace = transport.workspace().unwrap().to_owned();
+        let mut client = transport.client();
+        client.initialize().await.unwrap();
+        let definition = manifest.probe("native-work-to-run-v1").unwrap();
+        let execution =
+            execute_minimal_probe(definition, &mut client, &workspace, None, recorder.as_ref())
+                .await;
+        assert_eq!(
+            execution.result.status,
+            ProbeStatus::Passed,
+            "diagnostics: {:?}",
+            execution.result.diagnostics
+        );
+        assert!(execution
+            .result
+            .opaque_ids
+            .iter()
+            .any(|value| { value.kind == crate::report::DurableIdKind::Work }));
+        assert!(execution
+            .result
+            .opaque_ids
+            .iter()
+            .any(|value| { value.kind == crate::report::DurableIdKind::Run }));
+        assert!(execution.provider_run.is_some());
+        client.close_session().await.unwrap();
+        drop(recorder);
+        transport.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_duplicate_probe_exercises_offline_public_executor_shape() {
+        if !crate::local_service::loopback_test_available() {
+            return;
+        }
+        let repository =
+            dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let manifest = CampaignManifest::bundled().unwrap();
+        let options = default_options(&repository);
+        let (transport, recorder) = start_transport(&options, &manifest, None).await.unwrap();
+        let workspace = transport.workspace().unwrap().to_owned();
+        let mut client = transport.client();
+        client.initialize().await.unwrap();
+        let definition = manifest.probe("native-no-duplicate-run-v1").unwrap();
+        let execution =
+            execute_minimal_probe(definition, &mut client, &workspace, None, recorder.as_ref())
+                .await;
+        assert_eq!(
+            execution.result.status,
+            ProbeStatus::Passed,
+            "diagnostics: {:?}",
+            execution.result.diagnostics
+        );
+        assert!(execution.provider_run.is_some());
+        client.close_session().await.unwrap();
+        drop(recorder);
+        transport.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1188,8 +1478,8 @@ mod tests {
             .iter()
             .map(|probe| (&probe.probe_id, probe.status, &probe.diagnostics))
             .collect();
-        assert_eq!(completion.summary.probes, 5);
-        assert_eq!(completion.summary.passed, 5, "{outcomes:?}");
+        assert_eq!(completion.summary.probes, 7);
+        assert_eq!(completion.summary.passed, 7, "{outcomes:?}");
         assert_eq!(completion.summary.failed, 0);
         assert_eq!(completion.summary.skipped, 0);
         assert_eq!(completion.summary.indeterminate, 0);
@@ -1199,5 +1489,36 @@ mod tests {
             .find(|probe| probe.probe_id == "work-idempotency-conflict-v1")
             .unwrap();
         assert_eq!(work.counters.errors, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offline_restart_campaign_recovers_run_and_event_cursor() {
+        if !crate::local_service::loopback_test_available() {
+            return;
+        }
+        let repository =
+            dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let mut options = default_options(&repository);
+        options.output_root = dunce::canonicalize(output.path()).unwrap();
+        options.selected_probe_ids = vec!["core-restart-durable-runs-events-v1".into()];
+
+        let completion = run_campaign(&options).await.unwrap();
+        let campaign = output.path().join(&completion.campaign_id);
+        let report: CampaignReport =
+            serde_json::from_slice(&std::fs::read(campaign.join("report.json")).unwrap()).unwrap();
+        let probe = report
+            .probes
+            .iter()
+            .find(|probe| probe.probe_id == "core-restart-durable-runs-events-v1")
+            .unwrap();
+        assert_eq!(completion.summary.probes, 1);
+        assert_eq!(completion.summary.passed, 1, "{probe:?}");
+        assert!(probe.restart.attempted);
+        assert!(probe.restart.host_owned);
+        assert!(probe.restart.durable_read_recovered);
+        assert!(probe.restart.event_cursor_recovered);
+        assert!(!probe.restart.implicit_execution_observed);
+        assert!(probe.reconnect.continuity_proven);
     }
 }

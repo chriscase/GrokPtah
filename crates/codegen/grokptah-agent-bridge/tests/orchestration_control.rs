@@ -1466,13 +1466,80 @@ async fn submit_task_reaches_terminal_offline() {
     let state = wait_run_terminal(&orch, &auth, &run_id, Duration::from_secs(10)).await;
     assert_eq!(state, RunState::Completed);
     let run = orch.get_run(&auth, &run_id).unwrap();
-    assert!(run["agentId"].as_str().is_some());
+    let agent_id = run["agentId"].as_str().unwrap().to_string();
+    assert!(!agent_id.is_empty());
     assert_eq!(
         run["bounds"]["maxTotalTokens"],
         grokptah_agent_bridge::DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS
     );
     let handoff = orch.get_handoff(&auth, &run_id).unwrap();
     assert!(handoff["finalResponse"].as_str().is_some());
+
+    // Service-owned Build Runs must publish the same durable checkpoint that
+    // the explicit public continuation API consumes. Checkpoint persistence
+    // happens after Run finalization, so tolerate that short asynchronous
+    // window while keeping the assertion entirely on the public service
+    // projection.
+    let checkpoint_plan = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match orch.get_persistent_agent_scoped(&auth, session.id, ws.path(), &agent_id) {
+                Ok(plan) if plan["checkpoint"]["checkpointId"].as_str().is_some() => {
+                    break plan;
+                }
+                Ok(_) | Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(_) | Err(_) => panic!("service Run never published a persistent checkpoint"),
+            }
+        }
+    };
+    let checkpoint_id = checkpoint_plan["checkpoint"]["checkpointId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(checkpoint_plan["checkpoint"]["runId"], run_id);
+    assert_eq!(
+        checkpoint_plan["agent"]["latestCheckpointId"],
+        checkpoint_id
+    );
+
+    let resumed = orch
+        .resume_persistent_agent(
+            &auth,
+            "continuation-service-test",
+            session.id,
+            ws.path(),
+            &agent_id,
+            "Continue with one bounded acknowledgement.".into(),
+            Some(1),
+        )
+        .await
+        .unwrap();
+    let replayed = orch
+        .resume_persistent_agent(
+            &auth,
+            "continuation-service-test",
+            session.id,
+            ws.path(),
+            &agent_id,
+            "Continue with one bounded acknowledgement.".into(),
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed["response"], resumed["response"]);
+    let runs = orch.list_runs_scoped(&auth, session.id, ws.path()).unwrap();
+    let resumed_runs = runs["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|candidate| candidate["parentRunId"] == run_id)
+        .collect::<Vec<_>>();
+    assert_eq!(resumed_runs.len(), 1);
+    assert_eq!(resumed_runs[0]["state"], "completed");
+    assert_eq!(resumed_runs[0]["checkpointId"], checkpoint_id);
+    assert!(resumed_runs[0]["continuationContextId"].as_str().is_some());
     // Idempotent retry
     let again = orch
         .submit_task(

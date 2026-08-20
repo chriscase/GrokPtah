@@ -206,6 +206,7 @@ pub enum DurableIdKind {
     Agent,
     Session,
     Run,
+    Checkpoint,
     Work,
     Attempt,
     Routine,
@@ -836,7 +837,9 @@ pub enum TraceOperationCode {
     GetEvents,
     SteerRun,
     CancelRun,
+    ResumeAgent,
     CreateWork,
+    ListWork,
     GetWork,
     AssignWork,
     ClaimWork,
@@ -863,6 +866,7 @@ pub enum TraceOperationCode {
     ListDecisions,
     SendMessage,
     ListMessages,
+    ListInbox,
     AckMessage,
     Disconnect,
     Reconnect,
@@ -883,6 +887,7 @@ pub enum ArgumentFieldCode {
     Workspace,
     AgentId,
     RunId,
+    MaxRounds,
     WorkId,
     AttemptId,
     RoutineId,
@@ -1192,6 +1197,13 @@ fn validate_probe_against_definition(
         && probe.capture_refs.is_empty()
     {
         bail!("passing provider probe has no capture");
+    }
+    if definition.scope == ProbeScope::NativeManagedFuture
+        && !definition.eligibility.offline
+        && probe.status == ProbeStatus::Passed
+        && probe.capture_refs.is_empty()
+    {
+        bail!("passing live native probe has no provider capture");
     }
     Ok(())
 }
@@ -1888,6 +1900,55 @@ mod tests {
         value.recompute_summary().unwrap();
         value.certified = true;
         assert!(value.validate_at(root.path()).is_err());
+    }
+
+    #[test]
+    fn live_native_probe_cannot_pass_without_provider_capture() {
+        let manifest = CampaignManifest::bundled().unwrap();
+        let definition = manifest.probe("native-no-duplicate-run-v1").unwrap();
+        let mut probe = ProbeResult::skipped(
+            definition.id.clone(),
+            definition.catalog_scenario_ids.clone(),
+            DiagnosticCode::Ok,
+        );
+        probe.status = ProbeStatus::Passed;
+        probe.supported = true;
+        probe.failure_class = FailureClass::None;
+        probe.diagnostics = vec![DiagnosticCode::Ok];
+        probe.verified_actions = definition.actions.clone();
+        probe.verified_oracles = definition.oracle_codes.clone();
+        probe.phases = vec![PhaseResult {
+            phase: PhaseCode::Oracle,
+            status: ProbeStatus::Passed,
+            elapsed_millis: 1,
+            diagnostics: vec![DiagnosticCode::Ok],
+        }];
+        probe.transitions = vec![
+            TransitionEvidence {
+                entity: EntityKind::ExecutionIntent,
+                from: DurableStateCode::Absent,
+                to: DurableStateCode::Admitted,
+                opaque_id: None,
+            },
+            TransitionEvidence {
+                entity: EntityKind::Attempt,
+                from: DurableStateCode::Absent,
+                to: DurableStateCode::Leased,
+                opaque_id: None,
+            },
+            TransitionEvidence {
+                entity: EntityKind::Run,
+                from: DurableStateCode::Absent,
+                to: DurableStateCode::Queued,
+                opaque_id: None,
+            },
+        ];
+        probe.trace = Some(ArtifactReference {
+            relative_path: "traces/native-no-duplicate-run-v1.json".into(),
+            sha256: "a".repeat(64),
+            bytes: 1,
+        });
+        assert!(validate_probe_against_definition(&probe, definition).is_err());
     }
 
     #[test]

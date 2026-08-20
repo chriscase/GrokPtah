@@ -6047,6 +6047,20 @@ impl OrchestrationService {
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
 
+            // Service-owned Build Runs use the same durable Agent identity as
+            // desktop turns. Persist the verified checkpoint after the Run
+            // finalization so the public persistent-agent read/resume surface
+            // has a real continuation source. This remains a finite explicit
+            // checkpoint; it never resumes the completed invocation.
+            if candidate.agent_id.is_some() {
+                let outcome = candidate.terminal_result.as_deref().unwrap_or("failed");
+                if let Err(error) =
+                    host.persist_agent_checkpoint(&candidate, outcome, end_seq, &bus, &store)
+                {
+                    eprintln!("[grokptah] service checkpoint for run {rid} failed: {error:#}");
+                }
+            }
+
             // Release capacity before waking the scheduler, so a queued task
             // can be promoted immediately and fairly.
             drop(admission_guard);

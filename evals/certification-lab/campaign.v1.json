@@ -148,7 +148,6 @@
       "required_tools": [
         "ptah_create_session",
         "ptah_list_persistent_agents",
-        "ptah_get_persistent_agent",
         "ptah_submit_task",
         "ptah_cancel",
         "ptah_get_run",
@@ -282,7 +281,6 @@
       "required_tools": [
         "ptah_create_session",
         "ptah_list_persistent_agents",
-        "ptah_get_persistent_agent",
         "ptah_submit_task",
         "ptah_cancel",
         "ptah_get_run",
@@ -347,7 +345,6 @@
       "required_tools": [
         "ptah_create_session",
         "ptah_list_persistent_agents",
-        "ptah_get_persistent_agent",
         "ptah_submit_task",
         "ptah_cancel",
         "ptah_list_runs",
@@ -472,6 +469,80 @@
       "incomplete_evidence": "not_applicable"
     },
     {
+      "id": "core-continuation-resume-v1",
+      "description": "Create a bounded service-owned Agent Run, inspect its durable checkpoint through MCP, explicitly resume the same Agent in the same Lane, and prove parent lineage, continuation context, and idempotent replay without implicit invocation resumption.",
+      "catalog_scenario_ids": [
+        "resume-same-lane-001",
+        "resume-idempotency-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_get_persistent_agent",
+        "ptah_resume_persistent_agent",
+        "ptah_list_runs"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "persistent_agent_evidence"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 60,
+        "max_rounds": 2,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 3000,
+        "max_provider_requests": 40,
+        "max_continuations": 2,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 131072,
+        "max_artifact_bytes": 524288
+      },
+      "actions": [
+        "create_persistent_agent",
+        "submit_bounded_run",
+        "wait_for_terminal_run",
+        "inspect_checkpoint",
+        "resume_persistent_agent",
+        "inspect_run_set"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "run",
+          "from": "completed",
+          "to": "completed"
+        },
+        {
+          "entity": "run",
+          "from": "absent",
+          "to": "completed"
+        }
+      ],
+      "oracle_codes": [
+        "checkpoint_inspectable",
+        "continuation_run_created",
+        "checkpoint_used_for_continuation",
+        "no_implicit_invocation_resume",
+        "resume_request_replay_stable"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
       "id": "work-lifecycle-v1",
       "description": "Drive create, offer, accept, claim, lease heartbeat, progress, and completion through MCP.",
       "catalog_scenario_ids": [
@@ -485,7 +556,6 @@
         "ptah_cancel",
         "ptah_get_run",
         "ptah_list_persistent_agents",
-        "ptah_get_persistent_agent",
         "ptah_create_work",
         "ptah_offer_work",
         "ptah_accept_work",
@@ -1574,7 +1644,6 @@
         "ptah_cancel",
         "ptah_get_run",
         "ptah_list_persistent_agents",
-        "ptah_get_persistent_agent",
         "ptah_get_managed_execution",
         "ptah_get_capacity"
       ],
@@ -1622,7 +1691,7 @@
     },
     {
       "id": "native-work-to-run-v1",
-      "description": "Capability-gated future probe linking one Routine or coordinator Work item to one finite native Run.",
+      "description": "Capability-gated probe linking one assigned Work item to one finite native Run through the native Agent executor.",
       "catalog_scenario_ids": [
         "agent-initial-run-001",
         "endurance-finite-runs-001"
@@ -1679,16 +1748,11 @@
         {
           "entity": "work",
           "from": "queued",
-          "to": "running"
+          "to": "succeeded"
         },
         {
           "entity": "run",
           "from": "absent",
-          "to": "queued"
-        },
-        {
-          "entity": "run",
-          "from": "running",
           "to": "completed"
         }
       ],
@@ -1792,7 +1856,7 @@
     },
     {
       "id": "native-interruption-retry-policy-v1",
-      "description": "Capability-gated live probe proving retryEligible=false closes one failed native Run, attempt, and intent; ptah_retry_work queues the Work, repeated native ticks create no second native Run or attempt, an external worker can claim it, and the original failed attempt remains inspectable.",
+      "description": "Capability-gated live probe using an owned restart to close one interrupted native Run, expired attempt, and finalized intent; ptah_retry_work queues the Work, repeated native ticks create no second native Run or attempt while retryEligible=false, an external worker can claim it, and the original interrupted attempt remains inspectable.",
       "catalog_scenario_ids": [
         "interrupt-recover-001"
       ],
@@ -1807,6 +1871,7 @@
         "ptah_set_managed_execution",
         "ptah_create_work",
         "ptah_assign_work",
+        "ptah_authorize_work_execution",
         "ptah_retry_work",
         "ptah_get_work",
         "ptah_list_work",
@@ -1818,6 +1883,8 @@
       "required_capabilities": [
         "mcp_streamable_http",
         "disposable_workspace",
+        "client_reconnect",
+        "local_restart_control",
         "native_managed_execution",
         "live_provider_route",
         "provider_observation",
@@ -1827,8 +1894,8 @@
         "offline": false,
         "live": true,
         "local_launch": true,
-        "attach": true,
-        "attach_access": "explicit_mutation_opt_in"
+        "attach": false,
+        "attach_access": "not_allowed"
       },
       "workspace_fixture": "synthetic-disposable-v1",
       "bounds": {
@@ -1846,6 +1913,10 @@
       "actions": [
         "submit_managed_work",
         "wait_for_terminal_run",
+        "wait_for_managed_admission",
+        "disconnect_client",
+        "restart_service",
+        "reconnect_client",
         "retry_work",
         "observe_native_ticks",
         "inspect_work_attempts",
@@ -1859,12 +1930,12 @@
         {
           "entity": "run",
           "from": "running",
-          "to": "failed"
+          "to": "interrupted"
         },
         {
           "entity": "attempt",
           "from": "running",
-          "to": "failed"
+          "to": "expired"
         },
         {
           "entity": "execution_intent",
@@ -1888,6 +1959,9 @@
         }
       ],
       "oracle_codes": [
+        "external_state_converged",
+        "restart_reconnect_observed",
+        "no_implicit_invocation_resume",
         "retry_ineligible_native_readmission_blocked",
         "manual_retry_remains_external",
         "original_failed_attempt_inspectable",
@@ -1914,6 +1988,7 @@
         "ptah_set_managed_execution",
         "ptah_create_work",
         "ptah_assign_work",
+        "ptah_authorize_work_execution",
         "ptah_list_execution_intents",
         "ptah_get_work",
         "ptah_list_runs",

@@ -6,6 +6,7 @@
 //! desktop state, or process environment.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -229,9 +230,15 @@ impl ContinuationInputSnapshot {
         self.execution_spec.validate()?;
         self.effective_run_bounds.validate()?;
         if self.agent_id != self.checkpoint.agent_id
-            || self.source_workspace != self.checkpoint.workspace
-            || self.source_workspace != self.checkpoint_spec.source_workspace
-            || self.source_workspace != self.execution_spec.source_workspace
+            || !workspace_identity_matches(&self.source_workspace, &self.checkpoint.workspace)
+            || !workspace_identity_matches(
+                &self.source_workspace,
+                &self.checkpoint_spec.source_workspace,
+            )
+            || !workspace_identity_matches(
+                &self.source_workspace,
+                &self.execution_spec.source_workspace,
+            )
             || self
                 .checkpoint
                 .agent_spec_revision
@@ -380,6 +387,19 @@ impl ContinuationInputSnapshot {
         let mut unhashed = self.clone();
         unhashed.input_hash.clear();
         canonical_hash(&unhashed)
+    }
+}
+
+fn workspace_identity_matches(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (
+        dunce::canonicalize(Path::new(left)),
+        dunce::canonicalize(Path::new(right)),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 

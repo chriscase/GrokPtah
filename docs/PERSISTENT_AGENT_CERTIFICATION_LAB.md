@@ -30,7 +30,11 @@ The deterministic smoke campaign proves, through the public MCP surface:
 - Work request replay plus a typed changed-payload conflict and an independent
   durable reread;
 - exact manual Routine activation linkage; and
-- independently reread coordinator parent/child Work lineage.
+- independently reread coordinator parent/child Work lineage;
+- checkpoint inspection, explicit same-Lane continuation, and idempotent
+  continuation replay; and
+- native managed execution remaining disabled by default, with a healthy
+  executor projection.
 
 The checked structural replay fixture covers normal completion, a tool call,
 malformed tool arguments, provider rejection, timeout, interruption, explicit
@@ -42,8 +46,11 @@ reconstruct provider SSE payloads, model prose, tool arguments, or reasoning.
 
 The lab does not claim model quality, exact prose, unattended long-lived model
 execution, or Computer Use safety. The merged service exposes native managed
-execution, but the lab's six native probes intentionally remain unimplemented
-and therefore indeterminate rather than passing. Live model quality remains
+execution; the default smoke campaign verifies that the policy is disabled by
+default. The native Work-to-Run, permission, duplicate-suppression,
+restart-adoption, and interruption-retry probes are implemented for bounded
+live evidence, but remain capability-gated until an explicitly authorized live
+campaign runs them. Live model quality remains
 nondeterministic and is never a deterministic CI gate.
 
 ## Safe commands
@@ -64,13 +71,27 @@ cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
   run --repository "$PWD"
 ```
 
-The default run selects the five deterministic probes above, creates a
+The default run selects the seven deterministic probes above, creates a
 disposable runtime home and workspace, uses the offline provider path, and
 writes under `evals/runs/persistent-agent-cert/<campaign-id>/`. Override
 manifest, fixture, campaign, capture, and output paths must be absolute. An
 output inside the source repository is accepted only beneath that precise
 ignored campaign root; an output outside the repository must still be an
 absolute sentinel-owned root.
+
+The owned-local restart probe can be run independently when restart durability
+is the focus:
+
+```sh
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  run --repository "$PWD" \
+  --probe core-restart-durable-runs-events-v1
+```
+
+It creates a bounded offline Run, closes the MCP session, restarts the same
+durable local home, reconnects through a new MCP session, and compares the
+post-restart Run projection and event sequence. It does not claim that an
+interrupted model invocation resumed.
 
 Inspect a completed report without reading transcripts:
 
@@ -138,13 +159,14 @@ it cannot produce passing provider-certification evidence.
 
 A live request requires both `--live` and `GROKPTAH_LIVE_CERT=1`, plus an
 explicit public `--model grok-*`. Those switches are necessary but not
-sufficient. The current credential precedence can select an API key,
-keychain entry, token command, or endpoint override, and its OIDC refresh path
-does not yet provide the issuer/origin and storage guarantees required by this
-lab. Therefore live preflight fails with the typed safety refusal
-`live_oidc_route_attestation_unavailable` before starting a host or making a
-network request. `XAI_API_KEY`, `XAI_API_BASE`, or `GROKPTAH_TOKEN_COMMAND`
-cause an earlier ambient-override refusal.
+sufficient. The production bridge now exposes a fail-closed, positive-schema OIDC
+attestation and a bounded secure-refresh path, documented in
+[`GROK_BUILD_LIVE_ATTESTATION.md`](GROK_BUILD_LIVE_ATTESTATION.md). It refuses
+API-key, keychain-key, token-command, compatible-gateway, endpoint, unsafe-file,
+issuer, and model ambiguity. The official `GROK_HOME` cache-location override
+is honored consistently. The campaign gate requires the cached session to
+outlive the selected campaign bound, so the first live path does not depend on
+an invented OAuth client-ID or refresh policy.
 
 Live execution may be enabled only after an OIDC-only resolver attests all of:
 
@@ -158,7 +180,66 @@ Live execution may be enabled only after an OIDC-only resolver attests all of:
 
 Missing authoritative usage or any provider-observer drop makes dependent
 claims indeterminate. Observation presence alone never assigns a provider
-identity. No live campaign was run while adding this lab.
+identity. The bounded-run probe now converts the selected finite Run and its
+metadata-only provider observations into a payload-free
+`grokptah.persistent_agent_capture.v2` artifact. Live execution remains a
+separate explicit step; local validation does not claim that a model call was
+made.
+
+## Live campaign handoff
+
+Run the live campaign from a user-facing Terminal that can both bind a
+loopback listener and reach `cli-chat-proxy.grok.com`. The shell sandbox used
+by some development agents may refuse the loopback bind before the first
+provider request; that result is a harness failure, not provider evidence.
+
+From the certification worktree:
+
+```sh
+cd /Users/chriscase/Documents/GitHub/GrokPtah/.worktrees/cert-codex
+export GROKPTAH_LIVE_CERT=1
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  preflight --repository "$PWD" --live --model grok-build
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  run --repository "$PWD" --live --model grok-build \
+  --probe core-bounded-run-terminal-v1
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  run --repository "$PWD" --live --model grok-build \
+  --probe core-continuation-resume-v1
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  run --repository "$PWD" --live --model grok-build \
+  --probe native-work-to-run-v1
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  run --repository "$PWD" --live --model grok-build \
+  --probe native-permission-park-decisions-v1
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  run --repository "$PWD" --live --model grok-build \
+  --probe native-no-duplicate-run-v1
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  run --repository "$PWD" --live --model grok-build \
+  --probe native-restart-intent-adoption-v1
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  run --repository "$PWD" --live --model grok-build \
+  --probe native-interruption-retry-policy-v1
+```
+
+The preflight must pass OIDC attestation, public-model validation, and service
+startup. Each passing live campaign must produce a report plus a payload-free
+capture artifact whose provider route, model, usage, Run identity, and bounds
+all match. Inspect the sealed report with the `inspect` command before
+considering it certification evidence. Never paste the Grok auth cache, bearer
+token, request body, model prose, or raw provider stream into an issue or
+review. Run the restart and interruption/retry probes as separate campaigns;
+each owns one bounded local restart and must not be combined with another
+restart-dependent probe in the same runtime home.
 
 ## Evidence, interruption, and privacy
 
@@ -219,11 +300,11 @@ failure. A second forced interrupt may terminate with the platform's standard
 | Readiness/capabilities | Implemented | Actual capacity fields and persistence/supervisor error slots are checked; `nativeExecutor` is optional. |
 | Agent identity | Implemented | Two MCP projections after one finite bounded offline seed Run. |
 | Bounded live Run, steer/cancel | Declared, indeterminate without attested live evidence | Never inferred from a service-only Run. |
-| Reconnect/restart/checkpoint | Declared; unimplemented probes are indeterminate | Owned restart only; the MCP external-Run path does not seed the checkpoint required by `ptah_get_persistent_agent`, so the lab does not fabricate that proof or claim implicit invocation resume. |
-| Work | Idempotency/conflict implemented; lifecycle, lease, dependencies, approval declared | Deterministic clock-dependent expiry remains skipped. |
+| Reconnect/restart/checkpoint | Reconnect, owned restart, checkpoint inspection, and explicit continuation implemented | Restart rereads the same terminal Run and event cursor through a fresh MCP session. Service-owned finite Runs persist a verified Agent checkpoint; continuation remains an explicit new finite Run with parent lineage and idempotent replay. |
+| Work | Idempotency/conflict and lifecycle/lease implemented; dependencies and approval declared | Deterministic clock-dependent expiry remains skipped. |
 | Routines | Manual activation implemented; schedule/dedupe/lifecycle/recovery declared | Scheduled timing requires deterministic clock support. |
 | Coordinator/messages | Parent/child implemented; workers/messages/cursors/expiry/scope declared | Fixed message expiry without clock control is skipped. |
-| Native managed execution | Capability present; six probes unimplemented and indeterminate | Public discovery and the nativeExecutor health status are verified, but no generic placeholder can pass a native oracle. |
+| Native managed execution | Default-off policy, Work-to-Run, permission parking, duplicate suppression, restart adoption, and interruption retry implemented | Public discovery, default policy, and `nativeExecutor` health are verified. All five live probes use public MCP oracles; restart/retry additionally require an owned local restart and explicit reconnect. Payload-free capture is bound to the separate successful seed Run, while interrupted/failed scenario Runs remain structural evidence. |
 | Soak | Declared, bounded, not implemented by the minimal runner | Existing coordinator/continuity/soak suites remain complementary evidence. |
 
 On the merged native-executor main, discovery looks only for the audited public tools
@@ -238,7 +319,7 @@ authorized through `ptah_authorize_work_execution`; a wrong, dead, or missing
 permission resolution must fail closed and leave its Work parked. A single
 permission is never treated as having transitioned to both decisions.
 
-The `retryEligible=false` probe observes one native failure and its original
+The `retryEligible=false` probe observes one native interruption and its original
 failed attempt, calls `ptah_retry_work`, proves repeated native ticks leave the
 Work queued without attempt 2 or another native Run, and then proves an
 external worker can claim it. `ptah_get_work` supplies the public attempt list

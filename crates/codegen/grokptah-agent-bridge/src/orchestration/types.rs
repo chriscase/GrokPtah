@@ -1,6 +1,7 @@
 //! Shared orchestration types for #196.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1153,8 +1154,8 @@ impl AgentResumePlan {
                 .agent
                 .historical_lane_ids()
                 .contains(&self.checkpoint.session_id)
-            || self.agent.workspace != workspace
-            || self.checkpoint.workspace != workspace
+            || !workspace_identity_matches(&self.agent.workspace, workspace)
+            || !workspace_identity_matches(&self.checkpoint.workspace, workspace)
             || self.checkpoint.agent_id != self.agent.agent_id
             || self.agent.latest_checkpoint_id.as_deref()
                 != Some(self.checkpoint.checkpoint_id.as_str())
@@ -1166,6 +1167,19 @@ impl AgentResumePlan {
             ));
         }
         Ok(())
+    }
+}
+
+fn workspace_identity_matches(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (
+        dunce::canonicalize(Path::new(left)),
+        dunce::canonicalize(Path::new(right)),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 

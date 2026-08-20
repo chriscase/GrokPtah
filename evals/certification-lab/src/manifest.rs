@@ -209,6 +209,7 @@ pub enum ProbeAction {
     ReconnectClient,
     RestartService,
     InspectCheckpoint,
+    ResumePersistentAgent,
     CreateWork,
     InspectWork,
     InspectWorkSet,
@@ -288,6 +289,7 @@ impl ProbeAction {
             Self::CancelRun | Self::InterruptRun => &["ptah_cancel"],
             Self::DisconnectClient | Self::ReconnectClient | Self::RestartService => &[],
             Self::InspectCheckpoint => &["ptah_get_persistent_agent", "ptah_get_run"],
+            Self::ResumePersistentAgent => &["ptah_resume_persistent_agent"],
             Self::CreateWork | Self::CreateDependency | Self::CreateChildWork => {
                 &["ptah_create_work"]
             }
@@ -378,6 +380,7 @@ impl ProbeAction {
                 | Self::ReconnectClient
                 | Self::RestartService
                 | Self::InspectCheckpoint
+                | Self::ResumePersistentAgent
                 | Self::InspectWork
                 | Self::InspectWorkSet
                 | Self::InspectWorkAttempts
@@ -512,6 +515,9 @@ pub enum OracleCode {
     NoLiveLeaseLeak,
     NoLiveCursorLeak,
     RestartReconnectObserved,
+    ContinuationRunCreated,
+    CheckpointUsedForContinuation,
+    ResumeRequestReplayStable,
 }
 
 #[derive(Debug, Deserialize)]
@@ -844,6 +850,7 @@ impl ProbeDefinition {
             if actions.contains(&ProbeAction::InterruptRun) {
                 bail!("retry-ineligible native proof must use a failed Run, not interruption");
             }
+            let restart_induced = actions.contains(&ProbeAction::RestartService);
             for action in [
                 ProbeAction::SubmitManagedWork,
                 ProbeAction::WaitForTerminalRun,
@@ -860,17 +867,35 @@ impl ProbeDefinition {
                     bail!("retry-ineligible native probe lacks public evidence actions");
                 }
             }
-            for (entity, from, to) in [
+            let terminal_run_transition = if restart_induced {
+                (
+                    DurableEntity::Run,
+                    DurableState::Running,
+                    DurableState::Interrupted,
+                )
+            } else {
                 (
                     DurableEntity::Run,
                     DurableState::Running,
                     DurableState::Failed,
-                ),
+                )
+            };
+            let terminal_attempt_transition = if restart_induced {
+                (
+                    DurableEntity::Attempt,
+                    DurableState::Running,
+                    DurableState::Expired,
+                )
+            } else {
                 (
                     DurableEntity::Attempt,
                     DurableState::Running,
                     DurableState::Failed,
-                ),
+                )
+            };
+            for (entity, from, to) in [
+                terminal_run_transition,
+                terminal_attempt_transition,
                 (
                     DurableEntity::ExecutionIntent,
                     DurableState::Admitted,
@@ -1174,6 +1199,7 @@ fn validate_action_sequence(probe: &ProbeDefinition, actions: &HashSet<ProbeActi
         ProbeAction::CancelRun,
         ProbeAction::InterruptRun,
         ProbeAction::InspectCheckpoint,
+        ProbeAction::ResumePersistentAgent,
     ] {
         if let Some(consumer_at) = position(consumer) {
             let Some(submitted_at) = submitted_at else {
@@ -1182,6 +1208,13 @@ fn validate_action_sequence(probe: &ProbeDefinition, actions: &HashSet<ProbeActi
             if submitted_at >= consumer_at {
                 bail!("run-dependent probe action precedes its submission");
             }
+        }
+    }
+    if let Some(resume_at) = position(ProbeAction::ResumePersistentAgent) {
+        let checkpoint_at = position(ProbeAction::InspectCheckpoint)
+            .context("persistent Agent resume has no checkpoint inspection")?;
+        if checkpoint_at >= resume_at {
+            bail!("persistent Agent resume precedes checkpoint inspection");
         }
     }
     if let Some(reconnect_at) = position(ProbeAction::ReconnectClient) {
