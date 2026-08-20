@@ -794,7 +794,9 @@ impl ProviderObservationAttempt {
     }
 
     pub fn notify(&self, observation: ProviderObservation) -> DeliveryDisposition {
-        if observation.attempt_number() != self.attempt_number || observation.scope() != &self.scope
+        if observation.evidence_mode() != self.mode
+            || observation.attempt_number() != self.attempt_number
+            || observation.scope() != &self.scope
         {
             return DeliveryDisposition::Dropped;
         }
@@ -1145,6 +1147,51 @@ mod tests {
                 .notify(observation(1, EvidenceMode::Disabled)),
             DeliveryDisposition::Dropped
         );
+        assert!(recorder.is_empty());
+        assert_eq!(recorder.dropped_count(), 0);
+    }
+
+    #[test]
+    fn attempt_rejects_observations_from_a_different_evidence_mode() {
+        let recorder = InMemoryObservationRecorder::new(2).unwrap();
+        let session = ProviderObservationSession::new(
+            EvidenceMode::MetadataOnly,
+            OpaqueScopeId::new("018f1234-5678-7abc-8def-0123456789ab").unwrap(),
+            recorder.observer(),
+        );
+        let context = session.context("run-mode-check", Uuid::nil()).unwrap();
+        let attempt = context.begin_attempt().unwrap();
+
+        let mut mismatched = observation(attempt.attempt_number(), EvidenceMode::Disabled);
+        mismatched.scope = attempt.scope().clone();
+        assert_eq!(attempt.notify(mismatched), DeliveryDisposition::Dropped);
+        assert!(recorder.is_empty());
+
+        let mut synthetic = observation(attempt.attempt_number(), EvidenceMode::SyntheticPayloads);
+        synthetic.scope = attempt.scope().clone();
+        assert_eq!(attempt.notify(synthetic), DeliveryDisposition::Dropped);
+        assert!(recorder.is_empty());
+
+        let mut matching = observation(attempt.attempt_number(), EvidenceMode::MetadataOnly);
+        matching.scope = attempt.scope().clone();
+        assert_eq!(attempt.notify(matching), DeliveryDisposition::Delivered);
+        assert_eq!(recorder.len(), 1);
+    }
+
+    #[test]
+    fn disabled_session_rejects_an_enabled_observation_before_the_sink() {
+        let recorder = InMemoryObservationRecorder::new(1).unwrap();
+        let session = ProviderObservationSession::new(
+            EvidenceMode::Disabled,
+            OpaqueScopeId::new("018f1234-5678-7abc-8def-0123456789ab").unwrap(),
+            recorder.observer(),
+        );
+        let context = session.context("run-disabled-mode", Uuid::nil()).unwrap();
+        let attempt = context.begin_attempt().unwrap();
+        let mut enabled = observation(attempt.attempt_number(), EvidenceMode::MetadataOnly);
+        enabled.scope = attempt.scope().clone();
+
+        assert_eq!(attempt.notify(enabled), DeliveryDisposition::Dropped);
         assert!(recorder.is_empty());
         assert_eq!(recorder.dropped_count(), 0);
     }

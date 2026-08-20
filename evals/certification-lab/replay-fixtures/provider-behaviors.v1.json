@@ -1,0 +1,497 @@
+{
+  "schema": "grokptah.certification_structural_replay_fixture.v1",
+  "fixture_id": "provider-behaviors-v1",
+  "kind": "synthetic_behavior",
+  "cases": [
+    {
+      "id": "normal-completion",
+      "catalog_scenario_id": "sse-stream-001",
+      "records": [
+        {
+          "kind": "provider_attempt",
+          "ordinal": 1,
+          "disposition": "completed",
+          "framing": "sse",
+          "usage": {
+            "input_tokens": 3,
+            "output_tokens": 2,
+            "total_tokens": 5,
+            "complete": true
+          }
+        },
+        {
+          "kind": "response_delta",
+          "ordinal": 2,
+          "response_id": 1
+        },
+        {
+          "kind": "response_delta",
+          "ordinal": 3,
+          "response_id": 2
+        },
+        {
+          "kind": "finish",
+          "ordinal": 4,
+          "category": "completed"
+        }
+      ],
+      "expected": {
+        "terminal": "completed",
+        "counters": {
+          "provider_attempts": 1,
+          "tool_calls": 0,
+          "tool_executions": 0,
+          "permission_requests": 0,
+          "response_deltas_applied": 2,
+          "duplicates_ignored": 0,
+          "backoffs": 0,
+          "errors": 0,
+          "total_tokens": 5,
+          "usage_complete": true
+        }
+      }
+    },
+    {
+      "id": "tool-call-then-completion",
+      "catalog_scenario_id": "native-tools-001",
+      "records": [
+        {
+          "kind": "provider_attempt",
+          "ordinal": 1,
+          "disposition": "completed",
+          "framing": "sse",
+          "usage": {
+            "input_tokens": 2,
+            "output_tokens": 2,
+            "total_tokens": 4,
+            "complete": true
+          }
+        },
+        {
+          "kind": "tool_call",
+          "ordinal": 2,
+          "call_id": 1,
+          "tool": "read_fixture",
+          "argument_shape": "empty_object"
+        },
+        {
+          "kind": "tool_result",
+          "ordinal": 3,
+          "call_id": 1,
+          "outcome": "completed"
+        },
+        {
+          "kind": "provider_attempt",
+          "ordinal": 4,
+          "disposition": "completed",
+          "framing": "sse",
+          "usage": {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "complete": true
+          }
+        },
+        {
+          "kind": "response_delta",
+          "ordinal": 5,
+          "response_id": 1
+        },
+        {
+          "kind": "finish",
+          "ordinal": 6,
+          "category": "completed"
+        }
+      ],
+      "expected": {
+        "terminal": "completed",
+        "counters": {
+          "provider_attempts": 2,
+          "tool_calls": 1,
+          "tool_executions": 1,
+          "permission_requests": 0,
+          "response_deltas_applied": 1,
+          "duplicates_ignored": 0,
+          "backoffs": 0,
+          "errors": 0,
+          "total_tokens": 6,
+          "usage_complete": true
+        }
+      }
+    },
+    {
+      "id": "malformed-tool-arguments",
+      "catalog_scenario_id": "native-tools-001",
+      "records": [
+        {
+          "kind": "provider_attempt",
+          "ordinal": 1,
+          "disposition": "completed",
+          "framing": "sse",
+          "usage": {
+            "input_tokens": 2,
+            "output_tokens": 1,
+            "total_tokens": 3,
+            "complete": true
+          }
+        },
+        {
+          "kind": "tool_call",
+          "ordinal": 2,
+          "call_id": 1,
+          "tool": "write_marker",
+          "argument_shape": "malformed_json"
+        },
+        {
+          "kind": "finish",
+          "ordinal": 3,
+          "category": "malformed_tool_arguments"
+        }
+      ],
+      "expected": {
+        "terminal": "malformed_tool_arguments",
+        "counters": {
+          "provider_attempts": 1,
+          "tool_calls": 1,
+          "tool_executions": 0,
+          "permission_requests": 0,
+          "response_deltas_applied": 0,
+          "duplicates_ignored": 0,
+          "backoffs": 0,
+          "errors": 1,
+          "total_tokens": 3,
+          "usage_complete": true
+        }
+      }
+    },
+    {
+      "id": "provider-error",
+      "catalog_scenario_id": "retry-transient-001",
+      "records": [
+        {
+          "kind": "provider_attempt",
+          "ordinal": 1,
+          "disposition": "provider_rejected",
+          "framing": "no_body"
+        },
+        {
+          "kind": "finish",
+          "ordinal": 2,
+          "category": "provider_error"
+        }
+      ],
+      "expected": {
+        "terminal": "provider_error",
+        "counters": {
+          "provider_attempts": 1,
+          "tool_calls": 0,
+          "tool_executions": 0,
+          "permission_requests": 0,
+          "response_deltas_applied": 0,
+          "duplicates_ignored": 0,
+          "backoffs": 0,
+          "errors": 1,
+          "total_tokens": 0,
+          "usage_complete": false
+        }
+      }
+    },
+    {
+      "id": "provider-timeout",
+      "catalog_scenario_id": "retry-transient-001",
+      "records": [
+        {
+          "kind": "provider_attempt",
+          "ordinal": 1,
+          "disposition": "timed_out",
+          "framing": "no_body"
+        },
+        {
+          "kind": "finish",
+          "ordinal": 2,
+          "category": "timeout"
+        }
+      ],
+      "expected": {
+        "terminal": "timeout",
+        "counters": {
+          "provider_attempts": 1,
+          "tool_calls": 0,
+          "tool_executions": 0,
+          "permission_requests": 0,
+          "response_deltas_applied": 0,
+          "duplicates_ignored": 0,
+          "backoffs": 0,
+          "errors": 1,
+          "total_tokens": 0,
+          "usage_complete": false
+        }
+      }
+    },
+    {
+      "id": "provider-interruption",
+      "catalog_scenario_id": "interrupt-recover-001",
+      "records": [
+        {
+          "kind": "provider_attempt",
+          "ordinal": 1,
+          "disposition": "cancelled",
+          "framing": "no_body"
+        },
+        {
+          "kind": "finish",
+          "ordinal": 2,
+          "category": "interrupted"
+        }
+      ],
+      "expected": {
+        "terminal": "interrupted",
+        "counters": {
+          "provider_attempts": 1,
+          "tool_calls": 0,
+          "tool_executions": 0,
+          "permission_requests": 0,
+          "response_deltas_applied": 0,
+          "duplicates_ignored": 0,
+          "backoffs": 0,
+          "errors": 1,
+          "total_tokens": 0,
+          "usage_complete": false
+        }
+      }
+    },
+    {
+      "id": "rate-limit-backoff-recovery",
+      "catalog_scenario_id": "retry-transient-001",
+      "records": [
+        {
+          "kind": "provider_attempt",
+          "ordinal": 1,
+          "disposition": "rate_limited",
+          "framing": "no_body"
+        },
+        {
+          "kind": "backoff",
+          "ordinal": 2,
+          "attempt": 1
+        },
+        {
+          "kind": "provider_attempt",
+          "ordinal": 3,
+          "disposition": "completed",
+          "framing": "sse",
+          "usage": {
+            "input_tokens": 2,
+            "output_tokens": 1,
+            "total_tokens": 3,
+            "complete": true
+          }
+        },
+        {
+          "kind": "response_delta",
+          "ordinal": 4,
+          "response_id": 1
+        },
+        {
+          "kind": "finish",
+          "ordinal": 5,
+          "category": "completed"
+        }
+      ],
+      "expected": {
+        "terminal": "completed",
+        "counters": {
+          "provider_attempts": 2,
+          "tool_calls": 0,
+          "tool_executions": 0,
+          "permission_requests": 0,
+          "response_deltas_applied": 1,
+          "duplicates_ignored": 0,
+          "backoffs": 1,
+          "errors": 1,
+          "total_tokens": 3,
+          "usage_complete": false
+        }
+      }
+    },
+    {
+      "id": "duplicate-response-suppression",
+      "catalog_scenario_id": "sse-stream-001",
+      "records": [
+        {
+          "kind": "provider_attempt",
+          "ordinal": 1,
+          "disposition": "completed",
+          "framing": "sse",
+          "usage": {
+            "input_tokens": 2,
+            "output_tokens": 2,
+            "total_tokens": 4,
+            "complete": true
+          }
+        },
+        {
+          "kind": "response_delta",
+          "ordinal": 2,
+          "response_id": 1
+        },
+        {
+          "kind": "response_delta",
+          "ordinal": 3,
+          "response_id": 1,
+          "duplicate_of": 1
+        },
+        {
+          "kind": "response_delta",
+          "ordinal": 4,
+          "response_id": 2
+        },
+        {
+          "kind": "finish",
+          "ordinal": 5,
+          "category": "completed"
+        }
+      ],
+      "expected": {
+        "terminal": "completed",
+        "counters": {
+          "provider_attempts": 1,
+          "tool_calls": 0,
+          "tool_executions": 0,
+          "permission_requests": 0,
+          "response_deltas_applied": 2,
+          "duplicates_ignored": 1,
+          "backoffs": 0,
+          "errors": 0,
+          "total_tokens": 4,
+          "usage_complete": true
+        }
+      }
+    },
+    {
+      "id": "permission-required-allowed",
+      "catalog_scenario_id": "native-tools-001",
+      "records": [
+        {
+          "kind": "provider_attempt",
+          "ordinal": 1,
+          "disposition": "completed",
+          "framing": "sse",
+          "usage": {
+            "input_tokens": 2,
+            "output_tokens": 1,
+            "total_tokens": 3,
+            "complete": true
+          }
+        },
+        {
+          "kind": "tool_call",
+          "ordinal": 2,
+          "call_id": 1,
+          "tool": "write_marker",
+          "argument_shape": "bounded_object"
+        },
+        {
+          "kind": "permission_required",
+          "ordinal": 3,
+          "call_id": 1,
+          "decision": "allowed"
+        },
+        {
+          "kind": "tool_result",
+          "ordinal": 4,
+          "call_id": 1,
+          "outcome": "completed"
+        },
+        {
+          "kind": "provider_attempt",
+          "ordinal": 5,
+          "disposition": "completed",
+          "framing": "sse",
+          "usage": {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+            "complete": true
+          }
+        },
+        {
+          "kind": "response_delta",
+          "ordinal": 6,
+          "response_id": 1
+        },
+        {
+          "kind": "finish",
+          "ordinal": 7,
+          "category": "completed"
+        }
+      ],
+      "expected": {
+        "terminal": "completed",
+        "counters": {
+          "provider_attempts": 2,
+          "tool_calls": 1,
+          "tool_executions": 1,
+          "permission_requests": 1,
+          "response_deltas_applied": 1,
+          "duplicates_ignored": 0,
+          "backoffs": 0,
+          "errors": 0,
+          "total_tokens": 5,
+          "usage_complete": true
+        }
+      }
+    },
+    {
+      "id": "permission-required-denied",
+      "catalog_scenario_id": "native-tools-001",
+      "records": [
+        {
+          "kind": "provider_attempt",
+          "ordinal": 1,
+          "disposition": "completed",
+          "framing": "sse",
+          "usage": {
+            "input_tokens": 2,
+            "output_tokens": 1,
+            "total_tokens": 3,
+            "complete": true
+          }
+        },
+        {
+          "kind": "tool_call",
+          "ordinal": 2,
+          "call_id": 1,
+          "tool": "write_marker",
+          "argument_shape": "bounded_object"
+        },
+        {
+          "kind": "permission_required",
+          "ordinal": 3,
+          "call_id": 1,
+          "decision": "denied"
+        },
+        {
+          "kind": "finish",
+          "ordinal": 4,
+          "category": "permission_denied"
+        }
+      ],
+      "expected": {
+        "terminal": "permission_denied",
+        "counters": {
+          "provider_attempts": 1,
+          "tool_calls": 1,
+          "tool_executions": 0,
+          "permission_requests": 1,
+          "response_deltas_applied": 0,
+          "duplicates_ignored": 0,
+          "backoffs": 0,
+          "errors": 1,
+          "total_tokens": 3,
+          "usage_complete": true
+        }
+      }
+    }
+  ]
+}

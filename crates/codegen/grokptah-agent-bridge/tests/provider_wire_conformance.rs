@@ -208,6 +208,7 @@ fn synthetic_xai_fixture_has_a_promotable_secret_free_capture() {
     let capture = PersistentAgentCapture {
         schema: PERSISTENT_AGENT_CAPTURE_SCHEMA.into(),
         campaign: CampaignIdentity {
+            campaign_id: format!("opaque-{}", "9".repeat(64)),
             scenario_id: fixture.scenario_id,
             repository_commit: "b6dab133".into(),
             dirty: false,
@@ -223,6 +224,8 @@ fn synthetic_xai_fixture_has_a_promotable_secret_free_capture() {
             .unwrap(),
         },
         budgets: CampaignBudgets {
+            bound_profile: grokptah_agent_bridge::CertificationBoundProfile::Smoke,
+            max_run_tokens: 20_000,
             max_total_tokens: 100_000,
             max_provider_requests: 40,
             max_continuations: 4,
@@ -260,12 +263,33 @@ fn synthetic_xai_fixture_has_a_promotable_secret_free_capture() {
             }),
             latency_millis: 1,
         }],
-        durable_states: Vec::new(),
-        checks: vec![CertificationCheck {
-            name: "fragmented-sse-reassembled".into(),
+        durable_states: vec![grokptah_agent_bridge::DurableStateEvidence {
+            agent_id: format!("opaque-{}", "1".repeat(64)),
+            agent_spec_revision: 1,
+            lane_id: format!("opaque-{}", "2".repeat(64)),
+            run_id: format!("opaque-{}", "3".repeat(64)),
+            parent_run_id: None,
+            checkpoint_id: Some(format!("opaque-{}", "4".repeat(64))),
+            continuation_input_hash: None,
+            continuation_context_hash: None,
+            continuation_fidelity: Some("complete".into()),
+            terminal_state: "completed".into(),
+            stop_cause: None,
+        }],
+        checks: [
+            "ordered_text_or_tool_deltas",
+            "terminal_frame_observed",
+            "authoritative_usage_present",
+            "provider_observation_complete",
+            "provider_attempts_bound_to_durable_run",
+        ]
+        .into_iter()
+        .map(|name| CertificationCheck {
+            name: name.into(),
             passed: true,
             detail_code: "production-provider-path-and-usage-match".into(),
-        }],
+        })
+        .collect(),
     };
     capture
         .validate_for_xai_fixture_promotion_at(&fixture_directory())

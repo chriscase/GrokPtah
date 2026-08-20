@@ -55,10 +55,11 @@ pub use agents_personas::{
 };
 pub use certification::{
     public_xai_endpoint_fingerprint, scan_value_for_forbidden_data, ArtifactReference,
-    AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity, CertificationCheck,
-    CertificationError, CredentialMethodClass, DurableStateEvidence, PersistentAgentCapture,
-    ProviderAttemptEvidence, ProviderDialectClass, ProviderIdentity, ProviderRouteClass,
-    StreamFraming, UsageEvidence, MAX_CAPTURE_ATTEMPTS, MAX_CAPTURE_BYTES, MAX_CAPTURE_CHECKS,
+    AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity,
+    CertificationBoundLimits, CertificationBoundProfile, CertificationCheck, CertificationError,
+    CredentialMethodClass, DurableStateEvidence, PersistentAgentCapture, ProviderAttemptEvidence,
+    ProviderDialectClass, ProviderIdentity, ProviderRouteClass, StreamFraming, UsageEvidence,
+    MAX_CAPTURE_ATTEMPTS, MAX_CAPTURE_BYTES, MAX_CAPTURE_CHECKS, MAX_PROMOTABLE_ARTIFACT_BYTES,
     MAX_RAW_ARTIFACT_BYTES, PERSISTENT_AGENT_CAPTURE_SCHEMA,
 };
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
@@ -124,7 +125,7 @@ pub use mcp_control::{
     start_control_server_with_bind, ControlServerHandle, ControlServerLimits,
 };
 pub use mcp_control_client::{
-    ListedTool, LiveEventFrame, LiveNotification, McpControlClient, McpEventStream,
+    ListedTool, LiveEventFrame, LiveNotification, McpControlClient, McpEventStream, McpRemoteError,
     PtahEventNotification, PtahRecoveryNotification, RunScope, MAX_LIVE_EVENT_FRAME_BYTES,
 };
 /// List MCP tools for the project (spawns stdio servers when allowed).
