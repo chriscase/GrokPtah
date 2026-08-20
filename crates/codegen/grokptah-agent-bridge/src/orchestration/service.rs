@@ -19,6 +19,12 @@ use super::authz::{
     authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
     WorkspaceAllowlist,
 };
+use super::managed::{
+    assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedIntentState,
+    ManagedRetryCause, NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
+    MANAGED_EXECUTION_SCHEMA_VERSION, MAX_MANAGED_MESSAGES,
+};
 use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
 use super::routine::{
     manual_dedupe_key, ActivationCause, ActivationRequest, MissedRunPolicy,
@@ -34,7 +40,7 @@ use super::types::*;
 use super::worker::{reject_privilege_amplification, WorkerHostKind};
 use super::workload::{
     WorkAttempt, WorkAttemptView, WorkDecision, WorkDependency, WorkItem, WorkPolicy, WorkProgress,
-    WorkResult,
+    WorkResult, WorkState,
 };
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
@@ -84,6 +90,8 @@ pub struct OrchestrationService {
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     workload_supervisor: Mutex<Option<WorkloadSupervisor>>,
     routine_supervisor: Mutex<Option<RoutineSupervisor>>,
+    native_executor: Mutex<NativeExecutorStatus>,
+    native_executor_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -253,9 +261,14 @@ impl OrchestrationService {
             scheduler_watcher: Mutex::new(None),
             workload_supervisor: Mutex::new(workload_supervisor),
             routine_supervisor: Mutex::new(routine_supervisor),
+            native_executor: Mutex::new(NativeExecutorStatus::disabled(
+                DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
+            )),
+            native_executor_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
         });
         service.start_scheduler_watcher();
+        service.start_native_executor();
         service
     }
 
@@ -296,6 +309,533 @@ impl OrchestrationService {
         *self.scheduler_watcher.lock() = Some(watcher);
     }
 
+    fn start_native_executor(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        {
+            let mut status = self.native_executor.lock();
+            status.enabled = true;
+            status.interval_ms = DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS;
+            status.started_at = Some(Utc::now());
+        }
+        let service_ref = self.self_ref.clone();
+        let mut events = self.host.subscribe_events();
+        let watcher = runtime.spawn(async move {
+            let mut ticker =
+                tokio::time::interval(Duration::from_millis(DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let Some(service) = service_ref.upgrade() else { break; };
+                        service.drive_native_executor_once().await;
+                    }
+                    update = events.recv() => {
+                        let Some(update) = update else { break; };
+                        let Some(service) = service_ref.upgrade() else { break; };
+                        service.handle_native_executor_event(&update).await;
+                    }
+                }
+            }
+        });
+        *self.native_executor_watcher.lock() = Some(watcher);
+    }
+
+    pub fn native_executor_status(&self) -> NativeExecutorStatus {
+        self.native_executor.lock().clone()
+    }
+
+    pub async fn drive_native_executor_once(&self) {
+        let now = Utc::now();
+        self.native_executor.lock().last_tick_at = Some(now);
+        if let Err(error) = self.recover_and_finalize_managed_intents().await {
+            self.native_executor.lock().last_error = Some(error.to_string());
+            return;
+        }
+        match self.admit_eligible_managed_work().await {
+            Ok(()) => {
+                let mut status = self.native_executor.lock();
+                status.last_success_at = Some(now);
+                status.last_error = None;
+            }
+            Err(error) => {
+                self.native_executor.lock().last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    pub async fn notify_native_executor(&self, update: &crate::events::SessionUpdate) {
+        self.handle_native_executor_event(update).await;
+    }
+
+    async fn handle_native_executor_event(&self, update: &crate::events::SessionUpdate) {
+        let crate::events::SessionUpdate::PermissionRequired {
+            session_id,
+            request,
+        } = update
+        else {
+            return;
+        };
+        let Some(request_run_id) = request.run_id.as_deref() else {
+            return;
+        };
+        let Ok(intents) = self.store.list_managed_intents() else {
+            return;
+        };
+        let Some(mut intent) = intents.into_iter().find(|intent| {
+            intent.session_id == *session_id
+                && intent.run_id.as_deref() == Some(request_run_id)
+                && matches!(
+                    intent.state,
+                    ManagedIntentState::Admitted
+                        | ManagedIntentState::Parked
+                        | ManagedIntentState::Resolving
+                )
+        }) else {
+            return;
+        };
+        let (Some(attempt_id), Some(run_id)) = (&intent.attempt_id, &intent.run_id) else {
+            return;
+        };
+        let secret = self.config.lock().bearer_token.clone();
+        let Ok(Some(attempt)) = self.store.load_work_attempt(attempt_id) else {
+            return;
+        };
+        let token = attempt.lease_token_for_secret(&secret);
+        let reason = format!("permission required: {}", request.tool_name);
+        if self
+            .store
+            .park_work_input(&intent.work_id, attempt_id, &token, &reason)
+            .is_ok()
+        {
+            intent.state = ManagedIntentState::Parked;
+            intent.permission_request_id = Some(request.id.to_string());
+            intent.updated_at = Utc::now();
+            let _ = self.store.save_managed_intent(&intent);
+            let _ = self.store.send_message(
+                super::message::WorkMessage::new(
+                    MessageKind::Question,
+                    "native-executor",
+                    Some(intent.agent_id.clone()),
+                    None,
+                    intent.session_id,
+                    intent.workspace.clone(),
+                    Some(intent.work_id.clone()),
+                    reason,
+                    Some(json!({
+                        "permissionId": request.id,
+                        "toolName": request.tool_name,
+                        "runId": run_id,
+                    })),
+                    Utc::now(),
+                )
+                .unwrap_or_else(|_| {
+                    super::message::WorkMessage::new(
+                        MessageKind::Informational,
+                        "native-executor",
+                        None,
+                        None,
+                        intent.session_id,
+                        intent.workspace.clone(),
+                        Some(intent.work_id.clone()),
+                        "permission required",
+                        None,
+                        Utc::now(),
+                    )
+                    .expect("informational fallback")
+                }),
+            );
+        }
+    }
+
+    async fn recover_and_finalize_managed_intents(&self) -> Result<(), OrchError> {
+        let _ = self.store.recover_managed_finalization_intents();
+        let intents = self.store.list_managed_intents()?;
+        let secret = self.config.lock().bearer_token.clone();
+        for intent in intents {
+            match intent.state {
+                ManagedIntentState::Resolving => {
+                    self.recover_resolving_permission(&intent).await?;
+                }
+                ManagedIntentState::Claiming => {
+                    let recovered = self.store.reconcile_claiming_intent(
+                        &intent.intent_id,
+                        &secret,
+                        Utc::now(),
+                    )?;
+                    if let Some(recovered) = recovered {
+                        if recovered.state == ManagedIntentState::Admitted {
+                            self.finalize_or_heartbeat_intent(&recovered, &secret)
+                                .await?;
+                        }
+                    }
+                }
+                ManagedIntentState::Admitted | ManagedIntentState::Parked => {
+                    self.finalize_or_heartbeat_intent(&intent, &secret).await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn recover_resolving_permission(
+        &self,
+        intent: &ManagedExecutionIntent,
+    ) -> Result<(), OrchError> {
+        // `resolving` means the operator path had not committed Work back to
+        // running. A missing, dead, cancelled, or restart-dropped oneshot is
+        // not proof that `permission_respond` delivered a decision: that call
+        // removes the host entry before send, so a failed signal and a
+        // successful signal look the same after a crash. Fail closed: abort
+        // to `parked` and never unpark from recovery. A live Run is
+        // heartbeated; an interrupted/terminal Run is finalized.
+        let _ = self
+            .store
+            .abort_managed_permission_resolve(&intent.intent_id, Utc::now());
+        let secret = self.config.lock().bearer_token.clone();
+        self.finalize_or_heartbeat_intent(intent, &secret).await
+    }
+
+    async fn finalize_or_heartbeat_intent(
+        &self,
+        intent: &ManagedExecutionIntent,
+        secret: &str,
+    ) -> Result<(), OrchError> {
+        let (Some(attempt_id), Some(run_id)) = (&intent.attempt_id, &intent.run_id) else {
+            let _ = self
+                .store
+                .abandon_managed_intent(&intent.intent_id, Utc::now());
+            return Ok(());
+        };
+        let Some(attempt) = self
+            .store
+            .load_work_attempt(attempt_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(());
+        };
+        let token = attempt.lease_token_for_secret(secret);
+        let Some(run) = self
+            .store
+            .load_run(run_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(());
+        };
+        if run.state == RunState::Interrupted {
+            let retry_eligible = self.managed_retry_eligible(&intent.agent_id);
+            let closed = self.store.close_managed_attempt(
+                &intent.intent_id,
+                retry_eligible,
+                ManagedRetryCause::Interrupted,
+                "managed run interrupted; native executor does not resume the invocation",
+                Utc::now(),
+            )?;
+            if closed.is_some() {
+                self.native_executor.lock().finalized += 1;
+            }
+            return Ok(());
+        }
+        if !run.state.is_terminal() {
+            let _ = self
+                .store
+                .renew_work_lease(&intent.work_id, attempt_id, &token, None);
+            return Ok(());
+        }
+        let summary = run
+            .final_response
+            .clone()
+            .or(run.terminal_result.clone())
+            .unwrap_or_else(|| format!("{:?}", run.state));
+        let result = WorkResult {
+            summary,
+            evidence: Vec::new(),
+            artifacts: Vec::new(),
+            failure: run.error_code.clone(),
+            cancellation_reason: None,
+            completed_at: Utc::now(),
+        };
+        let outcome = match run.state {
+            RunState::Completed => {
+                let outcome = if self
+                    .store
+                    .load_work_item(&intent.work_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|item| item.policy.requires_approval)
+                {
+                    ManagedFinalizationOutcome::AwaitingApproval
+                } else {
+                    ManagedFinalizationOutcome::Completed
+                };
+                self.store
+                    .finalize_managed_intent(
+                        &intent.intent_id,
+                        outcome,
+                        "managed run completed",
+                        Some(result),
+                        Utc::now(),
+                    )
+                    .map(|_| ())
+            }
+            RunState::Cancelled => self
+                .store
+                .finalize_managed_intent(
+                    &intent.intent_id,
+                    ManagedFinalizationOutcome::Cancelled,
+                    "managed run cancelled",
+                    Some(result),
+                    Utc::now(),
+                )
+                .map(|_| ()),
+            _ => {
+                let retry_eligible = self.managed_retry_eligible(&intent.agent_id);
+                self.store
+                    .close_managed_attempt(
+                        &intent.intent_id,
+                        retry_eligible,
+                        ManagedRetryCause::Failed,
+                        result.failure.as_deref().unwrap_or("managed run failed"),
+                        Utc::now(),
+                    )
+                    .map(|_| ())
+            }
+        };
+        if outcome.is_ok() {
+            self.native_executor.lock().finalized += 1;
+        }
+        Ok(())
+    }
+
+    fn managed_retry_eligible(&self, agent_id: &str) -> bool {
+        self.store
+            .load_agent(agent_id)
+            .ok()
+            .flatten()
+            .and_then(|agent| agent.spec)
+            .is_some_and(|spec| spec.managed_execution.retry_eligible)
+    }
+
+    async fn admit_eligible_managed_work(&self) -> Result<(), OrchError> {
+        let items = self
+            .store
+            .list_work_items()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let ceiling = self.config.lock().bounds.clone();
+        let owner = self.agent_owner_id.lock().clone();
+        let secret = self.config.lock().bearer_token.clone();
+        for work in items {
+            if work.state != WorkState::Queued {
+                continue;
+            }
+            if self
+                .store
+                .live_managed_intent_for_work(&work.work_id)?
+                .is_some()
+            {
+                continue;
+            }
+            let Some(agent_id) = work.assigned_agent_id.clone() else {
+                self.native_executor.lock().skipped_manual += 1;
+                continue;
+            };
+            let Ok(Some(agent)) = self.store.load_agent(&agent_id) else {
+                self.native_executor.lock().skipped_ineligible += 1;
+                continue;
+            };
+            let Ok(spec) = agent.current_spec().cloned() else {
+                self.native_executor.lock().skipped_ineligible += 1;
+                continue;
+            };
+            if !spec.managed_execution.enabled {
+                self.native_executor.lock().skipped_manual += 1;
+                continue;
+            }
+            if work.attempt_count >= work.policy.retry.max_attempts {
+                self.native_executor.lock().skipped_ineligible += 1;
+                continue;
+            }
+            if work.attempt_count >= 1 && !spec.managed_execution.retry_eligible {
+                self.native_executor.lock().skipped_ineligible += 1;
+                continue;
+            }
+            let decisions = self.store.list_work_decisions(&work.work_id)?;
+            let live = self.store.live_managed_intents_for_agent(&agent_id)?;
+            let bounds = match managed_execution_eligible(
+                &work, &agent, &spec, &decisions, live, &ceiling,
+            ) {
+                Ok(bounds) => bounds,
+                Err(_) => {
+                    self.native_executor.lock().skipped_ineligible += 1;
+                    continue;
+                }
+            };
+            if let Err(error) = self
+                .admit_one_managed_work(&work, &agent, &spec, bounds, &owner, &secret)
+                .await
+            {
+                let mut status = self.native_executor.lock();
+                status.last_error = Some(error.to_string());
+                status.skipped_ineligible += 1;
+                continue;
+            }
+            self.native_executor.lock().admitted += 1;
+        }
+        Ok(())
+    }
+
+    async fn admit_one_managed_work(
+        &self,
+        work: &WorkItem,
+        agent: &super::types::AgentRecord,
+        spec: &super::types::AgentSpec,
+        bounds: super::types::RunBounds,
+        owner_id: &str,
+        secret: &str,
+    ) -> Result<(), OrchError> {
+        let now = Utc::now();
+        let parent = match &work.parent_work_id {
+            Some(parent_id) => self
+                .store
+                .load_work_item(parent_id)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            None => None,
+        };
+        let page = self
+            .store
+            .list_recent_messages(work.session_id, &work.workspace, None, None, 200)
+            .unwrap_or_else(|_| super::message::MessagePage {
+                messages: Vec::new(),
+                next_seq: 0,
+                retained_from_seq: 1,
+            });
+        let messages = select_relevant_managed_messages(
+            &page.messages,
+            work,
+            &agent.agent_id,
+            Utc::now(),
+            MAX_MANAGED_MESSAGES,
+        );
+        let (prompt, input_hash) = assemble_managed_run_input(
+            work,
+            spec,
+            &bounds,
+            work.attempt_count + 1,
+            parent.as_ref(),
+            &messages,
+            None,
+        )?;
+        let mut intent = ManagedExecutionIntent {
+            schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+            intent_id: Uuid::new_v4().to_string(),
+            agent_id: agent.agent_id.clone(),
+            agent_spec_revision: spec.revision,
+            work_id: work.work_id.clone(),
+            work_revision: work.revision,
+            attempt_id: None,
+            run_id: None,
+            session_id: work.session_id,
+            workspace: work.workspace.clone(),
+            source_routine_id: work.source_routine_id.clone(),
+            source_activation_id: work.source_activation_id.clone(),
+            model_selection_key: spec.model.selection_key.clone(),
+            bounds: bounds.clone(),
+            input_hash,
+            state: ManagedIntentState::Claiming,
+            permission_request_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.store.save_managed_intent(&intent)?;
+        let claim = match self.store.claim_work_with_lease_secret(
+            &work.work_id,
+            &agent.agent_id,
+            None,
+            secret,
+        ) {
+            Ok(claim) => claim,
+            Err(error) => {
+                let _ = self
+                    .store
+                    .abandon_managed_intent(&intent.intent_id, Utc::now());
+                return Err(error);
+            }
+        };
+        intent.attempt_id = Some(claim.attempt.attempt_id.clone());
+        intent.updated_at = Utc::now();
+        self.store.save_managed_intent(&intent)?;
+        let auth = AuthContext {
+            token_id: "native-executor".into(),
+            owner_id: owner_id.to_string(),
+        };
+        let bounds_json = serde_json::to_value(&bounds)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let submitted = match self
+            .submit_task_with_execution_mode_and_queue_parent(
+                &auth,
+                &intent.intent_id,
+                work.session_id,
+                Path::new(&work.workspace),
+                prompt,
+                Some(bounds_json),
+                RunExecutionMode::Shared,
+                false,
+                None,
+                "ptah_native_execute",
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                if self
+                    .store
+                    .find_run_by_request_id(&intent.intent_id)?
+                    .is_some()
+                {
+                    self.store
+                        .reconcile_claiming_intent(&intent.intent_id, secret, Utc::now())?;
+                    return Ok(());
+                }
+                let _ = self.store.release_work(
+                    &work.work_id,
+                    &claim.attempt.attempt_id,
+                    &claim.lease_token,
+                    "managed run admission failed",
+                );
+                let _ = self
+                    .store
+                    .abandon_managed_intent(&intent.intent_id, Utc::now());
+                return Err(error);
+            }
+        };
+        let run_id = submitted["runId"]
+            .as_str()
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Internal, "managed run missing run_id"))?
+            .to_string();
+        self.store.link_work_run(
+            &work.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            &run_id,
+        )?;
+        let _ = self.store.report_work_progress(
+            &work.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            WorkProgress {
+                summary: "native executor admitted a finite Run".into(),
+                percent: Some(1),
+                updated_at: Utc::now(),
+            },
+        );
+        intent.run_id = Some(run_id);
+        intent.state = ManagedIntentState::Admitted;
+        intent.updated_at = Utc::now();
+        self.store.save_managed_intent(&intent)?;
+        Ok(())
+    }
+
     pub fn bus(&self) -> &EventBus {
         &self.bus
     }
@@ -312,6 +852,10 @@ impl OrchestrationService {
         if let Some(mut supervisor) = supervisor {
             supervisor.stop_and_wait();
         }
+        if let Some(watcher) = self.native_executor_watcher.lock().take() {
+            watcher.abort();
+        }
+        self.native_executor.lock().enabled = false;
     }
 
     pub fn store(&self) -> &OrchStore {
@@ -2981,6 +3525,225 @@ impl OrchestrationService {
         }))
     }
 
+    pub fn set_managed_execution(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        agent_id: &str,
+        policy: ManagedExecutionPolicy,
+    ) -> Result<serde_json::Value, OrchError> {
+        policy.validate()?;
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let _ = self.store.require_agent_in_scope(
+            agent_id,
+            session_id,
+            &claimed.display().to_string(),
+        )?;
+        if policy.enabled && (policy.bounds.max_total_tokens.is_none()) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "managed execution requires a finite token ceiling",
+            ));
+        }
+        let agent = self
+            .store
+            .revise_agent_spec(agent_id, &auth.token_id, |spec| {
+                if policy.enabled && spec.authority.computer_use_allowed {
+                    anyhow::bail!("managed execution cannot grant Computer Use");
+                }
+                if policy.enabled {
+                    spec.authority.bypass_permissions = false;
+                }
+                spec.managed_execution = policy.clone();
+                Ok(())
+            })
+            .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.to_string()))?
+            .ok_or_else(|| {
+                OrchError::new(OrchErrorCode::InvalidRequest, "unknown agent identity")
+            })?;
+        Ok(json!({
+            "agent": agent,
+            "managedExecution": agent.current_spec()?.managed_execution,
+            "policyRevision": agent.current_spec()?.revision,
+        }))
+    }
+
+    pub fn get_managed_execution(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        agent_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let agent = self.store.require_agent_in_scope(
+            agent_id,
+            session_id,
+            &claimed.display().to_string(),
+        )?;
+        Ok(json!({
+            "agentId": agent.agent_id,
+            "managedExecution": agent.current_spec()?.managed_execution,
+            "policyRevision": agent.current_spec()?.revision,
+            "executor": self.native_executor_status(),
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn authorize_work_execution(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        reason: String,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "workId": work_id,
+            "reason": reason,
+            "expectedRevision": expected_revision,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_authorize_work_execution",
+                request_id,
+                session_id,
+                workspace,
+                &payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let (item, decision) = match self.store.authorize_work_execution(
+            work_id,
+            &auth.token_id,
+            None,
+            &reason,
+            expected_revision,
+            Utc::now(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let response = json!({ "work": item, "decision": decision });
+        lease
+            .complete(Some(work_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    pub fn list_execution_intents_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let intents = self
+            .store
+            .list_managed_intents()?
+            .into_iter()
+            .filter(|intent| {
+                intent.session_id == session_id
+                    && super::workspaces_match(&intent.workspace, &claimed.display().to_string())
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "intents": intents, "executor": self.native_executor_status() }))
+    }
+
+    pub fn resolve_work_input(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        permission_id: Uuid,
+        allow: bool,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_mutation_scope(session_id, workspace)?;
+        let claimed_text = claimed.display().to_string();
+        let intent = self.store.inspect_parked_managed_permission(
+            &permission_id.to_string(),
+            session_id,
+            &claimed_text,
+        )?;
+        let pending = self
+            .host
+            .inspect_pending_permission(permission_id)
+            .ok_or_else(|| {
+                OrchError::new(OrchErrorCode::Conflict, "host permission is not pending")
+            })?;
+        if pending.session_id != session_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "permission is outside the requested session workspace",
+            ));
+        }
+        if let Some(run_id) = intent.run_id.as_deref() {
+            if pending.run_id.as_deref() != Some(run_id) {
+                return Err(OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "permission belongs to a different run",
+                ));
+            }
+        }
+        if !pending.receiver_open {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "permission receiver is gone",
+            ));
+        }
+        let resolving = self.store.begin_managed_permission_resolve(
+            &permission_id.to_string(),
+            session_id,
+            &claimed_text,
+            Utc::now(),
+        )?;
+        let decision = if allow {
+            crate::permission::PermissionDecision::Allow
+        } else {
+            crate::permission::PermissionDecision::Deny
+        };
+        if let Err(error) = self.host.permission_respond(permission_id, decision) {
+            let _ = self
+                .store
+                .abort_managed_permission_resolve(&resolving.intent_id, Utc::now());
+            return Err(OrchError::new(OrchErrorCode::Conflict, error.to_string()));
+        }
+        let intent = self.store.resolve_parked_managed_permission(
+            &permission_id.to_string(),
+            session_id,
+            &claimed_text,
+            Utc::now(),
+        )?;
+        Ok(json!({
+            "permissionId": permission_id,
+            "allow": allow,
+            "sessionId": session_id,
+            "workId": intent.work_id,
+            "intentId": intent.intent_id,
+        }))
+    }
+
     pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
         let max = self.host.orchestration_capacity_limit();
         let active = self.host.orchestration_active_count();
@@ -3034,6 +3797,8 @@ impl OrchestrationService {
                 "workloadSupervisor": workload_supervisor,
                 "routineSupervisorError": routine_supervisor_error,
                 "routineSupervisor": routine_supervisor,
+                "nativeExecutorError": self.native_executor.lock().last_error.clone().map(|error| self.bus.redact_text(&error, 500)),
+                "nativeExecutor": self.native_executor.lock().clone(),
             },
         }))
     }

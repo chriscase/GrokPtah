@@ -68,6 +68,9 @@ single-writer supervisor today: hosted deployments gain the same recovery
 semantics, but multi-node ownership still requires the future database-backed
 coordinator boundary described in ADR-002.
 
+Native persistent-Agent execution is a separate, opt-in dispatcher in the same
+process. See [NATIVE_AGENT_EXECUTION.md](NATIVE_AGENT_EXECUTION.md).
+
 ## MCP/service surface
 
 Read tools:

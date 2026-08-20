@@ -6,6 +6,7 @@ import type {
   RemoteSessionTarget,
   RemoteServiceStatus,
 } from "../lib/protocol";
+import { api } from "../lib/api";
 import { StateCard } from "./StateCard";
 
 export type PersistentAgentPanelProps = {
@@ -317,6 +318,27 @@ export function PersistentAgentPanel({
             </div>
             <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 4 }}>
               {agent.model} · {laneIds.length} {laneIds.length === 1 ? "Lane" : "Lanes"} · continuation {agent.continuationOrdinal} · updated {timeLabel(agent.updatedAt)}
+            </div>
+            <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 3 }}>
+              Managed execution: {agent.spec?.managedExecution?.enabled ? "on" : "off"}
+              {!remoteStatus.connected && (
+                <>
+                  {" "}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void api
+                        .persistentAgentSetManagedExecution(
+                          agent.agentId,
+                          !agent.spec?.managedExecution?.enabled,
+                        )
+                        .then(() => onRefresh());
+                    }}
+                  >
+                    {agent.spec?.managedExecution?.enabled ? "Disable" : "Enable"}
+                  </button>
+                </>
+              )}
             </div>
             <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 3, wordBreak: "break-word" }}>
               {agent.workspace}

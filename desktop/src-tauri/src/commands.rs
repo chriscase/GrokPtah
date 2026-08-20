@@ -309,11 +309,7 @@ pub async fn routine_list(
 ) -> Result<Vec<grokptah_agent_bridge::RoutineRecord>, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
     let host = state.host.clone();
-    run_blocking(move || {
-        host.list_routines_for_session(session_id)
-            .map_err(map_err)
-    })
-    .await
+    run_blocking(move || host.list_routines_for_session(session_id).map_err(map_err)).await
 }
 
 #[tauri::command]
@@ -710,6 +706,20 @@ pub async fn persistent_agent_get(
     }
     let host = state.host.clone();
     run_blocking(move || host.get_persistent_agent(&agent_id).map_err(map_err)).await
+}
+
+#[tauri::command]
+pub async fn persistent_agent_set_managed_execution(
+    state: State<'_, AppState>,
+    agent_id: String,
+    enabled: bool,
+) -> Result<Option<grokptah_agent_bridge::AgentRecord>, String> {
+    let host = state.host.clone();
+    run_blocking(move || {
+        host.set_managed_execution(&agent_id, enabled, "desktop-operator")
+            .map_err(map_err)
+    })
+    .await
 }
 
 #[tauri::command]

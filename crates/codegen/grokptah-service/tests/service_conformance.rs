@@ -927,7 +927,10 @@ async fn hosted_service_exposes_the_same_routine_state_as_local_store() {
         )
         .await
         .unwrap();
-    assert_eq!(fired.structured["activation"]["disposition"], "created_work");
+    assert_eq!(
+        fired.structured["activation"]["disposition"],
+        "created_work"
+    );
     let work_id = fired.structured["activation"]["workId"]
         .as_str()
         .unwrap()
@@ -937,7 +940,10 @@ async fn hosted_service_exposes_the_same_routine_state_as_local_store() {
         .get_work_item_snapshot(session_id, &work_id)
         .unwrap()
         .expect("local work");
-    assert_eq!(work.work.source_routine_id.as_deref(), Some(routine_id.as_str()));
+    assert_eq!(
+        work.work.source_routine_id.as_deref(),
+        Some(routine_id.as_str())
+    );
 
     let capacity = client
         .call_tool("ptah_get_capacity", json!({}))
@@ -1005,6 +1011,51 @@ async fn hosted_service_exposes_worker_and_message_state() {
         .unwrap()
         .iter()
         .any(|worker| worker["agentId"] == agent.agent_id));
+    client.close_session().await.unwrap();
+    handle.stop_and_wait().await;
+}
+
+#[tokio::test]
+async fn hosted_service_exposes_native_executor_controls() {
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+    let handle = start_isolated(&env, vec![workspace.clone()], 2).await;
+    let mut client = mcp_client(handle.addr).await;
+    let session_id = create_build_session(&mut client, &workspace, "Native executor").await;
+    let agent = handle
+        .host()
+        .ensure_session_agent(session_id)
+        .expect("persistent agent");
+    let tools = client.list_tools().await.unwrap();
+    for required in [
+        "ptah_set_managed_execution",
+        "ptah_get_managed_execution",
+        "ptah_list_execution_intents",
+    ] {
+        assert!(
+            tools.iter().any(|tool| tool.name == required),
+            "missing {required}"
+        );
+    }
+    let capacity = client
+        .call_tool("ptah_get_capacity", json!({}))
+        .await
+        .unwrap();
+    assert!(capacity.structured["health"]
+        .get("nativeExecutor")
+        .is_some());
+    let inspected = client
+        .call_tool(
+            "ptah_get_managed_execution",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "agent_id": agent.agent_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inspected.structured["managedExecution"]["enabled"], false);
     client.close_session().await.unwrap();
     handle.stop_and_wait().await;
 }

@@ -4,6 +4,7 @@
 
 mod authz;
 mod continuation;
+pub(crate) mod managed;
 mod message;
 mod routine;
 mod service;
@@ -23,6 +24,14 @@ pub use continuation::{
     ContinuationMemoryInput, ContinuationMemoryScope, ContinuationOmission, ContinuationReasonCode,
     ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef,
     CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
+};
+pub use managed::{
+    assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
+    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionIntent,
+    ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedFinalizationRecord,
+    ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause, ManagedWorkMode,
+    NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
+    MANAGED_FINALIZATION_SCHEMA_VERSION, MANAGED_TRUNCATION_MARKER,
 };
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,

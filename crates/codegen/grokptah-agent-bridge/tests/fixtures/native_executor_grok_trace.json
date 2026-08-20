@@ -1,0 +1,30 @@
+{
+  "name": "native-executor-grok-compatible-trace",
+  "secretFree": true,
+  "provider": "xai-compatible",
+  "steps": [
+    {
+      "kind": "tool_call",
+      "name": "read_file",
+      "arguments": { "path": "README.md" }
+    },
+    {
+      "kind": "progress",
+      "summary": "Read the project README",
+      "percent": 40
+    },
+    {
+      "kind": "question",
+      "body": "Which fixture should I use for the remaining check?"
+    },
+    {
+      "kind": "completion",
+      "summary": "Finished the bounded native Work attempt"
+    },
+    {
+      "kind": "provider_failure",
+      "error": "rate_limited",
+      "retry": true
+    }
+  ]
+}

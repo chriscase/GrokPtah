@@ -108,6 +108,7 @@ pub enum WorkDecisionAction {
     Unblock,
     Cancel,
     RequestReview,
+    AuthorizeExecution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +208,9 @@ pub struct WorkPolicy {
     pub requires_approval: bool,
     #[serde(default)]
     pub max_concurrent_attempts: u32,
+    /// Work-level override. Default inherit: Agent policy decides.
+    #[serde(default)]
+    pub managed_execution: super::managed::ManagedWorkMode,
 }
 
 impl Default for WorkPolicy {
@@ -216,6 +220,7 @@ impl Default for WorkPolicy {
             retry: WorkRetryPolicy::default(),
             requires_approval: false,
             max_concurrent_attempts: 1,
+            managed_execution: super::managed::ManagedWorkMode::Inherit,
         }
     }
 }

@@ -957,6 +957,7 @@ mod tests {
             },
             authority: AgentAuthorityPolicy::default(),
             memory: Default::default(),
+            managed_execution: Default::default(),
             created_at: now,
             created_by: "test".into(),
         };
