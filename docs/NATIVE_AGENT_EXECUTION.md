@@ -236,7 +236,23 @@ or its receiver is gone, the call fails and durable state stays parked.
 A failed host signal aborts `resolving` back to `parked`. Replay of an
 already-resolved permission ID is a conflict. Process restart drops
 in-memory pending permissions; resolve then fails honestly rather than
-unparking.
+unparking. Supervisor recovery of `resolving` also fails closed: it aborts
+back to `parked` (and finalizes only if the Run is already
+interrupted/terminal). A missing host entry is not treated as a delivered
+decision, because `permission_respond` removes the in-memory oneshot before
+send.
+
+## Current limitations
+
+- The host still admits **one in-flight turn per session**. Native admission
+  uses the existing `submit_task` path with `allow_queue: false`, so a busy
+  session is `session_busy` rather than a second concurrent turn.
+- Permission oneshots are process memory. They are not restart-durable.
+  Resolution after restart, cancel, or a dead receiver fails closed.
+- Named control-plane credentials remain **operator-equivalent**. They share
+  one service `owner_id` and are not bound to a single Agent.
+- `maxConcurrentRuns` is bounded to **1–4** (default 1). Live intents in
+  `claiming`, `admitted`, `parked`, and `resolving` consume that ceiling.
 
 ## Local versus hosted
 

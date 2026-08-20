@@ -1457,3 +1457,120 @@ async fn resolve_work_input_fails_after_restart_without_host_pending() {
     orch.stop_background_tasks().await;
     client.close_session().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn resolving_dead_oneshot_does_not_unpark_on_recovery() {
+    let (_env, _home, workspace, host, orch, session, agent_id, workspace_text) =
+        boot_native(false).await;
+    let (item, _, run) = seed_admitted_work(
+        orch.store(),
+        session,
+        &workspace_text,
+        &agent_id,
+        RunState::Running,
+        "native-token-308",
+    );
+    let (req, rx) = host
+        .begin_pending_permission(
+            session,
+            Some(run.run_id.as_str()),
+            "write_file",
+            "Allow write?",
+        )
+        .unwrap();
+    orch.notify_native_executor(&SessionUpdate::PermissionRequired {
+        session_id: session,
+        request: req.clone(),
+    })
+    .await;
+    orch.stop_background_tasks().await;
+    orch.store()
+        .begin_managed_permission_resolve(
+            &req.id.to_string(),
+            session,
+            &workspace_text,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    drop(rx);
+    orch.drive_native_executor_once().await;
+    assert_eq!(
+        orch.store()
+            .load_work_item(&item.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::AwaitingInput
+    );
+    assert_eq!(
+        orch.store()
+            .live_managed_intent_for_work(&item.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ManagedIntentState::Parked
+    );
+    let _ = workspace;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn failed_permission_respond_then_recovery_does_not_unpark() {
+    let (_env, _home, workspace, host, orch, session, agent_id, workspace_text) =
+        boot_native(false).await;
+    let (item, _, run) = seed_admitted_work(
+        orch.store(),
+        session,
+        &workspace_text,
+        &agent_id,
+        RunState::Running,
+        "native-token-308",
+    );
+    let (req, rx) = host
+        .begin_pending_permission(
+            session,
+            Some(run.run_id.as_str()),
+            "write_file",
+            "Allow write?",
+        )
+        .unwrap();
+    orch.notify_native_executor(&SessionUpdate::PermissionRequired {
+        session_id: session,
+        request: req.clone(),
+    })
+    .await;
+    orch.stop_background_tasks().await;
+    orch.store()
+        .begin_managed_permission_resolve(
+            &req.id.to_string(),
+            session,
+            &workspace_text,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    drop(rx);
+    assert!(host
+        .permission_respond(req.id, grokptah_agent_bridge::PermissionDecision::Allow)
+        .is_err());
+    assert!(host.inspect_pending_permission(req.id).is_none());
+    orch.drive_native_executor_once().await;
+    assert_eq!(
+        orch.store()
+            .load_work_item(&item.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::AwaitingInput
+    );
+    assert_eq!(
+        orch.store()
+            .live_managed_intent_for_work(&item.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ManagedIntentState::Parked
+    );
+    orch.stop_background_tasks().await;
+    let _ = workspace;
+}

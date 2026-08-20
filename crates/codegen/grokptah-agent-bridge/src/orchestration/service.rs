@@ -483,39 +483,17 @@ impl OrchestrationService {
         &self,
         intent: &ManagedExecutionIntent,
     ) -> Result<(), OrchError> {
-        let Some(permission_id) = intent
-            .permission_request_id
-            .as_deref()
-            .and_then(|value| Uuid::parse_str(value).ok())
-        else {
-            let secret = self.config.lock().bearer_token.clone();
-            return self.finalize_or_heartbeat_intent(intent, &secret).await;
-        };
-        if let Some(pending) = self.host.inspect_pending_permission(permission_id) {
-            if pending.receiver_open {
-                let _ = self
-                    .store
-                    .abort_managed_permission_resolve(&intent.intent_id, Utc::now());
-                return Ok(());
-            }
-        }
+        // `resolving` means the operator path had not committed Work back to
+        // running. A missing, dead, cancelled, or restart-dropped oneshot is
+        // not proof that `permission_respond` delivered a decision: that call
+        // removes the host entry before send, so a failed signal and a
+        // successful signal look the same after a crash. Fail closed: abort
+        // to `parked` and never unpark from recovery. A live Run is
+        // heartbeated; an interrupted/terminal Run is finalized.
+        let _ = self
+            .store
+            .abort_managed_permission_resolve(&intent.intent_id, Utc::now());
         let secret = self.config.lock().bearer_token.clone();
-        if let Some(run_id) = intent.run_id.as_deref() {
-            if let Ok(Some(run)) = self.store.load_run(run_id) {
-                if !run.state.is_terminal() && run.state != RunState::Interrupted {
-                    let claimed = intent.workspace.clone();
-                    if let Some(permission) = intent.permission_request_id.as_deref() {
-                        let _ = self.store.resolve_parked_managed_permission(
-                            permission,
-                            intent.session_id,
-                            &claimed,
-                            Utc::now(),
-                        );
-                    }
-                    return Ok(());
-                }
-            }
-        }
         self.finalize_or_heartbeat_intent(intent, &secret).await
     }
 

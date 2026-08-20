@@ -5952,14 +5952,15 @@ impl AgentHostHandle {
         if pending.tx.is_closed() {
             return Err(anyhow!("permission receiver is gone"));
         }
-        // AlwaysAllow is per-tool only. Global YOLO remains Settings/`set_always_approve`.
-        if decision == PermissionDecision::AlwaysAllow && !pending.tool_name.is_empty() {
-            g.always_allowed_tools.insert(pending.tool_name);
-        }
         pending
             .tx
             .send(decision)
             .map_err(|_| anyhow!("permission receiver is gone"))?;
+        // AlwaysAllow is per-tool only and must not persist if the oneshot
+        // never received the decision. Global YOLO remains Settings/`set_always_approve`.
+        if decision == PermissionDecision::AlwaysAllow && !pending.tool_name.is_empty() {
+            g.always_allowed_tools.insert(pending.tool_name);
+        }
         Ok(())
     }
 
