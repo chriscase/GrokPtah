@@ -1397,7 +1397,7 @@ async fn native_skips_manual_retry_without_mutating() {
             .len(),
         original_attempts
     );
-    let claimed = client
+    let claimed = match client
         .call_tool(
             "ptah_claim_work",
             json!({
@@ -1409,7 +1409,22 @@ async fn native_skips_manual_retry_without_mutating() {
             }),
         )
         .await
-        .unwrap();
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let item = orch.store().load_work_item(&work_id).unwrap().unwrap();
+            let attempts = orch.store().list_work_attempts(Some(&work_id)).unwrap();
+            panic!(
+                "manual claim conflict: {error}; state={:?}; assignment={:?}; assigned_matches={}; attempt_count={}; max_attempts={}; attempt_states={:?}",
+                item.state,
+                item.assignment_status,
+                item.assigned_agent_id.as_deref() == Some(agent.agent_id.as_str()),
+                item.attempt_count,
+                item.policy.retry.max_attempts,
+                attempts.iter().map(|attempt| attempt.state).collect::<Vec<_>>(),
+            );
+        }
+    };
     assert_eq!(claimed.structured["work"]["state"], "leased");
     orch.stop_background_tasks().await;
     client.close_session().await.unwrap();
