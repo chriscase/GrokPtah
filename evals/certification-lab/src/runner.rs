@@ -259,6 +259,8 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
     let manifest =
         CampaignManifest::load_checked(&options.manifest_path, &options.repository_root)?;
     let selected = manifest.select_probes(&options.selected_probe_ids)?;
+    let repository_commit = repository_commit(&options.repository_root)?;
+    let repository_dirty = repository_dirty(&options.repository_root)?;
     if options.runtime_mode == RuntimeMode::Live {
         let selected_duration_seconds = selected.iter().try_fold(0u64, |total, definition| {
             total
@@ -338,8 +340,8 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
         },
         selected_probe_ids,
         catalog_schema: CATALOG_SCHEMA.into(),
-        repository_commit: repository_commit(&options.repository_root)?,
-        repository_dirty: repository_dirty(&options.repository_root)?,
+        repository_commit,
+        repository_dirty,
         started_at: started_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         finished_at: started_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         runtime_mode: options.runtime_mode,
