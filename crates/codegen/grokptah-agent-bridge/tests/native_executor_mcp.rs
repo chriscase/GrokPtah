@@ -1414,8 +1414,13 @@ async fn native_skips_manual_retry_without_mutating() {
         Err(error) => {
             let item = orch.store().load_work_item(&work_id).unwrap().unwrap();
             let attempts = orch.store().list_work_attempts(Some(&work_id)).unwrap();
+            let receipt = orch
+                .store()
+                .load_idempotency("manual-claim-1")
+                .unwrap()
+                .map(|receipt| (receipt.status, receipt.tool, receipt.payload_hash));
             panic!(
-                "manual claim conflict: {error}; state={:?}; assignment={:?}; assigned_matches={}; attempt_count={}; max_attempts={}; attempt_states={:?}",
+                "manual claim conflict: {error}; state={:?}; assignment={:?}; assigned_matches={}; attempt_count={}; max_attempts={}; attempt_states={:?}; receipt={receipt:?}",
                 item.state,
                 item.assignment_status,
                 item.assigned_agent_id.as_deref() == Some(agent.agent_id.as_str()),
