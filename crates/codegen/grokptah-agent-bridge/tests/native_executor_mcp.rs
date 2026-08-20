@@ -1348,6 +1348,19 @@ async fn native_skips_manual_retry_without_mutating() {
             .state,
         ManagedIntentState::Finalized
     );
+    let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    loop {
+        let attempts = orch.store().list_work_attempts(Some(&work_id)).unwrap();
+        if attempts.iter().all(|attempt| !attempt.state.is_active()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < settle_deadline,
+            "native attempt did not settle before manual retry"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        orch.drive_native_executor_once().await;
+    }
     let original_attempts = orch
         .store()
         .list_work_attempts(Some(&work_id))
