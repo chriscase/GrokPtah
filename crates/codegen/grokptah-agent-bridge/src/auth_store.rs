@@ -13,14 +13,16 @@
 //! We also refresh the access token via the OIDC refresh_token when near expiry
 //! or after a 401.
 
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use keyring::Entry;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::types::AuthState;
 
@@ -28,6 +30,24 @@ const SERVICE: &str = "grokptah-desktop";
 const ACCOUNT_API_KEY: &str = "xai-api-key";
 const ACCOUNT_DISPLAY: &str = "display-name";
 const PROVIDER_KEYCHAIN_PREFIX: &str = "keychain:";
+const OIDC_DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
+const REFRESH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REFRESH_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_REFRESH_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_REFRESH_TOKEN_BYTES: usize = 32 * 1024;
+const MAX_REFRESH_EXPIRES_SECONDS: u64 = 24 * 60 * 60;
+
+pub(crate) fn xai_keychain_api_key_state() -> crate::live_attestation::KeychainApiKeyState {
+    let Ok(entry) = Entry::new(SERVICE, ACCOUNT_API_KEY) else {
+        return crate::live_attestation::KeychainApiKeyState::Unknown;
+    };
+    match entry.get_password() {
+        Ok(value) if value.is_empty() => crate::live_attestation::KeychainApiKeyState::Absent,
+        Ok(_) => crate::live_attestation::KeychainApiKeyState::Present,
+        Err(keyring::Error::NoEntry) => crate::live_attestation::KeychainApiKeyState::Absent,
+        Err(_) => crate::live_attestation::KeychainApiKeyState::Unknown,
+    }
+}
 
 /// Header value required by cli-chat-proxy nginx auth (matches xai-grok-cli).
 pub const XAI_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
@@ -186,10 +206,20 @@ fn update_fingerprint_field(digest: &mut Sha256, label: &str, value: Option<&str
 /// Avoid concurrent refresh stampedes (async-friendly).
 static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+pub const GROK_HOME_ENV: &str = "GROK_HOME";
+
+/// Match the official Grok CLI's cache-location override. Keeping this in one
+/// resolver means direct proxy calls, refreshes, and strict certification
+/// attestation cannot silently consult different auth stores.
 pub fn grok_home() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".grok")
+    std::env::var_os(GROK_HOME_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".grok")
+        })
 }
 
 pub fn auth_json_path() -> PathBuf {
@@ -683,171 +713,427 @@ pub fn apply_auth_headers(
     req
 }
 
-/// Refresh access token if missing/near expiry. Best-effort; returns original on failure.
+/// Refresh an OIDC access token near expiry. A refusal is secret-free and
+/// leaves the original credential unchanged; callers may surface only its code.
 pub async fn ensure_fresh_credentials(creds: WireCredentials) -> WireCredentials {
     if !creds.oidc_token_auth {
         return creds;
     }
-    let needs = creds.expires_at.is_none_or(|exp| {
-        // Refresh 5 minutes early (same spirit as CLI proactive refresh).
-        exp < Utc::now() + ChronoDuration::minutes(5)
-    });
+    let needs = creds
+        .expires_at
+        .is_none_or(|exp| exp < Utc::now() + ChronoDuration::minutes(5));
     if !needs {
         return creds;
     }
     match refresh_oidc(&creds).await {
         Ok(fresh) => fresh,
-        Err(e) => {
-            eprintln!("[grokptah] OIDC refresh skipped/failed: {e}");
+        Err(error) => {
+            eprintln!("[grokptah] OIDC refresh refused: {}", error.code());
             creds
         }
     }
 }
 
-/// Force a refresh (e.g. after HTTP 401).
-pub async fn force_refresh(creds: &WireCredentials) -> Result<WireCredentials, String> {
+/// Force a bounded first-party OIDC refresh, for example after HTTP 401.
+pub async fn force_refresh(
+    creds: &WireCredentials,
+) -> Result<WireCredentials, crate::live_attestation::LiveSafetyError> {
     refresh_oidc(creds).await
 }
 
-async fn refresh_oidc(creds: &WireCredentials) -> Result<WireCredentials, String> {
-    let _guard = REFRESH_LOCK.lock().await;
+async fn refresh_oidc(
+    creds: &WireCredentials,
+) -> Result<WireCredentials, crate::live_attestation::LiveSafetyError> {
+    use crate::live_attestation::LiveSafetyError;
 
-    // Re-read disk — another process may have refreshed already.
-    if let Some(disk) = load_grok_build_session() {
-        if disk
-            .expires_at
-            .is_some_and(|exp| exp > Utc::now() + ChronoDuration::minutes(5))
-            && disk.bearer != creds.bearer
-        {
-            return Ok(disk);
-        }
-        // Prefer latest disk material for refresh fields.
-        return refresh_oidc_inner(&disk).await;
+    if !creds.oidc_token_auth {
+        return Err(LiveSafetyError::OidcSessionInvalid);
     }
-    refresh_oidc_inner(creds).await
+    let _guard = REFRESH_LOCK.lock().await;
+    let path = auth_json_path();
+    let material = crate::live_attestation::load_strict_oidc_material(&path, Utc::now())?;
+    if creds.auth_scope.as_deref() != Some(material.scope.as_str())
+        || creds.oidc_client_id.as_deref() != Some(material.client_id.as_str())
+    {
+        return Err(LiveSafetyError::AmbiguousCredentialSource);
+    }
+    let mut disk = creds.clone();
+    disk.bearer = material.access_token;
+    disk.refresh_token = Some(material.refresh_token);
+    disk.oidc_issuer = Some(crate::live_attestation::XAI_OIDC_ISSUER.into());
+    disk.oidc_client_id = Some(material.client_id);
+    disk.auth_scope = Some(material.scope);
+    disk.expires_at = Some(material.expires_at);
+    if disk
+        .expires_at
+        .is_some_and(|expiry| expiry > Utc::now() + ChronoDuration::minutes(5))
+        && disk.bearer != creds.bearer
+    {
+        return Ok(disk);
+    }
+    refresh_oidc_inner(&disk, material.file_device, material.file_inode).await
 }
 
-async fn refresh_oidc_inner(creds: &WireCredentials) -> Result<WireCredentials, String> {
+async fn refresh_oidc_inner(
+    creds: &WireCredentials,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<WireCredentials, crate::live_attestation::LiveSafetyError> {
+    use crate::live_attestation::{LiveSafetyError, XAI_OIDC_ISSUER, XAI_OIDC_TOKEN_ENDPOINT};
+
     let refresh = creds
         .refresh_token
         .as_deref()
-        .ok_or_else(|| "no refresh_token in auth.json — run `grok login`".to_string())?;
-    let issuer = creds.oidc_issuer.as_deref().unwrap_or("https://auth.x.ai");
+        .filter(|value| !value.is_empty() && value.len() <= MAX_REFRESH_TOKEN_BYTES)
+        .ok_or(LiveSafetyError::OidcSessionInvalid)?;
+    let issuer = creds
+        .oidc_issuer
+        .as_deref()
+        .ok_or(LiveSafetyError::OidcSessionInvalid)?;
+    crate::live_attestation::validate_canonical_issuer(issuer)?;
     let client_id = creds
         .oidc_client_id
         .as_deref()
-        .ok_or_else(|| "no oidc_client_id — run `grok login`".to_string())?;
-
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or(LiveSafetyError::ClientPolicyUnavailable)?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+        .connect_timeout(REFRESH_CONNECT_TIMEOUT)
+        .timeout(REFRESH_OPERATION_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| LiveSafetyError::RefreshTransportFailed)?;
 
-    // OIDC discovery
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer.trim_end_matches('/')
-    );
-    let disc: Value = client
-        .get(&discovery_url)
+    let discovery_url = format!("{XAI_OIDC_ISSUER}{OIDC_DISCOVERY_PATH}");
+    let discovery_response = client
+        .get(discovery_url)
         .send()
         .await
-        .map_err(|e| format!("OIDC discovery: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("OIDC discovery status: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("OIDC discovery json: {e}"))?;
-    let token_endpoint = disc
-        .get("token_endpoint")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "discovery missing token_endpoint".to_string())?;
+        .map_err(|_| LiveSafetyError::RefreshTransportFailed)?;
+    let discovery = bounded_refresh_json(discovery_response).await?;
+    validate_discovery_document(&discovery)?;
 
     let mut form = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh),
         ("client_id", client_id),
     ];
-    if let Some(pt) = creds.principal_type.as_deref() {
-        form.push(("principal_type", pt));
+    if let Some(principal_type) = creds.principal_type.as_deref() {
+        if principal_type.len() > 256 {
+            return Err(LiveSafetyError::OidcSessionInvalid);
+        }
+        form.push(("principal_type", principal_type));
     }
-    if let Some(pid) = creds.principal_id.as_deref() {
-        form.push(("principal_id", pid));
+    if let Some(principal_id) = creds.principal_id.as_deref() {
+        if principal_id.len() > 1024 {
+            return Err(LiveSafetyError::OidcSessionInvalid);
+        }
+        form.push(("principal_id", principal_id));
     }
-
-    let resp = client
-        .post(token_endpoint)
+    let token_response = client
+        .post(XAI_OIDC_TOKEN_ENDPOINT)
         .form(&form)
         .send()
         .await
-        .map_err(|e| format!("token refresh request: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("token refresh HTTP {status}: {body}"));
-    }
-    let tokens: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("token refresh json: {e}"))?;
-    let access = tokens
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "no access_token in refresh response".to_string())?;
-    let new_refresh = tokens
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| creds.refresh_token.clone());
+        .map_err(|_| LiveSafetyError::RefreshTransportFailed)?;
+    let tokens = bounded_refresh_json(token_response).await?;
+    let access = bounded_refresh_string(&tokens, "access_token")?;
+    let new_refresh = match tokens.get("refresh_token") {
+        None => refresh.to_owned(),
+        Some(Value::String(value))
+            if !value.is_empty() && value.len() <= MAX_REFRESH_TOKEN_BYTES =>
+        {
+            value.clone()
+        }
+        Some(_) => return Err(LiveSafetyError::RefreshResponseMalformed),
+    };
     let expires_in = tokens
         .get("expires_in")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3600);
-    let expires_at = Utc::now() + ChronoDuration::seconds(expires_in as i64);
-
-    // Persist back into ~/.grok/auth.json so CLI + GrokPtah stay in sync.
-    if let Some(scope) = &creds.auth_scope {
-        if let Err(e) = write_refreshed_auth(scope, access, new_refresh.as_deref(), expires_at) {
-            eprintln!("[grokptah] failed to write refreshed auth.json: {e}");
-        }
-    }
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=MAX_REFRESH_EXPIRES_SECONDS).contains(value))
+        .ok_or(LiveSafetyError::RefreshResponseMalformed)?;
+    let expires_at = Utc::now()
+        + ChronoDuration::seconds(
+            i64::try_from(expires_in).map_err(|_| LiveSafetyError::RefreshResponseMalformed)?,
+        );
+    let scope = creds
+        .auth_scope
+        .as_deref()
+        .ok_or(LiveSafetyError::OidcSessionInvalid)?;
+    write_refreshed_auth_at(
+        &auth_json_path(),
+        expected_device,
+        expected_inode,
+        scope,
+        &creds.bearer,
+        access,
+        Some(&new_refresh),
+        expires_at,
+    )?;
 
     let mut fresh = creds.clone();
-    fresh.bearer = access.to_string();
-    fresh.refresh_token = new_refresh;
+    fresh.bearer = access.to_owned();
+    fresh.refresh_token = Some(new_refresh);
     fresh.expires_at = Some(expires_at);
     Ok(fresh)
 }
 
-fn write_refreshed_auth(
+fn validate_discovery_document(
+    discovery: &Value,
+) -> Result<(), crate::live_attestation::LiveSafetyError> {
+    use crate::live_attestation::LiveSafetyError;
+
+    let issuer = discovery
+        .get("issuer")
+        .and_then(Value::as_str)
+        .ok_or(LiveSafetyError::RefreshResponseMalformed)?;
+    crate::live_attestation::validate_canonical_issuer(issuer)?;
+    let token_endpoint = discovery
+        .get("token_endpoint")
+        .and_then(Value::as_str)
+        .ok_or(LiveSafetyError::RefreshResponseMalformed)?;
+    validate_token_endpoint(token_endpoint)
+}
+
+fn validate_token_endpoint(value: &str) -> Result<(), crate::live_attestation::LiveSafetyError> {
+    use crate::live_attestation::{LiveSafetyError, XAI_OIDC_TOKEN_ENDPOINT};
+
+    let parsed =
+        reqwest::Url::parse(value).map_err(|_| LiveSafetyError::TokenEndpointPolicyUnavailable)?;
+    if value != XAI_OIDC_TOKEN_ENDPOINT
+        || parsed.scheme() != "https"
+        || parsed.host_str() != Some("auth.x.ai")
+        || parsed.port().is_some()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.path() != "/oauth2/token"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(LiveSafetyError::TokenEndpointPolicyUnavailable);
+    }
+    Ok(())
+}
+
+async fn bounded_refresh_json(
+    mut response: reqwest::Response,
+) -> Result<Value, crate::live_attestation::LiveSafetyError> {
+    use crate::live_attestation::LiveSafetyError;
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    validate_refresh_response_metadata(response.status(), content_type, response.content_length())?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| LiveSafetyError::RefreshTransportFailed)?
+    {
+        if body
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > MAX_REFRESH_RESPONSE_BYTES)
+        {
+            return Err(LiveSafetyError::RefreshResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    parse_refresh_json(&body)
+}
+
+fn validate_refresh_response_metadata(
+    status: reqwest::StatusCode,
+    content_type: &str,
+    content_length: Option<u64>,
+) -> Result<(), crate::live_attestation::LiveSafetyError> {
+    use crate::live_attestation::LiveSafetyError;
+
+    if status.is_redirection() || !status.is_success() {
+        return Err(LiveSafetyError::RefreshResponseRefused);
+    }
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return Err(LiveSafetyError::RefreshResponseMalformed);
+    }
+    if content_length.is_some_and(|length| length > MAX_REFRESH_RESPONSE_BYTES as u64) {
+        return Err(LiveSafetyError::RefreshResponseTooLarge);
+    }
+    Ok(())
+}
+
+fn parse_refresh_json(bytes: &[u8]) -> Result<Value, crate::live_attestation::LiveSafetyError> {
+    use crate::live_attestation::LiveSafetyError;
+
+    if bytes.is_empty() || bytes.len() > MAX_REFRESH_RESPONSE_BYTES {
+        return Err(if bytes.len() > MAX_REFRESH_RESPONSE_BYTES {
+            LiveSafetyError::RefreshResponseTooLarge
+        } else {
+            LiveSafetyError::RefreshResponseMalformed
+        });
+    }
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| LiveSafetyError::RefreshResponseMalformed)?;
+    if !value.is_object() {
+        return Err(LiveSafetyError::RefreshResponseMalformed);
+    }
+    Ok(value)
+}
+
+fn bounded_refresh_string<'a>(
+    value: &'a Value,
+    key: &str,
+) -> Result<&'a str, crate::live_attestation::LiveSafetyError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_REFRESH_TOKEN_BYTES)
+        .ok_or(crate::live_attestation::LiveSafetyError::RefreshResponseMalformed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_refreshed_auth_at(
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
     scope: &str,
+    expected_access_token: &str,
     access_token: &str,
     refresh_token: Option<&str>,
     expires_at: DateTime<Utc>,
-) -> Result<(), String> {
-    let path = auth_json_path();
-    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut root: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    let obj = root
-        .as_object_mut()
-        .ok_or_else(|| "auth.json root not object".to_string())?;
-    let entry = obj
-        .get_mut(scope)
-        .and_then(|v| v.as_object_mut())
-        .ok_or_else(|| format!("scope {scope} missing"))?;
-    entry.insert("key".into(), Value::String(access_token.into()));
-    if let Some(rt) = refresh_token {
-        entry.insert("refresh_token".into(), Value::String(rt.into()));
+) -> Result<(), crate::live_attestation::LiveSafetyError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            path,
+            expected_device,
+            expected_inode,
+            scope,
+            expected_access_token,
+            access_token,
+            refresh_token,
+            expires_at,
+        );
+        Err(crate::live_attestation::LiveSafetyError::UnsupportedPlatform)
     }
-    entry.insert("expires_at".into(), Value::String(expires_at.to_rfc3339()));
-    let tmp = path.with_extension("json.tmp");
-    fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    Ok(())
+    #[cfg(unix)]
+    {
+        use crate::live_attestation::LiveSafetyError;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        if access_token.is_empty()
+            || access_token.len() > MAX_REFRESH_TOKEN_BYTES
+            || refresh_token
+                .is_some_and(|value| value.is_empty() || value.len() > MAX_REFRESH_TOKEN_BYTES)
+        {
+            return Err(LiveSafetyError::RefreshResponseMalformed);
+        }
+        let snapshot = crate::live_attestation::read_safe_auth_file(path)?;
+        if snapshot.device != expected_device || snapshot.inode != expected_inode {
+            return Err(LiveSafetyError::CredentialPersistenceRace);
+        }
+        let mut root: Value = serde_json::from_slice(&snapshot.bytes)
+            .map_err(|_| LiveSafetyError::AuthFileMalformed)?;
+        let entry = root
+            .as_object_mut()
+            .and_then(|root| root.get_mut(scope))
+            .and_then(Value::as_object_mut)
+            .ok_or(LiveSafetyError::CredentialPersistenceRace)?;
+        if entry.get("key").and_then(Value::as_str) != Some(expected_access_token) {
+            return Err(LiveSafetyError::CredentialPersistenceRace);
+        }
+        entry.insert("key".into(), Value::String(access_token.into()));
+        if let Some(refresh_token) = refresh_token {
+            entry.insert("refresh_token".into(), Value::String(refresh_token.into()));
+        }
+        entry.insert("expires_at".into(), Value::String(expires_at.to_rfc3339()));
+        let bytes = serde_json::to_vec_pretty(&root)
+            .map_err(|_| LiveSafetyError::CredentialPersistenceFailed)?;
+        if bytes.is_empty() || bytes.len() as u64 > crate::live_attestation::MAX_AUTH_JSON_BYTES {
+            return Err(LiveSafetyError::CredentialPersistenceFailed);
+        }
+        let parent = path
+            .parent()
+            .ok_or(LiveSafetyError::CredentialPersistenceFailed)?;
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(LiveSafetyError::CredentialPersistenceFailed)?;
+        let temp_path = parent.join(format!(
+            ".{file_name}.grokptah-{}.tmp",
+            Uuid::new_v4().simple()
+        ));
+        let mut cleanup = ExactTempCleanup::new(temp_path.clone());
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temp_path)
+            .map_err(|_| LiveSafetyError::CredentialPersistenceFailed)?;
+        temp.write_all(&bytes)
+            .map_err(|_| LiveSafetyError::CredentialPersistenceFailed)?;
+        temp.flush()
+            .map_err(|_| LiveSafetyError::CredentialPersistenceFailed)?;
+        temp.sync_all()
+            .map_err(|_| LiveSafetyError::CredentialPersistenceFailed)?;
+        let metadata = temp
+            .metadata()
+            .map_err(|_| LiveSafetyError::CredentialPersistenceFailed)?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+            || metadata.len() != bytes.len() as u64
+        {
+            return Err(LiveSafetyError::CredentialPersistenceFailed);
+        }
+        drop(temp);
+        let current = crate::live_attestation::read_safe_auth_file(path)?;
+        if current.device != expected_device
+            || current.inode != expected_inode
+            || current.bytes != snapshot.bytes
+        {
+            return Err(LiveSafetyError::CredentialPersistenceRace);
+        }
+        fs::rename(&temp_path, path).map_err(|_| LiveSafetyError::CredentialPersistenceFailed)?;
+        cleanup.disarm();
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| LiveSafetyError::CredentialPersistenceFailed)?;
+        let installed = crate::live_attestation::read_safe_auth_file(path)?;
+        if installed.bytes != bytes {
+            return Err(LiveSafetyError::CredentialPersistenceFailed);
+        }
+        Ok(())
+    }
+}
+
+struct ExactTempCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl ExactTempCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ExactTempCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub fn load_auth_state() -> AuthState {
@@ -1118,5 +1404,199 @@ mod tests {
         );
 
         set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn first_party_refresh_endpoint_policy_is_exact() {
+        assert!(validate_token_endpoint(crate::live_attestation::XAI_OIDC_TOKEN_ENDPOINT).is_ok());
+        for endpoint in [
+            "http://auth.x.ai/oauth2/token",
+            "https://AUTH.X.AI/oauth2/token",
+            "https://auth.x.ai/oauth2/token/",
+            "https://auth.x.ai:443/oauth2/token",
+            "https://auth.x.ai/other",
+            "https://user@auth.x.ai/oauth2/token",
+            "https://auth.x.ai/oauth2/token?next=x",
+            "https://auth.x.ai/oauth2/token#fragment",
+            "https://example.invalid/oauth2/token",
+        ] {
+            assert_eq!(
+                validate_token_endpoint(endpoint),
+                Err(crate::live_attestation::LiveSafetyError::TokenEndpointPolicyUnavailable),
+                "accepted {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_document_binds_issuer_and_token_endpoint() {
+        use crate::live_attestation::{LiveSafetyError, XAI_OIDC_TOKEN_ENDPOINT};
+
+        assert!(validate_discovery_document(&serde_json::json!({
+            "issuer": crate::live_attestation::XAI_OIDC_ISSUER,
+            "token_endpoint": XAI_OIDC_TOKEN_ENDPOINT
+        }))
+        .is_ok());
+        assert_eq!(
+            validate_discovery_document(&serde_json::json!({
+                "issuer": "https://auth.x.ai/",
+                "token_endpoint": XAI_OIDC_TOKEN_ENDPOINT
+            })),
+            Err(LiveSafetyError::IssuerNotCanonical)
+        );
+        assert_eq!(
+            validate_discovery_document(&serde_json::json!({
+                "issuer": crate::live_attestation::XAI_OIDC_ISSUER,
+                "token_endpoint": "https://auth.x.ai/oauth2/token/"
+            })),
+            Err(LiveSafetyError::TokenEndpointPolicyUnavailable)
+        );
+        assert_eq!(
+            validate_discovery_document(&serde_json::json!({})),
+            Err(LiveSafetyError::RefreshResponseMalformed)
+        );
+    }
+
+    #[test]
+    fn refresh_metadata_and_json_are_bounded_and_secret_free() {
+        use crate::live_attestation::LiveSafetyError;
+
+        assert_eq!(
+            validate_refresh_response_metadata(
+                reqwest::StatusCode::FOUND,
+                "application/json",
+                Some(2),
+            ),
+            Err(LiveSafetyError::RefreshResponseRefused)
+        );
+        assert_eq!(
+            validate_refresh_response_metadata(reqwest::StatusCode::OK, "text/html", Some(2),),
+            Err(LiveSafetyError::RefreshResponseMalformed)
+        );
+        assert_eq!(
+            validate_refresh_response_metadata(
+                reqwest::StatusCode::OK,
+                "application/json",
+                Some(MAX_REFRESH_RESPONSE_BYTES as u64 + 1),
+            ),
+            Err(LiveSafetyError::RefreshResponseTooLarge)
+        );
+        assert_eq!(
+            parse_refresh_json(b"not-json"),
+            Err(LiveSafetyError::RefreshResponseMalformed)
+        );
+        assert_eq!(
+            parse_refresh_json(&vec![b'x'; MAX_REFRESH_RESPONSE_BYTES + 1]),
+            Err(LiveSafetyError::RefreshResponseTooLarge)
+        );
+        let rendered = LiveSafetyError::RefreshResponseRefused.to_string();
+        assert_eq!(rendered, "OIDC refresh response was refused");
+        assert!(!rendered.contains("http"));
+        assert!(!rendered.contains("secret"));
+    }
+
+    #[test]
+    fn refresh_transport_limits_are_finite_and_ordered() {
+        assert_eq!(REFRESH_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(REFRESH_OPERATION_TIMEOUT, Duration::from_secs(20));
+        assert!(REFRESH_CONNECT_TIMEOUT < REFRESH_OPERATION_TIMEOUT);
+        assert_eq!(MAX_REFRESH_RESPONSE_BYTES, 64 * 1024);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_refresh_write_preserves_private_file_and_cleans_temp() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let expires_at = Utc::now() + ChronoDuration::hours(1);
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "scope": {
+                    "key": "old-access",
+                    "refresh_token": "old-refresh",
+                    "expires_at": expires_at.to_rfc3339(),
+                    "auth_mode": "oidc",
+                    "oidc_issuer": crate::live_attestation::XAI_OIDC_ISSUER,
+                    "oidc_client_id": "dynamic-client"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let path = dunce::canonicalize(path).unwrap();
+        let snapshot = crate::live_attestation::read_safe_auth_file(&path).unwrap();
+        write_refreshed_auth_at(
+            &path,
+            snapshot.device,
+            snapshot.inode,
+            "scope",
+            "old-access",
+            "new-access",
+            Some("new-refresh"),
+            expires_at + ChronoDuration::hours(1),
+        )
+        .unwrap();
+        let installed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(installed["scope"]["key"], "new-access");
+        assert_eq!(installed["scope"]["refresh_token"], "new-refresh");
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".grokptah-")
+        }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_refresh_write_rejects_replaced_original() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let expires_at = Utc::now() + ChronoDuration::hours(1);
+        let document = |key: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "scope": {
+                    "key": key,
+                    "refresh_token": "refresh",
+                    "expires_at": expires_at.to_rfc3339(),
+                    "auth_mode": "oidc",
+                    "oidc_issuer": crate::live_attestation::XAI_OIDC_ISSUER,
+                    "oidc_client_id": "dynamic-client"
+                }
+            }))
+            .unwrap()
+        };
+        fs::write(&path, document("old-access")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let path = dunce::canonicalize(path).unwrap();
+        let snapshot = crate::live_attestation::read_safe_auth_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, document("replacement-access")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            write_refreshed_auth_at(
+                &path,
+                snapshot.device,
+                snapshot.inode,
+                "scope",
+                "old-access",
+                "new-access",
+                Some("new-refresh"),
+                expires_at,
+            ),
+            Err(crate::live_attestation::LiveSafetyError::CredentialPersistenceRace)
+        );
+        let retained: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(retained["scope"]["key"], "replacement-access");
     }
 }

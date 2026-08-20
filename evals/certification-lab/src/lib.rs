@@ -4,6 +4,7 @@
 //! and mutates product state through [`grokptah_agent_bridge::McpControlClient`].
 
 pub mod artifact;
+pub mod capture;
 pub mod cli;
 pub mod local_service;
 pub mod manifest;

@@ -279,6 +279,10 @@ impl PublicModelId {
         }
         Ok(Self(value.to_owned()))
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for PublicModelId {
@@ -513,6 +517,8 @@ pub struct ProviderObservation {
     route_class: ProviderRouteClass,
     dialect: ProviderDialect,
     credential_method: CredentialMethod,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_binding: Option<OpaqueIdentity>,
     provider: ProviderIdentity,
     method: HttpMethod,
     route: RequestRouteIdentity,
@@ -530,6 +536,37 @@ impl ProviderObservation {
         route_class: ProviderRouteClass,
         dialect: ProviderDialect,
         credential_method: CredentialMethod,
+        provider: ProviderIdentity,
+        route: RequestRouteIdentity,
+        request_header_names: Vec<RequestHeaderName>,
+        response: ResponseMetadata,
+        metrics: AttemptMetrics,
+    ) -> Result<Self, ObservationError> {
+        Self::new_with_binding(
+            evidence_mode,
+            scope,
+            attempt_number,
+            route_class,
+            dialect,
+            credential_method,
+            None,
+            provider,
+            route,
+            request_header_names,
+            response,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_binding(
+        evidence_mode: EvidenceMode,
+        scope: ObservationScope,
+        attempt_number: u32,
+        route_class: ProviderRouteClass,
+        dialect: ProviderDialect,
+        credential_method: CredentialMethod,
+        credential_binding: Option<OpaqueIdentity>,
         provider: ProviderIdentity,
         route: RequestRouteIdentity,
         mut request_header_names: Vec<RequestHeaderName>,
@@ -554,6 +591,7 @@ impl ProviderObservation {
             route_class,
             dialect,
             credential_method,
+            credential_binding,
             provider,
             method: route.method(),
             route,
@@ -574,6 +612,10 @@ impl ProviderObservation {
     pub const fn attempt_number(&self) -> u32 {
         self.attempt_number
     }
+
+    pub fn credential_binding(&self) -> Option<&OpaqueIdentity> {
+        self.credential_binding.as_ref()
+    }
 }
 
 impl fmt::Debug for ProviderObservation {
@@ -586,6 +628,10 @@ impl fmt::Debug for ProviderObservation {
             .field("route_class", &self.route_class)
             .field("dialect", &self.dialect)
             .field("credential_method", &self.credential_method)
+            .field(
+                "credential_binding",
+                &self.credential_binding.as_ref().map(|_| "[opaque]"),
+            )
             .field("provider", &"[redacted]")
             .field("method", &self.method)
             .field("route", &"[redacted]")
@@ -1211,6 +1257,40 @@ mod tests {
             observer.notify(observation(1, EvidenceMode::MetadataOnly)),
             DeliveryDisposition::Panicked
         );
+    }
+
+    #[test]
+    fn opaque_credential_binding_is_retained_without_widening_payloads() {
+        let binding = OpaqueIdentity::new(&format!("opaque-{HASH_B}")).unwrap();
+        let observation = ProviderObservation::new_with_binding(
+            EvidenceMode::MetadataOnly,
+            scope(),
+            1,
+            ProviderRouteClass::GrokBuildProxy,
+            ProviderDialect::GrokBuild,
+            CredentialMethod::GrokBuildOidc,
+            Some(binding.clone()),
+            ProviderIdentity::public(
+                PublicModelId::new("grok-code-fast-1").unwrap(),
+                EndpointFingerprint::new(HASH_A).unwrap(),
+            ),
+            RequestRouteIdentity::public_chat_completions(),
+            vec![RequestHeaderName::Accept],
+            ResponseMetadata::new(
+                Some(200),
+                Some(ResponseContentClass::EventStream),
+                ResponseFraming::ServerSentEvents,
+                AttemptDisposition::Completed,
+            )
+            .unwrap(),
+            AttemptMetrics::new(10, 20, 30, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(observation.credential_binding(), Some(&binding));
+        let serialized = serde_json::to_string(&observation).unwrap();
+        assert!(serialized.contains(&format!("opaque-{HASH_B}")));
+        assert!(!serialized.contains("Bearer"));
+        assert!(!format!("{observation:?}").contains(HASH_B));
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod host_helpers;
 mod instance_lock;
 mod isolation;
 mod lane;
+pub mod live_attestation;
 mod local_tools;
 pub mod mcp_control;
 pub mod mcp_control_client;
@@ -70,6 +71,13 @@ pub use gateway_config::{
     ProviderModel, ProviderProfile, ProviderProfileUpdate,
 };
 pub use isolation::prepare_isolation_cwd;
+pub use live_attestation::{
+    attest_grok_build_oidc, attest_grok_build_oidc_with_min_validity, AuthFileState,
+    ClientPolicyState, LiveAttestationSchema, LiveCredentialAttestation, LiveCredentialClass,
+    LiveEndpointClass, LiveIssuerClass, LiveSafetyError, OverrideState, RedirectPolicyClass,
+    RefreshEndpointPolicyState, GROK_BUILD_ENDPOINT, MAX_AUTH_JSON_BYTES, XAI_OIDC_ISSUER,
+    XAI_OIDC_TOKEN_ENDPOINT,
+};
 pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};
 pub use prompt_queue::{
     PromptQueueBatch, PromptQueueEntry, PromptQueueRunNextResult, PromptQueueSnapshot,
