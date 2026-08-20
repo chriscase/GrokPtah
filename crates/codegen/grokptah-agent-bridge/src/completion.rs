@@ -347,6 +347,7 @@ mod tests {
                 request: crate::permission::PermissionRequest {
                     id: Uuid::new_v4(),
                     session_id,
+                    run_id: Some("run-1".into()),
                     tool_name: "apply_patch".into(),
                     summary: "edit".into(),
                     detail: serde_json::json!({}),

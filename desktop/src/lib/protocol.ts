@@ -684,6 +684,7 @@ export type SessionUpdate =
 export interface PermissionRequest {
   id: string;
   session_id: string;
+  run_id?: string | null;
   tool_name: string;
   summary: string;
   detail: unknown;

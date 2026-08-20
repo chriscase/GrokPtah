@@ -172,8 +172,56 @@ pub enum ManagedIntentState {
     Claiming,
     Admitted,
     Parked,
+    /// Durable commit of a permission resolution is in flight. Counts as live
+    /// capacity until the host oneshot and Work/attempt writes converge.
+    Resolving,
     Finalized,
     Abandoned,
+}
+
+impl ManagedIntentState {
+    pub fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::Claiming | Self::Admitted | Self::Parked | Self::Resolving
+        )
+    }
+}
+
+pub const MANAGED_FINALIZATION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedFinalizationOutcome {
+    Completed,
+    AwaitingApproval,
+    Failed,
+    RetryQueued,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedFinalizationRecord {
+    pub schema_version: u32,
+    pub intent_id: String,
+    pub work_id: String,
+    pub attempt_id: Option<String>,
+    pub outcome: ManagedFinalizationOutcome,
+    pub attempt_state: super::workload::AttemptState,
+    pub work_state: WorkState,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<super::workload::WorkResult>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedFinalizationStage {
+    AfterJournal,
+    AfterAttempt,
+    AfterWork,
+    Complete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

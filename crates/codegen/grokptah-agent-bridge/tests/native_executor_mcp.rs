@@ -10,7 +10,7 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
-    SessionKind,
+    SessionKind, SessionUpdate,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -868,28 +868,7 @@ async fn resolve_work_input_requires_parked_scope() {
     let parked = orch.store().load_work_item(&item.work_id).unwrap().unwrap();
     assert_eq!(parked.state, WorkState::AwaitingInput);
 
-    let allowed = client
-        .call_tool(
-            "ptah_resolve_work_input",
-            json!({
-                "session_id": lane.id,
-                "workspace": workspace_text,
-                "permission_id": permission_id,
-                "allow": true
-            }),
-        )
-        .await
-        .unwrap();
-    assert!(!allowed.is_error);
-    assert_eq!(
-        orch.store()
-            .load_work_item(&item.work_id)
-            .unwrap()
-            .unwrap()
-            .state,
-        WorkState::Running
-    );
-    let replay = client
+    let missing_host = client
         .call_tool(
             "ptah_resolve_work_input",
             json!({
@@ -901,65 +880,17 @@ async fn resolve_work_input_requires_parked_scope() {
         )
         .await
         .unwrap_err();
-    assert!(replay.to_string().contains("409") || replay.to_string().contains("already resolved"));
-
-    let deny_id = Uuid::new_v4();
-    let mut deny_item = WorkItem::new(
-        "native",
-        "Need a denial",
-        lane.id,
-        &workspace_text,
-        "operator",
-        WorkPolicy::default(),
-    )
-    .unwrap();
-    deny_item.assigned_agent_id = Some(agent.agent_id.clone());
-    deny_item.assignment_status = AssignmentStatus::Accepted;
-    orch.store().save_work_item(&deny_item).unwrap();
-    let deny_claim = orch
-        .store()
-        .claim_work_with_lease_secret(
-            &deny_item.work_id,
-            &agent.agent_id,
-            None,
-            "native-token-308",
-        )
-        .unwrap();
-    orch.store()
-        .park_work_input(
-            &deny_item.work_id,
-            &deny_claim.attempt.attempt_id,
-            &deny_claim.lease_token,
-            "permission required",
-        )
-        .unwrap();
-    let mut deny_intent = intent.clone();
-    deny_intent.intent_id = Uuid::new_v4().to_string();
-    deny_intent.work_id = deny_item.work_id.clone();
-    deny_intent.attempt_id = Some(deny_claim.attempt.attempt_id);
-    deny_intent.state = ManagedIntentState::Parked;
-    deny_intent.permission_request_id = Some(deny_id.to_string());
-    orch.store().save_managed_intent(&deny_intent).unwrap();
-    let denied = client
-        .call_tool(
-            "ptah_resolve_work_input",
-            json!({
-                "session_id": lane.id,
-                "workspace": workspace_text,
-                "permission_id": deny_id,
-                "allow": false
-            }),
-        )
-        .await
-        .unwrap();
-    assert!(!denied.is_error);
+    assert!(
+        missing_host.to_string().contains("409")
+            || missing_host.to_string().contains("not pending")
+    );
     assert_eq!(
         orch.store()
-            .load_work_item(&deny_item.work_id)
+            .load_work_item(&item.work_id)
             .unwrap()
             .unwrap()
             .state,
-        WorkState::Running
+        WorkState::AwaitingInput
     );
 
     orch.store()
@@ -992,6 +923,537 @@ async fn resolve_work_input_requires_parked_scope() {
         WorkState::Cancelled
     );
 
+    orch.stop_background_tasks().await;
+    client.close_session().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn permission_from_run_b_does_not_park_work_a() {
+    let (_env, _home, _workspace, host, orch, session, agent_id, workspace_text) =
+        boot_native(false).await;
+    let (work_a, intent_a, run_a) = seed_admitted_work(
+        orch.store(),
+        session,
+        &workspace_text,
+        &agent_id,
+        RunState::Running,
+        "native-token-308",
+    );
+    let (work_b, intent_b, run_b) = seed_admitted_work(
+        orch.store(),
+        session,
+        &workspace_text,
+        &agent_id,
+        RunState::Running,
+        "native-token-308",
+    );
+    let (req, _rx) = host
+        .begin_pending_permission(
+            session,
+            Some(run_b.run_id.as_str()),
+            "write_file",
+            "Allow write?",
+        )
+        .unwrap();
+    orch.notify_native_executor(&SessionUpdate::PermissionRequired {
+        session_id: session,
+        request: req.clone(),
+    })
+    .await;
+    let loaded_a = orch
+        .store()
+        .load_work_item(&work_a.work_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(loaded_a.state, WorkState::AwaitingInput);
+    let loaded_b = orch
+        .store()
+        .load_work_item(&work_b.work_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded_b.state, WorkState::AwaitingInput);
+    assert_eq!(
+        orch.store()
+            .load_managed_intent(&intent_a.intent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ManagedIntentState::Admitted
+    );
+    assert_eq!(
+        orch.store()
+            .load_managed_intent(&intent_b.intent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ManagedIntentState::Parked
+    );
+    let _ = run_a;
+    orch.stop_background_tasks().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn resolve_work_input_uses_real_host_pending() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: false,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let agent = host.ensure_session_agent(lane.id).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orchestration")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let server = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let workspace_text = workspace.path().display().to_string();
+    orch.set_managed_execution(
+        &auth(),
+        lane.id,
+        workspace.path(),
+        &agent.agent_id,
+        retry_policy(false),
+    )
+    .unwrap();
+    let (item, intent, run) = seed_admitted_work(
+        orch.store(),
+        lane.id,
+        &workspace_text,
+        &agent.agent_id,
+        RunState::Running,
+        "native-token-308",
+    );
+    let _ = intent;
+    let (req, rx) = host
+        .begin_pending_permission(
+            lane.id,
+            Some(run.run_id.as_str()),
+            "write_file",
+            "Allow write?",
+        )
+        .unwrap();
+    orch.notify_native_executor(&SessionUpdate::PermissionRequired {
+        session_id: lane.id,
+        request: req.clone(),
+    })
+    .await;
+    let allowed = client
+        .call_tool(
+            "ptah_resolve_work_input",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "permission_id": req.id,
+                "allow": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!allowed.is_error);
+    assert_eq!(
+        rx.await.unwrap(),
+        grokptah_agent_bridge::PermissionDecision::Allow
+    );
+    assert_eq!(
+        orch.store()
+            .load_work_item(&item.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Running
+    );
+    let replay = client
+        .call_tool(
+            "ptah_resolve_work_input",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "permission_id": req.id,
+                "allow": true
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(replay.to_string().contains("409") || replay.to_string().contains("already resolved"));
+
+    let (deny_item, _, deny_run) = seed_admitted_work(
+        orch.store(),
+        lane.id,
+        &workspace_text,
+        &agent.agent_id,
+        RunState::Running,
+        "native-token-308",
+    );
+    let (deny_req, deny_rx) = host
+        .begin_pending_permission(
+            lane.id,
+            Some(deny_run.run_id.as_str()),
+            "write_file",
+            "Allow write?",
+        )
+        .unwrap();
+    orch.notify_native_executor(&SessionUpdate::PermissionRequired {
+        session_id: lane.id,
+        request: deny_req.clone(),
+    })
+    .await;
+    let denied = client
+        .call_tool(
+            "ptah_resolve_work_input",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "permission_id": deny_req.id,
+                "allow": false
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!denied.is_error);
+    assert_eq!(
+        deny_rx.await.unwrap(),
+        grokptah_agent_bridge::PermissionDecision::Deny
+    );
+    assert_eq!(
+        orch.store()
+            .load_work_item(&deny_item.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Running
+    );
+
+    let (drop_item, _, drop_run) = seed_admitted_work(
+        orch.store(),
+        lane.id,
+        &workspace_text,
+        &agent.agent_id,
+        RunState::Running,
+        "native-token-308",
+    );
+    let (drop_req, drop_rx) = host
+        .begin_pending_permission(
+            lane.id,
+            Some(drop_run.run_id.as_str()),
+            "write_file",
+            "Allow write?",
+        )
+        .unwrap();
+    orch.notify_native_executor(&SessionUpdate::PermissionRequired {
+        session_id: lane.id,
+        request: drop_req.clone(),
+    })
+    .await;
+    drop(drop_rx);
+    let dropped = client
+        .call_tool(
+            "ptah_resolve_work_input",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "permission_id": drop_req.id,
+                "allow": true
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(dropped.to_string().contains("receiver") || dropped.to_string().contains("409"));
+    assert_eq!(
+        orch.store()
+            .load_work_item(&drop_item.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::AwaitingInput
+    );
+
+    let (wrong_item, mut wrong_intent, _) = seed_admitted_work(
+        orch.store(),
+        lane.id,
+        &workspace_text,
+        &agent.agent_id,
+        RunState::Running,
+        "native-token-308",
+    );
+    let attempt_id = wrong_intent.attempt_id.clone().unwrap();
+    let token = orch
+        .store()
+        .load_work_attempt(&attempt_id)
+        .unwrap()
+        .unwrap()
+        .lease_token_for_secret("native-token-308");
+    orch.store()
+        .park_work_input(
+            &wrong_item.work_id,
+            &attempt_id,
+            &token,
+            "permission required",
+        )
+        .unwrap();
+    let (wrong_req, _wrong_rx) = host
+        .begin_pending_permission(lane.id, Some("run-other"), "write_file", "Allow write?")
+        .unwrap();
+    wrong_intent.state = ManagedIntentState::Parked;
+    wrong_intent.permission_request_id = Some(wrong_req.id.to_string());
+    orch.store().save_managed_intent(&wrong_intent).unwrap();
+    let wrong = client
+        .call_tool(
+            "ptah_resolve_work_input",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "permission_id": wrong_req.id,
+                "allow": true
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(wrong.to_string().contains("403") || wrong.to_string().contains("different run"));
+    assert_eq!(
+        orch.store()
+            .load_work_item(&wrong_item.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::AwaitingInput
+    );
+
+    orch.stop_background_tasks().await;
+    client.close_session().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn native_skips_manual_retry_without_mutating() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let agent = host.ensure_session_agent(lane.id).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orchestration")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let server = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let workspace_text = workspace.path().display().to_string();
+    orch.set_managed_execution(
+        &auth(),
+        lane.id,
+        workspace.path(),
+        &agent.agent_id,
+        retry_policy(false),
+    )
+    .unwrap();
+    let created = client
+        .call_tool(
+            "ptah_create_work",
+            json!({
+                "request_id": "manual-retry-work",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "kind": "native",
+                "objective": "Fail once, then wait for a manual worker"
+            }),
+        )
+        .await
+        .unwrap();
+    let work_id = created.structured["work"]["workId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .call_tool(
+            "ptah_assign_work",
+            json!({
+                "request_id": "manual-retry-assign",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": work_id,
+                "assigned_agent_id": agent.agent_id
+            }),
+        )
+        .await
+        .unwrap();
+    orch.stop_background_tasks().await;
+    let mut intent = None;
+    for _ in 0..10 {
+        orch.drive_native_executor_once().await;
+        intent = orch
+            .store()
+            .list_managed_intents()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.work_id == work_id);
+        if intent.is_some() {
+            break;
+        }
+    }
+    let intent = intent.expect("native admission");
+    if let Some(run_id) = intent.run_id.as_deref() {
+        if let Ok(Some(mut run)) = orch.store().load_run(run_id) {
+            run.state = RunState::Failed;
+            run.error_code = Some("failed".into());
+            orch.store().save_run(&run).unwrap();
+        }
+    }
+    orch.drive_native_executor_once().await;
+    assert_eq!(
+        orch.store()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Failed
+    );
+    assert_eq!(
+        orch.store()
+            .load_managed_intent(&intent.intent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ManagedIntentState::Finalized
+    );
+    let original_attempts = orch
+        .store()
+        .list_work_attempts(Some(&work_id))
+        .unwrap()
+        .len();
+    let retried = client
+        .call_tool(
+            "ptah_retry_work",
+            json!({
+                "request_id": "manual-retry-1",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": work_id,
+                "reason": "operator wants a manual worker"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.structured["work"]["state"], "queued");
+    for _ in 0..3 {
+        orch.drive_native_executor_once().await;
+    }
+    let still = orch.store().load_work_item(&work_id).unwrap().unwrap();
+    assert_eq!(still.state, WorkState::Queued);
+    assert!(orch
+        .store()
+        .live_managed_intent_for_work(&work_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        orch.store()
+            .list_work_attempts(Some(&work_id))
+            .unwrap()
+            .len(),
+        original_attempts
+    );
+    let claimed = client
+        .call_tool(
+            "ptah_claim_work",
+            json!({
+                "request_id": "manual-claim-1",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": work_id,
+                "agent_id": agent.agent_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.structured["work"]["state"], "leased");
+    orch.stop_background_tasks().await;
+    client.close_session().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn resolve_work_input_fails_after_restart_without_host_pending() {
+    let (_env, _home, workspace, host, orch, session, agent_id, workspace_text) =
+        boot_native(false).await;
+    let server = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let (item, _, run) = seed_admitted_work(
+        orch.store(),
+        session,
+        &workspace_text,
+        &agent_id,
+        RunState::Running,
+        "native-token-308",
+    );
+    let (req, rx) = host
+        .begin_pending_permission(
+            session,
+            Some(run.run_id.as_str()),
+            "write_file",
+            "Allow write?",
+        )
+        .unwrap();
+    orch.notify_native_executor(&SessionUpdate::PermissionRequired {
+        session_id: session,
+        request: req.clone(),
+    })
+    .await;
+    drop(rx);
+    orch.stop_background_tasks().await;
+    drop(orch);
+    let store = host.ensure_orchestration_store().unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let missing = orch
+        .resolve_work_input(&auth(), session, workspace.path(), req.id, true)
+        .unwrap_err();
+    assert_eq!(
+        missing.code,
+        grokptah_agent_bridge::orchestration::OrchErrorCode::Conflict
+    );
+    let work = orch.store().load_work_item(&item.work_id).unwrap().unwrap();
+    assert_ne!(work.state, WorkState::Running);
     orch.stop_background_tasks().await;
     client.close_session().await.unwrap();
 }

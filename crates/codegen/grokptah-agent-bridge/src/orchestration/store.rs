@@ -13,7 +13,9 @@ use parking_lot::Mutex;
 use uuid::Uuid;
 
 use super::managed::{
-    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedIntentState, ManagedRetryCause,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome,
+    ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
+    MANAGED_FINALIZATION_SCHEMA_VERSION,
 };
 use super::message::{MessagePage, WorkMessage, MAX_RETAINED_MESSAGES};
 use super::routine::{
@@ -167,6 +169,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("messages"))?;
         fs::create_dir_all(root.join("worker-presence"))?;
         fs::create_dir_all(root.join("managed-intents"))?;
+        fs::create_dir_all(root.join("managed-finalization"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -215,6 +218,7 @@ impl OrchStore {
         store.recover_agent_activation_intents()?;
         store.recover_finalization_intents()?;
         store.recover_routine_intents()?;
+        store.recover_managed_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
@@ -2253,6 +2257,49 @@ impl OrchStore {
         })
     }
 
+    /// Newest retained messages in deterministic `seq` order.
+    ///
+    /// `list_messages(after_seq=0)` returns the oldest page. Native input
+    /// assembly needs the newest window so relevant instructions past seq 200
+    /// are not dropped from a long-lived Lane.
+    pub fn list_recent_messages(
+        &self,
+        session_id: Uuid,
+        workspace: &str,
+        inbox_agent_id: Option<&str>,
+        outbox_actor: Option<&str>,
+        limit: usize,
+    ) -> Result<MessagePage, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut messages = self.list_messages_unlocked()?;
+        messages.retain(|message| {
+            message.session_id == session_id
+                && workspaces_match(&message.workspace, workspace)
+                && match inbox_agent_id {
+                    Some(agent) => message.to_agent_id.as_deref() == Some(agent),
+                    None => true,
+                }
+                && match outbox_actor {
+                    Some(actor) => {
+                        message.from_actor == actor
+                            || message.from_agent_id.as_deref() == Some(actor)
+                    }
+                    None => true,
+                }
+        });
+        messages.sort_by_key(|message| message.seq);
+        let retained_from_seq = messages.first().map(|message| message.seq).unwrap_or(1);
+        let limit = limit.clamp(1, MAX_RETAINED_MESSAGES);
+        let skip = messages.len().saturating_sub(limit);
+        let messages = messages.into_iter().skip(skip).collect::<Vec<_>>();
+        let next_seq = messages.last().map(|message| message.seq).unwrap_or(0);
+        Ok(MessagePage {
+            messages,
+            next_seq,
+            retained_from_seq,
+        })
+    }
+
     pub fn load_message(&self, message_id: &str) -> Result<Option<WorkMessage>, OrchError> {
         let _guard = self.inner.lock.lock();
         self.load_message_unlocked(message_id)
@@ -2412,15 +2459,7 @@ impl OrchStore {
         Ok(self
             .list_managed_intents()?
             .into_iter()
-            .filter(|intent| {
-                intent.agent_id == agent_id
-                    && matches!(
-                        intent.state,
-                        ManagedIntentState::Claiming
-                            | ManagedIntentState::Admitted
-                            | ManagedIntentState::Parked
-                    )
-            })
+            .filter(|intent| intent.agent_id == agent_id && intent.state.is_live())
             .count())
     }
 
@@ -2428,15 +2467,10 @@ impl OrchStore {
         &self,
         work_id: &str,
     ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
-        Ok(self.list_managed_intents()?.into_iter().find(|intent| {
-            intent.work_id == work_id
-                && matches!(
-                    intent.state,
-                    ManagedIntentState::Claiming
-                        | ManagedIntentState::Admitted
-                        | ManagedIntentState::Parked
-                )
-        }))
+        Ok(self
+            .list_managed_intents()?
+            .into_iter()
+            .find(|intent| intent.work_id == work_id && intent.state.is_live()))
     }
 
     fn managed_intent_path(&self, intent_id: &str) -> Result<PathBuf, OrchError> {
@@ -2644,8 +2678,27 @@ impl OrchStore {
         reason: &str,
         now: chrono::DateTime<Utc>,
     ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
+        self.close_managed_attempt_until(
+            intent_id,
+            retry_eligible,
+            cause,
+            reason,
+            now,
+            ManagedFinalizationStage::Complete,
+        )
+    }
+
+    pub fn close_managed_attempt_until(
+        &self,
+        intent_id: &str,
+        retry_eligible: bool,
+        cause: ManagedRetryCause,
+        reason: &str,
+        now: chrono::DateTime<Utc>,
+        stage: ManagedFinalizationStage,
+    ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
         let _guard = self.inner.lock.lock();
-        let Some(mut intent) = self.load_managed_intent_unlocked(intent_id)? else {
+        let Some(intent) = self.load_managed_intent_unlocked(intent_id)? else {
             return Ok(None);
         };
         if intent.state == ManagedIntentState::Finalized
@@ -2653,57 +2706,264 @@ impl OrchStore {
         {
             return Ok(Some(intent));
         }
-        let mut item = self
+        let item = self
             .load_work_item_unlocked(&intent.work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
-        if let Some(attempt_id) = intent.attempt_id.as_deref() {
+        let attempt = match intent.attempt_id.as_deref() {
+            Some(attempt_id) => self
+                .load_work_attempt_unlocked(attempt_id)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            None => None,
+        };
+        let attempt_number = attempt
+            .as_ref()
+            .map(|value| value.attempt_number)
+            .unwrap_or(item.attempt_count.max(1));
+        let policy = ManagedExecutionPolicy {
+            retry_eligible,
+            ..ManagedExecutionPolicy::default()
+        };
+        let retry = policy.allows_auto_retry(&item, attempt_number.saturating_add(1), cause);
+        let attempt_state = match cause {
+            ManagedRetryCause::Expired | ManagedRetryCause::Interrupted => AttemptState::Expired,
+            ManagedRetryCause::Failed => AttemptState::Failed,
+        };
+        let (outcome, work_state, result) = if item.state == WorkState::Cancelled {
+            (
+                ManagedFinalizationOutcome::Cancelled,
+                WorkState::Cancelled,
+                item.result.clone(),
+            )
+        } else if item.state == WorkState::Succeeded || item.state == WorkState::AwaitingApproval {
+            (
+                if item.state == WorkState::AwaitingApproval {
+                    ManagedFinalizationOutcome::AwaitingApproval
+                } else {
+                    ManagedFinalizationOutcome::Completed
+                },
+                item.state,
+                item.result.clone(),
+            )
+        } else if retry {
+            (
+                ManagedFinalizationOutcome::RetryQueued,
+                WorkState::Queued,
+                None,
+            )
+        } else {
+            (
+                ManagedFinalizationOutcome::Failed,
+                WorkState::Failed,
+                Some(Self::work_failure_result(reason, now)),
+            )
+        };
+        let record = ManagedFinalizationRecord {
+            schema_version: MANAGED_FINALIZATION_SCHEMA_VERSION,
+            intent_id: intent.intent_id.clone(),
+            work_id: intent.work_id.clone(),
+            attempt_id: intent.attempt_id.clone(),
+            outcome,
+            attempt_state,
+            work_state,
+            reason: reason.to_string(),
+            result,
+            created_at: now,
+        };
+        self.apply_managed_finalization_unlocked(&record, stage, now)?;
+        self.load_managed_intent_unlocked(intent_id)
+    }
+
+    pub fn finalize_managed_intent(
+        &self,
+        intent_id: &str,
+        outcome: ManagedFinalizationOutcome,
+        reason: &str,
+        result: Option<WorkResult>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
+        self.finalize_managed_intent_until(
+            intent_id,
+            outcome,
+            reason,
+            result,
+            now,
+            ManagedFinalizationStage::Complete,
+        )
+    }
+
+    pub fn finalize_managed_intent_until(
+        &self,
+        intent_id: &str,
+        outcome: ManagedFinalizationOutcome,
+        reason: &str,
+        result: Option<WorkResult>,
+        now: chrono::DateTime<Utc>,
+        stage: ManagedFinalizationStage,
+    ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(intent) = self.load_managed_intent_unlocked(intent_id)? else {
+            return Ok(None);
+        };
+        if intent.state == ManagedIntentState::Finalized
+            || intent.state == ManagedIntentState::Abandoned
+        {
+            return Ok(Some(intent));
+        }
+        let item = self
+            .load_work_item_unlocked(&intent.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        let (attempt_state, work_state, result) = if item.state == WorkState::Cancelled {
+            (
+                AttemptState::Cancelled,
+                WorkState::Cancelled,
+                item.result.clone(),
+            )
+        } else if item.state == WorkState::Succeeded
+            && outcome != ManagedFinalizationOutcome::Cancelled
+        {
+            (
+                AttemptState::Succeeded,
+                WorkState::Succeeded,
+                item.result.clone(),
+            )
+        } else {
+            match outcome {
+                ManagedFinalizationOutcome::Completed => {
+                    (AttemptState::Succeeded, WorkState::Succeeded, result)
+                }
+                ManagedFinalizationOutcome::AwaitingApproval => (
+                    AttemptState::AwaitingApproval,
+                    WorkState::AwaitingApproval,
+                    result,
+                ),
+                ManagedFinalizationOutcome::Failed => (
+                    AttemptState::Failed,
+                    WorkState::Failed,
+                    result.or_else(|| Some(Self::work_failure_result(reason, now))),
+                ),
+                ManagedFinalizationOutcome::RetryQueued => {
+                    (AttemptState::Failed, WorkState::Queued, None)
+                }
+                ManagedFinalizationOutcome::Cancelled => {
+                    (AttemptState::Cancelled, WorkState::Cancelled, result)
+                }
+            }
+        };
+        let record = ManagedFinalizationRecord {
+            schema_version: MANAGED_FINALIZATION_SCHEMA_VERSION,
+            intent_id: intent.intent_id.clone(),
+            work_id: intent.work_id.clone(),
+            attempt_id: intent.attempt_id.clone(),
+            outcome,
+            attempt_state,
+            work_state,
+            reason: reason.to_string(),
+            result,
+            created_at: now,
+        };
+        self.apply_managed_finalization_unlocked(&record, stage, now)?;
+        self.load_managed_intent_unlocked(intent_id)
+    }
+
+    pub fn recover_managed_finalization_intents(&self) -> anyhow::Result<usize> {
+        let _guard = self.inner.lock.lock();
+        let dir = self.inner.root.join("managed-finalization");
+        if !dir.is_dir() {
+            return Ok(0);
+        }
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                paths.push(path);
+            }
+        }
+        let mut n = 0;
+        for path in paths {
+            let record: ManagedFinalizationRecord =
+                serde_json::from_str(&fs::read_to_string(&path)?)?;
+            self.apply_managed_finalization_unlocked(
+                &record,
+                ManagedFinalizationStage::Complete,
+                Utc::now(),
+            )
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn managed_finalization_path(&self, intent_id: &str) -> Result<PathBuf, OrchError> {
+        Ok(self
+            .inner
+            .root
+            .join("managed-finalization")
+            .join(format!("{}.json", safe_id_filename(intent_id)?)))
+    }
+
+    fn apply_managed_finalization_unlocked(
+        &self,
+        record: &ManagedFinalizationRecord,
+        stage: ManagedFinalizationStage,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), OrchError> {
+        let path = self.managed_finalization_path(&record.intent_id)?;
+        atomic_write_json(&path, record)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if stage == ManagedFinalizationStage::AfterJournal {
+            return Ok(());
+        }
+        if let Some(attempt_id) = record.attempt_id.as_deref() {
             if let Ok(Some(mut attempt)) = self.load_work_attempt_unlocked(attempt_id) {
                 if attempt.state.is_active() {
-                    attempt.state = match cause {
-                        ManagedRetryCause::Expired | ManagedRetryCause::Interrupted => {
-                            AttemptState::Expired
-                        }
-                        ManagedRetryCause::Failed => AttemptState::Failed,
-                    };
-                    attempt.terminal_reason = Some(reason.to_string());
+                    attempt.state = record.attempt_state;
+                    attempt.terminal_reason = Some(record.reason.clone());
+                    if record.result.is_some() {
+                        attempt.result = record.result.clone();
+                    }
                     attempt.updated_at = now;
                     self.save_work_attempt_unlocked(&attempt).map_err(|error| {
-                        OrchError::new(OrchErrorCode::Internal, error.to_string())
-                    })?;
-                    let next_attempt = attempt.attempt_number.saturating_add(1);
-                    let policy = ManagedExecutionPolicy {
-                        retry_eligible,
-                        ..ManagedExecutionPolicy::default()
-                    };
-                    let retry = policy.allows_auto_retry(&item, next_attempt, cause);
-                    if !item.state.is_terminal() {
-                        if retry {
-                            item.state = WorkState::Queued;
-                            item.blocked_reason = None;
-                        } else {
-                            item.state = WorkState::Failed;
-                            item.result = Some(Self::work_failure_result(reason, now));
-                        }
-                        item.bump_at(now);
-                        self.save_work_item_unlocked(&item).map_err(|error| {
-                            OrchError::new(OrchErrorCode::Internal, error.to_string())
-                        })?;
-                    }
-                } else if item.state == WorkState::Queued && !retry_eligible {
-                    item.state = WorkState::Failed;
-                    item.result = Some(Self::work_failure_result(reason, now));
-                    item.bump_at(now);
-                    self.save_work_item_unlocked(&item).map_err(|error| {
                         OrchError::new(OrchErrorCode::Internal, error.to_string())
                     })?;
                 }
             }
         }
-        intent.state = ManagedIntentState::Finalized;
-        intent.updated_at = now;
-        self.save_managed_intent_unlocked(&intent)?;
-        Ok(Some(intent))
+        if stage == ManagedFinalizationStage::AfterAttempt {
+            return Ok(());
+        }
+        if let Ok(Some(mut item)) = self.load_work_item_unlocked(&record.work_id) {
+            let preserve_terminal = item.state == WorkState::Cancelled
+                || item.state == WorkState::Succeeded
+                || item.state == WorkState::AwaitingApproval;
+            if !preserve_terminal {
+                item.state = record.work_state;
+                if record.work_state == WorkState::Queued {
+                    item.blocked_reason = None;
+                    item.result = None;
+                } else if record.result.is_some() {
+                    item.result = record.result.clone();
+                }
+                item.bump_at(now);
+                self.save_work_item_unlocked(&item)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            }
+        }
+        if stage == ManagedFinalizationStage::AfterWork {
+            return Ok(());
+        }
+        if let Some(mut intent) = self.load_managed_intent_unlocked(&record.intent_id)? {
+            if intent.state != ManagedIntentState::Finalized
+                && intent.state != ManagedIntentState::Abandoned
+            {
+                intent.state = ManagedIntentState::Finalized;
+                intent.updated_at = now;
+                self.save_managed_intent_unlocked(&intent)?;
+            }
+        }
+        let _ = fs::remove_file(path);
+        Ok(())
     }
 
     pub fn seal_queued_managed_work(
@@ -2733,16 +2993,24 @@ impl OrchStore {
         Ok(Some(item))
     }
 
-    pub fn resolve_parked_managed_permission(
+    pub fn inspect_parked_managed_permission(
         &self,
         permission_id: &str,
         session_id: Uuid,
         workspace: &str,
-        now: chrono::DateTime<Utc>,
     ) -> Result<ManagedExecutionIntent, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.inspect_parked_managed_permission_unlocked(permission_id, session_id, workspace)
+    }
+
+    fn inspect_parked_managed_permission_unlocked(
+        &self,
+        permission_id: &str,
+        session_id: Uuid,
+        workspace: &str,
+    ) -> Result<ManagedExecutionIntent, OrchError> {
         let intents = self.list_managed_intents_unlocked()?;
-        let Some(mut intent) = intents
+        let Some(intent) = intents
             .into_iter()
             .find(|intent| intent.permission_request_id.as_deref() == Some(permission_id))
         else {
@@ -2757,15 +3025,24 @@ impl OrchStore {
                 "permission is outside the requested session workspace",
             ));
         }
-        if intent.state != ManagedIntentState::Parked {
-            let message = if intent.permission_request_id.as_deref() == Some(permission_id) {
-                "permission is already resolved"
-            } else {
-                "permission is not parked"
-            };
-            return Err(OrchError::new(OrchErrorCode::Conflict, message));
+        match intent.state {
+            ManagedIntentState::Parked | ManagedIntentState::Resolving => {}
+            ManagedIntentState::Admitted | ManagedIntentState::Finalized
+                if intent.permission_request_id.as_deref() == Some(permission_id) =>
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "permission is already resolved",
+                ));
+            }
+            _ => {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "permission is not parked",
+                ));
+            }
         }
-        let mut item = self
+        let item = self
             .load_work_item_unlocked(&intent.work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
@@ -2781,12 +3058,62 @@ impl OrchStore {
                 "work is not awaiting input",
             ));
         }
+        Ok(intent)
+    }
+
+    pub fn begin_managed_permission_resolve(
+        &self,
+        permission_id: &str,
+        session_id: Uuid,
+        workspace: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<ManagedExecutionIntent, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut intent =
+            self.inspect_parked_managed_permission_unlocked(permission_id, session_id, workspace)?;
+        intent.state = ManagedIntentState::Resolving;
+        intent.updated_at = now;
+        self.save_managed_intent_unlocked(&intent)?;
+        Ok(intent)
+    }
+
+    pub fn abort_managed_permission_resolve(
+        &self,
+        intent_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(mut intent) = self.load_managed_intent_unlocked(intent_id)? else {
+            return Ok(None);
+        };
+        if intent.state == ManagedIntentState::Resolving {
+            intent.state = ManagedIntentState::Parked;
+            intent.updated_at = now;
+            self.save_managed_intent_unlocked(&intent)?;
+        }
+        Ok(Some(intent))
+    }
+
+    pub fn resolve_parked_managed_permission(
+        &self,
+        permission_id: &str,
+        session_id: Uuid,
+        workspace: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<ManagedExecutionIntent, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut intent =
+            self.inspect_parked_managed_permission_unlocked(permission_id, session_id, workspace)?;
         let attempt_id = intent.attempt_id.clone().ok_or_else(|| {
             OrchError::new(
                 OrchErrorCode::Conflict,
                 "parked intent is missing an attempt",
             )
         })?;
+        let mut item = self
+            .load_work_item_unlocked(&intent.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
         let mut attempt = self
             .load_work_attempt_unlocked(&attempt_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?

@@ -21,9 +21,9 @@ use super::authz::{
 };
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
-    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedIntentState, ManagedRetryCause,
-    NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
-    MAX_MANAGED_MESSAGES,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedIntentState,
+    ManagedRetryCause, NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
+    MANAGED_EXECUTION_SCHEMA_VERSION, MAX_MANAGED_MESSAGES,
 };
 use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
 use super::routine::{
@@ -364,6 +364,10 @@ impl OrchestrationService {
         }
     }
 
+    pub async fn notify_native_executor(&self, update: &crate::events::SessionUpdate) {
+        self.handle_native_executor_event(update).await;
+    }
+
     async fn handle_native_executor_event(&self, update: &crate::events::SessionUpdate) {
         let crate::events::SessionUpdate::PermissionRequired {
             session_id,
@@ -372,14 +376,20 @@ impl OrchestrationService {
         else {
             return;
         };
+        let Some(request_run_id) = request.run_id.as_deref() else {
+            return;
+        };
         let Ok(intents) = self.store.list_managed_intents() else {
             return;
         };
         let Some(mut intent) = intents.into_iter().find(|intent| {
             intent.session_id == *session_id
+                && intent.run_id.as_deref() == Some(request_run_id)
                 && matches!(
                     intent.state,
-                    ManagedIntentState::Admitted | ManagedIntentState::Parked
+                    ManagedIntentState::Admitted
+                        | ManagedIntentState::Parked
+                        | ManagedIntentState::Resolving
                 )
         }) else {
             return;
@@ -439,10 +449,14 @@ impl OrchestrationService {
     }
 
     async fn recover_and_finalize_managed_intents(&self) -> Result<(), OrchError> {
+        let _ = self.store.recover_managed_finalization_intents();
         let intents = self.store.list_managed_intents()?;
         let secret = self.config.lock().bearer_token.clone();
         for intent in intents {
             match intent.state {
+                ManagedIntentState::Resolving => {
+                    self.recover_resolving_permission(&intent).await?;
+                }
                 ManagedIntentState::Claiming => {
                     let recovered = self.store.reconcile_claiming_intent(
                         &intent.intent_id,
@@ -463,6 +477,46 @@ impl OrchestrationService {
             }
         }
         Ok(())
+    }
+
+    async fn recover_resolving_permission(
+        &self,
+        intent: &ManagedExecutionIntent,
+    ) -> Result<(), OrchError> {
+        let Some(permission_id) = intent
+            .permission_request_id
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok())
+        else {
+            let secret = self.config.lock().bearer_token.clone();
+            return self.finalize_or_heartbeat_intent(intent, &secret).await;
+        };
+        if let Some(pending) = self.host.inspect_pending_permission(permission_id) {
+            if pending.receiver_open {
+                let _ = self
+                    .store
+                    .abort_managed_permission_resolve(&intent.intent_id, Utc::now());
+                return Ok(());
+            }
+        }
+        let secret = self.config.lock().bearer_token.clone();
+        if let Some(run_id) = intent.run_id.as_deref() {
+            if let Ok(Some(run)) = self.store.load_run(run_id) {
+                if !run.state.is_terminal() && run.state != RunState::Interrupted {
+                    let claimed = intent.workspace.clone();
+                    if let Some(permission) = intent.permission_request_id.as_deref() {
+                        let _ = self.store.resolve_parked_managed_permission(
+                            permission,
+                            intent.session_id,
+                            &claimed,
+                            Utc::now(),
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        self.finalize_or_heartbeat_intent(intent, &secret).await
     }
 
     async fn finalize_or_heartbeat_intent(
@@ -525,13 +579,37 @@ impl OrchestrationService {
             completed_at: Utc::now(),
         };
         let outcome = match run.state {
-            RunState::Completed => self
-                .store
-                .complete_work(&intent.work_id, attempt_id, &token, result)
-                .map(|_| ()),
+            RunState::Completed => {
+                let outcome = if self
+                    .store
+                    .load_work_item(&intent.work_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|item| item.policy.requires_approval)
+                {
+                    ManagedFinalizationOutcome::AwaitingApproval
+                } else {
+                    ManagedFinalizationOutcome::Completed
+                };
+                self.store
+                    .finalize_managed_intent(
+                        &intent.intent_id,
+                        outcome,
+                        "managed run completed",
+                        Some(result),
+                        Utc::now(),
+                    )
+                    .map(|_| ())
+            }
             RunState::Cancelled => self
                 .store
-                .cancel_work_checked(&intent.work_id, "managed run cancelled", None)
+                .finalize_managed_intent(
+                    &intent.intent_id,
+                    ManagedFinalizationOutcome::Cancelled,
+                    "managed run cancelled",
+                    Some(result),
+                    Utc::now(),
+                )
                 .map(|_| ()),
             _ => {
                 let retry_eligible = self.managed_retry_eligible(&intent.agent_id);
@@ -547,12 +625,6 @@ impl OrchestrationService {
             }
         };
         if outcome.is_ok() {
-            if run.state == RunState::Completed || run.state == RunState::Cancelled {
-                let mut done = intent.clone();
-                done.state = ManagedIntentState::Finalized;
-                done.updated_at = Utc::now();
-                let _ = self.store.save_managed_intent(&done);
-            }
             self.native_executor.lock().finalized += 1;
         }
         Ok(())
@@ -607,11 +679,6 @@ impl OrchestrationService {
                 continue;
             }
             if work.attempt_count >= 1 && !spec.managed_execution.retry_eligible {
-                let _ = self.store.seal_queued_managed_work(
-                    &work.work_id,
-                    "managed retryEligible forbids another native attempt",
-                    Utc::now(),
-                );
                 self.native_executor.lock().skipped_ineligible += 1;
                 continue;
             }
@@ -659,7 +726,7 @@ impl OrchestrationService {
         };
         let page = self
             .store
-            .list_messages(work.session_id, &work.workspace, 0, None, None, 200)
+            .list_recent_messages(work.session_id, &work.workspace, None, None, 200)
             .unwrap_or_else(|_| super::message::MessagePage {
                 messages: Vec::new(),
                 next_seq: 0,
@@ -3635,10 +3702,42 @@ impl OrchestrationService {
         allow: bool,
     ) -> Result<serde_json::Value, OrchError> {
         let claimed = self.authorize_work_mutation_scope(session_id, workspace)?;
-        let intent = self.store.resolve_parked_managed_permission(
+        let claimed_text = claimed.display().to_string();
+        let intent = self.store.inspect_parked_managed_permission(
             &permission_id.to_string(),
             session_id,
-            &claimed.display().to_string(),
+            &claimed_text,
+        )?;
+        let pending = self
+            .host
+            .inspect_pending_permission(permission_id)
+            .ok_or_else(|| {
+                OrchError::new(OrchErrorCode::Conflict, "host permission is not pending")
+            })?;
+        if pending.session_id != session_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "permission is outside the requested session workspace",
+            ));
+        }
+        if let Some(run_id) = intent.run_id.as_deref() {
+            if pending.run_id.as_deref() != Some(run_id) {
+                return Err(OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "permission belongs to a different run",
+                ));
+            }
+        }
+        if !pending.receiver_open {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "permission receiver is gone",
+            ));
+        }
+        let resolving = self.store.begin_managed_permission_resolve(
+            &permission_id.to_string(),
+            session_id,
+            &claimed_text,
             Utc::now(),
         )?;
         let decision = if allow {
@@ -3646,7 +3745,18 @@ impl OrchestrationService {
         } else {
             crate::permission::PermissionDecision::Deny
         };
-        let _ = self.host.permission_respond(permission_id, decision);
+        if let Err(error) = self.host.permission_respond(permission_id, decision) {
+            let _ = self
+                .store
+                .abort_managed_permission_resolve(&resolving.intent_id, Utc::now());
+            return Err(OrchError::new(OrchErrorCode::Conflict, error.to_string()));
+        }
+        let intent = self.store.resolve_parked_managed_permission(
+            &permission_id.to_string(),
+            session_id,
+            &claimed_text,
+            Utc::now(),
+        )?;
         Ok(json!({
             "permissionId": permission_id,
             "allow": allow,

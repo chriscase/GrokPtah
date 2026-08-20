@@ -5,9 +5,24 @@ use uuid::Uuid;
 pub struct PermissionRequest {
     pub id: Uuid,
     pub session_id: Uuid,
+    /// Durable Run that owns this request when the host has an in-flight turn.
+    /// Native managed execution matches this against `ManagedExecutionIntent.runId`
+    /// and never guesses from session insertion order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub tool_name: String,
     pub summary: String,
     pub detail: serde_json::Value,
+}
+
+/// Non-consuming view of an in-memory host permission oneshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPermissionView {
+    pub request_id: Uuid,
+    pub session_id: Uuid,
+    pub run_id: Option<String>,
+    pub tool_name: String,
+    pub receiver_open: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

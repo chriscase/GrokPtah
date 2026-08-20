@@ -150,7 +150,7 @@ pub use orchestration::{
     DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
     ROUTINE_SCHEMA_VERSION,
 };
-pub use permission::{PermissionDecision, PermissionRequest};
+pub use permission::{PendingPermissionView, PermissionDecision, PermissionRequest};
 pub use run_promotion::RunReview;
 pub use search_engine::{SearchHit, SearchQuery};
 pub use session::{

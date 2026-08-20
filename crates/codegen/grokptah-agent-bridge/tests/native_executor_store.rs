@@ -2,9 +2,10 @@ use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
     select_relevant_managed_messages, AssignmentStatus, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedIntentState, ManagedRetryCause, ManagedWorkMode, MessageKind,
-    OrchErrorCode, OrchStore, RunBounds, RunRecord, RunState, WorkItem, WorkMessage, WorkPolicy,
-    WorkProgress, WorkResult, WorkState, MANAGED_EXECUTION_SCHEMA_VERSION,
+    ManagedExecutionPolicy, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
+    ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, RunBounds, RunRecord, RunState,
+    WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkResult, WorkState,
+    MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
 use tempfile::tempdir;
@@ -984,4 +985,291 @@ fn relevant_context_keeps_newest_work_and_agent_messages() {
     );
     assert_eq!(selected.last().unwrap().seq, 34);
     assert!(selected.first().unwrap().seq > 1);
+}
+
+#[test]
+fn list_recent_messages_reads_the_newest_retained_window() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+    let work = accepted_work(session, "/tmp/ws", "worker-a");
+    store.save_work_item(&work).unwrap();
+    let now = Utc::now();
+    for seq in 1..=500u64 {
+        let work_id = if seq > 400 {
+            Some(work.work_id.clone())
+        } else if seq % 17 == 0 {
+            Some("unrelated".into())
+        } else {
+            None
+        };
+        let kind = if seq == 450 {
+            MessageKind::Question
+        } else {
+            MessageKind::Instruction
+        };
+        let mut message = WorkMessage::new(
+            kind,
+            "actor",
+            None,
+            Some("worker-a".into()),
+            session,
+            "/tmp/ws",
+            work_id,
+            if seq > 400 {
+                format!("late-instruction-{seq}")
+            } else {
+                format!("old-{seq}")
+            },
+            None,
+            now,
+        )
+        .unwrap();
+        if seq == 450 {
+            message.expires_at = Some(now - chrono::Duration::minutes(1));
+        }
+        if seq == 480 || seq == 481 {
+            message.thread_id = Some("dup".into());
+            message.body = "duplicate thread".into();
+        }
+        store.send_message(message).unwrap();
+    }
+    let oldest = store
+        .list_messages(session, "/tmp/ws", 0, None, None, 200)
+        .unwrap();
+    assert!(oldest.messages.last().unwrap().seq <= 200);
+    let newest = store
+        .list_recent_messages(session, "/tmp/ws", None, None, 200)
+        .unwrap();
+    assert!(newest.messages.first().unwrap().seq >= 300);
+    let selected = select_relevant_managed_messages(&newest.messages, &work, "worker-a", now, 16);
+    assert!(selected
+        .iter()
+        .all(|message| message.seq > 400 || message.from_agent_id.is_none()));
+    assert!(selected.iter().any(|message| message.seq > 400));
+    assert!(!selected
+        .iter()
+        .any(|message| message.body.starts_with("old-")));
+    assert!(!selected
+        .iter()
+        .any(|message| message.body == "late-instruction-450"));
+}
+
+fn crash_close_stage(stage: ManagedFinalizationStage) {
+    let home = tempdir().unwrap();
+    let path = home.path().to_path_buf();
+    let session = Uuid::new_v4();
+    let (work_id, intent_id, attempt_id) = {
+        let store = OrchStore::open(&path).unwrap();
+        store
+            .save_agent(&agent("worker-a", "/tmp/ws", session))
+            .unwrap();
+        enable_managed(&store, "worker-a", true);
+        let item = accepted_work(session, "/tmp/ws", "worker-a");
+        store.save_work_item(&item).unwrap();
+        let claim = store
+            .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+            .unwrap();
+        let mut intent = claiming_intent(
+            &item,
+            Some(claim.attempt.attempt_id.clone()),
+            Some("run-int".into()),
+            session,
+        );
+        intent.state = ManagedIntentState::Admitted;
+        store.save_managed_intent(&intent).unwrap();
+        store
+            .close_managed_attempt_until(
+                &intent.intent_id,
+                false,
+                ManagedRetryCause::Interrupted,
+                "interrupted",
+                Utc::now(),
+                stage,
+            )
+            .unwrap();
+        let loaded = store
+            .load_managed_intent(&intent.intent_id)
+            .unwrap()
+            .unwrap();
+        match stage {
+            ManagedFinalizationStage::AfterJournal => {
+                assert_eq!(loaded.state, ManagedIntentState::Admitted);
+                assert!(store
+                    .load_work_attempt(&claim.attempt.attempt_id)
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    .is_active());
+            }
+            ManagedFinalizationStage::AfterAttempt => {
+                assert!(loaded.state.is_live());
+                assert!(!store
+                    .load_work_attempt(&claim.attempt.attempt_id)
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    .is_active());
+            }
+            ManagedFinalizationStage::AfterWork => {
+                assert!(loaded.state.is_live());
+                assert_eq!(
+                    store.load_work_item(&item.work_id).unwrap().unwrap().state,
+                    WorkState::Failed
+                );
+            }
+            ManagedFinalizationStage::Complete => {
+                assert_eq!(loaded.state, ManagedIntentState::Finalized);
+            }
+        }
+        (item.work_id, intent.intent_id, claim.attempt.attempt_id)
+    };
+    let store = OrchStore::open(&path).unwrap();
+    let intent = store.load_managed_intent(&intent_id).unwrap().unwrap();
+    assert_eq!(intent.state, ManagedIntentState::Finalized);
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Failed
+    );
+    assert!(!store
+        .load_work_attempt(&attempt_id)
+        .unwrap()
+        .unwrap()
+        .state
+        .is_active());
+    assert_eq!(store.live_managed_intents_for_agent("worker-a").unwrap(), 0);
+}
+
+#[test]
+fn managed_finalization_converges_after_journal_only_crash() {
+    crash_close_stage(ManagedFinalizationStage::AfterJournal);
+}
+
+#[test]
+fn managed_finalization_converges_after_attempt_write_crash() {
+    crash_close_stage(ManagedFinalizationStage::AfterAttempt);
+}
+
+#[test]
+fn managed_finalization_converges_after_work_write_crash() {
+    crash_close_stage(ManagedFinalizationStage::AfterWork);
+}
+
+#[test]
+fn managed_finalization_complete_is_idempotent() {
+    crash_close_stage(ManagedFinalizationStage::Complete);
+}
+
+#[test]
+fn managed_finalization_preserves_cancelled_work() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    store.save_work_item(&item).unwrap();
+    let claim = store
+        .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+        .unwrap();
+    let mut intent = claiming_intent(
+        &item,
+        Some(claim.attempt.attempt_id.clone()),
+        Some("run-c".into()),
+        session,
+    );
+    intent.state = ManagedIntentState::Admitted;
+    store.save_managed_intent(&intent).unwrap();
+    store
+        .cancel_work(&item.work_id, "operator cancelled")
+        .unwrap();
+    store
+        .close_managed_attempt(
+            &intent.intent_id,
+            true,
+            ManagedRetryCause::Interrupted,
+            "interrupted",
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.load_work_item(&item.work_id).unwrap().unwrap().state,
+        WorkState::Cancelled
+    );
+    assert_eq!(
+        store
+            .load_managed_intent(&intent.intent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ManagedIntentState::Finalized
+    );
+}
+
+#[test]
+fn completed_finalization_converges_after_partial_writes() {
+    let home = tempdir().unwrap();
+    let path = home.path().to_path_buf();
+    let session = Uuid::new_v4();
+    let (work_id, intent_id) = {
+        let store = OrchStore::open(&path).unwrap();
+        store
+            .save_agent(&agent("worker-a", "/tmp/ws", session))
+            .unwrap();
+        let item = accepted_work(session, "/tmp/ws", "worker-a");
+        store.save_work_item(&item).unwrap();
+        let claim = store
+            .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+            .unwrap();
+        let mut intent = claiming_intent(
+            &item,
+            Some(claim.attempt.attempt_id.clone()),
+            Some("run-ok".into()),
+            session,
+        );
+        intent.state = ManagedIntentState::Admitted;
+        store.save_managed_intent(&intent).unwrap();
+        let result = WorkResult {
+            summary: "done".into(),
+            evidence: Vec::new(),
+            artifacts: Vec::new(),
+            failure: None,
+            cancellation_reason: None,
+            completed_at: Utc::now(),
+        };
+        store
+            .finalize_managed_intent_until(
+                &intent.intent_id,
+                grokptah_agent_bridge::orchestration::ManagedFinalizationOutcome::Completed,
+                "completed",
+                Some(result),
+                Utc::now(),
+                ManagedFinalizationStage::AfterAttempt,
+            )
+            .unwrap();
+        assert!(store
+            .load_managed_intent(&intent.intent_id)
+            .unwrap()
+            .unwrap()
+            .state
+            .is_live());
+        (item.work_id, intent.intent_id)
+    };
+    let store = OrchStore::open(&path).unwrap();
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Succeeded
+    );
+    assert_eq!(
+        store
+            .load_managed_intent(&intent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ManagedIntentState::Finalized
+    );
 }

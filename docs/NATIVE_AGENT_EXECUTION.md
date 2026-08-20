@@ -44,9 +44,12 @@ admission and recovery path.
   (`retryFailed` for failed/limit, `retryExpired` for interrupted/expired) and
   `attempt_count < maxAttempts`.
 
-`ManagedExecutionPolicy.allows_auto_retry` is the single predicate. Manual
-`ptah_retry_work` can re-queue a failed item; native admission of that next
-attempt still requires `retryEligible`.
+`ManagedExecutionPolicy.allows_auto_retry` is the single predicate for
+**native auto-admission**. `retryEligible: false` does not rewrite a Work
+item that an operator reopened with `ptah_retry_work`: that item stays
+`queued` and claimable by an external/manual worker. The native supervisor
+skips it without mutating it and without creating another Run. The original
+failed native attempt remains inspectable.
 
 ## Dispatcher ownership
 
@@ -85,10 +88,11 @@ runs for that request ID.
 | `claiming` | Durable intent exists; claim and/or Run admission may still be in flight |
 | `admitted` | A finite Run is linked; the executor heartbeats the lease |
 | `parked` | Run asked for permission; Work and attempt are `awaiting_input` |
+| `resolving` | Operator resolve is in flight; host oneshot not yet committed |
 | `finalized` | Terminal for this intent; does not consume concurrency |
 | `abandoned` | Admission did not commit a Run; any claim was released |
 
-Live concurrency counts only `claiming`, `admitted`, and `parked`.
+Live concurrency counts `claiming`, `admitted`, `parked`, and `resolving`.
 
 ### Admission sequence
 
@@ -158,7 +162,9 @@ source at a character boundary instead of panicking.
 ### Message context
 
 The executor does **not** inject the first 16 messages from the entire Lane.
-It lists a bounded page and then `select_relevant_managed_messages`:
+`list_messages(afterSeq=0)` returns the oldest page, so the supervisor
+loads `list_recent_messages` (the newest retained window, up to 200 of
+the 500 retained records) and then `select_relevant_managed_messages`:
 
 - keep messages whose `workId` is this Work
 - keep messages with no `workId` that are from or to the assigned Agent
@@ -193,7 +199,15 @@ Crash recovery:
 Late completion after lease expiry is rejected. Retry creates a new attempt
 and a new Run only when policy allows. Native admission never loops a
 forbidden retry: queued Work with `attempt_count >= 1` and
-`retryEligible = false` is sealed `failed`.
+`retryEligible = false` is skipped, not sealed, so a manual `ptah_retry_work`
+remains claimable by an external worker.
+
+Completed, failed, cancelled, and interrupted closes write a
+`managed-finalization` journal first, then the attempt, Work, and intent.
+Store open and supervisor ticks replay leftover journals. Replay never
+overwrites cancelled or succeeded Work, always finalizes the intent, and
+releases concurrency. Partial writes (journal only; attempt only; Work
+without intent) converge to the same durable outcome.
 
 ## Approval and input
 
@@ -202,16 +216,27 @@ forbidden retry: queued Work with `attempt_count >= 1` and
 - Permission requests park Work as `awaiting_input` and emit a question
   message. They are never auto-approved.
 
-`ptah_resolve_work_input` locates the parked managed intent for the
-permission ID **before** calling `permission_respond`. It requires exact
-session and workspace match. Unknown, cross-session, cross-workspace,
-non-parked, stale, already-resolved, and unauthorized requests are rejected
-without mutating the host permission or durable Work/intent state.
+Each host `PermissionRequest` carries the in-flight Run ID from the
+session's turn tracker. The native executor parks an intent only when
+`request.runId` equals `ManagedExecutionIntent.runId`. It never guesses
+from session identity or insertion order.
 
-A successful resolve (allow or deny) updates WorkItem and WorkAttempt
-together back to `running` and marks the intent `admitted`, keeping the
-permission ID for replay detection. Terminal/cancelled Work is preserved
-during races. The host oneshot is signaled only after that durable commit.
+`ptah_resolve_work_input`:
+
+1. Inspects the parked/resolving intent for exact session and workspace
+   match without mutation
+2. Requires a genuine in-memory host pending permission whose session and
+   Run match, with a live oneshot receiver
+3. Marks the intent `resolving`
+4. Signals `permission_respond`
+5. Commits Work and attempt back to `running` and the intent to `admitted`
+
+If the host permission is missing, stale, cancelled, bound to another Run,
+or its receiver is gone, the call fails and durable state stays parked.
+A failed host signal aborts `resolving` back to `parked`. Replay of an
+already-resolved permission ID is a conflict. Process restart drops
+in-memory pending permissions; resolve then fails honestly rather than
+unparking.
 
 ## Local versus hosted
 
@@ -236,6 +261,3 @@ explicit enable/disable; it does not own dispatch.
 - Message-triggered routine activation
 - Per-principal worker credentials bound to one Agent
 - Computer Use for unattended Agents (not in this slice)
-- Binding a host permission request to a specific Run when several managed
-  Runs share one session (parking currently matches the session's live
-  managed intent)

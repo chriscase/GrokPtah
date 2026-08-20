@@ -51,7 +51,9 @@ use crate::orchestration::{
     RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
     WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
 };
-use crate::permission::{evaluate_tool_gate, PermissionDecision, PermissionRequest, ToolGate};
+use crate::permission::{
+    evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
+};
 use crate::prompt_queue::{
     format_interjection, PromptQueueClearOutcome, PromptQueueEntry, PromptQueueRunNextResult,
     PromptQueueSnapshot, PromptQueueTakeResult, SessionPromptQueue, SteeringDisposition,
@@ -136,6 +138,8 @@ pub struct AgentStatus {
 struct PendingPermission {
     /// Tool that requested this permission (for scoped AlwaysAllow).
     tool_name: String,
+    session_id: Uuid,
+    run_id: Option<String>,
     tx: oneshot::Sender<PermissionDecision>,
 }
 
@@ -5834,17 +5838,128 @@ impl AgentHostHandle {
         Ok(())
     }
 
+    fn current_turn_run_id(&self, session_id: Uuid) -> Option<String> {
+        self.run_usage_trackers
+            .lock()
+            .get(&session_id)
+            .map(|tracker| tracker.run_id().to_string())
+    }
+
+    fn insert_pending_permission(
+        &self,
+        session_id: Uuid,
+        run_id: Option<String>,
+        tool_name: impl Into<String>,
+        summary: impl Into<String>,
+        detail: serde_json::Value,
+    ) -> (PermissionRequest, oneshot::Receiver<PermissionDecision>) {
+        let req = PermissionRequest {
+            id: Uuid::new_v4(),
+            session_id,
+            run_id: run_id.clone(),
+            tool_name: tool_name.into(),
+            summary: summary.into(),
+            detail,
+        };
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut g = self.inner.lock();
+            g.pending_permissions.insert(
+                req.id,
+                PendingPermission {
+                    tool_name: req.tool_name.clone(),
+                    session_id,
+                    run_id,
+                    tx,
+                },
+            );
+        }
+        (req, rx)
+    }
+
+    async fn prompt_tool_permission(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        summary: String,
+        detail: serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> PermissionDecision {
+        let run_id = self.current_turn_run_id(session_id);
+        let (req, rx) =
+            self.insert_pending_permission(session_id, run_id, tool_name, summary, detail);
+        let _ = self.event_bus().send(SessionUpdate::PermissionRequired {
+            session_id,
+            request: req,
+        });
+        tokio::select! {
+            decision = rx => decision.unwrap_or(PermissionDecision::Deny),
+            _ = cancel.cancelled() => PermissionDecision::Deny,
+        }
+    }
+
+    /// Non-consuming lookup of an in-memory permission oneshot.
+    pub fn inspect_pending_permission(&self, request_id: Uuid) -> Option<PendingPermissionView> {
+        let g = self.inner.lock();
+        let pending = g.pending_permissions.get(&request_id)?;
+        Some(PendingPermissionView {
+            request_id,
+            session_id: pending.session_id,
+            run_id: pending.run_id.clone(),
+            tool_name: pending.tool_name.clone(),
+            receiver_open: !pending.tx.is_closed(),
+        })
+    }
+
+    /// Insert a host pending permission bound to a Run, using the same path
+    /// production tools use. The returned receiver is the in-memory oneshot.
+    pub fn begin_pending_permission(
+        &self,
+        session_id: Uuid,
+        run_id: Option<&str>,
+        tool_name: &str,
+        summary: &str,
+    ) -> Result<(PermissionRequest, oneshot::Receiver<PermissionDecision>)> {
+        {
+            let g = self.inner.lock();
+            if !g.sessions.contains_key(&session_id) {
+                bail!("unknown session");
+            }
+        }
+        let run_id = run_id
+            .map(str::to_string)
+            .or_else(|| self.current_turn_run_id(session_id));
+        let (req, rx) = self.insert_pending_permission(
+            session_id,
+            run_id,
+            tool_name,
+            summary,
+            serde_json::json!({ "tool": tool_name }),
+        );
+        let _ = self.event_bus().send(SessionUpdate::PermissionRequired {
+            session_id,
+            request: req.clone(),
+        });
+        Ok((req, rx))
+    }
+
     pub fn permission_respond(&self, request_id: Uuid, decision: PermissionDecision) -> Result<()> {
         let mut g = self.inner.lock();
         let pending = g
             .pending_permissions
             .remove(&request_id)
             .ok_or_else(|| anyhow!("no pending permission {request_id}"))?;
+        if pending.tx.is_closed() {
+            return Err(anyhow!("permission receiver is gone"));
+        }
         // AlwaysAllow is per-tool only. Global YOLO remains Settings/`set_always_approve`.
         if decision == PermissionDecision::AlwaysAllow && !pending.tool_name.is_empty() {
             g.always_allowed_tools.insert(pending.tool_name);
         }
-        let _ = pending.tx.send(decision);
+        pending
+            .tx
+            .send(decision)
+            .map_err(|_| anyhow!("permission receiver is gone"))?;
         Ok(())
     }
 
@@ -9133,32 +9248,15 @@ impl AgentHostHandle {
                 let always = matches!(gate, ToolGate::AutoAllow);
                 let call_id = Uuid::new_v4().to_string();
                 if needs && !always {
-                    let req = PermissionRequest {
-                        id: Uuid::new_v4(),
-                        session_id,
-                        tool_name: "apply_patch".into(),
-                        summary: "Allow apply_patch (edit files)?".into(),
-                        detail: input.clone(),
-                    };
-                    let (tx, rx) = oneshot::channel();
-                    {
-                        let mut g = self.inner.lock();
-                        g.pending_permissions.insert(
-                            req.id,
-                            PendingPermission {
-                                tool_name: req.tool_name.clone(),
-                                tx,
-                            },
-                        );
-                    }
-                    let _ = event_tx.send(SessionUpdate::PermissionRequired {
-                        session_id,
-                        request: req,
-                    });
-                    let decision = tokio::select! {
-                        d = rx => d.unwrap_or(PermissionDecision::Deny),
-                        _ = cancel.cancelled() => PermissionDecision::Deny,
-                    };
+                    let decision = self
+                        .prompt_tool_permission(
+                            session_id,
+                            "apply_patch",
+                            "Allow apply_patch (edit files)?".into(),
+                            input.clone(),
+                            cancel,
+                        )
+                        .await;
                     if decision == PermissionDecision::Deny {
                         let _ = event_tx.send(SessionUpdate::ToolCall {
                             session_id,
@@ -10155,32 +10253,15 @@ impl AgentHostHandle {
         let always = matches!(gate, ToolGate::AutoAllow);
         let call_id = Uuid::new_v4().to_string();
         if !always {
-            let req = PermissionRequest {
-                id: Uuid::new_v4(),
-                session_id,
-                tool_name: wire_name.into(),
-                summary: format!("Allow MCP tool `{server}/{tool}`?"),
-                detail: args.clone(),
-            };
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut g = self.inner.lock();
-                g.pending_permissions.insert(
-                    req.id,
-                    PendingPermission {
-                        tool_name: req.tool_name.clone(),
-                        tx,
-                    },
-                );
-            }
-            let _ = event_tx.send(SessionUpdate::PermissionRequired {
-                session_id,
-                request: req,
-            });
-            let decision = tokio::select! {
-                d = rx => d.unwrap_or(PermissionDecision::Deny),
-                _ = cancel.cancelled() => PermissionDecision::Deny,
-            };
+            let decision = self
+                .prompt_tool_permission(
+                    session_id,
+                    wire_name,
+                    format!("Allow MCP tool `{server}/{tool}`?"),
+                    args.clone(),
+                    cancel,
+                )
+                .await;
             if decision == PermissionDecision::Deny {
                 let _ = event_tx.send(SessionUpdate::ToolCall {
                     session_id,
@@ -10316,32 +10397,15 @@ impl AgentHostHandle {
         let always = matches!(gate, ToolGate::AutoAllow);
 
         if needs_perm && !always {
-            let req = PermissionRequest {
-                id: Uuid::new_v4(),
-                session_id,
-                tool_name: tool_name.into(),
-                summary: format!("Allow tool `{tool_name}`?"),
-                detail: input.clone(),
-            };
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut g = self.inner.lock();
-                g.pending_permissions.insert(
-                    req.id,
-                    PendingPermission {
-                        tool_name: req.tool_name.clone(),
-                        tx,
-                    },
-                );
-            }
-            let _ = event_tx.send(SessionUpdate::PermissionRequired {
-                session_id,
-                request: req,
-            });
-            let decision = tokio::select! {
-                d = rx => d.unwrap_or(PermissionDecision::Deny),
-                _ = cancel.cancelled() => PermissionDecision::Deny,
-            };
+            let decision = self
+                .prompt_tool_permission(
+                    session_id,
+                    tool_name,
+                    format!("Allow tool `{tool_name}`?"),
+                    input.clone(),
+                    cancel,
+                )
+                .await;
             if decision == PermissionDecision::Deny {
                 let _ = event_tx.send(SessionUpdate::ToolCall {
                     session_id,
@@ -10518,42 +10582,25 @@ impl AgentHostHandle {
             } else {
                 String::new()
             };
-            let req = PermissionRequest {
-                id: Uuid::new_v4(),
-                session_id,
-                tool_name: "run_terminal_cmd".into(),
-                summary: format!("Allow shell: {command}{risk_note}"),
-                detail: serde_json::json!({
-                    "tool": "run_terminal_cmd",
-                    "command": command,
-                    "risk": risk.reason,
-                    "risk_tier": match risk.tier {
-                        crate::exec_risk::RiskTier::Allow => "allow",
-                        crate::exec_risk::RiskTier::Ask => "ask",
-                        crate::exec_risk::RiskTier::Deny => "deny",
-                    },
-                    "peeled": risk.peeled,
-                }),
-            };
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut g = self.inner.lock();
-                g.pending_permissions.insert(
-                    req.id,
-                    PendingPermission {
-                        tool_name: req.tool_name.clone(),
-                        tx,
-                    },
-                );
-            }
-            let _ = event_tx.send(SessionUpdate::PermissionRequired {
-                session_id,
-                request: req,
-            });
-            let decision = tokio::select! {
-                d = rx => d.unwrap_or(PermissionDecision::Deny),
-                _ = cancel.cancelled() => PermissionDecision::Deny,
-            };
+            let decision = self
+                .prompt_tool_permission(
+                    session_id,
+                    "run_terminal_cmd",
+                    format!("Allow shell: {command}{risk_note}"),
+                    serde_json::json!({
+                        "tool": "run_terminal_cmd",
+                        "command": command,
+                        "risk": risk.reason,
+                        "risk_tier": match risk.tier {
+                            crate::exec_risk::RiskTier::Allow => "allow",
+                            crate::exec_risk::RiskTier::Ask => "ask",
+                            crate::exec_risk::RiskTier::Deny => "deny",
+                        },
+                        "peeled": risk.peeled,
+                    }),
+                    cancel,
+                )
+                .await;
             if decision == PermissionDecision::Deny {
                 let msg = format!(
                     "DENIED: user denied shell `{command}` (reason for model: do not retry; \
@@ -10750,41 +10797,24 @@ impl AgentHostHandle {
             } else {
                 String::new()
             };
-            let req = PermissionRequest {
-                id: Uuid::new_v4(),
-                session_id,
-                tool_name: "run_terminal_cmd".into(),
-                summary: format!("Allow tool `run_terminal_cmd`?{risk_note}"),
-                detail: serde_json::json!({
-                    "tool": "run_terminal_cmd",
-                    "command": command,
-                    "risk": risk.reason,
-                    "risk_tier": match risk.tier {
-                        crate::exec_risk::RiskTier::Allow => "allow",
-                        crate::exec_risk::RiskTier::Ask => "ask",
-                        crate::exec_risk::RiskTier::Deny => "deny",
-                    },
-                }),
-            };
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut g = self.inner.lock();
-                g.pending_permissions.insert(
-                    req.id,
-                    PendingPermission {
-                        tool_name: req.tool_name.clone(),
-                        tx,
-                    },
-                );
-            }
-            let _ = event_tx.send(SessionUpdate::PermissionRequired {
-                session_id,
-                request: req,
-            });
-            let decision = tokio::select! {
-                d = rx => d.unwrap_or(PermissionDecision::Deny),
-                _ = cancel.cancelled() => PermissionDecision::Deny,
-            };
+            let decision = self
+                .prompt_tool_permission(
+                    session_id,
+                    "run_terminal_cmd",
+                    format!("Allow tool `run_terminal_cmd`?{risk_note}"),
+                    serde_json::json!({
+                        "tool": "run_terminal_cmd",
+                        "command": command,
+                        "risk": risk.reason,
+                        "risk_tier": match risk.tier {
+                            crate::exec_risk::RiskTier::Allow => "allow",
+                            crate::exec_risk::RiskTier::Ask => "ask",
+                            crate::exec_risk::RiskTier::Deny => "deny",
+                        },
+                    }),
+                    cancel,
+                )
+                .await;
             if decision == PermissionDecision::Deny {
                 let _ = event_tx.send(SessionUpdate::ToolCall {
                     session_id,
@@ -10919,32 +10949,15 @@ impl AgentHostHandle {
         let always = matches!(gate, ToolGate::AutoAllow);
 
         if needs_perm && !always {
-            let req = PermissionRequest {
-                id: Uuid::new_v4(),
-                session_id,
-                tool_name: tool_name.into(),
-                summary: format!("Allow tool `{tool_name}`?"),
-                detail: serde_json::json!({ "tool": tool_name }),
-            };
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut g = self.inner.lock();
-                g.pending_permissions.insert(
-                    req.id,
-                    PendingPermission {
-                        tool_name: req.tool_name.clone(),
-                        tx,
-                    },
-                );
-            }
-            let _ = event_tx.send(SessionUpdate::PermissionRequired {
-                session_id,
-                request: req,
-            });
-            let decision = tokio::select! {
-                d = rx => d.unwrap_or(PermissionDecision::Deny),
-                _ = cancel.cancelled() => PermissionDecision::Deny,
-            };
+            let decision = self
+                .prompt_tool_permission(
+                    session_id,
+                    tool_name,
+                    format!("Allow tool `{tool_name}`?"),
+                    serde_json::json!({ "tool": tool_name }),
+                    cancel,
+                )
+                .await;
             if decision == PermissionDecision::Deny {
                 let _ = event_tx.send(SessionUpdate::ToolCall {
                     session_id,
