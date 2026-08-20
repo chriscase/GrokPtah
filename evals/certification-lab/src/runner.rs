@@ -1310,6 +1310,7 @@ mod tests {
         }
         let repository =
             dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let repository_was_dirty = repository_dirty(&repository).unwrap();
         let output = tempfile::tempdir().unwrap();
         let mut options = default_options(&repository);
         options.output_root = dunce::canonicalize(output.path()).unwrap();
@@ -1370,7 +1371,7 @@ mod tests {
         assert_eq!(completion.summary.failed, 0);
         assert_eq!(completion.summary.skipped, 0);
         assert_eq!(completion.summary.indeterminate, 0);
-        assert!(completion.certified);
+        assert_eq!(completion.certified, !repository_was_dirty);
 
         let campaign = output.path().join(&completion.campaign_id);
         let report: CampaignReport =
@@ -1382,7 +1383,8 @@ mod tests {
             .unwrap();
         assert_eq!(probe.status, ProbeStatus::Passed);
         assert!(probe.supported);
-        assert!(report.certified);
+        assert_eq!(report.repository_dirty, repository_was_dirty);
+        assert_eq!(report.certified, !repository_was_dirty);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
