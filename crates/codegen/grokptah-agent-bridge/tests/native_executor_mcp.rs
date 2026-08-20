@@ -1418,7 +1418,14 @@ async fn native_skips_manual_retry_without_mutating() {
                 .store()
                 .load_idempotency("manual-claim-1")
                 .unwrap()
-                .map(|receipt| (receipt.status, receipt.tool, receipt.payload_hash));
+                .map(|receipt| {
+                    (
+                        receipt.status,
+                        receipt.tool,
+                        receipt.payload_hash,
+                        receipt.error.map(|error| (error.code, error.message)),
+                    )
+                });
             panic!(
                 "manual claim conflict: {error}; state={:?}; assignment={:?}; assigned_matches={}; attempt_count={}; max_attempts={}; attempt_states={:?}; receipt={receipt:?}",
                 item.state,
