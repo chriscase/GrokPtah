@@ -1958,7 +1958,7 @@ impl AgentHostHandle {
                 break;
             };
             if run.agent_id.as_deref() != Some(agent.agent_id.as_str())
-                || run.workspace != agent.workspace
+                || !Self::workspace_identity_matches(&run.workspace, &agent.workspace)
                 || !run.state.is_terminal()
             {
                 bail!("continuation lineage crosses Agent/workspace scope or is nonterminal");
@@ -2487,10 +2487,14 @@ impl AgentHostHandle {
         };
         let run_id = format!("desktop-{turn_id}");
         let now = Utc::now();
+        let durable_workspace = dunce::canonicalize(cwd)
+            .unwrap_or_else(|_| cwd.to_path_buf())
+            .display()
+            .to_string();
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
-            workspace: cwd.display().to_string(),
+            workspace: durable_workspace,
             request_id: format!("desktop-turn-{turn_id}"),
             client_id: Some("desktop".into()),
             state: RunState::Running,
@@ -2595,7 +2599,7 @@ impl AgentHostHandle {
         Ok(bounded)
     }
 
-    fn persist_agent_checkpoint(
+    pub(crate) fn persist_agent_checkpoint(
         &self,
         run: &RunRecord,
         outcome: &str,
@@ -2659,6 +2663,19 @@ impl AgentHostHandle {
             })?
             .ok_or_else(|| anyhow!("persistent agent disappeared while checkpointing"))?;
         Ok(())
+    }
+
+    fn workspace_identity_matches(left: &str, right: &str) -> bool {
+        if left == right {
+            return true;
+        }
+        match (
+            dunce::canonicalize(Path::new(left)),
+            dunce::canonicalize(Path::new(right)),
+        ) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
     }
 
     #[allow(clippy::too_many_arguments)] // Keeps terminal evidence inputs explicit at this boundary.

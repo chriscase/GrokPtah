@@ -15,12 +15,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const PERSISTENT_AGENT_CAPTURE_SCHEMA: &str = "grokptah.persistent_agent_capture.v1";
+pub const PERSISTENT_AGENT_CAPTURE_SCHEMA: &str = "grokptah.persistent_agent_capture.v2";
 pub const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CAPTURE_ATTEMPTS: usize = 4_096;
 pub const MAX_CAPTURE_CHECKS: usize = 2_048;
 pub const MAX_CAPTURE_STRING_BYTES: usize = 8 * 1024;
 pub const MAX_RAW_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const MAX_PROMOTABLE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 pub const PERSISTENT_AGENT_SCENARIO_IDS: &[&str] = &[
     "xai-route-oidc-001",
     "sse-stream-001",
@@ -33,11 +34,14 @@ pub const PERSISTENT_AGENT_SCENARIO_IDS: &[&str] = &[
     "archive-lane-001",
     "interrupt-recover-001",
     "resume-idempotency-001",
+    "managed-work-run-001",
     "memory-scopes-001",
     "spec-revision-001",
     "token-ceiling-001",
     "endurance-finite-runs-001",
 ];
+const CERTIFICATION_CATALOG: &str =
+    include_str!("../../../../evals/persistent-agent-scenarios.v1.json");
 const GROK_BUILD_PROXY_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const XAI_API_BASE: &str = "https://api.x.ai/v1";
 
@@ -74,6 +78,60 @@ pub enum CredentialMethodClass {
     ManagedProviderReference,
 }
 
+/// Authoritative bound profiles shared by captures and certification runners.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificationBoundProfile {
+    Smoke,
+    Standard,
+    Extended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CertificationBoundLimits {
+    pub per_run_tokens: u64,
+    pub campaign_tokens: u64,
+    pub provider_requests: u32,
+    pub continuations: u32,
+    pub duration_seconds: u64,
+    pub artifact_bytes: u64,
+    pub response_bytes: u64,
+}
+
+impl CertificationBoundProfile {
+    pub const fn limits(self) -> CertificationBoundLimits {
+        match self {
+            Self::Smoke => CertificationBoundLimits {
+                per_run_tokens: 20_000,
+                campaign_tokens: 100_000,
+                provider_requests: 40,
+                continuations: 4,
+                duration_seconds: 1_800,
+                artifact_bytes: 128 * 1024 * 1024,
+                response_bytes: 8 * 1024 * 1024,
+            },
+            Self::Standard => CertificationBoundLimits {
+                per_run_tokens: 100_000,
+                campaign_tokens: 500_000,
+                provider_requests: 160,
+                continuations: 16,
+                duration_seconds: 7_200,
+                artifact_bytes: 512 * 1024 * 1024,
+                response_bytes: 16 * 1024 * 1024,
+            },
+            Self::Extended => CertificationBoundLimits {
+                per_run_tokens: 250_000,
+                campaign_tokens: 2_000_000,
+                provider_requests: 800,
+                continuations: 96,
+                duration_seconds: 86_400,
+                artifact_bytes: 2 * 1024 * 1024 * 1024,
+                response_bytes: 32 * 1024 * 1024,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderDialectClass {
@@ -106,6 +164,9 @@ pub enum AttemptDisposition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CampaignIdentity {
+    /// Opaque SHA-256 label for the owning lab campaign. The raw campaign ID
+    /// is deliberately not part of portable provider evidence.
+    pub campaign_id: String,
     pub scenario_id: String,
     pub repository_commit: String,
     pub dirty: bool,
@@ -127,6 +188,8 @@ pub struct ProviderIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CampaignBudgets {
+    pub bound_profile: CertificationBoundProfile,
+    pub max_run_tokens: u64,
     pub max_total_tokens: u64,
     pub max_provider_requests: u32,
     pub max_continuations: u32,
@@ -247,6 +310,7 @@ impl PersistentAgentCapture {
         if self.schema != PERSISTENT_AGENT_CAPTURE_SCHEMA {
             return Err(CertificationError::UnsupportedSchema);
         }
+        validate_opaque_label(&self.campaign.campaign_id, "campaign_id")?;
         validate_identifier(&self.campaign.scenario_id, "scenario_id")?;
         validate_commit(&self.campaign.repository_commit)?;
         validate_identity(&self.provider)?;
@@ -266,6 +330,15 @@ impl PersistentAgentCapture {
             }
             validate_attempt(attempt, &self.provider.route_class)?;
             if attempt
+                .usage
+                .as_ref()
+                .is_some_and(|usage| usage.total_tokens > self.budgets.max_run_tokens)
+            {
+                return Err(CertificationError::Bound(
+                    "attempt usage exceeds per-run token budget",
+                ));
+            }
+            if attempt
                 .response_body
                 .as_ref()
                 .is_some_and(|body| body.bytes > self.budgets.max_response_bytes_per_request)
@@ -275,12 +348,25 @@ impl PersistentAgentCapture {
                 ));
             }
         }
+        if self
+            .attempts
+            .last()
+            .is_some_and(|attempt| attempt.disposition == AttemptDisposition::Retried)
+        {
+            return Err(CertificationError::Identifier(
+                "retried attempt has no following attempt",
+            ));
+        }
         for state in &self.durable_states {
-            validate_identifier(&state.agent_id, "agent_id")?;
-            validate_identifier(&state.lane_id, "lane_id")?;
-            validate_identifier(&state.run_id, "run_id")?;
-            validate_optional_identifier(state.parent_run_id.as_deref(), "parent_run_id")?;
-            validate_optional_identifier(state.checkpoint_id.as_deref(), "checkpoint_id")?;
+            // Capture v2 is portable evidence, not a local operational log.
+            // Every durable identity must already be irreversibly scoped before
+            // serialization so direct validation/promotion cannot bypass the
+            // report layer's opaque-ID requirement.
+            validate_opaque_label(&state.agent_id, "agent_id")?;
+            validate_opaque_label(&state.lane_id, "lane_id")?;
+            validate_opaque_label(&state.run_id, "run_id")?;
+            validate_optional_opaque_label(state.parent_run_id.as_deref(), "parent_run_id")?;
+            validate_optional_opaque_label(state.checkpoint_id.as_deref(), "checkpoint_id")?;
             validate_optional_hash(
                 state.continuation_input_hash.as_deref(),
                 "continuation_input_hash",
@@ -297,9 +383,13 @@ impl PersistentAgentCapture {
                 validate_short_token(value, "stop_cause")?;
             }
         }
+        let mut check_names = BTreeSet::new();
         for check in &self.checks {
             validate_identifier(&check.name, "check name")?;
             validate_short_token(&check.detail_code, "check detail_code")?;
+            if !check_names.insert(check.name.as_str()) {
+                return Err(CertificationError::Identifier("duplicate check name"));
+            }
         }
         validate_actuals(self)?;
         let value = serde_json::to_value(self).map_err(|_| CertificationError::Serialization)?;
@@ -335,6 +425,7 @@ impl PersistentAgentCapture {
                 "capture has no provider attempts",
             ));
         }
+        self.validate_complete_structural_evidence()?;
         let expected_endpoint = public_xai_endpoint_fingerprint(&self.provider.route_class).ok_or(
             CertificationError::NotPromotable("provider route is not a public xAI route"),
         )?;
@@ -350,6 +441,38 @@ impl PersistentAgentCapture {
         }
         verify_promotion_artifacts(self, fixture_root)?;
         Ok(())
+    }
+
+    /// Validate the complete structural provider/durable oracle needed by a
+    /// report or normalization candidate. This does not approve promotion and
+    /// does not inspect payload artifacts; callers must apply their own
+    /// root-bound artifact policy.
+    pub fn validate_complete_structural_evidence(&self) -> Result<(), CertificationError> {
+        self.validate()?;
+        if self.durable_states.len() != 1 {
+            return Err(CertificationError::NotPromotable(
+                "complete provider evidence must be partitioned to exactly one durable Run",
+            ));
+        }
+        if !self.provider.route_class.is_public_xai() {
+            return Err(CertificationError::NotPromotable(
+                "provider evidence is not an allowlisted public xAI route",
+            ));
+        }
+        let expected_endpoint = public_xai_endpoint_fingerprint(&self.provider.route_class).ok_or(
+            CertificationError::NotPromotable("provider route is not a public xAI route"),
+        )?;
+        if self.provider.endpoint_fingerprint != expected_endpoint {
+            return Err(CertificationError::NotPromotable(
+                "provider endpoint is not on the public xAI allowlist",
+            ));
+        }
+        if !PERSISTENT_AGENT_SCENARIO_IDS.contains(&self.campaign.scenario_id.as_str()) {
+            return Err(CertificationError::NotPromotable(
+                "campaign scenario is not in the versioned catalog",
+            ));
+        }
+        validate_promotion_completeness(self)
     }
 }
 
@@ -375,6 +498,11 @@ fn validate_actuals(capture: &PersistentAgentCapture) -> Result<(), Certificatio
     }
     if capture.actuals.total_tokens > capture.budgets.max_total_tokens {
         return Err(CertificationError::Bound("aggregate token usage"));
+    }
+    if capture.durable_states.len() == 1
+        && capture.actuals.total_tokens > capture.budgets.max_run_tokens
+    {
+        return Err(CertificationError::Bound("per-Run aggregate token usage"));
     }
 
     let continuations = capture
@@ -448,6 +576,17 @@ fn validate_identity(identity: &ProviderIdentity) -> Result<(), CertificationErr
         ));
     }
     if identity.route_class.is_public_xai()
+        && (!(6..=80).contains(&identity.model_identity.len())
+            || !identity.model_identity.starts_with("grok-")
+            || !identity.model_identity.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'.' | b'_')
+            }))
+    {
+        return Err(CertificationError::Identifier("public xAI model identity"));
+    }
+    if identity.route_class.is_public_xai()
         && !matches!(identity.dialect, ProviderDialectClass::XaiChatCompletions)
     {
         return Err(CertificationError::Identifier(
@@ -468,7 +607,8 @@ fn validate_identity(identity: &ProviderIdentity) -> Result<(), CertificationErr
 }
 
 fn validate_budgets(budgets: &CampaignBudgets) -> Result<(), CertificationError> {
-    if budgets.max_total_tokens == 0
+    if budgets.max_run_tokens == 0
+        || budgets.max_total_tokens == 0
         || budgets.max_provider_requests == 0
         || budgets.max_continuations == 0
         || budgets.max_duration_seconds == 0
@@ -476,6 +616,20 @@ fn validate_budgets(budgets: &CampaignBudgets) -> Result<(), CertificationError>
         || budgets.max_response_bytes_per_request == 0
     {
         return Err(CertificationError::Bound("zero campaign budget"));
+    }
+    let limits = budgets.bound_profile.limits();
+    if budgets.max_run_tokens > limits.per_run_tokens
+        || budgets.max_total_tokens > limits.campaign_tokens
+        || budgets.max_run_tokens > budgets.max_total_tokens
+        || budgets.max_provider_requests > limits.provider_requests
+        || budgets.max_continuations > limits.continuations
+        || budgets.max_duration_seconds > limits.duration_seconds
+        || budgets.max_raw_artifact_bytes > limits.artifact_bytes
+        || budgets.max_response_bytes_per_request > limits.response_bytes
+    {
+        return Err(CertificationError::Bound(
+            "campaign budgets exceed bound profile",
+        ));
     }
     if budgets.max_raw_artifact_bytes > MAX_RAW_ARTIFACT_BYTES {
         return Err(CertificationError::Bound("raw artifact bytes"));
@@ -535,11 +689,166 @@ fn validate_attempt(
             .prompt_tokens
             .checked_add(usage.completion_tokens)
             .ok_or(CertificationError::Bound("usage overflow"))?;
-        if usage.complete && usage.total_tokens != summed {
+        if usage.complete && usage.total_tokens < summed {
             return Err(CertificationError::Identifier("complete token usage"));
         }
     }
+    let status = attempt.response_status;
+    let response_shape_valid = match attempt.disposition {
+        AttemptDisposition::Success | AttemptDisposition::Downgraded => {
+            status.is_some_and(|value| (200..300).contains(&value))
+                && matches!(attempt.framing, StreamFraming::Sse | StreamFraming::Json)
+        }
+        AttemptDisposition::RateLimited => {
+            status == Some(429) && attempt.framing != StreamFraming::TransportFailure
+        }
+        AttemptDisposition::ProviderRejected => {
+            status.is_some_and(|value| (400..600).contains(&value) && value != 429)
+                && attempt.framing != StreamFraming::TransportFailure
+        }
+        AttemptDisposition::Retried => {
+            status.is_some_and(|value| {
+                value == 408 || value == 425 || value == 429 || (500..600).contains(&value)
+            }) && attempt.framing != StreamFraming::TransportFailure
+        }
+        AttemptDisposition::TransportFailed => {
+            status.is_none() && attempt.framing == StreamFraming::TransportFailure
+        }
+        AttemptDisposition::TimedOut | AttemptDisposition::Cancelled => {
+            status.is_none() && attempt.framing == StreamFraming::NoBody
+        }
+    };
+    if !response_shape_valid
+        || (attempt.framing == StreamFraming::Sse
+            && attempt.response_content_type.as_deref() != Some("text/event-stream"))
+        || (attempt.framing == StreamFraming::TransportFailure
+            && attempt.response_content_type.is_some())
+    {
+        return Err(CertificationError::Identifier(
+            "response status/disposition/framing consistency",
+        ));
+    }
     Ok(())
+}
+
+fn validate_promotion_completeness(
+    capture: &PersistentAgentCapture,
+) -> Result<(), CertificationError> {
+    if capture.checks.is_empty() || capture.checks.iter().any(|check| !check.passed) {
+        return Err(CertificationError::NotPromotable(
+            "certification checks are empty or not all passing",
+        ));
+    }
+    let required_checks = required_live_checks(&capture.campaign.scenario_id)?;
+    let observed: BTreeSet<&str> = capture
+        .checks
+        .iter()
+        .map(|check| check.name.as_str())
+        .collect();
+    for required in [
+        "provider_observation_complete",
+        "provider_attempts_bound_to_durable_run",
+    ] {
+        if !observed.contains(required) {
+            return Err(CertificationError::NotPromotable(
+                "provider observation or Run binding evidence is missing",
+            ));
+        }
+    }
+    if required_checks
+        .iter()
+        .any(|check| !observed.contains(check.as_str()))
+    {
+        return Err(CertificationError::NotPromotable(
+            "scenario-required live checks are missing",
+        ));
+    }
+    if capture
+        .attempts
+        .iter()
+        .any(|attempt| attempt.usage.as_ref().is_none_or(|usage| !usage.complete))
+    {
+        return Err(CertificationError::NotPromotable(
+            "authoritative usage is incomplete",
+        ));
+    }
+    for (index, attempt) in capture.attempts.iter().enumerate() {
+        let final_attempt = index + 1 == capture.attempts.len();
+        let disposition_is_causal = if final_attempt {
+            matches!(
+                attempt.disposition,
+                AttemptDisposition::Success | AttemptDisposition::Downgraded
+            )
+        } else {
+            matches!(
+                attempt.disposition,
+                AttemptDisposition::Retried
+                    | AttemptDisposition::RateLimited
+                    | AttemptDisposition::TimedOut
+                    | AttemptDisposition::TransportFailed
+            )
+        };
+        if !disposition_is_causal {
+            return Err(CertificationError::NotPromotable(
+                "provider attempt sequence is not causally retryable with one successful terminal attempt",
+            ));
+        }
+    }
+    let terminal = capture
+        .durable_states
+        .last()
+        .ok_or(CertificationError::NotPromotable(
+            "capture has no durable terminal evidence",
+        ))?;
+    let terminal_ok = if capture.campaign.scenario_id == "token-ceiling-001" {
+        terminal.terminal_state == "limit_reached"
+            && terminal.stop_cause.as_deref().is_some_and(|cause| {
+                matches!(
+                    cause,
+                    "token_ceiling"
+                        | "max_total_tokens_reached"
+                        | "max_total_tokens_usage_unavailable"
+                )
+            })
+    } else {
+        matches!(terminal.terminal_state.as_str(), "completed" | "succeeded")
+    };
+    if !terminal_ok {
+        return Err(CertificationError::NotPromotable(
+            "scenario durable terminal evidence is unsuccessful or inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn required_live_checks(scenario_id: &str) -> Result<Vec<String>, CertificationError> {
+    let catalog: Value = serde_json::from_str(CERTIFICATION_CATALOG)
+        .map_err(|_| CertificationError::NotPromotable("versioned catalog is malformed"))?;
+    let scenario = catalog["scenarios"]
+        .as_array()
+        .and_then(|scenarios| {
+            scenarios
+                .iter()
+                .find(|scenario| scenario["id"].as_str() == Some(scenario_id))
+        })
+        .ok_or(CertificationError::NotPromotable(
+            "campaign scenario is not in the versioned catalog",
+        ))?;
+    scenario["live_checks"]
+        .as_array()
+        .ok_or(CertificationError::NotPromotable(
+            "scenario live checks are malformed",
+        ))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or(CertificationError::NotPromotable(
+                    "scenario live checks are malformed",
+                ))
+        })
+        .collect()
 }
 
 fn validate_artifact(reference: &ArtifactReference) -> Result<(), CertificationError> {
@@ -605,6 +914,11 @@ fn verify_promotion_artifact(
     reference: &ArtifactReference,
 ) -> Result<(), CertificationError> {
     validate_artifact(reference)?;
+    if reference.bytes > MAX_PROMOTABLE_ARTIFACT_BYTES {
+        return Err(CertificationError::Bound(
+            "promotable artifact exceeds its memory-safe byte bound",
+        ));
+    }
     let relative = Path::new(&reference.relative_path);
     let mut candidate = canonical_root.to_path_buf();
     for component in relative.components() {
@@ -651,6 +965,14 @@ fn verify_promotion_artifact(
     let file = fs::File::open(&canonical).map_err(|_| {
         CertificationError::ArtifactVerification("referenced artifact is unavailable")
     })?;
+    let opened_metadata = file.metadata().map_err(|_| {
+        CertificationError::ArtifactVerification("opened artifact metadata is unavailable")
+    })?;
+    if !opened_metadata.is_file() || !same_file(&metadata, &opened_metadata) {
+        return Err(CertificationError::ArtifactVerification(
+            "artifact changed while it was opened",
+        ));
+    }
     let mut bytes = Vec::with_capacity(reference.bytes.min(MAX_CAPTURE_BYTES as u64) as usize);
     file.take(read_limit)
         .read_to_end(&mut bytes)
@@ -671,6 +993,17 @@ fn verify_promotion_artifact(
         CertificationError::ArtifactVerification("opaque binary artifacts cannot be promoted")
     })?;
     scan_promotable_artifact(relative, text)
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn scan_promotable_artifact(relative_path: &Path, text: &str) -> Result<(), CertificationError> {
@@ -720,22 +1053,7 @@ fn scan_sse_artifact(text: &str) -> Result<(), CertificationError> {
 }
 
 fn scan_artifact_text_patterns(text: &str) -> Result<(), CertificationError> {
-    let lower = text.to_ascii_lowercase();
-    let rule = if lower.contains("bearer ") {
-        Some("bearer credential")
-    } else if lower.contains("sk-")
-        || lower.contains("xai-")
-        || lower.contains("-----begin private key-----")
-    {
-        Some("credential-shaped value")
-    } else if lower.contains("/users/") || lower.contains("/home/") || lower.contains("c:\\users\\")
-    {
-        Some("host filesystem path")
-    } else if lower.contains("http://") || lower.contains("https://") {
-        Some("endpoint URL")
-    } else {
-        None
-    };
+    let rule = forbidden_string_rule(text);
     if let Some(rule) = rule {
         return Err(CertificationError::ForbiddenData {
             path: "$artifact".into(),
@@ -794,28 +1112,27 @@ fn looks_like_hostname(token: &str) -> bool {
 }
 
 fn looks_like_high_entropy_token(token: &str) -> bool {
-    if token.len() < 40 || token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if token.len() < 40
+        || token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || (token.len() == 71
+            && token.starts_with("opaque-")
+            && token[7..].bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
         return false;
     }
     let has_alpha = token.bytes().any(|byte| byte.is_ascii_alphabetic());
-    let has_digit = token.bytes().any(|byte| byte.is_ascii_digit());
+    let digit_count = token.bytes().filter(u8::is_ascii_digit).count();
     let distinct = token.bytes().collect::<BTreeSet<_>>().len();
-    has_alpha && has_digit && distinct >= 12
+    has_alpha && digit_count >= 6 && distinct >= 12
 }
 
 fn validate_commit(value: &str) -> Result<(), CertificationError> {
-    if !(7..=64).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !(7..=64).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(CertificationError::Identifier("repository_commit"));
-    }
-    Ok(())
-}
-
-fn validate_optional_identifier(
-    value: Option<&str>,
-    field: &'static str,
-) -> Result<(), CertificationError> {
-    if let Some(value) = value {
-        validate_identifier(value, field)?;
     }
     Ok(())
 }
@@ -843,8 +1160,34 @@ fn validate_identifier(value: &str, field: &'static str) -> Result<(), Certifica
 }
 
 fn validate_hash(value: &str, field: &'static str) -> Result<(), CertificationError> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(CertificationError::Identifier(field));
+    }
+    Ok(())
+}
+
+fn validate_opaque_label(value: &str, field: &'static str) -> Result<(), CertificationError> {
+    if value.len() != 71
+        || !value.starts_with("opaque-")
+        || !value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CertificationError::Identifier(field));
+    }
+    Ok(())
+}
+
+fn validate_optional_opaque_label(
+    value: Option<&str>,
+    field: &'static str,
+) -> Result<(), CertificationError> {
+    if let Some(value) = value {
+        validate_opaque_label(value, field)?;
     }
     Ok(())
 }
@@ -970,10 +1313,35 @@ fn scan_string(text: &str, path: &str) -> Result<(), CertificationError> {
             rule: "unbounded string",
         });
     }
+    let rule = forbidden_string_rule(text);
+    if let Some(rule) = rule {
+        return Err(CertificationError::ForbiddenData {
+            path: path.into(),
+            rule,
+        });
+    }
+    for token in text.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    }) {
+        if looks_like_high_entropy_token(token) {
+            return Err(CertificationError::ForbiddenData {
+                path: path.into(),
+                rule: "high-entropy token-shaped value",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn forbidden_string_rule(text: &str) -> Option<&'static str> {
     let lower = text.to_ascii_lowercase();
-    let rule = if lower.contains("bearer ") {
+    if lower.contains("bearer ") {
         Some("bearer credential")
-    } else if lower.starts_with("sk-") || lower.contains("-----begin private key-----") {
+    } else if contains_prefixed_credential(&lower, "sk-")
+        || contains_prefixed_credential(&lower, "xai-")
+        || lower.contains("-----begin private key-----")
+        || contains_jwt_shape(text)
+    {
         Some("credential-shaped value")
     } else if lower.contains("/users/") || lower.contains("/home/") || lower.contains("c:\\users\\")
     {
@@ -982,14 +1350,57 @@ fn scan_string(text: &str, path: &str) -> Result<(), CertificationError> {
         Some("endpoint URL")
     } else {
         None
-    };
-    if let Some(rule) = rule {
-        return Err(CertificationError::ForbiddenData {
-            path: path.into(),
-            rule,
-        });
     }
-    Ok(())
+}
+
+fn contains_prefixed_credential(text: &str, prefix: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(relative) = text[offset..].find(prefix) {
+        let start = offset + relative;
+        let suffix = &text[start + prefix.len()..];
+        let token_len = suffix
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .count();
+        let token = &suffix[..token_len];
+        let digit_count = token.bytes().filter(u8::is_ascii_digit).count();
+        let distinct = token.bytes().collect::<BTreeSet<_>>().len();
+        let explicit_sk_prefix = prefix == "sk-" && start == 0 && token_len >= 8;
+        let embedded_entropy =
+            token_len >= 16 && distinct >= 10 && (digit_count >= 4 || token_len >= 24);
+        if explicit_sk_prefix || embedded_entropy {
+            return true;
+        }
+        offset = start + prefix.len();
+    }
+    false
+}
+
+fn contains_jwt_shape(text: &str) -> bool {
+    text.split_ascii_whitespace().any(|candidate| {
+        let candidate = candidate.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_' | '.')
+        });
+        let mut parts = candidate.split('.');
+        let Some(header) = parts.next() else {
+            return false;
+        };
+        let Some(payload) = parts.next() else {
+            return false;
+        };
+        let Some(signature) = parts.next() else {
+            return false;
+        };
+        parts.next().is_none()
+            && candidate.len() >= 40
+            && header.starts_with("eyJ")
+            && [header, payload, signature].iter().all(|part| {
+                part.len() >= 8
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+    })
 }
 
 #[cfg(test)]
@@ -1041,6 +1452,7 @@ mod tests {
         PersistentAgentCapture {
             schema: PERSISTENT_AGENT_CAPTURE_SCHEMA.into(),
             campaign: CampaignIdentity {
+                campaign_id: format!("opaque-{}", hash('9')),
                 scenario_id: "resume-same-lane-001".into(),
                 repository_commit: "b6dab133".into(),
                 dirty: false,
@@ -1056,6 +1468,8 @@ mod tests {
                 .unwrap(),
             },
             budgets: CampaignBudgets {
+                bound_profile: CertificationBoundProfile::Standard,
+                max_run_tokens: 100_000,
                 max_total_tokens: 100_000,
                 max_provider_requests: 64,
                 max_continuations: 16,
@@ -1098,23 +1512,40 @@ mod tests {
                 latency_millis: 25,
             }],
             durable_states: vec![DurableStateEvidence {
-                agent_id: "agent-fixture".into(),
+                agent_id: format!("opaque-{}", hash('1')),
                 agent_spec_revision: 2,
-                lane_id: "lane-fixture".into(),
-                run_id: "run-fixture".into(),
-                parent_run_id: Some("run-parent".into()),
-                checkpoint_id: Some("checkpoint-fixture".into()),
+                lane_id: format!("opaque-{}", hash('2')),
+                run_id: format!("opaque-{}", hash('3')),
+                parent_run_id: Some(format!("opaque-{}", hash('4'))),
+                checkpoint_id: Some(format!("opaque-{}", hash('5'))),
                 continuation_input_hash: Some(hash('d')),
                 continuation_context_hash: Some(hash('e')),
                 continuation_fidelity: Some("complete".into()),
                 terminal_state: "completed".into(),
                 stop_cause: None,
             }],
-            checks: vec![CertificationCheck {
-                name: "checkpoint-linked".into(),
-                passed: true,
-                detail_code: "parent-and-context-match".into(),
-            }],
+            checks: vec![
+                CertificationCheck {
+                    name: "new_finite_run_created".into(),
+                    passed: true,
+                    detail_code: "run-created".into(),
+                },
+                CertificationCheck {
+                    name: "verified_checkpoint_used".into(),
+                    passed: true,
+                    detail_code: "parent-and-context-match".into(),
+                },
+                CertificationCheck {
+                    name: "provider_observation_complete".into(),
+                    passed: true,
+                    detail_code: "recorder-complete".into(),
+                },
+                CertificationCheck {
+                    name: "provider_attempts_bound_to_durable_run".into(),
+                    passed: true,
+                    detail_code: "run-scope-match".into(),
+                },
+            ],
         }
     }
 
@@ -1161,11 +1592,23 @@ mod tests {
             json!({"value": "/Users/alice/private/repo"}),
             json!({"value": "https://private.example/path"}),
             json!({"value": "sk-test-value"}),
+            json!({"value": "prefix-xai-0123456789abcdef-suffix"}),
+            json!({"value": "prefix-sk-0123456789abcdef-suffix"}),
+            json!({"value": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJwcml2YXRlLXVzZXIifQ.signature_material_123456"}),
+            json!({"value": "tokenMaterialWithManyDistinctChars0123456789abcdefghijk"}),
         ] {
             assert!(matches!(
                 scan_value_for_forbidden_data(&value),
                 Err(CertificationError::ForbiddenData { .. })
             ));
+        }
+
+        for public_identifier in [
+            "xai-route-oidc-001",
+            "x-xai-token-auth",
+            "native-xai-grok-build-oidc",
+        ] {
+            scan_value_for_forbidden_data(&json!({"value": public_identifier})).unwrap();
         }
     }
 
@@ -1229,11 +1672,108 @@ mod tests {
         );
 
         let mut capture = fixture();
-        capture.attempts[0].usage.as_mut().unwrap().total_tokens = 16;
+        capture.attempts[0].usage.as_mut().unwrap().total_tokens = 14;
         assert_eq!(
             capture.validate().unwrap_err(),
             CertificationError::Identifier("complete token usage")
         );
+
+        let mut capture = fixture();
+        capture.attempts[0].disposition = AttemptDisposition::Retried;
+        capture.attempts[0].response_status = Some(503);
+        capture.attempts[0].response_content_type = Some("application/json".into());
+        capture.attempts[0].framing = StreamFraming::Json;
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier("retried attempt has no following attempt")
+        );
+    }
+
+    #[test]
+    fn campaign_identity_hash_and_lowercase_repository_state_are_required() {
+        let mut capture = fixture();
+        capture.schema = "grokptah.persistent_agent_capture.v1".into();
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::UnsupportedSchema
+        );
+
+        let mut capture = fixture();
+        capture.campaign.campaign_id = "raw-campaign-identifier".into();
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier("campaign_id")
+        );
+
+        let mut capture = fixture();
+        capture.campaign.repository_commit = "ABCDEF12".into();
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier("repository_commit")
+        );
+
+        let mut capture = fixture();
+        capture.durable_states[0].run_id = "run-actual-must-not-escape".into();
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Identifier("run_id")
+        );
+    }
+
+    #[test]
+    fn promotion_requires_passing_checks_authoritative_usage_and_successful_causality() {
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        capture.checks.clear();
+        assert!(matches!(
+            capture.validate_for_xai_fixture_promotion_at(directory.path()),
+            Err(CertificationError::NotPromotable(_))
+        ));
+
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        capture.checks[0].passed = false;
+        assert!(matches!(
+            capture.validate_for_xai_fixture_promotion_at(directory.path()),
+            Err(CertificationError::NotPromotable(_))
+        ));
+
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        capture.attempts[0].usage.as_mut().unwrap().complete = false;
+        assert!(matches!(
+            capture.validate_for_xai_fixture_promotion_at(directory.path()),
+            Err(CertificationError::NotPromotable(_))
+        ));
+
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        capture.checks.pop();
+        assert!(matches!(
+            capture.validate_for_xai_fixture_promotion_at(directory.path()),
+            Err(CertificationError::NotPromotable(_))
+        ));
+
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        capture.durable_states.clear();
+        capture.actuals.continuations = 0;
+        assert!(matches!(
+            capture.validate_for_xai_fixture_promotion_at(directory.path()),
+            Err(CertificationError::NotPromotable(_))
+        ));
+
+        let mut capture = fixture();
+        let directory = materialize_fixture(&mut capture);
+        capture.attempts[0].disposition = AttemptDisposition::ProviderRejected;
+        capture.attempts[0].response_status = Some(500);
+        capture.attempts[0].response_content_type = Some("application/json".into());
+        capture.attempts[0].framing = StreamFraming::Json;
+        capture.durable_states[0].terminal_state = "failed".into();
+        assert!(matches!(
+            capture.validate_for_xai_fixture_promotion_at(directory.path()),
+            Err(CertificationError::NotPromotable(_))
+        ));
     }
 
     #[test]
@@ -1301,7 +1841,7 @@ mod tests {
         capture.budgets.max_total_tokens = 14;
         assert_eq!(
             capture.validate().unwrap_err(),
-            CertificationError::Bound("aggregate token usage")
+            CertificationError::Bound("campaign budgets exceed bound profile")
         );
 
         let mut capture = fixture();
@@ -1316,6 +1856,34 @@ mod tests {
         assert_eq!(
             capture.validate().unwrap_err(),
             CertificationError::Identifier("artifact actual does not match referenced artifacts")
+        );
+
+        let mut capture = fixture();
+        let mut terminal = capture.attempts[0].clone();
+        capture.attempts[0].disposition = AttemptDisposition::Retried;
+        capture.attempts[0].response_status = Some(503);
+        capture.attempts[0].response_content_type = Some("application/json".into());
+        capture.attempts[0].framing = StreamFraming::Json;
+        capture.attempts[0].usage = Some(UsageEvidence {
+            prompt_tokens: 4,
+            completion_tokens: 4,
+            total_tokens: 8,
+            complete: true,
+        });
+        terminal.attempt = 2;
+        terminal.usage = Some(UsageEvidence {
+            prompt_tokens: 4,
+            completion_tokens: 3,
+            total_tokens: 7,
+            complete: true,
+        });
+        capture.attempts.push(terminal);
+        capture.actuals.provider_requests = 2;
+        capture.actuals.total_tokens = 15;
+        capture.budgets.max_run_tokens = 10;
+        assert_eq!(
+            capture.validate().unwrap_err(),
+            CertificationError::Bound("per-Run aggregate token usage")
         );
     }
 
@@ -1453,6 +2021,28 @@ mod tests {
                 profile["provider_request_ceiling"].as_u64().unwrap()
                     <= MAX_CAPTURE_ATTEMPTS as u64
             );
+        }
+        for (name, typed) in [
+            ("smoke", CertificationBoundProfile::Smoke),
+            ("standard", CertificationBoundProfile::Standard),
+            ("extended", CertificationBoundProfile::Extended),
+        ] {
+            let profile = &catalog["bound_profiles"][name];
+            let limits = typed.limits();
+            assert_eq!(profile["per_run_token_ceiling"], limits.per_run_tokens);
+            assert_eq!(profile["campaign_token_ceiling"], limits.campaign_tokens);
+            assert_eq!(
+                profile["provider_request_ceiling"],
+                limits.provider_requests
+            );
+            assert_eq!(profile["continuation_ceiling"], limits.continuations);
+            assert_eq!(profile["duration_seconds"], limits.duration_seconds);
+            assert_eq!(profile["raw_artifact_byte_ceiling"], limits.artifact_bytes);
+            assert_eq!(
+                profile["response_byte_ceiling_per_request"],
+                limits.response_bytes
+            );
+            assert_eq!(profile["missing_usage_policy"], "fail_closed");
         }
     }
 }

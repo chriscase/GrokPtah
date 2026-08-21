@@ -279,6 +279,10 @@ impl PublicModelId {
         }
         Ok(Self(value.to_owned()))
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for PublicModelId {
@@ -434,6 +438,27 @@ impl AuthoritativeUsage {
             total_tokens,
         })
     }
+
+    /// Preserve provider-reported accounting categories that are not part of
+    /// the visible input/output pair without ever undercounting the pair.
+    pub fn new_conservative(
+        input_tokens: u64,
+        output_tokens: u64,
+        reported_total_tokens: u64,
+    ) -> Result<Self, ObservationError> {
+        let computed = input_tokens
+            .checked_add(output_tokens)
+            .ok_or(ObservationError::InvalidUsage)?;
+        let total_tokens = reported_total_tokens.max(computed);
+        if total_tokens > MAX_USAGE_TOKENS {
+            return Err(ObservationError::InvalidUsage);
+        }
+        Ok(Self {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -513,6 +538,8 @@ pub struct ProviderObservation {
     route_class: ProviderRouteClass,
     dialect: ProviderDialect,
     credential_method: CredentialMethod,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_binding: Option<OpaqueIdentity>,
     provider: ProviderIdentity,
     method: HttpMethod,
     route: RequestRouteIdentity,
@@ -530,6 +557,37 @@ impl ProviderObservation {
         route_class: ProviderRouteClass,
         dialect: ProviderDialect,
         credential_method: CredentialMethod,
+        provider: ProviderIdentity,
+        route: RequestRouteIdentity,
+        request_header_names: Vec<RequestHeaderName>,
+        response: ResponseMetadata,
+        metrics: AttemptMetrics,
+    ) -> Result<Self, ObservationError> {
+        Self::new_with_binding(
+            evidence_mode,
+            scope,
+            attempt_number,
+            route_class,
+            dialect,
+            credential_method,
+            None,
+            provider,
+            route,
+            request_header_names,
+            response,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_binding(
+        evidence_mode: EvidenceMode,
+        scope: ObservationScope,
+        attempt_number: u32,
+        route_class: ProviderRouteClass,
+        dialect: ProviderDialect,
+        credential_method: CredentialMethod,
+        credential_binding: Option<OpaqueIdentity>,
         provider: ProviderIdentity,
         route: RequestRouteIdentity,
         mut request_header_names: Vec<RequestHeaderName>,
@@ -554,6 +612,7 @@ impl ProviderObservation {
             route_class,
             dialect,
             credential_method,
+            credential_binding,
             provider,
             method: route.method(),
             route,
@@ -574,6 +633,10 @@ impl ProviderObservation {
     pub const fn attempt_number(&self) -> u32 {
         self.attempt_number
     }
+
+    pub fn credential_binding(&self) -> Option<&OpaqueIdentity> {
+        self.credential_binding.as_ref()
+    }
 }
 
 impl fmt::Debug for ProviderObservation {
@@ -586,6 +649,10 @@ impl fmt::Debug for ProviderObservation {
             .field("route_class", &self.route_class)
             .field("dialect", &self.dialect)
             .field("credential_method", &self.credential_method)
+            .field(
+                "credential_binding",
+                &self.credential_binding.as_ref().map(|_| "[opaque]"),
+            )
             .field("provider", &"[redacted]")
             .field("method", &self.method)
             .field("route", &"[redacted]")
@@ -794,7 +861,9 @@ impl ProviderObservationAttempt {
     }
 
     pub fn notify(&self, observation: ProviderObservation) -> DeliveryDisposition {
-        if observation.attempt_number() != self.attempt_number || observation.scope() != &self.scope
+        if observation.evidence_mode() != self.mode
+            || observation.attempt_number() != self.attempt_number
+            || observation.scope() != &self.scope
         {
             return DeliveryDisposition::Dropped;
         }
@@ -1074,6 +1143,12 @@ mod tests {
             ObservationError::InvalidUsage
         );
         assert_eq!(
+            AuthoritativeUsage::new_conservative(2, 3, 7)
+                .unwrap()
+                .total_tokens,
+            7
+        );
+        assert_eq!(
             AttemptMetrics::new(MAX_OBSERVED_BYTES + 1, 0, 0, None).unwrap_err(),
             ObservationError::StructuralBoundExceeded
         );
@@ -1149,6 +1224,51 @@ mod tests {
         assert_eq!(recorder.dropped_count(), 0);
     }
 
+    #[test]
+    fn attempt_rejects_observations_from_a_different_evidence_mode() {
+        let recorder = InMemoryObservationRecorder::new(2).unwrap();
+        let session = ProviderObservationSession::new(
+            EvidenceMode::MetadataOnly,
+            OpaqueScopeId::new("018f1234-5678-7abc-8def-0123456789ab").unwrap(),
+            recorder.observer(),
+        );
+        let context = session.context("run-mode-check", Uuid::nil()).unwrap();
+        let attempt = context.begin_attempt().unwrap();
+
+        let mut mismatched = observation(attempt.attempt_number(), EvidenceMode::Disabled);
+        mismatched.scope = attempt.scope().clone();
+        assert_eq!(attempt.notify(mismatched), DeliveryDisposition::Dropped);
+        assert!(recorder.is_empty());
+
+        let mut synthetic = observation(attempt.attempt_number(), EvidenceMode::SyntheticPayloads);
+        synthetic.scope = attempt.scope().clone();
+        assert_eq!(attempt.notify(synthetic), DeliveryDisposition::Dropped);
+        assert!(recorder.is_empty());
+
+        let mut matching = observation(attempt.attempt_number(), EvidenceMode::MetadataOnly);
+        matching.scope = attempt.scope().clone();
+        assert_eq!(attempt.notify(matching), DeliveryDisposition::Delivered);
+        assert_eq!(recorder.len(), 1);
+    }
+
+    #[test]
+    fn disabled_session_rejects_an_enabled_observation_before_the_sink() {
+        let recorder = InMemoryObservationRecorder::new(1).unwrap();
+        let session = ProviderObservationSession::new(
+            EvidenceMode::Disabled,
+            OpaqueScopeId::new("018f1234-5678-7abc-8def-0123456789ab").unwrap(),
+            recorder.observer(),
+        );
+        let context = session.context("run-disabled-mode", Uuid::nil()).unwrap();
+        let attempt = context.begin_attempt().unwrap();
+        let mut enabled = observation(attempt.attempt_number(), EvidenceMode::MetadataOnly);
+        enabled.scope = attempt.scope().clone();
+
+        assert_eq!(attempt.notify(enabled), DeliveryDisposition::Dropped);
+        assert!(recorder.is_empty());
+        assert_eq!(recorder.dropped_count(), 0);
+    }
+
     struct PanicSink;
 
     impl ProviderObservationSink for PanicSink {
@@ -1164,6 +1284,40 @@ mod tests {
             observer.notify(observation(1, EvidenceMode::MetadataOnly)),
             DeliveryDisposition::Panicked
         );
+    }
+
+    #[test]
+    fn opaque_credential_binding_is_retained_without_widening_payloads() {
+        let binding = OpaqueIdentity::new(&format!("opaque-{HASH_B}")).unwrap();
+        let observation = ProviderObservation::new_with_binding(
+            EvidenceMode::MetadataOnly,
+            scope(),
+            1,
+            ProviderRouteClass::GrokBuildProxy,
+            ProviderDialect::GrokBuild,
+            CredentialMethod::GrokBuildOidc,
+            Some(binding.clone()),
+            ProviderIdentity::public(
+                PublicModelId::new("grok-code-fast-1").unwrap(),
+                EndpointFingerprint::new(HASH_A).unwrap(),
+            ),
+            RequestRouteIdentity::public_chat_completions(),
+            vec![RequestHeaderName::Accept],
+            ResponseMetadata::new(
+                Some(200),
+                Some(ResponseContentClass::EventStream),
+                ResponseFraming::ServerSentEvents,
+                AttemptDisposition::Completed,
+            )
+            .unwrap(),
+            AttemptMetrics::new(10, 20, 30, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(observation.credential_binding(), Some(&binding));
+        let serialized = serde_json::to_string(&observation).unwrap();
+        assert!(serialized.contains(&format!("opaque-{HASH_B}")));
+        assert!(!serialized.contains("Bearer"));
+        assert!(!format!("{observation:?}").contains(HASH_B));
     }
 
     #[test]

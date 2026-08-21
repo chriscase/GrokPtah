@@ -1574,7 +1574,9 @@ struct AgentSseAccumulator {
 
 /// Parse OpenAI chat-completions or Responses-style usage without guessing.
 /// A present but malformed usage object is a protocol error; an absent/null
-/// object is reported as unavailable so bounded runs can fail closed.
+/// object is reported as unavailable so bounded runs can fail closed. When a
+/// provider reports a total that includes accounting categories not represented
+/// by the visible prompt/completion pair, retain the conservative maximum.
 pub(crate) fn parse_completion_usage(
     value: &serde_json::Value,
 ) -> Result<Option<crate::completion::CompletionUsage>> {
@@ -1599,20 +1601,16 @@ pub(crate) fn parse_completion_usage(
     let derived_total = prompt_tokens
         .checked_add(completion_tokens)
         .ok_or_else(|| anyhow!("provider usage token total overflowed"))?;
-    let total_tokens = match object.get("total_tokens") {
-        Some(value) => {
-            let reported = value
+    let total_tokens = object
+        .get("total_tokens")
+        .map(|value| {
+            value
                 .as_u64()
-                .ok_or_else(|| anyhow!("provider usage has invalid `total_tokens`"))?;
-            if reported != derived_total {
-                bail!(
-                    "provider usage has contradictory `total_tokens`: reported {reported}, derived {derived_total}"
-                );
-            }
-            reported
-        }
-        None => derived_total,
-    };
+                .ok_or_else(|| anyhow!("provider usage has invalid `total_tokens`"))
+                .map(|reported| reported.max(derived_total))
+        })
+        .transpose()?
+        .unwrap_or(derived_total);
     Ok(Some(crate::completion::CompletionUsage {
         prompt_tokens,
         completion_tokens,
@@ -1760,6 +1758,7 @@ struct ProviderObservationRoute {
     provider: ObservationProviderIdentity,
     route: RequestRouteIdentity,
     request_header_names: Vec<RequestHeaderName>,
+    credential_binding: Option<OpaqueIdentity>,
 }
 
 fn sha256_hex(value: &str) -> String {
@@ -1773,6 +1772,7 @@ fn opaque_identity(value: &str) -> Option<OpaqueIdentity> {
 fn provider_observation_route(
     creds: &crate::auth_store::WireCredentials,
     target: &ResolvedModelTarget,
+    credential_binding: Option<OpaqueIdentity>,
 ) -> Option<ProviderObservationRoute> {
     const GROK_BUILD_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
     const XAI_API_BASE: &str = "https://api.x.ai/v1";
@@ -1809,6 +1809,7 @@ fn provider_observation_route(
             ),
             route: RequestRouteIdentity::public_chat_completions(),
             request_header_names,
+            credential_binding,
         });
     }
 
@@ -1828,6 +1829,7 @@ fn provider_observation_route(
             ),
             route: RequestRouteIdentity::public_chat_completions(),
             request_header_names,
+            credential_binding: None,
         });
     }
 
@@ -1854,6 +1856,7 @@ fn provider_observation_route(
         ),
         route: RequestRouteIdentity::opaque(route),
         request_header_names,
+        credential_binding: None,
     })
 }
 
@@ -1921,7 +1924,7 @@ fn record_provider_attempt(
         return;
     };
     let usage = usage.and_then(|usage| {
-        AuthoritativeUsage::new(
+        AuthoritativeUsage::new_conservative(
             usage.prompt_tokens,
             usage.completion_tokens,
             usage.total_tokens,
@@ -1936,13 +1939,14 @@ fn record_provider_attempt(
     ) else {
         return;
     };
-    let Ok(observation) = ProviderObservation::new(
+    let Ok(observation) = ProviderObservation::new_with_binding(
         attempt.evidence_mode(),
         attempt.scope().clone(),
         attempt.attempt_number(),
         route.route_class,
         route.dialect,
         route.credential_method,
+        route.credential_binding.clone(),
         route.provider.clone(),
         route.route.clone(),
         route.request_header_names.clone(),
@@ -2010,7 +2014,16 @@ where
 {
     let creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
     let target = resolve_model_target(&creds, model)?;
-    let observation_route = observation.and_then(|_| provider_observation_route(&creds, &target));
+    let credential_binding = if creds.oidc_token_auth {
+        crate::live_attestation::attest_grok_build_oidc(model)
+            .ok()
+            .filter(crate::live_attestation::LiveCredentialAttestation::certification_ready)
+            .map(|attestation| attestation.binding_id().clone())
+    } else {
+        None
+    };
+    let observation_route =
+        observation.and_then(|_| provider_observation_route(&creds, &target, credential_binding));
     call_provider_agent_step(
         creds,
         target,
@@ -2020,7 +2033,7 @@ where
         allow_transient_retries,
         cancel,
         observation,
-        observation_route.as_ref(),
+        observation_route,
         on_delta,
         on_thought,
     )
@@ -2037,7 +2050,7 @@ async fn call_provider_agent_step<F, G>(
     allow_transient_retries: bool,
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
-    observation_route: Option<&ProviderObservationRoute>,
+    mut observation_route: Option<ProviderObservationRoute>,
     mut on_delta: F,
     mut on_thought: G,
 ) -> Result<AgentStep>
@@ -2105,6 +2118,7 @@ where
             .unwrap_or_default();
         let mut observation_attempt =
             observation_route
+                .as_ref()
                 .zip(observation)
                 .and_then(|(route, context)| {
                     context.begin_attempt().ok().map(|attempt| (route, attempt))
@@ -2191,8 +2205,18 @@ where
             match crate::auth_store::force_refresh(&creds).await {
                 Ok(fresh) => {
                     creds = fresh;
+                    let refreshed_binding = crate::live_attestation::attest_grok_build_oidc(
+                        &target.wire_model,
+                    )
+                    .ok()
+                    .filter(crate::live_attestation::LiveCredentialAttestation::certification_ready)
+                    .map(|attestation| attestation.binding_id().clone());
+                    observation_route = observation.and_then(|_| {
+                        provider_observation_route(&creds, &target, refreshed_binding)
+                    });
                     observation_attempt =
                         observation_route
+                            .as_ref()
                             .zip(observation)
                             .and_then(|(route, context)| {
                                 context.begin_attempt().ok().map(|attempt| (route, attempt))
@@ -2218,7 +2242,16 @@ where
                                         None,
                                     );
                                 }
-                                return Err(anyhow!("request error after refresh: {error}"));
+                                let class = if error.is_timeout() {
+                                    "timeout"
+                                } else if error.is_connect() {
+                                    "connect"
+                                } else {
+                                    "transport"
+                                };
+                                return Err(anyhow!(
+                                    "request after OIDC refresh failed ({class})"
+                                ));
                             }
                         },
                         _ = cancel.cancelled() => {
@@ -2239,14 +2272,8 @@ where
                         },
                     };
                 }
-                Err(e) => {
-                    let text = read_bounded_response_body(resp, cancel)
-                        .await
-                        .unwrap_or_default();
-                    bail!(
-                        "HTTP 401 (refresh failed: {e}): {}",
-                        text.chars().take(400).collect::<String>()
-                    );
+                Err(error) => {
+                    bail!("HTTP 401 (OIDC refresh refused: {})", error.code());
                 }
             }
         }
@@ -3080,15 +3107,16 @@ mod compatible_stream_tests {
             "usage": {"prompt_tokens": -1, "completion_tokens": 1, "total_tokens": 0}
         }))
         .is_err());
-        let contradictory = parse_completion_usage(&serde_json::json!({
+        let conservative = parse_completion_usage(&serde_json::json!({
             "usage": {
                 "prompt_tokens": 10_000,
                 "completion_tokens": 5_000,
                 "total_tokens": 1
             }
         }))
-        .unwrap_err();
-        assert!(contradictory.to_string().contains("contradictory"));
+        .unwrap()
+        .unwrap();
+        assert_eq!(conservative.total_tokens, 15_000);
         assert!(parse_completion_usage(&serde_json::json!({
             "usage": {
                 "prompt_tokens": u64::MAX,
@@ -3735,19 +3763,22 @@ pub(crate) async fn call_xai_chat(
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
-                resp = send_once(&creds)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("request error after refresh for {url}: {e}"))?;
+                resp = send_once(&creds).send().await.map_err(|error| {
+                    let class = if error.is_timeout() {
+                        "timeout"
+                    } else if error.is_connect() {
+                        "connect"
+                    } else {
+                        "transport"
+                    };
+                    anyhow!("request after OIDC refresh failed ({class})")
+                })?;
             }
-            Err(e) => {
-                let text = read_bounded_response_body(resp, &CancellationToken::new())
-                    .await
-                    .unwrap_or_default();
-                let clipped: String = text.chars().take(400).collect();
+            Err(error) => {
                 bail!(
-                    "HTTP 401 Unauthorized (refresh also failed: {e}). \
-                     Server said: {clipped}. Run `grok login` to re-authenticate."
+                    "HTTP 401 Unauthorized (OIDC refresh refused: {}). \
+                     Run `grok login` to re-authenticate.",
+                    error.code()
                 );
             }
         }

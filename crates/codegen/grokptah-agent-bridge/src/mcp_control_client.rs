@@ -9,6 +9,7 @@
 //! `mcp-session-id`.
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -20,12 +21,50 @@ use crate::events::SessionUpdate;
 /// Bound a coordinator-side SSE frame independently from the server body
 /// limit. A frame larger than this is rejected before it can grow buffers.
 pub const MAX_LIVE_EVENT_FRAME_BYTES: usize = 512 * 1024;
+/// Maximum non-streaming MCP response body accepted before JSON parsing.
+pub const MAX_MCP_RESPONSE_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Secret-free classification for a JSON-RPC error returned by the service.
+///
+/// The server's prose and arbitrary data object are deliberately discarded.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "MCP remote error: {code}",
+    code = .data_code.as_deref().unwrap_or("unknown")
+)]
+pub struct McpRemoteError {
+    data_code: Option<String>,
+}
+
+impl McpRemoteError {
+    pub fn data_code(&self) -> Option<&str> {
+        self.data_code.as_deref()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("MCP HTTP status error")]
+struct McpHttpStatusError;
+
+#[derive(Debug, thiserror::Error)]
+#[error("MCP transport error")]
+struct McpTransportError;
+
+#[derive(Debug, thiserror::Error)]
+#[error("MCP response exceeded its byte ceiling")]
+struct McpResponseTooLarge;
+
+#[derive(Debug, thiserror::Error)]
+#[error("MCP response was malformed")]
+struct McpMalformedResponse;
 
 /// Minimal MCP client against GrokPtah control Streamable HTTP.
 pub struct McpControlClient {
     base_url: String,
     token: String,
     http: reqwest::Client,
+    operation_timeout: Duration,
     next_id: u64,
     /// MCP session state: false until successful initialize.
     initialized: bool,
@@ -285,10 +324,23 @@ fn validate_scope(
 
 impl McpControlClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self::with_operation_timeout(base_url, token, MCP_REQUEST_TIMEOUT)
+    }
+
+    fn with_operation_timeout(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        operation_timeout: Duration,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("static MCP client configuration must build");
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
-            http: reqwest::Client::new(),
+            http,
+            operation_timeout,
             next_id: 1,
             initialized: false,
             protocol_version: None,
@@ -334,23 +386,36 @@ impl McpControlClient {
         if let Some(sid) = &self.session_id {
             req = req.header("mcp-session-id", sid);
         }
-        let resp = req.send().await?;
-        if let Some(sid) = resp.headers().get("mcp-session-id") {
-            if let Ok(s) = sid.to_str() {
-                self.session_id = Some(s.to_string());
-            }
-        }
-        let status = resp.status();
-        let v: Value = resp.json().await?;
-        if !status.is_success() {
-            anyhow::bail!("MCP HTTP {status}: {v}");
+        let (status, v, response_session_id) =
+            bounded_non_streaming(self.operation_timeout, async move {
+                let resp = req.send().await.map_err(|_| McpTransportError)?;
+                let response_session_id = resp
+                    .headers()
+                    .get("mcp-session-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let status = resp.status();
+                let value = bounded_response_json(resp).await?;
+                Ok((status, value, response_session_id))
+            })
+            .await?;
+        if let Some(session_id) = response_session_id {
+            self.session_id = Some(session_id);
         }
         if let Some(err) = v.get("error") {
-            anyhow::bail!("MCP error: {err}");
+            let data_code = err
+                .get("data")
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str)
+                .and_then(normalize_remote_error_code);
+            return Err(McpRemoteError { data_code }.into());
+        }
+        if !status.is_success() {
+            return Err(McpHttpStatusError.into());
         }
         if let Some(ver) = v.get("jsonrpc").and_then(|x| x.as_str()) {
             if ver != "2.0" {
-                anyhow::bail!("server jsonrpc version {ver:?}");
+                return Err(McpMalformedResponse.into());
             }
         }
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
@@ -379,10 +444,13 @@ impl McpControlClient {
         if with_auth {
             req = req.header("Authorization", format!("Bearer {}", self.token));
         }
-        let resp = req.send().await?;
-        let status = resp.status();
-        let v: Value = resp.json().await.unwrap_or(json!({}));
-        Ok((status, v))
+        bounded_non_streaming(self.operation_timeout, async move {
+            let resp = req.send().await.map_err(|_| McpTransportError)?;
+            let status = resp.status();
+            let value = bounded_response_json(resp).await?;
+            Ok((status, value))
+        })
+        .await
     }
 
     /// MCP initialize handshake (Streamable HTTP session established).
@@ -428,13 +496,17 @@ impl McpControlClient {
         if let Some(sid) = &self.session_id {
             req = req.header("mcp-session-id", sid);
         }
-        let resp = req.send().await?;
-        if resp.status().as_u16() == 202 || resp.status().is_success() {
+        let status = bounded_non_streaming(self.operation_timeout, async move {
+            let response = req.send().await.map_err(|_| McpTransportError)?;
+            let status = response.status();
+            let _ = bounded_response_body(response).await?;
+            Ok(status)
+        })
+        .await?;
+        if status.as_u16() == 202 || status.is_success() {
             return Ok(());
         }
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("notification {method} failed: {status} {text}");
+        Err(McpHttpStatusError.into())
     }
 
     /// End Streamable HTTP session (DELETE /mcp).
@@ -442,19 +514,24 @@ impl McpControlClient {
         let Some(sid) = self.session_id.clone() else {
             return Ok(());
         };
-        let resp = self
+        let request = self
             .http
             .delete(format!("{}/mcp", self.base_url))
             .header("Authorization", format!("Bearer {}", self.token))
-            .header("mcp-session-id", sid)
-            .send()
-            .await?;
+            .header("mcp-session-id", sid);
+        let status = bounded_non_streaming(self.operation_timeout, async move {
+            let response = request.send().await.map_err(|_| McpTransportError)?;
+            let status = response.status();
+            let _ = bounded_response_body(response).await?;
+            Ok(status)
+        })
+        .await?;
         self.session_id = None;
         self.initialized = false;
-        if resp.status().as_u16() == 204 || resp.status().is_success() {
+        if status.as_u16() == 204 || status.is_success() {
             Ok(())
         } else {
-            anyhow::bail!("close_session HTTP {}", resp.status())
+            Err(McpHttpStatusError.into())
         }
     }
 
@@ -475,7 +552,8 @@ impl McpControlClient {
             .session_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("MCP client has no transport session"))?;
-        let mut url = reqwest::Url::parse(&format!("{}/mcp", self.base_url))?;
+        let mut url = reqwest::Url::parse(&format!("{}/mcp", self.base_url))
+            .map_err(|_| McpMalformedResponse)?;
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("session_id", &scope.session_id.to_string());
@@ -492,11 +570,15 @@ impl McpControlClient {
         if let Some(seq) = after_seq {
             request = request.header("Last-Event-ID", seq.to_string());
         }
-        let response = request.send().await?;
+        // Bound connection and response-header acquisition only. Once the
+        // server establishes text/event-stream, the returned byte stream must
+        // remain usable for its full healthy lifetime.
+        let response = tokio::time::timeout(self.operation_timeout, request.send())
+            .await
+            .map_err(|_| McpTransportError)?
+            .map_err(|_| McpTransportError)?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("MCP live stream HTTP {status}: {body}");
+            return Err(McpHttpStatusError.into());
         }
         let content_type = response
             .headers()
@@ -504,7 +586,7 @@ impl McpControlClient {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         if !content_type.starts_with("text/event-stream") {
-            anyhow::bail!("MCP live stream returned content type {content_type:?}");
+            return Err(McpMalformedResponse.into());
         }
         Ok(McpEventStream {
             scope,
@@ -589,6 +671,57 @@ impl McpControlClient {
     }
 }
 
+async fn bounded_response_json(response: reqwest::Response) -> anyhow::Result<Value> {
+    let bytes = bounded_response_body(response).await?;
+    serde_json::from_slice(&bytes).map_err(|_| McpMalformedResponse.into())
+}
+
+async fn bounded_response_body(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MCP_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err(McpResponseTooLarge.into());
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| McpTransportError)?;
+        append_bounded_response_chunk(&mut bytes, &chunk)?;
+    }
+    Ok(bytes)
+}
+
+async fn bounded_non_streaming<T>(
+    timeout: Duration,
+    operation: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(timeout, operation)
+        .await
+        .map_err(|_| McpTransportError)?
+}
+
+fn append_bounded_response_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> anyhow::Result<()> {
+    let next = bytes
+        .len()
+        .checked_add(chunk.len())
+        .ok_or(McpResponseTooLarge)?;
+    if next > MAX_MCP_RESPONSE_BODY_BYTES {
+        return Err(McpResponseTooLarge.into());
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn normalize_remote_error_code(value: &str) -> Option<String> {
+    match value {
+        "unauthenticated" | "forbidden_scope" | "workspace_mismatch" | "session_busy"
+        | "capacity_exhausted" | "stale_version" | "cursor_expired" | "internal" | "timeout"
+        | "invalid_request" | "unsupported" | "conflict" => Some(value.to_owned()),
+        _ => None,
+    }
+}
+
 /// Client-side required-field check against MCP inputSchema.
 fn validate_args_against_schema(schema: &Value, args: &Value) -> anyhow::Result<()> {
     let required = schema
@@ -624,12 +757,22 @@ fn validate_args_against_schema(schema: &Value, args: &Value) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     use crate::host::{AgentHost, HostConfig};
     use crate::mcp_control::start_control_server;
     use crate::orchestration::{
         OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
     };
     use crate::{home_override_serial, set_grokptah_home_override};
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::{Redirect, Response};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -721,6 +864,210 @@ mod tests {
         assert!(validate_args_against_schema(&schema, &json!({"a": "1"})).is_ok());
         assert!(validate_args_against_schema(&schema, &json!({})).is_err());
         assert!(validate_args_against_schema(&schema, &json!({"a":"1","z":1})).is_err());
+    }
+
+    #[test]
+    fn remote_error_codes_are_a_small_positive_allowlist() {
+        assert_eq!(
+            normalize_remote_error_code("conflict").as_deref(),
+            Some("conflict")
+        );
+        assert!(normalize_remote_error_code("xai_private_token_material_123456789").is_none());
+        assert!(normalize_remote_error_code("unknown_future_code").is_none());
+    }
+
+    #[test]
+    fn response_body_accumulation_fails_before_crossing_the_byte_ceiling() {
+        let mut bytes = vec![0_u8; MAX_MCP_RESPONSE_BODY_BYTES];
+        assert!(append_bounded_response_chunk(&mut bytes, b"x").is_err());
+        assert_eq!(bytes.len(), MAX_MCP_RESPONSE_BODY_BYTES);
+        let mut exact = Vec::new();
+        append_bounded_response_chunk(&mut exact, &bytes).unwrap();
+        assert_eq!(exact.len(), MAX_MCP_RESPONSE_BODY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn established_sse_outlives_operation_timeout_but_non_streaming_calls_do_not() {
+        const TEST_TIMEOUT: Duration = Duration::from_millis(100);
+        const BODY_DELAY: Duration = Duration::from_millis(350);
+
+        async fn live_stream(State(scope): State<Arc<RunScope>>) -> Response {
+            let established = futures::stream::once(async {
+                Ok::<Bytes, Infallible>(Bytes::from_static(b": established\n\n"))
+            });
+            let event = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/ptah_event",
+                "params": {
+                    "sessionId": scope.session_id,
+                    "workspace": scope.workspace,
+                    "runId": scope.run_id,
+                    "seq": 1,
+                    "ts": "2026-08-19T00:00:00Z",
+                    "update": {
+                        "type": "turn_complete",
+                        "session_id": scope.session_id,
+                        "cancelled": false
+                    }
+                }
+            });
+            let delayed = futures::stream::once(async move {
+                tokio::time::sleep(BODY_DELAY).await;
+                Ok::<Bytes, Infallible>(Bytes::from(format!(
+                    "id: 1\nevent: message\ndata: {event}\n\n"
+                )))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(established.chain(delayed)))
+                .unwrap()
+        }
+
+        async fn slow_json() -> Response {
+            let body = futures::stream::once(async {
+                tokio::time::sleep(BODY_DELAY).await;
+                Ok::<Bytes, Infallible>(Bytes::from_static(
+                    br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+                ))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(body))
+                .unwrap()
+        }
+
+        async fn slow_close() -> Response {
+            let body = futures::stream::once(async {
+                tokio::time::sleep(BODY_DELAY).await;
+                Ok::<Bytes, Infallible>(Bytes::from_static(b"closed"))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(body))
+                .unwrap()
+        }
+
+        let scope = RunScope {
+            session_id: uuid::Uuid::new_v4(),
+            workspace: "/tmp/disposable".into(),
+            run_id: "run-1".into(),
+        };
+        let router = Router::new()
+            .route("/mcp", get(live_stream).post(slow_json).delete(slow_close))
+            .with_state(Arc::new(scope.clone()));
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("unexpected loopback bind failure: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let mut client = McpControlClient::with_operation_timeout(
+            format!("http://{address}"),
+            "test-token",
+            TEST_TIMEOUT,
+        );
+        client.initialized = true;
+        client.session_id = Some("test-session".into());
+
+        let mut stream = client
+            .open_event_stream(scope, None)
+            .await
+            .expect("SSE handshake should complete inside the operation timeout");
+        let frame = tokio::time::timeout(Duration::from_secs(2), stream.next_notification())
+            .await
+            .expect("healthy established SSE stream should remain live")
+            .expect("SSE frame should decode")
+            .expect("SSE stream should produce an event");
+        assert_eq!(frame.sse_id, Some(1));
+
+        let rpc_error = client
+            .rpc_raw("2.0", "tools/list", json!({}), true)
+            .await
+            .expect_err("non-streaming JSON body must inherit the operation timeout");
+        assert!(rpc_error.downcast_ref::<McpTransportError>().is_some());
+
+        let notify_error = client
+            .notify("notifications/test", json!({}))
+            .await
+            .expect_err("notification body consumption must remain bounded");
+        assert!(notify_error.downcast_ref::<McpTransportError>().is_some());
+
+        let close_error = client
+            .close_session()
+            .await
+            .expect_err("session close body consumption must remain bounded");
+        assert!(close_error.downcast_ref::<McpTransportError>().is_some());
+        assert_eq!(client.session_id(), Some("test-session"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn client_refuses_redirects_and_discards_arbitrary_remote_error_text() {
+        async fn redirect() -> Redirect {
+            Redirect::temporary("/redirect-target")
+        }
+        async fn redirected(State(hit): State<Arc<AtomicBool>>) -> Json<Value> {
+            hit.store(true, Ordering::SeqCst);
+            Json(json!({"jsonrpc":"2.0","id":1,"result":{}}))
+        }
+
+        let hit = Arc::new(AtomicBool::new(false));
+        let router = Router::new()
+            .route("/mcp", post(redirect))
+            .route("/redirect-target", post(redirected))
+            .with_state(hit.clone());
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("unexpected loopback bind failure: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let mut client = McpControlClient::new(format!("http://{address}"), "test-token");
+        assert!(client.initialize().await.is_err());
+        assert!(!hit.load(Ordering::SeqCst));
+        server.abort();
+
+        async fn remote_error() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {
+                        "code": -32000,
+                        "message": "Bearer must-never-escape",
+                        "data": {"code": "conflict", "private": "xai-secret-material"}
+                    }
+                })),
+            )
+        }
+        let router = Router::new().route("/mcp", post(remote_error));
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("unexpected loopback bind failure: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let mut client = McpControlClient::new(format!("http://{address}"), "test-token");
+        let error = client.initialize().await.unwrap_err();
+        let typed = error.downcast_ref::<McpRemoteError>().unwrap();
+        assert_eq!(typed.data_code(), Some("conflict"));
+        let rendered = error.to_string();
+        assert_eq!(rendered, "MCP remote error: conflict");
+        assert!(!rendered.contains("Bearer"));
+        assert!(!rendered.contains("xai-"));
+        server.abort();
     }
 
     #[tokio::test]

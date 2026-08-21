@@ -10,13 +10,24 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
-    SessionKind, SessionUpdate,
+    McpRemoteError, SessionKind, SessionUpdate,
 };
 use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
 
 use common::ProcessEnvGuard;
+
+fn assert_remote_error(error: anyhow::Error, expected_code: &str) {
+    let remote = error
+        .downcast_ref::<McpRemoteError>()
+        .expect("MCP failure should be a typed remote error");
+    assert_eq!(remote.data_code(), Some(expected_code));
+    assert_eq!(
+        error.to_string(),
+        format!("MCP remote error: {expected_code}")
+    );
+}
 
 fn enabled_policy() -> ManagedExecutionPolicy {
     ManagedExecutionPolicy {
@@ -830,9 +841,7 @@ async fn resolve_work_input_requires_parked_scope() {
         )
         .await
         .unwrap_err();
-    assert!(
-        unknown.to_string().contains("unknown permission") || unknown.to_string().contains("400")
-    );
+    assert_remote_error(unknown, "invalid_request");
     let cross_session = client
         .call_tool(
             "ptah_resolve_work_input",
@@ -845,9 +854,7 @@ async fn resolve_work_input_requires_parked_scope() {
         )
         .await
         .unwrap_err();
-    assert!(
-        cross_session.to_string().contains("403") || cross_session.to_string().contains("outside")
-    );
+    assert_remote_error(cross_session, "forbidden_scope");
     let foreign = tempdir().unwrap();
     let cross_workspace = client
         .call_tool(
@@ -861,10 +868,7 @@ async fn resolve_work_input_requires_parked_scope() {
         )
         .await
         .unwrap_err();
-    assert!(
-        cross_workspace.to_string().contains("403")
-            || cross_workspace.to_string().contains("workspace")
-    );
+    assert_remote_error(cross_workspace, "workspace_mismatch");
     let parked = orch.store().load_work_item(&item.work_id).unwrap().unwrap();
     assert_eq!(parked.state, WorkState::AwaitingInput);
 
@@ -880,10 +884,7 @@ async fn resolve_work_input_requires_parked_scope() {
         )
         .await
         .unwrap_err();
-    assert!(
-        missing_host.to_string().contains("409")
-            || missing_host.to_string().contains("not pending")
-    );
+    assert_remote_error(missing_host, "conflict");
     assert_eq!(
         orch.store()
             .load_work_item(&item.work_id)
@@ -913,7 +914,7 @@ async fn resolve_work_input_requires_parked_scope() {
         )
         .await
         .unwrap_err();
-    assert!(cancelled.to_string().contains("409") || cancelled.to_string().contains("no longer"));
+    assert_remote_error(cancelled, "conflict");
     assert_eq!(
         orch.store()
             .load_work_item(&item.work_id)
@@ -1091,7 +1092,7 @@ async fn resolve_work_input_uses_real_host_pending() {
         )
         .await
         .unwrap_err();
-    assert!(replay.to_string().contains("409") || replay.to_string().contains("already resolved"));
+    assert_remote_error(replay, "conflict");
 
     let (deny_item, _, deny_run) = seed_admitted_work(
         orch.store(),
@@ -1174,7 +1175,7 @@ async fn resolve_work_input_uses_real_host_pending() {
         )
         .await
         .unwrap_err();
-    assert!(dropped.to_string().contains("receiver") || dropped.to_string().contains("409"));
+    assert_remote_error(dropped, "conflict");
     assert_eq!(
         orch.store()
             .load_work_item(&drop_item.work_id)
@@ -1225,7 +1226,7 @@ async fn resolve_work_input_uses_real_host_pending() {
         )
         .await
         .unwrap_err();
-    assert!(wrong.to_string().contains("403") || wrong.to_string().contains("different run"));
+    assert_remote_error(wrong, "forbidden_scope");
     assert_eq!(
         orch.store()
             .load_work_item(&wrong_item.work_id)
@@ -1255,6 +1256,17 @@ async fn native_skips_manual_retry_without_mutating() {
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
     let agent = host.ensure_session_agent(lane.id).unwrap();
+    let manual_agent = {
+        let store = host.ensure_orchestration_store().unwrap();
+        let mut manual_agent = agent.clone();
+        manual_agent.agent_id = format!("manual-worker-{}", lane.id);
+        if let Some(spec) = manual_agent.spec.as_mut() {
+            spec.display_name = "manual worker".into();
+            spec.managed_execution = ManagedExecutionPolicy::default();
+        }
+        store.save_agent(&manual_agent).unwrap();
+        manual_agent
+    };
     let orch = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
@@ -1347,6 +1359,19 @@ async fn native_skips_manual_retry_without_mutating() {
             .state,
         ManagedIntentState::Finalized
     );
+    let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    loop {
+        let attempts = orch.store().list_work_attempts(Some(&work_id)).unwrap();
+        if attempts.iter().all(|attempt| !attempt.state.is_active()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < settle_deadline,
+            "native attempt did not settle before manual retry"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        orch.drive_native_executor_once().await;
+    }
     let original_attempts = orch
         .store()
         .list_work_attempts(Some(&work_id))
@@ -1383,6 +1408,19 @@ async fn native_skips_manual_retry_without_mutating() {
             .len(),
         original_attempts
     );
+    client
+        .call_tool(
+            "ptah_assign_work",
+            json!({
+                "request_id": "manual-retry-reassign",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "work_id": work_id,
+                "assigned_agent_id": manual_agent.agent_id
+            }),
+        )
+        .await
+        .unwrap();
     let claimed = client
         .call_tool(
             "ptah_claim_work",
@@ -1391,7 +1429,7 @@ async fn native_skips_manual_retry_without_mutating() {
                 "session_id": lane.id,
                 "workspace": workspace_text,
                 "work_id": work_id,
-                "agent_id": agent.agent_id
+                "agent_id": manual_agent.agent_id
             }),
         )
         .await

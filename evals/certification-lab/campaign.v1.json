@@ -1,0 +1,2243 @@
+{
+  "schema": "grokptah.certification_lab_manifest.v1",
+  "campaign_id": "persistent-agent-certification-lab-v1",
+  "catalog": {
+    "relative_path": "../persistent-agent-scenarios.v1.json",
+    "schema": "grokptah.persistent_agent_scenarios.v1",
+    "catalog_id": "persistent-agent-certification-v1",
+    "catalog_version": 1
+  },
+  "campaign_bounds": {
+    "bound_profile": "extended",
+    "max_duration_seconds": 86400,
+    "max_rounds": 10000,
+    "max_run_tokens": 250000,
+    "max_total_tokens": 2000000,
+    "max_provider_requests": 800,
+    "max_continuations": 96,
+    "max_response_bytes_per_request": 33554432,
+    "max_output_bytes": 4194304,
+    "max_artifact_bytes": 134217728
+  },
+  "workspace_fixtures": [
+    {
+      "id": "synthetic-disposable-v1",
+      "kind": "synthetic_disposable",
+      "max_seed_bytes": 65536,
+      "disposable_required": true,
+      "writable": true
+    }
+  ],
+  "probes": [
+    {
+      "id": "core-service-readiness-v1",
+      "description": "Initialize the public MCP session and discover readiness, capacity, and the supported control tools.",
+      "catalog_scenario_ids": [
+        "agent-initial-run-001"
+      ],
+      "scope": "service_contract",
+      "effect": "read_only",
+      "required_tools": [
+        "ptah_get_capacity",
+        "ptah_list_sessions"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "read_only"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 30,
+        "max_rounds": 2,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 65536,
+        "max_artifact_bytes": 262144
+      },
+      "actions": [
+        "discover_capabilities"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "service",
+          "from": "starting",
+          "to": "ready"
+        }
+      ],
+      "oracle_codes": [
+        "service_ready",
+        "required_tools_discovered"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "core-agent-identity-v1",
+      "description": "Create a session, materialize its Agent with one bounded deterministic offline Run, and verify the durable list projection twice without retaining real identifiers.",
+      "catalog_scenario_ids": [
+        "agent-initial-run-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 180,
+        "max_rounds": 8,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 20000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 2097152
+      },
+      "actions": [
+        "create_persistent_agent"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "agent",
+          "from": "absent",
+          "to": "created"
+        }
+      ],
+      "oracle_codes": [
+        "agent_projection_stable"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "core-bounded-run-terminal-v1",
+      "description": "Submit one finite Run with explicit limits and observe a host-authored terminal state plus complete structural provider accounting.",
+      "catalog_scenario_ids": [
+        "agent-initial-run-001",
+        "token-ceiling-001"
+      ],
+      "scope": "provider_structural",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_list_persistent_agents",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_get_events"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "live_provider_route",
+        "provider_observation",
+        "authoritative_usage"
+      ],
+      "eligibility": {
+        "offline": false,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 300,
+        "max_rounds": 12,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 40000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 524288,
+        "max_artifact_bytes": 4194304
+      },
+      "actions": [
+        "create_persistent_agent",
+        "submit_bounded_run",
+        "wait_for_terminal_run"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "run",
+          "from": "queued",
+          "to": "running"
+        },
+        {
+          "entity": "run",
+          "from": "running",
+          "to": "completed"
+        }
+      ],
+      "oracle_codes": [
+        "run_terminal_and_bounded"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "mark_indeterminate"
+    },
+    {
+      "id": "core-steering-cancellation-v1",
+      "description": "Exercise steering and explicit cancellation through public controls and require a durable cancelled terminal state.",
+      "catalog_scenario_ids": [
+        "retry-transient-001"
+      ],
+      "scope": "provider_structural",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_list_persistent_agents",
+        "ptah_get_persistent_agent",
+        "ptah_submit_task",
+        "ptah_steer",
+        "ptah_cancel",
+        "ptah_get_run"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "live_provider_route",
+        "provider_observation",
+        "authoritative_usage"
+      ],
+      "eligibility": {
+        "offline": false,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 300,
+        "max_rounds": 12,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 40000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 524288,
+        "max_artifact_bytes": 4194304
+      },
+      "actions": [
+        "create_persistent_agent",
+        "submit_bounded_run",
+        "steer_run",
+        "cancel_run",
+        "wait_for_terminal_run"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "run",
+          "from": "running",
+          "to": "cancelled"
+        }
+      ],
+      "oracle_codes": [
+        "steering_observed",
+        "cancellation_terminal",
+        "run_terminal_and_bounded"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "mark_indeterminate"
+    },
+    {
+      "id": "core-reconnect-cursor-v1",
+      "description": "Create one bounded no-tool Run, disconnect, reinitialize MCP, and recover ordered events from the recorded cursor.",
+      "catalog_scenario_ids": [
+        "restart-between-runs-001",
+        "interrupt-recover-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_list_persistent_agents",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_get_events",
+        "ptah_list_runs"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "client_reconnect",
+        "persistent_agent_evidence"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 60,
+        "max_rounds": 4,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 131072,
+        "max_artifact_bytes": 524288
+      },
+      "actions": [
+        "create_persistent_agent",
+        "submit_bounded_run",
+        "wait_for_terminal_run",
+        "disconnect_client",
+        "reconnect_client"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "cursor",
+          "from": "active",
+          "to": "advanced"
+        }
+      ],
+      "oracle_codes": [
+        "event_cursor_monotonic",
+        "event_cursor_no_gap"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "core-restart-durable-runs-events-v1",
+      "description": "Create one bounded no-tool Run, restart the owned service, and re-read its durable Run and cursor-addressed events through fresh MCP.",
+      "catalog_scenario_ids": [
+        "restart-between-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_list_persistent_agents",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_list_runs",
+        "ptah_get_run",
+        "ptah_get_events"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "client_reconnect",
+        "local_restart_control",
+        "persistent_agent_evidence"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": false,
+        "attach_access": "not_allowed"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 120,
+        "max_rounds": 6,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_persistent_agent",
+        "submit_bounded_run",
+        "wait_for_terminal_run",
+        "disconnect_client",
+        "restart_service",
+        "reconnect_client"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "service",
+          "from": "ready",
+          "to": "starting"
+        },
+        {
+          "entity": "service",
+          "from": "starting",
+          "to": "ready"
+        }
+      ],
+      "oracle_codes": [
+        "durable_read_after_restart",
+        "event_cursor_no_gap",
+        "no_implicit_invocation_resume"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "core-checkpoint-inspection-v1",
+      "description": "Create one bounded no-tool Run, then inspect its persisted checkpoint and lineage without issuing a resume operation.",
+      "catalog_scenario_ids": [
+        "resume-same-lane-001",
+        "interrupt-recover-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_list_persistent_agents",
+        "ptah_get_persistent_agent",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "persistent_agent_evidence"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 30,
+        "max_rounds": 2,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 65536,
+        "max_artifact_bytes": 262144
+      },
+      "actions": [
+        "create_persistent_agent",
+        "submit_bounded_run",
+        "wait_for_terminal_run",
+        "inspect_checkpoint"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "run",
+          "from": "completed",
+          "to": "completed"
+        }
+      ],
+      "oracle_codes": [
+        "checkpoint_inspectable",
+        "no_implicit_invocation_resume"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "core-continuation-resume-v1",
+      "description": "Create a bounded service-owned Agent Run, inspect its durable checkpoint through MCP, explicitly resume the same Agent in the same Lane, and prove parent lineage, continuation context, and idempotent replay without implicit invocation resumption.",
+      "catalog_scenario_ids": [
+        "resume-same-lane-001",
+        "resume-idempotency-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_get_persistent_agent",
+        "ptah_resume_persistent_agent",
+        "ptah_list_runs"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "persistent_agent_evidence"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 60,
+        "max_rounds": 2,
+        "max_run_tokens": 20000,
+        "max_total_tokens": 40000,
+        "max_provider_requests": 40,
+        "max_continuations": 2,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 131072,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_persistent_agent",
+        "submit_bounded_run",
+        "wait_for_terminal_run",
+        "inspect_checkpoint",
+        "resume_persistent_agent",
+        "inspect_run_set"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "run",
+          "from": "completed",
+          "to": "completed"
+        },
+        {
+          "entity": "run",
+          "from": "absent",
+          "to": "completed"
+        }
+      ],
+      "oracle_codes": [
+        "checkpoint_inspectable",
+        "continuation_run_created",
+        "checkpoint_used_for_continuation",
+        "no_implicit_invocation_resume",
+        "resume_request_replay_stable"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "work-lifecycle-v1",
+      "description": "Drive create, offer, accept, claim, lease heartbeat, progress, and completion through MCP.",
+      "catalog_scenario_ids": [
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_work",
+        "ptah_offer_work",
+        "ptah_accept_work",
+        "ptah_claim_work",
+        "ptah_renew_work",
+        "ptah_report_work_progress",
+        "ptah_complete_work",
+        "ptah_get_work"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "preexisting_test_agents"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 120,
+        "max_rounds": 16,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "create_work",
+        "offer_work",
+        "accept_work",
+        "claim_work",
+        "heartbeat_lease",
+        "report_work_progress",
+        "complete_work"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "work",
+          "from": "created",
+          "to": "offered"
+        },
+        {
+          "entity": "work",
+          "from": "offered",
+          "to": "accepted"
+        },
+        {
+          "entity": "work",
+          "from": "accepted",
+          "to": "claimed"
+        },
+        {
+          "entity": "work",
+          "from": "claimed",
+          "to": "completed"
+        }
+      ],
+      "oracle_codes": [
+        "work_lifecycle_ordered"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "work-lease-expiry-retry-v1",
+      "description": "Expire a claimed Work lease under deterministic time and verify one policy-bounded retry without duplicate completion.",
+      "catalog_scenario_ids": [
+        "interrupt-recover-001",
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_work",
+        "ptah_assign_work",
+        "ptah_claim_work",
+        "ptah_get_work",
+        "ptah_retry_work"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "deterministic_clock"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 120,
+        "max_rounds": 12,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "create_work",
+        "assign_work",
+        "claim_work",
+        "expire_lease",
+        "retry_work"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "lease",
+          "from": "active",
+          "to": "expired"
+        },
+        {
+          "entity": "work",
+          "from": "claimed",
+          "to": "retrying"
+        },
+        {
+          "entity": "work",
+          "from": "retrying",
+          "to": "queued"
+        }
+      ],
+      "oracle_codes": [
+        "lease_expiry_single_retry"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "work-dependency-block-unblock-v1",
+      "description": "Create dependent Work, prove it remains blocked, complete the prerequisite, and observe deterministic unblocking.",
+      "catalog_scenario_ids": [
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_work",
+        "ptah_get_work",
+        "ptah_complete_work"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 90,
+        "max_rounds": 10,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "create_dependency",
+        "complete_dependency"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "work",
+          "from": "created",
+          "to": "blocked"
+        },
+        {
+          "entity": "work",
+          "from": "blocked",
+          "to": "queued"
+        }
+      ],
+      "oracle_codes": [
+        "dependency_blocks_then_unblocks"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "work-approval-cancellation-v1",
+      "description": "Verify approval-gated Work cannot proceed before an explicit decision, then cover approval and cancellation terminal paths.",
+      "catalog_scenario_ids": [
+        "interrupt-recover-001",
+        "spec-revision-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_work",
+        "ptah_approve_work",
+        "ptah_cancel_work",
+        "ptah_get_work"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 90,
+        "max_rounds": 10,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "create_work",
+        "request_approval",
+        "approve_work",
+        "cancel_work"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "work",
+          "from": "created",
+          "to": "awaiting_approval"
+        },
+        {
+          "entity": "work",
+          "from": "awaiting_approval",
+          "to": "queued"
+        },
+        {
+          "entity": "work",
+          "from": "queued",
+          "to": "cancelled"
+        }
+      ],
+      "oracle_codes": [
+        "approval_gate_enforced",
+        "cancellation_terminal"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "work-idempotency-conflict-v1",
+      "description": "Replay an identical idempotent Work request and reject reuse of its request identity with a changed payload.",
+      "catalog_scenario_ids": [
+        "resume-idempotency-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_work",
+        "ptah_get_work"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 60,
+        "max_rounds": 8,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 131072,
+        "max_artifact_bytes": 524288
+      },
+      "actions": [
+        "create_test_agents",
+        "create_work",
+        "replay_request",
+        "replay_changed_payload",
+        "inspect_work"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "work",
+          "from": "created",
+          "to": "deduplicated"
+        }
+      ],
+      "oracle_codes": [
+        "request_replay_same_resource",
+        "changed_payload_conflict"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "routine-manual-activation-v1",
+      "description": "Create an enabled Routine, fire one manual activation, and inspect the durable activation projection.",
+      "catalog_scenario_ids": [
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_routine",
+        "ptah_fire_routine",
+        "ptah_list_activations"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 90,
+        "max_rounds": 10,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "create_routine",
+        "fire_routine",
+        "inspect_activations"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "activation",
+          "from": "absent",
+          "to": "created"
+        }
+      ],
+      "oracle_codes": [
+        "manual_activation_created"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "routine-scheduled-activation-v1",
+      "description": "Advance a deterministic clock across one schedule boundary and require at most one durable activation.",
+      "catalog_scenario_ids": [
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_routine",
+        "ptah_list_activations"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "deterministic_clock"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 120,
+        "max_rounds": 12,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "create_routine",
+        "advance_deterministic_clock",
+        "inspect_activations"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "activation",
+          "from": "absent",
+          "to": "created"
+        }
+      ],
+      "oracle_codes": [
+        "scheduled_activation_at_most_once"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "routine-activation-dedupe-v1",
+      "description": "Replay the same manual activation request and prove the existing Activation is returned without duplicate Work.",
+      "catalog_scenario_ids": [
+        "resume-idempotency-001",
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_routine",
+        "ptah_fire_routine",
+        "ptah_list_activations"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 90,
+        "max_rounds": 10,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "create_routine",
+        "fire_routine",
+        "replay_request",
+        "inspect_activations"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "activation",
+          "from": "created",
+          "to": "deduplicated"
+        }
+      ],
+      "oracle_codes": [
+        "activation_deduplicated",
+        "request_replay_same_resource"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "routine-paused-disabled-v1",
+      "description": "Pause and disable a Routine and prove neither state permits a new activation until it is explicitly enabled.",
+      "catalog_scenario_ids": [
+        "spec-revision-001",
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_routine",
+        "ptah_pause_routine",
+        "ptah_disable_routine",
+        "ptah_enable_routine",
+        "ptah_fire_routine",
+        "ptah_list_activations"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 120,
+        "max_rounds": 16,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "create_routine",
+        "pause_routine",
+        "disable_routine",
+        "enable_routine",
+        "fire_routine",
+        "inspect_activations"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "routine",
+          "from": "enabled",
+          "to": "paused"
+        },
+        {
+          "entity": "routine",
+          "from": "paused",
+          "to": "disabled"
+        },
+        {
+          "entity": "routine",
+          "from": "disabled",
+          "to": "enabled"
+        }
+      ],
+      "oracle_codes": [
+        "routine_lifecycle_enforced"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "routine-restart-recovery-v1",
+      "description": "Restart an owned service after activation admission and prove the durable Routine and Activation projections recover once.",
+      "catalog_scenario_ids": [
+        "restart-between-runs-001",
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_routine",
+        "ptah_fire_routine",
+        "ptah_get_routine",
+        "ptah_list_activations"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "client_reconnect",
+        "local_restart_control"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": false,
+        "attach_access": "not_allowed"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 180,
+        "max_rounds": 16,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 524288,
+        "max_artifact_bytes": 2097152
+      },
+      "actions": [
+        "create_test_agents",
+        "create_routine",
+        "fire_routine",
+        "disconnect_client",
+        "restart_service",
+        "reconnect_client",
+        "inspect_activations"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "activation",
+          "from": "created",
+          "to": "recovered"
+        }
+      ],
+      "oracle_codes": [
+        "activation_recovered_after_restart",
+        "restart_reconnect_observed"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "coordinator-worker-discovery-heartbeat-v1",
+      "description": "Discover scoped workers and renew one worker heartbeat using only public coordinator controls.",
+      "catalog_scenario_ids": [
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_get_persistent_agent",
+        "ptah_list_workers",
+        "ptah_get_worker",
+        "ptah_heartbeat_worker"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "preexisting_test_agents"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 60,
+        "max_rounds": 8,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 131072,
+        "max_artifact_bytes": 524288
+      },
+      "actions": [
+        "create_test_agents",
+        "discover_workers",
+        "heartbeat_worker"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "worker",
+          "from": "created",
+          "to": "active"
+        }
+      ],
+      "oracle_codes": [
+        "worker_projection_stable",
+        "worker_heartbeat_fresh"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "coordinator-parent-child-work-v1",
+      "description": "Create parent and child Work records and verify durable lineage and workspace scope in their public projections.",
+      "catalog_scenario_ids": [
+        "resume-same-lane-001",
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_work",
+        "ptah_get_work"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 60,
+        "max_rounds": 8,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 131072,
+        "max_artifact_bytes": 524288
+      },
+      "actions": [
+        "create_test_agents",
+        "create_work",
+        "create_child_work",
+        "inspect_work"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "work",
+          "from": "absent",
+          "to": "created"
+        }
+      ],
+      "oracle_codes": [
+        "parent_child_lineage_preserved"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "coordinator-typed-messages-v1",
+      "description": "Exchange typed question, answer, handoff, and review messages between scoped synthetic worker identities.",
+      "catalog_scenario_ids": [
+        "memory-scopes-001",
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_get_persistent_agent",
+        "ptah_send_message",
+        "ptah_list_inbox",
+        "ptah_ack_message",
+        "ptah_list_outbox"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "preexisting_test_agents"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 90,
+        "max_rounds": 16,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "send_question",
+        "send_answer",
+        "send_handoff",
+        "send_review"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "message",
+          "from": "created",
+          "to": "acknowledged"
+        }
+      ],
+      "oracle_codes": [
+        "typed_messages_round_trip"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "coordinator-inbox-reconnect-v1",
+      "description": "Create two test Agents and one typed message, then reconnect the inbox consumer from its prior cursor without duplicates or gaps.",
+      "catalog_scenario_ids": [
+        "restart-between-runs-001",
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_get_persistent_agent",
+        "ptah_send_message",
+        "ptah_list_inbox"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "client_reconnect",
+        "preexisting_test_agents"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 60,
+        "max_rounds": 8,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 131072,
+        "max_artifact_bytes": 524288
+      },
+      "actions": [
+        "create_test_agents",
+        "send_question",
+        "read_inbox_cursor",
+        "disconnect_client",
+        "reconnect_client"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "cursor",
+          "from": "active",
+          "to": "advanced"
+        }
+      ],
+      "oracle_codes": [
+        "inbox_cursor_monotonic",
+        "event_cursor_no_gap"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "coordinator-message-idempotency-expiry-v1",
+      "description": "Replay an identical message and deterministically advance past its expiry while preserving exactly-once visibility.",
+      "catalog_scenario_ids": [
+        "resume-idempotency-001",
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_get_persistent_agent",
+        "ptah_send_message",
+        "ptah_list_inbox",
+        "ptah_list_outbox"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "preexisting_test_agents",
+        "deterministic_clock"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 90,
+        "max_rounds": 12,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "send_question",
+        "replay_request",
+        "advance_deterministic_clock",
+        "expire_message"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "message",
+          "from": "created",
+          "to": "deduplicated"
+        },
+        {
+          "entity": "message",
+          "from": "deduplicated",
+          "to": "expired"
+        }
+      ],
+      "oracle_codes": [
+        "message_replay_deduplicated",
+        "message_expiry_enforced"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "coordinator-cross-workspace-rejection-v1",
+      "description": "Attempt a coordinator mutation across the configured workspace boundary and require a typed rejection with no durable creation.",
+      "catalog_scenario_ids": [
+        "resume-cross-lane-001",
+        "memory-scopes-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_get_persistent_agent",
+        "ptah_create_work",
+        "ptah_send_message",
+        "ptah_list_work"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "preexisting_test_agents"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 60,
+        "max_rounds": 8,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 131072,
+        "max_artifact_bytes": 524288
+      },
+      "actions": [
+        "create_test_agents",
+        "attempt_cross_workspace_mutation"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "work",
+          "from": "absent",
+          "to": "absent"
+        }
+      ],
+      "oracle_codes": [
+        "cross_workspace_rejected"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "native-policy-default-off-v1",
+      "description": "Create a fresh Agent and, when native managed execution is discoverable, prove its managed policy remains disabled until explicitly configured.",
+      "catalog_scenario_ids": [
+        "spec-revision-001"
+      ],
+      "scope": "native_managed_future",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_get_managed_execution",
+        "ptah_get_capacity"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "native_managed_execution"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 60,
+        "max_rounds": 4,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 131072,
+        "max_artifact_bytes": 524288
+      },
+      "actions": [
+        "create_persistent_agent",
+        "inspect_managed_policy"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "execution_intent",
+          "from": "absent",
+          "to": "absent"
+        }
+      ],
+      "oracle_codes": [
+        "managed_policy_default_off"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "mark_indeterminate"
+    },
+    {
+      "id": "native-work-to-run-v1",
+      "description": "Capability-gated probe linking one assigned Work item to one finite native Run through the native Agent executor.",
+      "catalog_scenario_ids": [
+        "managed-work-run-001",
+        "endurance-finite-runs-001"
+      ],
+      "scope": "native_managed_future",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_set_managed_execution",
+        "ptah_create_work",
+        "ptah_assign_work",
+        "ptah_authorize_work_execution",
+        "ptah_get_work",
+        "ptah_list_runs"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "native_managed_execution",
+        "live_provider_route",
+        "provider_observation",
+        "authoritative_usage"
+      ],
+      "eligibility": {
+        "offline": false,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 300,
+        "max_rounds": 12,
+        "max_run_tokens": 20000,
+        "max_total_tokens": 40000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 524288,
+        "max_artifact_bytes": 4194304
+      },
+      "actions": [
+        "submit_managed_work",
+        "authorize_work_execution",
+        "wait_for_terminal_run"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "work",
+          "from": "queued",
+          "to": "succeeded"
+        },
+        {
+          "entity": "run",
+          "from": "absent",
+          "to": "completed"
+        }
+      ],
+      "oracle_codes": [
+        "native_run_linked_to_work",
+        "run_terminal_and_bounded"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "mark_indeterminate"
+    },
+    {
+      "id": "native-permission-park-decisions-v1",
+      "description": "Capability-gated live probe that creates two independent fresh Work, Run, intent, and real permission cases, pre-authorizes each Work, allows one permission, denies the other, and proves missing, dead, or wrong-Run resolution fails closed without unparking Work; no permission is transitioned to both decisions.",
+      "catalog_scenario_ids": [
+        "native-tools-001",
+        "spec-revision-001"
+      ],
+      "scope": "native_managed_future",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_set_managed_execution",
+        "ptah_create_work",
+        "ptah_assign_work",
+        "ptah_authorize_work_execution",
+        "ptah_list_execution_intents",
+        "ptah_list_inbox",
+        "ptah_resolve_work_input",
+        "ptah_get_work",
+        "ptah_list_runs"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "explicit_permission_control",
+        "native_managed_execution",
+        "live_provider_route",
+        "provider_observation",
+        "authoritative_usage"
+      ],
+      "eligibility": {
+        "offline": false,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 300,
+        "max_rounds": 12,
+        "max_run_tokens": 20000,
+        "max_total_tokens": 40000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 524288,
+        "max_artifact_bytes": 4194304
+      },
+      "actions": [
+        "submit_independent_permission_cases",
+        "authorize_work_execution",
+        "observe_permission_park",
+        "attempt_invalid_work_input_resolution",
+        "allow_permission",
+        "deny_permission",
+        "inspect_work_attempts",
+        "inspect_run_set"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "permission",
+          "from": "created",
+          "to": "parked"
+        },
+        {
+          "entity": "permission",
+          "from": "parked",
+          "to": "allowed"
+        },
+        {
+          "entity": "permission",
+          "from": "parked",
+          "to": "denied"
+        }
+      ],
+      "oracle_codes": [
+        "permission_decision_explicit",
+        "permission_bound_to_exact_run",
+        "independent_permission_cases_observed",
+        "invalid_permission_resolution_fails_closed",
+        "work_remains_parked_on_input_mismatch"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "mark_indeterminate"
+    },
+    {
+      "id": "native-interruption-retry-policy-v1",
+      "description": "Capability-gated live probe using an owned restart to close one interrupted native Run, expired attempt, and finalized intent; ptah_retry_work queues the Work, repeated native ticks create no second native Run or attempt while retryEligible=false, an external worker can claim it, and the original interrupted attempt remains inspectable.",
+      "catalog_scenario_ids": [
+        "interrupt-recover-001"
+      ],
+      "scope": "native_managed_future",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_set_managed_execution",
+        "ptah_create_work",
+        "ptah_assign_work",
+        "ptah_authorize_work_execution",
+        "ptah_retry_work",
+        "ptah_get_work",
+        "ptah_list_work",
+        "ptah_claim_work",
+        "ptah_list_runs",
+        "ptah_list_execution_intents",
+        "ptah_get_capacity"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "client_reconnect",
+        "local_restart_control",
+        "native_managed_execution",
+        "live_provider_route",
+        "provider_observation",
+        "authoritative_usage"
+      ],
+      "eligibility": {
+        "offline": false,
+        "live": true,
+        "local_launch": true,
+        "attach": false,
+        "attach_access": "not_allowed"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 300,
+        "max_rounds": 16,
+        "max_run_tokens": 20000,
+        "max_total_tokens": 60000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 524288,
+        "max_artifact_bytes": 4194304
+      },
+      "actions": [
+        "submit_managed_work",
+        "wait_for_terminal_run",
+        "wait_for_managed_admission",
+        "disconnect_client",
+        "restart_service",
+        "reconnect_client",
+        "retry_work",
+        "observe_native_ticks",
+        "inspect_work_attempts",
+        "inspect_execution_intent",
+        "inspect_run_set",
+        "inspect_work_set",
+        "claim_retried_work",
+        "inspect_work"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "run",
+          "from": "running",
+          "to": "interrupted"
+        },
+        {
+          "entity": "attempt",
+          "from": "running",
+          "to": "expired"
+        },
+        {
+          "entity": "execution_intent",
+          "from": "admitted",
+          "to": "finalized"
+        },
+        {
+          "entity": "work",
+          "from": "running",
+          "to": "failed"
+        },
+        {
+          "entity": "work",
+          "from": "failed",
+          "to": "queued"
+        },
+        {
+          "entity": "work",
+          "from": "queued",
+          "to": "leased"
+        }
+      ],
+      "oracle_codes": [
+        "external_state_converged",
+        "restart_reconnect_observed",
+        "no_implicit_invocation_resume",
+        "retry_ineligible_native_readmission_blocked",
+        "manual_retry_remains_external",
+        "original_failed_attempt_inspectable",
+        "no_duplicate_native_run"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "mark_indeterminate"
+    },
+    {
+      "id": "native-restart-intent-adoption-v1",
+      "description": "Capability-gated live probe with retryEligible=false that observes one admitted native Run before an owned restart, then proves only the public Run interrupted, attempt expired, Work failed, and intent finalized convergence with reconnect, no implicit invocation resume, and no duplicate Run; it makes no internal crash-stage or adoption claim.",
+      "catalog_scenario_ids": [
+        "restart-between-runs-001",
+        "interrupt-recover-001"
+      ],
+      "scope": "native_managed_future",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_set_managed_execution",
+        "ptah_create_work",
+        "ptah_assign_work",
+        "ptah_authorize_work_execution",
+        "ptah_list_execution_intents",
+        "ptah_get_work",
+        "ptah_list_runs",
+        "ptah_get_capacity"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "client_reconnect",
+        "local_restart_control",
+        "native_managed_execution",
+        "live_provider_route",
+        "provider_observation",
+        "authoritative_usage"
+      ],
+      "eligibility": {
+        "offline": false,
+        "live": true,
+        "local_launch": true,
+        "attach": false,
+        "attach_access": "not_allowed"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 360,
+        "max_rounds": 16,
+        "max_run_tokens": 20000,
+        "max_total_tokens": 60000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 1048576,
+        "max_artifact_bytes": 8388608
+      },
+      "actions": [
+        "submit_managed_work",
+        "wait_for_managed_admission",
+        "disconnect_client",
+        "restart_service",
+        "reconnect_client",
+        "observe_native_ticks",
+        "inspect_work_attempts",
+        "inspect_run_set",
+        "inspect_execution_intent"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "run",
+          "from": "running",
+          "to": "interrupted"
+        },
+        {
+          "entity": "attempt",
+          "from": "running",
+          "to": "expired"
+        },
+        {
+          "entity": "work",
+          "from": "running",
+          "to": "failed"
+        },
+        {
+          "entity": "execution_intent",
+          "from": "admitted",
+          "to": "finalized"
+        }
+      ],
+      "oracle_codes": [
+        "external_state_converged",
+        "no_duplicate_native_run",
+        "restart_reconnect_observed",
+        "no_implicit_invocation_resume"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "mark_indeterminate"
+    },
+    {
+      "id": "native-no-duplicate-run-v1",
+      "description": "Capability-gated live probe replaying the public Work create and assignment request IDs, observing repeated native supervisor ticks, and proving exactly one Work, one admitted intent, one attempt, and one linked native Run through public Work, attempt, intent, and Run projections.",
+      "catalog_scenario_ids": [
+        "resume-idempotency-001"
+      ],
+      "scope": "native_managed_future",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_set_managed_execution",
+        "ptah_create_work",
+        "ptah_assign_work",
+        "ptah_get_work",
+        "ptah_list_work",
+        "ptah_list_runs",
+        "ptah_list_execution_intents",
+        "ptah_get_capacity"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "native_managed_execution",
+        "live_provider_route",
+        "provider_observation",
+        "authoritative_usage"
+      ],
+      "eligibility": {
+        "offline": false,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 300,
+        "max_rounds": 12,
+        "max_run_tokens": 20000,
+        "max_total_tokens": 40000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 524288,
+        "max_artifact_bytes": 4194304
+      },
+      "actions": [
+        "submit_managed_work",
+        "replay_request",
+        "wait_for_managed_admission",
+        "observe_native_ticks",
+        "inspect_work_set",
+        "inspect_work_attempts",
+        "inspect_execution_intent",
+        "inspect_run_set"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "execution_intent",
+          "from": "absent",
+          "to": "admitted"
+        },
+        {
+          "entity": "attempt",
+          "from": "absent",
+          "to": "leased"
+        },
+        {
+          "entity": "run",
+          "from": "absent",
+          "to": "queued"
+        }
+      ],
+      "oracle_codes": [
+        "no_duplicate_native_run",
+        "request_replay_same_resource",
+        "single_attempt_run_linkage"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "mark_indeterminate"
+    },
+    {
+      "id": "soak-bounded-cycles-restart-v1",
+      "description": "Repeat bounded Work, Routine, and message cycles with scheduled owned restarts, reconnects, invariant snapshots, and leak checks.",
+      "catalog_scenario_ids": [
+        "endurance-finite-runs-001"
+      ],
+      "scope": "soak",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_get_persistent_agent",
+        "ptah_create_work",
+        "ptah_complete_work",
+        "ptah_create_routine",
+        "ptah_fire_routine",
+        "ptah_list_activations",
+        "ptah_send_message",
+        "ptah_list_inbox",
+        "ptah_list_work",
+        "ptah_list_routines"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "preexisting_test_agents",
+        "client_reconnect",
+        "local_restart_control"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": false,
+        "attach_access": "not_allowed"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "extended",
+        "max_duration_seconds": 14400,
+        "max_rounds": 10000,
+        "max_run_tokens": 250000,
+        "max_total_tokens": 2000000,
+        "max_provider_requests": 800,
+        "max_continuations": 96,
+        "max_response_bytes_per_request": 33554432,
+        "max_output_bytes": 4194304,
+        "max_artifact_bytes": 134217728
+      },
+      "actions": [
+        "create_test_agents",
+        "repeat_bounded_cycle",
+        "snapshot_invariants",
+        "disconnect_client",
+        "restart_service",
+        "reconnect_client"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "campaign",
+          "from": "active",
+          "to": "completed"
+        },
+        {
+          "entity": "service",
+          "from": "ready",
+          "to": "starting"
+        },
+        {
+          "entity": "service",
+          "from": "starting",
+          "to": "ready"
+        }
+      ],
+      "oracle_codes": [
+        "cycle_count_bounded",
+        "growth_within_artifact_budget",
+        "no_live_lease_leak",
+        "no_live_cursor_leak",
+        "restart_reconnect_observed"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    }
+  ]
+}

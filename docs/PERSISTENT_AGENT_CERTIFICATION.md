@@ -7,6 +7,9 @@ implementation and not authorization to broaden Agent permissions.
 
 The machine-readable scenario catalog is
 [`evals/persistent-agent-scenarios.v1.json`](../evals/persistent-agent-scenarios.v1.json).
+The executable black-box runner, safe commands, and current coverage are
+documented in
+[`PERSISTENT_AGENT_CERTIFICATION_LAB.md`](PERSISTENT_AGENT_CERTIFICATION_LAB.md).
 
 ## Purpose and rollout order
 
@@ -129,10 +132,11 @@ Raw artifacts belong under:
 
 `evals/runs/persistent-agent-cert/<campaign-id>/`
 
-`evals/runs/` is ignored by Git. A raw campaign may retain synthetic request
-bodies, synthetic model responses, event journals, disposable orchestration
-state, workspace results, aggregate usage, and resource measurements when its
-evidence mode permits them. Raw does not mean unrestricted: the forbidden-data
+The campaign root is beneath the repository's ignored `evals/runs/` area. A
+raw campaign may retain synthetic request bodies, synthetic model responses,
+event journals, disposable orchestration state, workspace results, aggregate
+usage, and resource measurements when its evidence mode permits them. Raw does
+not mean unrestricted: the forbidden-data
 rules apply before bytes are written.
 
 Raw campaigns have finite retention and disk ceilings. They are development
