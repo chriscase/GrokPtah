@@ -636,6 +636,7 @@ fn seed_active_run(
             request_id: "service-e2e-request".into(),
             client_id: Some("mcp".into()),
             state: RunState::Running,
+            purpose: Default::default(),
             agent_id: Some(agent_id.clone()),
             retry_of: None,
             parent_run_id: None,

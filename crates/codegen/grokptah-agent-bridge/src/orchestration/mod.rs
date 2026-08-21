@@ -35,9 +35,11 @@ pub use managed::{
     MANAGED_FINALIZATION_SCHEMA_VERSION, MANAGED_TRUNCATION_MARKER,
 };
 pub use manager::{
+    parse_manager_directive, ManagerCoordinationMode, ManagerCoordinationPolicy,
+    ManagerDecisionRecord, ManagerDecisionState, ManagerDirective, ManagerDirectiveEnvelope,
     ManagerNotification, ManagerPlan, ManagerPlanState, ManagerStep, ManagerStepSpec,
-    ManagerStepState, MANAGER_SCHEMA_VERSION, MAX_MANAGER_IN_FLIGHT, MAX_MANAGER_REPLANS,
-    MAX_MANAGER_STEPS,
+    ManagerStepState, MANAGER_SCHEMA_VERSION, MAX_MANAGER_DIRECTIVE_BYTES, MAX_MANAGER_IN_FLIGHT,
+    MAX_MANAGER_REPLANS, MAX_MANAGER_STEPS,
 };
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,
@@ -55,8 +57,10 @@ pub use service::{OrchestrationConfig, OrchestrationService};
 pub(crate) use store::workspaces_match;
 pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
 pub use supervisor::{
-    RoutineSupervisor, RoutineSupervisorStatus, WorkloadSupervisor, WorkloadSupervisorStatus,
+    ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
+    WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,
     DEFAULT_ROUTINE_TICK_INTERVAL, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
+    MAX_MANAGER_OBSERVATIONS_PER_PASS, MAX_MANAGER_PLANS_PER_PASS,
 };
 pub use types::{
     hash_payload, is_recognized_test_command, merge_bounds, prompt_preview, reject_control_prompt,
@@ -64,7 +68,7 @@ pub use types::{
     AgentModelSpec, AgentRecord, AgentResumePlan, AgentRuntimeState, AgentSpec, AgentState,
     AuditEntry, ChangeRecord, ContinuationCheckpoint, ContinuationReason, IdempotencyReceipt,
     OrchError, OrchErrorCode, PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution,
-    RunExecutionMode, RunProgress, RunRecord, RunState, RunStopCause, TestObservation,
+    RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, TestObservation,
     AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
     DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
 };

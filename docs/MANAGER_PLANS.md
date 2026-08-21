@@ -10,8 +10,9 @@ re-plan when a step fails.
 The plan is durable coordination metadata. Executable work remains in the
 existing Work ledger and therefore uses the same claim leases, assignments,
 messages, reviews, approvals, native executor, and hosted/local storage rules.
-The plan's blocked root Work item is only a visible container; it is never
-eligible for execution. Child Work items carry the normal `parentWorkId` link.
+The plan's root Work item is an explicit host-enforced `isContainer` record;
+it is never eligible for reconciliation admission, manual claims, or native
+execution. Child Work items carry the normal `parentWorkId` link.
 
 The same control operations are available through the local and hosted MCP
 surfaces:
@@ -27,13 +28,17 @@ surfaces:
 
 Plans have the states `active`, `needs_replan`, `succeeded`, `failed`, and
 `cancelled`. Steps are `pending`, `ready`, `in_flight`, `awaiting_input`,
-`awaiting_review`, `succeeded`, `failed`, `blocked`, or `cancelled`.
+`awaiting_review`, `succeeded`, `failed`, `blocked`, `cancelled`, or
+`superseded`. Supersession is an attributable replan result, not a worker
+transition.
 
 Creation rejects duplicate IDs, unknown dependencies, cycles, out-of-scope
 Agent identities, Computer Use workers, and bounds that exceed the manager,
 worker, or server policy. A plan contains at most 64 steps, can have at most
 16 ready/in-flight steps, and can be re-planned at most 16 times. Every
-mutation is request-idempotent and may carry an expected plan revision.
+mutation is request-idempotent and may carry an expected plan revision. Plan
+writes use a store-locked compare-and-swap, so two callers that read one
+revision cannot both materialize different Work for one step.
 
 `advance` materializes only steps whose declared dependencies have succeeded.
 It does not resume an interrupted model invocation, grant approval, grant
@@ -42,7 +47,69 @@ the plan becomes `needs_replan`; no replacement Work is invented implicitly.
 The operator or manager must provide a reason and new step specifications via
 `replan`, after which a later `advance` can continue the graph.
 
-## Bounded manager tick
+## Autonomous supervisor (Manager v2)
+
+Plans remain manual by default for JSON and behavioral compatibility. Passing
+`autonomous: true` at creation opts that plan into the process-owned manager
+supervisor. The shared Rust service runs in desktop and hosted modes; no
+focused window, UI timer, or second scheduler is involved.
+
+Autonomous creation fails closed unless the named manager is the lane's
+canonical active Agent and its managed-execution policy is enabled,
+approval-free, and allows `manager-decision` Work. Manual plans keep the
+legacy behavior and do not require native execution.
+
+The supervisor wakes on a two-second bounded interval and relevant durable Run
+events. A pass scans at most 16 plans and 64 observations, using a rotating
+stable cursor so a hot plan cannot permanently starve older plans. Its health,
+last pass, error, and counts appear under `health.managerSupervisor` in the
+existing capacity/readiness projection.
+
+For an active plan, the supervisor performs the same Work projection and
+materialization as an explicit tick. Work is written before the CAS-fenced
+plan revision; recovery adopts the tagged child if a crash occurs between
+those writes. Notifications use a deterministic message identity plus the
+per-step Work-revision fence, so interval and event wakeups converge without
+duplicates.
+
+## Durable manager decisions
+
+When an autonomous plan reaches `needs_replan`, the supervisor creates one
+deterministic `manager-decision` Work assigned to the plan's manager Agent.
+The Work uses the existing managed executor and a new finite Run; no manager
+execution queue exists. Its input is a bounded snapshot of the objective,
+plan and Work revisions/outcomes, manager AgentSpec revision, and finite
+bounds. It never includes the Agent's full transcript.
+
+The linked decision record fences the plan revision, manager AgentSpec
+revision, triggering Work/message IDs, input hash, decision Work and Run,
+proposed directive, validation outcome, applied mutation IDs, and timestamps.
+Occurrence and Work IDs are content-derived, so recovery after each durable
+write converges on the same decision.
+
+Decision Runs are proposal-only at the host permission gate. Every tool call,
+including MCP, Computer Use, approval, promotion, resume, and terminal access,
+is denied by an immutable host-owned capability downgrade installed before
+the provider task is spawned. The durable decision/Work/intent/Run records
+remain the audit trail, but permission enforcement never waits for a later
+ledger link. This is a host boundary, not a prompt instruction.
+
+Model output must be exactly one bounded JSON envelope; unknown fields fail.
+The current directive allowlist is deliberately small:
+
+- `append_replacement_steps`, naming every failed step and blocked descendant
+  it supersedes
+- `request_operator_intervention`
+- `no_safe_action`
+
+The envelope must match the occurrence, plan, expected plan revision, manager
+Agent, exact AgentSpec revision, and input snapshot hash. Replacement steps
+then flow through the existing replan validation and CAS operation. Malformed,
+oversized, stale, cross-scope, inactive-identity, and duplicate proposals fail
+closed. Explicitly superseded historical failures no longer prevent a valid
+replacement graph from reaching `succeeded`.
+
+## Explicit manager tick
 
 `ptah_tick_manager_plan` is the durable observation loop for a plan. It first
 advances an active plan using the current Work ledger, then projects each
@@ -76,8 +143,17 @@ Archiving a Lane does not archive or detach the Agent identity or its plan
 history. Hosted service instances and local desktop instances read the same
 plan and Work record shapes.
 
-## Current boundary
+## Authority and provider boundary
 
 The manager remains a bounded coordinator. It observes and routes durable
 state; it does not approve tools, grant Computer Use, resume interrupted Runs,
-or promote code on its own.
+promote or merge code, widen Work/Agent/model/token/duration/workspace bounds,
+or treat a named Agent ID as authentication. Approval- and permission-gated
+Work remains visibly awaiting operator input.
+
+Manager reasoning uses the manager Agent's captured provider/model selection
+through the ordinary native execution path. The supervisor and directive
+contract do not hard-code a provider. A future Grok Build route can plug into
+the same finite-Run seam only after explicit authentication, quota,
+capability, isolation, and audit policy are captured; its first certification
+must be a small read-only smoke Run.

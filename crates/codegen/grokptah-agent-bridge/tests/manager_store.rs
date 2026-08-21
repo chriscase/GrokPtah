@@ -1,6 +1,7 @@
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    ManagerPlan, ManagerStepSpec, OrchStore, WorkItem, WorkPolicy, WorkState,
+    ManagerDecisionRecord, ManagerDecisionState, ManagerPlan, ManagerStepSpec, OrchStore, WorkItem,
+    WorkPolicy, WorkState, MANAGER_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
 use tempfile::tempdir;
@@ -60,6 +61,7 @@ fn manager_plan_and_materialized_work_survive_restart() {
     )
     .unwrap();
     root.state = grokptah_agent_bridge::orchestration::WorkState::Blocked;
+    root.is_container = true;
     root.blocked_reason = Some("container".into());
     root.bump_at(now);
     let plan = ManagerPlan::new(
@@ -88,6 +90,124 @@ fn manager_plan_and_materialized_work_survive_restart() {
     assert_eq!(loaded.steps[0].work_id, plan.steps[0].work_id);
     assert_eq!(reopened.list_work_items().unwrap().len(), 2);
     assert_eq!(reopened.list_manager_plans().unwrap().len(), 1);
+    assert!(reopened
+        .claim_work(&root.work_id, "operator", None)
+        .is_err());
+}
+
+#[test]
+fn concurrent_same_revision_advances_commit_one_child() {
+    let home = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let workspace = "/tmp/manager-cas";
+    let store = OrchStore::open(home.path()).unwrap();
+    let now = Utc::now();
+    let root = WorkItem::new(
+        "manager-plan",
+        "cas objective",
+        session_id,
+        workspace,
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    let plan = ManagerPlan::new(
+        session_id,
+        workspace,
+        "manager",
+        "cas objective",
+        root.work_id,
+        vec![step("only")],
+        1,
+        2,
+        now,
+    )
+    .unwrap();
+    store.save_manager_plan(&plan).unwrap();
+    let mut left = plan.clone();
+    let mut right = plan.clone();
+    let left_work = left.advance(&[], "left", now).unwrap();
+    let right_work = right.advance(&[], "right", now).unwrap();
+    store
+        .save_manager_plan_with_work_cas(&left, plan.revision, &left_work)
+        .unwrap();
+    assert!(store
+        .save_manager_plan_with_work_cas(&right, plan.revision, &right_work)
+        .is_err());
+    let manager_children = store
+        .list_work_items()
+        .unwrap()
+        .into_iter()
+        .filter(|work| work.source_manager_plan_id.as_deref() == Some(&plan.plan_id))
+        .collect::<Vec<_>>();
+    assert_eq!(manager_children.len(), 1);
+    assert_eq!(manager_children[0].work_id, left_work[0].work_id);
+}
+
+#[test]
+fn decision_occurrence_and_work_replay_once_after_restart() {
+    let home = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let workspace = "/tmp/manager-decision-restart";
+    let now = Utc::now();
+    let mut work = WorkItem::new(
+        "manager-decision",
+        "return proposal",
+        session_id,
+        workspace,
+        "manager-supervisor",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    work.work_id = "manager-decision-work-stable".into();
+    work.parent_work_id = Some("root".into());
+    work.assigned_agent_id = Some("manager".into());
+    work.assignment_status = grokptah_agent_bridge::orchestration::AssignmentStatus::Accepted;
+    work.source_manager_plan_id = Some("plan".into());
+    work.source_manager_step_id = Some("__manager_decision__".into());
+    work.validate().unwrap();
+    let decision = ManagerDecisionRecord {
+        schema_version: MANAGER_SCHEMA_VERSION,
+        decision_id: "manager-decision-stable".into(),
+        plan_id: "plan".into(),
+        expected_plan_revision: 3,
+        manager_agent_id: "manager".into(),
+        agent_spec_revision: 1,
+        triggering_work_ids: vec!["failed-work".into()],
+        triggering_message_ids: vec![],
+        input_snapshot_hash: "snapshot-hash".into(),
+        decision_work_id: work.work_id.clone(),
+        run_id: None,
+        state: ManagerDecisionState::AwaitingResult,
+        proposed_directive: None,
+        outcome: None,
+        applied_mutation_ids: vec![],
+        created_at: now,
+        updated_at: now,
+    };
+    let store = OrchStore::open(home.path()).unwrap();
+    store
+        .save_manager_decision_with_work(&decision, &work)
+        .unwrap();
+    drop(store);
+
+    let reopened = OrchStore::open(home.path()).unwrap();
+    reopened
+        .save_manager_decision_with_work(&decision, &work)
+        .unwrap();
+    assert_eq!(
+        reopened.list_manager_decisions(Some("plan")).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .list_work_items()
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == "manager-decision")
+            .count(),
+        1
+    );
 }
 
 #[test]

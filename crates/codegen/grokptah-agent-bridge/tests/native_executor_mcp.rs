@@ -4,8 +4,8 @@ mod common;
 
 use grokptah_agent_bridge::orchestration::{
     AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord,
-    RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
+    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
+    RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
     MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
@@ -13,6 +13,7 @@ use grokptah_agent_bridge::{
     McpRemoteError, SessionKind, SessionUpdate,
 };
 use serde_json::json;
+use std::path::Path;
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -388,6 +389,7 @@ fn run_record(
         request_id: intent_id.into(),
         client_id: Some("native-executor".into()),
         state,
+        purpose: Default::default(),
         agent_id: Some(agent_id.into()),
         retry_of: None,
         parent_run_id: None,
@@ -529,6 +531,109 @@ async fn boot_native(
         agent.agent_id,
         workspace_text,
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn manager_decision_native_admission_has_durable_proposal_purpose() {
+    let (_env, _home, _workspace, _host, orch, session, agent_id, workspace_text) =
+        boot_native(false).await;
+    let mut work = WorkItem::new(
+        "manager-decision",
+        "return exactly one typed manager directive envelope",
+        session,
+        workspace_text.clone(),
+        "manager-supervisor",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    work.parent_work_id = Some("manager-root-test".into());
+    work.assigned_agent_id = Some(agent_id.clone());
+    work.assignment_status = AssignmentStatus::Accepted;
+    work.source_manager_plan_id = Some("manager-plan-test".into());
+    work.source_manager_step_id = Some("__manager_decision__".into());
+    work.validate().unwrap();
+    orch.store().save_work_item(&work).unwrap();
+
+    orch.drive_native_executor_once().await;
+    let admission_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    let (intent, mut run) = loop {
+        let intents = orch
+            .store()
+            .list_managed_intents()
+            .unwrap()
+            .into_iter()
+            .filter(|intent| intent.work_id == work.work_id)
+            .collect::<Vec<_>>();
+        if let Some(pair) = intents.iter().find_map(|intent| {
+            intent
+                .run_id
+                .as_deref()
+                .and_then(|run_id| orch.store().load_run(run_id).ok().flatten())
+                .or_else(|| {
+                    orch.store()
+                        .find_run_by_request_id(&intent.intent_id)
+                        .ok()
+                        .flatten()
+                })
+                .map(|run| (intent.clone(), run))
+        }) {
+            break pair;
+        }
+        assert!(
+            tokio::time::Instant::now() < admission_deadline,
+            "manager decision has no durable Run; native status: {:?}; intents: {:?}",
+            orch.native_executor_status(),
+            intents
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    };
+    let run_id = run.run_id.clone();
+    assert_eq!(run.purpose, RunPurpose::ManagerProposal);
+    assert_eq!(run.agent_id.as_deref(), Some(agent_id.as_str()));
+    assert_eq!(run.agent_spec_revision, Some(intent.agent_spec_revision));
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let agent = orch.store().load_agent(&agent_id).unwrap().unwrap();
+        if run.state.is_terminal() && agent.current_run_id.as_deref() != Some(run_id.as_str()) {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        run = orch.store().load_run(&run_id).unwrap().unwrap();
+    }
+    assert!(run.state.is_terminal(), "proposal Run did not settle");
+    let agent = orch.store().load_agent(&agent_id).unwrap().unwrap();
+    assert_ne!(agent.current_run_id.as_deref(), Some(run_id.as_str()));
+
+    orch.store()
+        .update_run(&run_id, |run| {
+            run.state = RunState::Interrupted;
+            run.terminal_result = Some("interrupted".into());
+            Ok(())
+        })
+        .unwrap();
+    let retry = orch
+        .retry_run(
+            &auth(),
+            "manager-proposal-retry",
+            session,
+            Path::new(&workspace_text),
+            &run_id,
+            "retry proposal".into(),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        retry.code,
+        grokptah_agent_bridge::orchestration::OrchErrorCode::Conflict
+    );
+    assert!(retry.message.contains("cannot be retried"));
+
+    orch.stop_background_tasks().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -192,6 +192,7 @@ fn service_store_seed(
             request_id: "coordinator-interrupted-request".into(),
             client_id: Some("mcp".into()),
             state: RunState::Interrupted,
+            purpose: Default::default(),
             agent_id: None,
             retry_of: None,
             parent_run_id: None,

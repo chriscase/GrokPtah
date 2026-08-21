@@ -48,6 +48,7 @@ fn seed_run(
             request_id: format!("{run_id}-request"),
             client_id: Some("mcp".into()),
             state,
+            purpose: Default::default(),
             agent_id: None,
             retry_of: None,
             parent_run_id: None,

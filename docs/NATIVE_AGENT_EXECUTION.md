@@ -30,6 +30,14 @@ Authority may only narrow. Computer Use and `bypassPermissions` Agents are
 rejected. Enabling managed execution clears `bypassPermissions` on the spec.
 The supervisor never sets global auto-approve and never grants Computer Use.
 
+Manager-decision Work is a stricter native-execution subtype. Before spawning
+the provider task, the native executor installs a host-owned proposal-only
+capability on the exact admitted Run; the permission gate then auto-denies
+every tool from the first model event. The durable Work → intent → Run link is
+the audit trail, not the enforcement lookup. The decision still uses the
+Agent's captured, provider-agnostic model route and finite bounds, but model
+output can only become a typed proposal for the manager applicator.
+
 ### `retryEligible`
 
 This flag is independent of Work retry policy and is enforced on every native

@@ -48,8 +48,9 @@ use crate::orchestration::{
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
     ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, RoutineConcurrencyPolicy,
     RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
-    RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
-    WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
+    RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState,
+    RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate,
+    DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -2498,6 +2499,7 @@ impl AgentHostHandle {
             request_id: format!("desktop-turn-{turn_id}"),
             client_id: Some("desktop".into()),
             state: RunState::Running,
+            purpose: RunPurpose::Execution,
             agent_id: agent_id.clone(),
             retry_of: None,
             parent_run_id,
@@ -2600,6 +2602,23 @@ impl AgentHostHandle {
     }
 
     pub(crate) fn persist_agent_checkpoint(
+        &self,
+        run: &RunRecord,
+        outcome: &str,
+        end_seq: u64,
+        event_tx: &crate::event_bus::EventBus,
+        store: &OrchStore,
+    ) -> Result<()> {
+        let result = self.persist_agent_checkpoint_inner(run, outcome, end_seq, event_tx, store);
+        if result.is_err() {
+            if let Some(agent_id) = run.agent_id.as_deref() {
+                store.deactivate_agent_run(agent_id, &run.run_id, outcome == "failed")?;
+            }
+        }
+        result
+    }
+
+    fn persist_agent_checkpoint_inner(
         &self,
         run: &RunRecord,
         outcome: &str,
@@ -4348,6 +4367,26 @@ impl AgentHostHandle {
             .map(|spec| spec.authority))
     }
 
+    /// Manager reasoning Runs are proposal-only. The durable Run purpose is
+    /// the authority; a missing or unreadable active record fails closed.
+    fn session_run_is_manager_proposal(&self, session_id: Uuid) -> Result<bool> {
+        let Some(run_id) = self.current_turn_run_id(session_id) else {
+            return Ok(false);
+        };
+        let store = self
+            .orchestration_store
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!("persistent Run store is unavailable"))?;
+        let run = store
+            .load_run(&run_id)?
+            .ok_or_else(|| anyhow!("active Run record is missing"))?;
+        if run.session_id != session_id {
+            bail!("active Run session does not match the current turn");
+        }
+        Ok(run.purpose == RunPurpose::ManagerProposal)
+    }
+
     /// Intersect mutable host policy with the Agent's captured ceiling. Either
     /// side may deny or require approval; auto-approval requires both.
     fn tool_gate(&self, session_id: Uuid, tool_name: &str) -> ToolGate {
@@ -4360,6 +4399,10 @@ impl AgentHostHandle {
         tool_name: &str,
         enforce_tool_allowlist: bool,
     ) -> ToolGate {
+        match self.session_run_is_manager_proposal(session_id) {
+            Ok(false) => {}
+            Ok(true) | Err(_) => return ToolGate::AutoDeny,
+        }
         let ambient = {
             let g = self.inner.lock();
             evaluate_tool_gate(
@@ -6838,15 +6881,48 @@ impl AgentHostHandle {
                 None
             }
         };
-        let agent_default_bounds = persistent_agent
-            .as_ref()
-            .map(|agent| {
-                agent
-                    .current_spec()
-                    .map(|spec| spec.default_run_bounds.clone())
-                    .map_err(|error| anyhow!(error.to_string()))
-            })
-            .transpose()?;
+        let external_agent_spec = if let Some(external) = external_run.as_ref() {
+            let store = self.ensure_orchestration_store()?;
+            let run = store
+                .load_run(&external.run_id)?
+                .ok_or_else(|| anyhow!("external Run disappeared before turn start"))?;
+            let agent = persistent_agent
+                .as_ref()
+                .ok_or_else(|| anyhow!("external Build Run has no persistent Agent"))?;
+            if run.state != RunState::Running
+                || run.session_id != session_id
+                || run.agent_id.as_deref() != Some(agent.agent_id.as_str())
+                || agent.current_run_id.as_deref() != Some(run.run_id.as_str())
+            {
+                bail!("external Run activation does not match the persistent Agent");
+            }
+            let revision = run
+                .agent_spec_revision
+                .ok_or_else(|| anyhow!("external Run has no captured Agent specification"))?;
+            if agent.current_spec()?.revision != revision {
+                bail!("persistent Agent specification changed before external turn start");
+            }
+            Some(
+                store
+                    .load_agent_spec(&agent.agent_id, revision)?
+                    .ok_or_else(|| anyhow!("external Run Agent specification is missing"))?,
+            )
+        } else {
+            None
+        };
+        let agent_default_bounds = if let Some(spec) = external_agent_spec.as_ref() {
+            Some(spec.default_run_bounds.clone())
+        } else {
+            persistent_agent
+                .as_ref()
+                .map(|agent| {
+                    agent
+                        .current_spec()
+                        .map(|spec| spec.default_run_bounds.clone())
+                        .map_err(|error| anyhow!(error.to_string()))
+                })
+                .transpose()?
+        };
         let effective_agent_bounds = resume
             .as_ref()
             .map(|plan| plan.effective_run_bounds.clone())
@@ -6946,16 +7022,20 @@ impl AgentHostHandle {
             }
             // Persistent Agent model selection is revisioned and must not
             // drift with the currently focused desktop model.
-            let model = persistent_agent
-                .as_ref()
-                .map(|agent| {
-                    agent
-                        .current_spec()
-                        .map(|spec| spec.model.selection_key.clone())
-                        .map_err(|error| anyhow!(error.to_string()))
-                })
-                .transpose()?
-                .unwrap_or_else(|| g.model.clone());
+            let model = if let Some(spec) = external_agent_spec.as_ref() {
+                spec.model.selection_key.clone()
+            } else {
+                persistent_agent
+                    .as_ref()
+                    .map(|agent| {
+                        agent
+                            .current_spec()
+                            .map(|spec| spec.model.selection_key.clone())
+                            .map_err(|error| anyhow!(error.to_string()))
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| g.model.clone())
+            };
             let effort = g.effort;
             let cancel = CancellationToken::new();
             g.turn_cancels.insert(session_id, cancel.clone());
@@ -11288,6 +11368,7 @@ mod tests {
             request_id: format!("request-{run_id}"),
             client_id: Some("test".into()),
             state: RunState::Running,
+            purpose: RunPurpose::Execution,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -11751,6 +11832,7 @@ mod tests {
             request_id: "continuation-source-request".into(),
             client_id: Some("test".into()),
             state: RunState::Completed,
+            purpose: RunPurpose::Execution,
             agent_id: Some(agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -11892,6 +11974,7 @@ mod tests {
             request_id: "competing-admission-request".into(),
             client_id: Some("test".into()),
             state: RunState::Running,
+            purpose: RunPurpose::Execution,
             agent_id: Some(current_agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -12172,8 +12255,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn active_run_keeps_its_frozen_spec_authority_after_revision() {
+    #[tokio::test]
+    async fn active_run_keeps_its_frozen_spec_authority_after_revision() {
         let (_home, host, lane_id) = test_host();
         host.set_permission_mode("default".into());
         let agent = host.ensure_session_agent(lane_id).unwrap();
@@ -12187,6 +12270,7 @@ mod tests {
             request_id: "frozen-spec-request".into(),
             client_id: Some("test".into()),
             state: RunState::Running,
+            purpose: RunPurpose::Execution,
             agent_id: Some(agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -12214,6 +12298,8 @@ mod tests {
         store
             .save_run_and_activate_agent(&run, &agent.agent_id)
             .unwrap();
+        host.reserve_orchestration_turn(&run.run_id, lane_id)
+            .unwrap();
         store
             .revise_agent_spec(&agent.agent_id, "test:deny-mid-run", |spec| {
                 spec.authority.deny_rules.push("run_terminal_cmd".into());
@@ -12227,6 +12313,141 @@ mod tests {
         );
         let frozen = host.session_agent_spec(lane_id).unwrap().unwrap();
         assert_eq!(frozen.revision, revision);
+        let error = host
+            .session_prompt_reserved_with_max_rounds_for_run(
+                lane_id,
+                "must not start under a newer specification".into(),
+                Some(1),
+                &run.run_id,
+                &run.run_id,
+                RunExecutionMode::Shared,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("specification changed before external turn start"),
+            "unexpected error: {error}"
+        );
+        host.release_orchestration_turn(&run.run_id);
+    }
+
+    #[test]
+    fn manager_decision_run_is_host_enforced_proposal_only() {
+        let (_home, host, lane_id) = test_host();
+        host.set_permission_mode("bypassPermissions".into());
+        let agent = host.ensure_session_agent(lane_id).unwrap();
+        let revision = agent.current_spec().unwrap().revision;
+        let store = host.ensure_orchestration_store().unwrap();
+        let now = Utc::now();
+        let mut work = WorkItem::new(
+            "manager-decision",
+            "return a typed proposal",
+            lane_id,
+            agent.workspace.clone(),
+            "manager-supervisor",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        work.assigned_agent_id = Some(agent.agent_id.clone());
+        work.assignment_status = crate::orchestration::AssignmentStatus::Accepted;
+        work.parent_work_id = Some("manager-root".into());
+        work.source_manager_plan_id = Some("manager-plan".into());
+        work.source_manager_step_id = Some("__manager_decision__".into());
+        work.validate().unwrap();
+        store.save_work_item(&work).unwrap();
+        let run = RunRecord {
+            run_id: "manager-proposal-run".into(),
+            session_id: lane_id,
+            workspace: agent.workspace.clone(),
+            request_id: "manager-proposal-intent".into(),
+            client_id: Some("native-executor".into()),
+            state: RunState::Running,
+            purpose: RunPurpose::ManagerProposal,
+            agent_id: Some(agent.agent_id.clone()),
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: Some(revision),
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: agent.current_spec().unwrap().default_run_bounds.clone(),
+            prompt_preview: "typed proposal".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: now,
+            updated_at: now,
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            stop_cause: None,
+            aggregates: RunAggregates::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        };
+        store
+            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .unwrap();
+        host.reserve_orchestration_turn(&run.run_id, lane_id)
+            .unwrap();
+        host.run_usage_trackers
+            .lock()
+            .insert(lane_id, RunUsageTracker::from_run(store.clone(), &run));
+
+        assert_eq!(
+            host.tool_gate(lane_id, "run_terminal_cmd"),
+            ToolGate::AutoDeny
+        );
+        assert_eq!(host.tool_gate(lane_id, "mcp"), ToolGate::AutoDeny);
+    }
+
+    #[test]
+    fn checkpoint_failure_still_deactivates_the_terminal_agent() {
+        let (_home, host, lane_id) = test_host();
+        let mut agent = host.ensure_session_agent(lane_id).unwrap();
+        let store = host.ensure_orchestration_store().unwrap();
+        let missing_lane = Uuid::new_v4();
+        agent.agent_id = "checkpoint-failure-agent".into();
+        agent.session_id = missing_lane;
+        agent.lane_ids = vec![missing_lane];
+        agent.lane_associations = vec![AgentLaneAssociation {
+            lane_id: missing_lane,
+            source_workspace: agent.workspace.clone(),
+            attached_at: Utc::now(),
+            attached_by: "test".into(),
+            detached_at: None,
+            detached_by: None,
+        }];
+        agent.current_run_id = None;
+        agent.state = AgentState::Waiting;
+        store.save_agent(&agent).unwrap();
+
+        let mut run = usage_test_run("checkpoint-failure-run", Some(100));
+        run.session_id = missing_lane;
+        run.workspace = agent.workspace.clone();
+        run.agent_id = Some(agent.agent_id.clone());
+        run.agent_spec_revision = Some(agent.current_spec().unwrap().revision);
+        store
+            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .unwrap();
+        let error = host
+            .persist_agent_checkpoint(&run, "failed", 1, &host.event_bus(), &store)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown session"),
+            "unexpected error: {error}"
+        );
+        let deactivated = store.load_agent(&agent.agent_id).unwrap().unwrap();
+        assert_eq!(deactivated.current_run_id, None);
+        assert_eq!(
+            deactivated.last_run_id.as_deref(),
+            Some(run.run_id.as_str())
+        );
+        assert_eq!(deactivated.state, AgentState::Failed);
     }
 
     #[test]

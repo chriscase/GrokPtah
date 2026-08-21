@@ -21,6 +21,50 @@ use serde::Serialize;
 
 pub const DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_ROUTINE_TICK_INTERVAL: Duration = Duration::from_secs(1);
+pub const DEFAULT_MANAGER_TICK_INTERVAL: Duration = Duration::from_secs(2);
+pub const MAX_MANAGER_PLANS_PER_PASS: usize = 16;
+pub const MAX_MANAGER_OBSERVATIONS_PER_PASS: usize = 64;
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerSupervisorReport {
+    pub plans_scanned: usize,
+    pub plans_processed: usize,
+    pub work_created: usize,
+    pub messages_created: usize,
+    pub decisions_created: usize,
+    pub decisions_applied: usize,
+    pub decisions_rejected: usize,
+    pub bounded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerSupervisorStatus {
+    pub enabled: bool,
+    pub interval_ms: u64,
+    pub started_at: Option<DateTime<Utc>>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub last_report: ManagerSupervisorReport,
+}
+
+impl ManagerSupervisorStatus {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            interval_ms: DEFAULT_MANAGER_TICK_INTERVAL
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            started_at: None,
+            last_run_at: None,
+            last_success_at: None,
+            last_error: None,
+            last_report: ManagerSupervisorReport::default(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

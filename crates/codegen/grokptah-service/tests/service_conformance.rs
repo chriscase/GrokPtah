@@ -8,7 +8,9 @@ mod common;
 
 use std::time::Duration;
 
-use grokptah_agent_bridge::{AuthCredential, LiveNotification, McpControlClient, RunScope};
+use grokptah_agent_bridge::{
+    AuthCredential, LiveNotification, McpControlClient, McpRemoteError, RunScope,
+};
 use grokptah_service::{start_service, ServiceConfig};
 use serde_json::json;
 use tokio::time::timeout;
@@ -420,12 +422,13 @@ async fn submit_idempotency_replays_receipt_and_rejects_payload_reuse() {
             }),
         )
         .await;
-    let conflict = err_text(&conflict).to_ascii_lowercase();
-    assert!(
-        conflict.contains("request_id")
-            || conflict.contains("payload")
-            || conflict.contains("reused"),
-        "reused request id with a different payload must fail closed, got {conflict}"
+    let conflict = conflict.unwrap_err();
+    assert_eq!(
+        conflict
+            .downcast_ref::<McpRemoteError>()
+            .and_then(McpRemoteError::data_code),
+        Some("conflict"),
+        "reused request id with a different payload must fail closed"
     );
 
     client.close_session().await.unwrap();
@@ -445,14 +448,13 @@ async fn authorization_is_fail_closed_across_token_session_and_workspace() {
     let peer = create_build_session(&mut client, &other, "Peer session").await;
 
     let mut wrong = McpControlClient::new(format!("http://{}", handle.addr), "wrong-token");
-    let wrong_init = wrong.initialize().await;
-    assert!(
-        err_text(&wrong_init).to_ascii_lowercase().contains("401")
-            || err_text(&wrong_init)
-                .to_ascii_lowercase()
-                .contains("unauthor"),
-        "wrong bearer must fail closed: {}",
-        err_text(&wrong_init)
+    let wrong_init = wrong.initialize().await.unwrap_err();
+    assert_eq!(
+        wrong_init
+            .downcast_ref::<McpRemoteError>()
+            .and_then(McpRemoteError::data_code),
+        Some("unauthenticated"),
+        "wrong bearer must fail closed"
     );
 
     let unknown_session = client
@@ -1031,6 +1033,8 @@ async fn hosted_service_exposes_native_executor_controls() {
         "ptah_set_managed_execution",
         "ptah_get_managed_execution",
         "ptah_list_execution_intents",
+        "ptah_create_manager_plan",
+        "ptah_tick_manager_plan",
     ] {
         assert!(
             tools.iter().any(|tool| tool.name == required),
@@ -1044,6 +1048,10 @@ async fn hosted_service_exposes_native_executor_controls() {
     assert!(capacity.structured["health"]
         .get("nativeExecutor")
         .is_some());
+    assert_eq!(
+        capacity.structured["health"]["managerSupervisor"]["enabled"],
+        true
+    );
     let inspected = client
         .call_tool(
             "ptah_get_managed_execution",
@@ -1056,6 +1064,75 @@ async fn hosted_service_exposes_native_executor_controls() {
         .await
         .unwrap();
     assert_eq!(inspected.structured["managedExecution"]["enabled"], false);
+    client
+        .call_tool(
+            "ptah_set_managed_execution",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "agent_id": agent.agent_id,
+                "policy": {
+                    "enabled": true,
+                    "allowedWorkKinds": [],
+                    "allowedSourceRoutineIds": [],
+                    "maxConcurrentRuns": 1,
+                    "bounds": {
+                        "maxPromptBytes": 16384,
+                        "maxRounds": 4,
+                        "maxDurationMs": 30000,
+                        "maxTotalTokens": 8000
+                    },
+                    "retryEligible": false,
+                    "requiresApprovalBeforeExecution": false
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let created = client
+        .call_tool(
+            "ptah_create_manager_plan",
+            json!({
+                "request_id": "standalone-manager-auto",
+                "session_id": session_id,
+                "workspace": workspace,
+                "manager_agent_id": agent.agent_id,
+                "objective": "prove the hosted owner advances without a client tick",
+                "steps": [{"stepId": "first", "kind": "verification", "objective": "materialize me"}],
+                "autonomous": true
+            }),
+        )
+        .await
+        .unwrap();
+    let plan_id = created.structured["plan"]["planId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let store = handle.host().ensure_orchestration_store().unwrap();
+    let mut children = Vec::new();
+    for _ in 0..150 {
+        children = store
+            .list_work_items()
+            .unwrap()
+            .into_iter()
+            .filter(|work| work.source_manager_plan_id.as_deref() == Some(plan_id.as_str()))
+            .collect();
+        if !children.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let after = client
+        .call_tool("ptah_get_capacity", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        children.len(),
+        1,
+        "hosted supervisor must materialize once; health={:?}; plan={:?}",
+        after.structured["health"]["managerSupervisor"],
+        store.load_manager_plan(&plan_id).unwrap()
+    );
     client.close_session().await.unwrap();
     handle.stop_and_wait().await;
 }
