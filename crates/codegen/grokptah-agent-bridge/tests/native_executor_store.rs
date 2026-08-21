@@ -322,6 +322,7 @@ fn run_for_intent(intent_id: &str, session: Uuid, workspace: &str, state: RunSta
         request_id: intent_id.into(),
         client_id: Some("native-executor".into()),
         state,
+        purpose: Default::default(),
         agent_id: Some("worker-a".into()),
         retry_of: None,
         parent_run_id: None,

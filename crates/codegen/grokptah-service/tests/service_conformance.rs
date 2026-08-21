@@ -8,7 +8,9 @@ mod common;
 
 use std::time::Duration;
 
-use grokptah_agent_bridge::{AuthCredential, LiveNotification, McpControlClient, RunScope};
+use grokptah_agent_bridge::{
+    AuthCredential, LiveNotification, McpControlClient, McpRemoteError, RunScope,
+};
 use grokptah_service::{start_service, ServiceConfig};
 use serde_json::json;
 use tokio::time::timeout;
@@ -420,12 +422,13 @@ async fn submit_idempotency_replays_receipt_and_rejects_payload_reuse() {
             }),
         )
         .await;
-    let conflict = err_text(&conflict).to_ascii_lowercase();
-    assert!(
-        conflict.contains("request_id")
-            || conflict.contains("payload")
-            || conflict.contains("reused"),
-        "reused request id with a different payload must fail closed, got {conflict}"
+    let conflict = conflict.unwrap_err();
+    assert_eq!(
+        conflict
+            .downcast_ref::<McpRemoteError>()
+            .and_then(McpRemoteError::data_code),
+        Some("conflict"),
+        "reused request id with a different payload must fail closed"
     );
 
     client.close_session().await.unwrap();
@@ -445,14 +448,13 @@ async fn authorization_is_fail_closed_across_token_session_and_workspace() {
     let peer = create_build_session(&mut client, &other, "Peer session").await;
 
     let mut wrong = McpControlClient::new(format!("http://{}", handle.addr), "wrong-token");
-    let wrong_init = wrong.initialize().await;
-    assert!(
-        err_text(&wrong_init).to_ascii_lowercase().contains("401")
-            || err_text(&wrong_init)
-                .to_ascii_lowercase()
-                .contains("unauthor"),
-        "wrong bearer must fail closed: {}",
-        err_text(&wrong_init)
+    let wrong_init = wrong.initialize().await.unwrap_err();
+    assert_eq!(
+        wrong_init
+            .downcast_ref::<McpRemoteError>()
+            .and_then(McpRemoteError::data_code),
+        Some("unauthenticated"),
+        "wrong bearer must fail closed"
     );
 
     let unknown_session = client

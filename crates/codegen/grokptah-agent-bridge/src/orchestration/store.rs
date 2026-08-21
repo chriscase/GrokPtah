@@ -59,6 +59,10 @@ struct OrchStoreInner {
 struct AgentActivationIntent {
     run: RunRecord,
     activated_agent: AgentRecord,
+    /// A queued Run replaced by `run` during atomic promotion. Legacy
+    /// creation intents have no prior record.
+    #[serde(default)]
+    prior_run: Option<RunRecord>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -454,12 +458,16 @@ impl OrchStore {
             .migrate_legacy_spec()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         anyhow::ensure!(
-            !(agent.state == AgentState::Active && agent.current_run_id.is_some()),
+            agent.current_run_id.is_none(),
             "persistent Agent already has an active Run"
         );
         anyhow::ensure!(
             agent.known_lane_ids().contains(&run.session_id),
             "Run Lane is not currently associated with the persistent Agent"
+        );
+        anyhow::ensure!(
+            run.agent_spec_revision == Some(agent.current_spec()?.revision),
+            "Run Agent specification revision is stale"
         );
         let run_path = self
             .run_path(&run.run_id)
@@ -478,6 +486,7 @@ impl OrchStore {
         let intent = AgentActivationIntent {
             run: run.clone(),
             activated_agent: agent.clone(),
+            prior_run: None,
         };
         atomic_write_json(&intent_path, &intent)?;
         if let Err(error) = atomic_write_json(&run_path, run) {
@@ -508,7 +517,139 @@ impl OrchStore {
             }
             return Err(error.context("persist Agent activation"));
         }
-        remove_file_durable(&intent_path).context("commit Agent activation recovery intent")?;
+        if let Err(error) = remove_file_durable(&intent_path) {
+            // Both authoritative records are installed. Keep the recovery
+            // intent as a safe replay anchor; terminal finalization removes
+            // it before replacing the Run.
+            *self.inner.last_run_error.lock() = Some(error.to_string());
+        }
+        Ok(())
+    }
+
+    /// Atomically promote a durable queued Run and activate its Agent.
+    ///
+    /// The recovery intent records both sides of the queued-to-running
+    /// replacement so a crash before either pointer write converges safely.
+    pub fn promote_queued_run_and_activate_agent(
+        &self,
+        run_id: &str,
+        agent_id: &str,
+        start_seq: u64,
+    ) -> anyhow::Result<Option<RunRecord>> {
+        let _g = self.inner.lock.lock();
+        let activation_dir = self.inner.root.join("agent-activation");
+        if fs::read_dir(&activation_dir)?.any(|entry| {
+            entry.ok().is_some_and(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            })
+        }) {
+            anyhow::bail!("a prior Agent activation requires restart recovery");
+        }
+        let Some(prior_run) = self.load_run_unlocked(run_id)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            prior_run.state == RunState::Queued,
+            "Run is no longer queued"
+        );
+        anyhow::ensure!(
+            prior_run.agent_id.as_deref() == Some(agent_id),
+            "Run Agent identity does not match activation target"
+        );
+        let agent_path = self
+            .agent_path(agent_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(agent_path.is_file(), "persistent Agent record is missing");
+        let mut agent: AgentRecord = serde_json::from_str(&fs::read_to_string(&agent_path)?)?;
+        agent
+            .migrate_legacy_spec()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            agent.current_run_id.is_none(),
+            "persistent Agent already has an active Run"
+        );
+        anyhow::ensure!(
+            agent.known_lane_ids().contains(&prior_run.session_id),
+            "Run Lane is not currently associated with the persistent Agent"
+        );
+        anyhow::ensure!(
+            prior_run.agent_spec_revision == Some(agent.current_spec()?.revision),
+            "Run Agent specification revision is stale"
+        );
+
+        let mut run = prior_run.clone();
+        run.state = RunState::Running;
+        run.queue_position = None;
+        run.start_seq = Some(start_seq);
+        run.updated_at = Utc::now();
+        agent.state = AgentState::Active;
+        agent.current_run_id = Some(run.run_id.clone());
+        agent.last_lane_id = Some(run.session_id);
+        agent.updated_at = Utc::now();
+        agent
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+        let run_path = self
+            .run_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let intent_path = self
+            .agent_activation_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let intent = AgentActivationIntent {
+            run: run.clone(),
+            activated_agent: agent.clone(),
+            prior_run: Some(prior_run.clone()),
+        };
+        atomic_write_json(&intent_path, &intent)?;
+        if let Err(error) = atomic_write_json(&run_path, &run) {
+            if remove_file_durable(&intent_path).is_err() {
+                return Err(
+                    error.context("promote queued Run; durable recovery intent requires restart")
+                );
+            }
+            return Err(error.context("promote queued Run"));
+        }
+        if let Err(error) = atomic_write_json(&agent_path, &agent) {
+            if atomic_write_json(&run_path, &prior_run).is_err()
+                || remove_file_durable(&intent_path).is_err()
+            {
+                return Err(error
+                    .context("activate promoted Run; durable recovery intent requires restart"));
+            }
+            return Err(error.context("activate promoted Run"));
+        }
+        if let Err(error) = remove_file_durable(&intent_path) {
+            *self.inner.last_run_error.lock() = Some(error.to_string());
+        }
+        Ok(Some(run))
+    }
+
+    /// Release a terminal Run's Agent pointer even when checkpoint creation
+    /// fails. A different active Run is never disturbed.
+    pub fn deactivate_agent_run(
+        &self,
+        agent_id: &str,
+        run_id: &str,
+        failed: bool,
+    ) -> anyhow::Result<()> {
+        self.update_agent(agent_id, |agent| {
+            match agent.current_run_id.as_deref() {
+                Some(current) if current == run_id => {
+                    agent.current_run_id = None;
+                    agent.last_run_id = Some(run_id.to_string());
+                    agent.state = if failed {
+                        AgentState::Failed
+                    } else {
+                        AgentState::Waiting
+                    };
+                }
+                Some(_) => anyhow::bail!("persistent Agent is active on a different Run"),
+                None => {}
+            }
+            Ok(())
+        })?
+        .ok_or_else(|| anyhow::anyhow!("persistent Agent disappeared during deactivation"))?;
         Ok(())
     }
 
@@ -4588,6 +4729,16 @@ impl OrchStore {
             anyhow::bail!("finalization candidate must be terminal");
         }
         let _guard = self.inner.lock.lock();
+        let activation_path = self
+            .agent_activation_path(&candidate.run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if activation_path.is_file() {
+            // A crash or cleanup failure may leave a fully applied activation
+            // intent. Remove that Running snapshot before a terminal record
+            // is installed so restart recovery can never resurrect the Run.
+            remove_file_durable(&activation_path)
+                .context("retire Agent activation before Run finalization")?;
+        }
         let mut final_run = candidate.clone();
         let run_path = self
             .run_path(&candidate.run_id)
@@ -4916,7 +5067,10 @@ impl OrchStore {
             if run_path.is_file() {
                 let existing: RunRecord = serde_json::from_str(&fs::read_to_string(&run_path)?)?;
                 anyhow::ensure!(
-                    serde_json::to_value(existing)? == serde_json::to_value(&intent.run)?,
+                    serde_json::to_value(&existing)? == serde_json::to_value(&intent.run)?
+                        || intent.prior_run.as_ref().is_some_and(|prior| {
+                            serde_json::to_value(&existing).ok() == serde_json::to_value(prior).ok()
+                        }),
                     "Agent activation recovery Run conflicts with durable state"
                 );
             }
@@ -5180,6 +5334,7 @@ fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::types::RunPurpose;
     use crate::orchestration::types::{
         AgentRecord, ContinuationCheckpoint, ContinuationReason, RunBounds,
     };
@@ -5194,6 +5349,7 @@ mod tests {
             request_id: format!("req-{run_id}"),
             client_id: None,
             state: RunState::Completed,
+            purpose: Default::default(),
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -5251,6 +5407,7 @@ mod tests {
             request_id: "req1".into(),
             client_id: None,
             state: RunState::Running,
+            purpose: Default::default(),
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -5616,6 +5773,7 @@ mod tests {
             request_id: "req2".into(),
             client_id: None,
             state: RunState::Running,
+            purpose: Default::default(),
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -5850,6 +6008,7 @@ mod tests {
             request_id: "req-tx".into(),
             client_id: None,
             state: RunState::Running,
+            purpose: Default::default(),
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -6081,6 +6240,15 @@ mod tests {
         first.session_id = first_lane;
         first.state = RunState::Running;
         first.agent_id = Some("agent-activation-race".into());
+        first.agent_spec_revision = Some(
+            store
+                .load_agent("agent-activation-race")
+                .unwrap()
+                .unwrap()
+                .current_spec()
+                .unwrap()
+                .revision,
+        );
         first.terminal_result = None;
         first.final_response = None;
         first.end_seq = None;
@@ -6107,6 +6275,36 @@ mod tests {
                 .as_deref(),
             Some(first.run_id.as_str())
         );
+
+        store
+            .deactivate_agent_run("agent-activation-race", &first.run_id, false)
+            .unwrap();
+        second.state = RunState::Queued;
+        second.start_seq = None;
+        store.save_run(&second).unwrap();
+        let promoted = store
+            .promote_queued_run_and_activate_agent(&second.run_id, "agent-activation-race", 42)
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted.state, RunState::Running);
+        assert_eq!(promoted.start_seq, Some(42));
+        assert_eq!(
+            store
+                .load_agent("agent-activation-race")
+                .unwrap()
+                .unwrap()
+                .current_run_id
+                .as_deref(),
+            Some(second.run_id.as_str())
+        );
+    }
+
+    #[test]
+    fn legacy_run_without_purpose_defaults_to_execution() {
+        let mut value = serde_json::to_value(terminal_run("legacy-purpose")).unwrap();
+        value.as_object_mut().unwrap().remove("purpose");
+        let run: RunRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(run.purpose, RunPurpose::Execution);
     }
 
     #[test]
@@ -6140,10 +6338,14 @@ mod tests {
             let mut run = terminal_run(run_id);
             run.session_id = lane_id;
             run.state = RunState::Running;
+            run.purpose = RunPurpose::ManagerProposal;
             run.agent_id = Some("agent-activation-crash".into());
             run.terminal_result = None;
             run.final_response = None;
             run.end_seq = None;
+            let mut prior_run = run.clone();
+            prior_run.state = RunState::Queued;
+            prior_run.start_seq = None;
             let mut activated = store.load_agent("agent-activation-crash").unwrap().unwrap();
             activated.state = AgentState::Active;
             activated.current_run_id = Some(run_id.into());
@@ -6151,10 +6353,12 @@ mod tests {
             let intent = AgentActivationIntent {
                 run: run.clone(),
                 activated_agent: activated,
+                prior_run: Some(prior_run.clone()),
             };
             atomic_write_json(&store.agent_activation_path(run_id).unwrap(), &intent).unwrap();
-            atomic_write_json(&store.run_path(run_id).unwrap(), &run).unwrap();
-            // Simulated crash before the Agent pointer write.
+            atomic_write_json(&store.run_path(run_id).unwrap(), &prior_run).unwrap();
+            // Simulated crash after the promotion intent but before replacing
+            // the queued Run or activating its Agent.
         }
 
         let reopened = OrchStore::open(root.path()).unwrap();
@@ -6164,6 +6368,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(run.state, RunState::Interrupted);
+        assert_eq!(run.purpose, RunPurpose::ManagerProposal);
         assert_eq!(agent.state, AgentState::Interrupted);
         assert_eq!(agent.current_run_id, None);
         assert_eq!(agent.last_run_id.as_deref(), Some(run_id));

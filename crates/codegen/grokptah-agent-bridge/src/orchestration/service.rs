@@ -1717,16 +1717,34 @@ impl OrchestrationService {
             }
 
             let start_seq = self.bus.next_seq();
-            let transitioned = self.store.update_run(&pending.run_id, |run| {
-                if run.state != RunState::Queued {
-                    anyhow::bail!("queued run is no longer pending");
-                }
-                run.state = RunState::Running;
-                run.queue_position = None;
-                run.start_seq = Some(start_seq);
-                run.updated_at = Utc::now();
-                Ok(())
-            });
+            let Some(agent_id) = current.agent_id.as_deref() else {
+                self.host.release_orchestration_turn(&pending.run_id);
+                continue;
+            };
+            let captured_spec_is_current = self
+                .store
+                .load_agent(agent_id)
+                .ok()
+                .flatten()
+                .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision))
+                == current.agent_spec_revision;
+            if !captured_spec_is_current {
+                let _ = self.store.update_run(&pending.run_id, |run| {
+                    run.state = RunState::Failed;
+                    run.terminal_result = Some("failed".into());
+                    run.error_code = Some(OrchErrorCode::StaleVersion.as_str().into());
+                    run.stop_cause = Some(RunStopCause::Failed);
+                    run.updated_at = Utc::now();
+                    Ok(())
+                });
+                self.host.release_orchestration_turn(&pending.run_id);
+                continue;
+            }
+            let transitioned = self.store.promote_queued_run_and_activate_agent(
+                &pending.run_id,
+                agent_id,
+                start_seq,
+            );
             match transitioned {
                 Ok(Some(run)) => self.spawn_run(run, pending.prompt, pending.execution_mode),
                 Ok(None) | Err(_) => {
@@ -6603,6 +6621,12 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
         let tool = idempotency_tool;
+        if proposal_only && allow_queue {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "proposal-only Runs cannot enter the generic admission queue",
+            ));
+        }
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -6798,6 +6822,11 @@ impl OrchestrationService {
             } else {
                 RunState::Running
             },
+            purpose: if proposal_only {
+                RunPurpose::ManagerProposal
+            } else {
+                RunPurpose::Execution
+            },
             agent_id: Some(agent.agent_id),
             retry_of: retry_of.map(str::to_string),
             parent_run_id: None,
@@ -6822,7 +6851,13 @@ impl OrchestrationService {
             execution: None,
             approval: None,
         };
-        if let Err(e) = self.store.save_run(&run) {
+        let persisted = if queued {
+            self.store.save_run(&run)
+        } else {
+            self.store
+                .save_run_and_activate_agent(&run, run.agent_id.as_deref().expect("Run Agent"))
+        };
+        if let Err(e) = persisted {
             if !queued {
                 self.host.release_turn_reservation(session_id, &run_id);
                 self.release_capacity(&run_id);
@@ -6861,18 +6896,6 @@ impl OrchestrationService {
             None
         };
 
-        if proposal_only {
-            if queued {
-                return Err(OrchError::new(
-                    OrchErrorCode::Internal,
-                    "proposal-only Runs cannot enter the generic admission queue",
-                ));
-            }
-            self.host
-                .mark_orchestration_run_proposal_only(&run_id)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        }
-
         let response = json!({
             "runId": run_id,
             "sessionId": session_id,
@@ -6891,6 +6914,11 @@ impl OrchestrationService {
             });
             self.remove_pending(&run_id);
             if !queued {
+                let _ = self.store.deactivate_agent_run(
+                    run.agent_id.as_deref().expect("Run Agent"),
+                    &run_id,
+                    true,
+                );
                 self.host.release_turn_reservation(session_id, &run_id);
                 self.release_capacity(&run_id);
             }
@@ -6953,6 +6981,15 @@ impl OrchestrationService {
                 OrchError::new(
                     OrchErrorCode::Conflict,
                     "only interrupted runs can be explicitly retried",
+                ),
+            ));
+        }
+        if source.purpose == RunPurpose::ManagerProposal {
+            return Err(fail(
+                self,
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "manager proposal Runs cannot be retried as executable work",
                 ),
             ));
         }

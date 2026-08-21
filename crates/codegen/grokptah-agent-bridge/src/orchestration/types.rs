@@ -34,6 +34,18 @@ impl RunState {
     }
 }
 
+/// Host-authored capability class for a finite Run.
+///
+/// This is durable because security decisions must survive process restarts
+/// and must not depend on an in-memory marker installed after admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPurpose {
+    #[default]
+    Execution,
+    ManagerProposal,
+}
+
 /// Host-decided terminal cause. Unlike `terminal_result`/`final_response`,
 /// this is never inferred from model-authored prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,6 +420,9 @@ pub struct RunRecord {
     pub request_id: String,
     pub client_id: Option<String>,
     pub state: RunState,
+    /// Immutable host-authored capability class for this Run.
+    #[serde(default)]
+    pub purpose: RunPurpose,
     /// Durable agent identity owning this run. Optional for legacy runs and
     /// non-agent orchestration clients.
     #[serde(default)]
