@@ -161,6 +161,21 @@ pub enum AttemptDisposition {
     Cancelled,
 }
 
+/// Identifies why a durable state is present in a provider capture.
+///
+/// `Primary` is the backwards-compatible default for the original single-Run
+/// capture shape. Recovery captures explicitly separate the completed Run
+/// whose provider observations are retained from the interrupted/retried Run
+/// whose durable lifecycle is being certified.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableEvidenceRole {
+    #[default]
+    Primary,
+    ProviderCapture,
+    Recovery,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CampaignIdentity {
@@ -250,6 +265,9 @@ pub struct ProviderAttemptEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DurableStateEvidence {
+    /// Defaults to `primary` when reading the original v2 single-Run shape.
+    #[serde(default)]
+    pub role: DurableEvidenceRole,
     pub agent_id: String,
     pub agent_spec_revision: u64,
     pub lane_id: String,
@@ -439,6 +457,15 @@ impl PersistentAgentCapture {
                 "campaign scenario is not in the versioned catalog",
             ));
         }
+        if self
+            .durable_states
+            .iter()
+            .any(|state| state.role == DurableEvidenceRole::Recovery)
+        {
+            return Err(CertificationError::NotPromotable(
+                "recovery captures require manual review before fixture promotion",
+            ));
+        }
         verify_promotion_artifacts(self, fixture_root)?;
         Ok(())
     }
@@ -449,9 +476,22 @@ impl PersistentAgentCapture {
     /// root-bound artifact policy.
     pub fn validate_complete_structural_evidence(&self) -> Result<(), CertificationError> {
         self.validate()?;
-        if self.durable_states.len() != 1 {
+        let provider_captures = self
+            .durable_states
+            .iter()
+            .filter(|state| state.role == DurableEvidenceRole::ProviderCapture)
+            .count();
+        let recovery_states = self
+            .durable_states
+            .iter()
+            .filter(|state| state.role == DurableEvidenceRole::Recovery)
+            .count();
+        let legacy_single_run = self.durable_states.len() == 1
+            && self.durable_states[0].role == DurableEvidenceRole::Primary;
+        let recovery_partition = provider_captures == 1 && recovery_states > 0;
+        if !legacy_single_run && !recovery_partition {
             return Err(CertificationError::NotPromotable(
-                "complete provider evidence must be partitioned to exactly one durable Run",
+                "complete provider evidence must use one primary Run or an explicit provider/recovery partition",
             ));
         }
         if !self.provider.route_class.is_public_xai() {
@@ -472,8 +512,69 @@ impl PersistentAgentCapture {
                 "campaign scenario is not in the versioned catalog",
             ));
         }
+        if recovery_partition {
+            let provider = self
+                .durable_states
+                .iter()
+                .find(|state| state.role == DurableEvidenceRole::ProviderCapture)
+                .expect("provider capture count checked above");
+            if !matches!(provider.terminal_state.as_str(), "completed" | "succeeded") {
+                return Err(CertificationError::NotPromotable(
+                    "provider-capture Run is not terminal-successful",
+                ));
+            }
+            for state in self
+                .durable_states
+                .iter()
+                .filter(|state| state.role == DurableEvidenceRole::Recovery)
+            {
+                if !matches!(
+                    state.terminal_state.as_str(),
+                    "interrupted" | "failed" | "completed" | "succeeded" | "limit_reached"
+                ) {
+                    return Err(CertificationError::NotPromotable(
+                        "recovery Run has an unsupported terminal state",
+                    ));
+                }
+            }
+            return validate_recovery_completeness(self);
+        }
         validate_promotion_completeness(self)
     }
+}
+
+fn validate_recovery_completeness(
+    capture: &PersistentAgentCapture,
+) -> Result<(), CertificationError> {
+    let required_checks = [
+        "provider_observation_complete",
+        "provider_attempts_bound_to_durable_run",
+        "recovery_state_partitioned",
+        "no_implicit_invocation_resume",
+    ];
+    let checks: BTreeSet<&str> = capture
+        .checks
+        .iter()
+        .map(|check| check.name.as_str())
+        .collect();
+    if capture.checks.is_empty()
+        || capture.checks.iter().any(|check| !check.passed)
+        || required_checks.iter().any(|check| !checks.contains(check))
+    {
+        return Err(CertificationError::NotPromotable(
+            "recovery capture lacks passing partition and no-resume checks",
+        ));
+    }
+    if capture
+        .attempts
+        .iter()
+        .any(|attempt| attempt.usage.as_ref().is_none_or(|usage| !usage.complete))
+    {
+        return Err(CertificationError::NotPromotable(
+            "recovery capture has incomplete provider usage",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_actuals(capture: &PersistentAgentCapture) -> Result<(), CertificationError> {
@@ -1512,6 +1613,7 @@ mod tests {
                 latency_millis: 25,
             }],
             durable_states: vec![DurableStateEvidence {
+                role: DurableEvidenceRole::Primary,
                 agent_id: format!("opaque-{}", hash('1')),
                 agent_spec_revision: 2,
                 lane_id: format!("opaque-{}", hash('2')),
@@ -1557,6 +1659,18 @@ mod tests {
         fixture
             .validate_for_xai_fixture_promotion_at(directory.path())
             .unwrap();
+    }
+
+    #[test]
+    fn legacy_single_run_capture_defaults_to_primary_evidence_role() {
+        let mut value = serde_json::to_value(fixture()).unwrap();
+        value["durableStates"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("role");
+        let capture: PersistentAgentCapture = serde_json::from_value(value).unwrap();
+        assert_eq!(capture.durable_states[0].role, DurableEvidenceRole::Primary);
+        capture.validate_complete_structural_evidence().unwrap();
     }
 
     #[test]

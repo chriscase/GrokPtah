@@ -6,6 +6,7 @@
 //! payloads while assembling a fixture.
 
 use anyhow::{bail, Context, Result};
+use grokptah_agent_bridge::certification::DurableEvidenceRole;
 use grokptah_agent_bridge::provider_observation::ProviderObservation;
 use grokptah_agent_bridge::{
     AttemptDisposition as CaptureAttemptDisposition, CampaignActuals, CampaignBudgets,
@@ -20,6 +21,11 @@ use crate::manifest::HardBounds;
 use crate::probes::ProviderRunEvidence;
 use crate::report::opaque_durable_id;
 
+pub struct CaptureRunSet<'a> {
+    pub provider: &'a ProviderRunEvidence,
+    pub recovery: &'a [ProviderRunEvidence],
+}
+
 /// Build one structural capture from one provider probe. The caller supplies
 /// only observations belonging to this finite Run; seed/setup calls must be
 /// excluded before calling this function.
@@ -30,8 +36,10 @@ pub fn build_capture(
     repository_dirty: bool,
     bounds: &HardBounds,
     observations: &[ProviderObservation],
-    run: &ProviderRunEvidence,
+    run_set: CaptureRunSet<'_>,
 ) -> Result<PersistentAgentCapture> {
+    let capture_run = run_set.provider;
+    let recovery_runs = run_set.recovery;
     if observations.is_empty() {
         bail!("provider_observation_missing");
     }
@@ -52,8 +60,8 @@ pub fn build_capture(
         let Ok(value) = serde_json::to_value(observation) else {
             return false;
         };
-        value["scope"]["run_id"].as_str() == Some(hash_hex(&run.run_id).as_str())
-            && value["scope"]["lane_id"].as_str() == Some(run.session_id.as_str())
+        value["scope"]["run_id"].as_str() == Some(hash_hex(&capture_run.run_id).as_str())
+            && value["scope"]["lane_id"].as_str() == Some(capture_run.session_id.as_str())
     });
     let total_tokens = attempts.iter().try_fold(0_u64, |total, attempt| {
         total
@@ -65,32 +73,29 @@ pub fn build_capture(
             .checked_add(attempt.latency_millis)
             .context("provider latency actual overflow")
     })?;
-    let checkpoint_id = run.checkpoint_id.as_deref().map(opaque_durable_id);
-    let parent_run_id = run.parent_run_id.as_deref().map(opaque_durable_id);
-    let durable = DurableStateEvidence {
-        agent_id: opaque_durable_id(&run.agent_id),
-        agent_spec_revision: run.agent_spec_revision,
-        lane_id: opaque_durable_id(&run.session_id),
-        run_id: opaque_durable_id(&run.run_id),
-        parent_run_id,
-        checkpoint_id,
-        continuation_input_hash: None,
-        continuation_context_hash: run
-            .continuation_context_hash
-            .as_deref()
-            .filter(|value| is_hash(value))
-            .map(str::to_owned),
-        continuation_fidelity: run.continuation_fidelity.clone(),
-        terminal_state: run.state.clone(),
-        stop_cause: run.stop_cause.clone(),
+    let mut durable_states = Vec::with_capacity(recovery_runs.len() + 1);
+    let capture_role = if recovery_runs.is_empty() {
+        DurableEvidenceRole::Primary
+    } else {
+        DurableEvidenceRole::ProviderCapture
     };
+    durable_states.push(durable_state(capture_run, capture_role));
+    for recovery_run in recovery_runs {
+        if recovery_run.run_id == capture_run.run_id
+            || recovery_run.agent_id != capture_run.agent_id
+            || recovery_run.session_id != capture_run.session_id
+        {
+            bail!("recovery_run_scope_mismatch");
+        }
+        durable_states.push(durable_state(recovery_run, DurableEvidenceRole::Recovery));
+    }
     let mut checks: Vec<CertificationCheck> = vec![
         check("new_finite_run_created", true, "run_created"),
         check("agent_durable", true, "agent_identity_bound"),
         check("run_durable", true, "run_identity_bound"),
         check(
             "terminal_state_durable",
-            run.state == "completed",
+            capture_run.state == "completed",
             "terminal_state_observed",
         ),
         check(
@@ -104,16 +109,28 @@ pub fn build_capture(
             "observation_scope_matches_run",
         ),
     ];
-    if durable.checkpoint_id.is_some() {
+    if durable_states[0].checkpoint_id.is_some() {
         checks.push(check("checkpoint_durable", true, "checkpoint_observed"));
     }
-    if durable.parent_run_id.is_some() {
+    if durable_states[0].parent_run_id.is_some() {
         checks.push(check(
             "verified_checkpoint_used",
-            durable.checkpoint_id.is_some()
-                && durable.continuation_context_hash.is_some()
-                && durable.continuation_fidelity.is_some(),
+            durable_states[0].checkpoint_id.is_some()
+                && durable_states[0].continuation_context_hash.is_some()
+                && durable_states[0].continuation_fidelity.is_some(),
             "parent-and-context-match",
+        ));
+    }
+    if !recovery_runs.is_empty() {
+        checks.push(check(
+            "recovery_state_partitioned",
+            true,
+            "provider-capture-and-recovery-runs-separated",
+        ));
+        checks.push(check(
+            "no_implicit_invocation_resume",
+            recovery_runs.iter().all(|run| run.state != "running"),
+            "recovery-run-terminal-state-observed",
         ));
     }
     if scenario_id == "resume-idempotency-001" {
@@ -126,7 +143,13 @@ pub fn build_capture(
     let actuals = CampaignActuals {
         total_tokens,
         provider_requests: u32::try_from(attempts.len()).context("provider request count")?,
-        continuations: u32::from(durable.parent_run_id.is_some()),
+        continuations: u32::try_from(
+            durable_states
+                .iter()
+                .filter(|state| state.parent_run_id.is_some())
+                .count(),
+        )
+        .context("durable continuation count")?,
         duration_seconds: duration_millis / 1_000,
         raw_artifact_bytes: 0,
     };
@@ -142,13 +165,34 @@ pub fn build_capture(
         budgets: campaign_budgets(bounds),
         actuals,
         attempts,
-        durable_states: vec![durable],
+        durable_states,
         checks,
     };
     capture
         .validate()
         .map_err(|error| anyhow::anyhow!("capture_validation_failed:{error}"))?;
     Ok(capture)
+}
+
+fn durable_state(run: &ProviderRunEvidence, role: DurableEvidenceRole) -> DurableStateEvidence {
+    DurableStateEvidence {
+        role,
+        agent_id: opaque_durable_id(&run.agent_id),
+        agent_spec_revision: run.agent_spec_revision,
+        lane_id: opaque_durable_id(&run.session_id),
+        run_id: opaque_durable_id(&run.run_id),
+        parent_run_id: run.parent_run_id.as_deref().map(opaque_durable_id),
+        checkpoint_id: run.checkpoint_id.as_deref().map(opaque_durable_id),
+        continuation_input_hash: None,
+        continuation_context_hash: run
+            .continuation_context_hash
+            .as_deref()
+            .filter(|value| is_hash(value))
+            .map(str::to_owned),
+        continuation_fidelity: run.continuation_fidelity.clone(),
+        terminal_state: run.state.clone(),
+        stop_cause: run.stop_cause.clone(),
+    }
 }
 
 fn campaign_budgets(bounds: &HardBounds) -> CampaignBudgets {
@@ -380,17 +424,20 @@ mod tests {
             false,
             &bounds(),
             &[observation],
-            &ProviderRunEvidence {
-                session_id,
-                agent_id: "agent-1".into(),
-                run_id: run_id.into(),
-                agent_spec_revision: 1,
-                checkpoint_id: Some("checkpoint-1".into()),
-                parent_run_id: None,
-                continuation_context_hash: None,
-                continuation_fidelity: None,
-                state: "completed".into(),
-                stop_cause: None,
+            CaptureRunSet {
+                provider: &ProviderRunEvidence {
+                    session_id: session_id.clone(),
+                    agent_id: "agent-1".into(),
+                    run_id: run_id.into(),
+                    agent_spec_revision: 1,
+                    checkpoint_id: Some("checkpoint-1".into()),
+                    parent_run_id: None,
+                    continuation_context_hash: None,
+                    continuation_fidelity: None,
+                    state: "completed".into(),
+                    stop_cause: None,
+                },
+                recovery: &[],
             },
         )
         .unwrap();
@@ -399,5 +446,90 @@ mod tests {
         assert!(!serialized.contains("BOUNDED_RUN_OK"));
         assert!(capture.attempts[0].request_body.is_none());
         assert!(capture.attempts[0].response_body.is_none());
+    }
+
+    #[test]
+    fn recovery_capture_keeps_provider_and_scenario_runs_distinct() {
+        let session_id = Uuid::parse_str("018f1234-5678-7abc-8def-0123456789ab")
+            .unwrap()
+            .to_string();
+        let endpoint =
+            public_xai_endpoint_fingerprint(&ProviderRouteClass::GrokBuildProxy).unwrap();
+        let observation = ProviderObservation::new(
+            EvidenceMode::MetadataOnly,
+            ObservationScope::new(
+                OpaqueScopeId::from_stable_input("campaign-recovery"),
+                OpaqueScopeId::from_stable_input("seed-run"),
+                OpaqueScopeId::new(&session_id).unwrap(),
+            ),
+            1,
+            ObservedRouteClass::GrokBuildProxy,
+            ProviderDialect::GrokBuild,
+            CredentialMethod::GrokBuildOidc,
+            ObservedIdentity::public(
+                PublicModelId::new("grok-build").unwrap(),
+                EndpointFingerprint::new(&endpoint).unwrap(),
+            ),
+            RequestRouteIdentity::public_chat_completions(),
+            vec![RequestHeaderName::ContentType],
+            ResponseMetadata::new(
+                Some(200),
+                Some(ResponseContentClass::EventStream),
+                ResponseFraming::ServerSentEvents,
+                grokptah_agent_bridge::provider_observation::AttemptDisposition::Completed,
+            )
+            .unwrap(),
+            AttemptMetrics::new(12, 24, 25, Some(AuthoritativeUsage::new(1, 1, 2).unwrap()))
+                .unwrap(),
+        )
+        .unwrap();
+        let capture = build_capture(
+            "campaign-recovery",
+            "interrupt-recover-001",
+            "b6dab133",
+            false,
+            &bounds(),
+            &[observation],
+            CaptureRunSet {
+                provider: &ProviderRunEvidence {
+                    session_id: session_id.clone(),
+                    agent_id: "agent-1".into(),
+                    run_id: "seed-run".into(),
+                    agent_spec_revision: 1,
+                    checkpoint_id: None,
+                    parent_run_id: None,
+                    continuation_context_hash: None,
+                    continuation_fidelity: None,
+                    state: "completed".into(),
+                    stop_cause: None,
+                },
+                recovery: &[ProviderRunEvidence {
+                    session_id,
+                    agent_id: "agent-1".into(),
+                    run_id: "interrupted-run".into(),
+                    agent_spec_revision: 1,
+                    checkpoint_id: None,
+                    parent_run_id: None,
+                    continuation_context_hash: None,
+                    continuation_fidelity: None,
+                    state: "interrupted".into(),
+                    stop_cause: Some("host_restart".into()),
+                }],
+            },
+        )
+        .unwrap();
+        capture.validate_complete_structural_evidence().unwrap();
+        assert_eq!(capture.durable_states.len(), 2);
+        assert_eq!(
+            capture.durable_states[0].role,
+            DurableEvidenceRole::ProviderCapture
+        );
+        assert_eq!(
+            capture.durable_states[1].role,
+            DurableEvidenceRole::Recovery
+        );
+        assert!(capture
+            .validate_for_xai_fixture_promotion_at(std::path::Path::new("."))
+            .is_err());
     }
 }

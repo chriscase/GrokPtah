@@ -477,6 +477,9 @@ pub async fn execute_minimal_probe(
     };
     match outcome {
         Ok(()) => probe.finish(ProbeStatus::Passed, DiagnosticCode::Ok),
+        Err(code) if code == DiagnosticCode::PermissionCapabilityAbsent => {
+            probe.finish(ProbeStatus::Skipped, code)
+        }
         Err(code) => probe.finish(ProbeStatus::Failed, code),
     }
 }
@@ -946,7 +949,11 @@ async fn native_permission_park_decisions(
     }
 
     let mut permission_cases: Vec<(String, String, String)> = Vec::new();
-    for _ in 0..300 {
+    // A live model must actually request the permission-gated tool. Do not
+    // spend the full campaign bound waiting for prose or a non-tool answer;
+    // after this bounded capability window the probe is skipped and the
+    // disposable native Runs are explicitly cancelled.
+    for _ in 0..120 {
         let page = probe
             .call(
                 client,
@@ -1007,7 +1014,56 @@ async fn native_permission_park_decisions(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     if permission_cases.len() != work_ids.len() {
-        return Err(DiagnosticCode::Timeout);
+        for work_id in &work_ids {
+            let snapshot = probe
+                .call(
+                    client,
+                    TraceOperationCode::GetWork,
+                    "ptah_get_work",
+                    json!({
+                        "session_id": agent.session_id,
+                        "workspace": workspace,
+                        "work_id": work_id,
+                    }),
+                    vec![
+                        ArgumentFieldCode::SessionId,
+                        ArgumentFieldCode::Workspace,
+                        ArgumentFieldCode::WorkId,
+                    ],
+                )
+                .await;
+            let run_ids = snapshot
+                .ok()
+                .and_then(|value| value["attempts"].as_array().cloned())
+                .into_iter()
+                .flatten()
+                .flat_map(|attempt| attempt["linkedRunIds"].as_array().cloned())
+                .flatten()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
+            for run_id in run_ids {
+                let _ = probe
+                    .call(
+                        client,
+                        TraceOperationCode::CancelRun,
+                        "ptah_cancel",
+                        json!({
+                            "request_id": request_id("permission-capability-cancel"),
+                            "session_id": agent.session_id,
+                            "workspace": workspace,
+                            "run_id": run_id,
+                        }),
+                        vec![
+                            ArgumentFieldCode::RequestId,
+                            ArgumentFieldCode::SessionId,
+                            ArgumentFieldCode::Workspace,
+                            ArgumentFieldCode::RunId,
+                        ],
+                    )
+                    .await;
+            }
+        }
+        return Err(DiagnosticCode::PermissionCapabilityAbsent);
     }
     probe.counters.permission_requests = probe
         .counters

@@ -264,6 +264,7 @@ fn synthetic_xai_fixture_has_a_promotable_secret_free_capture() {
             latency_millis: 1,
         }],
         durable_states: vec![grokptah_agent_bridge::DurableStateEvidence {
+            role: grokptah_agent_bridge::certification::DurableEvidenceRole::Primary,
             agent_id: format!("opaque-{}", "1".repeat(64)),
             agent_spec_revision: 1,
             lane_id: format!("opaque-{}", "2".repeat(64)),
