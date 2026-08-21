@@ -17,6 +17,7 @@ use super::managed::{
     ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
     MANAGED_FINALIZATION_SCHEMA_VERSION,
 };
+use super::manager::ManagerPlan;
 use super::message::{MessagePage, WorkMessage, MAX_RETAINED_MESSAGES};
 use super::routine::{
     advance_next_fire, decide_lifecycle_skip, due_occurrences, in_flight_count,
@@ -170,6 +171,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("worker-presence"))?;
         fs::create_dir_all(root.join("managed-intents"))?;
         fs::create_dir_all(root.join("managed-finalization"))?;
+        fs::create_dir_all(root.join("manager-plans"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -375,6 +377,15 @@ impl OrchStore {
             .inner
             .root
             .join("routine-intents")
+            .join(format!("{safe}.json")))
+    }
+
+    fn manager_plan_path(&self, plan_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(plan_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("manager-plans")
             .join(format!("{safe}.json")))
     }
 
@@ -657,6 +668,87 @@ impl OrchStore {
     pub fn load_work_attempt(&self, attempt_id: &str) -> anyhow::Result<Option<WorkAttempt>> {
         let _guard = self.inner.lock.lock();
         self.load_work_attempt_unlocked(attempt_id)
+    }
+
+    // --- Durable manager plans -------------------------------------------
+
+    pub fn save_manager_plan(&self, plan: &ManagerPlan) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.save_manager_plan_unlocked(plan)
+    }
+
+    pub fn save_manager_plan_with_work(
+        &self,
+        plan: &ManagerPlan,
+        work_items: &[WorkItem],
+    ) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        for item in work_items {
+            self.save_work_item_unlocked(item)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        self.save_manager_plan_unlocked(plan)
+    }
+
+    pub fn load_manager_plan(&self, plan_id: &str) -> Result<Option<ManagerPlan>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.load_manager_plan_unlocked(plan_id)
+    }
+
+    pub fn list_manager_plans(&self) -> Result<Vec<ManagerPlan>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.list_manager_plans_unlocked()
+    }
+
+    fn save_manager_plan_unlocked(&self, plan: &ManagerPlan) -> Result<(), OrchError> {
+        plan.validate()?;
+        let path = self.manager_plan_path(&plan.plan_id)?;
+        atomic_write_json(&path, plan)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn load_manager_plan_unlocked(&self, plan_id: &str) -> Result<Option<ManagerPlan>, OrchError> {
+        let path = match self.manager_plan_path(plan_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let plan: ManagerPlan = serde_json::from_str(
+            &fs::read_to_string(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        plan.validate()?;
+        Ok(Some(plan))
+    }
+
+    fn list_manager_plans_unlocked(&self) -> Result<Vec<ManagerPlan>, OrchError> {
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("manager-plans");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let plan: ManagerPlan = serde_json::from_str(
+                &fs::read_to_string(path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            plan.validate()?;
+            out.push(plan);
+        }
+        out.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(out)
     }
 
     // --- Durable routines -------------------------------------------------
