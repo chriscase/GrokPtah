@@ -1897,6 +1897,188 @@ impl OrchestrationService {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn tick_manager_plan(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        plan_id: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "planId": plan_id,
+            "expectedRevision": expected_revision,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_tick_manager_plan",
+                request_id,
+                session_id,
+                workspace,
+                &payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let (_, mut plan) = match self.load_manager_plan_scoped(session_id, &claimed, plan_id) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        if let Err(error) = plan.require_revision(expected_revision) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        if let Err(error) = self.validate_manager_assignments(&plan, &claimed, true) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        let work_items = match self.store.list_work_items() {
+            Ok(items) => items,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                ))
+            }
+        };
+        let now = Utc::now();
+        let created = if plan.state == super::manager::ManagerPlanState::Active {
+            match plan.advance(&work_items, &auth.token_id, now) {
+                Ok(created) => created,
+                Err(error) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        Some(plan_id.into()),
+                        session_id,
+                        &claimed,
+                        error,
+                    ))
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let notifications = plan.pending_notifications(&work_items);
+        let mut delivered = Vec::with_capacity(notifications.len());
+        let mut message_values = Vec::with_capacity(notifications.len());
+        for notification in notifications {
+            let notification_request_id = format!(
+                "manager-notify:{}:{}:{}:{}",
+                plan.plan_id,
+                notification.step_id,
+                notification.work_revision,
+                notification.kind.as_str()
+            );
+            let response = match self
+                .send_message(
+                    auth,
+                    &notification_request_id,
+                    session_id,
+                    &claimed,
+                    notification.kind,
+                    Some(plan.manager_agent_id.clone()),
+                    Some(plan.manager_agent_id.clone()),
+                    Some(notification.work_id.clone()),
+                    notification.body,
+                    Some(notification.payload),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        Some(plan_id.into()),
+                        session_id,
+                        &claimed,
+                        error,
+                    ))
+                }
+            };
+            let message_id = match response
+                .get("message")
+                .and_then(|message| message.get("messageId"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(message_id) => message_id.to_string(),
+                None => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        Some(plan_id.into()),
+                        session_id,
+                        &claimed,
+                        OrchError::new(
+                            OrchErrorCode::Internal,
+                            "manager notification response omitted message_id",
+                        ),
+                    ))
+                }
+            };
+            delivered.push((notification.step_id, notification.work_revision, message_id));
+            message_values.push(response["message"].clone());
+        }
+        if let Err(error) = plan.mark_notifications_sent(&delivered, Utc::now()) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        if let Err(error) = self.store.save_manager_plan_with_work(&plan, &created) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        let response = json!({
+            "plan": plan,
+            "createdWork": created,
+            "messages": message_values,
+            "nativeExecutor": self.native_executor_status(),
+        });
+        lease
+            .complete(Some(plan_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn replan_manager_plan(
         &self,
         _auth: &AuthContext,

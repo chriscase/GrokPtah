@@ -1447,6 +1447,7 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_list_manager_plans",
     "ptah_get_manager_plan",
     "ptah_advance_manager_plan",
+    "ptah_tick_manager_plan",
     "ptah_replan_manager_plan",
     "ptah_assign_work",
     "ptah_list_work",
