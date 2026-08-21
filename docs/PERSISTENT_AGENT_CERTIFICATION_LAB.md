@@ -20,6 +20,13 @@ identity, opaque durable Agent/lane/Run/checkpoint identities, and authoritative
 bound-profile fields. Old or unknown capture schemas fail closed; the
 independent scenario catalog remains v1.
 
+The v2 capture remains backwards-readable for the original single-Run shape.
+New recovery captures use `durableStates[].role` to distinguish the completed
+`provider_capture` Run whose sanitized provider observations are retained from
+one or more `recovery` Run states whose durable lifecycle is under test. A
+recovery capture must pass explicit partition and no-implicit-resume checks;
+it is evidence for review, not an automatically promotable replay fixture.
+
 ## What it proves
 
 The deterministic smoke campaign proves, through the public MCP surface:
@@ -43,6 +50,9 @@ are synthetic behavior fixtures. A normalized live capture is explicitly
 `live_capture_structural`: it can retain only attempt classification, framing,
 usage shape, one opaque Run partition, and a typed durable terminal. It cannot
 reconstruct provider SSE payloads, model prose, tool arguments, or reasoning.
+Recovery captures may additionally retain opaque structural states for the
+interrupted or explicitly retried Run without attaching that Run's provider
+payload to the successful provider-capture attempt.
 
 The lab does not claim model quality, exact prose, unattended long-lived model
 execution, or Computer Use safety. The merged service exposes native managed
@@ -309,7 +319,7 @@ failure. A second forced interrupt may terminate with the platform's standard
 | Work | Idempotency/conflict and lifecycle/lease implemented; dependencies and approval declared | Deterministic clock-dependent expiry remains skipped. |
 | Routines | Manual activation implemented; schedule/dedupe/lifecycle/recovery declared | Scheduled timing requires deterministic clock support. |
 | Coordinator/messages | Parent/child implemented; workers/messages/cursors/expiry/scope declared | Fixed message expiry without clock control is skipped. |
-| Native managed execution | Default-off policy, Work-to-Run, permission parking, duplicate suppression, restart adoption, and interruption retry implemented | Public discovery, default policy, and `nativeExecutor` health are verified. All five live probes use public MCP oracles; restart/retry additionally require an owned local restart and explicit reconnect. Payload-free capture is bound to the separate successful seed Run, while interrupted/failed scenario Runs remain structural evidence. |
+| Native managed execution | Default-off policy, Work-to-Run, permission parking, duplicate suppression, restart adoption, and interruption retry implemented | Public discovery, default policy, and `nativeExecutor` health are verified. All five live probes use public MCP oracles; restart/retry additionally require an owned local restart and explicit reconnect. Payload-free capture is bound to a successful provider-capture Run, while interrupted/failed scenario Runs are now retained as explicitly labelled recovery evidence. |
 | Soak | Declared, bounded, not implemented by the minimal runner | Existing coordinator/continuity/soak suites remain complementary evidence. |
 
 On the merged native-executor main, discovery looks only for the audited public tools
@@ -319,10 +329,15 @@ On the merged native-executor main, discovery looks only for the audited public 
 `ptah_get_capacity`. Even then, an unimplemented probe is indeterminate, not a
 pass. Permission checks must use a real elicited permission bound to its exact
 Run and are live-only: one fresh Work/Run/permission case is explicitly allowed
-and a second independent fresh case is denied. Each pre-execution-gated Work is
-authorized through `ptah_authorize_work_execution`; a wrong, dead, or missing
-permission resolution must fail closed and leave its Work parked. A single
-permission is never treated as having transitioned to both decisions.
+and a second independent fresh case is denied. The lab waits only within a
+bounded capability window (120 public inbox polls); if the provider does not
+elicit both permission cases, it cancels the disposable Runs and records
+`permission_capability_absent` as skipped rather than consuming the full
+campaign timeout. Each pre-execution-gated Work is authorized through
+`ptah_authorize_work_execution`; a wrong, dead, or missing permission
+resolution must fail closed and leave its Work parked. A single permission is
+never treated as having transitioned to both decisions. The synthetic replay
+fixture remains the deterministic unit-test path for allow/deny behavior.
 
 The `retryEligible=false` probe observes one native interruption and its original
 failed attempt, calls `ptah_retry_work`, proves repeated native ticks leave the

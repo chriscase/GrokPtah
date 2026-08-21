@@ -20,7 +20,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::artifact::{SafeOutputRoot, DEFAULT_OUTPUT_RELATIVE_PATH};
-use crate::capture::build_capture;
+use crate::capture::{build_capture, CaptureRunSet};
 use crate::local_service::{
     validate_public_model, LocalService, LocalServiceConfig, LocalServiceMode, DEFAULT_LIVE_MODEL,
 };
@@ -476,12 +476,15 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
                         .map_err(|_| anyhow::anyhow!("mcp_reinitialize_failed"))?;
                 }
                 if let Some(recorder) = recorder.as_ref() {
-                    let capture_run_is_distinct = execution.capture_provider_run.is_some();
-                    if let Some(provider_run) = execution
-                        .capture_provider_run
-                        .take()
-                        .or_else(|| execution.provider_run.take())
-                    {
+                    let scenario_run = execution.provider_run.clone();
+                    let capture_provider_run = execution.capture_provider_run.take();
+                    let capture_run_is_distinct =
+                        capture_provider_run.as_ref().is_some_and(|capture_run| {
+                            scenario_run
+                                .as_ref()
+                                .is_some_and(|scenario| scenario.run_id != capture_run.run_id)
+                        });
+                    if let Some(provider_run) = capture_provider_run.or(scenario_run.clone()) {
                         let capture_result: Result<grokptah_agent_bridge::PersistentAgentCapture> =
                             (|| {
                                 let start = if capture_run_is_distinct {
@@ -503,6 +506,10 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
                                     .catalog_scenario_ids
                                     .first()
                                     .context("provider_catalog_scenario_missing")?;
+                                let recovery_runs = scenario_run
+                                    .into_iter()
+                                    .filter(|scenario| scenario.run_id != provider_run.run_id)
+                                    .collect::<Vec<_>>();
                                 let capture = build_capture(
                                     &campaign_id,
                                     scenario_id,
@@ -510,7 +517,10 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
                                     report.repository_dirty,
                                     &definition.bounds,
                                     &observations,
-                                    &provider_run,
+                                    CaptureRunSet {
+                                        provider: &provider_run,
+                                        recovery: &recovery_runs,
+                                    },
                                 )?;
                                 capture.validate_complete_structural_evidence().map_err(
                                     |error| anyhow::anyhow!("capture_incomplete:{error}"),

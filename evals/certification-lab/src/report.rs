@@ -106,6 +106,7 @@ pub enum DiagnosticCode {
     AttachMutationOptInRequired,
     DeterministicClockUnavailable,
     ManagedExecutionUnavailable,
+    PermissionCapabilityAbsent,
     ProviderObservationUnavailable,
     ProviderObservationDropped,
     AuthoritativeUsageMissing,
@@ -366,6 +367,7 @@ pub fn diagnostic_failure_class(status: ProbeStatus, diagnostic: DiagnosticCode)
         DiagnosticCode::CapabilityAbsent
         | DiagnosticCode::RequiredToolMissing
         | DiagnosticCode::ManagedExecutionUnavailable
+        | DiagnosticCode::PermissionCapabilityAbsent
         | DiagnosticCode::DeterministicClockUnavailable => FailureClass::Capability,
         DiagnosticCode::ProbeImplementationUnavailable
         | DiagnosticCode::ModeIneligible
@@ -1738,6 +1740,7 @@ mod tests {
     fn capture_durable_state_rejects_actual_ids_before_report_binding() {
         let opaque = |value: &str| opaque_durable_id(value);
         let mut state = grokptah_agent_bridge::DurableStateEvidence {
+            role: grokptah_agent_bridge::certification::DurableEvidenceRole::Primary,
             agent_id: opaque("agent"),
             agent_spec_revision: 1,
             lane_id: opaque("lane"),

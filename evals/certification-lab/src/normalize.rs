@@ -1017,6 +1017,7 @@ mod tests {
                 latency_millis: 1,
             }],
             durable_states: vec![DurableStateEvidence {
+                role: grokptah_agent_bridge::certification::DurableEvidenceRole::Primary,
                 agent_id: format!("opaque-{}", "1".repeat(64)),
                 agent_spec_revision: 1,
                 lane_id: format!("opaque-{}", "2".repeat(64)),
