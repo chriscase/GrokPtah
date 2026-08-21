@@ -383,6 +383,13 @@ pub struct WorkItem {
     pub source_routine_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_activation_id: Option<String>,
+    /// Optional durable link to a manager plan and logical step. These links
+    /// let restart recovery adopt a child Work that was persisted immediately
+    /// before its plan revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_manager_plan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_manager_step_id: Option<String>,
     #[serde(default)]
     pub assignment_status: AssignmentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -444,6 +451,8 @@ impl WorkItem {
             approval: None,
             source_routine_id: None,
             source_activation_id: None,
+            source_manager_plan_id: None,
+            source_manager_step_id: None,
             assignment_status: AssignmentStatus::Unassigned,
             blocked_reason: None,
             last_decision_id: None,
@@ -510,6 +519,17 @@ impl WorkItem {
         }
         if let Some(activation_id) = &self.source_activation_id {
             validate_id(activation_id, "source_activation_id")?;
+        }
+        if self.source_manager_plan_id.is_some() != self.source_manager_step_id.is_some() {
+            return Err(invalid(
+                "source manager plan and step links must be provided together",
+            ));
+        }
+        if let Some(plan_id) = &self.source_manager_plan_id {
+            validate_id(plan_id, "source_manager_plan_id")?;
+        }
+        if let Some(step_id) = &self.source_manager_step_id {
+            validate_id(step_id, "source_manager_step_id")?;
         }
         if let Some(reason) = &self.blocked_reason {
             validate_text(reason, MAX_WORK_OBJECTIVE_BYTES, "blocked_reason")?;

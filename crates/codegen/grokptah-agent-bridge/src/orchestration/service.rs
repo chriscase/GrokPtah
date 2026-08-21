@@ -25,6 +25,7 @@ use super::managed::{
     ManagedRetryCause, NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
     MANAGED_EXECUTION_SCHEMA_VERSION, MAX_MANAGED_MESSAGES,
 };
+use super::manager::{ManagerPlan, ManagerStepSpec};
 use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
 use super::routine::{
     manual_dedupe_key, ActivationCause, ActivationRequest, MissedRunPolicy,
@@ -1572,6 +1573,417 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
         self.workload_value(item, true)
+    }
+
+    fn load_manager_plan_scoped(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+        plan_id: &str,
+    ) -> Result<(PathBuf, ManagerPlan), OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let plan = self
+            .store
+            .load_manager_plan(plan_id)?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown plan_id"))?;
+        if plan.session_id != session_id || plan.workspace != claimed.display().to_string() {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "manager plan is outside the requested session scope",
+            ));
+        }
+        Ok((claimed, plan))
+    }
+
+    pub fn list_manager_plans_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let plans = self
+            .store
+            .list_manager_plans()?
+            .into_iter()
+            .filter(|plan| {
+                plan.session_id == session_id && plan.workspace == claimed.display().to_string()
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "plans": plans }))
+    }
+
+    pub fn get_manager_plan_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        plan_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (_, plan) = self.load_manager_plan_scoped(session_id, workspace, plan_id)?;
+        Ok(json!({ "plan": plan }))
+    }
+
+    fn validate_manager_assignments(
+        &self,
+        plan: &ManagerPlan,
+        claimed: &Path,
+        only_unmaterialized: bool,
+    ) -> Result<(), OrchError> {
+        let manager = self.store.require_agent_in_scope(
+            &plan.manager_agent_id,
+            plan.session_id,
+            &claimed.display().to_string(),
+        )?;
+        let manager_spec = manager.current_spec()?.clone();
+        let ceiling = self.config.lock().bounds.clone();
+        for step in &plan.steps {
+            if only_unmaterialized && step.work_id.is_some() {
+                continue;
+            }
+            let Some(agent_id) = &step.assigned_agent_id else {
+                continue;
+            };
+            let worker = self.store.require_agent_in_scope(
+                agent_id,
+                plan.session_id,
+                &claimed.display().to_string(),
+            )?;
+            if !super::workspaces_match(&worker.workspace, &plan.workspace) {
+                return Err(OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "manager plan cannot assign work across workspaces",
+                ));
+            }
+            let worker_spec = worker.current_spec()?.clone();
+            reject_privilege_amplification(
+                Some(&manager_spec),
+                &worker_spec,
+                &step.policy.bounds,
+                &ceiling,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_manager_plan(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        manager_agent_id: String,
+        objective: String,
+        steps: Vec<ManagerStepSpec>,
+        max_in_flight: u32,
+        max_replans: u32,
+    ) -> Result<serde_json::Value, OrchError> {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "managerAgentId": manager_agent_id,
+            "objective": objective,
+            "steps": steps,
+            "maxInFlight": max_in_flight,
+            "maxReplans": max_replans,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_create_manager_plan",
+                request_id,
+                session_id,
+                workspace,
+                &payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let manager = match self.store.require_agent_in_scope(
+            &manager_agent_id,
+            session_id,
+            &claimed.display().to_string(),
+        ) {
+            Ok(manager) => manager,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        if let Err(error) = manager.current_spec() {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        let now = Utc::now();
+        let mut root = match WorkItem::new(
+            "manager-plan",
+            objective.clone(),
+            session_id,
+            claimed.display().to_string(),
+            &auth.token_id,
+            WorkPolicy::default(),
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        root.state = WorkState::Blocked;
+        root.blocked_reason = Some("manager plan container; execute its child Work items".into());
+        root.bump_at(now);
+        let plan = match ManagerPlan::new(
+            session_id,
+            claimed.display().to_string(),
+            manager_agent_id,
+            objective,
+            root.work_id.clone(),
+            steps,
+            max_in_flight,
+            max_replans,
+            now,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(root.work_id),
+                    session_id,
+                    &claimed,
+                    error,
+                ))
+            }
+        };
+        if let Err(error) = self.validate_manager_assignments(&plan, &claimed, false) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(root.work_id.clone()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        if let Err(error) = self.store.save_work_item(&root) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(root.work_id.clone()),
+                session_id,
+                &claimed,
+                OrchError::new(OrchErrorCode::Internal, error.to_string()),
+            ));
+        }
+        if let Err(error) = self.store.save_manager_plan(&plan) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan.plan_id.clone()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        let response = json!({ "plan": plan, "rootWork": root });
+        lease
+            .complete(
+                Some(
+                    response["plan"]["planId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .into(),
+                ),
+                response.clone(),
+            )
+            .map_err(|error| self.fail_claim(&mut lease, None, session_id, &claimed, error))?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn advance_manager_plan(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        plan_id: &str,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "planId": plan_id,
+            "expectedRevision": expected_revision,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_advance_manager_plan",
+                request_id,
+                session_id,
+                workspace,
+                &payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let (_, mut plan) = match self.load_manager_plan_scoped(session_id, &claimed, plan_id) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        if let Err(error) = plan.require_revision(expected_revision) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        if let Err(error) = self.validate_manager_assignments(&plan, &claimed, true) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        let work_items = match self.store.list_work_items() {
+            Ok(items) => items,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                ))
+            }
+        };
+        let created = match plan.advance(&work_items, &auth.token_id, Utc::now()) {
+            Ok(created) => created,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    error,
+                ));
+            }
+        };
+        if let Err(error) = self.store.save_manager_plan_with_work(&plan, &created) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        let response = json!({ "plan": plan, "createdWork": created });
+        lease
+            .complete(Some(plan_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replan_manager_plan(
+        &self,
+        _auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        plan_id: &str,
+        reason: String,
+        steps: Vec<ManagerStepSpec>,
+        expected_revision: Option<u64>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": workspace.display().to_string(),
+            "planId": plan_id,
+            "reason": reason,
+            "steps": steps,
+            "expectedRevision": expected_revision,
+        });
+        let (claimed, start) = self
+            .begin_work_mutation(
+                "ptah_replan_manager_plan",
+                request_id,
+                session_id,
+                workspace,
+                &payload,
+            )
+            .await?;
+        let mut lease = match start {
+            IdempotencyStart::Replay(response) => return Ok(response),
+            IdempotencyStart::Perform(lease) => lease,
+        };
+        let (_, mut plan) = match self.load_manager_plan_scoped(session_id, &claimed, plan_id) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        if let Err(error) = plan.require_revision(expected_revision) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        if let Err(error) = plan.append_replan(reason, steps, Utc::now()) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        if let Err(error) = self.validate_manager_assignments(&plan, &claimed, true) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        if let Err(error) = self.store.save_manager_plan(&plan) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(plan_id.into()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        let response = json!({ "plan": plan });
+        lease
+            .complete(Some(plan_id.to_string()), response.clone())
+            .map_err(|error| {
+                self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    error,
+                )
+            })?;
+        Ok(response)
     }
 
     fn restore_claim_response(

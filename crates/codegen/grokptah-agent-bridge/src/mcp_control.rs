@@ -32,11 +32,11 @@ use uuid::Uuid;
 
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    AuthContext, ChangeRecord, MessageKind, MissedRunPolicy, OrchError, OrchErrorCode,
-    OrchestrationConfig, OrchestrationService, RoutineConcurrencyPolicy, RoutineLifecycle,
-    RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef, WorkDependency,
-    WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS,
-    FORBIDDEN_TOOLS,
+    AuthContext, ChangeRecord, ManagerStepSpec, MessageKind, MissedRunPolicy, OrchError,
+    OrchErrorCode, OrchestrationConfig, OrchestrationService, RoutineConcurrencyPolicy,
+    RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef,
+    WorkDependency, WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist,
+    CONTROL_TOOLS, FORBIDDEN_TOOLS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -1020,6 +1020,53 @@ struct CreateWorkArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CreateManagerPlanArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    manager_agent_id: String,
+    objective: String,
+    steps: Vec<ManagerStepSpec>,
+    #[serde(default = "default_manager_in_flight")]
+    max_in_flight: u32,
+    #[serde(default = "default_manager_replans")]
+    max_replans: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagerPlanScopeArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    plan_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdvanceManagerPlanArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    plan_id: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplanManagerPlanArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    plan_id: String,
+    reason: String,
+    steps: Vec<ManagerStepSpec>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkScopeArgs {
     session_id: Uuid,
     workspace: PathBuf,
@@ -1931,6 +1978,83 @@ fn tool_input_schema(name: &str) -> Value {
                 "policy": {"type": "object"}
             }
         }),
+        "ptah_create_manager_plan" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "manager_agent_id", "objective", "steps"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "manager_agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "objective": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "steps": {"type": "array", "minItems": 1, "maxItems": 64, "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["stepId", "kind", "objective"],
+                    "properties": {
+                        "stepId": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "kind": {"type": "string", "minLength": 1, "maxLength": 96},
+                        "objective": {"type": "string", "minLength": 1, "maxLength": 32768},
+                        "priority": {"type": "integer"},
+                        "dependencies": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 256}},
+                        "assignedAgentId": {"type": ["string", "null"], "maxLength": 256},
+                        "policy": {"type": "object"}
+                    }
+                }},
+                "max_in_flight": {"type": "integer", "minimum": 1, "maximum": 16},
+                "max_replans": {"type": "integer", "minimum": 0, "maximum": 16}
+            }
+        }),
+        "ptah_list_manager_plans" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {"session_id": session, "workspace": workspace}
+        }),
+        "ptah_get_manager_plan" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "plan_id"],
+            "additionalProperties": false,
+            "properties": {"session_id": session, "workspace": workspace, "plan_id": run_id}
+        }),
+        "ptah_advance_manager_plan" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "plan_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "plan_id": run_id,
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
+        "ptah_replan_manager_plan" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "plan_id", "reason", "steps"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "plan_id": run_id,
+                "reason": {"type": "string", "minLength": 1, "maxLength": 32768},
+                "steps": {"type": "array", "minItems": 1, "maxItems": 64, "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["stepId", "kind", "objective"],
+                    "properties": {
+                        "stepId": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "kind": {"type": "string", "minLength": 1, "maxLength": 96},
+                        "objective": {"type": "string", "minLength": 1, "maxLength": 32768},
+                        "priority": {"type": "integer"},
+                        "dependencies": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 256}},
+                        "assignedAgentId": {"type": ["string", "null"], "maxLength": 256},
+                        "policy": {"type": "object"}
+                    }
+                }},
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
         "ptah_assign_work" => json!({
             "type": "object",
             "required": ["request_id", "session_id", "workspace", "work_id", "assigned_agent_id"],
@@ -2696,6 +2820,62 @@ async fn dispatch_tool(
             )
             .await
         }
+        "ptah_create_manager_plan" => {
+            let args: CreateManagerPlanArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.manager_agent_id, "manager_agent_id")?;
+            orch.create_manager_plan(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                args.manager_agent_id,
+                args.objective,
+                args.steps,
+                args.max_in_flight,
+                args.max_replans,
+            )
+            .await
+        }
+        "ptah_list_manager_plans" => {
+            let args: SessionWorkspaceArgs = parse_value(args)?;
+            orch.list_manager_plans_scoped(auth, args.session_id, &args.workspace)
+        }
+        "ptah_get_manager_plan" => {
+            let args: ManagerPlanScopeArgs = parse_value(args)?;
+            require_nonempty(&args.plan_id, "plan_id")?;
+            orch.get_manager_plan_scoped(auth, args.session_id, &args.workspace, &args.plan_id)
+        }
+        "ptah_advance_manager_plan" => {
+            let args: AdvanceManagerPlanArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.plan_id, "plan_id")?;
+            orch.advance_manager_plan(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.plan_id,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_replan_manager_plan" => {
+            let args: ReplanManagerPlanArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.plan_id, "plan_id")?;
+            orch.replan_manager_plan(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.plan_id,
+                args.reason,
+                args.steps,
+                args.expected_revision,
+            )
+            .await
+        }
         "ptah_assign_work" => {
             let args: AssignWorkArgs = parse_value(args)?;
             require_nonempty(&args.request_id, "request_id")?;
@@ -3412,6 +3592,14 @@ fn require_nonempty(value: &str, key: &str) -> Result<(), OrchError> {
     } else {
         Ok(())
     }
+}
+
+fn default_manager_in_flight() -> u32 {
+    4
+}
+
+fn default_manager_replans() -> u32 {
+    3
 }
 
 /// Discoverable tool names for schema snapshot tests.

@@ -5,6 +5,7 @@
 mod authz;
 mod continuation;
 pub(crate) mod managed;
+mod manager;
 mod message;
 mod routine;
 mod service;
@@ -32,6 +33,10 @@ pub use managed::{
     ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause, ManagedWorkMode,
     NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
     MANAGED_FINALIZATION_SCHEMA_VERSION, MANAGED_TRUNCATION_MARKER,
+};
+pub use manager::{
+    ManagerPlan, ManagerPlanState, ManagerStep, ManagerStepSpec, ManagerStepState,
+    MANAGER_SCHEMA_VERSION, MAX_MANAGER_IN_FLIGHT, MAX_MANAGER_REPLANS, MAX_MANAGER_STEPS,
 };
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,
