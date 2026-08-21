@@ -35,8 +35,9 @@ pub use managed::{
     MANAGED_FINALIZATION_SCHEMA_VERSION, MANAGED_TRUNCATION_MARKER,
 };
 pub use manager::{
-    ManagerPlan, ManagerPlanState, ManagerStep, ManagerStepSpec, ManagerStepState,
-    MANAGER_SCHEMA_VERSION, MAX_MANAGER_IN_FLIGHT, MAX_MANAGER_REPLANS, MAX_MANAGER_STEPS,
+    ManagerNotification, ManagerPlan, ManagerPlanState, ManagerStep, ManagerStepSpec,
+    ManagerStepState, MANAGER_SCHEMA_VERSION, MAX_MANAGER_IN_FLIGHT, MAX_MANAGER_REPLANS,
+    MAX_MANAGER_STEPS,
 };
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,

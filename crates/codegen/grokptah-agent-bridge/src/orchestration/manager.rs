@@ -9,8 +9,10 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::message::MessageKind;
 use super::workload::{AssignmentStatus, WorkDependency, WorkItem, WorkPolicy, WorkState};
 use super::OrchError;
 
@@ -37,6 +39,8 @@ pub enum ManagerStepState {
     Pending,
     Ready,
     InFlight,
+    AwaitingInput,
+    AwaitingReview,
     Succeeded,
     Failed,
     Blocked,
@@ -96,6 +100,10 @@ pub struct ManagerStep {
     pub work_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_notification_work_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_notification_message_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -113,6 +121,8 @@ impl ManagerStep {
             state: ManagerStepState::Pending,
             work_id: None,
             last_error: None,
+            last_notification_work_revision: None,
+            last_notification_message_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -129,6 +139,19 @@ impl ManagerStep {
             policy: self.policy.clone(),
         }
     }
+}
+
+/// A durable manager observation delivered through the existing message
+/// ledger. It is a projection, not a second execution or inbox queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerNotification {
+    pub step_id: String,
+    pub work_id: String,
+    pub work_revision: u64,
+    pub kind: MessageKind,
+    pub body: String,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +250,16 @@ impl ManagerPlan {
             }
             if let Some(error) = &step.last_error {
                 validate_text(error, "step.last_error")?;
+            }
+            if let Some(revision) = step.last_notification_work_revision {
+                if revision == 0 {
+                    return Err(invalid(
+                        "step.last_notification_work_revision must be positive",
+                    ));
+                }
+            }
+            if let Some(message_id) = &step.last_notification_message_id {
+                validate_id(message_id, "step.last_notification_message_id")?;
             }
             dependencies.insert(step.step_id.clone(), step.dependencies.clone());
         }
@@ -362,12 +395,10 @@ impl ManagerPlan {
                 WorkState::Failed => ManagerStepState::Failed,
                 WorkState::Cancelled => ManagerStepState::Cancelled,
                 WorkState::Queued => ManagerStepState::Ready,
+                WorkState::AwaitingInput => ManagerStepState::AwaitingInput,
+                WorkState::AwaitingApproval | WorkState::Review => ManagerStepState::AwaitingReview,
                 WorkState::Blocked => ManagerStepState::Blocked,
-                WorkState::Leased
-                | WorkState::Running
-                | WorkState::AwaitingInput
-                | WorkState::AwaitingApproval
-                | WorkState::Review => ManagerStepState::InFlight,
+                WorkState::Leased | WorkState::Running => ManagerStepState::InFlight,
             };
             if step.state != next {
                 step.state = next;
@@ -419,7 +450,10 @@ impl ManagerPlan {
             .filter(|step| {
                 matches!(
                     step.state,
-                    ManagerStepState::Ready | ManagerStepState::InFlight
+                    ManagerStepState::Ready
+                        | ManagerStepState::InFlight
+                        | ManagerStepState::AwaitingInput
+                        | ManagerStepState::AwaitingReview
                 )
             })
             .count() as u32;
@@ -495,6 +529,127 @@ impl ManagerPlan {
         Ok(created)
     }
 
+    /// Return at most one notification for each step's current Work revision.
+    /// The caller persists the resulting message ID back onto the plan after
+    /// the message is durably accepted. This makes retries deterministic even
+    /// after a process restart.
+    pub fn pending_notifications(&self, work_items: &[WorkItem]) -> Vec<ManagerNotification> {
+        let by_work_id = work_items
+            .iter()
+            .filter(|item| item.session_id == self.session_id && item.workspace == self.workspace)
+            .map(|item| (item.work_id.as_str(), item))
+            .collect::<HashMap<_, _>>();
+        self.steps
+            .iter()
+            .filter_map(|step| {
+                let work_id = step.work_id.as_deref()?;
+                let work = by_work_id.get(work_id)?;
+                if step.last_notification_work_revision == Some(work.revision) {
+                    return None;
+                }
+                let kind = match work.state {
+                    WorkState::AwaitingInput => MessageKind::Question,
+                    WorkState::AwaitingApproval | WorkState::Review => MessageKind::ReviewRequest,
+                    WorkState::Succeeded
+                    | WorkState::Failed
+                    | WorkState::Cancelled
+                    | WorkState::Blocked => MessageKind::Status,
+                    WorkState::Queued | WorkState::Leased | WorkState::Running => return None,
+                };
+                let state = work_state_label(work.state);
+                let detail = work
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.failure.clone())
+                    .or_else(|| work.blocked_reason.clone());
+                let body = match kind {
+                    MessageKind::Question => format!(
+                        "Manager step {} is awaiting input for Work {}: {}",
+                        step.step_id,
+                        work.work_id,
+                        detail
+                            .as_deref()
+                            .unwrap_or("the native worker needs a decision")
+                    ),
+                    MessageKind::ReviewRequest => format!(
+                        "Manager step {} is awaiting review for Work {}",
+                        step.step_id, work.work_id
+                    ),
+                    MessageKind::Status => format!(
+                        "Manager step {} observed Work {} in state {}{}",
+                        step.step_id,
+                        work.work_id,
+                        state,
+                        detail
+                            .as_deref()
+                            .map(|value| format!(": {value}"))
+                            .unwrap_or_default()
+                    ),
+                    _ => return None,
+                };
+                Some(ManagerNotification {
+                    step_id: step.step_id.clone(),
+                    work_id: work.work_id.clone(),
+                    work_revision: work.revision,
+                    kind,
+                    body,
+                    payload: json!({
+                        "managerPlanId": self.plan_id,
+                        "stepId": step.step_id,
+                        "workId": work.work_id,
+                        "workRevision": work.revision,
+                        "workState": state,
+                        "requiresManagerAction": matches!(
+                            kind,
+                            MessageKind::Question | MessageKind::ReviewRequest
+                        ),
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    /// Fence delivered observations onto the plan revision. Re-delivering an
+    /// already recorded notification is idempotent; a different message for
+    /// the same Work revision fails closed.
+    pub fn mark_notifications_sent(
+        &mut self,
+        delivered: &[(String, u64, String)],
+        now: DateTime<Utc>,
+    ) -> Result<(), OrchError> {
+        let mut changed = false;
+        for (step_id, work_revision, message_id) in delivered {
+            validate_id(step_id, "notification.step_id")?;
+            validate_id(message_id, "notification.message_id")?;
+            if *work_revision == 0 {
+                return Err(invalid("notification.work_revision must be positive"));
+            }
+            let step = self
+                .steps
+                .iter_mut()
+                .find(|step| step.step_id == *step_id)
+                .ok_or_else(|| invalid("notification references an unknown manager step"))?;
+            if step.last_notification_work_revision == Some(*work_revision) {
+                if step.last_notification_message_id.as_deref() != Some(message_id) {
+                    return Err(OrchError::new(
+                        super::OrchErrorCode::Conflict,
+                        "manager notification revision is already fenced by another message",
+                    ));
+                }
+                continue;
+            }
+            step.last_notification_work_revision = Some(*work_revision);
+            step.last_notification_message_id = Some(message_id.clone());
+            step.updated_at = now;
+            changed = true;
+        }
+        if changed {
+            self.bump(now);
+            self.validate()?;
+        }
+        Ok(())
+    }
+
     fn bump(&mut self, now: DateTime<Utc>) {
         self.revision = self.revision.saturating_add(1);
         self.updated_at = now;
@@ -543,6 +698,21 @@ fn validate_text(value: &str, field: &str) -> Result<(), OrchError> {
 
 fn invalid(message: impl Into<String>) -> OrchError {
     OrchError::new(super::OrchErrorCode::InvalidRequest, message)
+}
+
+fn work_state_label(state: WorkState) -> &'static str {
+    match state {
+        WorkState::Queued => "queued",
+        WorkState::Leased => "leased",
+        WorkState::Running => "running",
+        WorkState::AwaitingInput => "awaiting_input",
+        WorkState::AwaitingApproval => "awaiting_approval",
+        WorkState::Review => "review",
+        WorkState::Succeeded => "succeeded",
+        WorkState::Failed => "failed",
+        WorkState::Cancelled => "cancelled",
+        WorkState::Blocked => "blocked",
+    }
 }
 
 #[cfg(test)]
@@ -620,5 +790,60 @@ mod tests {
         assert_eq!(third.len(), 1);
         assert_eq!(plan.steps[1].state, ManagerStepState::Ready);
         assert_eq!(third[0].dependencies[0].work_id, first[0].work_id);
+    }
+
+    #[test]
+    fn notifications_distinguish_input_review_and_terminal_outcomes() {
+        let now = Utc::now();
+        let mut plan = ManagerPlan::new(
+            Uuid::new_v4(),
+            "/tmp/project",
+            "manager",
+            "objective",
+            "root",
+            vec![spec("a", &[])],
+            1,
+            2,
+            now,
+        )
+        .unwrap();
+        let created = plan.advance(&[], "operator", now).unwrap();
+        let mut awaiting = created[0].clone();
+        awaiting.state = WorkState::AwaitingInput;
+        awaiting.blocked_reason = Some("permission required".into());
+        awaiting.bump_at(now);
+        plan.advance(&[awaiting.clone()], "operator", now).unwrap();
+        assert_eq!(plan.steps[0].state, ManagerStepState::AwaitingInput);
+        let question = plan.pending_notifications(&[awaiting.clone()]);
+        assert_eq!(question.len(), 1);
+        assert_eq!(question[0].kind, MessageKind::Question);
+        plan.mark_notifications_sent(&[("a".into(), awaiting.revision, "message-1".into())], now)
+            .unwrap();
+        assert!(plan.pending_notifications(&[awaiting.clone()]).is_empty());
+
+        let mut review = awaiting;
+        review.state = WorkState::Review;
+        review.bump_at(now + chrono::Duration::seconds(1));
+        plan.advance(&[review.clone()], "operator", now).unwrap();
+        assert_eq!(plan.steps[0].state, ManagerStepState::AwaitingReview);
+        let review_request = plan.pending_notifications(&[review.clone()]);
+        assert_eq!(review_request[0].kind, MessageKind::ReviewRequest);
+
+        let mut failed = review;
+        failed.state = WorkState::Failed;
+        failed.result = Some(super::super::workload::WorkResult {
+            summary: "failed".into(),
+            failure: Some("fixture failure".into()),
+            evidence: Vec::new(),
+            artifacts: Vec::new(),
+            cancellation_reason: None,
+            completed_at: now,
+        });
+        failed.bump_at(now + chrono::Duration::seconds(2));
+        plan.advance(&[failed.clone()], "operator", now).unwrap();
+        assert_eq!(plan.state, ManagerPlanState::NeedsReplan);
+        let status = plan.pending_notifications(&[failed]);
+        assert_eq!(status[0].kind, MessageKind::Status);
+        assert!(status[0].body.contains("fixture failure"));
     }
 }

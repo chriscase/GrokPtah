@@ -2,8 +2,10 @@
 
 mod common;
 
+use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkResult, WorkState,
+    WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
@@ -237,4 +239,171 @@ async fn hosted_manager_plan_replays_and_unlocks_dependency_graph() {
         1
     );
     assert_eq!(resumed.structured["plan"]["state"], "active");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn hosted_manager_tick_routes_attention_and_terminal_outcomes() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let manager = host.ensure_session_agent(lane.id).unwrap();
+    let store = OrchStore::open(home.path().join("orchestration")).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "manager-tick-token".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let store_for_fixture = host.ensure_orchestration_store().unwrap();
+    let server = start_control_server(orch, 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", server.addr), "manager-tick-token");
+    client.initialize().await.unwrap();
+    let workspace_text = workspace.path().display().to_string();
+    let created = client
+        .call_tool(
+            "ptah_create_manager_plan",
+            json!({
+                "request_id": "manager-tick-create",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "manager_agent_id": manager.agent_id,
+                "objective": "exercise durable manager observations",
+                "steps": [{"stepId": "observe", "kind": "verification", "objective": "observe the fixture"}],
+                "max_in_flight": 1,
+                "max_replans": 2
+            }),
+        )
+        .await
+        .unwrap();
+    let plan_id = created.structured["plan"]["planId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let advanced = client
+        .call_tool(
+            "ptah_advance_manager_plan",
+            json!({
+                "request_id": "manager-tick-advance",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "plan_id": plan_id,
+                "expected_revision": 1
+            }),
+        )
+        .await
+        .unwrap();
+    let work_id = advanced.structured["createdWork"][0]["workId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut work = store_for_fixture.load_work_item(&work_id).unwrap().unwrap();
+    work.state = WorkState::AwaitingInput;
+    work.blocked_reason = Some("permission required by the fixture".into());
+    work.bump_at(Utc::now());
+    store_for_fixture.save_work_item(&work).unwrap();
+    let tick = client
+        .call_tool(
+            "ptah_tick_manager_plan",
+            json!({
+                "request_id": "manager-tick-input",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "plan_id": plan_id,
+                "expected_revision": advanced.structured["plan"]["revision"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tick.structured["messages"][0]["kind"], "question");
+    assert_eq!(
+        tick.structured["plan"]["steps"][0]["state"],
+        "awaiting_input"
+    );
+    let tick_replay = client
+        .call_tool(
+            "ptah_tick_manager_plan",
+            json!({
+                "request_id": "manager-tick-input",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "plan_id": plan_id,
+                "expected_revision": advanced.structured["plan"]["revision"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tick_replay.structured["messages"][0]["messageId"],
+        tick.structured["messages"][0]["messageId"]
+    );
+
+    work.state = WorkState::Review;
+    work.bump_at(Utc::now());
+    store_for_fixture.save_work_item(&work).unwrap();
+    let review = client
+        .call_tool(
+            "ptah_tick_manager_plan",
+            json!({
+                "request_id": "manager-tick-review",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "plan_id": plan_id,
+                "expected_revision": tick.structured["plan"]["revision"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(review.structured["messages"][0]["kind"], "review_request");
+    assert_eq!(
+        review.structured["plan"]["steps"][0]["state"],
+        "awaiting_review"
+    );
+
+    let now = Utc::now();
+    work.state = WorkState::Failed;
+    work.result = Some(WorkResult {
+        summary: "fixture failed".into(),
+        evidence: Vec::new(),
+        artifacts: Vec::new(),
+        failure: Some("fixture failure".into()),
+        cancellation_reason: None,
+        completed_at: now,
+    });
+    work.bump_at(now);
+    store_for_fixture.save_work_item(&work).unwrap();
+    let terminal = client
+        .call_tool(
+            "ptah_tick_manager_plan",
+            json!({
+                "request_id": "manager-tick-terminal",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "plan_id": plan_id,
+                "expected_revision": review.structured["plan"]["revision"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(terminal.structured["messages"][0]["kind"], "status");
+    assert_eq!(terminal.structured["plan"]["state"], "needs_replan");
+    assert!(terminal.structured["messages"][0]["body"]
+        .as_str()
+        .unwrap()
+        .contains("fixture failure"));
 }

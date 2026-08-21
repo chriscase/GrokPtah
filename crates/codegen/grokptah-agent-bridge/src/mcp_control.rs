@@ -1054,6 +1054,17 @@ struct AdvanceManagerPlanArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct TickManagerPlanArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    plan_id: String,
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplanManagerPlanArgs {
     request_id: String,
     session_id: Uuid,
@@ -2029,6 +2040,18 @@ fn tool_input_schema(name: &str) -> Value {
                 "expected_revision": {"type": "integer", "minimum": 1}
             }
         }),
+        "ptah_tick_manager_plan" => json!({
+            "type": "object",
+            "required": ["request_id", "session_id", "workspace", "plan_id"],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "plan_id": run_id,
+                "expected_revision": {"type": "integer", "minimum": 1}
+            }
+        }),
         "ptah_replan_manager_plan" => json!({
             "type": "object",
             "required": ["request_id", "session_id", "workspace", "plan_id", "reason", "steps"],
@@ -2851,6 +2874,20 @@ async fn dispatch_tool(
             require_nonempty(&args.request_id, "request_id")?;
             require_nonempty(&args.plan_id, "plan_id")?;
             orch.advance_manager_plan(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.plan_id,
+                args.expected_revision,
+            )
+            .await
+        }
+        "ptah_tick_manager_plan" => {
+            let args: TickManagerPlanArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.plan_id, "plan_id")?;
+            orch.tick_manager_plan(
                 auth,
                 &args.request_id,
                 args.session_id,

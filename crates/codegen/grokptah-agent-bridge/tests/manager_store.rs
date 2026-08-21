@@ -1,6 +1,6 @@
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    ManagerPlan, ManagerStepSpec, OrchStore, WorkItem, WorkPolicy,
+    ManagerPlan, ManagerStepSpec, OrchStore, WorkItem, WorkPolicy, WorkState,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
 use tempfile::tempdir;
@@ -149,4 +149,61 @@ fn advance_adopts_a_child_written_before_plan_revision() {
         loaded.steps[0].work_id.as_deref(),
         Some(orphan.work_id.as_str())
     );
+}
+
+#[test]
+fn notification_fence_survives_store_restart() {
+    let home = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let workspace = "/tmp/manager-notification-recovery";
+    let store = OrchStore::open(home.path()).unwrap();
+    store
+        .save_agent(&agent("manager", session_id, workspace))
+        .unwrap();
+    let now = Utc::now();
+    let root = WorkItem::new(
+        "manager-plan",
+        "recover notifications",
+        session_id,
+        workspace,
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    let mut plan = ManagerPlan::new(
+        session_id,
+        workspace,
+        "manager",
+        "recover notifications",
+        root.work_id.clone(),
+        vec![step("observe")],
+        1,
+        2,
+        now,
+    )
+    .unwrap();
+    let mut created = plan.advance(&[], "operator", now).unwrap();
+    let mut completed = created[0].clone();
+    completed.state = WorkState::Succeeded;
+    completed.bump_at(now);
+    plan.advance(&[completed.clone()], "operator", now).unwrap();
+    let pending = plan.pending_notifications(&[completed.clone()]);
+    assert_eq!(pending.len(), 1);
+    plan.mark_notifications_sent(
+        &[(
+            pending[0].step_id.clone(),
+            pending[0].work_revision,
+            "notification-1".into(),
+        )],
+        now,
+    )
+    .unwrap();
+    created[0] = completed.clone();
+    store.save_work_item(&root).unwrap();
+    store.save_manager_plan_with_work(&plan, &created).unwrap();
+    drop(store);
+
+    let reopened = OrchStore::open(home.path()).unwrap();
+    let loaded = reopened.load_manager_plan(&plan.plan_id).unwrap().unwrap();
+    assert!(loaded.pending_notifications(&[completed]).is_empty());
 }
