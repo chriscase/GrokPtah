@@ -374,6 +374,10 @@ pub struct WorkItem {
     pub attempt_count: u32,
     pub progress: Option<WorkProgress>,
     pub result: Option<WorkResult>,
+    /// Non-executable coordination container. This is host-enforced and does
+    /// not rely on the transient `blocked_reason` projection.
+    #[serde(default)]
+    pub is_container: bool,
     #[serde(default)]
     pub approval: Option<WorkApproval>,
     /// Optional durable link to the routine that created this item. Absent on
@@ -448,6 +452,7 @@ impl WorkItem {
             attempt_count: 0,
             progress: None,
             result: None,
+            is_container: false,
             approval: None,
             source_routine_id: None,
             source_activation_id: None,

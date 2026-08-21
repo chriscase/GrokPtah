@@ -208,6 +208,10 @@ pub(crate) struct Inner {
     /// Short-lived orchestration admission reservations. These close the gap
     /// between accepting a run and polling its async prompt future.
     turn_reservations: HashMap<Uuid, String>,
+    /// Host-authored immutable capability downgrade for active orchestration
+    /// runs. Manager reasoning is proposal-only even when ambient or Agent
+    /// policy would otherwise permit tools.
+    proposal_only_runs: HashSet<String>,
     /// When a queue-drain reservation was taken. A drain claims the turn slot
     /// and hands it to a separate start call, so a caller that dies in between
     /// would otherwise wedge the session as permanently busy. Only drain
@@ -907,6 +911,7 @@ impl AgentHost {
             computer_agent_operations: HashMap::new(),
             computer_agent_qualifications: HashMap::new(),
             turn_reservations: HashMap::new(),
+            proposal_only_runs: HashSet::new(),
             drain_reservations: HashMap::new(),
             orchestration_admissions: HashMap::new(),
             orchestration_pending_admissions: HashMap::new(),
@@ -3166,6 +3171,7 @@ impl AgentHostHandle {
     pub fn release_orchestration_turn(&self, run_id: &str) {
         let released = {
             let mut g = self.inner.lock();
+            g.proposal_only_runs.remove(run_id);
             if let Some(session_id) = g.orchestration_admissions.remove(run_id) {
                 if g.turn_reservations.get(&session_id).map(String::as_str) == Some(run_id) {
                     g.turn_reservations.remove(&session_id);
@@ -3178,6 +3184,15 @@ impl AgentHostHandle {
         if released {
             self.orchestration_wakeup.notify_waiters();
         }
+    }
+
+    pub fn mark_orchestration_run_proposal_only(&self, run_id: &str) -> Result<()> {
+        let mut g = self.inner.lock();
+        if !g.orchestration_admissions.contains_key(run_id) {
+            bail!("proposal-only Run must hold an orchestration admission");
+        }
+        g.proposal_only_runs.insert(run_id.to_string());
+        Ok(())
     }
 
     pub fn orchestration_active_count(&self) -> usize {
@@ -4348,6 +4363,14 @@ impl AgentHostHandle {
             .map(|spec| spec.authority))
     }
 
+    /// Manager reasoning Runs are proposal-only. This capability downgrade is
+    /// installed by the native executor before the provider task is spawned,
+    /// so the first tool call cannot race a later ledger linkage.
+    fn session_run_is_manager_proposal(&self, session_id: Uuid) -> bool {
+        self.current_turn_run_id(session_id)
+            .is_some_and(|run_id| self.inner.lock().proposal_only_runs.contains(&run_id))
+    }
+
     /// Intersect mutable host policy with the Agent's captured ceiling. Either
     /// side may deny or require approval; auto-approval requires both.
     fn tool_gate(&self, session_id: Uuid, tool_name: &str) -> ToolGate {
@@ -4360,6 +4383,9 @@ impl AgentHostHandle {
         tool_name: &str,
         enforce_tool_allowlist: bool,
     ) -> ToolGate {
+        if self.session_run_is_manager_proposal(session_id) {
+            return ToolGate::AutoDeny;
+        }
         let ambient = {
             let g = self.inner.lock();
             evaluate_tool_gate(
@@ -12227,6 +12253,77 @@ mod tests {
         );
         let frozen = host.session_agent_spec(lane_id).unwrap().unwrap();
         assert_eq!(frozen.revision, revision);
+    }
+
+    #[test]
+    fn manager_decision_run_is_host_enforced_proposal_only() {
+        let (_home, host, lane_id) = test_host();
+        host.set_permission_mode("bypassPermissions".into());
+        let agent = host.ensure_session_agent(lane_id).unwrap();
+        let revision = agent.current_spec().unwrap().revision;
+        let store = host.ensure_orchestration_store().unwrap();
+        let now = Utc::now();
+        let mut work = WorkItem::new(
+            "manager-decision",
+            "return a typed proposal",
+            lane_id,
+            agent.workspace.clone(),
+            "manager-supervisor",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        work.assigned_agent_id = Some(agent.agent_id.clone());
+        work.assignment_status = crate::orchestration::AssignmentStatus::Accepted;
+        work.parent_work_id = Some("manager-root".into());
+        work.source_manager_plan_id = Some("manager-plan".into());
+        work.source_manager_step_id = Some("__manager_decision__".into());
+        work.validate().unwrap();
+        store.save_work_item(&work).unwrap();
+        let run = RunRecord {
+            run_id: "manager-proposal-run".into(),
+            session_id: lane_id,
+            workspace: agent.workspace.clone(),
+            request_id: "manager-proposal-intent".into(),
+            client_id: Some("native-executor".into()),
+            state: RunState::Running,
+            agent_id: Some(agent.agent_id.clone()),
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: Some(revision),
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: agent.current_spec().unwrap().default_run_bounds.clone(),
+            prompt_preview: "typed proposal".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: now,
+            updated_at: now,
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            stop_cause: None,
+            aggregates: RunAggregates::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        };
+        store.save_run(&run).unwrap();
+        host.reserve_orchestration_turn(&run.run_id, lane_id)
+            .unwrap();
+        host.mark_orchestration_run_proposal_only(&run.run_id)
+            .unwrap();
+        host.run_usage_trackers
+            .lock()
+            .insert(lane_id, RunUsageTracker::from_run(store.clone(), &run));
+
+        assert_eq!(
+            host.tool_gate(lane_id, "run_terminal_cmd"),
+            ToolGate::AutoDeny
+        );
+        assert_eq!(host.tool_gate(lane_id, "mcp"), ToolGate::AutoDeny);
     }
 
     #[test]

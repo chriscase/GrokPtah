@@ -569,6 +569,7 @@ fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
         "runPersistenceError",
         "workloadSupervisorError",
         "routineSupervisorError",
+        "managerSupervisorError",
         "nativeExecutorError",
         "serviceError",
     ]
@@ -1031,6 +1032,8 @@ struct CreateManagerPlanArgs {
     max_in_flight: u32,
     #[serde(default = "default_manager_replans")]
     max_replans: u32,
+    #[serde(default)]
+    autonomous: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2014,6 +2017,7 @@ fn tool_input_schema(name: &str) -> Value {
                 }},
                 "max_in_flight": {"type": "integer", "minimum": 1, "maximum": 16},
                 "max_replans": {"type": "integer", "minimum": 0, "maximum": 16}
+                ,"autonomous": {"type": "boolean", "default": false}
             }
         }),
         "ptah_list_manager_plans" => json!({
@@ -2857,6 +2861,7 @@ async fn dispatch_tool(
                 args.steps,
                 args.max_in_flight,
                 args.max_replans,
+                args.autonomous,
             )
             .await
         }

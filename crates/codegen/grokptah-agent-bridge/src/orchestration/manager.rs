@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::message::MessageKind;
+use super::types::hash_payload;
 use super::workload::{AssignmentStatus, WorkDependency, WorkItem, WorkPolicy, WorkState};
 use super::OrchError;
 
@@ -20,6 +21,7 @@ pub const MANAGER_SCHEMA_VERSION: u32 = 1;
 pub const MAX_MANAGER_STEPS: usize = 64;
 pub const MAX_MANAGER_IN_FLIGHT: u32 = 16;
 pub const MAX_MANAGER_REPLANS: u32 = 16;
+pub const MAX_MANAGER_DIRECTIVE_BYTES: usize = 16 * 1024;
 const MAX_MANAGER_ID_BYTES: usize = 256;
 const MAX_MANAGER_TEXT_BYTES: usize = 32 * 1024;
 
@@ -45,6 +47,305 @@ pub enum ManagerStepState {
     Failed,
     Blocked,
     Cancelled,
+    /// A failed historical step that an accepted replan explicitly replaced.
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagerCoordinationMode {
+    #[default]
+    Manual,
+    Autonomous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerCoordinationPolicy {
+    #[serde(default)]
+    pub mode: ManagerCoordinationMode,
+}
+
+impl ManagerCoordinationPolicy {
+    pub fn autonomous(&self) -> bool {
+        self.mode == ManagerCoordinationMode::Autonomous
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagerDecisionState {
+    AwaitingResult,
+    Proposed,
+    Applied,
+    Rejected,
+    HumanRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerDecisionRecord {
+    pub schema_version: u32,
+    pub decision_id: String,
+    pub plan_id: String,
+    pub expected_plan_revision: u64,
+    pub manager_agent_id: String,
+    pub agent_spec_revision: u64,
+    #[serde(default)]
+    pub triggering_work_ids: Vec<String>,
+    #[serde(default)]
+    pub triggering_message_ids: Vec<String>,
+    pub input_snapshot_hash: String,
+    pub decision_work_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub state: ManagerDecisionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_directive: Option<ManagerDirectiveEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub applied_mutation_ids: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ManagerDecisionRecord {
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != MANAGER_SCHEMA_VERSION
+            || self.expected_plan_revision == 0
+            || self.agent_spec_revision == 0
+        {
+            return Err(invalid("manager decision schema or revision is invalid"));
+        }
+        if self.triggering_work_ids.len() > MAX_MANAGER_STEPS
+            || self.triggering_message_ids.len() > MAX_MANAGER_STEPS
+            || self.applied_mutation_ids.len() > MAX_MANAGER_STEPS
+        {
+            return Err(invalid("manager decision references exceed their bounds"));
+        }
+        for (value, field) in [
+            (&self.decision_id, "decision_id"),
+            (&self.plan_id, "plan_id"),
+            (&self.manager_agent_id, "manager_agent_id"),
+            (&self.input_snapshot_hash, "input_snapshot_hash"),
+            (&self.decision_work_id, "decision_work_id"),
+        ] {
+            validate_id(value, field)?;
+        }
+        for id in self
+            .triggering_work_ids
+            .iter()
+            .chain(self.triggering_message_ids.iter())
+            .chain(self.applied_mutation_ids.iter())
+        {
+            validate_id(id, "manager decision reference")?;
+        }
+        if let Some(outcome) = &self.outcome {
+            validate_text(outcome, "manager decision outcome")?;
+        }
+        if let Some(directive) = &self.proposed_directive {
+            parse_manager_directive(
+                &serde_json::to_string(directive)
+                    .map_err(|error| invalid(format!("invalid stored directive: {error}")))?,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Strict proposal envelope emitted by a bounded manager-decision Run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ManagerDirectiveEnvelope {
+    pub schema_version: u32,
+    pub occurrence_id: String,
+    pub plan_id: String,
+    pub expected_plan_revision: u64,
+    pub manager_agent_id: String,
+    pub expected_agent_spec_revision: u64,
+    pub input_snapshot_hash: String,
+    pub directive: ManagerDirective,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagerDirective {
+    #[serde(rename_all = "camelCase")]
+    AppendReplacementSteps {
+        reason: String,
+        replaces_step_ids: Vec<String>,
+        steps: Vec<ManagerStepSpec>,
+    },
+    #[serde(rename_all = "camelCase")]
+    RequestOperatorIntervention { reason: String },
+    #[serde(rename_all = "camelCase")]
+    NoSafeAction { reason: String },
+}
+
+pub fn parse_manager_directive(raw: &str) -> Result<ManagerDirectiveEnvelope, OrchError> {
+    if raw.is_empty() || raw.len() > MAX_MANAGER_DIRECTIVE_BYTES {
+        return Err(invalid("manager directive is empty or exceeds its bound"));
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let value = Value::deserialize(&mut deserializer)
+        .map_err(|error| invalid(format!("invalid manager directive: {error}")))?;
+    deserializer
+        .end()
+        .map_err(|error| invalid(format!("invalid trailing manager output: {error}")))?;
+    validate_directive_json_shape(&value)?;
+    let envelope = serde_json::from_value::<ManagerDirectiveEnvelope>(value)
+        .map_err(|error| invalid(format!("invalid manager directive: {error}")))?;
+    if envelope.schema_version != MANAGER_SCHEMA_VERSION || envelope.expected_plan_revision == 0 {
+        return Err(invalid("manager directive schema or revision is invalid"));
+    }
+    for (value, field) in [
+        (&envelope.occurrence_id, "occurrence_id"),
+        (&envelope.plan_id, "plan_id"),
+        (&envelope.manager_agent_id, "manager_agent_id"),
+        (&envelope.input_snapshot_hash, "input_snapshot_hash"),
+    ] {
+        validate_id(value, field)?;
+    }
+    match &envelope.directive {
+        ManagerDirective::AppendReplacementSteps {
+            reason,
+            replaces_step_ids,
+            steps,
+        } => {
+            validate_text(reason, "directive reason")?;
+            if replaces_step_ids.is_empty() || replaces_step_ids.len() > MAX_MANAGER_STEPS {
+                return Err(invalid(
+                    "replacement directive must name bounded replaced steps",
+                ));
+            }
+            for id in replaces_step_ids {
+                validate_id(id, "replaces_step_id")?;
+            }
+            if steps.is_empty() || steps.len() > MAX_MANAGER_STEPS {
+                return Err(invalid(
+                    "replacement directive contains an invalid step count",
+                ));
+            }
+            for step in steps {
+                step.validate()?;
+            }
+        }
+        ManagerDirective::RequestOperatorIntervention { reason }
+        | ManagerDirective::NoSafeAction { reason } => validate_text(reason, "directive reason")?,
+    }
+    Ok(envelope)
+}
+
+fn validate_directive_json_shape(value: &Value) -> Result<(), OrchError> {
+    fn only(
+        object: &serde_json::Map<String, Value>,
+        allowed: &[&str],
+        at: &str,
+    ) -> Result<(), OrchError> {
+        if let Some(field) = object
+            .keys()
+            .find(|field| !allowed.contains(&field.as_str()))
+        {
+            return Err(invalid(format!(
+                "unknown manager directive field `{at}.{field}`"
+            )));
+        }
+        Ok(())
+    }
+    let root = value
+        .as_object()
+        .ok_or_else(|| invalid("manager directive must be an object"))?;
+    only(
+        root,
+        &[
+            "schemaVersion",
+            "occurrenceId",
+            "planId",
+            "expectedPlanRevision",
+            "managerAgentId",
+            "expectedAgentSpecRevision",
+            "inputSnapshotHash",
+            "directive",
+        ],
+        "$",
+    )?;
+    let directive = root
+        .get("directive")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("manager directive payload must be an object"))?;
+    if directive.get("type").and_then(Value::as_str) != Some("append_replacement_steps") {
+        return Ok(());
+    }
+    only(
+        directive,
+        &["type", "reason", "replacesStepIds", "steps"],
+        "directive",
+    )?;
+    let steps = directive
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("replacement steps must be an array"))?;
+    for (index, step) in steps.iter().enumerate() {
+        let step = step
+            .as_object()
+            .ok_or_else(|| invalid("replacement step must be an object"))?;
+        only(
+            step,
+            &[
+                "stepId",
+                "kind",
+                "objective",
+                "priority",
+                "dependencies",
+                "assignedAgentId",
+                "policy",
+            ],
+            &format!("directive.steps[{index}]"),
+        )?;
+        if let Some(policy) = step.get("policy") {
+            let policy = policy
+                .as_object()
+                .ok_or_else(|| invalid("replacement policy must be an object"))?;
+            only(
+                policy,
+                &[
+                    "bounds",
+                    "retry",
+                    "requiresApproval",
+                    "maxConcurrentAttempts",
+                    "managedExecution",
+                ],
+                &format!("directive.steps[{index}].policy"),
+            )?;
+            if let Some(bounds) = policy.get("bounds") {
+                let bounds = bounds
+                    .as_object()
+                    .ok_or_else(|| invalid("replacement bounds must be an object"))?;
+                only(
+                    bounds,
+                    &[
+                        "maxPromptBytes",
+                        "maxRounds",
+                        "maxDurationMs",
+                        "maxTotalTokens",
+                    ],
+                    &format!("directive.steps[{index}].policy.bounds"),
+                )?;
+            }
+            if let Some(retry) = policy.get("retry") {
+                let retry = retry
+                    .as_object()
+                    .ok_or_else(|| invalid("replacement retry policy must be an object"))?;
+                only(
+                    retry,
+                    &["maxAttempts", "retryFailed", "retryExpired", "backoffMs"],
+                    &format!("directive.steps[{index}].policy.retry"),
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +368,9 @@ impl ManagerStepSpec {
     pub fn validate(&self) -> Result<(), OrchError> {
         validate_id(&self.step_id, "step_id")?;
         validate_text(&self.kind, "kind")?;
+        if self.step_id == "__manager_decision__" || self.kind == "manager-decision" {
+            return Err(invalid("manager decision identifiers are reserved"));
+        }
         validate_text(&self.objective, "objective")?;
         if self.dependencies.len() > MAX_MANAGER_STEPS {
             return Err(invalid("step dependencies exceed the manager bound"));
@@ -169,6 +473,9 @@ pub struct ManagerPlan {
     pub max_in_flight: u32,
     pub max_replans: u32,
     pub replan_count: u32,
+    /// Missing on v1 JSON and therefore safely defaults to manual operation.
+    #[serde(default)]
+    pub coordination: ManagerCoordinationPolicy,
     pub steps: Vec<ManagerStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -202,6 +509,7 @@ impl ManagerPlan {
             max_in_flight,
             max_replans,
             replan_count: 0,
+            coordination: ManagerCoordinationPolicy::default(),
             steps: steps
                 .into_iter()
                 .map(|step| ManagerStep::from_spec(step, now))
@@ -319,6 +627,38 @@ impl ManagerPlan {
             .iter()
             .map(|step| step.step_id.clone())
             .collect::<HashSet<_>>();
+        let mut superseded = self
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.state,
+                    ManagerStepState::Failed | ManagerStepState::Cancelled
+                )
+            })
+            .map(|step| step.step_id.clone())
+            .collect::<HashSet<_>>();
+        loop {
+            let before = superseded.len();
+            for step in &self.steps {
+                if !matches!(
+                    step.state,
+                    ManagerStepState::Succeeded | ManagerStepState::Superseded
+                ) && step.dependencies.iter().any(|id| superseded.contains(id))
+                {
+                    superseded.insert(step.step_id.clone());
+                }
+            }
+            if superseded.len() == before {
+                break;
+            }
+        }
+        for step in &mut self.steps {
+            if superseded.contains(&step.step_id) {
+                step.state = ManagerStepState::Superseded;
+                step.updated_at = now;
+            }
+        }
         for step in steps {
             step.validate()?;
             if !existing.insert(step.step_id.clone()) {
@@ -353,10 +693,13 @@ impl ManagerPlan {
             .collect::<HashMap<_, _>>();
         let mut changed = false;
         let mut recovered_by_step = HashMap::new();
-        for item in work_items
-            .iter()
-            .filter(|item| item.source_manager_plan_id.as_deref() == Some(self.plan_id.as_str()))
-        {
+        for item in work_items.iter().filter(|item| {
+            item.session_id == self.session_id
+                && item.workspace == self.workspace
+                && item.parent_work_id.as_deref() == Some(self.root_work_id.as_str())
+                && item.kind != "manager-decision"
+                && item.source_manager_plan_id.as_deref() == Some(self.plan_id.as_str())
+        }) {
             let Some(step_id) = item.source_manager_step_id.as_deref() else {
                 continue;
             };
@@ -381,6 +724,9 @@ impl ManagerPlan {
         }
         let mut failed = None;
         for step in &mut self.steps {
+            if step.state == ManagerStepState::Superseded {
+                continue;
+            }
             let Some(work_id) = step.work_id.as_deref() else {
                 continue;
             };
@@ -427,11 +773,12 @@ impl ManagerPlan {
             self.state = ManagerPlanState::NeedsReplan;
             self.last_error = Some(error);
             changed = true;
-        } else if self
-            .steps
-            .iter()
-            .all(|step| step.state == ManagerStepState::Succeeded)
-        {
+        } else if self.steps.iter().all(|step| {
+            matches!(
+                step.state,
+                ManagerStepState::Succeeded | ManagerStepState::Superseded
+            )
+        }) {
             self.state = ManagerPlanState::Succeeded;
             self.last_error = None;
             changed = true;
@@ -527,6 +874,120 @@ impl ManagerPlan {
             self.validate()?;
         }
         Ok(created)
+    }
+
+    pub fn replace_failed_steps(
+        &mut self,
+        reason: String,
+        replaces_step_ids: &[String],
+        steps: Vec<ManagerStepSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<(), OrchError> {
+        let replace = replaces_step_ids.iter().cloned().collect::<HashSet<_>>();
+        if replace.len() != replaces_step_ids.len() {
+            return Err(invalid("replaced manager step IDs must be unique"));
+        }
+        let mut required = self
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.state,
+                    ManagerStepState::Failed | ManagerStepState::Cancelled
+                )
+            })
+            .map(|step| step.step_id.clone())
+            .collect::<HashSet<_>>();
+        loop {
+            let before = required.len();
+            for step in &self.steps {
+                if !matches!(
+                    step.state,
+                    ManagerStepState::Succeeded | ManagerStepState::Superseded
+                ) && step.dependencies.iter().any(|id| required.contains(id))
+                {
+                    required.insert(step.step_id.clone());
+                }
+            }
+            if required.len() == before {
+                break;
+            }
+        }
+        if replace != required {
+            return Err(invalid(
+                "replacement must account for every failed step and blocked descendant",
+            ));
+        }
+        for id in &replace {
+            let step = self
+                .steps
+                .iter()
+                .find(|step| &step.step_id == id)
+                .ok_or_else(|| invalid("replacement references an unknown manager step"))?;
+            if !required.contains(&step.step_id) {
+                return Err(invalid(
+                    "replacement may only supersede failed steps and blocked descendants",
+                ));
+            }
+        }
+        self.append_replan(reason, steps, now)?;
+        Ok(())
+    }
+
+    pub fn manager_decision_snapshot(plan: &ManagerPlan, work_items: &[WorkItem]) -> Value {
+        let mut selected = plan
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.state,
+                    ManagerStepState::Failed | ManagerStepState::Cancelled
+                )
+            })
+            .map(|step| step.step_id.as_str())
+            .take(8)
+            .collect::<HashSet<_>>();
+        for step in plan.steps.iter().rev() {
+            if selected.len() == 8 {
+                break;
+            }
+            selected.insert(step.step_id.as_str());
+        }
+        let outcomes = plan
+                .steps
+                .iter()
+                .filter(|step| selected.contains(step.step_id.as_str()))
+                .filter_map(|step| {
+                    let work = step
+                        .work_id
+                        .as_deref()
+                        .and_then(|id| work_items.iter().find(|item| item.work_id == id));
+                    work.map(|work| json!({
+                "stepId": step.step_id,
+                "workId": work.work_id,
+                "workRevision": work.revision,
+                "state": work_state_label(work.state),
+                "summary": work.result.as_ref().map(|result| truncate_manager_text(&result.summary, 512)),
+                "failure": work.result.as_ref().and_then(|result| result.failure.as_ref()).map(|failure| truncate_manager_text(failure, 512)),
+            }))
+                })
+                .collect::<Vec<_>>();
+        json!({
+            "planId": plan.plan_id,
+            "planRevision": plan.revision,
+            "objective": truncate_manager_text(&plan.objective, 4096),
+            "managerAgentId": plan.manager_agent_id,
+            "outcomes": outcomes,
+        })
+    }
+
+    pub fn manager_decision_id(plan: &ManagerPlan, snapshot: &Value) -> String {
+        format!(
+            "manager-decision-{}",
+            &hash_payload(
+                &json!({"planId": plan.plan_id, "revision": plan.revision, "snapshot": snapshot})
+            )[..32]
+        )
     }
 
     /// Return at most one notification for each step's current Work revision.
@@ -654,6 +1115,17 @@ impl ManagerPlan {
         self.revision = self.revision.saturating_add(1);
         self.updated_at = now;
     }
+}
+
+fn truncate_manager_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 fn assert_acyclic(
@@ -845,5 +1317,147 @@ mod tests {
         let status = plan.pending_notifications(&[failed]);
         assert_eq!(status[0].kind, MessageKind::Status);
         assert!(status[0].body.contains("fixture failure"));
+    }
+
+    #[test]
+    fn legacy_plan_json_defaults_to_manual_coordination() {
+        let plan = ManagerPlan::new(
+            Uuid::new_v4(),
+            "/tmp/project",
+            "manager",
+            "objective",
+            "root",
+            vec![spec("a", &[])],
+            1,
+            2,
+            Utc::now(),
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(plan).unwrap();
+        value.as_object_mut().unwrap().remove("coordination");
+        let recovered: ManagerPlan = serde_json::from_value(value).unwrap();
+        assert!(!recovered.coordination.autonomous());
+    }
+
+    #[test]
+    fn replacement_supersedes_failure_and_plan_can_succeed() {
+        let now = Utc::now();
+        let mut plan = ManagerPlan::new(
+            Uuid::new_v4(),
+            "/tmp/project",
+            "manager",
+            "objective",
+            "root",
+            vec![spec("original", &[])],
+            1,
+            2,
+            now,
+        )
+        .unwrap();
+        let mut original = plan.advance(&[], "operator", now).unwrap().remove(0);
+        original.state = WorkState::Failed;
+        original.result = Some(super::super::workload::WorkResult {
+            summary: "failed".into(),
+            evidence: vec![],
+            artifacts: vec![],
+            failure: Some("fixture".into()),
+            cancellation_reason: None,
+            completed_at: now,
+        });
+        original.bump_at(now);
+        plan.advance(&[original.clone()], "operator", now).unwrap();
+        assert_eq!(plan.state, ManagerPlanState::NeedsReplan);
+        plan.replace_failed_steps(
+            "replace failed path".into(),
+            &["original".into()],
+            vec![spec("replacement", &[])],
+            now,
+        )
+        .unwrap();
+        let mut replacement = plan
+            .advance(&[original.clone()], "operator", now)
+            .unwrap()
+            .remove(0);
+        replacement.state = WorkState::Succeeded;
+        replacement.bump_at(now);
+        plan.advance(&[original, replacement], "operator", now)
+            .unwrap();
+        assert_eq!(plan.steps[0].state, ManagerStepState::Superseded);
+        assert_eq!(plan.state, ManagerPlanState::Succeeded);
+    }
+
+    #[test]
+    fn replacement_must_cover_failed_step_descendants() {
+        let now = Utc::now();
+        let mut plan = ManagerPlan::new(
+            Uuid::new_v4(),
+            "/tmp/project",
+            "manager",
+            "objective",
+            "root",
+            vec![spec("a", &[]), spec("b", &["a"])],
+            1,
+            2,
+            now,
+        )
+        .unwrap();
+        let mut a = plan.advance(&[], "operator", now).unwrap().remove(0);
+        a.state = WorkState::Failed;
+        a.bump_at(now);
+        plan.advance(&[a], "operator", now).unwrap();
+        assert!(plan
+            .replace_failed_steps(
+                "incomplete replacement".into(),
+                &["a".into()],
+                vec![spec("a2", &[])],
+                now,
+            )
+            .is_err());
+        plan.replace_failed_steps(
+            "replace blocked path".into(),
+            &["a".into(), "b".into()],
+            vec![spec("a2", &[]), spec("b2", &["a2"])],
+            now,
+        )
+        .unwrap();
+        assert!(plan.steps[..2]
+            .iter()
+            .all(|step| step.state == ManagerStepState::Superseded));
+    }
+
+    #[test]
+    fn directive_parser_is_bounded_and_denies_unknown_fields() {
+        let valid = json!({
+            "schemaVersion": 1,
+            "occurrenceId": "decision-1",
+            "planId": "plan-1",
+            "expectedPlanRevision": 3,
+            "managerAgentId": "agent-1",
+            "expectedAgentSpecRevision": 2,
+            "inputSnapshotHash": "abc",
+            "directive": {
+                "type": "append_replacement_steps",
+                "reason": "replace failure",
+                "replacesStepIds": ["failed"],
+                "steps": [{"stepId": "retry", "kind": "coding", "objective": "retry"}]
+            }
+        });
+        parse_manager_directive(&valid.to_string()).unwrap();
+        let mut unknown = valid;
+        unknown["unexpected"] = json!(true);
+        assert!(parse_manager_directive(&unknown.to_string()).is_err());
+        let mut nested_unknown = unknown;
+        nested_unknown.as_object_mut().unwrap().remove("unexpected");
+        nested_unknown["directive"]["steps"][0]["policy"] = json!({
+            "bounds": {
+                "maxPromptBytes": 1024,
+                "maxRounds": 1,
+                "maxDurationMs": 1000,
+                "unknownBound": 1
+            }
+        });
+        assert!(parse_manager_directive(&nested_unknown.to_string()).is_err());
+        assert!(parse_manager_directive("{} trailing").is_err());
+        assert!(parse_manager_directive(&"x".repeat(MAX_MANAGER_DIRECTIVE_BYTES + 1)).is_err());
     }
 }

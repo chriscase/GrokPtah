@@ -17,7 +17,7 @@ use super::managed::{
     ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
     MANAGED_FINALIZATION_SCHEMA_VERSION,
 };
-use super::manager::ManagerPlan;
+use super::manager::{ManagerDecisionRecord, ManagerPlan};
 use super::message::{MessagePage, WorkMessage, MAX_RETAINED_MESSAGES};
 use super::routine::{
     advance_next_fire, decide_lifecycle_skip, due_occurrences, in_flight_count,
@@ -80,6 +80,13 @@ struct RoutineFireIntent {
     activation: ActivationRecord,
     work: Option<WorkItem>,
     dedupe: Option<RoutineDedupeRecord>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagerCreationIntent {
+    plan: ManagerPlan,
+    root_work: WorkItem,
 }
 
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
@@ -172,6 +179,8 @@ impl OrchStore {
         fs::create_dir_all(root.join("managed-intents"))?;
         fs::create_dir_all(root.join("managed-finalization"))?;
         fs::create_dir_all(root.join("manager-plans"))?;
+        fs::create_dir_all(root.join("manager-decisions"))?;
+        fs::create_dir_all(root.join("manager-intents"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -221,6 +230,7 @@ impl OrchStore {
         store.recover_finalization_intents()?;
         store.recover_routine_intents()?;
         store.recover_managed_finalization_intents()?;
+        store.recover_manager_creation_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
@@ -387,6 +397,22 @@ impl OrchStore {
             .root
             .join("manager-plans")
             .join(format!("{safe}.json")))
+    }
+
+    fn manager_decision_path(&self, decision_id: &str) -> Result<PathBuf, OrchError> {
+        Ok(self
+            .inner
+            .root
+            .join("manager-decisions")
+            .join(format!("{}.json", safe_id_filename(decision_id)?)))
+    }
+
+    fn manager_creation_intent_path(&self, plan_id: &str) -> Result<PathBuf, OrchError> {
+        Ok(self
+            .inner
+            .root
+            .join("manager-intents")
+            .join(format!("{}.json", safe_id_filename(plan_id)?)))
     }
 
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
@@ -672,6 +698,73 @@ impl OrchStore {
 
     // --- Durable manager plans -------------------------------------------
 
+    pub fn save_manager_plan_with_root(
+        &self,
+        plan: &ManagerPlan,
+        root_work: &WorkItem,
+    ) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        plan.validate()?;
+        root_work
+            .validate()
+            .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.message))?;
+        if !root_work.is_container
+            || root_work.work_id != plan.root_work_id
+            || root_work.session_id != plan.session_id
+            || root_work.workspace != plan.workspace
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "manager root Work does not match its plan",
+            ));
+        }
+        let intent = ManagerCreationIntent {
+            plan: plan.clone(),
+            root_work: root_work.clone(),
+        };
+        let intent_path = self.manager_creation_intent_path(&plan.plan_id)?;
+        atomic_write_json(&intent_path, &intent)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.commit_manager_creation_intent_unlocked(&intent)?;
+        remove_file_durable(&intent_path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn commit_manager_creation_intent_unlocked(
+        &self,
+        intent: &ManagerCreationIntent,
+    ) -> Result<(), OrchError> {
+        self.save_work_item_unlocked(&intent.root_work)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.save_manager_plan_unlocked(&intent.plan)
+    }
+
+    fn recover_manager_creation_intents(&self) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let dir = self.inner.root.join("manager-intents");
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let intent: ManagerCreationIntent = serde_json::from_str(
+                &fs::read_to_string(&path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            intent.plan.validate()?;
+            intent.root_work.validate()?;
+            self.commit_manager_creation_intent_unlocked(&intent)?;
+            remove_file_durable(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub fn save_manager_plan(&self, plan: &ManagerPlan) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
         self.save_manager_plan_unlocked(plan)
@@ -688,6 +781,41 @@ impl OrchStore {
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         self.save_manager_plan_unlocked(plan)
+    }
+
+    /// Compare-and-swap a plan revision and its newly materialized Work under
+    /// one process-store lock. The Work-first write order remains recoverable
+    /// after a crash, while the CAS prevents concurrent ticks from producing
+    /// two children for one logical step.
+    pub fn save_manager_plan_with_work_cas(
+        &self,
+        plan: &ManagerPlan,
+        expected_revision: u64,
+        work_items: &[WorkItem],
+    ) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let current = self
+            .load_manager_plan_unlocked(&plan.plan_id)?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown plan_id"))?;
+        if current.revision != expected_revision {
+            return Err(OrchError::new(
+                OrchErrorCode::StaleVersion,
+                "manager plan changed before the mutation could be committed",
+            ));
+        }
+        for item in work_items {
+            self.save_work_item_unlocked(item)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        self.save_manager_plan_unlocked(plan)
+    }
+
+    pub fn save_manager_plan_cas(
+        &self,
+        plan: &ManagerPlan,
+        expected_revision: u64,
+    ) -> Result<(), OrchError> {
+        self.save_manager_plan_with_work_cas(plan, expected_revision, &[])
     }
 
     pub fn load_manager_plan(&self, plan_id: &str) -> Result<Option<ManagerPlan>, OrchError> {
@@ -748,6 +876,97 @@ impl OrchStore {
             out.push(plan);
         }
         out.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(out)
+    }
+
+    pub fn save_manager_decision_with_work(
+        &self,
+        decision: &ManagerDecisionRecord,
+        work: &WorkItem,
+    ) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        decision.validate()?;
+        if let Some(existing) = self
+            .load_work_item_unlocked(&work.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            if existing.source_manager_plan_id != work.source_manager_plan_id
+                || existing.kind != work.kind
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "manager decision Work ID is already owned by another occurrence",
+                ));
+            }
+        } else {
+            self.save_work_item_unlocked(work)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        self.save_manager_decision_unlocked(decision)
+    }
+
+    pub fn save_manager_decision(&self, decision: &ManagerDecisionRecord) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.save_manager_decision_unlocked(decision)
+    }
+
+    fn save_manager_decision_unlocked(
+        &self,
+        decision: &ManagerDecisionRecord,
+    ) -> Result<(), OrchError> {
+        decision.validate()?;
+        atomic_write_json(
+            &self.manager_decision_path(&decision.decision_id)?,
+            decision,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    pub fn load_manager_decision(
+        &self,
+        decision_id: &str,
+    ) -> Result<Option<ManagerDecisionRecord>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let path = self.manager_decision_path(decision_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let decision: ManagerDecisionRecord = serde_json::from_str(
+            &fs::read_to_string(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        decision.validate()?;
+        Ok(Some(decision))
+    }
+
+    pub fn list_manager_decisions(
+        &self,
+        plan_id: Option<&str>,
+    ) -> Result<Vec<ManagerDecisionRecord>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("manager-decisions");
+        for entry in fs::read_dir(dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let decision: ManagerDecisionRecord = serde_json::from_str(
+                &fs::read_to_string(path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            decision.validate()?;
+            if plan_id.is_none_or(|id| decision.plan_id == id) {
+                out.push(decision);
+            }
+        }
+        out.sort_by(|left, right| left.created_at.cmp(&right.created_at));
         Ok(out)
     }
 
@@ -1456,7 +1675,7 @@ impl OrchStore {
         item: &mut WorkItem,
         now: chrono::DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        if item.state.is_terminal() {
+        if item.state.is_terminal() || item.is_container {
             return Ok(());
         }
         let dependencies_ready = item.dependencies.iter().all(|dependency| {
@@ -2213,6 +2432,41 @@ impl OrchStore {
 
     pub fn send_message(&self, mut message: WorkMessage) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.send_message_unlocked(&mut message)
+    }
+
+    /// Persist a host-derived stable message identity exactly once. A replay
+    /// with different content fails closed instead of overwriting the first
+    /// durable observation.
+    pub fn send_message_once(&self, mut message: WorkMessage) -> Result<WorkMessage, OrchError> {
+        let _guard = self.inner.lock.lock();
+        if let Some(existing) = self.load_message_unlocked(&message.message_id)? {
+            if existing.kind != message.kind
+                || existing.from_actor != message.from_actor
+                || existing.from_agent_id != message.from_agent_id
+                || existing.to_agent_id != message.to_agent_id
+                || existing.session_id != message.session_id
+                || existing.workspace != message.workspace
+                || existing.work_id != message.work_id
+                || existing.attempt_id != message.attempt_id
+                || existing.run_id != message.run_id
+                || existing.reply_to_id != message.reply_to_id
+                || existing.thread_id != message.thread_id
+                || existing.body != message.body
+                || existing.payload != message.payload
+                || existing.expires_at != message.expires_at
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "stable message identity was replayed with different content",
+                ));
+            }
+            return Ok(existing);
+        }
+        self.send_message_unlocked(&mut message)
+    }
+
+    fn send_message_unlocked(&self, message: &mut WorkMessage) -> Result<WorkMessage, OrchError> {
         message.validate()?;
         self.require_optional_agent_in_scope_unlocked(
             message.from_agent_id.as_deref(),
@@ -2230,7 +2484,7 @@ impl OrchStore {
         atomic_write_json(&path, &message)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         self.prune_messages_unlocked()?;
-        Ok(message)
+        Ok(message.clone())
     }
 
     fn require_optional_agent_in_scope_unlocked(
@@ -3371,6 +3625,12 @@ impl OrchStore {
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        if item.is_container {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "coordination container Work is not executable",
+            ));
+        }
         self.refresh_work_item_unlocked(&mut item)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         let now = Utc::now();

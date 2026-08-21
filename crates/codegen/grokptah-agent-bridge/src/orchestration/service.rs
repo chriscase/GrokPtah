@@ -25,7 +25,10 @@ use super::managed::{
     ManagedRetryCause, NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
     MANAGED_EXECUTION_SCHEMA_VERSION, MAX_MANAGED_MESSAGES,
 };
-use super::manager::{ManagerPlan, ManagerStepSpec};
+use super::manager::{
+    parse_manager_directive, ManagerCoordinationMode, ManagerDecisionRecord, ManagerDecisionState,
+    ManagerDirective, ManagerPlan, ManagerPlanState, ManagerStepSpec, MANAGER_SCHEMA_VERSION,
+};
 use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
 use super::routine::{
     manual_dedupe_key, ActivationCause, ActivationRequest, MissedRunPolicy,
@@ -34,8 +37,10 @@ use super::routine::{
 };
 use super::store::{IdempotencyClaim, OrchStore};
 use super::supervisor::{
-    RoutineSupervisor, RoutineSupervisorStatus, WorkloadSupervisor, WorkloadSupervisorStatus,
+    ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
+    WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,
     DEFAULT_ROUTINE_TICK_INTERVAL, DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL,
+    MAX_MANAGER_OBSERVATIONS_PER_PASS, MAX_MANAGER_PLANS_PER_PASS,
 };
 use super::types::*;
 use super::worker::{reject_privilege_amplification, WorkerHostKind};
@@ -91,6 +96,10 @@ pub struct OrchestrationService {
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     workload_supervisor: Mutex<Option<WorkloadSupervisor>>,
     routine_supervisor: Mutex<Option<RoutineSupervisor>>,
+    manager_supervisor: Mutex<ManagerSupervisorStatus>,
+    manager_scan_cursor: Mutex<Option<String>>,
+    manager_wakeup: Arc<tokio::sync::Notify>,
+    manager_supervisor_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     native_executor: Mutex<NativeExecutorStatus>,
     native_executor_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
@@ -262,6 +271,10 @@ impl OrchestrationService {
             scheduler_watcher: Mutex::new(None),
             workload_supervisor: Mutex::new(workload_supervisor),
             routine_supervisor: Mutex::new(routine_supervisor),
+            manager_supervisor: Mutex::new(ManagerSupervisorStatus::disabled()),
+            manager_scan_cursor: Mutex::new(None),
+            manager_wakeup: Arc::new(tokio::sync::Notify::new()),
+            manager_supervisor_watcher: Mutex::new(None),
             native_executor: Mutex::new(NativeExecutorStatus::disabled(
                 DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
             )),
@@ -270,7 +283,555 @@ impl OrchestrationService {
         });
         service.start_scheduler_watcher();
         service.start_native_executor();
+        service.start_manager_supervisor();
         service
+    }
+
+    fn start_manager_supervisor(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        {
+            let mut status = self.manager_supervisor.lock();
+            status.enabled = true;
+            status.started_at = Some(Utc::now());
+        }
+        let service_ref = self.self_ref.clone();
+        let mut events = self.host.subscribe_events();
+        let wakeup = self.manager_wakeup.clone();
+        let watcher = runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(DEFAULT_MANAGER_TICK_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let Some(service) = service_ref.upgrade() else { break; };
+                        service.drive_manager_supervisor_once().await;
+                    }
+                    update = events.recv() => {
+                        let Some(update) = update else { break; };
+                        if matches!(update,
+                            crate::events::SessionUpdate::TurnComplete { .. }
+                            | crate::events::SessionUpdate::Error { .. }
+                            | crate::events::SessionUpdate::PermissionRequired { .. }
+                        ) {
+                            let Some(service) = service_ref.upgrade() else { break; };
+                            service.drive_manager_supervisor_once().await;
+                        }
+                    }
+                    _ = wakeup.notified() => {
+                        let Some(service) = service_ref.upgrade() else { break; };
+                        service.drive_manager_supervisor_once().await;
+                    }
+                }
+            }
+        });
+        *self.manager_supervisor_watcher.lock() = Some(watcher);
+    }
+
+    pub fn manager_supervisor_status(&self) -> ManagerSupervisorStatus {
+        self.manager_supervisor.lock().clone()
+    }
+
+    /// Run one bounded convergence pass. Tests and hosted runtimes use this
+    /// same seam; it never depends on a desktop window or UI timer.
+    pub async fn drive_manager_supervisor_once(&self) {
+        let now = Utc::now();
+        self.manager_supervisor.lock().last_run_at = Some(now);
+        match self.manager_supervisor_pass(now) {
+            Ok(report) => {
+                let mut status = self.manager_supervisor.lock();
+                status.last_success_at = Some(now);
+                status.last_error = None;
+                status.last_report = report;
+            }
+            Err(error) => {
+                self.manager_supervisor.lock().last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn manager_supervisor_pass(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<ManagerSupervisorReport, OrchError> {
+        let mut plans = self.store.list_manager_plans()?;
+        plans.retain(|plan| {
+            plan.coordination.autonomous()
+                && matches!(
+                    plan.state,
+                    ManagerPlanState::Active | ManagerPlanState::NeedsReplan
+                )
+        });
+        plans.sort_by(|left, right| left.plan_id.cmp(&right.plan_id));
+        let total = plans.len();
+        let cursor = self.manager_scan_cursor.lock().clone();
+        if let Some(cursor) = cursor {
+            let split = plans
+                .iter()
+                .position(|plan| plan.plan_id > cursor)
+                .unwrap_or(0);
+            plans.rotate_left(split);
+        }
+        let mut report = ManagerSupervisorReport {
+            plans_scanned: total,
+            bounded: total > MAX_MANAGER_PLANS_PER_PASS,
+            ..ManagerSupervisorReport::default()
+        };
+        let mut observations = 0usize;
+        for plan in plans.into_iter().take(MAX_MANAGER_PLANS_PER_PASS) {
+            let remaining = MAX_MANAGER_OBSERVATIONS_PER_PASS.saturating_sub(observations);
+            if remaining < super::manager::MAX_MANAGER_IN_FLIGHT as usize {
+                report.bounded = true;
+                break;
+            }
+            *self.manager_scan_cursor.lock() = Some(plan.plan_id.clone());
+            let consumed =
+                self.process_autonomous_manager_plan(plan, now, remaining, &mut report)?;
+            observations = observations.saturating_add(consumed);
+            report.plans_processed += 1;
+        }
+        Ok(report)
+    }
+
+    fn process_autonomous_manager_plan(
+        &self,
+        mut plan: ManagerPlan,
+        now: chrono::DateTime<Utc>,
+        observation_budget: usize,
+        report: &mut ManagerSupervisorReport,
+    ) -> Result<usize, OrchError> {
+        let workspace = Path::new(&plan.workspace);
+        self.validate_manager_assignments(&plan, workspace, true)?;
+        let work_items = self
+            .store
+            .list_work_items()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let durable_revision = plan.revision;
+        let created = if plan.state == ManagerPlanState::Active {
+            plan.advance(&work_items, "manager-supervisor", now)?
+        } else {
+            Vec::new()
+        };
+        let notifications = plan
+            .pending_notifications(&work_items)
+            .into_iter()
+            .take(observation_budget.saturating_sub(created.len()))
+            .collect::<Vec<_>>();
+        let mut delivered = Vec::new();
+        for notification in &notifications {
+            let message =
+                self.persist_manager_notification(&plan, notification, "manager-supervisor", now)?;
+            delivered.push((
+                notification.step_id.clone(),
+                notification.work_revision,
+                message.message_id,
+            ));
+        }
+        plan.mark_notifications_sent(&delivered, now)?;
+        match self
+            .store
+            .save_manager_plan_with_work_cas(&plan, durable_revision, &created)
+        {
+            Ok(()) => {
+                report.work_created += created.len();
+                report.messages_created += delivered.len();
+            }
+            Err(error) if error.code == OrchErrorCode::StaleVersion => return Ok(0),
+            Err(error) => return Err(error),
+        }
+        let plan = self
+            .store
+            .load_manager_plan(&plan.plan_id)?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Internal, "manager plan disappeared"))?;
+        if plan.state == ManagerPlanState::NeedsReplan {
+            self.converge_manager_decision(&plan, now, report)?;
+        }
+        Ok(notifications.len().saturating_add(created.len()).max(1))
+    }
+
+    fn persist_manager_notification(
+        &self,
+        plan: &ManagerPlan,
+        notification: &super::manager::ManagerNotification,
+        actor_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<WorkMessage, OrchError> {
+        let stable_id = format!(
+            "manager-message-{}",
+            &hash_payload(&json!({
+                "planId": plan.plan_id,
+                "stepId": notification.step_id,
+                "workRevision": notification.work_revision,
+                "kind": notification.kind,
+            }))[..32]
+        );
+        let mut message = WorkMessage::new(
+            notification.kind,
+            actor_id,
+            None,
+            Some(plan.manager_agent_id.clone()),
+            plan.session_id,
+            plan.workspace.clone(),
+            Some(notification.work_id.clone()),
+            notification.body.clone(),
+            Some(notification.payload.clone()),
+            now,
+        )?;
+        message.message_id = stable_id;
+        self.store.send_message_once(message)
+    }
+
+    fn converge_manager_decision(
+        &self,
+        plan: &ManagerPlan,
+        now: chrono::DateTime<Utc>,
+        report: &mut ManagerSupervisorReport,
+    ) -> Result<(), OrchError> {
+        let items = self
+            .store
+            .list_work_items()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let agent = self.store.require_agent_in_scope(
+            &plan.manager_agent_id,
+            plan.session_id,
+            &plan.workspace,
+        )?;
+        let spec = agent.current_spec()?.clone();
+        let mut snapshot = ManagerPlan::manager_decision_snapshot(plan, &items);
+        if let Some(snapshot) = snapshot.as_object_mut() {
+            snapshot.insert("managerAgentSpecRevision".into(), json!(spec.revision));
+            snapshot.insert(
+                "effectiveBounds".into(),
+                json!(spec.managed_execution.bounds),
+            );
+            snapshot.insert("toolAuthority".into(), json!("none"));
+        }
+        let decision_id = ManagerPlan::manager_decision_id(plan, &snapshot);
+        let snapshot_hash = hash_payload(&snapshot);
+        let mut decision = if let Some(decision) = self.store.load_manager_decision(&decision_id)? {
+            if decision.input_snapshot_hash != snapshot_hash {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "manager decision occurrence hash changed",
+                ));
+            }
+            decision
+        } else {
+            let work_id = format!("manager-decision-work-{}", &decision_id[17..]);
+            let mut policy = WorkPolicy::default();
+            policy.bounds.max_prompt_bytes = 32 * 1024;
+            policy.bounds.max_rounds = 2;
+            policy.bounds.max_duration_ms = 120_000;
+            policy.bounds.max_total_tokens = Some(8_000);
+            policy.retry.max_attempts = 1;
+            policy.requires_approval = false;
+            let envelope_template = json!({
+                "schemaVersion": MANAGER_SCHEMA_VERSION,
+                "occurrenceId": decision_id,
+                "planId": plan.plan_id,
+                "expectedPlanRevision": plan.revision,
+                "managerAgentId": plan.manager_agent_id,
+                "expectedAgentSpecRevision": spec.revision,
+                "inputSnapshotHash": snapshot_hash,
+                "directive": {"type": "no_safe_action", "reason": "replace with one allowed directive"},
+            });
+            let objective = format!(
+                "Return exactly this JSON envelope with only directive replaced, and no prose. You have no tool authority. Envelope: {} Snapshot: {}",
+                serde_json::to_string(&envelope_template)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+                serde_json::to_string(&snapshot)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            );
+            let mut work = WorkItem::new_at(
+                "manager-decision",
+                objective,
+                plan.session_id,
+                plan.workspace.clone(),
+                "manager-supervisor",
+                policy,
+                now,
+            )?;
+            work.work_id = work_id.clone();
+            work.parent_work_id = Some(plan.root_work_id.clone());
+            work.assigned_agent_id = Some(plan.manager_agent_id.clone());
+            work.assignment_status = super::workload::AssignmentStatus::Accepted;
+            work.source_manager_plan_id = Some(plan.plan_id.clone());
+            work.source_manager_step_id = Some("__manager_decision__".into());
+            work.validate()?;
+            let decision = ManagerDecisionRecord {
+                schema_version: MANAGER_SCHEMA_VERSION,
+                decision_id,
+                plan_id: plan.plan_id.clone(),
+                expected_plan_revision: plan.revision,
+                manager_agent_id: plan.manager_agent_id.clone(),
+                agent_spec_revision: spec.revision,
+                triggering_work_ids: plan
+                    .steps
+                    .iter()
+                    .filter(|step| {
+                        matches!(
+                            step.state,
+                            super::manager::ManagerStepState::Failed
+                                | super::manager::ManagerStepState::Cancelled
+                        )
+                    })
+                    .filter_map(|step| step.work_id.clone())
+                    .collect(),
+                triggering_message_ids: plan
+                    .steps
+                    .iter()
+                    .filter_map(|step| step.last_notification_message_id.clone())
+                    .collect(),
+                input_snapshot_hash: snapshot_hash,
+                decision_work_id: work_id,
+                run_id: None,
+                state: ManagerDecisionState::AwaitingResult,
+                proposed_directive: None,
+                outcome: None,
+                applied_mutation_ids: Vec::new(),
+                created_at: now,
+                updated_at: now,
+            };
+            self.store
+                .save_manager_decision_with_work(&decision, &work)?;
+            report.decisions_created += 1;
+            return Ok(());
+        };
+        if decision.state != ManagerDecisionState::AwaitingResult
+            && decision.state != ManagerDecisionState::Proposed
+        {
+            return Ok(());
+        }
+        if decision.run_id.is_none() {
+            decision.run_id = self
+                .store
+                .list_managed_intents()?
+                .into_iter()
+                .find(|intent| intent.work_id == decision.decision_work_id)
+                .and_then(|intent| intent.run_id);
+        }
+        let Some(work) = self
+            .store
+            .load_work_item(&decision.decision_work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "manager decision Work is missing",
+            ));
+        };
+        if matches!(work.state, WorkState::Failed | WorkState::Cancelled) {
+            decision.state = ManagerDecisionState::Rejected;
+            decision.outcome = Some("manager decision Work did not succeed".into());
+            decision.updated_at = now;
+            self.store.save_manager_decision(&decision)?;
+            report.decisions_rejected += 1;
+            return Ok(());
+        }
+        if decision.state == ManagerDecisionState::AwaitingResult
+            && work.state != WorkState::Succeeded
+        {
+            self.store.save_manager_decision(&decision)?;
+            return Ok(());
+        }
+        let envelope = match decision.proposed_directive.clone() {
+            Some(envelope) => envelope,
+            None => {
+                let raw = work
+                    .result
+                    .as_ref()
+                    .map(|result| result.summary.as_str())
+                    .ok_or_else(|| {
+                        OrchError::new(OrchErrorCode::Conflict, "decision result is missing")
+                    })?;
+                let envelope = match parse_manager_directive(raw) {
+                    Ok(envelope) => envelope,
+                    Err(error) => {
+                        decision.state = ManagerDecisionState::Rejected;
+                        decision.outcome = Some(error.message.clone());
+                        decision.updated_at = now;
+                        self.store.save_manager_decision(&decision)?;
+                        report.decisions_rejected += 1;
+                        return Ok(());
+                    }
+                };
+                if let Err(error) = self.validate_manager_directive_envelope(&decision, &envelope) {
+                    decision.state = ManagerDecisionState::Rejected;
+                    decision.outcome = Some(error.message.clone());
+                    decision.updated_at = now;
+                    self.store.save_manager_decision(&decision)?;
+                    report.decisions_rejected += 1;
+                    return Ok(());
+                }
+                decision.proposed_directive = Some(envelope.clone());
+                decision.state = ManagerDecisionState::Proposed;
+                decision.updated_at = now;
+                self.store.save_manager_decision(&decision)?;
+                envelope
+            }
+        };
+        if let Err(error) = self.validate_manager_directive_envelope(&decision, &envelope) {
+            decision.state = ManagerDecisionState::Rejected;
+            decision.outcome = Some(error.message.clone());
+            decision.updated_at = now;
+            self.store.save_manager_decision(&decision)?;
+            report.decisions_rejected += 1;
+            return Ok(());
+        }
+        self.apply_manager_directive(plan, &mut decision, envelope, now, report)
+    }
+
+    fn validate_manager_directive_envelope(
+        &self,
+        decision: &ManagerDecisionRecord,
+        envelope: &super::manager::ManagerDirectiveEnvelope,
+    ) -> Result<(), OrchError> {
+        if envelope.occurrence_id != decision.decision_id
+            || envelope.plan_id != decision.plan_id
+            || envelope.expected_plan_revision != decision.expected_plan_revision
+            || envelope.manager_agent_id != decision.manager_agent_id
+            || envelope.expected_agent_spec_revision != decision.agent_spec_revision
+            || envelope.input_snapshot_hash != decision.input_snapshot_hash
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::StaleVersion,
+                "manager directive does not match its durable occurrence fences",
+            ));
+        }
+        let plan = self
+            .store
+            .load_manager_plan(&decision.plan_id)?
+            .ok_or_else(|| {
+                OrchError::new(OrchErrorCode::InvalidRequest, "manager plan is missing")
+            })?;
+        let agent = self.store.require_agent_in_scope(
+            &decision.manager_agent_id,
+            plan.session_id,
+            &plan.workspace,
+        )?;
+        if agent.current_spec()?.revision != decision.agent_spec_revision {
+            return Err(OrchError::new(
+                OrchErrorCode::StaleVersion,
+                "manager Agent specification changed after reasoning",
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_manager_directive(
+        &self,
+        plan: &ManagerPlan,
+        decision: &mut ManagerDecisionRecord,
+        envelope: super::manager::ManagerDirectiveEnvelope,
+        now: chrono::DateTime<Utc>,
+        report: &mut ManagerSupervisorReport,
+    ) -> Result<(), OrchError> {
+        match envelope.directive {
+            ManagerDirective::AppendReplacementSteps {
+                reason,
+                replaces_step_ids,
+                steps,
+            } => {
+                let mutation_ids = steps
+                    .iter()
+                    .map(|step| format!("manager-step-{}", step.step_id))
+                    .collect::<Vec<_>>();
+                let mut current =
+                    self.store
+                        .load_manager_plan(&plan.plan_id)?
+                        .ok_or_else(|| {
+                            OrchError::new(OrchErrorCode::InvalidRequest, "unknown plan_id")
+                        })?;
+                if current.revision != decision.expected_plan_revision {
+                    let already_applied = steps.iter().all(|proposed| {
+                        current.steps.iter().any(|step| {
+                            step.step_id == proposed.step_id
+                                && step.kind == proposed.kind
+                                && step.objective == proposed.objective
+                                && step.priority == proposed.priority
+                                && step.dependencies == proposed.dependencies
+                                && step.assigned_agent_id == proposed.assigned_agent_id
+                                && step.policy == proposed.policy
+                        })
+                    }) && replaces_step_ids.iter().all(|id| {
+                        current.steps.iter().any(|step| {
+                            step.step_id == *id
+                                && step.state == super::manager::ManagerStepState::Superseded
+                        })
+                    }) && current.last_error.as_deref()
+                        == Some(reason.as_str());
+                    if already_applied {
+                        decision.state = ManagerDecisionState::Applied;
+                        decision.outcome = Some("recovered already-applied replacement".into());
+                        decision.applied_mutation_ids = mutation_ids;
+                        decision.updated_at = now;
+                        self.store.save_manager_decision(decision)?;
+                        report.decisions_applied += 1;
+                        return Ok(());
+                    }
+                    return Err(OrchError::new(
+                        OrchErrorCode::StaleVersion,
+                        "manager plan changed before directive application",
+                    ));
+                }
+                let base_revision = current.revision;
+                current.replace_failed_steps(reason, &replaces_step_ids, steps, now)?;
+                self.validate_manager_assignments(&current, Path::new(&current.workspace), true)?;
+                self.store.save_manager_plan_cas(&current, base_revision)?;
+                decision.state = ManagerDecisionState::Applied;
+                decision.outcome = Some("replacement steps appended through manager replan".into());
+                decision.applied_mutation_ids = mutation_ids;
+                decision.updated_at = now;
+                self.store.save_manager_decision(decision)?;
+                report.decisions_applied += 1;
+            }
+            ManagerDirective::RequestOperatorIntervention { reason } => {
+                if plan.revision != decision.expected_plan_revision {
+                    return Err(OrchError::new(
+                        OrchErrorCode::StaleVersion,
+                        "manager plan changed before operator intervention",
+                    ));
+                }
+                let message_id = format!("manager-human-{}", decision.decision_id);
+                let mut message = WorkMessage::new(
+                    MessageKind::Instruction,
+                    "manager-supervisor",
+                    Some(decision.manager_agent_id.clone()),
+                    Some(decision.manager_agent_id.clone()),
+                    plan.session_id,
+                    plan.workspace.clone(),
+                    Some(decision.decision_work_id.clone()),
+                    format!("Operator intervention required: {reason}"),
+                    Some(json!({
+                        "managerPlanId": plan.plan_id,
+                        "decisionId": decision.decision_id,
+                        "requiresOperatorAction": true,
+                    })),
+                    now,
+                )?;
+                message.message_id = message_id.clone();
+                self.store.send_message_once(message)?;
+                decision.state = ManagerDecisionState::HumanRequired;
+                decision.outcome = Some(reason);
+                decision.applied_mutation_ids = vec![message_id];
+                decision.updated_at = now;
+                self.store.save_manager_decision(decision)?;
+            }
+            ManagerDirective::NoSafeAction { reason } => {
+                if plan.revision != decision.expected_plan_revision {
+                    return Err(OrchError::new(
+                        OrchErrorCode::StaleVersion,
+                        "manager plan changed before no-safe-action outcome",
+                    ));
+                }
+                decision.state = ManagerDecisionState::Rejected;
+                decision.outcome = Some(reason);
+                decision.updated_at = now;
+                self.store.save_manager_decision(decision)?;
+                report.decisions_rejected += 1;
+            }
+        }
+        Ok(())
     }
 
     fn start_scheduler_watcher(&self) {
@@ -784,6 +1345,10 @@ impl OrchestrationService {
                 false,
                 None,
                 "ptah_native_execute",
+                Some(&intent.agent_id),
+                Some(intent.agent_spec_revision),
+                work.kind == "manager-decision"
+                    && work.source_manager_step_id.as_deref() == Some("__manager_decision__"),
             )
             .await
         {
@@ -856,7 +1421,11 @@ impl OrchestrationService {
         if let Some(watcher) = self.native_executor_watcher.lock().take() {
             watcher.abort();
         }
+        if let Some(watcher) = self.manager_supervisor_watcher.lock().take() {
+            watcher.abort();
+        }
         self.native_executor.lock().enabled = false;
+        self.manager_supervisor.lock().enabled = false;
     }
 
     pub fn store(&self) -> &OrchStore {
@@ -1641,14 +2210,14 @@ impl OrchestrationService {
             if only_unmaterialized && step.work_id.is_some() {
                 continue;
             }
-            let Some(agent_id) = &step.assigned_agent_id else {
-                continue;
+            let worker = match &step.assigned_agent_id {
+                Some(agent_id) => self.store.require_agent_in_scope(
+                    agent_id,
+                    plan.session_id,
+                    &claimed.display().to_string(),
+                )?,
+                None => manager.clone(),
             };
-            let worker = self.store.require_agent_in_scope(
-                agent_id,
-                plan.session_id,
-                &claimed.display().to_string(),
-            )?;
             if !super::workspaces_match(&worker.workspace, &plan.workspace) {
                 return Err(OrchError::new(
                     OrchErrorCode::ForbiddenScope,
@@ -1678,6 +2247,7 @@ impl OrchestrationService {
         steps: Vec<ManagerStepSpec>,
         max_in_flight: u32,
         max_replans: u32,
+        autonomous: bool,
     ) -> Result<serde_json::Value, OrchError> {
         let payload = json!({
             "sessionId": session_id,
@@ -1687,6 +2257,7 @@ impl OrchestrationService {
             "steps": steps,
             "maxInFlight": max_in_flight,
             "maxReplans": max_replans,
+            "autonomous": autonomous,
         });
         let (claimed, start) = self
             .begin_work_mutation(
@@ -1714,6 +2285,35 @@ impl OrchestrationService {
         if let Err(error) = manager.current_spec() {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        if autonomous {
+            let session_agent = self
+                .host
+                .ensure_session_agent(session_id)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()));
+            let session_agent = match session_agent {
+                Ok(agent) => agent,
+                Err(error) => {
+                    return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+                }
+            };
+            let spec = manager.current_spec().expect("validated above");
+            if session_agent.agent_id != manager.agent_id
+                || !spec.managed_execution.enabled
+                || !spec.managed_execution.allows_kind("manager-decision")
+                || spec.managed_execution.requires_approval_before_execution
+            {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    OrchError::new(
+                        OrchErrorCode::ForbiddenScope,
+                        "autonomous coordination requires the lane Agent with approval-free managed manager-decision execution",
+                    ),
+                ));
+            }
+        }
         let now = Utc::now();
         let mut root = match WorkItem::new(
             "manager-plan",
@@ -1729,9 +2329,10 @@ impl OrchestrationService {
             }
         };
         root.state = WorkState::Blocked;
+        root.is_container = true;
         root.blocked_reason = Some("manager plan container; execute its child Work items".into());
         root.bump_at(now);
-        let plan = match ManagerPlan::new(
+        let mut plan = match ManagerPlan::new(
             session_id,
             claimed.display().to_string(),
             manager_agent_id,
@@ -1753,6 +2354,9 @@ impl OrchestrationService {
                 ))
             }
         };
+        if autonomous {
+            plan.coordination.mode = ManagerCoordinationMode::Autonomous;
+        }
         if let Err(error) = self.validate_manager_assignments(&plan, &claimed, false) {
             return Err(self.fail_claim(
                 &mut lease,
@@ -1762,16 +2366,7 @@ impl OrchestrationService {
                 error,
             ));
         }
-        if let Err(error) = self.store.save_work_item(&root) {
-            return Err(self.fail_claim(
-                &mut lease,
-                Some(root.work_id.clone()),
-                session_id,
-                &claimed,
-                OrchError::new(OrchErrorCode::Internal, error.to_string()),
-            ));
-        }
-        if let Err(error) = self.store.save_manager_plan(&plan) {
+        if let Err(error) = self.store.save_manager_plan_with_root(&plan, &root) {
             return Err(self.fail_claim(
                 &mut lease,
                 Some(plan.plan_id.clone()),
@@ -1780,6 +2375,7 @@ impl OrchestrationService {
                 error,
             ));
         }
+        self.manager_wakeup.notify_one();
         let response = json!({ "plan": plan, "rootWork": root });
         lease
             .complete(
@@ -1830,6 +2426,7 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
+        let durable_revision = plan.revision;
         if let Err(error) = plan.require_revision(expected_revision) {
             return Err(self.fail_claim(
                 &mut lease,
@@ -1872,7 +2469,10 @@ impl OrchestrationService {
                 ));
             }
         };
-        if let Err(error) = self.store.save_manager_plan_with_work(&plan, &created) {
+        if let Err(error) =
+            self.store
+                .save_manager_plan_with_work_cas(&plan, durable_revision, &created)
+        {
             return Err(self.fail_claim(
                 &mut lease,
                 Some(plan_id.into()),
@@ -1931,6 +2531,7 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
+        let durable_revision = plan.revision;
         if let Err(error) = plan.require_revision(expected_revision) {
             return Err(self.fail_claim(
                 &mut lease,
@@ -1982,32 +2583,13 @@ impl OrchestrationService {
         let mut delivered = Vec::with_capacity(notifications.len());
         let mut message_values = Vec::with_capacity(notifications.len());
         for notification in notifications {
-            let notification_request_id = format!(
-                "manager-notify:{}:{}:{}:{}",
-                plan.plan_id,
-                notification.step_id,
-                notification.work_revision,
-                notification.kind.as_str()
-            );
-            let response = match self
-                .send_message(
-                    auth,
-                    &notification_request_id,
-                    session_id,
-                    &claimed,
-                    notification.kind,
-                    Some(plan.manager_agent_id.clone()),
-                    Some(plan.manager_agent_id.clone()),
-                    Some(notification.work_id.clone()),
-                    notification.body,
-                    Some(notification.payload),
-                    None,
-                    None,
-                    None,
-                )
-                .await
-            {
-                Ok(response) => response,
+            let message = match self.persist_manager_notification(
+                &plan,
+                &notification,
+                &auth.token_id,
+                Utc::now(),
+            ) {
+                Ok(message) => message,
                 Err(error) => {
                     return Err(self.fail_claim(
                         &mut lease,
@@ -2018,27 +2600,12 @@ impl OrchestrationService {
                     ))
                 }
             };
-            let message_id = match response
-                .get("message")
-                .and_then(|message| message.get("messageId"))
-                .and_then(serde_json::Value::as_str)
-            {
-                Some(message_id) => message_id.to_string(),
-                None => {
-                    return Err(self.fail_claim(
-                        &mut lease,
-                        Some(plan_id.into()),
-                        session_id,
-                        &claimed,
-                        OrchError::new(
-                            OrchErrorCode::Internal,
-                            "manager notification response omitted message_id",
-                        ),
-                    ))
-                }
-            };
-            delivered.push((notification.step_id, notification.work_revision, message_id));
-            message_values.push(response["message"].clone());
+            delivered.push((
+                notification.step_id,
+                notification.work_revision,
+                message.message_id.clone(),
+            ));
+            message_values.push(json!(message));
         }
         if let Err(error) = plan.mark_notifications_sent(&delivered, Utc::now()) {
             return Err(self.fail_claim(
@@ -2049,7 +2616,10 @@ impl OrchestrationService {
                 error,
             ));
         }
-        if let Err(error) = self.store.save_manager_plan_with_work(&plan, &created) {
+        if let Err(error) =
+            self.store
+                .save_manager_plan_with_work_cas(&plan, durable_revision, &created)
+        {
             return Err(self.fail_claim(
                 &mut lease,
                 Some(plan_id.into()),
@@ -2117,6 +2687,7 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
+        let durable_revision = plan.revision;
         if let Err(error) = plan.require_revision(expected_revision) {
             return Err(self.fail_claim(
                 &mut lease,
@@ -2144,7 +2715,7 @@ impl OrchestrationService {
                 error,
             ));
         }
-        if let Err(error) = self.store.save_manager_plan(&plan) {
+        if let Err(error) = self.store.save_manager_plan_cas(&plan, durable_revision) {
             return Err(self.fail_claim(
                 &mut lease,
                 Some(plan_id.into()),
@@ -2449,6 +3020,7 @@ impl OrchestrationService {
                     error,
                 )
             })?;
+        self.manager_wakeup.notify_one();
         Ok(response)
     }
 
@@ -2544,6 +3116,7 @@ impl OrchestrationService {
                     error,
                 )
             })?;
+        self.manager_wakeup.notify_one();
         Ok(response)
     }
 
@@ -3313,6 +3886,7 @@ impl OrchestrationService {
                     error,
                 )
             })?;
+        self.manager_wakeup.notify_one();
         Ok(response)
     }
 
@@ -4376,6 +4950,11 @@ impl OrchestrationService {
             .last_error
             .as_deref()
             .map(|error| self.bus.redact_text(error, 500));
+        let manager_supervisor = self.manager_supervisor.lock().clone();
+        let manager_supervisor_error = manager_supervisor
+            .last_error
+            .as_deref()
+            .map(|error| self.bus.redact_text(error, 500));
         Ok(json!({
             "maxConcurrentRuns": max,
             "activeRuns": active,
@@ -4391,6 +4970,8 @@ impl OrchestrationService {
                 "workloadSupervisor": workload_supervisor,
                 "routineSupervisorError": routine_supervisor_error,
                 "routineSupervisor": routine_supervisor,
+                "managerSupervisorError": manager_supervisor_error,
+                "managerSupervisor": manager_supervisor,
                 "nativeExecutorError": self.native_executor.lock().last_error.clone().map(|error| self.bus.redact_text(&error, 500)),
                 "nativeExecutor": self.native_executor.lock().clone(),
             },
@@ -5996,6 +6577,9 @@ impl OrchestrationService {
             allow_queue,
             None,
             "ptah_submit_task",
+            None,
+            None,
+            false,
         )
         .await
     }
@@ -6013,6 +6597,9 @@ impl OrchestrationService {
         allow_queue: bool,
         retry_of: Option<&str>,
         idempotency_tool: &str,
+        expected_agent_id: Option<&str>,
+        expected_agent_spec_revision: Option<u64>,
+        proposal_only: bool,
     ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
         let tool = idempotency_tool;
@@ -6092,6 +6679,25 @@ impl OrchestrationService {
                 ));
             }
         };
+        if expected_agent_id.is_some_and(|expected| expected != agent.agent_id)
+            || expected_agent_spec_revision.is_some_and(|expected| {
+                agent
+                    .current_spec()
+                    .map(|spec| spec.revision != expected)
+                    .unwrap_or(true)
+            })
+        {
+            return Err(self.fail_claim(
+                &mut lease,
+                None,
+                session_id,
+                &claimed,
+                OrchError::new(
+                    OrchErrorCode::StaleVersion,
+                    "managed Run Agent identity or specification changed before admission",
+                ),
+            ));
+        }
         let agent = match self
             .store
             .claim_agent_owner(&agent.agent_id, &auth.owner_id)
@@ -6255,6 +6861,18 @@ impl OrchestrationService {
             None
         };
 
+        if proposal_only {
+            if queued {
+                return Err(OrchError::new(
+                    OrchErrorCode::Internal,
+                    "proposal-only Runs cannot enter the generic admission queue",
+                ));
+            }
+            self.host
+                .mark_orchestration_run_proposal_only(&run_id)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+
         let response = json!({
             "runId": run_id,
             "sessionId": session_id,
@@ -6406,6 +7024,9 @@ impl OrchestrationService {
                 allow_queue,
                 Some(source_run_id),
                 tool,
+                None,
+                None,
+                false,
             )
             .await
             .map_err(|error| fail(self, error))?;
