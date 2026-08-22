@@ -109,11 +109,27 @@ impl<'a> ProbeBuilder<'a> {
             Ok(result) if !result.is_error => {
                 if matches!(
                     tool,
-                    "ptah_get_run" | "ptah_list_runs" | "ptah_get_progress"
-                ) && grokptah_agent_bridge::orchestration::public_run_contains_forbidden_fields(
-                    &result.structured,
+                    "ptah_get_run"
+                        | "ptah_list_runs"
+                        | "ptah_get_progress"
+                        | "ptah_promote_run"
+                        | "ptah_discard_run"
                 ) {
-                    return Err(DiagnosticCode::McpResultMalformed);
+                    let text = result
+                        .raw
+                        .get("content")
+                        .and_then(|content| content.get(0))
+                        .and_then(|item| item.get("text"))
+                        .and_then(|text| text.as_str())
+                        .unwrap_or("");
+                    let parsed_text = serde_json::from_str::<Value>(text).ok();
+                    if grokptah_agent_bridge::orchestration::public_run_contains_forbidden_fields(
+                        &result.structured,
+                    ) || parsed_text.as_ref().is_some_and(
+                        grokptah_agent_bridge::orchestration::public_run_contains_forbidden_fields,
+                    ) {
+                        return Err(DiagnosticCode::McpResultMalformed);
+                    }
                 }
                 Ok(result.structured)
             }

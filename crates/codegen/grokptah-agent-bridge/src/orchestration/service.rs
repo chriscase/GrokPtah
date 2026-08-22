@@ -6634,7 +6634,9 @@ impl OrchestrationService {
             )
             .await?
         {
-            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Replay(value) => {
+                return super::public_run_from_receipt(&self.store, value)
+            }
             IdempotencyStart::Perform(lease) => lease,
         };
         let promoted =
@@ -6653,9 +6655,12 @@ impl OrchestrationService {
                     ))
                 }
             };
-        let response = serde_json::to_value(promoted)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        lease.complete(Some(run_id.to_string()), response.clone())?;
+        let projected = super::project_public_run(&self.store, &promoted)?;
+        let response = super::public_run_to_value(&projected)?;
+        lease.complete(
+            Some(run_id.to_string()),
+            super::encode_public_run_receipt(&projected)?,
+        )?;
         Ok(response)
     }
 
@@ -6691,7 +6696,9 @@ impl OrchestrationService {
             )
             .await?
         {
-            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Replay(value) => {
+                return super::public_run_from_receipt(&self.store, value)
+            }
             IdempotencyStart::Perform(lease) => lease,
         };
         let discarded = match self.host.discard_run(session_id, run_id) {
@@ -6706,9 +6713,12 @@ impl OrchestrationService {
                 ))
             }
         };
-        let response = serde_json::to_value(discarded)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        lease.complete(Some(run_id.to_string()), response.clone())?;
+        let projected = super::project_public_run(&self.store, &discarded)?;
+        let response = super::public_run_to_value(&projected)?;
+        lease.complete(
+            Some(run_id.to_string()),
+            super::encode_public_run_receipt(&projected)?,
+        )?;
         Ok(response)
     }
 

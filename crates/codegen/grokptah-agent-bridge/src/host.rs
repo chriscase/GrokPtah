@@ -48,10 +48,11 @@ use crate::orchestration::{
     AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
     ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, ProviderRouteSnapshot,
-    ProviderSendCertainty, PublicRun, QuotaReservation, RoutineConcurrencyPolicy, RoutineLifecycle,
-    RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger, RunAggregates, RunBounds,
-    RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState, RunStopCause, WorkAttemptView,
-    WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
+    ProviderSendCertainty, PublicRun, QuotaClass, QuotaLimits, QuotaReservation,
+    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
+    RoutineTrigger, RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose,
+    RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy,
+    WorkTemplate, DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -870,12 +871,34 @@ pub struct AgentHostHandle {
     /// through `grokptah_home()`. Shared by all host clones.
     runtime_home: crate::discover::RuntimeHome,
     _runtime_home_context: Arc<crate::discover::RuntimeHomeContext>,
+    #[cfg(test)]
+    desktop_admission_cutpoint: Arc<Mutex<Option<DesktopAdmissionCutpoint>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesktopAdmissionCutpoint {
+    AfterRouteCapture,
+    AfterValidation,
+    BeforePersist,
+    AfterPersistBeforeSessionCommit,
+    LedgerUnavailable,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExternalRunContext {
     pub run_id: String,
     pub execution_mode: RunExecutionMode,
+}
+
+struct DesktopTurnSnapshot {
+    cwd: PathBuf,
+    model: String,
+    effort: EffortLevel,
+    plan_mode: bool,
+    kind: SessionKind,
+    execution_mode: RunExecutionMode,
+    event_tx: crate::event_bus::EventBus,
 }
 
 pub struct AgentHost;
@@ -1052,6 +1075,8 @@ impl AgentHost {
             _instance_lock: instance_lock,
             runtime_home,
             _runtime_home_context: runtime_home_context,
+            #[cfg(test)]
+            desktop_admission_cutpoint: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -2371,6 +2396,25 @@ impl AgentHostHandle {
             .map_err(|error| anyhow!(error.to_string()))
     }
 
+    /// Promote through the shared public Run projection.
+    pub fn promote_public_session_run(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+        approval_id: Option<&str>,
+    ) -> Result<PublicRun> {
+        self.project_public_session_run(self.promote_run_with_approval(
+            session_id,
+            run_id,
+            approval_id,
+        )?)
+    }
+
+    /// Discard through the shared public Run projection.
+    pub fn discard_public_session_run(&self, session_id: Uuid, run_id: &str) -> Result<PublicRun> {
+        self.project_public_session_run(self.discard_run(session_id, run_id)?)
+    }
+
     /// Desktop-visible Runs for one session, using the shared public projection.
     pub fn list_public_session_runs(&self, session_id: Uuid) -> Result<Vec<PublicRun>> {
         self.list_session_runs(session_id)?
@@ -2633,35 +2677,187 @@ impl AgentHostHandle {
         result
     }
 
+    fn inspect_turn_slot(
+        &self,
+        session_id: Uuid,
+        reservation_owner: Option<&str>,
+        external_agent_spec: Option<&AgentSpec>,
+        persistent_agent: Option<&AgentRecord>,
+        external_provider_route: Option<&ProviderRouteSnapshot>,
+    ) -> Result<DesktopTurnSnapshot> {
+        let g = self.inner.lock();
+        if !g.running {
+            bail!("agent not started");
+        }
+        if g.turn_cancels.contains_key(&session_id) {
+            bail!("session already has an active turn");
+        }
+        match reservation_owner {
+            Some(owner)
+                if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) => {}
+            Some(_) => bail!("missing or mismatched turn reservation"),
+            None if g.turn_reservations.contains_key(&session_id) => {
+                bail!("session already has an active turn");
+            }
+            None => {}
+        }
+        let model = if let Some(spec) = external_agent_spec {
+            spec.model.selection_key.clone()
+        } else {
+            persistent_agent
+                .map(|agent| {
+                    agent
+                        .current_spec()
+                        .map(|spec| spec.model.selection_key.clone())
+                        .map_err(|error| anyhow!(error.to_string()))
+                })
+                .transpose()?
+                .unwrap_or_else(|| g.model.clone())
+        };
+        let effort = external_provider_route
+            .map(|route| route.effort)
+            .unwrap_or(g.effort);
+        let session = g
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        Ok(DesktopTurnSnapshot {
+            cwd: session.cwd.clone(),
+            model,
+            effort,
+            plan_mode: session.plan_mode,
+            kind: session.kind,
+            execution_mode: session.execution_mode,
+            event_tx: g.event_tx.clone(),
+        })
+    }
+
+    fn commit_admitted_turn(
+        &self,
+        session_id: Uuid,
+        reservation_owner: Option<&str>,
+        snapshot: &DesktopTurnSnapshot,
+        effective_max_rounds: Option<u32>,
+        prompt: &str,
+        defer_resume_transcript: bool,
+    ) -> Result<CancellationToken> {
+        let mut g = self.inner.lock();
+        if !g.running {
+            bail!("agent not started");
+        }
+        if g.turn_cancels.contains_key(&session_id) {
+            bail!("session already has an active turn");
+        }
+        match reservation_owner {
+            Some(owner)
+                if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) =>
+            {
+                g.turn_reservations.remove(&session_id);
+                g.drain_reservations.remove(&session_id);
+            }
+            Some(_) => bail!("missing or mismatched turn reservation"),
+            None if g.turn_reservations.contains_key(&session_id) => {
+                bail!("session already has an active turn");
+            }
+            None => {}
+        }
+        let cancel = CancellationToken::new();
+        g.turn_cancels.insert(session_id, cancel.clone());
+        g.begin_turn_generation(session_id);
+        if let Some(n) = effective_max_rounds {
+            g.turn_max_rounds.insert(session_id, n.max(1));
+        } else {
+            g.turn_max_rounds.remove(&session_id);
+        }
+        g.active_session = Some(session_id);
+        let session = g
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        session.model = snapshot.model.clone();
+        session.effort = snapshot.effort;
+        if !defer_resume_transcript {
+            session
+                .transcript
+                .push(TranscriptEntry::user(prompt.to_string()));
+            if session.title == "New session" || session.title == "New chat" {
+                session.title = prompt.chars().take(48).collect();
+            }
+        }
+        session.updated_at = Utc::now();
+        Ok(cancel)
+    }
+
+    fn map_desktop_admission_error(error: anyhow::Error) -> anyhow::Error {
+        if let Some(orch) = error.downcast_ref::<crate::orchestration::OrchError>() {
+            return anyhow!(orch.clone());
+        }
+        error
+    }
+
+    #[cfg(test)]
+    fn fail_admission_cutpoint(
+        &self,
+        expected: DesktopAdmissionCutpoint,
+        message: &str,
+    ) -> Result<()> {
+        if self
+            .desktop_admission_cutpoint
+            .lock()
+            .as_ref()
+            .is_some_and(|cutpoint| *cutpoint == expected)
+        {
+            *self.desktop_admission_cutpoint.lock() = None;
+            bail!(message.to_string());
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // Keeps durable run identity inputs explicit.
-    fn begin_desktop_run(
+    fn admit_desktop_build_run(
         &self,
         session_id: Uuid,
         cwd: &Path,
         prompt: &str,
-        bounds: RunBounds,
+        mut bounds: RunBounds,
         start_seq: u64,
         turn_id: Uuid,
         provider_route: Option<ProviderRouteSnapshot>,
-        execution: Option<RunExecution>,
         agent_id: Option<String>,
         agent_spec_revision: Option<u64>,
         parent_run_id: Option<String>,
         continuation: Option<&AgentContinuationPlan>,
-    ) -> Option<(String, OrchStore)> {
-        let store = match self.ensure_orchestration_store() {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("[grokptah] desktop run ledger unavailable: {error:#}");
-                return None;
-            }
-        };
+    ) -> Result<(String, OrchStore)> {
+        #[cfg(test)]
+        self.fail_admission_cutpoint(
+            DesktopAdmissionCutpoint::LedgerUnavailable,
+            "desktop run ledger unavailable",
+        )?;
+        #[cfg(test)]
+        self.fail_admission_cutpoint(
+            DesktopAdmissionCutpoint::BeforePersist,
+            "injected persist fault",
+        )?;
+        let store = self
+            .ensure_orchestration_store()
+            .map_err(|error| anyhow!("desktop run ledger unavailable: {error:#}"))?;
         let run_id = format!("desktop-{turn_id}");
         let now = Utc::now();
         let durable_workspace = dunce::canonicalize(cwd)
             .unwrap_or_else(|_| cwd.to_path_buf())
             .display()
             .to_string();
+        if bounds.max_total_tokens.is_none() {
+            bounds.max_total_tokens = Some(DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS);
+        }
+        let provider_route = match provider_route {
+            Some(route) => Some(
+                route
+                    .bind_quota(QuotaClass::CodingExecution, format!("quota-{run_id}"))
+                    .map_err(|error| Self::map_desktop_admission_error(anyhow!(error)))?,
+            ),
+            None => None,
+        };
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -2697,18 +2893,46 @@ impl AgentHostHandle {
             stop_cause: None,
             aggregates: RunAggregates::default(),
             progress: None,
-            execution,
+            execution: None,
             approval: None,
         };
-        let persisted = match agent_id.as_deref() {
-            Some(agent_id) => store.save_run_and_activate_agent(&run, agent_id),
-            None => store.save_run(&run),
+        let reservation = match run.provider_route.as_ref() {
+            Some(_) => Some(
+                QuotaReservation::for_run(
+                    &run,
+                    crate::native_coding_readiness::DESKTOP_OWNER_ID,
+                    QuotaLimits::default(),
+                    now,
+                )
+                .map_err(|error| Self::map_desktop_admission_error(anyhow!(error)))?,
+            ),
+            None => None,
+        };
+        let persisted = match (agent_id.as_deref(), reservation.as_ref()) {
+            (Some(agent_id), Some(reservation)) => {
+                store.save_run_and_activate_agent_with_quota(&run, agent_id, reservation)
+            }
+            (Some(agent_id), None) => store.save_run_and_activate_agent(&run, agent_id),
+            (None, Some(reservation)) => store.save_run_with_quota(&run, reservation),
+            (None, None) => store.save_run(&run),
         };
         if let Err(error) = persisted {
-            eprintln!("[grokptah] desktop run {run_id} start persistence failed: {error:#}");
-            return None;
+            return Err(Self::map_desktop_admission_error(error));
         }
-        Some((run_id, store))
+        #[cfg(test)]
+        if self
+            .desktop_admission_cutpoint
+            .lock()
+            .as_ref()
+            .is_some_and(|cutpoint| {
+                *cutpoint == DesktopAdmissionCutpoint::AfterPersistBeforeSessionCommit
+            })
+        {
+            *self.desktop_admission_cutpoint.lock() = None;
+            let _ = store.abort_unstarted_run_admission(&run_id);
+            bail!("injected post-persist admission fault");
+        }
+        Ok((run_id, store))
     }
 
     fn start_desktop_run_aggregator(
@@ -4212,6 +4436,28 @@ impl AgentHostHandle {
     ///
     /// `#[doc(hidden)]` — for integration tests (not a product API).
     #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn set_desktop_admission_cutpoint(
+        &self,
+        cutpoint: Option<DesktopAdmissionCutpoint>,
+    ) {
+        *self.desktop_admission_cutpoint.lock() = cutpoint;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_reservation_owner(&self, session_id: Uuid) -> Option<String> {
+        self.inner
+            .lock()
+            .turn_reservations
+            .get(&session_id)
+            .cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_has_turn_cancel(&self, session_id: Uuid) -> bool {
+        self.inner.lock().turn_cancels.contains_key(&session_id)
+    }
+
     pub fn test_only_panic_while_turn_busy(&self, session_id: Uuid) {
         let cancel = CancellationToken::new();
         {
@@ -6089,7 +6335,18 @@ impl AgentHostHandle {
                 s.plan_status = "executing".into();
             }
         }
-        let reply = self.session_prompt(session_id, exec_prompt).await?;
+        let reply = match self.session_prompt(session_id, exec_prompt).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                let mut g = self.inner.lock();
+                if let Some(session) = g.sessions.get_mut(&session_id) {
+                    if session.plan_status == "executing" {
+                        session.plan_status = "accepted".into();
+                    }
+                }
+                return Err(error);
+            }
+        };
         {
             let mut g = self.inner.lock();
             if let Some(s) = g.sessions.get_mut(&session_id) {
@@ -7246,112 +7503,20 @@ impl AgentHostHandle {
             .as_ref()
             .map(|plan| plan.context.rendered_context.clone());
         let defer_resume_transcript = resume_context.is_some();
-        let (cwd, model, effort, plan_mode, kind, execution_mode, cancel, event_tx) = {
-            let mut g = self.inner.lock();
-            if !g.running {
-                bail!("agent not started");
-            }
-            // One in-flight turn per session (re-prompt while busy is an error).
-            if g.turn_cancels.contains_key(&session_id) {
-                bail!("session already has an active turn");
-            }
-            match reservation_owner {
-                Some(owner)
-                    if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) =>
-                {
-                    g.turn_reservations.remove(&session_id);
-                    g.drain_reservations.remove(&session_id);
-                }
-                Some(_) => bail!("missing or mismatched turn reservation"),
-                None if g.turn_reservations.contains_key(&session_id) => {
-                    bail!("session already has an active turn");
-                }
-                None => {}
-            }
-            // Persistent Agent model selection is revisioned and must not
-            // drift with the currently focused desktop model.
-            let model = if let Some(spec) = external_agent_spec.as_ref() {
-                spec.model.selection_key.clone()
-            } else {
-                persistent_agent
-                    .as_ref()
-                    .map(|agent| {
-                        agent
-                            .current_spec()
-                            .map(|spec| spec.model.selection_key.clone())
-                            .map_err(|error| anyhow!(error.to_string()))
-                    })
-                    .transpose()?
-                    .unwrap_or_else(|| g.model.clone())
-            };
-            let effort = external_provider_route
-                .as_ref()
-                .map(|route| route.effort)
-                .unwrap_or(g.effort);
-            let cancel = CancellationToken::new();
-            g.turn_cancels.insert(session_id, cancel.clone());
-            g.begin_turn_generation(session_id);
-            if let Some(n) = effective_max_rounds {
-                g.turn_max_rounds.insert(session_id, n.max(1));
-            } else {
-                g.turn_max_rounds.remove(&session_id);
-            }
-            g.active_session = Some(session_id);
-            let event_tx = g.event_tx.clone();
-            let s = g
-                .sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| anyhow!("unknown session"))?;
-            s.model = model.clone();
-            s.effort = effort;
-            if !defer_resume_transcript {
-                s.transcript.push(TranscriptEntry::user(prompt.clone()));
-                if s.title == "New session" || s.title == "New chat" {
-                    s.title = prompt.chars().take(48).collect();
-                }
-            }
-            s.updated_at = Utc::now();
-            (
-                s.cwd.clone(),
-                model,
-                effort,
-                s.plan_mode,
-                s.kind,
-                s.execution_mode,
-                cancel,
-                event_tx,
-            )
-        };
-        // RAII immediately after insert — before any fallible work — so a panic
-        // in persist_session cannot leave the session permanently busy.
-        let mut busy_guard = TurnBusyGuard {
-            host: self.clone(),
+        let snapshot = self.inspect_turn_slot(
             session_id,
-            armed: true,
-        };
-        let provider_route = match external_provider_route {
-            Some(route) => Some(route),
-            None if kind == SessionKind::Build
-                && std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none() =>
-            {
-                Some(self.capture_provider_route(&model, effort)?)
-            }
-            None => None,
-        };
-        if external_run.is_none() {
-            if let Some(route) = provider_route.as_ref() {
-                crate::native_coding_readiness::validate_provider_route_for_purpose(
-                    route,
-                    RunPurpose::Execution,
-                )?;
-            }
-        }
-        // Durably append the user turn before the long model call.
-        self.persist_session(session_id);
-        let start_seq = event_tx.current_seq();
-        let usage_before = self.session_usage_snapshot(session_id);
-        let turn_id = Uuid::new_v4();
-        let agent = persistent_agent;
+            reservation_owner,
+            external_agent_spec.as_ref(),
+            persistent_agent.as_ref(),
+            external_provider_route.as_ref(),
+        )?;
+        let cwd = snapshot.cwd.clone();
+        let model = snapshot.model.clone();
+        let effort = snapshot.effort;
+        let plan_mode = snapshot.plan_mode;
+        let kind = snapshot.kind;
+        let execution_mode = snapshot.execution_mode;
+        let event_tx = snapshot.event_tx.clone();
         let requested_execution_mode = external_run
             .as_ref()
             .map(|run| run.execution_mode)
@@ -7362,14 +7527,107 @@ impl AgentHostHandle {
         {
             bail!("isolated external execution is available only for Build sessions");
         }
+
+        // ── desktop Build admission (no session mutation) ──
+        let provider_route = match external_provider_route {
+            Some(route) => Some(route),
+            None if kind == SessionKind::Build
+                && std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none() =>
+            {
+                let route = self.capture_provider_route(&model, effort)?;
+                #[cfg(test)]
+                self.fail_admission_cutpoint(
+                    DesktopAdmissionCutpoint::AfterRouteCapture,
+                    "injected capture fault",
+                )?;
+                crate::native_coding_readiness::validate_provider_route_for_purpose(
+                    &route,
+                    RunPurpose::Execution,
+                )?;
+                #[cfg(test)]
+                self.fail_admission_cutpoint(
+                    DesktopAdmissionCutpoint::AfterValidation,
+                    "injected validation fault",
+                )?;
+                Some(route)
+            }
+            None => None,
+        };
+        let turn_id = Uuid::new_v4();
+        let start_seq = event_tx.current_seq();
+        let agent = persistent_agent;
+        let desktop_run = if external_run.is_none() && kind == SessionKind::Build {
+            let mut bounds = effective_agent_bounds.clone().unwrap_or_default();
+            if let Some(rounds) = effective_max_rounds {
+                bounds.max_rounds = bounds.max_rounds.min(rounds).max(1);
+            }
+            Some(
+                self.admit_desktop_build_run(
+                    session_id,
+                    &cwd,
+                    &prompt,
+                    bounds,
+                    start_seq,
+                    turn_id,
+                    provider_route.clone(),
+                    agent.as_ref().map(|agent| agent.agent_id.clone()),
+                    agent
+                        .as_ref()
+                        .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
+                    resume.as_ref().map(|plan| plan.parent_run_id.clone()),
+                    resume.as_ref(),
+                )?,
+            )
+        } else {
+            None
+        };
+        if resume.is_some() && desktop_run.is_none() {
+            bail!("persistent continuation could not create and activate its durable Run");
+        }
+
+        // ── session mutation after durable admission ──
+        let cancel = match self.commit_admitted_turn(
+            session_id,
+            reservation_owner,
+            &snapshot,
+            effective_max_rounds,
+            &prompt,
+            defer_resume_transcript,
+        ) {
+            Ok(cancel) => cancel,
+            Err(error) => {
+                if let Some((run_id, store)) = desktop_run.as_ref() {
+                    let _ = store.abort_unstarted_run_admission(run_id);
+                }
+                return Err(error);
+            }
+        };
+        // RAII immediately after insert — before any fallible work — so a panic
+        // in persist_session cannot leave the session permanently busy.
+        let mut busy_guard = TurnBusyGuard {
+            host: self.clone(),
+            session_id,
+            armed: true,
+        };
+        self.persist_session(session_id);
+        let usage_before = self.session_usage_snapshot(session_id);
         let run_execution = if kind == SessionKind::Build
             && requested_execution_mode == RunExecutionMode::IsolatedWorktree
         {
             let run_id = external_run
                 .as_ref()
                 .map(|run| run.run_id.clone())
+                .or_else(|| desktop_run.as_ref().map(|(run_id, _)| run_id.clone()))
                 .unwrap_or_else(|| format!("desktop-{turn_id}"));
-            let prepared = run_promotion::prepare(&cwd, &run_id)?;
+            let prepared = match run_promotion::prepare(&cwd, &run_id) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Some((run_id, store)) = desktop_run.as_ref() {
+                        let _ = store.abort_unstarted_run_admission(run_id);
+                    }
+                    return Err(error);
+                }
+            };
             let execution = RunExecution {
                 mode: RunExecutionMode::IsolatedWorktree,
                 source_workspace: cwd.display().to_string(),
@@ -7380,16 +7638,22 @@ impl AgentHostHandle {
                 promotion_state: PromotionState::Preparing,
                 promoted_at: None,
             };
-            if let Some(external) = external_run.as_ref() {
-                let store = match self.ensure_orchestration_store() {
-                    Ok(store) => store,
+            let attach_store = if let Some((_, store)) = desktop_run.as_ref() {
+                Some(store.clone())
+            } else if external_run.is_some() {
+                match self.ensure_orchestration_store() {
+                    Ok(store) => Some(store),
                     Err(error) => {
                         let _ =
                             run_promotion::discard(&cwd, Path::new(&execution.execution_workspace));
                         return Err(error);
                     }
-                };
-                let updated = match store.update_run(&external.run_id, |run| {
+                }
+            } else {
+                None
+            };
+            if let Some(store) = attach_store {
+                let updated = match store.update_run(&run_id, |run| {
                     if run.session_id != session_id {
                         bail!("external run session does not match turn session");
                     }
@@ -7406,7 +7670,7 @@ impl AgentHostHandle {
                 };
                 if updated.is_none() {
                     let _ = run_promotion::discard(&cwd, Path::new(&execution.execution_workspace));
-                    bail!("external run disappeared before execution could be attached");
+                    bail!("run disappeared before execution could be attached");
                 }
             }
             Some(execution)
@@ -7417,33 +7681,6 @@ impl AgentHostHandle {
             .as_ref()
             .map(|execution| PathBuf::from(&execution.execution_workspace))
             .unwrap_or_else(|| cwd.clone());
-        let desktop_run = if external_run.is_none() && kind == SessionKind::Build {
-            let mut bounds = effective_agent_bounds.clone().unwrap_or_default();
-            if let Some(rounds) = effective_max_rounds {
-                bounds.max_rounds = bounds.max_rounds.min(rounds).max(1);
-            }
-            self.begin_desktop_run(
-                session_id,
-                &cwd,
-                &prompt,
-                bounds,
-                start_seq,
-                turn_id,
-                provider_route.clone(),
-                run_execution.clone(),
-                agent.as_ref().map(|agent| agent.agent_id.clone()),
-                agent
-                    .as_ref()
-                    .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
-                resume.as_ref().map(|plan| plan.parent_run_id.clone()),
-                resume.as_ref(),
-            )
-        } else {
-            None
-        };
-        if resume.is_some() && desktop_run.is_none() {
-            bail!("persistent continuation could not create and activate its durable Run");
-        }
         if let Some(context) = resume_context.as_deref() {
             let mut g = self.inner.lock();
             let session = g

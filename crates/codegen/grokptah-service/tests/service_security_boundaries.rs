@@ -3,8 +3,10 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    hash_payload, public_run_contains_forbidden_fields, ProviderRouteSnapshot, RunAggregates,
-    RunBounds, RunPurpose, RunRecord, RunState, PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+    hash_payload, public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
+    IdempotencyClaim, ProviderRouteSnapshot, QuotaClass, QuotaLimits, QuotaReservation,
+    RunAggregates, RunBounds, RunPurpose, RunRecord, RunState,
+    PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
     model_selection_key, CapabilitySource, EffortLevel, McpRemoteError, ModelCapabilities,
@@ -17,8 +19,14 @@ use common::{create_build_session, mcp_client, start_isolated, ServiceEnv};
 const BASE_URL_SENTINEL: &str = "http://127.0.0.1:35201/leak-base-url-sentinel-pr352/v1";
 const CREDENTIAL_REF_SENTINEL: &str = "keychain:provider/leak-cred-ref-sentinel-pr352";
 const CREDENTIAL_FP_SENTINEL: &str = "v1-sha256:leak-cred-fp-sentinel-pr352";
+const QUOTA_RESERVATION_SENTINEL: &str = "quota-leak-reservation-sentinel-pr352";
+const QUALIFICATION_SCHEMA: &str = "grokptah.provider-qualification.v1";
 
 fn leaky_route() -> ProviderRouteSnapshot {
+    leaky_route_with_quota(QUOTA_RESERVATION_SENTINEL)
+}
+
+fn leaky_route_with_quota(reservation_id: &str) -> ProviderRouteSnapshot {
     let mut route = ProviderRouteSnapshot {
         schema_version: PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
         provider_id: "env-grokptah".into(),
@@ -34,14 +42,16 @@ fn leaky_route() -> ProviderRouteSnapshot {
         capabilities: ModelCapabilities {
             chat: true,
             tools: true,
-            source: CapabilitySource::Declared,
+            stream: true,
+            source: CapabilitySource::Measured,
+            qualification_schema: Some(QUALIFICATION_SCHEMA.into()),
             ..ModelCapabilities::default()
         },
         deadline_class: ProviderDeadlineClass::Standard,
         effort: EffortLevel::Medium,
         qualification_record_id: None,
-        quota_class: None,
-        quota_reservation_id: None,
+        quota_class: Some(QuotaClass::CodingExecution),
+        quota_reservation_id: Some(reservation_id.into()),
         snapshot_hash: "pending".into(),
     };
     route.endpoint_fingerprint = hash_payload(&json!({
@@ -49,6 +59,14 @@ fn leaky_route() -> ProviderRouteSnapshot {
         "dialect": route.dialect,
         "baseUrl": route.base_url,
     }));
+    route.qualification_record_id = Some(hash_payload(&json!({
+        "providerId": route.provider_id,
+        "modelId": route.model_id,
+        "wireModelId": route.wire_model_id,
+        "endpointFingerprint": route.endpoint_fingerprint,
+        "credentialFingerprint": route.credential_fingerprint,
+        "qualificationSchema": route.capabilities.qualification_schema,
+    })));
     let material = json!({
         "schemaVersion": route.schema_version,
         "providerId": route.provider_id,
@@ -65,12 +83,24 @@ fn leaky_route() -> ProviderRouteSnapshot {
         "deadlineClass": route.deadline_class,
         "effort": route.effort,
         "qualificationRecordId": route.qualification_record_id,
+        "quotaClass": route.quota_class,
+        "quotaReservationId": route.quota_reservation_id,
     });
     route.snapshot_hash = hash_payload(&material);
     route
         .validate()
         .expect("reconstructed leaky route must validate");
     route
+}
+
+fn mcp_text_value(raw: &Value) -> Value {
+    let text = raw
+        .get("content")
+        .and_then(|content| content.get(0))
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .expect("MCP tool result must include content[0].text");
+    serde_json::from_str(text).unwrap_or_else(|_| json!({ "text": text }))
 }
 
 fn assert_payload_hides_route(payload: &Value, route: &ProviderRouteSnapshot) {
@@ -96,21 +126,46 @@ fn assert_payload_hides_route(payload: &Value, route: &ProviderRouteSnapshot) {
     }
     walk(payload, "$");
     let encoded = payload.to_string();
+    let qualification = route.qualification_record_id.as_deref().unwrap_or_default();
     for sentinel in [
         route.base_url.as_str(),
         route.credential_ref.as_str(),
         route.credential_fingerprint.as_str(),
         route.endpoint_fingerprint.as_str(),
+        qualification,
+        route.selection_key.as_str(),
         BASE_URL_SENTINEL,
         CREDENTIAL_REF_SENTINEL,
         CREDENTIAL_FP_SENTINEL,
     ] {
+        if sentinel.is_empty() {
+            continue;
+        }
         assert!(
             !encoded.contains(sentinel),
             "hosted payload leaked {sentinel}: {encoded}"
         );
     }
     assert!(!public_run_contains_forbidden_fields(payload));
+    if let Some(route_json) = payload
+        .get("providerExecution")
+        .and_then(|value| value.get("route"))
+        .or_else(|| {
+            payload
+                .get("runs")
+                .and_then(|runs| runs.get(0))
+                .and_then(|run| run.get("providerExecution"))
+                .and_then(|value| value.get("route"))
+        })
+    {
+        assert!(route_json.get("quotaReservationId").is_none());
+        assert!(route_json.get("selectionKey").is_none());
+        assert!(route_json.get("qualificationRecordId").is_none());
+        assert!(
+            public_provider_route_keys_are_allowlisted(route_json),
+            "providerExecution.route keys must be exact-allowlisted: {route_json}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -142,7 +197,10 @@ async fn hosted_list_and_get_omit_frozen_provider_route() {
         continuation_context_hash: None,
         continuation_fidelity: None,
         queue_position: None,
-        bounds: RunBounds::default(),
+        bounds: RunBounds {
+            max_total_tokens: Some(8_000),
+            ..RunBounds::default()
+        },
         prompt_preview: "inspect".into(),
         start_seq: Some(1),
         end_seq: None,
@@ -157,10 +215,10 @@ async fn hosted_list_and_get_omit_frozen_provider_route() {
         execution: None,
         approval: None,
     };
-    host.ensure_orchestration_store()
-        .unwrap()
-        .save_run(&run)
-        .unwrap();
+    let store = host.ensure_orchestration_store().unwrap();
+    let reservation =
+        QuotaReservation::for_run(&run, "primary", QuotaLimits::default(), now).unwrap();
+    store.save_run_with_quota(&run, &reservation).unwrap();
 
     let get_run = client
         .call_tool(
@@ -196,19 +254,108 @@ async fn hosted_list_and_get_omit_frozen_provider_route() {
         .unwrap();
     assert!(!get_run.is_error, "{:?}", get_run.raw);
     assert!(!list_runs.is_error, "{:?}", list_runs.raw);
-    assert_payload_hides_route(&get_run.structured, &route);
-    assert_payload_hides_route(&list_runs.structured, &route);
-    assert_payload_hides_route(&list_runs.structured["runs"][0], &route);
-    assert_payload_hides_route(&progress.structured, &route);
-    let persisted = serde_json::to_value(
-        host.ensure_orchestration_store()
-            .unwrap()
-            .load_run(&run.run_id)
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+    assert!(!progress.is_error, "{:?}", progress.raw);
+    for payload in [
+        &get_run.structured,
+        &mcp_text_value(&get_run.raw),
+        &list_runs.structured,
+        &list_runs.structured["runs"][0],
+        &mcp_text_value(&list_runs.raw),
+        &progress.structured,
+        &mcp_text_value(&progress.raw),
+    ] {
+        assert_payload_hides_route(payload, &route);
+    }
+    let persisted = serde_json::to_value(store.load_run(&run.run_id).unwrap().unwrap()).unwrap();
     assert!(persisted.get("providerRoute").is_some());
+
+    let promote_request = "hosted-promote-replay";
+    let approval_id = "hosted-approval-replay";
+    let promote_hash = hash_payload(&json!({
+        "sessionId": session_id,
+        "workspace": workspace.display().to_string(),
+        "runId": run.run_id,
+        "approvalId": approval_id,
+    }));
+    assert!(matches!(
+        store
+            .claim_idempotency("ptah_promote_run", promote_request, &promote_hash)
+            .unwrap(),
+        IdempotencyClaim::Perform
+    ));
+    store
+        .complete_idempotency(
+            "ptah_promote_run",
+            promote_request,
+            &promote_hash,
+            Some(run.run_id.clone()),
+            persisted.clone(),
+        )
+        .unwrap();
+    let promote = client
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": promote_request,
+                "session_id": session_id,
+                "workspace": workspace,
+                "run_id": run.run_id,
+                "approval_id": approval_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!promote.is_error, "{:?}", promote.raw);
+    assert_payload_hides_route(&promote.structured, &route);
+    assert_payload_hides_route(&mcp_text_value(&promote.raw), &route);
+
+    let discard_route = leaky_route_with_quota("quota-leak-discard-sentinel-pr352");
+    let mut discarded = run.clone();
+    discarded.run_id = "hosted-leaky-discard".into();
+    discarded.request_id = "hosted-leaky-discard-req".into();
+    discarded.state = RunState::Completed;
+    discarded.provider_route = Some(discard_route.clone());
+    let discard_reservation =
+        QuotaReservation::for_run(&discarded, "primary", QuotaLimits::default(), now).unwrap();
+    store
+        .save_run_with_quota(&discarded, &discard_reservation)
+        .unwrap();
+    let discard_request = "hosted-discard-replay";
+    let discard_hash = hash_payload(&json!({
+        "sessionId": session_id,
+        "workspace": workspace.display().to_string(),
+        "runId": discarded.run_id,
+    }));
+    assert!(matches!(
+        store
+            .claim_idempotency("ptah_discard_run", discard_request, &discard_hash)
+            .unwrap(),
+        IdempotencyClaim::Perform
+    ));
+    store
+        .complete_idempotency(
+            "ptah_discard_run",
+            discard_request,
+            &discard_hash,
+            Some(discarded.run_id.clone()),
+            serde_json::to_value(&discarded).unwrap(),
+        )
+        .unwrap();
+    let discard = client
+        .call_tool(
+            "ptah_discard_run",
+            json!({
+                "request_id": discard_request,
+                "session_id": session_id,
+                "workspace": workspace,
+                "run_id": discarded.run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!discard.is_error, "{:?}", discard.raw);
+    assert_payload_hides_route(&discard.structured, &discard_route);
+    assert_payload_hides_route(&mcp_text_value(&discard.raw), &discard_route);
 }
 
 #[tokio::test]

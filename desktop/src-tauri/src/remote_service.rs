@@ -1668,12 +1668,42 @@ mod tests {
                 "baseUrl": "http://leak-base-url-sentinel-pr352.example/v1",
                 "credentialRef": "keychain:provider/leak-cred-ref-sentinel-pr352",
                 "credentialFingerprint": "v1-sha256:leak-cred-fp-sentinel-pr352",
-                "endpointFingerprint": "v1-sha256:leak-endpoint-fp-sentinel-pr352"
+                "endpointFingerprint": "v1-sha256:leak-endpoint-fp-sentinel-pr352",
+                "qualificationRecordId": "leak-qualification-record-sentinel-pr352",
+                "selectionKey": "ptah.model.v1:leak-selection-key-sentinel-pr352",
+                "quotaReservationId": "quota-leak-reservation-sentinel-pr352"
+            },
+            "providerExecution": {
+                "route": {
+                    "providerId": "company-gateway",
+                    "kind": "open_ai_compatible",
+                    "dialect": "open_ai_chat_completions",
+                    "modelId": "leak-model",
+                    "wireModelId": "leak-model",
+                    "capabilitySource": "declared",
+                    "deadlineClass": "standard",
+                    "effort": "medium",
+                    "snapshotHash": "keep-public-route-hash"
+                },
+                "quota": null,
+                "attempts": [],
+                "attemptCount": 0,
+                "attemptsTruncated": false,
+                "usageComplete": false,
+                "pendingRequests": 0
             }
         });
         let decoded: PublicRun = serde_json::from_value(leaked).unwrap();
         let encoded = serde_json::to_value(&decoded).unwrap();
         assert!(encoded.get("providerRoute").is_none());
+        assert_eq!(
+            encoded["providerExecution"]["route"]["snapshotHash"],
+            "keep-public-route-hash"
+        );
+        assert_eq!(
+            encoded["providerExecution"]["route"]["providerId"],
+            "company-gateway"
+        );
         let text = encoded.to_string();
         for sentinel in [
             "providerRoute",
@@ -1681,6 +1711,9 @@ mod tests {
             "leak-cred-ref-sentinel-pr352",
             "leak-cred-fp-sentinel-pr352",
             "leak-endpoint-fp-sentinel-pr352",
+            "leak-qualification-record-sentinel-pr352",
+            "leak-selection-key-sentinel-pr352",
+            "quota-leak-reservation-sentinel-pr352",
         ] {
             assert!(
                 !text.contains(sentinel),
@@ -1694,9 +1727,13 @@ mod tests {
         let commands = include_str!("commands.rs");
         assert!(commands.contains("list_public_session_runs"));
         assert!(commands.contains("get_public_session_run"));
+        assert!(commands.contains("promote_public_session_run"));
+        assert!(commands.contains("discard_public_session_run"));
         assert!(commands.contains("Result<Vec<PublicRun>"));
         assert!(commands.contains("Result<Option<PublicRun>"));
         assert!(!commands.contains("host.list_session_runs(id)"));
+        assert!(!commands.contains("host.promote_run("));
+        assert!(!commands.contains("host.discard_run("));
         let remote = include_str!("remote_service.rs")
             .split("#[cfg(test)]")
             .next()

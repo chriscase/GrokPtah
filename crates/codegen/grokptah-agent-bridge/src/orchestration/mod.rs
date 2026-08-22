@@ -54,10 +54,12 @@ pub use provider_attempt::{
     PROVIDER_ATTEMPT_SCHEMA_VERSION,
 };
 pub use public_run::{
-    project_public_run, project_public_run_progress, public_run_contains_forbidden_fields,
-    public_run_progress_to_value, public_run_to_value, PublicProviderAttempt,
-    PublicProviderExecution, PublicProviderQuota, PublicProviderRouteSummary, PublicRun,
-    PublicRunProgress,
+    encode_public_run_receipt, project_public_run, project_public_run_progress,
+    public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
+    public_run_from_receipt, public_run_progress_to_value, public_run_to_value,
+    PublicProviderAttempt, PublicProviderExecution, PublicProviderQuota,
+    PublicProviderRouteSummary, PublicRun, PublicRunProgress, PUBLIC_PROVIDER_ROUTE_KEYS,
+    PUBLIC_RUN_RECEIPT_SCHEMA,
 };
 pub use quota::{
     QuotaClass, QuotaLimits, QuotaPoolKey, QuotaPoolUsage, QuotaReservation, QuotaReservationState,

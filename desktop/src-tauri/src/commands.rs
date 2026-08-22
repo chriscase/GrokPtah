@@ -1630,14 +1630,14 @@ pub async fn run_promote(
             .get_session_run(id, &run_id)
             .map_err(map_err)?
             .ok_or_else(|| "unknown run for this session".to_string())?;
-        let promoted = match run.approval.as_ref() {
-            Some(approval) => {
-                host.promote_run_with_approval(id, &run_id, Some(&approval.approval_id))
-            }
-            None => host.promote_run(id, &run_id),
-        }
-        .map_err(map_err)?;
-        host.project_public_session_run(promoted).map_err(map_err)
+        host.promote_public_session_run(
+            id,
+            &run_id,
+            run.approval
+                .as_ref()
+                .map(|approval| approval.approval_id.as_str()),
+        )
+        .map_err(map_err)
     })
     .await
 }
@@ -1652,8 +1652,8 @@ pub async fn run_discard(
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     run_blocking(move || {
-        let discarded = host.discard_run(id, &run_id).map_err(map_err)?;
-        host.project_public_session_run(discarded).map_err(map_err)
+        host.discard_public_session_run(id, &run_id)
+            .map_err(map_err)
     })
     .await
 }

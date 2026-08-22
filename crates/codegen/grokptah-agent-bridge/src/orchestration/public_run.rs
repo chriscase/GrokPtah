@@ -45,9 +45,32 @@ const FORBIDDEN_PUBLIC_RUN_KEYS: &[&str] = &[
     "password",
     "providerRoute",
     "provider_route",
+    "qualificationRecordId",
+    "qualification_record_id",
+    "quotaReservationId",
+    "quota_reservation_id",
     "secret",
+    "selectionKey",
+    "selection_key",
     "token",
 ];
+
+/// Exact public `providerExecution.route` key allowlist.
+pub const PUBLIC_PROVIDER_ROUTE_KEYS: &[&str] = &[
+    "capabilitySource",
+    "deadlineClass",
+    "dialect",
+    "effort",
+    "kind",
+    "modelId",
+    "providerId",
+    "qualificationSchema",
+    "snapshotHash",
+    "wireModelId",
+];
+
+/// Version stamp for promote/discard idempotency receipts.
+pub const PUBLIC_RUN_RECEIPT_SCHEMA: &str = "grokptah.public-run-receipt.v1";
 
 /// Secret-free route identity that operators and coordinators may observe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +288,76 @@ pub fn public_run_contains_forbidden_fields(value: &Value) -> bool {
     contains_forbidden_key(value)
 }
 
+/// True when `providerExecution.route` contains only the public allowlist.
+pub fn public_provider_route_keys_are_allowlisted(route: &Value) -> bool {
+    let Some(object) = route.as_object() else {
+        return false;
+    };
+    object
+        .keys()
+        .all(|key| PUBLIC_PROVIDER_ROUTE_KEYS.contains(&key.as_str()))
+}
+
+/// Store a versioned PublicRun receipt. The MCP response remains the inner run.
+pub fn encode_public_run_receipt(run: &PublicRun) -> Result<Value, OrchError> {
+    Ok(serde_json::json!({
+        "schema": PUBLIC_RUN_RECEIPT_SCHEMA,
+        "run": public_run_to_value(run)?,
+    }))
+}
+
+/// Replay a promote/discard receipt. Legacy leaky RunRecord JSON is re-projected
+/// from the durable store and never returned as stored.
+pub fn public_run_from_receipt(store: &OrchStore, value: Value) -> Result<Value, OrchError> {
+    if value.get("schema").and_then(Value::as_str) == Some(PUBLIC_RUN_RECEIPT_SCHEMA) {
+        let run = value.get("run").cloned().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "versioned public run receipt is missing its run",
+            )
+        })?;
+        return encode_decoded_public_run(run);
+    }
+    if public_run_contains_forbidden_fields(&value) || value.get("providerRoute").is_some() {
+        let run_id = value
+            .get("runId")
+            .or_else(|| value.get("run_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "legacy run receipt is missing runId",
+                )
+            })?;
+        let run = store
+            .load_run(run_id)
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "legacy run receipt could not load its durable Run",
+                )
+            })?
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "legacy run receipt names an unknown Run",
+                )
+            })?;
+        return public_run_to_value(&project_public_run(store, &run)?);
+    }
+    encode_decoded_public_run(value)
+}
+
+fn encode_decoded_public_run(value: Value) -> Result<Value, OrchError> {
+    let parsed: PublicRun = serde_json::from_value(value).map_err(|error| {
+        OrchError::new(
+            OrchErrorCode::Internal,
+            format!("public run receipt is not a PublicRun: {error}"),
+        )
+    })?;
+    public_run_to_value(&parsed)
+}
+
 fn encode_allowlisted<T: Serialize>(value: &T) -> Result<Value, OrchError> {
     let encoded = serde_json::to_value(value)
         .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
@@ -404,7 +497,9 @@ fn provider_projection_error(_error: anyhow::Error) -> OrchError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway_config::ModelCapabilities;
+    use crate::gateway_config::{
+        model_selection_key, ModelCapabilities, CAPABILITY_QUALIFICATION_SCHEMA,
+    };
     use crate::orchestration::quota::QuotaLimits;
     use crate::orchestration::{
         QuotaClass, QuotaReservation, PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
@@ -416,17 +511,16 @@ mod tests {
     const BASE_URL_SENTINEL: &str = "http://127.0.0.1:35201/leak-base-url-sentinel-pr352/v1";
     const CREDENTIAL_REF_SENTINEL: &str = "keychain:provider/leak-cred-ref-sentinel-pr352";
     const CREDENTIAL_FP_SENTINEL: &str = "v1-sha256:leak-cred-fp-sentinel-pr352";
+    const MODEL_ID: &str = "leak-model";
+    const QUOTA_RESERVATION_SENTINEL: &str = "quota-leak-reservation-sentinel-pr352";
 
     fn leaky_route() -> ProviderRouteSnapshot {
         ProviderRouteSnapshot {
             schema_version: PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
             provider_id: "company-gateway".into(),
-            model_id: "leak-model".into(),
-            wire_model_id: "leak-model".into(),
-            selection_key: crate::gateway_config::model_selection_key(
-                "company-gateway",
-                "leak-model",
-            ),
+            model_id: MODEL_ID.into(),
+            wire_model_id: MODEL_ID.into(),
+            selection_key: model_selection_key("company-gateway", MODEL_ID),
             kind: ProviderKind::OpenAiCompatible,
             dialect: ProviderDialect::OpenAiChatCompletions,
             base_url: BASE_URL_SENTINEL.into(),
@@ -436,7 +530,9 @@ mod tests {
             capabilities: ModelCapabilities {
                 chat: true,
                 tools: true,
-                source: CapabilitySource::Declared,
+                stream: true,
+                source: CapabilitySource::Measured,
+                qualification_schema: Some(CAPABILITY_QUALIFICATION_SCHEMA.into()),
                 ..ModelCapabilities::default()
             },
             deadline_class: ProviderDeadlineClass::Standard,
@@ -447,6 +543,8 @@ mod tests {
             snapshot_hash: String::new(),
         }
         .seal()
+        .unwrap()
+        .bind_quota(QuotaClass::CodingExecution, QUOTA_RESERVATION_SENTINEL)
         .unwrap()
     }
 
@@ -513,18 +611,48 @@ mod tests {
         }
         walk(payload, "$");
         let encoded = payload.to_string();
+        let qualification = route.qualification_record_id.as_deref().unwrap_or_default();
         for sentinel in [
             route.base_url.as_str(),
             route.credential_ref.as_str(),
             route.credential_fingerprint.as_str(),
             route.endpoint_fingerprint.as_str(),
+            qualification,
+            route.selection_key.as_str(),
         ] {
+            if sentinel.is_empty() {
+                continue;
+            }
             assert!(
                 !encoded.contains(sentinel),
                 "public payload leaked {sentinel}: {encoded}"
             );
         }
         assert!(!public_run_contains_forbidden_fields(payload));
+        let route_json = payload
+            .pointer("/providerExecution/route")
+            .or_else(|| payload.pointer("/run/providerExecution/route"))
+            .or_else(|| payload.pointer("/runs/0/providerExecution/route"))
+            .expect("public payload must include providerExecution.route");
+        assert!(route_json.get("quotaReservationId").is_none());
+        assert!(route_json.get("selectionKey").is_none());
+        assert!(route_json.get("qualificationRecordId").is_none());
+        assert!(
+            public_provider_route_keys_are_allowlisted(route_json),
+            "providerExecution.route keys must be exact-allowlisted: {route_json}"
+        );
+        let quota_id = route
+            .quota_reservation_id
+            .as_deref()
+            .unwrap_or(QUOTA_RESERVATION_SENTINEL);
+        if let Some(object) = payload.as_object() {
+            if let Some(quota) = object
+                .get("providerExecution")
+                .and_then(|value| value.get("quota"))
+            {
+                assert_eq!(quota["reservationId"], quota_id);
+            }
+        }
     }
 
     #[test]
@@ -532,13 +660,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let store = OrchStore::open(temp.path()).unwrap();
         let route = leaky_route();
-        let mut run = leaky_run(route.clone());
-        run.provider_route = Some(
-            route
-                .clone()
-                .bind_quota(QuotaClass::CodingExecution, "quota-public-run-leak")
-                .unwrap(),
-        );
+        let run = leaky_run(route.clone());
         let reservation =
             QuotaReservation::for_run(&run, "owner-a", QuotaLimits::default(), Utc::now()).unwrap();
         store.save_run_with_quota(&run, &reservation).unwrap();
@@ -570,6 +692,16 @@ mod tests {
             &serde_json::to_value(&decoded).unwrap(),
             run.provider_route.as_ref().unwrap(),
         );
+        let receipt = encode_public_run_receipt(&projected).unwrap();
+        assert_eq!(receipt["schema"], PUBLIC_RUN_RECEIPT_SCHEMA);
+        assert_payload_hides_route(&receipt, run.provider_route.as_ref().unwrap());
+        let replayed = public_run_from_receipt(&store, receipt).unwrap();
+        assert_payload_hides_route(&replayed, run.provider_route.as_ref().unwrap());
+        let leaked_receipt = persisted.clone();
+        assert!(leaked_receipt.get("providerRoute").is_some());
+        let sanitized = public_run_from_receipt(&store, leaked_receipt).unwrap();
+        assert_payload_hides_route(&sanitized, run.provider_route.as_ref().unwrap());
+        assert_eq!(sanitized["runId"], run.run_id);
     }
 
     #[test]
@@ -623,6 +755,36 @@ mod tests {
         assert!(
             !progress_value.contains("serde_json::to_value(run)"),
             "progress must not serialize RunRecord"
+        );
+        let promote = service
+            .split("pub async fn promote_run(")
+            .nth(1)
+            .expect("promote_run")
+            .split("\n    pub async fn ")
+            .next()
+            .unwrap();
+        let discard = service
+            .split("pub async fn discard_run(")
+            .nth(1)
+            .expect("discard_run")
+            .split("\n    // ── mutations")
+            .next()
+            .unwrap();
+        assert!(
+            promote.contains("project_public_run") && promote.contains("public_run_from_receipt"),
+            "promote must project PublicRun and sanitize replay receipts"
+        );
+        assert!(
+            !promote.contains("serde_json::to_value(promoted)"),
+            "promote must not serialize raw RunRecord"
+        );
+        assert!(
+            discard.contains("project_public_run") && discard.contains("public_run_from_receipt"),
+            "discard must project PublicRun and sanitize replay receipts"
+        );
+        assert!(
+            !discard.contains("serde_json::to_value(discarded)"),
+            "discard must not serialize raw RunRecord"
         );
 
         let host = include_str!("../host.rs");

@@ -6,12 +6,12 @@ use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use grokptah_agent_bridge::orchestration::{
-    public_run_contains_forbidden_fields, AssignmentStatus, AuthContext, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedIntentState, OrchStore, OrchestrationConfig,
-    OrchestrationService, ProviderAttemptState, ProviderRetryClass, ProviderRoute,
-    ProviderRouteSnapshot, ProviderSendCertainty, PublicRun, QuotaClass, QuotaReservationState,
-    RunBounds, RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState,
-    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
+    public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
+    AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
+    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, ProviderAttemptState,
+    ProviderRetryClass, ProviderRoute, ProviderRouteSnapshot, ProviderSendCertainty, PublicRun,
+    QuotaClass, QuotaReservationState, RunBounds, RunPurpose, RunRecord, RunState, WorkItem,
+    WorkPolicy, WorkState, WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
     model_selection_key, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
@@ -442,11 +442,14 @@ fn assert_public_payload_hides_route(
     }
     walk(payload, "$");
     let encoded = payload.to_string();
+    let qualification = route.qualification_record_id.as_deref().unwrap_or_default();
     for sentinel in [route.base_url.as_str(), route.credential_ref.as_str()]
         .into_iter()
         .chain([
             route.credential_fingerprint.as_str(),
             route.endpoint_fingerprint.as_str(),
+            qualification,
+            route.selection_key.as_str(),
         ])
         .chain(extra_sentinels.iter().copied())
     {
@@ -459,6 +462,35 @@ fn assert_public_payload_hides_route(
         );
     }
     assert!(!public_run_contains_forbidden_fields(payload));
+    if let Some(route_json) = payload
+        .get("providerExecution")
+        .and_then(|value| value.get("route"))
+        .or_else(|| {
+            payload
+                .get("runs")
+                .and_then(|runs| runs.get(0))
+                .and_then(|run| run.get("providerExecution"))
+                .and_then(|value| value.get("route"))
+        })
+    {
+        assert!(route_json.get("quotaReservationId").is_none());
+        assert!(route_json.get("selectionKey").is_none());
+        assert!(route_json.get("qualificationRecordId").is_none());
+        assert!(
+            public_provider_route_keys_are_allowlisted(route_json),
+            "providerExecution.route keys must be exact-allowlisted: {route_json}"
+        );
+    }
+}
+
+fn mcp_text_value(raw: &serde_json::Value) -> serde_json::Value {
+    let text = raw
+        .get("content")
+        .and_then(|content| content.get(0))
+        .and_then(|item| item.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("MCP tool result must include content[0].text");
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({ "text": text }))
 }
 
 fn assert_public_surfaces_hide_route(
@@ -951,6 +983,15 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         &mcp_get.structured,
         &mcp_list.structured,
         &mcp_progress.structured,
+        &host_list,
+        &host_get,
+        run_route,
+        &sentinels,
+    );
+    assert_public_surfaces_hide_route(
+        &mcp_text_value(&mcp_get.raw),
+        &mcp_text_value(&mcp_list.raw),
+        &mcp_text_value(&mcp_progress.raw),
         &host_list,
         &host_get,
         run_route,

@@ -1013,6 +1013,59 @@ impl OrchStore {
         self.save_run_and_activate_agent_inner(run, agent_id, Some(reservation))
     }
 
+    /// Remove a just-admitted Run that never started provider work so an
+    /// admission failure after persist cannot leave a Run, quota row, or
+    /// Agent activation behind.
+    pub fn abort_unstarted_run_admission(&self, run_id: &str) -> anyhow::Result<()> {
+        let _g = self.inner.lock.lock();
+        let Some(run) = self.load_run_unlocked(run_id)? else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            run.state == RunState::Running,
+            "only an unstarted Running admission can be aborted"
+        );
+        anyhow::ensure!(
+            !self
+                .list_provider_attempts_unlocked()?
+                .iter()
+                .any(|attempt| attempt.run_id == run_id),
+            "cannot abort a Run that has provider attempts"
+        );
+        if let Some(agent_id) = run.agent_id.as_deref() {
+            if let Some(mut agent) = self.load_agent_unlocked(agent_id)? {
+                if agent.current_run_id.as_deref() == Some(run_id) {
+                    agent.current_run_id = None;
+                    agent.state = crate::orchestration::AgentState::Waiting;
+                    agent.updated_at = Utc::now();
+                    let agent_path = self
+                        .agent_path(agent_id)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    atomic_write_json(&agent_path, &agent)?;
+                }
+            }
+        }
+        if let Some(reservation_id) = run
+            .provider_route
+            .as_ref()
+            .and_then(|route| route.quota_reservation_id.as_deref())
+        {
+            let quota_path = self
+                .quota_reservation_path(reservation_id)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if quota_path.is_file() {
+                remove_file_durable(&quota_path)?;
+            }
+        }
+        let run_path = self
+            .run_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if run_path.is_file() {
+            remove_file_durable(&run_path)?;
+        }
+        Ok(())
+    }
+
     fn save_run_and_activate_agent_inner(
         &self,
         run: &RunRecord,
