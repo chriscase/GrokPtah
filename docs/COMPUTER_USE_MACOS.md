@@ -76,8 +76,13 @@ completion race cannot commit as successful.
 Current semantic Computer Use **deliberately avoids raw global mouse injection**. Foreground
 `activate target` (this shim rechecks the frontmost application and focused AX window) is
 **not equivalent to non-disruptive isolated Computer Use**. Background-safe semantic
-([#287](https://github.com/chriscase/GrokPtah/issues/287)) and an isolated visual backend
-([#288](https://github.com/chriscase/GrokPtah/issues/288)) are Planned. Status:
+([#287](https://github.com/chriscase/GrokPtah/issues/287)) is Planned.
+**Isolated visual Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288))
+is a mandatory product exit**: a genuinely isolated agent-owned app
+surface/cursor; global pointer, keyboard, focus, clipboard, and unrelated apps
+remain unaffected; takeover is out-of-band and preemptive. This foreground
+slice does **not** satisfy that contract. Raw global injection may remain
+Explicitly unsupported. Status:
 [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md).
 
 ## Packaging and signing

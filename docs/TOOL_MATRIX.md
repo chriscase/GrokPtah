@@ -2,15 +2,22 @@
 
 Status as of Phase 16. Bridge implements a **thin** tool loop (ADR-001); full upstream embed is non-goal.
 
+This table is the **Build agent tool loop** inventory. Product capability
+status — including Computer Use tiers and Computer Run MCP — lives in
+[`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md). A deferred **Build-loop**
+browser/computer tool is not proof that the native Computer Use adapter or
+read-only Computer Run MCP tools are absent.
+
 ## Residual policy (#160)
 
-Every capability is **shipped**, **via shell**, or **explicitly deferred**. Nothing may be silently missing.
+Every Build-loop capability is **shipped**, **via shell**, or **explicitly deferred**. Native Computer Use and Computer Run MCP reads are listed so this file cannot contradict [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md); they use **on main (not Build loop)**.
 
 | Status | Meaning |
 |--------|---------|
 | **shipped** | Wired into the Build tool loop and tested |
 | **via shell** | Use `run_terminal_cmd` (no dedicated tool) |
 | **deferred** | Explicit non-goal this phase; reopen only with a dedicated issue |
+| **on main (not Build loop)** | Present on `origin/main` outside the thin Build loop. Product status (Supported / Experimental / Planned) is [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) |
 
 ## Matrix
 
@@ -32,7 +39,9 @@ Every capability is **shipped**, **via shell**, or **explicitly deferred**. Noth
 | kill_task / task_output | background task cancel + shell cancel | **shipped** (partial) | Via Tasks panel / `cancel_background_task` / turn cancel — not full Build IDs |
 | notifications | desktop OS notifications | **deferred** | Track under residual; no ship issue yet |
 | notebook | — | **deferred** | Not planned in bridge |
-| browser / computer use | — | **deferred** | Safety foundation in #267/#268; no native adapter or Build tool is shipped yet ([design](COMPUTER_USE.md)) |
+| browser / computer use (Grok Build tool loop) | — | **deferred** | No `computer` / `browser` tool in the thin Build loop. This is **not** the native Computer Use adapter. |
+| Computer Use — native semantic adapter + cockpit | (not a Build-loop tool) | **on main (not Build loop)** | Consented semantic **foreground** Computer Use exists on main (Experimental in the capability matrix). Not isolated or background-safe. Design: [COMPUTER_USE.md](COMPUTER_USE.md). Isolated visual ([#288](https://github.com/chriscase/GrokPtah/issues/288)) is a mandatory unmet product exit. Raw global input is Explicitly unsupported. |
+| Computer Run MCP **reads** | `ptah_list_computer_runs`, `ptah_get_computer_run`, `ptah_get_computer_run_events`, `ptah_get_computer_capacity` | **on main (not Build loop)** | Read-only Computer Run surfaces on main. MCP **mutations** remain unsupported ([#271](https://github.com/chriscase/GrokPtah/issues/271) **open**). |
 | image_gen | — | **deferred** | Desktop may use separate Imagine path |
 | semantic search | — | **deferred** | Grep + glob only |
 | git specialized tools | shell | **via shell** | Use `run_terminal_cmd` |
