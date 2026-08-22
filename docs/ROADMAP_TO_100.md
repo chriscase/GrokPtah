@@ -97,9 +97,16 @@ for the full `CONTROL_TOOLS` surface, including `ptah_approve_run` and
 `ptah_promote_run`. Bearer authentication must not imply that authority once
 least-privilege ships.
 
+**Company-approved OpenAI-compatible gateway quota is not Grok Build quota.**
+Compatible-profile requests consume that company’s provider quota. That is
+not the Stage 2 Grok Build provider-quota receipt and not a Grok Build
+account balance. Closed [#169](https://github.com/chriscase/GrokPtah/issues/169)
+(named compatible profiles) is not the Stage 12 enterprise review-lane
+certification.
+
 ## What “100%” means (measurable exit)
 
-A 100% claim is allowed only when **all eleven stages below have met their
+A 100% claim is allowed only when **all twelve stages below have met their
 exits**, and all of the following are true:
 
 1. Every matrix row that this program marks Supported or Experimental has
@@ -160,7 +167,9 @@ exits**, and all of the following are true:
     acceptance set** (keyboard/accessibility, operator workflows,
     wide/narrow/light/dark, reconnect/error/quota/authority states, visual
     evidence). Explicitly unsupported may cover **documented non-goals only**,
-    not the Codex-class core interface.
+    not the Codex-class core interface. A **recurring expert UI/UX review
+    cadence** (stage 10) supplements that one-time acceptance: it is not a
+    single pre-release polish pass and cannot remain Unverified at 100%.
 11. Operations and release drills have a dated runbook execution covering
     backup/restore, restart, cursor expiry, credential rotation, Computer Use
     Stop / Take over on a packaged identity, upgrade/rollback,
@@ -168,6 +177,12 @@ exits**, and all of the following are true:
     monitoring/alerts, backup confidentiality, RTO/RPO, and the
     sccache / repository-family `CARGO_TARGET_DIR` ownership and cleanup
     policy in [`BUILD_PERFORMANCE.md`](BUILD_PERFORMANCE.md).
+12. An **enterprise gateway review lane** is certified (stage 12): a user
+    restricted to a company-approved OpenAI-compatible gateway, including a
+    weaker non-frontier model, still obtains powerful long-running code
+    review from bounded orchestration — not from secretly routing to a
+    stronger external model. That outcome cannot be waived as Explicitly
+    unsupported if we claim the full product vision.
 
 Until every item holds, **do not claim 100%.**
 
@@ -195,6 +210,21 @@ Explicitly unsupported / “not observed” status-relabeling.
    reconnect/error/quota/authority states, visual evidence. Explicitly
    unsupported covers documented non-goals only, not the Codex-class core
    interface.
+
+**Mandatory product goals added 2026-08-22 — also forbidden to remain
+Unverified at 100%:**
+
+4. **Recurring expert UI/UX review cadence** (stage 10 supplement, not a
+   substitute for #308). Reviews the exact assembled integration head on a
+   recorded cadence; unresolved P0/P1 UX/accessibility findings block the
+   next integration/release gate. Phase 2 mockups and a one-time polish pass
+   do not close this.
+5. **Enterprise gateway long-running code-review lane** (stage 12). A frozen
+   company-approved OpenAI-compatible route, including a modest non-frontier
+   model, must deliver powerful multi-hour review from orchestration — not
+   from secretly routing to a stronger external model. Closed [#169](https://github.com/chriscase/GrokPtah/issues/169)
+   profiles are not this certification. Cannot be waived as Explicitly
+   unsupported if we claim the full product vision.
 
 **Already forbidden by earlier corrections (preserved):** isolated visual
 Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288)); named
@@ -592,9 +622,37 @@ proof still required.
 - The Phase 2 design package and D1 recommendation are inputs. They do not
   satisfy this exit until a direction is selected in the 100% record and the
   packaged-desktop acceptance set passes.
+- **Recurring expert UI/UX review cadence** (mandatory supplement; not a
+  substitute for the #308 selected direction and packaged acceptance; not
+  one pre-release polish pass). GrokPtah must be periodically reviewed by a
+  skilled UI/UX expert so it remains sleek, aesthetically coherent,
+  accessible, approachable, and exceptionally effective for power users.
+  - During active development: an expert review after each material
+    operator-surface integration wave **or** every 2–3 significant GUI
+    changes, whichever comes first, **plus** a full packaged-desktop review
+    before release.
+  - Review the **exact assembled integration head**, not mockups alone.
+    Record SHA, reviewer/model/tool, surfaces/workflows, visual evidence,
+    severity-ranked findings, accepted tradeoffs, and issue/PR follow-ups.
+  - Cover progressive disclosure, information density, navigation/search,
+    command/keyboard efficiency, bulk/multi-lane workflows, status/evidence
+    clarity, error/reconnect/quota/authority/permission states, and
+    preservation of advanced functionality.
+  - Accessibility: full keyboard use, focus order/visibility, screen-reader
+    labels/status, contrast, zoom/reflow, reduced motion, platform
+    conventions.
+  - Visual matrix: wide/narrow, light/dark,
+    empty/loading/success/error/denied/exhausted/reconnecting, hostile/long
+    text and overflow, real packaged windows.
+  - Unresolved P0/P1 UX/accessibility findings **block** the next
+    integration/release gate. Lower findings require explicit disposition
+    and regression coverage.
+  No dated cadence review of an assembled head is recorded. Phase 2
+  prototypes do not close this.
 
 **Must not claim:** packaged UX certified from `tauri:dev`, terminal-owned
-TCC grants, or prototype screenshots alone.
+TCC grants, or prototype screenshots alone. **Must not claim** the expert
+cadence from a single audit or from mockups of an unintegrated head.
 
 ## Stage 11 — Operations and release drills
 
@@ -661,6 +719,64 @@ drill report, including no recorded sccache/target drill evidence.
 
 **Must not claim:** operations certified from unit tests alone.
 
+## Stage 12 — Enterprise gateway review lane
+
+**Depends on:** stages 3–6 (least-privilege, parity, memory, independent
+workers) and stage 10 (operator workflow language). Provider-neutral
+OpenAI-compatible **profiles** already exist on main
+([#169](https://github.com/chriscase/GrokPtah/issues/169) closed); they do
+**not** certify this lane.
+
+**Exists today:** Named OpenAI-compatible profiles and measured coding-ready
+vs discussion-only qualification
+([`PROVIDER_PROFILES.md`](PROVIDER_PROFILES.md)). Isolated Build worktrees
+and finite Runs exist as separate contracts. **No** frozen-route,
+read-only, multi-hour enterprise review-lane certification exists. This
+row is **not** certified.
+
+**Exit (all required):**
+
+- A user restricted to a **company-approved OpenAI-compatible gateway**,
+  even with a weaker non-frontier model, still obtains powerful
+  **long-running code review**. Orchestrator strength comes from bounded
+  decomposition; specialized passes (correctness, security, concurrency,
+  performance, tests, API, UX as relevant); deterministic static/tool
+  evidence; disagreement/adversarial checks; durable memory/checkpoints;
+  and evidence-grounded synthesis — **not** from secretly routing to a
+  stronger external model.
+- The exact approved provider route is **frozen and auditable**. Code,
+  prompts, and artifacts never leave the configured company boundary.
+  **No fallback** to another provider (including Grok Build / xAI).
+  Capability, credential, or route changes **fail closed** and require
+  requalification.
+- **Read-only by default:** isolated checkout, explicit file/repo scope,
+  no builds, network, writes, or PR comments unless separately authorized.
+  Publishing comments or fixes is a **distinct** least-privilege capability
+  and approval (stage 3).
+- Output cites exact code locations/evidence, distinguishes confirmed
+  findings from hypotheses, shows confidence and model limitations,
+  deduplicates across passes, and retains a **secret-free** audit trail.
+- **Certification (live, named, unmet):** a deliberately modest compatible
+  model completes a seeded multi-hour review corpus with measured
+  recall/precision, bounded cost/time/retries, restart continuity, **zero**
+  code/secret egress, **no** mutation, and useful findings materially
+  better than a single-pass baseline. Also certify **denial** on route
+  drift, missing capability, quota exhaustion, and unauthorized publish.
+- Integrate with provider-neutral execution, long-running workers
+  ([#305](https://github.com/chriscase/GrokPtah/issues/305)), least
+  privilege, memory, desktop/hosted parity, and the Stage 10 operator
+  workflow. Company-gateway quota is **that provider’s** quota; it is not
+  the Stage 2 Grok Build provider-quota receipt and not a Grok Build
+  account balance.
+- Marking this core product outcome Explicitly unsupported **fails** a
+  full-product 100% claim. Documented non-goals may stay unsupported
+  (proprietary non-OpenAI-compatible APIs remain out of scope until ADR-002
+  §6 evidence).
+
+**Must not claim:** enterprise review-lane certification from closed #169
+profiles, from Grok Build routing, from hermetic replay, or from a
+single-pass chat on a frontier model.
+
 ## Dependency graph (summary)
 
 ```text
@@ -689,21 +805,25 @@ drill report, including no recorded sccache/target drill evidence.
         │              │                     │
         └──────────────┴──────────┬──────────┘
                                   ▼
-                 10 packaged UX + selected direction + packaged-desktop acceptance (#308 core)
+                 10 packaged UX + #308 acceptance + recurring expert cadence
                                   │
-                                  ▼
-                 11 operations and release drills
-                                  │
+                    ┌─────────────┴──────────────┐
+                    ▼                            ▼
+     11 operations and release drills     12 enterprise gateway review lane
+                    │                            │
+                    └─────────────┬──────────────┘
                                   ▼
                          trustworthy 100% claim
 ```
 
 Stages 7–9 may be implemented locally after stage 2, but they **do not
-count toward 100%** until stages 3–6 and 10–11 are also done. Isolated
+count toward 100%** until stages 3–6 and 10–12 are also done. Isolated
 visual (stage 9) has no Explicitly unsupported waiver. Independent
 long-running workers (stage 6 / #305) have no descope waiver. Packaged
 core UX (stage 10 / #308) has no Explicitly unsupported waiver for the
-Codex-class interface.
+Codex-class interface. Recurring expert UX cadence (stage 10) has no
+one-polish-pass waiver. The enterprise gateway review lane (stage 12)
+has no Explicitly unsupported waiver if we claim the full product vision.
 
 ## Unverified (explicit)
 
@@ -739,5 +859,12 @@ still carries them here is invalid.
   ([#308](https://github.com/chriscase/GrokPtah/issues/308) core).
   **Must not remain Unverified at 100%.** Cannot be closed by marking the
   Codex-class core interface Explicitly unsupported.
+- Recurring expert UI/UX review cadence (stage 10 supplement).
+  **Must not remain Unverified at 100%.** Cannot be closed by mockups or a
+  single pre-release polish pass.
+- Enterprise gateway long-running code-review lane (stage 12).
+  **Must not remain Unverified at 100%.** Closed [#169](https://github.com/chriscase/GrokPtah/issues/169)
+  profiles and Grok Build routing do not close this. Cannot be waived as
+  Explicitly unsupported if we claim the full product vision.
 
 See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) for per-row evidence.

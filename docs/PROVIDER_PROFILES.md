@@ -17,7 +17,14 @@ fails that exit. Account-balance synchronization is not implemented and not a
 100% requirement. Exact live certification is a distinct question. A local durable
 host quota ledger and the Native Coding Readiness Center are **Pending — not
 shipped** on [PR #352](https://github.com/chriscase/GrokPtah/pull/352).
-Stage 1 cannot pass while that PR remains draft. Status:
+Stage 1 cannot pass while that PR remains draft. Compatible OpenAI-compatible
+profiles ([#169](https://github.com/chriscase/GrokPtah/issues/169) closed) are
+**not** a certified **enterprise gateway review lane**. That long-running,
+read-only, frozen-route code-review outcome is a mandatory unmet 100% exit
+([`ROADMAP_TO_100.md`](ROADMAP_TO_100.md) stage 12). Orchestrator strength
+must not come from secretly routing to a stronger external model.
+Company-gateway quota is that provider’s quota; it is not Grok Build quota
+or a Grok Build account balance. Status:
 [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md).
 
 ## Configure a provider
