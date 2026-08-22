@@ -1,24 +1,14 @@
 {
-  "schema": "grokptah.memory_long_horizon_fixture.v1",
+  "schema": "grokptah.memory_long_horizon_fixture.v2",
   "fixture_id": "memory-long-horizon-v1",
   "kind": "deterministic_logical_years",
   "epoch": "2000-01-01T00:00:00.000Z",
   "logical_years": 10,
   "logical_year_days": 365,
-  "instants": {
-    "y0": "2000-01-01T00:00:00.000Z",
-    "y1": "2001-01-01T00:00:00.000Z",
-    "y2": "2002-01-01T00:00:00.000Z",
-    "y3": "2003-01-01T00:00:00.000Z",
-    "y4": "2004-01-01T00:00:00.000Z",
-    "y5": "2005-01-01T00:00:00.000Z",
-    "y6": "2006-01-01T00:00:00.000Z",
-    "y7": "2007-01-01T00:00:00.000Z",
-    "y8": "2008-01-01T00:00:00.000Z",
-    "y9": "2009-01-01T00:00:00.000Z",
-    "y10": "2010-01-01T00:00:00.000Z",
-    "equal_stamp": "2004-06-01T00:00:00.000Z",
-    "status_until": "2001-01-31T00:00:00.000Z"
+  "seed": 1296386353,
+  "scopes": {
+    "private_agent_id": "horizon-agent",
+    "team_id": "horizon-team"
   },
   "declared_bounds": {
     "max_facts": 80,
@@ -28,96 +18,33 @@
     "max_id_chars": 128,
     "max_key_chars": 128,
     "max_source_actor_chars": 128,
+    "max_query_chars": 256,
     "max_hot_store_bytes": 131072,
-    "schema_version": 2
+    "max_receipts": 512,
+    "max_persisted_bytes": 196608,
+    "max_scope_footprint_bytes": 393216,
+    "max_scope_files": 24,
+    "max_critical_facts": 16,
+    "max_critical_bytes": 16384,
+    "schema": "grokptah.memory.v2"
   },
-  "scopes": {
-    "private_agent_id": "horizon-agent",
-    "team_id": "horizon-team"
-  },
-  "seeds": {
-    "critical_invariants": [
-      {
-        "scope": "project",
-        "idempotency_key": "project-license-invariant",
-        "claim_key": "workspace-license",
-        "text": "Workspace license is Apache-2.0.",
-        "salience": "high"
-      },
-      {
-        "scope": "private",
-        "idempotency_key": "private-exfil-invariant",
-        "claim_key": "exfil-policy",
-        "text": "Agent-private facts never leave the owning agent.",
-        "salience": "high"
-      },
-      {
-        "scope": "team",
-        "idempotency_key": "team-review-invariant",
-        "claim_key": "review-policy",
-        "text": "Releases require two reviewers.",
-        "salience": "high"
-      }
-    ],
-    "preference_revisions": {
-      "scope": "project",
-      "claim_key": "indent-style",
-      "v1": {
-        "idempotency_key": "indent-style-v1",
-        "at": "y0",
-        "text": "Use tabs for indentation."
-      },
-      "v2": {
-        "idempotency_key": "indent-style-v2",
-        "at": "y2",
-        "text": "Use spaces for indentation."
-      }
-    },
-    "expiring_status": {
-      "scope": "project",
-      "idempotency_key": "deploy-window-y1",
-      "claim_key": "deploy-window",
-      "at": "y1",
-      "text": "Deploy window is open.",
-      "valid_until": "status_until"
-    },
-    "duplicates": {
-      "scope": "project",
-      "text": "Build cache lives under target/debug.",
-      "keys": ["dup-cache-a", "dup-cache-b"]
-    },
-    "conflicts": {
-      "scope": "team",
-      "claim_key": "release-channel",
-      "at": "y4",
-      "texts": [
-        {
-          "idempotency_key": "release-channel-stable",
-          "text": "Release channel is stable."
-        },
-        {
-          "idempotency_key": "release-channel-beta",
-          "text": "Release channel is beta."
-        }
-      ]
-    },
-    "legacy_v1_fact": {
-      "id": "legacy-horizon-1",
-      "text": "Legacy substring needle lives in v1 storage.",
-      "tags": ["legacy"],
-      "updated_at": "2000-01-01T00:00:00Z"
-    },
-    "legacy_substring_query": "substring needle"
+  "workload": {
+    "critical_invariants_per_scope": 3,
+    "min_critical_sample": 9,
+    "preference_revisions": 2,
+    "expiring_status_ttl_days": 30,
+    "conflict_pairs": 1,
+    "writes_per_year": 3,
+    "lexical_topk": 5
   },
   "oracle": {
-    "critical_current_retention_pct": 100,
-    "authoritative_superseded_expired_as_current": 0,
-    "latest_valid_revision_selection_pct": 100,
-    "unresolved_conflicts_surfaced_pct": 100,
-    "scope_canary_leakage": 0,
-    "idempotent_ack_unique_revisions": 1,
-    "malformed_cross_scope_cyclic_mutations": 0,
-    "repeated_read_reopen_deterministic": true,
-    "hot_store_within_byte_bound": true
-  }
+    "critical_recall_pct": 100,
+    "stale_as_current_pct": 0,
+    "conflict_recall_pct": 100,
+    "conflict_false_positive_pct": 0,
+    "duplicate_rate_pct": 0,
+    "hot_store_within_byte_bound": true,
+    "repeated_read_reopen_deterministic": true
+  },
+  "product_claim": "safe_v2_hot_store_core"
 }
