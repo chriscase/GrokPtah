@@ -1,4 +1,15 @@
 {
+  "evidenceHash": "sha256:3b9c0de010245516e0360cff066b01b19766728612a20172a8d30401fc19ecee",
+  "overlay": {
+    "blockedTool": "ptah_get_work",
+    "completed": false,
+    "mcpError": {
+      "code": "invalid_request"
+    },
+    "note": "Same overlaid fixture at exact main 67e29bd34dc64049432c715c93c2cef2185c63ea. ptah_get_work returned typed invalid_request (unknown work_id) before a complete six-phase result existed. This file is not synthesized from the PR-head golden and does not fabricate absent-capability zeros.",
+    "support": "absent"
+  },
   "schema": "grokptah.shared-black-box-result.v1",
-  "calibration": "pending"
+  "sourceRevision": "67e29bd34dc64049432c715c93c2cef2185c63ea",
+  "version": "v1"
 }

@@ -1,6 +1,10 @@
 {
   "schema": "grokptah.shared-black-box-fixture.v1",
   "version": "v1",
+  "goldenSelector": {
+    "4bd2081b2945e8ce881895f976bb7c8d88b929f2": "expected-pr352-4bd2081b.json",
+    "67e29bd34dc64049432c715c93c2cef2185c63ea": "expected-main-67e29bd3.json"
+  },
   "requestIds": {
     "createSession": "sbb-v1-create-session",
     "bootstrapSubmit": "sbb-v1-bootstrap-submit",

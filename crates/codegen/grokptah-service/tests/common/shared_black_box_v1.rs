@@ -4,10 +4,24 @@
 //! initialize/list_tools/call_tool/close_session. Launch handles are retained
 //! only for stop/restart. Fake transport (MockGateway) is inspected for
 //! request cardinalities without exposing secrets.
+//!
+//! Timing (do not claim Utc timestamps are fake-controlled):
+//! - Both adapters are in-process on this test's Tokio runtime. Hosted
+//!   `start_service` is not a child process.
+//! - `#[tokio::test(start_paused = true)]` drives in-process timers via
+//!   bounded `tokio::time::advance` plus yield loops. No wall-clock sleeps.
+//! - `MockGateway::stall` holds the accepted connection with
+//!   `std::future::pending()` after the request is recorded and before any
+//!   response bytes. Paused time cannot complete a stall.
+//! - Durable supervisor OS threads still use wall-clock time; manager
+//!   progress is driven through public `ptah_tick_manager_plan`.
+//! - `chrono::Utc` timestamps are real and are stripped as transport-volatile.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, MutexGuard};
 use std::time::Duration;
@@ -28,14 +42,45 @@ const SCENARIO_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/shared-black-box/v1/scenario.json"
 );
-const PR_GOLDEN_PATH: &str = concat!(
+const GOLDEN_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/shared-black-box/v1/expected-pr352-4bd2081b.json"
+    "/tests/fixtures/shared-black-box/v1"
 );
-const MAIN_GOLDEN_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/shared-black-box/v1/expected-main-67e29bd3.json"
-);
+
+/// Compile-time map from audited host revision to the one immutable golden.
+/// Never infer the golden from advertised tools or feature downgrade.
+const AUDITED_GOLDENS: &[(&str, &str)] = &[
+    (
+        "4bd2081b2945e8ce881895f976bb7c8d88b929f2",
+        "expected-pr352-4bd2081b.json",
+    ),
+    (
+        "67e29bd34dc64049432c715c93c2cef2185c63ea",
+        "expected-main-67e29bd3.json",
+    ),
+];
+
+const FIXTURE_ALLOWLIST: &[&str] = &[
+    "crates/codegen/grokptah-service/Cargo.toml",
+    "crates/codegen/grokptah-service/Cargo.lock",
+    "crates/codegen/grokptah-service/tests/shared_black_box_v1.rs",
+    "crates/codegen/grokptah-service/tests/common/mod.rs",
+    "crates/codegen/grokptah-service/tests/common/shared_black_box_v1.rs",
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/scenario.json",
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-main-67e29bd3.json",
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-pr352-4bd2081b.json",
+];
+
+const GOLDEN_UPDATE_ENV_VARS: &[&str] = &[
+    "UPDATE_SHARED_BLACK_BOX_GOLDEN",
+    "GROKPTAH_UPDATE_GOLDENS",
+    "UPDATE_GOLDENS",
+    "UPDATE_SNAPSHOTS",
+];
+
+/// Set true in the committed tree. Session recording may flip this locally
+/// only long enough to dump `/tmp` JSON; it must be true before push.
+const PRELOAD_IMMUTABLE_GOLDEN: bool = true;
 
 /// Serializes process-global environment mutations for this test binary.
 pub struct ProcessEnvGuard {
@@ -181,6 +226,23 @@ impl Scenario {
     fn supervisor_ms(&self) -> u64 {
         self.u64(&["bounds", "advanceSupervisorMs"])
     }
+
+    fn golden_selector(&self) -> BTreeMap<String, String> {
+        let Some(map) = self.raw["goldenSelector"].as_object() else {
+            panic!("scenario.json missing goldenSelector");
+        };
+        map.iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    value
+                        .as_str()
+                        .unwrap_or_else(|| panic!("goldenSelector.{key} must be a string"))
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
 }
 
 struct RedactionHit {
@@ -209,6 +271,20 @@ struct GatewayScript {
 
 pub async fn run_fixture() {
     let scenario = Scenario::load();
+    reject_golden_mutation_env();
+    let source = detect_audited_source_revision();
+    let golden_name = select_golden_file(&source, &scenario);
+    let golden_path = PathBuf::from(GOLDEN_DIR).join(golden_name);
+    let golden_before = snapshot_path(&golden_path);
+    let expected = if PRELOAD_IMMUTABLE_GOLDEN {
+        Some(load_immutable_golden(&golden_path, &source))
+    } else {
+        eprintln!(
+            "shared-black-box-v1 recording: PRELOAD_IMMUTABLE_GOLDEN=false; will dump normalized JSON to temp"
+        );
+        None
+    };
+
     let mut env = ProcessEnvGuard::new();
     env.remove("GROKPTAH_AGENT_OFFLINE");
     env.remove("XAI_API_KEY");
@@ -219,26 +295,50 @@ pub async fn run_fixture() {
     let desktop = run_v1(EndpointKind::Desktop, &scenario, &mut env).await;
     let hosted = run_v1(EndpointKind::Hosted, &scenario, &mut env).await;
 
-    let desktop_json = serde_json::to_string(&desktop.result).expect("serialize desktop result");
-    let hosted_json = serde_json::to_string(&hosted.result).expect("serialize hosted result");
+    let mut desktop_result = desktop.result.clone();
+    let mut hosted_result = hosted.result.clone();
+    stamp_source_revision(&mut desktop_result, &source);
+    stamp_source_revision(&mut hosted_result, &source);
+
+    let desktop_json = canonical_json(&desktop_result);
+    let hosted_json = canonical_json(&hosted_result);
     let desktop_hash = sha256_hex(desktop_json.as_bytes());
     let hosted_hash = sha256_hex(hosted_json.as_bytes());
+    eprintln!("shared-black-box-v1 audited source revision={source}");
+    eprintln!("shared-black-box-v1 selected golden={golden_name}");
     eprintln!("shared-black-box-v1 desktop normalized sha256={desktop_hash}");
     eprintln!("shared-black-box-v1 hosted normalized sha256={hosted_hash}");
     eprintln!(
         "shared-black-box-v1 desktop transport {:?}",
-        desktop.result["transport"]
+        desktop_result["transport"]
     );
     eprintln!(
         "shared-black-box-v1 hosted transport {:?}",
-        hosted.result["transport"]
+        hosted_result["transport"]
     );
+    dump_normalized_temp("desktop", &desktop_result);
+    dump_normalized_temp("hosted", &hosted_result);
 
     let mut report = Vec::new();
+    if golden_before != snapshot_path(&golden_path) {
+        report.push(format!(
+            "immutable golden was rewritten during the run: {}",
+            golden_path.display()
+        ));
+    }
     if desktop_json != hosted_json {
         report.push(format!(
             "desktop and hosted normalized JSON are not byte-equal\ndesktop={desktop_hash}\nhosted={hosted_hash}"
         ));
+    }
+    if let Some(expected) = expected.as_ref() {
+        match compare_normalized(&desktop_result, expected) {
+            Ok(()) => {}
+            Err(errors) => report.push(format!(
+                "selected golden mismatch ({golden_name}):\n{}",
+                errors.join("\n")
+            )),
+        }
     }
     for (label, endpoint) in [("desktop", &desktop), ("hosted", &hosted)] {
         if !endpoint.defects.is_empty() {
@@ -255,7 +355,6 @@ pub async fn run_fixture() {
         }
     }
     if report.is_empty() {
-        write_or_compare_goldens(&desktop.result);
         return;
     }
     panic!("{}", report.join("\n\n"));
@@ -1017,6 +1116,9 @@ async fn drive_six_phases(
         scan,
     )
     .await;
+    // Wait until MockGateway has accepted+recorded the restart request. The
+    // routed stall returns Step::stall after recording, so the connection is
+    // held before any response bytes. Do not wait for a provider response.
     let saw_restart_send = wait_until(
         scenario,
         Duration::from_millis(scenario.native_ms()),
@@ -1035,6 +1137,7 @@ async fn drive_six_phases(
         "{} restart-cut must send exactly one provider request before stop",
         kind.as_str()
     );
+    let stall_held_after_accept = restart_http_before == 1;
 
     launched = restart_endpoint(kind, launched, home, workspace, token).await;
     for _ in 0..8 {
@@ -1081,12 +1184,13 @@ async fn drive_six_phases(
         &gateway_base,
         &gateway_authority,
     );
-    assert_eq!(
-        serde_json::to_string(&post1_norm).unwrap(),
-        serde_json::to_string(&post2_norm).unwrap(),
-        "{} post-restart observations must converge after ephemeral normalization",
-        kind.as_str()
-    );
+    let mut defects: Vec<String> = Vec::new();
+    if serde_json::to_string(&post1_norm).unwrap() != serde_json::to_string(&post2_norm).unwrap() {
+        defects.push(format!(
+            "{} post-restart observations did not converge after stripping declared transport-volatile fields",
+            kind.as_str()
+        ));
+    }
 
     let restart_http_after = chat_requests_containing(gateway, &restart_objective);
     let listed_after = call_ok(
@@ -1103,26 +1207,21 @@ async fn drive_six_phases(
     let native_intent_count = count_matching(&intents["intents"], "workId", &native_work_id);
     let native_run_count = count_runs_for_work(&runs, &intents, &native_work_id);
     let native_attempts = native_get["attempts"].as_array().map(Vec::len).unwrap_or(0);
-    let native_provider_attempts = native_get_run
-        .pointer("/providerExecution/attemptCount")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let native_quota_state = native_get_run
-        .pointer("/providerExecution/quota/state")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let native_tokens = native_get_run
-        .pointer("/providerExecution/attempts/0/usage/total_tokens")
-        .or_else(|| native_get_run.pointer("/providerExecution/attempts/0/usage/totalTokens"))
-        .or_else(|| native_get_run.pointer("/aggregates/usage/totalTokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let native_requests = native_get_run
-        .pointer("/providerExecution/attempts/0/usage/requests")
-        .or_else(|| native_get_run.pointer("/aggregates/usage/requests"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let native_provider_attempts =
+        u64_or_absent(native_get_run.pointer("/providerExecution/attemptCount"));
+    let native_quota_state =
+        str_or_absent(native_get_run.pointer("/providerExecution/quota/state"));
+    let native_tokens = u64_or_absent(
+        native_get_run
+            .pointer("/providerExecution/attempts/0/usage/total_tokens")
+            .or_else(|| native_get_run.pointer("/providerExecution/attempts/0/usage/totalTokens"))
+            .or_else(|| native_get_run.pointer("/aggregates/usage/totalTokens")),
+    );
+    let native_requests = u64_or_absent(
+        native_get_run
+            .pointer("/providerExecution/attempts/0/usage/requests")
+            .or_else(|| native_get_run.pointer("/aggregates/usage/requests")),
+    );
 
     let decision_intent_count =
         count_matching(&intents_manager["intents"], "workId", &decision_work_id);
@@ -1135,20 +1234,14 @@ async fn drive_six_phases(
         count_matching(&post1["intents"]["intents"], "workId", &restart_work_id);
     let restart_run_count =
         count_runs_for_work(&post1["runs"], &post1["intents"], &restart_work_id);
-    let restart_send = post1["getRun"]
-        .pointer("/providerExecution/attempts/0/sendCertainty")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let restart_retry = post1["getRun"]
-        .pointer("/providerExecution/attempts/0/retryClass")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let restart_quota = post1["getRun"]
-        .pointer("/providerExecution/quota/state")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let restart_send =
+        str_or_absent(post1["getRun"].pointer("/providerExecution/attempts/0/sendCertainty"));
+    let restart_retry =
+        str_or_absent(post1["getRun"].pointer("/providerExecution/attempts/0/retryClass"));
+    let restart_quota = str_or_absent(post1["getRun"].pointer("/providerExecution/quota/state"));
     let restart_queued = restart_work_row.get("state").and_then(Value::as_str) == Some("queued");
+    let restart_provider_attempts =
+        u64_or_absent(post1["getRun"].pointer("/providerExecution/attemptCount"));
 
     let ordinary = json!({
         "work": 1,
@@ -1177,15 +1270,16 @@ async fn drive_six_phases(
         "workAttempt": restart_attempt_count,
         "intent": restart_intent_count,
         "run": restart_run_count,
-        "providerAttempt": post1["getRun"].pointer("/providerExecution/attemptCount").cloned().unwrap_or(json!(0)),
+        "providerAttempt": restart_provider_attempts,
         "sendCertainty": restart_send,
         "retryClass": restart_retry,
         "quotaState": restart_quota,
         "http": restart_http_after,
-        "queued": restart_queued
+        "queued": restart_queued,
+        "stallHeldAfterAccept": stall_held_after_accept,
+        "httpBeforeStop": restart_http_before
     });
 
-    let mut defects: Vec<String> = Vec::new();
     push_mismatch(
         &mut defects,
         "ordinary.intent",
@@ -1193,6 +1287,12 @@ async fn drive_six_phases(
         json!(1),
     );
     push_mismatch(&mut defects, "ordinary.run", &ordinary["run"], json!(1));
+    push_mismatch(
+        &mut defects,
+        "ordinary.providerAttempt",
+        &ordinary["providerAttempt"],
+        json!(1),
+    );
     push_mismatch(&mut defects, "ordinary.http", &ordinary["http"], json!(1));
     push_mismatch(
         &mut defects,
@@ -1261,7 +1361,19 @@ async fn drive_six_phases(
         json!(1),
     );
     push_mismatch(&mut defects, "restart.run", &restart_obs["run"], json!(1));
+    push_mismatch(
+        &mut defects,
+        "restart.providerAttempt",
+        &restart_obs["providerAttempt"],
+        json!(1),
+    );
     push_mismatch(&mut defects, "restart.http", &restart_obs["http"], json!(1));
+    push_mismatch(
+        &mut defects,
+        "restart.stallHeldAfterAccept",
+        &restart_obs["stallHeldAfterAccept"],
+        json!(true),
+    );
     push_mismatch(
         &mut defects,
         "restart.queued",
@@ -1339,6 +1451,7 @@ async fn drive_six_phases(
             },
             "restart": {
                 "httpBeforeStop": restart_http_before,
+                "stallHeldAfterAccept": stall_held_after_accept,
                 "postRestart": [post1, post2]
             }
         },
@@ -1511,7 +1624,7 @@ async fn call_ok(
     arguments: Value,
     scan: &mut ScanFn<'_>,
 ) -> Value {
-    match mcp.call_tool(name, arguments).await {
+    match mcp.call_tool(name, arguments.clone()).await {
         Ok(result) => {
             scan(&result.raw, name);
             scan(&result.structured, name);
@@ -1523,7 +1636,7 @@ async fn call_ok(
                 let code = remote.data_code().unwrap_or("unknown");
                 let wrapped = json!({ "mcpError": { "code": code } });
                 scan(&wrapped, name);
-                panic!("{name} MCP error code={code}");
+                panic!("{name} MCP error code={code} error={error} args={arguments}");
             }
             panic!("{name}: {error}");
         }
@@ -2064,24 +2177,31 @@ fn strip_ephemerals(value: &mut Value, key: Option<&str>) {
 
 fn is_ephemeral_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    if lower.ends_with("at") && lower.len() > 3 && lower != "format" {
+    if is_timestamp_key(&lower) {
         return true;
     }
     matches!(
         lower.as_str(),
-        "promptpreview"
-            | "transportsessionid"
+        "transportsessionid"
             | "mcp-session-id"
             | "sessionidheader"
+            | "port"
+            | "listenport"
             | "backend"
             | "backendlabel"
-            | "port"
             | "skippedmanual"
             | "skippedineligible"
             | "skippedprovidercapacity"
             | "skippedunroutable"
             | "laggedliveevents"
     )
+}
+
+fn is_timestamp_key(lower: &str) -> bool {
+    if lower == "format" || lower.len() <= 3 {
+        return false;
+    }
+    lower.ends_with("at")
 }
 
 fn collect_ids(value: &Value, key: Option<&str>, canon: &mut IdCanon) {
@@ -2127,9 +2247,27 @@ fn apply_ids(value: &mut Value, canon: &IdCanon) {
         .map(|(from, to)| (from.clone(), to.clone()))
         .collect();
     pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    let mut prefixes: Vec<(String, String)> = Vec::new();
+    for (from, to) in &pairs {
+        if looks_like_uuid(from) && from.len() >= 14 {
+            let prefix = from[..14].to_string();
+            let unique = pairs
+                .iter()
+                .filter(|(other, _)| looks_like_uuid(other) && other.starts_with(&prefix))
+                .count()
+                == 1;
+            if unique {
+                prefixes.push((prefix, to.clone()));
+            }
+        }
+    }
+    prefixes.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
     visit_strings(value, &mut |text| {
         let mut out = text.to_string();
         for (from, to) in &pairs {
+            out = out.replace(from, to);
+        }
+        for (from, to) in &prefixes {
             out = out.replace(from, to);
         }
         out
@@ -2283,89 +2421,332 @@ fn sort_value(value: &mut Value, key: Option<&str>) {
     }
 }
 
-fn write_or_compare_goldens(pr_result: &Value) {
-    let update = std::env::var("UPDATE_SHARED_BLACK_BOX_GOLDEN").is_ok();
-    let pretty = serde_json::to_string_pretty(pr_result).expect("pretty pr result");
-    if update || golden_is_pending(PR_GOLDEN_PATH) {
-        std::fs::write(PR_GOLDEN_PATH, format!("{pretty}\n")).expect("write PR golden");
-    } else {
-        let expected: Value =
-            serde_json::from_str(&std::fs::read_to_string(PR_GOLDEN_PATH).expect("read PR golden"))
-                .expect("parse PR golden");
-        assert_eq!(
-            serde_json::to_string(pr_result).unwrap(),
-            serde_json::to_string(&expected).unwrap(),
-            "PR-head golden mismatch"
-        );
-    }
-
-    let main = calibrate_main(pr_result);
-    let main_pretty = serde_json::to_string_pretty(&main).expect("pretty main result");
-    if update || golden_is_pending(MAIN_GOLDEN_PATH) {
-        std::fs::write(MAIN_GOLDEN_PATH, format!("{main_pretty}\n")).expect("write main golden");
-    } else {
-        let expected: Value = serde_json::from_str(
-            &std::fs::read_to_string(MAIN_GOLDEN_PATH).expect("read main golden"),
-        )
-        .expect("parse main golden");
-        assert_eq!(
-            serde_json::to_string(&main).unwrap(),
-            serde_json::to_string(&expected).unwrap(),
-            "main calibration golden mismatch"
-        );
+fn u64_or_absent(value: Option<&Value>) -> Value {
+    match value.and_then(Value::as_u64) {
+        Some(number) => json!(number),
+        None => json!({ "support": "absent" }),
     }
 }
 
-fn golden_is_pending(path: &str) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .is_some_and(|value| value.get("calibration") == Some(&json!("pending")))
+fn str_or_absent(value: Option<&Value>) -> Value {
+    match value.and_then(Value::as_str) {
+        Some(text) => json!(text),
+        None => json!({ "support": "absent" }),
+    }
 }
 
-fn calibrate_main(pr: &Value) -> Value {
-    let mut main = pr.clone();
-    mark_absent(
-        &mut main,
-        &[
-            "providerQuota",
-            "providerExecution",
-            "ptah_get_native_coding_readiness",
-        ],
+fn canonical_json(value: &Value) -> String {
+    serde_json::to_string(value).expect("canonical json")
+}
+
+fn snapshot_path(path: &Path) -> Option<Vec<u8>> {
+    std::fs::read(path).ok()
+}
+
+fn dump_normalized_temp(label: &str, value: &Value) {
+    let source = value
+        .get("sourceRevision")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let document = write_golden_document(value, source);
+    let path = std::env::temp_dir().join(format!("sbb-v1-{label}-normalized.json"));
+    let pretty = serde_json::to_string_pretty(&document).expect("pretty dump");
+    let _ = std::fs::write(&path, format!("{pretty}\n"));
+    eprintln!(
+        "shared-black-box-v1 dumped {} evidenceHash={} to {}",
+        label,
+        document
+            .get("evidenceHash")
+            .and_then(Value::as_str)
+            .unwrap_or("missing"),
+        path.display()
     );
-    if let Some(readiness) = main.pointer_mut("/observations/discovery/readiness") {
-        *readiness = json!({ "support": "absent" });
+}
+
+fn stamp_source_revision(value: &mut Value, source: &str) {
+    if let Some(map) = value.as_object_mut() {
+        map.insert("sourceRevision".into(), json!(source));
     }
-    if let Some(features) = main.pointer_mut("/features/nativeCodingReadiness") {
-        *features = json!({ "support": "absent" });
-    }
-    if let Some(tools) = main.pointer_mut("/advertisedTools") {
-        if let Some(arr) = tools.as_array_mut() {
-            arr.retain(|item| item.as_str() != Some("ptah_get_native_coding_readiness"));
+    sort_value(value, None);
+}
+
+fn reject_golden_mutation_env() {
+    for var in GOLDEN_UPDATE_ENV_VARS {
+        if std::env::var_os(var).is_some() {
+            panic!("{var} cannot rewrite or bypass the immutable golden");
         }
     }
-    main
 }
 
-fn mark_absent(value: &mut Value, keys: &[&str]) {
-    match value {
-        Value::Object(map) => {
-            let names: Vec<String> = map.keys().cloned().collect();
-            for name in names {
-                if keys.iter().any(|key| *key == name) {
-                    map.insert(name, json!({ "support": "absent" }));
-                } else if let Some(child) = map.get_mut(&name) {
-                    mark_absent(child, keys);
+fn select_golden_file(source: &str, scenario: &Scenario) -> &'static str {
+    let from_const = AUDITED_GOLDENS
+        .iter()
+        .find(|(sha, _)| *sha == source)
+        .map(|(_, file)| *file);
+    let selector = scenario.golden_selector();
+    let from_scenario = selector.get(source).map(String::as_str);
+    match (from_const, from_scenario) {
+        (Some(const_file), Some(scenario_file)) if const_file == scenario_file => const_file,
+        (Some(const_file), Some(scenario_file)) => panic!(
+            "golden selector mismatch for {source}: compile-time={const_file} scenario={scenario_file}"
+        ),
+        (None, _) | (_, None) => panic!(
+            "unexpected source revision {source}; fail closed (no golden inference by feature downgrade)"
+        ),
+    }
+}
+
+fn load_immutable_golden(path: &Path, expected_source: &str) -> Value {
+    if !path.exists() {
+        panic!("missing immutable golden {}", path.display());
+    }
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read golden {}: {error}", path.display()));
+    let mut value: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("malformed golden {}: {error}", path.display()));
+    if value.get("calibration") == Some(&json!("pending")) {
+        panic!(
+            "pending golden is not an immutable oracle: {}",
+            path.display()
+        );
+    }
+    if value["schema"] != RESULT_SCHEMA {
+        panic!(
+            "malformed golden {}: schema={:?} expected={RESULT_SCHEMA}",
+            path.display(),
+            value.get("schema")
+        );
+    }
+    if value.get("version") != Some(&json!("v1")) {
+        panic!("malformed golden {}: missing version v1", path.display());
+    }
+    sort_value(&mut value, None);
+    let stored_hash = value
+        .get("evidenceHash")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut body = value.clone();
+    if let Some(map) = body.as_object_mut() {
+        map.remove("evidenceHash");
+    }
+    sort_value(&mut body, None);
+    let computed = format!("sha256:{}", sha256_hex(canonical_json(&body).as_bytes()));
+    match stored_hash {
+        Some(stored) if stored == computed => {}
+        Some(stored) => panic!(
+            "golden evidenceHash mismatch for {}: stored={stored} computed={computed}",
+            path.display()
+        ),
+        None => panic!("malformed golden {}: missing evidenceHash", path.display()),
+    }
+    if value.get("sourceRevision").and_then(Value::as_str) != Some(expected_source) {
+        panic!(
+            "golden sourceRevision {:?} does not match audited {}",
+            value.get("sourceRevision"),
+            expected_source
+        );
+    }
+    if let Some(map) = value.as_object_mut() {
+        map.remove("evidenceHash");
+    }
+    sort_value(&mut value, None);
+    value
+}
+
+fn compare_normalized(actual: &Value, expected: &Value) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    collect_semantic_key_diffs(actual, expected, "", &mut errors);
+    if canonical_json(actual) != canonical_json(expected) && errors.is_empty() {
+        errors.push(format!(
+            "canonical JSON differs (actual sha256={} expected sha256={})",
+            sha256_hex(canonical_json(actual).as_bytes()),
+            sha256_hex(canonical_json(expected).as_bytes())
+        ));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn collect_semantic_key_diffs(
+    actual: &Value,
+    expected: &Value,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    match (actual, expected) {
+        (Value::Object(actual_map), Value::Object(expected_map)) => {
+            for key in expected_map.keys() {
+                if !actual_map.contains_key(key) {
+                    errors.push(format!(
+                        "{}: missing semantic key {key}",
+                        display_path(path)
+                    ));
+                }
+            }
+            for key in actual_map.keys() {
+                if !expected_map.contains_key(key) {
+                    errors.push(format!("{}: extra semantic key {key}", display_path(path)));
+                }
+            }
+            for (key, expected_child) in expected_map {
+                if let Some(actual_child) = actual_map.get(key) {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    collect_semantic_key_diffs(actual_child, expected_child, &child_path, errors);
                 }
             }
         }
-        Value::Array(items) => {
-            for child in items {
-                mark_absent(child, keys);
+        (Value::Array(actual_items), Value::Array(expected_items)) => {
+            if actual_items.len() != expected_items.len() {
+                errors.push(format!(
+                    "{}: array cardinality actual={} expected={}",
+                    display_path(path),
+                    actual_items.len(),
+                    expected_items.len()
+                ));
             }
+            for (index, (actual_child, expected_child)) in
+                actual_items.iter().zip(expected_items.iter()).enumerate()
+            {
+                collect_semantic_key_diffs(
+                    actual_child,
+                    expected_child,
+                    &format!("{path}[{index}]"),
+                    errors,
+                );
+            }
+        }
+        (actual, expected) if actual != expected => {
+            errors.push(format!(
+                "{}: value actual={actual} expected={expected}",
+                display_path(path)
+            ));
         }
         _ => {}
     }
+}
+
+fn display_path(path: &str) -> String {
+    if path.is_empty() {
+        "$".into()
+    } else {
+        path.to_string()
+    }
+}
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .canonicalize()
+        .expect("canonicalize repo root")
+}
+
+fn git_stdout(args: &[&str]) -> Result<String, String> {
+    let root = repo_root();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(args)
+        .output()
+        .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
+fn porcelain_paths(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let rest = if line.len() >= 3 && line.as_bytes().get(2) == Some(&b' ') {
+                &line[3..]
+            } else {
+                line.trim()
+            };
+            rest.split(" -> ").last().unwrap_or(rest).trim().to_string()
+        })
+        .collect()
+}
+
+fn allowlisted(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    if FIXTURE_ALLOWLIST.contains(&path) {
+        return true;
+    }
+    FIXTURE_ALLOWLIST.iter().any(|allowed| {
+        allowed.starts_with(&format!("{path}/")) || path.starts_with(&format!("{allowed}/"))
+    })
+}
+
+fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
+    let parent = git_stdout(&["rev-parse", &format!("{sha}^")]);
+    let diff = if parent.is_ok() {
+        git_stdout(&["diff", "--name-only", &format!("{sha}^"), sha])?
+    } else {
+        git_stdout(&[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--root",
+            "-r",
+            sha,
+        ])?
+    };
+    Ok(diff
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn detect_audited_source_revision() -> String {
+    let status = git_stdout(&["status", "--porcelain"]).expect("git status");
+    for path in porcelain_paths(&status) {
+        if !allowlisted(&path) {
+            panic!("unexpected dirty path outside fixture allowlist: {path}");
+        }
+    }
+    let mut sha = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    loop {
+        let files = commit_changed_files(&sha).expect("commit files");
+        if files.iter().any(|path| !allowlisted(path)) {
+            return sha;
+        }
+        match git_stdout(&["rev-parse", &format!("{sha}^")]) {
+            Ok(parent) => sha = parent,
+            Err(_) => panic!("could not identify audited host revision (fail closed)"),
+        }
+    }
+}
+
+fn write_golden_document(result: &Value, source: &str) -> Value {
+    let mut document = result.clone();
+    stamp_source_revision(&mut document, source);
+    let mut body = document.clone();
+    if let Some(map) = body.as_object_mut() {
+        map.remove("evidenceHash");
+    }
+    sort_value(&mut body, None);
+    let hash = format!("sha256:{}", sha256_hex(canonical_json(&body).as_bytes()));
+    if let Some(map) = document.as_object_mut() {
+        map.insert("evidenceHash".into(), json!(hash));
+    }
+    sort_value(&mut document, None);
+    document
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2458,4 +2839,257 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
         out[i * 4..i * 4 + 4].copy_from_slice(&part.to_be_bytes());
     }
     out
+}
+
+fn sample_oracle_result() -> Value {
+    json!({
+        "schema": RESULT_SCHEMA,
+        "version": "v1",
+        "sourceRevision": "4bd2081b2945e8ce881895f976bb7c8d88b929f2",
+        "advertisedTools": ["ptah_get_capacity"],
+        "features": { "nativeCodingReadiness": { "support": "present" } },
+        "observations": {
+            "discovery": { "capacity": { "ok": true }, "readiness": { "support": "present" } },
+            "native": { "getRun": { "purpose": "native", "state": "completed" } },
+            "manager": { "purpose": "manager_proposal" },
+            "proposal": { "fileExists": false },
+            "restart": {
+                "httpBeforeStop": 1,
+                "stallHeldAfterAccept": true
+            }
+        },
+        "assertions": {
+            "ordinaryNative": {
+                "work": 1,
+                "intent": 1,
+                "run": 1,
+                "providerAttempt": 1,
+                "http": 1,
+                "quotaState": "consumed",
+                "requests": 1,
+                "tokens": 10
+            },
+            "manager": {
+                "proposalHttp": 2,
+                "permissionRequests": 0,
+                "permissionGrants": 0
+            },
+            "restart": {
+                "work": 1,
+                "workAttempt": 1,
+                "intent": 1,
+                "run": 1,
+                "providerAttempt": 1,
+                "sendCertainty": "uncertain_accept",
+                "retryClass": "explicit_new_run_only",
+                "quotaState": "reserved",
+                "http": 1,
+                "queued": false
+            }
+        },
+        "transport": { "ordinaryNativeHttp": 1, "proposalHttp": 2, "restartHttp": 1 }
+    })
+}
+
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn pending_golden_fails_before_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pending.json");
+    std::fs::write(
+        &path,
+        r#"{"schema":"grokptah.shared-black-box-result.v1","calibration":"pending"}"#,
+    )
+    .unwrap();
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        load_immutable_golden(&path, "4bd2081b2945e8ce881895f976bb7c8d88b929f2")
+    }))
+    .expect_err("pending golden must fail");
+    let text = panic_text(message);
+    assert!(text.contains("pending golden"), "unexpected panic: {text}");
+}
+
+#[test]
+fn missing_golden_fails_before_launch() {
+    let path = PathBuf::from("/tmp/sbb-v1-missing-golden-does-not-exist.json");
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        load_immutable_golden(&path, "4bd2081b2945e8ce881895f976bb7c8d88b929f2")
+    }))
+    .expect_err("missing golden must fail");
+    let text = panic_text(message);
+    assert!(text.contains("missing immutable golden"), "{text}");
+}
+
+#[test]
+fn malformed_golden_fails_before_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("malformed.json");
+    std::fs::write(&path, "{not-json").unwrap();
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        load_immutable_golden(&path, "4bd2081b2945e8ce881895f976bb7c8d88b929f2")
+    }))
+    .expect_err("malformed golden must fail");
+    let text = panic_text(message);
+    assert!(text.contains("malformed golden"), "{text}");
+}
+
+#[test]
+fn unknown_source_revision_fails_closed() {
+    let scenario = Scenario::load();
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        select_golden_file("ffffffffffffffffffffffffffffffffffffffff", &scenario)
+    }))
+    .expect_err("unknown revision must fail closed");
+    let text = panic_text(message);
+    assert!(text.contains("unexpected source revision"), "{text}");
+}
+
+#[test]
+fn extra_and_missing_semantic_keys_fail() {
+    let expected = sample_oracle_result();
+    let mut extra = expected.clone();
+    extra
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpectedLeaf".into(), json!(1));
+    let extra_errors = compare_normalized(&extra, &expected).expect_err("extra key");
+    assert!(
+        extra_errors
+            .iter()
+            .any(|row| row.contains("extra semantic key unexpectedLeaf")),
+        "{extra_errors:?}"
+    );
+    let mut missing = expected.clone();
+    missing.as_object_mut().unwrap().remove("assertions");
+    let missing_errors = compare_normalized(&missing, &expected).expect_err("missing key");
+    assert!(
+        missing_errors
+            .iter()
+            .any(|row| row.contains("missing semantic key assertions")),
+        "{missing_errors:?}"
+    );
+}
+
+#[test]
+fn altered_cardinality_state_purpose_quota_attempt_retry_fail() {
+    let expected = sample_oracle_result();
+    let mut actual = expected.clone();
+    actual["assertions"]["ordinaryNative"]["work"] = json!(2);
+    actual["assertions"]["ordinaryNative"]["quotaState"] = json!("reserved");
+    actual["observations"]["native"]["getRun"]["state"] = json!("failed");
+    actual["observations"]["native"]["getRun"]["purpose"] = json!("other");
+    actual["assertions"]["restart"]["providerAttempt"] = json!(2);
+    actual["assertions"]["restart"]["retryClass"] = json!("auto");
+    let errors = compare_normalized(&actual, &expected).expect_err("altered semantics");
+    let joined = errors.join("\n");
+    for needle in [
+        "ordinaryNative.work",
+        "quotaState",
+        "state",
+        "purpose",
+        "providerAttempt",
+        "retryClass",
+    ] {
+        assert!(joined.contains(needle), "missing {needle} in {joined}");
+    }
+}
+
+#[test]
+fn backend_result_divergence_fails() {
+    let desktop = sample_oracle_result();
+    let mut hosted = desktop.clone();
+    hosted["transport"]["restartHttp"] = json!(2);
+    let errors = compare_normalized(&desktop, &hosted).expect_err("divergence");
+    assert!(
+        errors.iter().any(|row| row.contains("restartHttp")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn redaction_scan_fails_on_forbidden_secrets() {
+    let mut hits = Vec::new();
+    scan_raw(
+        &json!({
+            "providerRoute": {
+                "baseUrl": "http://127.0.0.1:9",
+                "credentialRef": "ref",
+                "credentialFingerprint": "fp"
+            },
+            "text": "sbb-v1-api-key-1a2b3c4d5e6f708192a3b4c5d6e7f809"
+        }),
+        "probe",
+        "sbb-v1-mcp-bearer-7f3c9e1a4b8d2e6f0c5a9d3b7e1f4a8c",
+        "sbb-v1-api-key-1a2b3c4d5e6f708192a3b4c5d6e7f809",
+        "http://127.0.0.1:9",
+        "127.0.0.1:9",
+        "sbb-v1-private-gateway-sentinel",
+        &mut hits,
+    );
+    let reasons: Vec<_> = hits.iter().map(|hit| hit.reason.as_str()).collect();
+    assert!(reasons
+        .iter()
+        .any(|reason| reason.contains("forbidden key")));
+    assert!(reasons
+        .iter()
+        .any(|reason| reason.contains("api-key sentinel")));
+}
+
+#[test]
+fn update_env_cannot_rewrite_or_bypass() {
+    let _lock = home_override_serial();
+    let golden = PathBuf::from(GOLDEN_DIR).join("expected-pr352-4bd2081b.json");
+    let before = std::fs::read(&golden).expect("read pr golden");
+    std::env::set_var("UPDATE_SHARED_BLACK_BOX_GOLDEN", "1");
+    let panicked = catch_unwind(reject_golden_mutation_env);
+    std::env::remove_var("UPDATE_SHARED_BLACK_BOX_GOLDEN");
+    assert!(panicked.is_err(), "update env must fail closed");
+    let after = std::fs::read(&golden).expect("re-read pr golden");
+    assert_eq!(before, after, "golden bytes must be unchanged");
+}
+
+#[test]
+fn write_golden_document_roundtrip_does_not_touch_repo_goldens() {
+    let result = sample_oracle_result();
+    let document = write_golden_document(&result, "4bd2081b2945e8ce881895f976bb7c8d88b929f2");
+    assert!(document.get("evidenceHash").is_some());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oracle.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&document).unwrap()).unwrap();
+    let loaded = load_immutable_golden(&path, "4bd2081b2945e8ce881895f976bb7c8d88b929f2");
+    assert!(loaded.get("evidenceHash").is_none());
+    assert_eq!(
+        loaded["sourceRevision"],
+        json!("4bd2081b2945e8ce881895f976bb7c8d88b929f2")
+    );
+}
+
+#[test]
+fn committed_preload_is_armed() {
+    assert!(
+        PRELOAD_IMMUTABLE_GOLDEN,
+        "committed fixture must fail closed on missing/pending goldens before launch"
+    );
+}
+
+#[test]
+fn expected_main_golden_is_immutable_for_audited_revision() {
+    let path = PathBuf::from(GOLDEN_DIR).join("expected-main-67e29bd3.json");
+    let loaded = load_immutable_golden(&path, "67e29bd34dc64049432c715c93c2cef2185c63ea");
+    assert_eq!(loaded["overlay"]["completed"], json!(false));
+    assert_eq!(
+        loaded["overlay"]["mcpError"]["code"],
+        json!("invalid_request")
+    );
 }
