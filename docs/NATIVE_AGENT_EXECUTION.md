@@ -257,8 +257,10 @@ send.
   session is `session_busy` rather than a second concurrent turn.
 - Permission oneshots are process memory. They are not restart-durable.
   Resolution after restart, cancel, or a dead receiver fails closed.
-- Named control-plane credentials remain **operator-equivalent**. They share
-  one service `owner_id` and are not bound to a single Agent.
+- Named control-plane credentials remain **operator-equivalent**: **every
+  configured remote bearer can approve and promote within service scope**.
+  They share one service `owner_id` and are not bound to a single Agent.
+  `LocalOperator` / `RemoteCoordinator` / `Observer` separation is Planned.
 - `maxConcurrentRuns` is bounded to **1–4** (default 1). Live intents in
   `claiming`, `admitted`, `parked`, and `resolving` consume that ceiling.
 
@@ -289,10 +291,32 @@ Shipped since this slice (do not treat as remaining work):
 Still remaining:
 
 - Message-triggered routine activation (`RoutineTrigger::External` adapters remain `unsupported` on create/fire)
-- Per-principal worker credentials bound to one Agent (bearers are operator-equivalent today)
-- Computer Use for unattended Agents (not in this slice; [#287](https://github.com/chriscase/GrokPtah/issues/287)/[#288](https://github.com/chriscase/GrokPtah/issues/288) Planned)
-- Native Coding Readiness Center / local host quota ledger — **Pending — not shipped** on [PR #352](https://github.com/chriscase/GrokPtah/pull/352)
+- Per-principal worker credentials bound to one Agent (**every configured
+  remote bearer can currently approve/promote within service scope**;
+  `LocalOperator` / `RemoteCoordinator` / `Observer` are Planned and must
+  precede any production-shaped 72-hour soak)
+- Computer Use for unattended Agents (not in this slice; [#287](https://github.com/chriscase/GrokPtah/issues/287)
+  Planned; isolated visual [#288](https://github.com/chriscase/GrokPtah/issues/288)
+  is a **mandatory unmet** 100% exit, not an unsupported alternative)
+- Native Coding Readiness Center / local host quota ledger — **Pending — not shipped** on [PR #352](https://github.com/chriscase/GrokPtah/pull/352);
+  stage 1 cannot pass while that PR remains draft; merge requires independently
+  certified repair of the five confirmed P1s
+- Independent long-running workers / multi-worker ([#305](https://github.com/chriscase/GrokPtah/issues/305)) —
+  **mandatory unmet** 100% exit (durable ownership, bounded delegated
+  workloads, crash/restart recovery, no duplicate execution,
+  capability/authority isolation, retained evidence). Cannot be descoped.
+  First-slice coordinator/workload tests and closed [#307](https://github.com/chriscase/GrokPtah/issues/307)
+  do not close it.
+- Selected packaged-desktop UX ([#308](https://github.com/chriscase/GrokPtah/issues/308)) —
+  **mandatory unmet** 100% exit; Explicitly unsupported covers documented
+  non-goals only
 
 Status: [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md). Road to 100%:
 [`ROADMAP_TO_100.md`](ROADMAP_TO_100.md). Grok Build session/gateway routing is
-already Supported; quota observability and live certification are separate.
+already Supported (credential order: `XAI_API_KEY`, keychain,
+`GROKPTAH_TOKEN_COMMAND`, then `~/.grok/auth.json`); compatible gateway
+requests consume provider quota; GrokPtah does not sync a Grok Build account
+balance; a named secret-free provider-quota receipt is a mandatory unmet 100%
+exit (“not observed” fails); account-balance sync is not implemented and not
+required; the PR #352 local host quota ledger is a separate pending feature
+until merged. Live certification is a separate question.

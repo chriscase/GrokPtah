@@ -203,10 +203,15 @@ packaging requirements, and disposable smoke fixture.
 
 This semantic slice **deliberately avoids raw global mouse injection**.
 Foreground `activate target` (frontmost app / focused AX window) is **not equivalent to non-disruptive isolated Computer Use**. Background-safe semantic
-([#287](https://github.com/chriscase/GrokPtah/issues/287)) and an isolated
-visual backend ([#288](https://github.com/chriscase/GrokPtah/issues/288)) are
-Planned. An agent-owned interaction surface
+([#287](https://github.com/chriscase/GrokPtah/issues/287)) is Planned. An
+agent-owned interaction surface
 ([#286](https://github.com/chriscase/GrokPtah/issues/286)) is Planned.
+**Isolated visual Computer Use
+([#288](https://github.com/chriscase/GrokPtah/issues/288)) is a mandatory
+product exit for 100%**, never an Explicitly unsupported alternative: a
+genuinely isolated agent-owned app surface/cursor; global pointer, keyboard,
+focus, clipboard, and unrelated apps remain unaffected; takeover is
+out-of-band and preemptive. Raw global injection may remain unsupported.
 
 ## Deliberate non-goals of the current desktop slice
 
@@ -219,7 +224,7 @@ manager supervisor or native executor, which are different surfaces
 - no unattended or continuously autonomous **Computer Use** model invocation;
 - no MCP Computer Run **mutations**, grants, evidence bytes, or screenshots (read-only tools `ptah_list_computer_runs`, `ptah_get_computer_run`, `ptah_get_computer_run_events`, and `ptah_get_computer_capacity` are on main; [#271](https://github.com/chriscase/GrokPtah/issues/271) remains **open** for mutations);
 - no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell Computer Use endpoint;
-- no background-safe semantic grant ([#287](https://github.com/chriscase/GrokPtah/issues/287)) and no isolated visual backend ([#288](https://github.com/chriscase/GrokPtah/issues/288));
+- no background-safe semantic grant ([#287](https://github.com/chriscase/GrokPtah/issues/287)); isolated visual backend ([#288](https://github.com/chriscase/GrokPtah/issues/288)) is **absent today** and is a **mandatory** 100% exit, not a waived non-goal;
 - no cross-application target switching inside a run.
 
 ## Delivery sequence
@@ -232,14 +237,20 @@ manager supervisor or native executor, which are different surfaces
 | macOS act | #270 | Bounded semantic actions with immediate local takeover |
 | Coordinator reads | #271 (reads on main; issue **open** for mutations) | Read-only Computer Run MCP tools and event visibility; mutations stay disabled |
 | Coordinator mutations | #271 | Still unsupported until the shared event/approval contract and threat review complete |
+| Agent-owned surface | #286 | Mandatory for Codex-like CU; user pointer unchanged; takeover out-of-band and preemptive |
+| Background-safe semantic | #287 | Planned; not implied by foreground activation |
+| Isolated visual backend | #288 | **Mandatory 100% product exit**; cannot be waived as Explicitly unsupported |
 | Other platforms | #275, #276 | Windows and Linux adapters behind the same contract |
 
 [#268](https://github.com/chriscase/GrokPtah/issues/268) is closed. [#269](https://github.com/chriscase/GrokPtah/issues/269),
 [#270](https://github.com/chriscase/GrokPtah/issues/270), [#272](https://github.com/chriscase/GrokPtah/issues/272),
-[#273](https://github.com/chriscase/GrokPtah/issues/273), and [#274](https://github.com/chriscase/GrokPtah/issues/274)
+[#273](https://github.com/chriscase/GrokPtah/issues/273), [#274](https://github.com/chriscase/GrokPtah/issues/274),
+[#286](https://github.com/chriscase/GrokPtah/issues/286), [#287](https://github.com/chriscase/GrokPtah/issues/287),
+and [#288](https://github.com/chriscase/GrokPtah/issues/288)
 remain **open** even where substantial code exists. Epic
 [#267](https://github.com/chriscase/GrokPtah/issues/267) checkboxes are stale
-relative to child **state**.
+relative to child **state**. [#288](https://github.com/chriscase/GrokPtah/issues/288)
+is on the mandatory P0 proof list in [`ROADMAP_TO_100.md`](ROADMAP_TO_100.md).
 
 Provider support is capability-based, not model-name based. OpenAI-compatible corporate gateways
 can be evaluated in tiers: coding tools, observation interpretation, semantic action selection,

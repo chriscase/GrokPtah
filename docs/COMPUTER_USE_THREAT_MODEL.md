@@ -56,10 +56,16 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
   until the shared event/approval contract and its threat review are complete. Read-only tools are
   already on main.
 - Keep [#288](https://github.com/chriscase/GrokPtah/issues/288) isolated visual execution disabled
-  until a backend provides a genuinely separate input surface; hidden windows, separate Spaces, and
-  global `CGEvent` injection do not qualify. Foreground activation of a selected window is **not**
-  that isolated surface. Current semantic Computer Use has no raw global mouse injection
-  (`unsupported_pointer_fallback_never_reaches_backend`).
+  until a backend provides a genuinely separate agent-owned input surface that
+  leaves global pointer, keyboard, focus, clipboard, and unrelated apps
+  unaffected, with takeover out-of-band and preemptive. Hidden windows,
+  separate Spaces, and global `CGEvent` injection do not qualify. Isolated
+  visual Computer Use is a **mandatory 100% product exit** and must not be
+  waived as Explicitly unsupported. Foreground activation of a selected window
+  is **not** that isolated surface. Current semantic Computer Use has no raw
+  global mouse injection
+  (`unsupported_pointer_fallback_never_reaches_backend`). Raw **global**
+  injection may remain Explicitly unsupported after isolation ships.
 
 Tier status: [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md). Road to 100%:
 [`ROADMAP_TO_100.md`](ROADMAP_TO_100.md).
