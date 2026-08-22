@@ -106,7 +106,7 @@ certification.
 
 ## What “100%” means (measurable exit)
 
-A 100% claim is allowed only when **all twelve stages below have met their
+A 100% claim is allowed only when **all thirteen stages below have met their
 exits**, and all of the following are true:
 
 1. Every matrix row that this program marks Supported or Experimental has
@@ -159,7 +159,8 @@ exits**, and all of the following are true:
    semantic tier **or** an explicit documented unsupported disposition with
    tests, **and a proven isolated visual backend satisfying [#288](https://github.com/chriscase/GrokPtah/issues/288)**.
    Raw global input remains Explicitly unsupported unless isolation is
-   actually proven **without** global injection.
+   actually proven **without** global injection. Isolated visual for one
+   surface is **not** host-owned inter-agent coordination (stage 13).
 10. Packaged UX and accessibility certification for the Computer cockpit and
     the selected product UX direction ([#273](https://github.com/chriscase/GrokPtah/issues/273),
     [#308](https://github.com/chriscase/GrokPtah/issues/308)) is recorded: a
@@ -170,8 +171,9 @@ exits**, and all of the following are true:
     not the Codex-class core interface. A **recurring expert UI/UX review
     cadence** (stage 10) supplements that one-time acceptance: it is not a
     single pre-release polish pass; it is mechanically gated by the
-    operator-visible change counter and append-only ledger; and it cannot
-    remain Unverified at 100%.
+    operator-visible change counter and append-only ledger; it must review
+    the host-owned inter-agent Computer Use operator projection (stage 13)
+    on the assembled head; and it cannot remain Unverified at 100%.
 11. Operations and release drills have a dated runbook execution covering
     backup/restore, restart, cursor expiry, credential rotation, Computer Use
     Stop / Take over on a packaged identity, upgrade/rollback,
@@ -188,6 +190,16 @@ exits**, and all of the following are true:
     100% claim requires Stage 12.** It cannot be descoped, status-relabeled,
     or marked Explicitly unsupported. Documented non-goal features may
     remain unsupported; this core outcome may not.
+13. **Host-owned inter-agent Computer Use coordination** is proven
+    (stage 13): concurrent Computer Use is supported **only** when N active
+    Agents hold N leases on N host-attested independently isolated surfaces
+    with pairwise-distinct conflict domains, and each capability document
+    proves private framebuffer/input, no global pointer/focus/clipboard
+    effects, exact-current frame fencing, durable dispatch deduplication,
+    and out-of-band cancellation. Foreground-semantic macOS and simulator
+    runs **never** satisfy this. **Any GrokPtah 100% claim requires
+    Stage 13.** It cannot be descoped, status-relabeled, or marked
+    Explicitly unsupported.
 
 Until every item holds, **do not claim 100%.**
 
@@ -237,6 +249,13 @@ Unverified at 100%:**
    Closed [#169](https://github.com/chriscase/GrokPtah/issues/169)
    profiles are not this certification. Cannot be descoped, status-relabeled,
    or marked Explicitly unsupported.
+6. **Host-owned inter-agent Computer Use coordination** (stage 13). Concurrent
+   Computer Use only when N active Agents hold N leases on N host-attested
+   independently isolated surfaces with pairwise-distinct conflict domains.
+   Current foreground-semantic macOS is a singleton host-global-foreground
+   domain (advertised concurrency 1) and does **not** close this. Cannot be
+   descoped, status-relabeled, or marked Explicitly unsupported. **Any
+   GrokPtah 100% claim requires Stage 13.**
 
 **Already forbidden by earlier corrections (preserved):** isolated visual
 Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288)); named
@@ -532,7 +551,11 @@ for a local-only slice, but **release** of the surface as 100% does.
 
 **Exists today:** Experimental foreground semantic CU + cockpit projection
 ([`computerActivity.ts`](../desktop/src/lib/computerActivity.ts)).
-[#286](https://github.com/chriscase/GrokPtah/issues/286) **open**.
+Current foreground-semantic macOS is a **singleton host-global-foreground
+domain** (advertised concurrency **1**): it may activate real apps, has
+**no** independent logical cursor, and takeover is **not** physically
+preemptive. That slice is **not** host-owned inter-agent coordination
+(stage 13). [#286](https://github.com/chriscase/GrokPtah/issues/286) **open**.
 
 **Exit:** every [#286](https://github.com/chriscase/GrokPtah/issues/286)
 acceptance criterion, including: user pointer unchanged; agent cursor only
@@ -582,11 +605,14 @@ a path to 100%.** Required isolation:
 - raw **global** injection remains Explicitly unsupported.
 
 **Must not claim:** isolated visual CU from screenshots of the live desktop,
-foreground `ActivateTarget`, hidden windows, or Spaces.
+foreground `ActivateTarget`, hidden windows, or Spaces. **Must not claim**
+host-owned inter-agent coordination (stage 13) from a single isolated
+surface without N leases on N pairwise-distinct conflict domains.
 
 ## Stage 10 — Packaged UX and accessibility certification
 
-**Depends on:** stages 7–9 for Computer Use UX; stage 4 for hosted/desktop
+**Depends on:** stages 7–9 and 13 for Computer Use UX, including the
+host-owned inter-agent operator projection; stage 4 for hosted/desktop
 shared language.
 
 **Exists today:** UX audit artifacts under `docs/ux-audit/` and
@@ -660,8 +686,10 @@ proof still required.
     explicit PASS/BLOCK disposition.
   - Cover progressive disclosure, information density, navigation/search,
     command/keyboard efficiency, bulk/multi-lane workflows, status/evidence
-    clarity, error/reconnect/quota/authority/permission states, and
-    preservation of advanced functionality.
+    clarity, error/reconnect/quota/authority/permission states,
+    preservation of advanced functionality, and **host-owned inter-agent
+    Computer Use coordination** (leases, conflict domains, absorbing
+    takeover, quarantine, strict public operator projection; stage 13).
   - Accessibility: full keyboard use, focus order/visibility, screen-reader
     labels/status, contrast, zoom/reflow, reduced motion, platform
     conventions.
@@ -676,8 +704,10 @@ proof still required.
 
 **Must not claim:** packaged UX certified from `tauri:dev`, terminal-owned
 TCC grants, or prototype screenshots alone. **Must not claim** the expert
-cadence from a single audit, from mockups of an unintegrated head, or from
-a ledger that omits PASS/BLOCK or the operator-visible change counter.
+cadence from a single audit, from mockups of an unintegrated head, from
+a ledger that omits PASS/BLOCK or the operator-visible change counter, or
+from a cadence that omits the stage 13 inter-agent Computer Use operator
+projection on an assembled head that includes Computer Use.
 
 ## Stage 11 — Operations and release drills
 
@@ -835,6 +865,51 @@ row is **not** certified.
 profiles, from Grok Build routing, from hermetic replay, from a
 single-pass chat on a frontier model, or from an Indeterminate binding.
 
+## Stage 13 — Host-owned inter-agent Computer Use coordination
+
+**Depends on:** stages 7 and 9 (agent-owned isolated surfaces). Stage 8 is
+not a substitute. Durable workload `WorkAttempt` objects on main
+([`DURABLE_WORKLOADS.md`](DURABLE_WORKLOADS.md)) are **not** Computer Use
+surface leases.
+
+**Exists today:** Current foreground-semantic macOS is a **singleton
+host-global-foreground domain** (advertised concurrency **1**). It may
+activate real apps, has **no** independent logical cursor, and takeover
+is **not** physically preemptive. The in-process simulator is not an
+isolated surface. **No** host-attested independently isolated surfaces,
+WorkAttempt-bound CU leases, or pairwise-distinct conflict domains exist
+on main. This row is **not** shipped and **not** certified.
+
+**Exit (all required):**
+
+- Concurrent Computer Use is supported **only** when N active Agents hold
+  N leases on N host-attested independently isolated surfaces with
+  pairwise-distinct conflict domains.
+- Each capability document proves private framebuffer/input, no global
+  pointer/focus/clipboard effects, exact-current frame fencing, durable
+  dispatch deduplication, and out-of-band cancellation.
+- **WorkAttempt-bound** CU leases; per-Agent logical cursor/focus/frame
+  contexts; fair bounded queues with aging/round-robin; priority derived
+  **only** from Work; **one lease per attempt** (deadlock freedom);
+  **absorbing** human takeover; **uncertain-quiescence quarantine**;
+  crash/restart with **no** duplicate physical input and **no** authority
+  transfer; a **strict public operator projection**.
+- **Packaged exact-head hardware evidence** on the reviewed SHA: two
+  isolated app surfaces concurrently; host pointer/focus unchanged;
+  Agent A cannot use B’s context/receipt; same-domain serialization;
+  helper crash/restart; no replay.
+- Foreground-semantic macOS and simulator runs **never** satisfy this
+  isolated multi-agent acceptance.
+- Recurring expert UI/UX cadence (stage 10) must review this operator
+  projection on the assembled head.
+- **Any GrokPtah 100% claim requires this stage.** It cannot be descoped,
+  status-relabeled, or marked Explicitly unsupported.
+
+**Must not claim:** concurrent Computer Use from advertised concurrency 1,
+from `ActivateTarget`, from the simulator, from a single [#288](https://github.com/chriscase/GrokPtah/issues/288)
+surface without N leases, or from workload `WorkAttempt` objects that are
+not CU surface leases.
+
 ## Dependency graph (summary)
 
 ```text
@@ -863,6 +938,9 @@ single-pass chat on a frontier model, or from an Indeterminate binding.
         │              │                     │
         └──────────────┴──────────┬──────────┘
                                   ▼
+         13 host-owned inter-agent CU coordination (mandatory)
+                                  │
+                                  ▼
                  10 packaged UX + #308 acceptance + recurring expert cadence
                                   │
                     ┌─────────────┴──────────────┐
@@ -874,15 +952,19 @@ single-pass chat on a frontier model, or from an Indeterminate binding.
                          trustworthy 100% claim
 ```
 
-Stages 7–9 may be implemented locally after stage 2, but they **do not
+Stages 7–9 and 13 may be implemented locally after stage 2, but they **do not
 count toward 100%** until stages 3–6 and 10–12 are also done. Isolated
-visual (stage 9) has no Explicitly unsupported waiver. Independent
+visual (stage 9) has no Explicitly unsupported waiver. Host-owned
+inter-agent Computer Use coordination (stage 13) has no Explicitly
+unsupported waiver. Independent
 long-running workers (stage 6 / #305) have no descope waiver. Packaged
 core UX (stage 10 / #308) has no Explicitly unsupported waiver for the
 Codex-class interface. Recurring expert UX cadence (stage 10) has no
-one-polish-pass waiver and no vague 2–3-change waiver. The enterprise
+one-polish-pass waiver, no vague 2–3-change waiver, and no omission of the
+stage 13 operator projection. The enterprise
 gateway review lane (stage 12) cannot be descoped, status-relabeled, or
-marked Explicitly unsupported. **Any GrokPtah 100% claim requires Stage 12.**
+marked Explicitly unsupported. **Any GrokPtah 100% claim requires Stage 12
+and Stage 13.**
 
 ## Unverified (explicit)
 
@@ -927,5 +1009,11 @@ still carries them here is invalid.
   profiles and Grok Build routing do not close this. Cannot be descoped,
   status-relabeled, or marked Explicitly unsupported. **Any 100% claim
   requires Stage 12.**
+- Host-owned inter-agent Computer Use coordination (stage 13).
+  **Must not remain Unverified at 100%.** Foreground-semantic macOS
+  (advertised concurrency 1), simulator runs, and a single isolated
+  surface without N leases do not close this. Cannot be descoped,
+  status-relabeled, or marked Explicitly unsupported. **Any 100% claim
+  requires Stage 13.**
 
 See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) for per-row evidence.
