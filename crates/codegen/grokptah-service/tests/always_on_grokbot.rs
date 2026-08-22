@@ -23,7 +23,6 @@ use always_on_support::{
 };
 
 const CUTS: &[&str] = &[
-    "occurrence-reserved",
     "decision-work-persisted",
     "native-intent-persisted",
     "run-submitted",
@@ -200,7 +199,6 @@ async fn tick_twice(client: &mut McpControlClient, session: Uuid, workspace: &Pa
                 Ok(result) => {
                     let text = result.raw.to_string().to_lowercase();
                     if text.contains("conflict") || text.contains("stale") {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
                         continue;
                     }
                     panic!("ptah_tick_manager_plan error: {:?}", result.raw);
@@ -208,7 +206,6 @@ async fn tick_twice(client: &mut McpControlClient, session: Uuid, workspace: &Pa
                 Err(error) => {
                     let text = error.to_string().to_lowercase();
                     if text.contains("conflict") || text.contains("stale") {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
                         continue;
                     }
                     panic!("ptah_tick_manager_plan: {error}");
@@ -763,8 +760,18 @@ fn send_needle_for_cut(cut: &str) -> &'static str {
         "notification-accepted-fence-pending" | "terminal-run-before-settlement" => {
             "GROKBOT_SUCCESS first native unit"
         }
-        "occurrence-reserved" => "GROKBOT_FORCE_FAIL",
         _ => "GROKBOT_SUCCESS",
+    }
+}
+
+fn send_count_for_cut(provider: &FakeProvider, cut: &str) -> u64 {
+    let needle = send_needle_for_cut(cut);
+    match cut {
+        "decision-work-persisted"
+        | "native-intent-persisted"
+        | "run-submitted"
+        | "directive-proposed" => provider.sends_matching(needle),
+        _ => provider.sends_matching_execution(needle),
     }
 }
 
@@ -1117,6 +1124,41 @@ async fn autonomous_lifecycle_reaches_succeeded_without_duplicate_sends() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn occurrence_is_not_a_public_mcp_field() {
+    let _serial = serial_lock();
+    let provider = FakeProvider::start();
+    let service = ServiceProcess::spawn(&provider.base_url);
+    let mut client = mcp(&service.addr).await;
+    let (session, agent_id, _setup) = bootstrap_agent(&mut client, &service.workspace).await;
+    let plan_id = create_plan(&mut client, session, &service.workspace, &agent_id).await;
+    let plan = call(
+        &mut client,
+        "ptah_get_manager_plan",
+        json!({
+            "session_id": session,
+            "workspace": &service.workspace,
+            "plan_id": plan_id
+        }),
+    )
+    .await;
+    let work = list_work(&mut client, session, &service.workspace).await;
+    assert!(
+        !plan_projects_occurrence(&plan),
+        "ptah_get_manager_plan must not project occurrence at 67e29bd: {plan}"
+    );
+    assert_eq!(
+        work_kind_count(&work, "manager-decision"),
+        0,
+        "fresh plan must not already have decision Work: {work}"
+    );
+    let encoded = format!("{plan}{work}");
+    assert!(
+        !encoded.contains("occurrenceId") && !encoded.contains("occurrence_id"),
+        "occurrence must not appear on public MCP at this SHA: {encoded}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
     let _serial = serial_lock();
     for cut in CUTS {
@@ -1196,12 +1238,6 @@ async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
                 }),
             )
             .await;
-            if *cut == "occurrence-reserved" {
-                assert!(
-                    !plan_projects_occurrence(&before_plan),
-                    "occurrence-reserved proxy is not a public occurrence field: {before_plan}"
-                );
-            }
             let before_work = list_work(&mut client, session, &service.workspace).await;
             let before_detail = focal_work_detail(
                 &mut client,
@@ -1216,8 +1252,6 @@ async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
                 .as_ref()
                 .map(linked_run_ids)
                 .unwrap_or_default();
-            let needle = send_needle_for_cut(cut);
-            let before_sends = provider.sends_matching(needle);
             let before = collect_identity(
                 &mut client,
                 session,
@@ -1241,6 +1275,7 @@ async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
             .await;
             let post_respawn_runs = list_runs(&mut client, session, &service.workspace).await;
             assert_no_uncertain_resume(&post_respawn_runs);
+            let reopen_sends = send_count_for_cut(&provider, cut);
             tick_twice(&mut client, session, &service.workspace, &plan_id).await;
             let after_plan = call(
                 &mut client,
@@ -1270,7 +1305,7 @@ async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
                 provider.send_count(),
             )
             .await;
-            let after_sends = provider.sends_matching(needle);
+            let after_sends = send_count_for_cut(&provider, cut);
             assert_no_uncertain_resume(&list_runs(&mut client, session, &service.workspace).await);
             tick_twice(&mut client, session, &service.workspace, &plan_id).await;
             let again_plan = call(
@@ -1301,7 +1336,7 @@ async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
                 provider.send_count(),
             )
             .await;
-            let again_sends = provider.sends_matching(needle);
+            let again_sends = send_count_for_cut(&provider, cut);
             assert_exact_after_restart(&before, &after, &again, cut);
             assert_focal_after_restart(
                 cut,
@@ -1311,7 +1346,7 @@ async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
                 &before_links,
                 after_detail.as_ref(),
                 again_detail.as_ref(),
-                before_sends,
+                reopen_sends,
                 after_sends,
                 again_sends,
             );

@@ -102,6 +102,15 @@ impl FakeProvider {
             .filter(|content| content.contains(needle))
             .count() as u64
     }
+
+    pub fn sends_matching_execution(&self, needle: &str) -> u64 {
+        self.last_user_contents()
+            .iter()
+            .filter(|content| {
+                content.contains(needle) && !content.contains("Return exactly this JSON envelope")
+            })
+            .count() as u64
+    }
 }
 
 fn read_http_message(stream: &mut TcpStream) -> Option<(String, String)> {

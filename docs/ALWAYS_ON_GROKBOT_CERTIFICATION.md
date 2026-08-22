@@ -38,21 +38,20 @@ Generated reports stay under the output path and are not committed. Redaction: t
 
 ## Restart cut points
 
-The service test kills and relaunches the same binary against the same runtime home at:
+The service test kills and relaunches the same binary against the same runtime home at these **public MCP** cuts:
 
-1. `occurrence-reserved`
-2. `decision-work-persisted`
-3. `native-intent-persisted`
-4. `run-submitted`
-5. `directive-proposed`
-6. `orchestration-mutation-persisted`
-7. `decision-applied-pending`
-8. `notification-accepted-fence-pending`
-9. `terminal-run-before-settlement`
+1. `decision-work-persisted`
+2. `native-intent-persisted`
+3. `run-submitted`
+4. `directive-proposed`
+5. `orchestration-mutation-persisted`
+6. `decision-applied-pending`
+7. `notification-accepted-fence-pending`
+8. `terminal-run-before-settlement`
 
-Each cut is a unique public MCP state (not “or succeeded”). After reopen: drive `ptah_tick_manager_plan` twice **immediately** (no settle-to-done wait). Assert cut-specific identities: the same decision `workId` when one existed, that work’s `linkedRunIds.len()==1` when a Run was already linked, and the same provider send count for that attempt. Interrupted runs must project `usagePendingRequests=0` on the post-respawn snapshot, before any quiet wait.
+Each of those eight is a unique public MCP state (not “or succeeded”). After reopen: drive `ptah_tick_manager_plan` twice **immediately** (no settle-to-done wait). Assert cut-specific identities: the same decision `workId` when one existed, that work’s `linkedRunIds.len()==1` when a Run was already linked, and the same provider send count for that attempt. Interrupted runs must project `usagePendingRequests=0` on the post-respawn snapshot, before any quiet wait.
 
-`occurrence-reserved` is **not** a public MCP field at `67e29bd` (`ptah_get_manager_plan` does not project `occurrenceId` / `ManagerDecisionRecord`; occurrence and decision Work are written together). The campaign records that missing seam rather than treating “failed native run and zero decision Work” as the occurrence.
+`occurrence-reserved` is **not** claimed as a restart cut. At `67e29bd` it is not a public MCP field (`ptah_get_manager_plan` does not project `occurrenceId` / `ManagerDecisionRecord`; occurrence and decision Work are one store write). The campaign **STOPs** that named cut at the missing public seam.
 
 A bounded `/ready` poll is used after spawn. That is readiness, not a test `sleep`. Native executor and manager supervisor intervals are production (1s / 2s); tests poll MCP rather than injecting a fake clock (no public seam exists to inject `FakeClock` into the standalone process).
 
