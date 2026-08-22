@@ -56,6 +56,58 @@ use super::workload::{
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
 
+fn validate_provider_route_capabilities(
+    route: &super::types::ProviderRouteSnapshot,
+    purpose: RunPurpose,
+    stale_measured_qualification: bool,
+) -> Result<(), OrchError> {
+    route.validate()?;
+    if route.capabilities.source == crate::gateway_config::CapabilitySource::Unknown {
+        return Err(OrchError::new(
+            OrchErrorCode::Conflict,
+            "provider route must be qualified or explicitly declared before autonomous admission",
+        ));
+    }
+    if !route.capabilities.chat {
+        return Err(OrchError::new(
+            OrchErrorCode::Conflict,
+            "provider qualification does not allow chat generation",
+        ));
+    }
+    if purpose == RunPurpose::Execution {
+        if stale_measured_qualification
+            && route.capabilities.source == crate::gateway_config::CapabilitySource::Declared
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider qualification changed; requalify before autonomous execution",
+            ));
+        }
+        if !route.capabilities.tools {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider qualification does not allow native coding tools",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_route_for_purpose(
+    route: &super::types::ProviderRouteSnapshot,
+    purpose: RunPurpose,
+) -> Result<(), OrchError> {
+    let stale_measured_qualification =
+        crate::gateway_config::has_measured_xai_qualification(&route.provider_id, &route.model_id)
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "provider qualification ledger is unavailable",
+                )
+            })?;
+    validate_provider_route_capabilities(route, purpose, stale_measured_qualification)
+}
+
 fn provider_projection_error(_error: anyhow::Error) -> OrchError {
     OrchError::new(
         OrchErrorCode::Internal,
@@ -7035,6 +7087,11 @@ impl OrchestrationService {
         }
 
         let agent_spec_revision = agent_spec.revision;
+        let run_purpose = if proposal_only {
+            RunPurpose::ManagerProposal
+        } else {
+            RunPurpose::Execution
+        };
         let mut provider_route = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
             None
         } else {
@@ -7055,12 +7112,16 @@ impl OrchestrationService {
                     })?,
             )
         };
+        if let Some(route) = provider_route.as_ref() {
+            validate_provider_route_for_purpose(route, run_purpose)
+                .map_err(|error| self.fail_claim(&mut lease, None, session_id, &claimed, error))?;
+        }
 
         // Give older queued work first claim on any newly available capacity.
         self.pump_pending();
         let run_id = Uuid::new_v4().to_string();
         if let Some(route) = provider_route.take() {
-            let quota_class = if proposal_only {
+            let quota_class = if run_purpose == RunPurpose::ManagerProposal {
                 QuotaClass::ManagerProposal
             } else {
                 QuotaClass::CodingExecution
@@ -7112,11 +7173,7 @@ impl OrchestrationService {
             } else {
                 RunState::Running
             },
-            purpose: if proposal_only {
-                RunPurpose::ManagerProposal
-            } else {
-                RunPurpose::Execution
-            },
+            purpose: run_purpose,
             provider_route,
             agent_id: Some(agent.agent_id),
             retry_of: retry_of.map(str::to_string),
@@ -8230,5 +8287,87 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | SteeringInjected { session_id, .. }
         | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
+    }
+}
+
+#[cfg(test)]
+mod provider_route_policy_tests {
+    use super::*;
+    use crate::gateway_config::{
+        CapabilitySource, ModelCapabilities, ProviderDeadlineClass, ProviderDialect, ProviderKind,
+        CAPABILITY_QUALIFICATION_SCHEMA,
+    };
+    use crate::types::EffortLevel;
+
+    fn route(
+        source: CapabilitySource,
+        chat: bool,
+        tools: bool,
+    ) -> super::super::types::ProviderRouteSnapshot {
+        super::super::types::ProviderRouteSnapshot {
+            schema_version: super::super::types::PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+            provider_id: "env-grokptah".into(),
+            model_id: "policy-model".into(),
+            wire_model_id: "policy-model".into(),
+            selection_key: crate::gateway_config::model_selection_key(
+                "env-grokptah",
+                "policy-model",
+            ),
+            kind: ProviderKind::OpenAiCompatible,
+            dialect: ProviderDialect::OpenAiChatCompletions,
+            base_url: "http://127.0.0.1:41111/v1".into(),
+            endpoint_fingerprint: String::new(),
+            credential_ref: "env:GROKPTAH_API_KEY".into(),
+            credential_fingerprint: "v1-sha256:policy-credential".into(),
+            capabilities: ModelCapabilities {
+                chat,
+                tools,
+                source,
+                qualification_schema: (source == CapabilitySource::Measured)
+                    .then(|| CAPABILITY_QUALIFICATION_SCHEMA.into()),
+                ..ModelCapabilities::default()
+            },
+            deadline_class: ProviderDeadlineClass::Standard,
+            effort: EffortLevel::Medium,
+            qualification_record_id: None,
+            quota_class: None,
+            quota_reservation_id: None,
+            snapshot_hash: String::new(),
+        }
+        .seal()
+        .unwrap()
+    }
+
+    #[test]
+    fn unknown_capabilities_never_enter_autonomous_runs() {
+        let route = route(CapabilitySource::Unknown, true, true);
+        for purpose in [RunPurpose::Execution, RunPurpose::ManagerProposal] {
+            let error = validate_provider_route_capabilities(&route, purpose, false).unwrap_err();
+            assert_eq!(error.code, OrchErrorCode::Conflict);
+            assert!(error.message.contains("qualified or explicitly declared"));
+        }
+    }
+
+    #[test]
+    fn stale_measured_history_blocks_declared_execution_but_not_chat_only_proposals() {
+        let route = route(CapabilitySource::Declared, true, true);
+        validate_provider_route_capabilities(&route, RunPurpose::Execution, false).unwrap();
+        let error =
+            validate_provider_route_capabilities(&route, RunPurpose::Execution, true).unwrap_err();
+        assert!(error.message.contains("requalify"));
+        validate_provider_route_capabilities(&route, RunPurpose::ManagerProposal, true).unwrap();
+    }
+
+    #[test]
+    fn execution_requires_measured_or_declared_coding_tools_while_proposals_need_chat_only() {
+        let chat_only = route(CapabilitySource::Measured, true, false);
+        validate_provider_route_capabilities(&chat_only, RunPurpose::ManagerProposal, false)
+            .unwrap();
+        let error = validate_provider_route_capabilities(&chat_only, RunPurpose::Execution, false)
+            .unwrap_err();
+        assert!(error.message.contains("native coding tools"));
+
+        let coding = route(CapabilitySource::Measured, true, true);
+        validate_provider_route_capabilities(&coding, RunPurpose::Execution, false).unwrap();
     }
 }

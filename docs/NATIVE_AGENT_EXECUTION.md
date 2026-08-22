@@ -114,6 +114,26 @@ counts. Home-wide pressure is visible without that disclosure through
 The ceiling is a host constant in this slice. Making it operator-configurable
 per deployment is deliberate follow-up work, not part of this contract.
 
+### Capability and purpose gate
+
+Online autonomous admission validates the frozen route before it reserves
+quota or creates a Run. Unknown capability records are refused. Execution Runs
+require chat generation and native coding-tool capability; ManagerProposal
+Runs require chat generation but do not require tool capability because the
+host denies every tool for that purpose.
+
+Declared capability records remain usable before a model's first measured
+qualification, preserving the existing compatible-provider first-run path.
+For host-managed xAI, however, any prior measured record is a downgrade fence:
+if an endpoint or credential change causes the same model to fall back to
+declared tools, new Execution admission fails and requires requalification.
+The old measurement is never borrowed by the new route or credential.
+
+The proposal boundary is enforced from the durable Run purpose during the
+real native admission lifecycle. Ambient bypass settings and a permissive
+Agent policy cannot turn a ManagerProposal tool request into a mutation or an
+approval prompt; the model receives a host-authored denial as tool output.
+
 ### Durable provider quota
 
 Online native Runs also reserve a durable, provider-neutral quota row before

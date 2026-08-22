@@ -18,7 +18,7 @@ use grokptah_agent_bridge::{
 };
 use serde_json::json;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::Semaphore;
@@ -601,6 +601,52 @@ async fn blocking_provider(State(state): State<BlockingProviderState>) -> Json<s
     }))
 }
 
+#[derive(Clone)]
+struct ProposalProviderState {
+    requests: Arc<AtomicUsize>,
+    saw_host_denial: Arc<AtomicBool>,
+}
+
+async fn proposal_only_provider(
+    State(state): State<ProposalProviderState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let request = state.requests.fetch_add(1, Ordering::SeqCst);
+    let message = if request == 0 {
+        json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "proposal-write",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": "{\"path\":\"proposal-escape.txt\",\"content\":\"must never be written\\n\"}"
+                }
+            }]
+        })
+    } else {
+        let saw_denial = body["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "proposal-write"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("DENIED by deny rule"))
+            })
+        });
+        state.saw_host_denial.store(saw_denial, Ordering::SeqCst);
+        json!({"content": "No safe mutation was performed; returning a proposal only."})
+    };
+    Json(json!({
+        "choices": [{"message": message}],
+        "usage": {
+            "prompt_tokens": 6,
+            "completion_tokens": 4,
+            "total_tokens": 10
+        }
+    }))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
@@ -854,8 +900,58 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn manager_decision_native_admission_has_durable_proposal_purpose() {
-    let (_env, _home, _workspace, _host, orch, session, agent_id, workspace_text) =
-        boot_native(false).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let saw_host_denial = Arc::new(AtomicBool::new(false));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(proposal_only_provider))
+        .with_state(ProposalProviderState {
+            requests: requests.clone(),
+            saw_host_denial: saw_host_denial.clone(),
+        });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.remove("GROKPTAH_AGENT_OFFLINE");
+    env.set("GROKPTAH_API_BASE", format!("http://{address}/v1"));
+    env.set("GROKPTAH_API_KEY", "synthetic-proposal-key");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.set_model(model_selection_key("env-grokptah", "proposal-model"));
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let agent = host.ensure_session_agent(lane.id).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orchestration")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let session = lane.id;
+    let agent_id = agent.agent_id;
+    let workspace_text = workspace.path().display().to_string();
+    orch.set_managed_execution(
+        &auth(),
+        session,
+        workspace.path(),
+        &agent_id,
+        retry_policy(false),
+    )
+    .unwrap();
     let mut work = WorkItem::new(
         "manager-decision",
         "return exactly one typed manager directive envelope",
@@ -926,6 +1022,12 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
         intent.effective_provider_id().as_deref(),
         Some(admitted_spec.model.provider_id.as_str())
     );
+    assert_eq!(
+        run.provider_route
+            .as_ref()
+            .and_then(|route| route.quota_class),
+        Some(QuotaClass::ManagerProposal)
+    );
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
@@ -937,8 +1039,21 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
         run = orch.store().load_run(&run_id).unwrap().unwrap();
     }
     assert!(run.state.is_terminal(), "proposal Run did not settle");
+    orch.drive_native_executor_once().await;
     let agent = orch.store().load_agent(&agent_id).unwrap().unwrap();
     assert_ne!(agent.current_run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert!(saw_host_denial.load(Ordering::SeqCst));
+    assert!(!workspace.path().join("proposal-escape.txt").exists());
+    assert_eq!(run.aggregates.permissions_requested, 0);
+    assert_eq!(run.aggregates.permissions_granted, 0);
+    let events = host
+        .event_bus()
+        .read_range_all(0, None, Some(session))
+        .unwrap();
+    assert!(!events
+        .iter()
+        .any(|entry| matches!(&entry.update, SessionUpdate::PermissionRequired { .. })));
 
     orch.store()
         .update_run(&run_id, |run| {
@@ -968,6 +1083,8 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     assert!(retry.message.contains("cannot be retried"));
 
     orch.stop_background_tasks().await;
+    host.stop().unwrap();
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
