@@ -52,6 +52,13 @@ jobs:
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
         with:
           version: "v0.16.0"
+      - name: Install Linux keyring build deps
+        # The bridge's keyring crate needs libdbus on Ubuntu. Desktop CI is
+        # macOS and does not substitute for this hosted-service job.
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - name: Format, clippy, and complete hosted-service tests
         # Always run this crate's own suite. Compiling the bridge in another
         # workflow is not a substitute for hosted-service tests.
