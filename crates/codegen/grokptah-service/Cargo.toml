@@ -15,7 +15,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 [dev-dependencies]
 chrono = { version = "0.4", features = ["clock"] }
 dunce = "1"
+grokptah-test-gateway = { path = "../grokptah-agent-bridge/test-support/grokptah-test-gateway" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
 tempfile = "3"
+# test-util enables paused logical time for shared_black_box_v1 (no wall-clock sleeps).
+tokio = { version = "1", features = ["macros", "rt", "time", "test-util"] }
 uuid = { version = "1", features = ["v4"] }
