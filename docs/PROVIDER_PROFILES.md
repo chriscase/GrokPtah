@@ -6,11 +6,15 @@ reference, model inventory, request budget, and capability record. Routing and
 authentication are resolved together in the native host.
 
 Grok Build session/gateway **routing is Supported** (`~/.grok/auth.json` /
-OIDC and optional API key). Complete quota observability and exact live
-certification are distinct questions. GrokPtah does not synchronize a Grok
-Build account balance. A local durable host quota ledger and the Native
-Coding Readiness Center are **Pending — not shipped** on
-[PR #352](https://github.com/chriscase/GrokPtah/pull/352). Status:
+OIDC, optional API key, and optional `GROKPTAH_TOKEN_COMMAND`). Executable
+xAI credential order is `XAI_API_KEY`, OS keychain API key,
+`GROKPTAH_TOKEN_COMMAND`, then the Grok Build session
+(`auth_store.rs` `resolve_xai_credentials`). Compatible gateway requests
+consume provider quota. GrokPtah does not synchronize a Grok Build account
+balance. Exact live certification is a distinct question. A local durable
+host quota ledger and the Native Coding Readiness Center are **Pending — not
+shipped** on [PR #352](https://github.com/chriscase/GrokPtah/pull/352).
+Stage 1 cannot pass while that PR remains draft. Status:
 [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md).
 
 ## Configure a provider
@@ -60,7 +64,7 @@ the selected model's measured tier; local one-use approval is still required for
 The built-in xAI route is also resolved as a provider profile, but that profile is synthesized and
 owned by the host rather than stored in `gateway.json`. The reserved `xai` ID cannot be created,
 renamed, edited, or deleted by users. Its endpoint, catalog-to-wire model mapping, effort values,
-deadline, and API-key or Grok Build OIDC credentials use the same profile-shaped routing path as
+deadline, and API-key, `GROKPTAH_TOKEN_COMMAND`, or Grok Build OIDC credentials use the same profile-shaped routing path as
 compatible providers. `XAI_API_BASE` remains the explicit endpoint override.
 
 Built-in xAI models follow the same behavioral qualification proof. Measured capabilities are stored
@@ -120,10 +124,11 @@ does not combine one profile's endpoint with another profile's credential.
   credential mode, or durable principal fails the qualification instead of continuing on a stale
   route. Compatible-provider behavior is unchanged.
 - Model-list capability projection resolves the current xAI credential route once from the same live
-  environment, keychain, or Grok Build session source used by execution; cached UI auth state is not
+  environment, keychain, `GROKPTAH_TOKEN_COMMAND`, or Grok Build session source used by execution; cached UI auth state is not
   an authority source.
 - Malformed existing profile configuration is never silently replaced.
 
-The built-in xAI profile retains its existing API-key and Grok Build OIDC
-refresh/header behavior. That is routing, not a passed live-certification
-campaign and not a Grok Build account-balance feed.
+The built-in xAI profile retains its existing API-key, `GROKPTAH_TOKEN_COMMAND`,
+and Grok Build OIDC refresh/header behavior. That is routing, not a passed
+live-certification campaign and not a Grok Build account-balance feed.
+Compatible gateway requests still consume provider quota.
