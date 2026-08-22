@@ -25,8 +25,10 @@
 //! Main golden production (never by the PR-head run, never by rewriting
 //! expected-main from a PR result):
 //! 1. Detach a worktree at exact `67e29bd34dc64049432c715c93c2cef2185c63ea`.
-//! 2. Overlay only the allowlisted fixture files. On main `tests/common/mod.rs`
-//!    add `pub mod shared_black_box_v1;` only — do not copy PR-head `mod.rs`.
+//! 2. Overlay only the allowlisted fixture files. Overlay
+//!    `tests/shared_black_box_v1.rs` which loads this driver via `#[path]`.
+//!    Do not add this driver to main's `tests/common/mod.rs` — that compiles
+//!    it into unrelated integration targets.
 //! 3. Overlay this crate's `Cargo.toml` dev-deps (`grokptah-test-gateway`,
 //!    tokio `test-util`). Let the worktree refresh its own lockfile.
 //! 4. `CARGO_TARGET_DIR=/tmp/sbb-main-target cargo test --manifest-path
@@ -489,6 +491,21 @@ async fn run_v1(
 
     let mut hits = Vec::new();
     let mut launched = start_endpoint(kind, &home, &workspace, &token).await;
+    let gateway_http_before_auth = gateway.requests().len();
+    let workspace_files_before_auth = workspace_entry_count(&workspace);
+    assert_mcp_auth_zero_side_effects(&launched.addr, &token).await;
+    assert_eq!(
+        gateway.requests().len(),
+        gateway_http_before_auth,
+        "{} missing/wrong MCP auth must not send provider HTTP",
+        kind.as_str()
+    );
+    assert_eq!(
+        workspace_entry_count(&workspace),
+        workspace_files_before_auth,
+        "{} missing/wrong MCP auth must not write workspace files",
+        kind.as_str()
+    );
     initialize_mcp(&mut launched).await;
     let (result, mut launched, defects) = {
         let mut scan = |value: &Value, origin: &str| {
@@ -727,6 +744,96 @@ async fn restart_endpoint(
     next
 }
 
+async fn settle_native(scenario: &Scenario) {
+    for _ in 0..8 {
+        tokio::time::advance(Duration::from_millis(scenario.native_ms())).await;
+        yield_budget(scenario.yields() as usize).await;
+    }
+}
+
+async fn assert_mcp_auth_zero_side_effects(addr: &str, valid_token: &str) {
+    let missing = probe_mcp_initialize(addr, None).await;
+    assert_auth_rejected(&missing, "missing bearer");
+    let wrong = probe_mcp_initialize(addr, Some("sbb-v1-wrong-bearer-not-the-secret")).await;
+    assert_auth_rejected(&wrong, "wrong bearer");
+    let valid_len = valid_token.len();
+    assert!(valid_len > 16, "fixture bearer must be a real secret");
+}
+
+struct AuthProbe {
+    status: u16,
+    body: Option<Value>,
+}
+
+fn assert_auth_rejected(probe: &AuthProbe, label: &str) {
+    let code = probe
+        .body
+        .as_ref()
+        .and_then(|body| body.pointer("/error/data/code"))
+        .and_then(Value::as_str);
+    let unauthenticated = probe.status == 401
+        || code == Some("unauthenticated")
+        || probe
+            .body
+            .as_ref()
+            .and_then(|body| body.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.to_ascii_lowercase().contains("unauthenticated"));
+    assert!(
+        unauthenticated,
+        "{label} must fail closed without a session: status={} body={:?}",
+        probe.status, probe.body
+    );
+}
+
+async fn probe_mcp_initialize(base: &str, bearer: Option<&str>) -> AuthProbe {
+    let mut req = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("auth probe client")
+        .post(format!("{}/mcp", base.trim_end_matches('/')))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-03-26")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": { "name": "sbb-v1-auth-probe", "version": "0" }
+            }
+        }));
+    if let Some(token) = bearer {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = req.send().await.expect("auth probe request");
+    let status = resp.status().as_u16();
+    let body = resp.json::<Value>().await.ok();
+    AuthProbe { status, body }
+}
+
+fn workspace_entry_count(workspace: &Path) -> usize {
+    fn walk(path: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| {
+                let child = entry.path();
+                if child.is_dir() {
+                    walk(&child)
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+    walk(workspace)
+}
+
 async fn initialize_mcp(launched: &mut Launched) {
     yield_budget(16).await;
     launched
@@ -738,6 +845,7 @@ async fn initialize_mcp(launched: &mut Launched) {
 
 type ScanFn<'a> = dyn FnMut(&Value, &str) + 'a;
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_six_phases(
     kind: EndpointKind,
     scenario: &Scenario,
@@ -1310,10 +1418,9 @@ async fn drive_six_phases(
     let stall_held_after_accept = restart_http_before == 1;
 
     launched = restart_endpoint(kind, launched, home, workspace, token).await;
-    for _ in 0..8 {
-        tokio::time::advance(Duration::from_millis(scenario.native_ms())).await;
-        yield_budget(scenario.yields() as usize).await;
-    }
+    settle_native(scenario).await;
+    launched = restart_endpoint(kind, launched, home, workspace, token).await;
+    settle_native(scenario).await;
 
     let post1 = require!(
         restart_observation(
@@ -1418,6 +1525,7 @@ async fn drive_six_phases(
     let restart_queued = restart_work_row.get("state").and_then(Value::as_str) == Some("queued");
     let restart_provider_attempts =
         u64_or_absent(post1["getRun"].pointer("/providerExecution/attemptCount"));
+    let restart_tuple = restart_tuple_links(&post1, &restart_work_id);
 
     let ordinary = json!({
         "work": 1,
@@ -1453,7 +1561,8 @@ async fn drive_six_phases(
         "http": restart_http_after,
         "queued": restart_queued,
         "stallHeldAfterAccept": stall_held_after_accept,
-        "httpBeforeStop": restart_http_before
+        "httpBeforeStop": restart_http_before,
+        "tuple": restart_tuple["tuple"].clone()
     });
 
     push_mismatch(
@@ -1578,6 +1687,13 @@ async fn drive_six_phases(
         &restart_obs["quotaState"],
         json!("reserved"),
     );
+    if let Some(link_errors) = restart_tuple["errors"].as_array() {
+        for error in link_errors {
+            if let Some(text) = error.as_str() {
+                defects.push(text.to_string());
+            }
+        }
+    }
     let leak_paths = leak_paths(&post1["getRun"]);
     if !leak_paths.is_empty() {
         defects.push(format!(
@@ -1918,6 +2034,7 @@ async fn wait_run_terminal(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_work_state(
     launched: &mut Launched,
     scenario: &Scenario,
@@ -2092,31 +2209,126 @@ async fn wake_manager_plan(
     .await;
 }
 
-fn run_id_for_work(runs: &Value, intents: &Value, work_id: &str) -> Result<String, ToolFail> {
-    if let Some(id) = intents["intents"].as_array().and_then(|items| {
-        items.iter().find_map(|intent| {
-            if intent["workId"] == work_id {
-                intent["runId"].as_str().map(str::to_string)
-            } else {
-                None
-            }
-        })
-    }) {
-        return Ok(id);
-    }
-    runs["runs"]
+fn run_id_for_work(_runs: &Value, intents: &Value, work_id: &str) -> Result<String, ToolFail> {
+    let ids: Vec<String> = intents["intents"]
         .as_array()
-        .and_then(|items| {
-            items
-                .iter()
-                .rev()
-                .find_map(|run| run["runId"].as_str().map(str::to_string))
-        })
-        .ok_or_else(|| ToolFail {
-            tool: "ptah_list_runs".into(),
+        .into_iter()
+        .flatten()
+        .filter(|intent| intent["workId"] == work_id)
+        .filter_map(|intent| intent["runId"].as_str().map(str::to_string))
+        .filter(|id| !id.is_empty())
+        .collect();
+    match ids.as_slice() {
+        [id] => Ok(id.clone()),
+        [] => Err(ToolFail {
+            tool: "ptah_list_execution_intents".into(),
             mcp_code: None,
-            detail: format!("run id for work {work_id} was not advertised"),
-        })
+            detail: format!("run id for work {work_id} was not advertised on its intent"),
+        }),
+        _ => Err(ToolFail {
+            tool: "ptah_list_execution_intents".into(),
+            mcp_code: None,
+            detail: format!(
+                "work {work_id} advertised {} run ids on intents; expected exactly one",
+                ids.len()
+            ),
+        }),
+    }
+}
+
+fn restart_tuple_links(post: &Value, restart_work_id: &str) -> Value {
+    let mut errors: Vec<String> = Vec::new();
+    let work_id = post["work"]["work"]["workId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let attempts = post["work"]["attempts"].as_array();
+    let attempt = attempts.and_then(|items| items.first());
+    let attempt_id = attempt
+        .and_then(|row| row["attemptId"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let linked_run_ids = attempt
+        .and_then(|row| row["linkedRunIds"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    let matching_intents: Vec<&Value> = post["intents"]["intents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|intent| intent["workId"] == restart_work_id)
+        .collect();
+    let intent = matching_intents.first().copied();
+    let intent_id = intent
+        .and_then(|row| row["intentId"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let intent_attempt_id = intent
+        .and_then(|row| row["attemptId"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let intent_run_id = intent
+        .and_then(|row| row["runId"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let run_id = post["getRun"]["runId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let provider_attempt_id = post["getRun"]
+        .pointer("/providerExecution/attempts/0/attemptId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let reservation_id = post["getRun"]
+        .pointer("/providerExecution/quota/reservationId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if work_id != restart_work_id {
+        errors.push(format!(
+            "restart.tuple.workId: actual={work_id} expected={restart_work_id}"
+        ));
+    }
+    if matching_intents.len() != 1 {
+        errors.push(format!(
+            "restart.tuple.intent: expected exactly one intent, saw {}",
+            matching_intents.len()
+        ));
+    }
+    if attempt_id.is_empty() || intent_attempt_id != attempt_id {
+        errors.push(format!(
+            "restart.tuple.attemptId: work={attempt_id} intent={intent_attempt_id}"
+        ));
+    }
+    if intent_run_id.is_empty() || intent_run_id != run_id {
+        errors.push(format!(
+            "restart.tuple.runId: intent={intent_run_id} getRun={run_id}"
+        ));
+    }
+    let linked = linked_run_ids
+        .iter()
+        .any(|id| id.as_str() == Some(run_id.as_str()));
+    if !linked {
+        errors.push(format!("restart.tuple.linkedRunIds missing run {run_id}"));
+    }
+    if provider_attempt_id.is_empty() {
+        errors.push("restart.tuple.providerAttemptId missing".into());
+    }
+    if reservation_id.is_empty() {
+        errors.push("restart.tuple.reservationId missing".into());
+    }
+    json!({
+        "tuple": {
+            "workId": work_id,
+            "attemptId": attempt_id,
+            "intentId": intent_id,
+            "runId": run_id,
+            "providerAttemptId": provider_attempt_id,
+            "reservationId": reservation_id
+        },
+        "errors": errors
+    })
 }
 
 fn extract_json_object_after<'a>(haystack: &'a str, marker: &str) -> Option<&'a str> {
@@ -2196,6 +2408,7 @@ fn collect_leak_paths(value: &Value, path: &str, out: &mut Vec<String>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_raw(
     value: &Value,
     origin: &str,
@@ -2222,6 +2435,7 @@ fn scan_raw(
     hits.append(&mut ctx.hits);
 }
 
+#[allow(clippy::only_used_in_recursion)]
 fn walk_scan(value: &Value, path: &str, ctx: &mut ScanCtx<'_>) {
     match value {
         Value::Object(map) => {
@@ -2362,7 +2576,7 @@ fn visit_strings(value: &mut Value, edit: &mut dyn FnMut(&str) -> String) {
     }
 }
 
-fn strip_ephemerals(value: &mut Value, key: Option<&str>) {
+fn strip_ephemerals(value: &mut Value, _key: Option<&str>) {
     match value {
         Value::Object(map) => {
             let keys: Vec<String> = map.keys().cloned().collect();
@@ -2378,7 +2592,7 @@ fn strip_ephemerals(value: &mut Value, key: Option<&str>) {
         }
         Value::Array(items) => {
             for child in items {
-                strip_ephemerals(child, key);
+                strip_ephemerals(child, _key);
             }
         }
         _ => {}
@@ -2426,18 +2640,16 @@ fn collect_ids(value: &Value, key: Option<&str>, canon: &mut IdCanon) {
         Value::Array(items) => {
             let mut items = items.clone();
             if key.is_some_and(is_set_array_key) {
-                items.sort_by_key(|item| canonical_sort_key(item));
+                items.sort_by_key(canonical_sort_key);
             }
             for child in &items {
                 collect_ids(child, key, canon);
             }
         }
         Value::String(text) => {
-            if should_canonicalize(key, text) {
-                if !canon.map.contains_key(text) {
-                    let next = format!("$ID_{}", canon.map.len() + 1);
-                    canon.map.insert(text.clone(), next);
-                }
+            if should_canonicalize(key, text) && !canon.map.contains_key(text) {
+                let next = format!("$ID_{}", canon.map.len() + 1);
+                canon.map.insert(text.clone(), next);
             }
             for captured in find_generated_ids(text) {
                 if !canon.map.contains_key(&captured) {
@@ -2857,9 +3069,7 @@ fn display_path(path: &str) -> String {
 }
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .canonicalize()
+    dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.."))
         .expect("canonicalize repo root")
 }
 
@@ -3397,10 +3607,133 @@ fn expected_main_golden_is_immutable_for_audited_revision() {
         loaded.get("overlay").is_none(),
         "main golden is a complete overlay run, not a handwritten blocker"
     );
-    assert_eq!(
-        loaded["features"]["nativeCodingReadiness"]["support"],
-        json!("absent")
-    );
     assert!(loaded.get("observations").is_some());
     assert!(loaded.get("assertions").is_some());
+    assert!(
+        loaded
+            .get("assertions")
+            .and_then(Value::as_object)
+            .is_some(),
+        "main expectations are the source-typed overlay result, not an absent-metadata stub"
+    );
+}
+
+#[test]
+fn run_id_for_work_does_not_guess_the_newest_run() {
+    let runs = json!({
+        "runs": [{ "runId": "older-run" }, { "runId": "newest-run" }]
+    });
+    let intents = json!({
+        "intents": [{ "workId": "other-work", "runId": "newest-run" }]
+    });
+    let error = run_id_for_work(&runs, &intents, "wanted-work").expect_err("must not guess");
+    assert!(
+        error.detail.contains("not advertised"),
+        "unexpected detail: {}",
+        error.detail
+    );
+}
+
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn missing_and_wrong_mcp_auth_have_zero_side_effects() {
+    let scenario = Scenario::load();
+    let mut env = ProcessEnvGuard::new();
+    for kind in [EndpointKind::Desktop, EndpointKind::Hosted] {
+        run_auth_zero_side_effect(kind, &scenario, &mut env).await;
+    }
+}
+
+async fn run_auth_zero_side_effect(
+    kind: EndpointKind,
+    scenario: &Scenario,
+    env: &mut ProcessEnvGuard,
+) {
+    let home_dir = TempDir::new().expect("temp home");
+    let workspace_dir = TempDir::new().expect("temp workspace");
+    let home = dunce::canonicalize(home_dir.path()).expect("canonicalize home");
+    let workspace = dunce::canonicalize(workspace_dir.path()).expect("canonicalize workspace");
+    env.set("HOME", &home);
+    env.set("GROK_HOME", home.join(".grok"));
+    std::fs::create_dir_all(home.join(".grok")).expect("grok home");
+    std::fs::write(
+        home.join(".grok").join("config.toml"),
+        format!(
+            "[models]\ndefault = \"{}\"\n",
+            scenario.str(&["identities", "modelId"])
+        ),
+    )
+    .expect("write grok config.toml");
+    set_grokptah_home_override(Some(home.clone()));
+    let token = scenario.str(&["secrets", "mcpBearer"]);
+    let api_key = scenario.str(&["secrets", "apiKey"]);
+    let script = GatewayScript {
+        proposal_turns: Arc::new(AtomicUsize::new(0)),
+        restart_objective: scenario.str(&["objectives", "restartCut"]),
+        proposal_path: scenario.str(&["proposal", "targetRelativePath"]),
+    };
+    let gateway = start_scripted_gateway(script).await;
+    env.set("GROKPTAH_API_BASE", format!("{}/v1", gateway.base_url()));
+    env.set("GROKPTAH_API_KEY", &api_key);
+    let launched = start_endpoint(kind, &home, &workspace, &token).await;
+    let http_before = gateway.requests().len();
+    let files_before = workspace_entry_count(&workspace);
+    assert_mcp_auth_zero_side_effects(&launched.addr, &token).await;
+    assert_eq!(
+        gateway.requests().len(),
+        http_before,
+        "{} missing/wrong MCP auth must not send provider HTTP",
+        kind.as_str()
+    );
+    assert_eq!(
+        workspace_entry_count(&workspace),
+        files_before,
+        "{} missing/wrong MCP auth must not write workspace files",
+        kind.as_str()
+    );
+    let mut launched = launched;
+    initialize_mcp(&mut launched).await;
+    let sessions = launched
+        .mcp
+        .call_tool("ptah_list_sessions", json!({}))
+        .await
+        .unwrap_or_else(|error| panic!("list sessions after failed auth: {error}"));
+    let session_count = sessions.structured["sessions"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(usize::MAX);
+    assert_eq!(
+        session_count,
+        0,
+        "{} auth probes created sessions: {}",
+        kind.as_str(),
+        sessions.structured
+    );
+    let agents = launched
+        .mcp
+        .call_tool("ptah_list_persistent_agents", json!({}))
+        .await
+        .unwrap_or_else(|error| panic!("list agents after failed auth: {error}"));
+    let agent_count = agents.structured["agents"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(usize::MAX);
+    assert_eq!(
+        agent_count,
+        0,
+        "{} auth probes created agents: {}",
+        kind.as_str(),
+        agents.structured
+    );
+    assert_eq!(
+        gateway.requests().len(),
+        http_before,
+        "{} initialize after failed auth must not send provider HTTP",
+        kind.as_str()
+    );
+    let _ = launched.mcp.close_session().await;
+    stop_endpoint(launched).await;
+    drop(gateway);
+    drop(home_dir);
+    drop(workspace_dir);
 }

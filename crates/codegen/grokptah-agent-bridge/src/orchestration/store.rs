@@ -19,7 +19,9 @@ use super::managed::{
 };
 use super::manager::{ManagerDecisionRecord, ManagerPlan};
 use super::message::{MessagePage, WorkMessage, MAX_RETAINED_MESSAGES};
-use super::provider_attempt::{ProviderAttemptRecord, ProviderAttemptState, ProviderSendCertainty};
+use super::provider_attempt::{
+    ProviderAttemptRecord, ProviderAttemptState, ProviderRetryClass, ProviderSendCertainty,
+};
 use super::quota::{QuotaPoolUsage, QuotaReservation, QuotaReservationState};
 use super::routine::{
     advance_next_fire, decide_lifecycle_skip, due_occurrences, in_flight_count,
@@ -2481,9 +2483,14 @@ impl OrchStore {
             item.bump();
             self.save_work_item_unlocked(item)?;
         } else if dependencies_ready && matches!(item.state, WorkState::Blocked) {
-            item.state = WorkState::Queued;
-            item.bump();
-            self.save_work_item_unlocked(item)?;
+            // Dependency-blocked items have no `blocked_reason`. An explicit
+            // park (operator Block, or UncertainAccept / ExplicitNewRunOnly)
+            // must survive restart reconciliation and must not be readmitted.
+            if item.blocked_reason.is_none() {
+                item.state = WorkState::Queued;
+                item.bump();
+                self.save_work_item_unlocked(item)?;
+            }
         }
         if item.deadline.is_some_and(|deadline| deadline <= now) && !item.state.is_terminal() {
             item.state = WorkState::Failed;
@@ -3921,6 +3928,39 @@ impl OrchStore {
         )
     }
 
+    /// An Interrupted managed Run whose provider send is UncertainAccept or
+    /// ExplicitNewRunOnly must not auto-retry. Retry would create a second
+    /// intent/Run/HTTP request against a reservation that stays Reserved.
+    fn requires_explicit_new_logical_run_unlocked(
+        &self,
+        intent: &ManagedExecutionIntent,
+        cause: ManagedRetryCause,
+    ) -> Result<bool, OrchError> {
+        if cause != ManagedRetryCause::Interrupted {
+            return Ok(false);
+        }
+        let Some(run_id) = intent.run_id.as_deref() else {
+            return Ok(false);
+        };
+        let Some(run) = self
+            .load_run_unlocked(run_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        if run.state != RunState::Interrupted {
+            return Ok(false);
+        }
+        let attempts = self
+            .list_provider_attempts_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(attempts.iter().any(|attempt| {
+            attempt.run_id == run_id
+                && (attempt.send_certainty == Some(ProviderSendCertainty::UncertainAccept)
+                    || attempt.retry_class == Some(ProviderRetryClass::ExplicitNewRunOnly))
+        }))
+    }
+
     pub fn close_managed_attempt_until(
         &self,
         intent_id: &str,
@@ -3957,7 +3997,12 @@ impl OrchStore {
             retry_eligible,
             ..ManagedExecutionPolicy::default()
         };
-        let retry = policy.allows_auto_retry(&item, attempt_number.saturating_add(1), cause);
+        let explicit_new_run = self.requires_explicit_new_logical_run_unlocked(&intent, cause)?;
+        // UncertainAccept / ExplicitNewRunOnly on an Interrupted managed Run
+        // overrides retryEligible / retryExpired / retryFailed. Auto-retry
+        // would duplicate an in-flight provider send.
+        let retry = !explicit_new_run
+            && policy.allows_auto_retry(&item, attempt_number.saturating_add(1), cause);
         let attempt_state = match cause {
             ManagedRetryCause::Expired | ManagedRetryCause::Interrupted => AttemptState::Expired,
             ManagedRetryCause::Failed => AttemptState::Failed,
@@ -3978,6 +4023,8 @@ impl OrchStore {
                 item.state,
                 item.result.clone(),
             )
+        } else if explicit_new_run {
+            (ManagedFinalizationOutcome::Parked, WorkState::Blocked, None)
         } else if retry {
             (
                 ManagedFinalizationOutcome::RetryQueued,
@@ -4079,6 +4126,9 @@ impl OrchStore {
                 ManagedFinalizationOutcome::RetryQueued => {
                     (AttemptState::Failed, WorkState::Queued, None)
                 }
+                ManagedFinalizationOutcome::Parked => {
+                    (AttemptState::Expired, WorkState::Blocked, None)
+                }
                 ManagedFinalizationOutcome::Cancelled => {
                     (AttemptState::Cancelled, WorkState::Cancelled, result)
                 }
@@ -4175,8 +4225,13 @@ impl OrchStore {
                 if record.work_state == WorkState::Queued {
                     item.blocked_reason = None;
                     item.result = None;
-                } else if record.result.is_some() {
-                    item.result = record.result.clone();
+                } else {
+                    if record.work_state == WorkState::Blocked {
+                        item.blocked_reason = Some(record.reason.clone());
+                    }
+                    if record.result.is_some() {
+                        item.result = record.result.clone();
+                    }
                 }
                 item.bump_at(now);
                 self.save_work_item_unlocked(&item)
@@ -7844,6 +7899,241 @@ mod tests {
                 .state,
             QuotaReservationState::Reserved
         );
+    }
+
+    fn worker_agent(session: Uuid, workspace: &str) -> AgentRecord {
+        let now = Utc::now();
+        AgentRecord {
+            agent_id: "worker-a".into(),
+            owner_principal_id: None,
+            session_id: session,
+            lane_ids: vec![session],
+            lane_associations: Vec::new(),
+            workspace: workspace.into(),
+            model: "grok".into(),
+            spec: None,
+            state: AgentState::Waiting,
+            current_run_id: None,
+            last_run_id: None,
+            latest_checkpoint_id: None,
+            last_lane_id: Some(session),
+            continuation_ordinal: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn retry_allowed_work(session: Uuid, workspace: &str) -> WorkItem {
+        let mut policy = super::super::workload::WorkPolicy::default();
+        policy.retry.max_attempts = 2;
+        policy.retry.retry_failed = true;
+        policy.retry.retry_expired = true;
+        let mut item = WorkItem::new(
+            "native",
+            "restart cut",
+            session,
+            workspace,
+            "operator",
+            policy,
+        )
+        .unwrap();
+        item.assigned_agent_id = Some("worker-a".into());
+        item.assignment_status = AssignmentStatus::Accepted;
+        item
+    }
+
+    fn admitted_intent(
+        work: &WorkItem,
+        attempt_id: String,
+        run_id: String,
+        session: Uuid,
+    ) -> ManagedExecutionIntent {
+        let now = Utc::now();
+        ManagedExecutionIntent {
+            schema_version: super::super::managed::MANAGED_EXECUTION_SCHEMA_VERSION,
+            intent_id: "intent-uncertain-park".into(),
+            agent_id: "worker-a".into(),
+            agent_spec_revision: 1,
+            work_id: work.work_id.clone(),
+            work_revision: work.revision,
+            attempt_id: Some(attempt_id),
+            run_id: Some(run_id),
+            session_id: session,
+            workspace: work.workspace.clone(),
+            source_routine_id: None,
+            source_activation_id: None,
+            model_selection_key: crate::gateway_config::model_selection_key("xai", "grok-code-1"),
+            provider_route: Some(super::super::managed::ProviderRoute {
+                provider_id: "xai".into(),
+                model_id: "grok-code-1".into(),
+            }),
+            bounds: RunBounds::default(),
+            input_hash: "hash-uncertain-park".into(),
+            state: ManagedIntentState::Admitted,
+            permission_request_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn assert_one_uncertain_tuple(
+        store: &OrchStore,
+        work_id: &str,
+        attempt_id: &str,
+        intent_id: &str,
+        run_id: &str,
+        provider_attempt_id: &str,
+        reservation_id: &str,
+    ) {
+        let works = store.list_work_items().unwrap();
+        assert_eq!(works.len(), 1);
+        let work = store.load_work_item(work_id).unwrap().unwrap();
+        assert_eq!(work.state, WorkState::Blocked);
+        assert!(work.blocked_reason.is_some());
+        assert!(!work.state.is_claimable());
+        let attempts = store.list_work_attempts(Some(work_id)).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt_id, attempt_id);
+        assert_eq!(attempts[0].work_id, work_id);
+        assert!(attempts[0].linked_run_ids.iter().any(|id| id == run_id));
+        let intents = store.list_managed_intents().unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].intent_id, intent_id);
+        assert_eq!(intents[0].work_id, work_id);
+        assert_eq!(intents[0].attempt_id.as_deref(), Some(attempt_id));
+        assert_eq!(intents[0].run_id.as_deref(), Some(run_id));
+        assert_eq!(intents[0].state, ManagedIntentState::Finalized);
+        let runs = store.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, run_id);
+        assert_eq!(runs[0].state, RunState::Interrupted);
+        let provider_attempts = store.list_provider_attempts().unwrap();
+        assert_eq!(provider_attempts.len(), 1);
+        assert_eq!(provider_attempts[0].attempt_id, provider_attempt_id);
+        assert_eq!(provider_attempts[0].run_id, run_id);
+        assert_eq!(provider_attempts[0].reservation_id, reservation_id);
+        assert_eq!(
+            provider_attempts[0].send_certainty,
+            Some(ProviderSendCertainty::UncertainAccept)
+        );
+        assert_eq!(
+            provider_attempts[0].retry_class,
+            Some(super::super::provider_attempt::ProviderRetryClass::ExplicitNewRunOnly)
+        );
+        let reservations = store.list_quota_reservations().unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].reservation_id, reservation_id);
+        assert_eq!(reservations[0].run_id, run_id);
+        assert_eq!(reservations[0].state, QuotaReservationState::Reserved);
+        let route = runs[0].provider_route.as_ref().unwrap();
+        assert_eq!(route.quota_reservation_id.as_deref(), Some(reservation_id));
+        assert!(store
+            .live_managed_intent_for_work(work_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn uncertain_interrupted_run_parks_work_and_survives_two_reopens() {
+        let root = tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (mut run, reservation) = quota_backed_run(
+            "run-uncertain-park",
+            RunState::Running,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        let session = Uuid::new_v4();
+        run.session_id = session;
+        run.agent_id = Some("worker-a".into());
+        let work_id;
+        let attempt_id;
+        let provider_attempt_id;
+        {
+            let store = OrchStore::open(&path).unwrap();
+            store
+                .save_agent(&worker_agent(session, &run.workspace))
+                .unwrap();
+            let item = retry_allowed_work(session, &run.workspace);
+            work_id = item.work_id.clone();
+            store.save_work_item(&item).unwrap();
+            let claim = store
+                .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+                .unwrap();
+            attempt_id = claim.attempt.attempt_id.clone();
+            store.save_run_with_quota(&run, &reservation).unwrap();
+            provider_attempt_id = store
+                .begin_provider_attempt(&run.run_id)
+                .unwrap()
+                .attempt_id;
+            store
+                .link_work_run(&item.work_id, &attempt_id, &claim.lease_token, &run.run_id)
+                .unwrap();
+            store
+                .save_managed_intent(&admitted_intent(
+                    &item,
+                    attempt_id.clone(),
+                    run.run_id.clone(),
+                    session,
+                ))
+                .unwrap();
+        }
+
+        let reopened = OrchStore::open(&path).unwrap();
+        let recovered_run = reopened.load_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(recovered_run.state, RunState::Interrupted);
+        let closed = reopened
+            .close_managed_attempt(
+                "intent-uncertain-park",
+                true,
+                ManagedRetryCause::Interrupted,
+                "interrupted with uncertain provider send",
+                Utc::now(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.state, ManagedIntentState::Finalized);
+        assert_one_uncertain_tuple(
+            &reopened,
+            &work_id,
+            &attempt_id,
+            "intent-uncertain-park",
+            &run.run_id,
+            &provider_attempt_id,
+            &reservation.reservation_id,
+        );
+        drop(reopened);
+
+        for _ in 0..2 {
+            let again = OrchStore::open(&path).unwrap();
+            assert_one_uncertain_tuple(
+                &again,
+                &work_id,
+                &attempt_id,
+                "intent-uncertain-park",
+                &run.run_id,
+                &provider_attempt_id,
+                &reservation.reservation_id,
+            );
+            let still = again.load_work_item(&work_id).unwrap().unwrap();
+            assert_ne!(still.state, WorkState::Queued);
+            assert_eq!(
+                again
+                    .close_managed_attempt(
+                        "intent-uncertain-park",
+                        true,
+                        ManagedRetryCause::Interrupted,
+                        "interrupted with uncertain provider send",
+                        Utc::now(),
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                ManagedIntentState::Finalized
+            );
+            drop(again);
+        }
     }
 
     #[test]

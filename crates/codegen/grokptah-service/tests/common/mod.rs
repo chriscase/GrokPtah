@@ -3,8 +3,6 @@
 //! Starts a real loopback listener against a disposable home and workspace.
 //! Tests talk MCP over HTTP and never require model credentials.
 
-pub mod shared_black_box_v1;
-
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
