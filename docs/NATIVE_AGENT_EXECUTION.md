@@ -142,11 +142,35 @@ cannot be treated as healthy state.
 
 Authoritative terminal usage consumes `min(reservedTokens, measuredTokens)`
 and the measured request count; unused capacity is released. A terminal Run
-with complete zero usage is refunded. Missing usage or an unresolved provider
-request remains reserved deliberately: without a durable provider-attempt
-certainty record, refunding it could turn an accepted-but-unknown request into
-free capacity. The provider-attempt phase closes that operationally
-conservative case.
+with complete zero usage is refunded. Missing usage or an uncertain provider
+request remains reserved deliberately: refunding it could turn an
+accepted-but-unknown request into free capacity.
+
+### Durable provider attempts
+
+Before a quota-linked Run enters the HTTP transport, the store writes one
+`ProviderAttemptRecord` bound to the exact Run, reservation, and route-snapshot
+hash. The Run carries a bounded list of applied attempt IDs, so a response row
+written immediately before a crash is folded into usage exactly once on
+restart.
+
+The host decides one of three send certainties:
+
+- `known_not_sent`: the host can prove request bytes did not reach the
+  provider. This is the only same-Run retry-safe outcome.
+- `known_accepted`: the provider responded definitively, including an HTTP
+  refusal. A retry is a new explicit Run unless the provider supplies separate
+  idempotency evidence.
+- `uncertain_accept`: request acceptance cannot be disproved, including a
+  crash with an admitted row, an in-flight cancellation, timeout, or partial
+  stream. It is never automatically retried or refunded as unsent.
+
+Store open changes every unfinished admitted row to `uncertain_accept`, marks
+usage incomplete, and preserves its quota reservation. A completed row whose
+usage was not yet applied is replayed through the Run-side attempt-ID fence.
+For quota-linked Runs, definitive 400/401/429/5xx responses and compatibility
+rejections are never hidden behind an internal resend. Non-durable interactive
+calls retain their legacy compatibility behavior outside this native lane.
 
 ## Work-attempt / Run relationship
 
@@ -359,6 +383,7 @@ explicit enable/disable; it does not own dispatch.
 
 - Operator-configurable per-provider admission ceiling
 - Operator-configurable quota pools, spend conversion, and operator projections
+- Provider-side idempotency evidence if xAI exposes a verifiable contract
 - Manager-agent planning and decomposition
 - Message-triggered routine activation
 - Per-principal worker credentials bound to one Agent

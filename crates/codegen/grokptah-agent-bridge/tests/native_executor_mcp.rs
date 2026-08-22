@@ -7,9 +7,10 @@ use axum::routing::post;
 use axum::{Json, Router};
 use grokptah_agent_bridge::orchestration::{
     AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, ProviderRoute,
-    QuotaClass, QuotaReservationState, RunBounds, RunPurpose, RunRecord, RunState, WorkItem,
-    WorkPolicy, WorkState, WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
+    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, ProviderAttemptState,
+    ProviderRetryClass, ProviderRoute, ProviderSendCertainty, QuotaClass, QuotaReservationState,
+    RunBounds, RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState,
+    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
     model_selection_key, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
@@ -735,6 +736,11 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
     assert_eq!(reservation.run_id, run.run_id);
     assert_eq!(reservation.route_snapshot_hash, run_route.snapshot_hash);
     assert_eq!(reservation.state, QuotaReservationState::Reserved);
+    let admitted_attempts = orch.store().list_provider_attempts().unwrap();
+    assert_eq!(admitted_attempts.len(), 1);
+    assert_eq!(admitted_attempts[0].run_id, run.run_id);
+    assert_eq!(admitted_attempts[0].state, ProviderAttemptState::Admitted);
+    assert_eq!(admitted_attempts[0].send_certainty, None);
 
     release.add_permits(1);
     let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -758,6 +764,24 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
     assert_eq!(settled_reservation.state, QuotaReservationState::Consumed);
     assert_eq!(settled_reservation.tokens_consumed, 10);
     assert_eq!(settled_reservation.requests_consumed, 1);
+    let settled_attempts = orch.store().list_provider_attempts().unwrap();
+    assert_eq!(settled_attempts.len(), 1);
+    assert_eq!(settled_attempts[0].state, ProviderAttemptState::Finished);
+    assert_eq!(
+        settled_attempts[0].send_certainty,
+        Some(ProviderSendCertainty::KnownAccepted)
+    );
+    assert_eq!(
+        settled_attempts[0].retry_class,
+        Some(ProviderRetryClass::ExplicitNewRunOnly)
+    );
+    assert_eq!(
+        settled_attempts[0]
+            .usage
+            .as_ref()
+            .map(|usage| usage.total_tokens),
+        Some(10)
+    );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 
     orch.stop_background_tasks().await;

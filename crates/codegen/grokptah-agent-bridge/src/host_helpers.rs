@@ -24,6 +24,54 @@ use crate::session::{Session, SessionKind, TranscriptEntry};
 use crate::types::EffortLevel;
 use sha2::{Digest, Sha256};
 
+use crate::orchestration::ProviderSendCertainty;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProviderDispatchOutcome {
+    pub certainty: ProviderSendCertainty,
+    pub http_status: Option<u16>,
+}
+
+#[derive(Debug)]
+struct ProviderDispatchFailure {
+    outcome: ProviderDispatchOutcome,
+    message: String,
+}
+
+impl std::fmt::Display for ProviderDispatchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderDispatchFailure {}
+
+fn provider_dispatch_failure(
+    certainty: ProviderSendCertainty,
+    http_status: Option<u16>,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    anyhow!(ProviderDispatchFailure {
+        outcome: ProviderDispatchOutcome {
+            certainty,
+            http_status,
+        },
+        message: message.into(),
+    })
+}
+
+pub(crate) fn provider_dispatch_outcome(error: &anyhow::Error) -> ProviderDispatchOutcome {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderDispatchFailure>())
+        .map(|failure| failure.outcome)
+        .unwrap_or(ProviderDispatchOutcome {
+            // Unknown errors after durable admission are never assumed safe.
+            certainty: ProviderSendCertainty::UncertainAccept,
+            http_status: None,
+        })
+}
+
 pub(crate) fn push_assistant(host: &AgentHostHandle, session_id: Uuid, text: &str) {
     let mut g = host.inner.lock();
     if let Some(s) = g.sessions.get_mut(&session_id) {
@@ -2222,6 +2270,7 @@ where
     F: FnMut(&str),
     G: FnMut(&str),
 {
+    let durable_attempt = snapshot.is_some_and(|route| route.quota_reservation_id.is_some());
     if !target.capabilities.tools {
         bail!(
             "provider model `{}` is not qualified for coding tools; use Chat or qualify native tool calling first",
@@ -2264,7 +2313,11 @@ where
     let mut last_err = None::<String>;
     for _request_attempt in 0..MAX_REQUEST_ATTEMPTS {
         if cancel.is_cancelled() {
-            bail!("cancelled");
+            return Err(provider_dispatch_failure(
+                ProviderSendCertainty::KnownNotSent,
+                None,
+                "cancelled",
+            ));
         }
         let send_once = |c: &crate::auth_store::WireCredentials| {
             let mut req = client
@@ -2304,7 +2357,11 @@ where
                         None,
                     );
                 }
-                bail!("cancelled")
+                return Err(provider_dispatch_failure(
+                    ProviderSendCertainty::UncertainAccept,
+                    None,
+                    "cancelled",
+                ))
             },
         };
         let mut resp = match resp_result {
@@ -2342,13 +2399,25 @@ where
                         format!("request error: {e}")
                     },
                 );
-                if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
+                if !durable_attempt
+                    && allow_transient_retries
+                    && transient_retries < MAX_TRANSIENT_RETRIES
+                {
                     let delay = 400 * (1 << transient_retries);
                     transient_retries += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
                 }
-                bail!("{}", last_err.unwrap());
+                let certainty = if e.is_connect() {
+                    ProviderSendCertainty::KnownNotSent
+                } else {
+                    ProviderSendCertainty::UncertainAccept
+                };
+                return Err(provider_dispatch_failure(
+                    certainty,
+                    None,
+                    last_err.unwrap(),
+                ));
             }
         };
 
@@ -2365,6 +2434,13 @@ where
                     0,
                     None,
                 );
+            }
+            if durable_attempt {
+                return Err(provider_dispatch_failure(
+                    ProviderSendCertainty::KnownAccepted,
+                    Some(resp.status().as_u16()),
+                    "HTTP 401 Unauthorized; durable provider attempts are never resent after a definitive response",
+                ));
             }
             match crate::auth_store::force_refresh(&creds).await {
                 Ok(fresh) => {
@@ -2482,11 +2558,21 @@ where
             } else {
                 format!("HTTP {status}: {clipped}")
             });
-            if allow_transient_retries && transient_retries < MAX_TRANSIENT_RETRIES {
+            if !durable_attempt
+                && allow_transient_retries
+                && transient_retries < MAX_TRANSIENT_RETRIES
+            {
                 let delay = 600 * (1 << transient_retries);
                 transient_retries += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 continue;
+            }
+            if durable_attempt {
+                return Err(provider_dispatch_failure(
+                    ProviderSendCertainty::KnownAccepted,
+                    Some(status.as_u16()),
+                    last_err.unwrap(),
+                ));
             }
             bail!("{}", last_err.unwrap());
         }
@@ -2513,7 +2599,8 @@ where
             // Some OpenAI-compatible gateways support streaming but reject
             // `stream_options`. Retry once without usage metadata; bounded
             // runs will then stop fail-closed at the response boundary.
-            if status.as_u16() == 400
+            if !durable_attempt
+                && status.as_u16() == 400
                 && target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
                 && body.get("stream_options").is_some()
             {
@@ -2526,7 +2613,8 @@ where
             // Some compatible gateways support native tools but reject the
             // optional tool_choice field. Retry once without that foreign
             // field before changing the streaming contract.
-            if status.as_u16() == 400
+            if !durable_attempt
+                && status.as_u16() == 400
                 && target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
                 && body.get("tool_choice").is_some()
             {
@@ -2537,7 +2625,8 @@ where
                 continue;
             }
             // Some proxies reject stream+tools — fall back to non-stream once.
-            if status.as_u16() == 400
+            if !durable_attempt
+                && status.as_u16() == 400
                 && body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
             {
                 body["stream"] = serde_json::Value::Bool(false);
@@ -2549,6 +2638,13 @@ where
                     text.chars().take(200).collect::<String>()
                 ));
                 continue;
+            }
+            if durable_attempt {
+                return Err(provider_dispatch_failure(
+                    ProviderSendCertainty::KnownAccepted,
+                    Some(status.as_u16()),
+                    format!("provider returned HTTP {status}"),
+                ));
             }
             if target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
                 bail!("configured provider returned HTTP {status}");
@@ -3230,6 +3326,72 @@ mod compatible_stream_tests {
         let mut tampered = snapshot;
         tampered.wire_model_id = "attacker-model".into();
         assert!(tampered.validate().is_err());
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn known_accepted_429_is_not_auto_retried_for_a_durable_run() {
+        let _lock = crate::discover::home_override_serial();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let requests = Arc::new(AtomicUsize::new(0));
+                let seen = Arc::clone(&requests);
+                let app = Router::new().route(
+                    "/v1/chat/completions",
+                    post(move || {
+                        let seen = Arc::clone(&seen);
+                        async move {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            Response::builder()
+                                .status(StatusCode::TOO_MANY_REQUESTS)
+                                .body(Body::from("rate limited"))
+                                .unwrap()
+                        }
+                    }),
+                );
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let temp = tempfile::tempdir().unwrap();
+                let selection =
+                    install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
+                let credentials = compatible_credentials("cancel-test");
+                let snapshot =
+                    capture_provider_route_snapshot(&credentials, &selection, EffortLevel::Medium)
+                        .unwrap()
+                        .bind_quota(
+                            crate::orchestration::QuotaClass::CodingExecution,
+                            "quota-test-429",
+                        )
+                        .unwrap();
+
+                let result = call_xai_agent_step_routed(
+                    &credentials,
+                    &snapshot,
+                    &[serde_json::json!({"role": "user", "content": "synthetic"})],
+                    &serde_json::json!([]),
+                    true,
+                    &CancellationToken::new(),
+                    None,
+                    |_| {},
+                    |_| {},
+                )
+                .await;
+                let error = match result {
+                    Ok(_) => panic!("durable 429 unexpectedly succeeded"),
+                    Err(error) => error,
+                };
+                let outcome = provider_dispatch_outcome(&error);
+                assert_eq!(outcome.certainty, ProviderSendCertainty::KnownAccepted);
+                assert_eq!(outcome.http_status, Some(429));
+                assert_eq!(requests.load(Ordering::SeqCst), 1);
+                server.abort();
+            });
         crate::discover::set_grokptah_home_override(None);
     }
 
@@ -3959,6 +4121,7 @@ async fn call_xai_chat_inner(
     cwd: &Path,
     kind: SessionKind,
 ) -> Result<ChatReply> {
+    let durable_attempt = snapshot.is_some_and(|route| route.quota_reservation_id.is_some());
     // Prefer a non-expired / refreshed OIDC access token before the first call.
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
 
@@ -4056,20 +4219,36 @@ async fn call_xai_chat_inner(
         } else {
             "network"
         };
-        if is_compatible {
-            anyhow!(
+        let message = if is_compatible {
+            format!(
                 "configured provider request failed ({kind}); check its connection and request budget"
             )
         } else {
-            anyhow!(
+            format!(
                 "request error ({kind}) for {url}: {e}. \
                  Check network, VPN, and that cli-chat-proxy is reachable."
             )
-        }
+        };
+        provider_dispatch_failure(
+            if e.is_connect() {
+                ProviderSendCertainty::KnownNotSent
+            } else {
+                ProviderSendCertainty::UncertainAccept
+            },
+            None,
+            message,
+        )
     })?;
 
     // One retry after OIDC refresh on 401 (expired access token is common).
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
+        if durable_attempt {
+            return Err(provider_dispatch_failure(
+                ProviderSendCertainty::KnownAccepted,
+                Some(resp.status().as_u16()),
+                "HTTP 401 Unauthorized; durable provider attempts are never resent after a definitive response",
+            ));
+        }
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 if let Some(snapshot) = snapshot {
@@ -4099,6 +4278,13 @@ async fn call_xai_chat_inner(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        if durable_attempt {
+            return Err(provider_dispatch_failure(
+                ProviderSendCertainty::KnownAccepted,
+                Some(status.as_u16()),
+                format!("provider returned HTTP {status}"),
+            ));
+        }
         if is_compatible {
             bail!("configured provider returned HTTP {status}");
         }

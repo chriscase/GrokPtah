@@ -546,6 +546,10 @@ pub struct RunAggregates {
     /// response. A non-zero value after restart makes accounting incomplete.
     #[serde(default)]
     pub usage_pending_requests: u32,
+    /// Provider attempt rows whose usage has been folded into this Run. This
+    /// is the exactly-once application fence for crash recovery.
+    #[serde(default)]
+    pub accounted_provider_attempt_ids: Vec<String>,
     #[serde(default)]
     pub verification: Option<CompletionEvidence>,
 }
@@ -561,6 +565,7 @@ impl Default for RunAggregates {
             usage: CompletionUsage::default(),
             usage_complete: true,
             usage_pending_requests: 0,
+            accounted_provider_attempt_ids: Vec::new(),
             verification: None,
         }
     }

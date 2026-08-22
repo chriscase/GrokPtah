@@ -19,6 +19,7 @@ use super::managed::{
 };
 use super::manager::{ManagerDecisionRecord, ManagerPlan};
 use super::message::{MessagePage, WorkMessage, MAX_RETAINED_MESSAGES};
+use super::provider_attempt::{ProviderAttemptRecord, ProviderAttemptState, ProviderSendCertainty};
 use super::quota::{QuotaPoolUsage, QuotaReservation, QuotaReservationState};
 use super::routine::{
     advance_next_fire, decide_lifecycle_skip, due_occurrences, in_flight_count,
@@ -195,6 +196,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("agent-activation"))?;
         fs::create_dir_all(root.join("quota-reservations"))?;
         fs::create_dir_all(root.join("quota-admission-intents"))?;
+        fs::create_dir_all(root.join("provider-attempts"))?;
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
@@ -263,6 +265,7 @@ impl OrchStore {
         store.recover_routine_intents()?;
         store.recover_managed_finalization_intents()?;
         store.recover_manager_creation_intents()?;
+        store.reconcile_provider_attempt_ledger()?;
         store.mark_unfinished_interrupted()?;
         store.reconcile_quota_ledger()?;
         store.fail_orphaned_idempotency_claims()?;
@@ -372,6 +375,15 @@ impl OrchStore {
             .inner
             .root
             .join("quota-admission-intents")
+            .join(format!("{safe}.json")))
+    }
+
+    fn provider_attempt_path(&self, attempt_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(attempt_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("provider-attempts")
             .join(format!("{safe}.json")))
     }
 
@@ -511,6 +523,272 @@ impl OrchStore {
     pub fn list_quota_reservations(&self) -> anyhow::Result<Vec<QuotaReservation>> {
         let _guard = self.inner.lock.lock();
         self.list_quota_reservations_unlocked()
+    }
+
+    fn load_provider_attempt_unlocked(
+        &self,
+        attempt_id: &str,
+    ) -> anyhow::Result<Option<ProviderAttemptRecord>> {
+        let path = match self.provider_attempt_path(attempt_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let attempt: ProviderAttemptRecord = serde_json::from_str(&fs::read_to_string(path)?)?;
+        attempt.validate().map_err(|error| anyhow::anyhow!(error))?;
+        Ok(Some(attempt))
+    }
+
+    pub fn load_provider_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> anyhow::Result<Option<ProviderAttemptRecord>> {
+        let _guard = self.inner.lock.lock();
+        self.load_provider_attempt_unlocked(attempt_id)
+    }
+
+    fn list_provider_attempts_unlocked(&self) -> anyhow::Result<Vec<ProviderAttemptRecord>> {
+        let mut attempts = Vec::new();
+        for entry in fs::read_dir(self.inner.root.join("provider-attempts"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let attempt: ProviderAttemptRecord = serde_json::from_str(&fs::read_to_string(path)?)?;
+            attempt.validate().map_err(|error| anyhow::anyhow!(error))?;
+            attempts.push(attempt);
+        }
+        attempts.sort_by(|left, right| {
+            left.run_id
+                .cmp(&right.run_id)
+                .then(left.ordinal.cmp(&right.ordinal))
+                .then(left.attempt_id.cmp(&right.attempt_id))
+        });
+        Ok(attempts)
+    }
+
+    pub fn list_provider_attempts(&self) -> anyhow::Result<Vec<ProviderAttemptRecord>> {
+        let _guard = self.inner.lock.lock();
+        self.list_provider_attempts_unlocked()
+    }
+
+    fn save_provider_attempt_unlocked(
+        &self,
+        attempt: &ProviderAttemptRecord,
+    ) -> anyhow::Result<()> {
+        attempt.validate().map_err(|error| anyhow::anyhow!(error))?;
+        let path = self
+            .provider_attempt_path(&attempt.attempt_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        atomic_write_json(&path, attempt)
+    }
+
+    fn validate_provider_attempt_binding(
+        run: &RunRecord,
+        attempt: &ProviderAttemptRecord,
+    ) -> anyhow::Result<()> {
+        attempt.validate().map_err(|error| anyhow::anyhow!(error))?;
+        let route = run
+            .provider_route
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("provider attempt Run has no route snapshot"))?;
+        anyhow::ensure!(
+            run.run_id == attempt.run_id
+                && route.quota_reservation_id.as_deref() == Some(attempt.reservation_id.as_str())
+                && route.snapshot_hash == attempt.route_snapshot_hash,
+            "Run and provider attempt immutable identities do not match"
+        );
+        Ok(())
+    }
+
+    /// Install one durable provider attempt before transport dispatch. The
+    /// attempt row is the recovery anchor; if the subsequent Run write fails,
+    /// callers do not send and restart conservatively closes the row.
+    pub fn begin_provider_attempt(&self, run_id: &str) -> anyhow::Result<ProviderAttemptRecord> {
+        let _guard = self.inner.lock.lock();
+        let mut run = self
+            .load_run_unlocked(run_id)?
+            .ok_or_else(|| anyhow::anyhow!("provider attempt Run is missing"))?;
+        anyhow::ensure!(
+            run.state == RunState::Running,
+            "provider attempt Run is not active"
+        );
+        let reservation_id = run
+            .provider_route
+            .as_ref()
+            .and_then(|route| route.quota_reservation_id.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("provider attempt Run has no quota reservation"))?;
+        let reservation = self
+            .load_quota_reservation_unlocked(reservation_id)?
+            .ok_or_else(|| anyhow::anyhow!("provider attempt quota reservation is missing"))?;
+        Self::validate_quota_binding(&run, &reservation)?;
+        anyhow::ensure!(
+            reservation.state == QuotaReservationState::Reserved,
+            "provider attempt quota reservation is not active"
+        );
+
+        let attempts = self.list_provider_attempts_unlocked()?;
+        anyhow::ensure!(
+            !attempts.iter().any(|attempt| {
+                attempt.run_id == run_id && attempt.state == ProviderAttemptState::Admitted
+            }),
+            "provider attempt already admitted for this Run"
+        );
+        let ordinal = attempts
+            .iter()
+            .filter(|attempt| attempt.run_id == run_id)
+            .map(|attempt| attempt.ordinal)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("provider attempt ordinal overflowed"))?;
+        let now = Utc::now();
+        let attempt = ProviderAttemptRecord::admitted(
+            &run,
+            format!("provider-attempt-{}", Uuid::new_v4()),
+            ordinal,
+            now,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        self.save_provider_attempt_unlocked(&attempt)?;
+
+        run.aggregates.usage_pending_requests = run
+            .aggregates
+            .usage_pending_requests
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("provider attempt counter overflowed"))?;
+        run.updated_at = now;
+        let run_path = self
+            .run_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if let Err(error) = atomic_write_json(&run_path, &run) {
+            let mut not_sent = attempt.clone();
+            not_sent
+                .finish(ProviderSendCertainty::KnownNotSent, None, None, Utc::now())
+                .map_err(|finish_error| anyhow::anyhow!(finish_error))?;
+            self.save_provider_attempt_unlocked(&not_sent)?;
+            return Err(error.context("persist provider attempt on Run; transport was not entered"));
+        }
+        Ok(attempt)
+    }
+
+    fn apply_provider_attempt_to_run(
+        &self,
+        run: &mut RunRecord,
+        attempt: &ProviderAttemptRecord,
+    ) -> anyhow::Result<bool> {
+        if attempt.state != ProviderAttemptState::Finished
+            || run
+                .aggregates
+                .accounted_provider_attempt_ids
+                .iter()
+                .any(|attempt_id| attempt_id == &attempt.attempt_id)
+        {
+            return Ok(false);
+        }
+        Self::validate_provider_attempt_binding(run, attempt)?;
+        run.aggregates.usage_pending_requests = u32::try_from(
+            self.list_provider_attempts_unlocked()?
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.run_id == run.run_id
+                        && candidate.state == ProviderAttemptState::Admitted
+                })
+                .count(),
+        )
+        .map_err(|_| anyhow::anyhow!("provider attempt counter overflowed"))?;
+        match attempt.send_certainty {
+            Some(ProviderSendCertainty::KnownAccepted) => {
+                if let Some(usage) = &attempt.usage {
+                    run.aggregates.usage.prompt_tokens = run
+                        .aggregates
+                        .usage
+                        .prompt_tokens
+                        .checked_add(usage.prompt_tokens)
+                        .ok_or_else(|| anyhow::anyhow!("provider token accounting overflowed"))?;
+                    run.aggregates.usage.completion_tokens = run
+                        .aggregates
+                        .usage
+                        .completion_tokens
+                        .checked_add(usage.completion_tokens)
+                        .ok_or_else(|| anyhow::anyhow!("provider token accounting overflowed"))?;
+                    run.aggregates.usage.total_tokens = run
+                        .aggregates
+                        .usage
+                        .total_tokens
+                        .checked_add(usage.total_tokens)
+                        .ok_or_else(|| anyhow::anyhow!("provider token accounting overflowed"))?;
+                    run.aggregates.usage.requests = run
+                        .aggregates
+                        .usage
+                        .requests
+                        .checked_add(usage.requests)
+                        .ok_or_else(|| anyhow::anyhow!("provider request accounting overflowed"))?;
+                } else if attempt.http_status.is_none_or(|status| status < 400) {
+                    run.aggregates.usage_complete = false;
+                }
+            }
+            Some(ProviderSendCertainty::UncertainAccept) => {
+                run.aggregates.usage_complete = false;
+            }
+            Some(ProviderSendCertainty::KnownNotSent) => {}
+            None => anyhow::bail!("finished provider attempt has no send certainty"),
+        }
+        run.aggregates
+            .accounted_provider_attempt_ids
+            .push(attempt.attempt_id.clone());
+        if let Some(verification) = run.aggregates.verification.as_mut() {
+            verification.usage = run.aggregates.usage.clone();
+        }
+        if !run.aggregates.usage_complete && run.bounds.max_total_tokens.is_some() {
+            let code = "max_total_tokens_usage_unavailable";
+            run.error_code = Some(code.into());
+            run.stop_cause = Some(RunStopCause::TokenAccountingUnavailable);
+        } else if let Some(ceiling) = run.bounds.max_total_tokens {
+            if run.aggregates.usage.total_tokens >= ceiling {
+                run.error_code = Some("max_total_tokens_reached".into());
+                run.stop_cause = Some(RunStopCause::TokenCeiling);
+            }
+        }
+        run.updated_at = run.updated_at.max(attempt.updated_at);
+        Ok(true)
+    }
+
+    /// Finish an attempt and fold its usage into the Run exactly once. The
+    /// attempt is written first, so restart can complete the fold after a
+    /// crash between the two durable records.
+    pub fn finish_provider_attempt(
+        &self,
+        attempt_id: &str,
+        certainty: ProviderSendCertainty,
+        http_status: Option<u16>,
+        usage: Option<crate::completion::CompletionUsage>,
+    ) -> anyhow::Result<RunRecord> {
+        let _guard = self.inner.lock.lock();
+        let mut attempt = self
+            .load_provider_attempt_unlocked(attempt_id)?
+            .ok_or_else(|| anyhow::anyhow!("provider attempt is missing"))?;
+        attempt
+            .finish(certainty, http_status, usage, Utc::now())
+            .map_err(|error| anyhow::anyhow!(error))?;
+        self.save_provider_attempt_unlocked(&attempt)?;
+
+        let mut run = self
+            .load_run_unlocked(&attempt.run_id)?
+            .ok_or_else(|| anyhow::anyhow!("provider attempt Run is missing"))?;
+        if self.apply_provider_attempt_to_run(&mut run, &attempt)? {
+            self.preflight_quota_for_run_unlocked(&run)?;
+            let path = self
+                .run_path(&run.run_id)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            atomic_write_json(&path, &run)?;
+        }
+        // Keep settlement retryable even if an earlier call durably applied
+        // the attempt to the Run and then failed before writing the quota row.
+        self.sync_quota_for_run_unlocked(&run)?;
+        Ok(run)
     }
 
     fn validate_quota_binding(
@@ -5084,6 +5362,7 @@ impl OrchStore {
             .iter()
             .filter_map(|(_, run)| run.retry_of.as_deref())
             .collect();
+        let provider_attempts = self.list_provider_attempts_unlocked()?;
 
         let mut eligible_runs: Vec<(&Path, &RunRecord)> = Vec::new();
         for (path, run) in &runs {
@@ -5105,7 +5384,22 @@ impl OrchStore {
                 continue;
             }
             match fs::remove_file(path) {
-                Ok(()) => report.run_files_removed += 1,
+                Ok(()) => {
+                    report.run_files_removed += 1;
+                    for attempt in provider_attempts
+                        .iter()
+                        .filter(|attempt| attempt.run_id == run.run_id)
+                    {
+                        let attempt_path = self
+                            .provider_attempt_path(&attempt.attempt_id)
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        match fs::remove_file(attempt_path) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(_) => report.skipped_files += 1,
+                        }
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => report.skipped_files += 1,
             }
@@ -5571,6 +5865,54 @@ impl OrchStore {
         Ok(recovered)
     }
 
+    fn reconcile_provider_attempt_ledger(&self) -> anyhow::Result<usize> {
+        let _guard = self.inner.lock.lock();
+        let mut reconciled = 0;
+        for mut attempt in self.list_provider_attempts_unlocked()? {
+            if attempt.state == ProviderAttemptState::Admitted {
+                // The row was durable before transport entry. After process
+                // death there is no proof that request bytes were not
+                // accepted, so recovery must never classify it retry-safe.
+                attempt
+                    .finish(
+                        ProviderSendCertainty::UncertainAccept,
+                        None,
+                        None,
+                        Utc::now(),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                self.save_provider_attempt_unlocked(&attempt)?;
+                reconciled += 1;
+            }
+            let Some(mut run) = self.load_run_unlocked(&attempt.run_id)? else {
+                let reservation = self
+                    .load_quota_reservation_unlocked(&attempt.reservation_id)?
+                    .ok_or_else(|| anyhow::anyhow!("provider attempt reservation is missing"))?;
+                anyhow::ensure!(
+                    attempt.state == ProviderAttemptState::Finished
+                        && reservation.state != QuotaReservationState::Reserved,
+                    "live or uncertain provider attempt Run is missing"
+                );
+                let path = self
+                    .provider_attempt_path(&attempt.attempt_id)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                remove_file_durable(&path)?;
+                reconciled += 1;
+                continue;
+            };
+            if self.apply_provider_attempt_to_run(&mut run, &attempt)? {
+                self.preflight_quota_for_run_unlocked(&run)?;
+                let path = self
+                    .run_path(&run.run_id)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                atomic_write_json(&path, &run)?;
+                self.sync_quota_for_run_unlocked(&run)?;
+                reconciled += 1;
+            }
+        }
+        Ok(reconciled)
+    }
+
     fn reconcile_quota_ledger(&self) -> anyhow::Result<usize> {
         let _guard = self.inner.lock.lock();
         for entry in fs::read_dir(self.inner.root.join("runs"))? {
@@ -5834,6 +6176,18 @@ fn merge_run_observations(target: &mut RunRecord, current: &RunRecord) {
         .usage
         .requests
         .max(current.aggregates.usage.requests);
+    for attempt_id in &current.aggregates.accounted_provider_attempt_ids {
+        if !target
+            .aggregates
+            .accounted_provider_attempt_ids
+            .contains(attempt_id)
+        {
+            target
+                .aggregates
+                .accounted_provider_attempt_ids
+                .push(attempt_id.clone());
+        }
+    }
     target.aggregates.usage_complete &= current.aggregates.usage_complete;
     // A terminal candidate may have deliberately closed an unresolved marker
     // as accounting-unavailable. Do not resurrect the stale durable pending
@@ -7391,5 +7745,157 @@ mod tests {
         );
         assert_eq!(settled.tokens_consumed, 333);
         assert_eq!(settled.requests_consumed, 2);
+    }
+
+    #[test]
+    fn known_not_sent_is_retryable_and_completion_is_idempotent() {
+        let root = tempdir().unwrap();
+        let store = OrchStore::open(root.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (run, reservation) = quota_backed_run(
+            "attempt-not-sent",
+            RunState::Running,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        store.save_run_with_quota(&run, &reservation).unwrap();
+
+        let first = store.begin_provider_attempt(&run.run_id).unwrap();
+        assert_eq!(first.ordinal, 1);
+        assert_eq!(
+            store
+                .load_run(&run.run_id)
+                .unwrap()
+                .unwrap()
+                .aggregates
+                .usage_pending_requests,
+            1
+        );
+        for _ in 0..2 {
+            store
+                .finish_provider_attempt(
+                    &first.attempt_id,
+                    ProviderSendCertainty::KnownNotSent,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let finished = store
+            .load_provider_attempt(&first.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            finished.retry_class,
+            Some(super::super::provider_attempt::ProviderRetryClass::SameRunSafe)
+        );
+        let after = store.load_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(after.aggregates.usage_pending_requests, 0);
+        assert!(after.aggregates.usage_complete);
+        assert_eq!(after.aggregates.accounted_provider_attempt_ids.len(), 1);
+
+        let replacement = store.begin_provider_attempt(&run.run_id).unwrap();
+        assert_eq!(replacement.ordinal, 2);
+    }
+
+    #[test]
+    fn restart_marks_unresolved_attempt_uncertain_and_never_refunds_it() {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (run, reservation) = quota_backed_run(
+            "attempt-uncertain",
+            RunState::Running,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        let attempt_id = {
+            let store = OrchStore::open(root.path()).unwrap();
+            store.save_run_with_quota(&run, &reservation).unwrap();
+            store
+                .begin_provider_attempt(&run.run_id)
+                .unwrap()
+                .attempt_id
+            // Crash after the durable row and possible transport entry.
+        };
+
+        let reopened = OrchStore::open(root.path()).unwrap();
+        let attempt = reopened
+            .load_provider_attempt(&attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attempt.send_certainty,
+            Some(ProviderSendCertainty::UncertainAccept)
+        );
+        assert_eq!(
+            attempt.retry_class,
+            Some(super::super::provider_attempt::ProviderRetryClass::ExplicitNewRunOnly)
+        );
+        let recovered_run = reopened.load_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(recovered_run.state, RunState::Interrupted);
+        assert!(!recovered_run.aggregates.usage_complete);
+        assert_eq!(recovered_run.aggregates.usage_pending_requests, 0);
+        assert!(reopened.begin_provider_attempt(&run.run_id).is_err());
+        assert_eq!(
+            reopened
+                .load_quota_reservation(&reservation.reservation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            QuotaReservationState::Reserved
+        );
+    }
+
+    #[test]
+    fn restart_applies_a_completed_attempt_exactly_once() {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (run, reservation) = quota_backed_run(
+            "attempt-complete-crash",
+            RunState::Running,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        let attempt_id = {
+            let store = OrchStore::open(root.path()).unwrap();
+            store.save_run_with_quota(&run, &reservation).unwrap();
+            let mut attempt = store.begin_provider_attempt(&run.run_id).unwrap();
+            attempt
+                .finish(
+                    ProviderSendCertainty::KnownAccepted,
+                    Some(200),
+                    Some(crate::completion::CompletionUsage {
+                        prompt_tokens: 7,
+                        completion_tokens: 5,
+                        total_tokens: 12,
+                        requests: 1,
+                    }),
+                    Utc::now(),
+                )
+                .unwrap();
+            store.save_provider_attempt_unlocked(&attempt).unwrap();
+            attempt.attempt_id
+            // Crash after the response row but before applying it to Run.
+        };
+
+        for _ in 0..2 {
+            let reopened = OrchStore::open(root.path()).unwrap();
+            let recovered = reopened.load_run(&run.run_id).unwrap().unwrap();
+            assert_eq!(recovered.aggregates.usage.total_tokens, 12);
+            assert_eq!(recovered.aggregates.usage.requests, 1);
+            assert_eq!(
+                recovered.aggregates.accounted_provider_attempt_ids,
+                vec![attempt_id.clone()]
+            );
+            assert_eq!(
+                reopened
+                    .load_quota_reservation(&reservation.reservation_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                QuotaReservationState::Consumed
+            );
+            drop(reopened);
+        }
     }
 }

@@ -7,6 +7,7 @@ mod continuation;
 pub(crate) mod managed;
 mod manager;
 mod message;
+mod provider_attempt;
 mod quota;
 mod routine;
 mod service;
@@ -46,6 +47,10 @@ pub use manager::{
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,
     MESSAGE_SCHEMA_VERSION,
+};
+pub use provider_attempt::{
+    ProviderAttemptRecord, ProviderAttemptState, ProviderRetryClass, ProviderSendCertainty,
+    PROVIDER_ATTEMPT_SCHEMA_VERSION,
 };
 pub use quota::{
     QuotaClass, QuotaLimits, QuotaPoolKey, QuotaPoolUsage, QuotaReservation, QuotaReservationState,

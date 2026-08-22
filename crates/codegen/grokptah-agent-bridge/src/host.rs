@@ -32,9 +32,9 @@ use crate::host_helpers::{
     filter_tools_edit_and_shell, filter_tools_edit_only, is_incomplete_stop_message,
     is_round_limit_stop_message, is_true_noop_tool_step, multi_failure_partial_edit_coaching,
     normalize_sandbox_profile, offline_plan_steps, parse_effort_arg,
-    post_cargo_failure_skip_message, propose_plan_with_model, push_assistant, push_thought,
-    push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
-    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    post_cargo_failure_skip_message, propose_plan_with_model, provider_dispatch_outcome,
+    push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
+    resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
     IdenticalToolCallRun, McpToolIndex,
@@ -48,10 +48,10 @@ use crate::orchestration::{
     AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
     ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, ProviderRouteSnapshot,
-    QuotaReservation, RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord,
-    RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger, RunAggregates, RunBounds, RunExecution,
-    RunExecutionMode, RunPurpose, RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem,
-    WorkItemSnapshot, WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
+    ProviderSendCertainty, QuotaReservation, RoutineConcurrencyPolicy, RoutineLifecycle,
+    RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger, RunAggregates, RunBounds,
+    RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState, RunStopCause, WorkAttemptView,
+    WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -443,12 +443,23 @@ struct RunUsageTracker {
 
 struct RunUsageAttempt {
     tracker: Arc<RunUsageTracker>,
+    provider_attempt_id: Option<String>,
     _bounded_admission: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl RunUsageAttempt {
-    fn finish(self, usage: Option<&CompletionUsage>) -> Result<Option<String>> {
-        self.tracker.finish_attempt(usage)
+    fn finish(
+        self,
+        certainty: ProviderSendCertainty,
+        http_status: Option<u16>,
+        usage: Option<&CompletionUsage>,
+    ) -> Result<Option<String>> {
+        self.tracker.finish_attempt(
+            self.provider_attempt_id.as_deref(),
+            certainty,
+            http_status,
+            usage,
+        )
     }
 }
 
@@ -545,28 +556,77 @@ impl RunUsageTracker {
                 .ok_or_else(|| anyhow!("provider attempt counter overflowed"))?;
             state.pending_requests
         };
-        match self.store.update_run(&self.run_id, |run| {
-            run.aggregates.usage_pending_requests = pending_requests;
-            run.updated_at = Utc::now();
-            Ok(())
-        }) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                self.state.lock().pending_requests = pending_requests.saturating_sub(1);
-                bail!("run disappeared while admitting a provider request");
+        let provider_attempt_id = if self.max_provider_requests.is_some() {
+            match self.store.begin_provider_attempt(&self.run_id) {
+                Ok(attempt) => Some(attempt.attempt_id),
+                Err(error) => {
+                    self.state.lock().pending_requests = pending_requests.saturating_sub(1);
+                    return Err(error);
+                }
             }
-            Err(error) => {
-                self.state.lock().pending_requests = pending_requests.saturating_sub(1);
-                return Err(error);
+        } else {
+            match self.store.update_run(&self.run_id, |run| {
+                run.aggregates.usage_pending_requests = pending_requests;
+                run.updated_at = Utc::now();
+                Ok(())
+            }) {
+                Ok(Some(_)) => None,
+                Ok(None) => {
+                    self.state.lock().pending_requests = pending_requests.saturating_sub(1);
+                    bail!("run disappeared while admitting a provider request");
+                }
+                Err(error) => {
+                    self.state.lock().pending_requests = pending_requests.saturating_sub(1);
+                    return Err(error);
+                }
             }
-        }
+        };
         Ok(RunUsageAttempt {
             tracker: self.clone(),
+            provider_attempt_id,
             _bounded_admission: bounded_admission,
         })
     }
 
-    fn finish_attempt(&self, usage: Option<&CompletionUsage>) -> Result<Option<String>> {
+    fn finish_attempt(
+        &self,
+        provider_attempt_id: Option<&str>,
+        certainty: ProviderSendCertainty,
+        http_status: Option<u16>,
+        usage: Option<&CompletionUsage>,
+    ) -> Result<Option<String>> {
+        if let Some(attempt_id) = provider_attempt_id {
+            let run = self.store.finish_provider_attempt(
+                attempt_id,
+                certainty,
+                http_status,
+                usage.cloned(),
+            )?;
+            let mut state = self.state.lock();
+            state.usage = run.aggregates.usage;
+            state.complete = run.aggregates.usage_complete;
+            state.pending_requests = run.aggregates.usage_pending_requests;
+            state.stop = match run.stop_cause {
+                Some(RunStopCause::TokenCeiling) => {
+                    self.max_total_tokens.map(|ceiling| RunTokenStop::Reached {
+                        consumed: state.usage.total_tokens,
+                        ceiling,
+                    })
+                }
+                Some(RunStopCause::TokenAccountingUnavailable) => self
+                    .max_total_tokens
+                    .map(|ceiling| RunTokenStop::UsageUnavailable { ceiling }),
+                Some(RunStopCause::ProviderQuota) => {
+                    self.max_provider_requests
+                        .map(|ceiling| RunTokenStop::RequestCeiling {
+                            consumed: state.usage.requests,
+                            ceiling,
+                        })
+                }
+                _ => None,
+            };
+            return Ok(state.stop.map(RunTokenStop::message));
+        }
         {
             let mut state = self.state.lock();
             state.pending_requests = state.pending_requests.saturating_sub(1);
@@ -4030,8 +4090,8 @@ impl AgentHostHandle {
                         (!reply.text.trim().is_empty())
                             .then(|| format!("LLM compact summary:\n{}", reply.text))
                     }
-                    Err(_) => {
-                        self.finish_provider_attempt(id, usage_attempt, None)?;
+                    Err(error) => {
+                        self.finish_provider_attempt_after_error(usage_attempt, &error)?;
                         None
                     }
                 }
@@ -4277,7 +4337,19 @@ impl AgentHostHandle {
             );
         }
         match attempt {
-            Some(attempt) => attempt.finish(usage),
+            Some(attempt) => attempt.finish(ProviderSendCertainty::KnownAccepted, None, usage),
+            None => Ok(None),
+        }
+    }
+
+    fn finish_provider_attempt_after_error(
+        &self,
+        attempt: Option<RunUsageAttempt>,
+        error: &anyhow::Error,
+    ) -> Result<Option<String>> {
+        let outcome = provider_dispatch_outcome(error);
+        match attempt {
+            Some(attempt) => attempt.finish(outcome.certainty, outcome.http_status, None),
             None => Ok(None),
         }
     }
@@ -7796,7 +7868,7 @@ impl AgentHostHandle {
                         }
                         Err(e) => {
                             plan_token_stop =
-                                self.finish_provider_attempt(session_id, usage_attempt, None)?;
+                                self.finish_provider_attempt_after_error(usage_attempt, &e)?;
                             let mut s = offline_plan_steps(&goal);
                             s.insert(0, format!("(model plan fallback: {e})"));
                             s
@@ -8811,7 +8883,7 @@ impl AgentHostHandle {
                 Ok(s) => s,
                 Err(e) => {
                     if let Some(stop) =
-                        self.finish_provider_attempt(session_id, usage_attempt, None)?
+                        self.finish_provider_attempt_after_error(usage_attempt, &e)?
                     {
                         emit_message(event_tx, session_id, &stop);
                         push_assistant(self, session_id, &stop);
@@ -9991,9 +10063,9 @@ impl AgentHostHandle {
                                 stop.map(|stop| format!("\n\n{stop}")).unwrap_or_default()
                             );
                         }
-                        Err(_error) => {
+                        Err(error) => {
                             if let Some(stop) =
-                                self.finish_provider_attempt(session_id, usage_attempt, None)?
+                                self.finish_provider_attempt_after_error(usage_attempt, &error)?
                             {
                                 summary = format!("{summary}\n\n### Explorer summary\n{stop}");
                             } else {
@@ -10372,7 +10444,7 @@ impl AgentHostHandle {
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
-                    match self.finish_provider_attempt(session_id, usage_attempt, None) {
+                    match self.finish_provider_attempt_after_error(usage_attempt, &error) {
                         Ok(Some(stop)) => last = stop,
                         Ok(None) => last = format!("GP subagent model call failed: {error:#}"),
                         Err(persist_error) => {
@@ -11764,12 +11836,16 @@ mod tests {
         .is_err());
 
         first
-            .finish(Some(&CompletionUsage {
-                prompt_tokens: 3,
-                completion_tokens: 2,
-                total_tokens: 5,
-                requests: 1,
-            }))
+            .finish(
+                ProviderSendCertainty::KnownAccepted,
+                None,
+                Some(&CompletionUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                    requests: 1,
+                }),
+            )
             .unwrap();
         let second = tokio::time::timeout(
             std::time::Duration::from_millis(250),
@@ -11779,12 +11855,16 @@ mod tests {
         .unwrap()
         .unwrap();
         second
-            .finish(Some(&CompletionUsage {
-                prompt_tokens: 2,
-                completion_tokens: 1,
-                total_tokens: 3,
-                requests: 1,
-            }))
+            .finish(
+                ProviderSendCertainty::KnownAccepted,
+                None,
+                Some(&CompletionUsage {
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    total_tokens: 3,
+                    requests: 1,
+                }),
+            )
             .unwrap();
 
         let persisted = store.load_run("bounded-admission").unwrap().unwrap();
