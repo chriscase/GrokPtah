@@ -25,14 +25,15 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
-    call_xai_agent_step_observed, call_xai_chat, cargo_test_failure_coaching,
-    cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
-    coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
-    filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
-    is_incomplete_stop_message, is_round_limit_stop_message, is_true_noop_tool_step,
-    multi_failure_partial_edit_coaching, normalize_sandbox_profile, offline_plan_steps,
-    parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model, push_assistant,
-    push_thought, push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
+    call_xai_agent_step_routed, call_xai_chat, call_xai_chat_routed,
+    capture_provider_route_snapshot, cargo_test_failure_coaching, cargo_test_output_failed,
+    cargo_test_output_passed, cargo_test_reverify_coaching, coding_agent_tools,
+    count_cargo_test_failures, emit_message, emit_thought, filter_tools_batch_edit_only,
+    filter_tools_edit_and_shell, filter_tools_edit_only, is_incomplete_stop_message,
+    is_round_limit_stop_message, is_true_noop_tool_step, multi_failure_partial_edit_coaching,
+    normalize_sandbox_profile, offline_plan_steps, parse_effort_arg,
+    post_cargo_failure_skip_message, propose_plan_with_model, push_assistant, push_thought,
+    push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
     round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
@@ -46,11 +47,11 @@ use crate::orchestration::{
     AgentContinuationPlan, AgentLaneAssociation, AgentRecord, AgentResumePlan, AgentSpec,
     AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
-    ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
-    RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate,
-    DEFAULT_AGENT_TOOL_IDS,
+    ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, ProviderRouteSnapshot,
+    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
+    RoutineTrigger, RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose,
+    RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy,
+    WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -72,6 +73,22 @@ use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
     SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
 };
+
+fn resolve_run_credentials(
+    provider_route: Option<&ProviderRouteSnapshot>,
+    model: &str,
+) -> Result<Option<crate::auth_store::WireCredentials>> {
+    match provider_route {
+        Some(route) => crate::auth_store::resolve_wire_credentials_for_route(
+            &route.provider_id,
+            route.kind,
+            route.dialect,
+            &route.credential_ref,
+        ),
+        None => crate::auth_store::resolve_wire_credentials_for_model(model),
+    }
+    .map_err(anyhow::Error::msg)
+}
 
 /// UI restore payload: open tabs + active Lane + project.
 ///
@@ -950,6 +967,32 @@ impl AgentHostHandle {
         let session = self.provider_observation.as_ref()?;
         let tracker = self.run_usage_trackers.lock().get(&session_id).cloned()?;
         session.context(tracker.run_id(), session_id).ok()
+    }
+
+    fn active_run_provider_route(&self, session_id: Uuid) -> Result<Option<ProviderRouteSnapshot>> {
+        let tracker = self.run_usage_trackers.lock().get(&session_id).cloned();
+        let Some(tracker) = tracker else {
+            if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none()
+                && self.inner.lock().turn_cancels.contains_key(&session_id)
+            {
+                bail!("active turn has no durable provider route yet");
+            }
+            return Ok(None);
+        };
+        let run = tracker
+            .store
+            .load_run(tracker.run_id())?
+            .ok_or_else(|| anyhow!("active Run disappeared while resolving its provider route"))?;
+        match run.provider_route {
+            Some(route) => {
+                route
+                    .validate()
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                Ok(Some(route))
+            }
+            None if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() => Ok(None),
+            None => bail!("active Build Run has no immutable provider route snapshot"),
+        }
     }
 
     pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {
@@ -2473,6 +2516,7 @@ impl AgentHostHandle {
         bounds: RunBounds,
         start_seq: u64,
         turn_id: Uuid,
+        provider_route: Option<ProviderRouteSnapshot>,
         execution: Option<RunExecution>,
         agent_id: Option<String>,
         agent_spec_revision: Option<u64>,
@@ -2500,6 +2544,7 @@ impl AgentHostHandle {
             client_id: Some("desktop".into()),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
+            provider_route,
             agent_id: agent_id.clone(),
             retry_of: None,
             parent_run_id,
@@ -3871,6 +3916,16 @@ impl AgentHostHandle {
 
     /// Async compact: model-backed summary when online, extractive offline.
     pub async fn compact_session_async(&self, id: Uuid) -> Result<SessionSummary> {
+        let provider_route = self.active_run_provider_route(id)?;
+        self.compact_session_async_routed(id, provider_route.as_ref())
+            .await
+    }
+
+    async fn compact_session_async_routed(
+        &self,
+        id: Uuid,
+        provider_route: Option<&ProviderRouteSnapshot>,
+    ) -> Result<SessionSummary> {
         self.ensure_session_accepts_new_work(id)?;
         self.ensure_transcript_loaded(id)?;
         const KEEP_RECENT: usize = 6;
@@ -3897,9 +3952,7 @@ impl AgentHostHandle {
 
         let quality = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
             None
-        } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(&model)
-            .map_err(anyhow::Error::msg)?
-        {
+        } else if let Some(creds) = resolve_run_credentials(provider_route, &model)? {
             let blob = build_compact_summary(&leaving);
             let prompt = format!(
                 "Summarize this coding-agent conversation for future turns. \
@@ -3914,16 +3967,25 @@ impl AgentHostHandle {
             if !call_allowed {
                 None
             } else {
-                match call_xai_chat(
-                    &creds,
-                    &model,
-                    &[("user".into(), prompt)],
-                    None,
-                    &cwd,
-                    SessionKind::Build,
-                )
-                .await
-                {
+                let history = [("user".into(), prompt)];
+                let reply = match provider_route {
+                    Some(route) => {
+                        call_xai_chat_routed(
+                            &creds,
+                            route,
+                            &history,
+                            None,
+                            &cwd,
+                            SessionKind::Build,
+                        )
+                        .await
+                    }
+                    None => {
+                        call_xai_chat(&creds, &model, &history, None, &cwd, SessionKind::Build)
+                            .await
+                    }
+                };
+                match reply {
                     Ok(reply) => {
                         self.finish_provider_attempt(id, usage_attempt, reply.usage.as_ref())?;
                         (!reply.text.trim().is_empty())
@@ -4271,6 +4333,21 @@ impl AgentHostHandle {
     pub fn set_effort(&self, effort: EffortLevel) {
         self.inner.lock().effort = effort;
         self.persist_chrome();
+    }
+
+    pub(crate) fn current_effort(&self) -> EffortLevel {
+        self.inner.lock().effort
+    }
+
+    pub(crate) fn capture_provider_route(
+        &self,
+        model: &str,
+        effort: EffortLevel,
+    ) -> Result<ProviderRouteSnapshot> {
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        capture_provider_route_snapshot(&credentials, model, effort)
     }
 
     /// Single source of truth for global tool prompting (#113).
@@ -6881,7 +6958,9 @@ impl AgentHostHandle {
                 None
             }
         };
-        let external_agent_spec = if let Some(external) = external_run.as_ref() {
+        let (external_agent_spec, external_provider_route) = if let Some(external) =
+            external_run.as_ref()
+        {
             let store = self.ensure_orchestration_store()?;
             let run = store
                 .load_run(&external.run_id)?
@@ -6902,13 +6981,25 @@ impl AgentHostHandle {
             if agent.current_spec()?.revision != revision {
                 bail!("persistent Agent specification changed before external turn start");
             }
-            Some(
-                store
-                    .load_agent_spec(&agent.agent_id, revision)?
-                    .ok_or_else(|| anyhow!("external Run Agent specification is missing"))?,
-            )
+            let spec = store
+                .load_agent_spec(&agent.agent_id, revision)?
+                .ok_or_else(|| anyhow!("external Run Agent specification is missing"))?;
+            let route = match run.provider_route.clone() {
+                Some(route) => {
+                    route
+                        .validate()
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                    if route.selection_key != spec.model.selection_key {
+                        bail!("external Run provider route does not match its captured Agent specification");
+                    }
+                    Some(route)
+                }
+                None if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() => None,
+                None => bail!("external Run has no immutable provider route snapshot"),
+            };
+            (Some(spec), route)
         } else {
-            None
+            (None, None)
         };
         let agent_default_bounds = if let Some(spec) = external_agent_spec.as_ref() {
             Some(spec.default_run_bounds.clone())
@@ -7036,7 +7127,10 @@ impl AgentHostHandle {
                     .transpose()?
                     .unwrap_or_else(|| g.model.clone())
             };
-            let effort = g.effort;
+            let effort = external_provider_route
+                .as_ref()
+                .map(|route| route.effort)
+                .unwrap_or(g.effort);
             let cancel = CancellationToken::new();
             g.turn_cancels.insert(session_id, cancel.clone());
             g.begin_turn_generation(session_id);
@@ -7077,6 +7171,15 @@ impl AgentHostHandle {
             host: self.clone(),
             session_id,
             armed: true,
+        };
+        let provider_route = match external_provider_route {
+            Some(route) => Some(route),
+            None if kind == SessionKind::Build
+                && std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none() =>
+            {
+                Some(self.capture_provider_route(&model, effort)?)
+            }
+            None => None,
         };
         // Durably append the user turn before the long model call.
         self.persist_session(session_id);
@@ -7161,6 +7264,7 @@ impl AgentHostHandle {
                 bounds,
                 start_seq,
                 turn_id,
+                provider_route.clone(),
                 run_execution.clone(),
                 agent.as_ref().map(|agent| agent.agent_id.clone()),
                 agent
@@ -7223,6 +7327,7 @@ impl AgentHostHandle {
             &execution_cwd,
             &model,
             effort,
+            provider_route.as_ref(),
             plan_mode,
             kind,
             &prompt,
@@ -7532,6 +7637,7 @@ impl AgentHostHandle {
         cwd: &Path,
         model: &str,
         effort: EffortLevel,
+        provider_route: Option<&ProviderRouteSnapshot>,
         plan_mode: bool,
         kind: SessionKind,
         prompt: &str,
@@ -7609,9 +7715,7 @@ impl AgentHostHandle {
             let mut plan_token_stop = None;
             let steps = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
                 offline_plan_steps(&goal)
-            } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(model)
-                .map_err(anyhow::Error::msg)?
-            {
+            } else if let Some(creds) = resolve_run_credentials(provider_route, model)? {
                 let usage_attempt = match self.begin_provider_attempt(session_id).await {
                     Ok(attempt) => attempt,
                     Err(error) => {
@@ -7625,7 +7729,16 @@ impl AgentHostHandle {
                 if plan_token_stop.is_some() {
                     offline_plan_steps(&goal)
                 } else {
-                    match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
+                    match propose_plan_with_model(
+                        &creds,
+                        model,
+                        provider_route,
+                        cwd,
+                        &goal,
+                        &cancel,
+                    )
+                    .await
+                    {
                         Ok((steps, usage)) if !steps.is_empty() => {
                             plan_token_stop = self.finish_provider_attempt(
                                 session_id,
@@ -7734,7 +7847,9 @@ impl AgentHostHandle {
                             .map(|s| s.transcript.len())
                             .unwrap_or(0)
                     };
-                    let _ = self.compact_session_async(session_id).await?;
+                    let _ = self
+                        .compact_session_async_routed(session_id, provider_route)
+                        .await?;
                     let after = {
                         let g = self.inner.lock();
                         g.sessions
@@ -7932,7 +8047,14 @@ impl AgentHostHandle {
                         args.join(" ")
                     };
                     let summary = self
-                        .run_explore_subagent(session_id, cwd, &query, &cancel, &event_tx)
+                        .run_explore_subagent(
+                            session_id,
+                            cwd,
+                            &query,
+                            &cancel,
+                            &event_tx,
+                            provider_route,
+                        )
                         .await?;
                     emit_message(&event_tx, session_id, &summary);
                     push_assistant(self, session_id, &summary);
@@ -7950,9 +8072,9 @@ impl AgentHostHandle {
         }
 
         // ── Real multi-step coding agent (tool-calling loop) ─────────────
-        let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(model)
-            .map_err(anyhow::Error::msg)?
-        else {
+        let provider_route = provider_route
+            .ok_or_else(|| anyhow!("Build Run has no immutable provider route snapshot"))?;
+        let Some(creds) = resolve_run_credentials(Some(provider_route), model)? else {
             let msg = format!(
                 "{}\n\nYou said: {}\nProject: {}\nModel: {} · effort: {}",
                 crate::auth_store::auth_help_message(),
@@ -7979,9 +8101,8 @@ impl AgentHostHandle {
             .run_coding_agent_loop(
                 session_id,
                 cwd,
-                model,
-                effort,
                 &creds,
+                provider_route,
                 &wire_history,
                 compacted_summary.as_deref(),
                 &cancel,
@@ -8273,6 +8394,7 @@ impl AgentHostHandle {
                     &args.to_string(),
                     cancel,
                     event_tx,
+                    None,
                     &Default::default(),
                 )
                 .await;
@@ -8290,6 +8412,7 @@ impl AgentHostHandle {
                     .to_string(),
                     cancel,
                     event_tx,
+                    None,
                     &Default::default(),
                 )
                 .await;
@@ -8307,6 +8430,7 @@ impl AgentHostHandle {
                     .to_string(),
                     cancel,
                     event_tx,
+                    None,
                     &Default::default(),
                 )
                 .await;
@@ -8320,6 +8444,7 @@ impl AgentHostHandle {
                     &serde_json::json!({ "patch": rest.trim() }).to_string(),
                     cancel,
                     event_tx,
+                    None,
                     &Default::default(),
                 )
                 .await;
@@ -8334,6 +8459,7 @@ impl AgentHostHandle {
                         &serde_json::json!({ "url": url }).to_string(),
                         cancel,
                         event_tx,
+                        None,
                         &Default::default(),
                     )
                     .await;
@@ -8382,9 +8508,8 @@ impl AgentHostHandle {
         &self,
         session_id: Uuid,
         cwd: &Path,
-        model: &str,
-        effort: EffortLevel,
         creds: &crate::auth_store::WireCredentials,
+        provider_route: &ProviderRouteSnapshot,
         history: &[(String, String)],
         compacted_summary: Option<&str>,
         cancel: &CancellationToken,
@@ -8410,7 +8535,9 @@ impl AgentHostHandle {
                     .unwrap_or(false)
             };
             if need {
-                let _ = self.compact_session_async(session_id).await;
+                let _ = self
+                    .compact_session_async_routed(session_id, Some(provider_route))
+                    .await;
             }
         }
 
@@ -8625,10 +8752,9 @@ impl AgentHostHandle {
                 }
             };
             let provider_observation = self.provider_observation_context(session_id);
-            let step = match call_xai_agent_step_observed(
+            let step = match call_xai_agent_step_routed(
                 creds,
-                model,
-                effort,
+                provider_route,
                 &messages,
                 &tools_this_round,
                 !self.run_tokens_bounded(session_id),
@@ -8850,6 +8976,7 @@ impl AgentHostHandle {
                                 &tc.arguments,
                                 cancel,
                                 event_tx,
+                                Some(provider_route),
                                 &mcp_index,
                             )
                             .await;
@@ -8964,6 +9091,7 @@ impl AgentHostHandle {
                                 &args,
                                 cancel,
                                 event_tx,
+                                Some(provider_route),
                                 &mcp_index,
                             )
                             .await;
@@ -9104,6 +9232,7 @@ impl AgentHostHandle {
         arguments_json: &str,
         cancel: &CancellationToken,
         event_tx: &crate::event_bus::EventBus,
+        provider_route: Option<&ProviderRouteSnapshot>,
         mcp_index: &McpToolIndex,
     ) -> Result<String> {
         let args: serde_json::Value = serde_json::from_str(arguments_json)
@@ -9444,8 +9573,15 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .unwrap_or("explore the codebase")
                     .to_string();
-                self.run_explore_subagent(session_id, cwd, &query, cancel, event_tx)
-                    .await
+                self.run_explore_subagent(
+                    session_id,
+                    cwd,
+                    &query,
+                    cancel,
+                    event_tx,
+                    provider_route,
+                )
+                .await
             }
             "spawn_general_purpose" | "spawn_subagent" => {
                 let prompt = args
@@ -9690,6 +9826,7 @@ impl AgentHostHandle {
         query: &str,
         cancel: &CancellationToken,
         event_tx: &crate::event_bus::EventBus,
+        provider_route: Option<&ProviderRouteSnapshot>,
     ) -> Result<String> {
         let sub_id = Uuid::new_v4().to_string();
         {
@@ -9764,9 +9901,7 @@ impl AgentHostHandle {
         let mut summary = parts.join("\n\n");
         if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none() {
             let model = self.inner.lock().model.clone();
-            if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(&model)
-                .map_err(anyhow::Error::msg)?
-            {
+            if let Some(creds) = resolve_run_credentials(provider_route, &model)? {
                 let ask = format!(
                     "You are a read-only explore agent. Summarize findings for the parent agent.\n\
                      Query: {query}\n\nFindings:\n{}",
@@ -9786,16 +9921,25 @@ impl AgentHostHandle {
                 if usage_attempt.is_some()
                     || self.run_token_stop_before_request(session_id).is_none()
                 {
-                    match call_xai_chat(
-                        &creds,
-                        &model,
-                        &[("user".into(), ask)],
-                        None,
-                        cwd,
-                        SessionKind::Build,
-                    )
-                    .await
-                    {
+                    let history = [("user".into(), ask)];
+                    let reply = match provider_route {
+                        Some(route) => {
+                            call_xai_chat_routed(
+                                &creds,
+                                route,
+                                &history,
+                                None,
+                                cwd,
+                                SessionKind::Build,
+                            )
+                            .await
+                        }
+                        None => {
+                            call_xai_chat(&creds, &model, &history, None, cwd, SessionKind::Build)
+                                .await
+                        }
+                    };
+                    match reply {
                         Ok(reply) => {
                             let stop = self.finish_provider_attempt(
                                 session_id,
@@ -9966,6 +10110,14 @@ impl AgentHostHandle {
         // Snapshot the durable parent Run identity. Looking this up again from
         // the session after the parent finishes could charge a later Run.
         let run_usage_tracker = self.run_usage_trackers.lock().get(&session_id).cloned();
+        let provider_route = run_usage_tracker.as_ref().and_then(|tracker| {
+            tracker
+                .store
+                .load_run(tracker.run_id())
+                .ok()
+                .flatten()
+                .and_then(|run| run.provider_route)
+        });
         let sub_id_task = sub_id.clone();
         tokio::spawn(async move {
             host.run_gp_subagent_body(
@@ -9978,6 +10130,7 @@ impl AgentHostHandle {
                 event_tx,
                 persona_reminder,
                 run_usage_tracker,
+                provider_route,
             )
             .await;
         });
@@ -10010,6 +10163,7 @@ impl AgentHostHandle {
         event_tx: crate::event_bus::EventBus,
         persona_reminder: Option<String>,
         run_usage_tracker: Option<Arc<RunUsageTracker>>,
+        provider_route: Option<ProviderRouteSnapshot>,
     ) {
         if cancel.is_cancelled() {
             self.finish_subagent(sub_id, "cancelled", &event_tx, session_id, None);
@@ -10086,22 +10240,35 @@ impl AgentHostHandle {
         }
 
         // Online: short multi-tool agent loop under child cancel.
-        let creds = match crate::auth_store::resolve_wire_credentials_for_model(
-            &self.inner.lock().model.clone(),
-        ) {
-            Err(error) => {
-                self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(error));
-                return;
-            }
-            Ok(None) => {
-                let msg = "GP subagent: no credentials";
-                self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(msg.into()));
-                return;
-            }
-            Ok(Some(c)) => c,
+        let Some(provider_route) = provider_route else {
+            self.finish_subagent(
+                sub_id,
+                "failed",
+                &event_tx,
+                session_id,
+                Some("GP subagent: parent Run has no immutable provider route".into()),
+            );
+            return;
         };
-        let model = self.inner.lock().model.clone();
-        let effort = self.inner.lock().effort;
+        let creds =
+            match resolve_run_credentials(Some(&provider_route), &provider_route.selection_key) {
+                Err(error) => {
+                    self.finish_subagent(
+                        sub_id,
+                        "failed",
+                        &event_tx,
+                        session_id,
+                        Some(error.to_string()),
+                    );
+                    return;
+                }
+                Ok(None) => {
+                    let msg = "GP subagent: no credentials";
+                    self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(msg.into()));
+                    return;
+                }
+                Ok(Some(c)) => c,
+            };
         let (tools, mcp_index) = coding_agent_tools(&[]);
         let mut sys = format!(
             "You are a {kind} subagent for GrokPtah. Complete the task with tools. \
@@ -10149,10 +10316,9 @@ impl AgentHostHandle {
                     }
                 };
             let provider_observation = self.provider_observation_context(session_id);
-            let step = call_xai_agent_step_observed(
+            let step = call_xai_agent_step_routed(
                 &creds,
-                &model,
-                effort,
+                &provider_route,
                 &messages,
                 &tools,
                 !run_usage_tracker
@@ -10252,6 +10418,7 @@ impl AgentHostHandle {
                                 &tc.arguments,
                                 &cancel,
                                 &event_tx,
+                                Some(&provider_route),
                                 &mcp_index,
                             ))
                             .await
@@ -11369,6 +11536,7 @@ mod tests {
             client_id: Some("test".into()),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -11833,6 +12001,7 @@ mod tests {
             client_id: Some("test".into()),
             state: RunState::Completed,
             purpose: RunPurpose::Execution,
+            provider_route: None,
             agent_id: Some(agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -11975,6 +12144,7 @@ mod tests {
             client_id: Some("test".into()),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
+            provider_route: None,
             agent_id: Some(current_agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -12271,6 +12441,7 @@ mod tests {
             client_id: Some("test".into()),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
+            provider_route: None,
             agent_id: Some(agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -12364,6 +12535,7 @@ mod tests {
             client_id: Some("native-executor".into()),
             state: RunState::Running,
             purpose: RunPurpose::ManagerProposal,
+            provider_route: None,
             agent_id: Some(agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,

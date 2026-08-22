@@ -12,6 +12,42 @@ use grokptah_agent_bridge::{AgentRecord, AgentState};
 use tempfile::tempdir;
 use uuid::Uuid;
 
+fn managed_intent(
+    intent_id: &str,
+    agent_id: &str,
+    work_id: &str,
+    session_id: Uuid,
+    provider_id: &str,
+    model_id: &str,
+) -> ManagedExecutionIntent {
+    let now = Utc::now();
+    ManagedExecutionIntent {
+        schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+        intent_id: intent_id.into(),
+        agent_id: agent_id.into(),
+        agent_spec_revision: 1,
+        work_id: work_id.into(),
+        work_revision: 1,
+        attempt_id: None,
+        run_id: None,
+        session_id,
+        workspace: "/tmp/ws".into(),
+        source_routine_id: None,
+        source_activation_id: None,
+        model_selection_key: grokptah_agent_bridge::model_selection_key(provider_id, model_id),
+        provider_route: Some(ProviderRoute {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+        }),
+        bounds: RunBounds::default(),
+        input_hash: format!("hash-{intent_id}"),
+        state: ManagedIntentState::Claiming,
+        permission_request_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 fn capacity(live_for_agent: usize, live_for_provider: usize) -> ManagedAdmissionCapacity {
     ManagedAdmissionCapacity {
         live_intents_for_agent: live_for_agent,
@@ -245,7 +281,7 @@ fn live_provider_counts_ignore_finalized_and_foreign_providers() {
             workspace: "/tmp/ws".into(),
             source_routine_id: None,
             source_activation_id: None,
-            model_selection_key: model.into(),
+            model_selection_key: grokptah_agent_bridge::model_selection_key(provider, model),
             provider_route: Some(ProviderRoute {
                 provider_id: provider.into(),
                 model_id: model.into(),
@@ -322,6 +358,41 @@ fn legacy_intents_without_a_route_still_consume_provider_capacity() {
 }
 
 #[test]
+fn unresolvable_legacy_intent_conservatively_consumes_provider_capacity() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    let mut legacy = managed_intent(
+        "legacy-unknown",
+        "legacy-agent",
+        "legacy-work",
+        session,
+        "xai",
+        "grok",
+    );
+    legacy.provider_route = None;
+    legacy.model_selection_key = "ptah.model.v1:malformed".into();
+    legacy.validate().unwrap();
+    assert_eq!(legacy.effective_provider_id(), None);
+    store.save_managed_intent(&legacy).unwrap();
+
+    assert_eq!(store.live_managed_intents_for_provider("xai").unwrap(), 1);
+    assert_eq!(store.live_managed_intents_for_provider("corp").unwrap(), 1);
+
+    let candidate = managed_intent(
+        "candidate",
+        "candidate-agent",
+        "candidate-work",
+        session,
+        "corp",
+        "code",
+    );
+    let error = store.reserve_managed_intent(&candidate, 2, 1).unwrap_err();
+    assert_eq!(error.code, OrchErrorCode::CapacityExhausted);
+    assert_eq!(error.message, PROVIDER_CEILING_EXHAUSTED);
+}
+
+#[test]
 fn intent_validation_rejects_a_malformed_provider_route() {
     let session = Uuid::new_v4();
     let now = Utc::now();
@@ -363,7 +434,52 @@ fn intent_validation_rejects_a_malformed_provider_route() {
         provider_id: "corp".into(),
         model_id: "code".into(),
     });
+    assert!(intent.validate().is_err());
+    intent.model_selection_key = grokptah_agent_bridge::model_selection_key("corp", "code");
     intent.validate().unwrap();
+}
+
+#[test]
+fn concurrent_provider_reservations_never_exceed_the_durable_ceiling() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(MAX_CONCURRENT_PROVIDER_RUNS + 2));
+    let mut threads = Vec::new();
+    for index in 0..MAX_CONCURRENT_PROVIDER_RUNS + 2 {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        threads.push(std::thread::spawn(move || {
+            let intent = managed_intent(
+                &format!("intent-{index}"),
+                &format!("agent-{index}"),
+                &format!("work-{index}"),
+                session,
+                "xai",
+                "grok",
+            );
+            barrier.wait();
+            store.reserve_managed_intent(
+                &intent,
+                MAX_CONCURRENT_PROVIDER_RUNS,
+                MAX_CONCURRENT_PROVIDER_RUNS,
+            )
+        }));
+    }
+    let outcomes = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 4);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err())
+            .filter(|error| error.message == PROVIDER_CEILING_EXHAUSTED)
+            .count(),
+        2
+    );
+    assert_eq!(store.live_managed_intents_for_provider("xai").unwrap(), 4);
 }
 
 #[test]
@@ -581,6 +697,7 @@ fn run_for_intent(intent_id: &str, session: Uuid, workspace: &str, state: RunSta
         client_id: Some("native-executor".into()),
         state,
         purpose: Default::default(),
+        provider_route: None,
         agent_id: Some("worker-a".into()),
         retry_of: None,
         parent_run_id: None,

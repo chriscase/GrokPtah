@@ -163,6 +163,7 @@ pub const MAX_CONCURRENT_PROVIDER_RUNS: usize = 4;
 /// Single source of truth for the provider-ceiling rejection, so the executor
 /// can attribute a declined admission without re-deriving policy order.
 pub const PROVIDER_CEILING_EXHAUSTED: &str = "provider concurrent run ceiling is exhausted";
+pub const AGENT_CEILING_EXHAUSTED: &str = "managed execution concurrent run ceiling is exhausted";
 
 pub const MAX_PROVIDER_ROUTE_COMPONENT_BYTES: usize = 256;
 
@@ -344,6 +345,13 @@ impl ManagedExecutionIntent {
         }
         if let Some(route) = &self.provider_route {
             route.validate()?;
+            let selection = crate::gateway_config::parse_model_selection(&self.model_selection_key)
+                .map_err(|_| invalid("managed execution intent model selection is invalid"))?;
+            if route.provider_id != selection.provider_id || route.model_id != selection.model_id {
+                return Err(invalid(
+                    "managed execution intent provider route does not match its model selection",
+                ));
+            }
         }
         self.bounds.validate()?;
         Ok(())
@@ -518,7 +526,7 @@ pub fn managed_execution_eligible(
     if capacity.agent_ceiling_exhausted(policy) {
         return Err(OrchError::new(
             OrchErrorCode::CapacityExhausted,
-            "managed execution concurrent run ceiling is exhausted",
+            AGENT_CEILING_EXHAUSTED,
         ));
     }
     if capacity.provider_ceiling_exhausted() {
