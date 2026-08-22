@@ -159,6 +159,8 @@ pub enum EntityKind {
     Cursor,
     Permission,
     ExecutionIntent,
+    ManagerPlan,
+    ManagerStep,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -199,6 +201,8 @@ pub enum DurableStateCode {
     Deduplicated,
     Expired,
     Acknowledged,
+    NeedsReplan,
+    Superseded,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -213,6 +217,7 @@ pub enum DurableIdKind {
     Routine,
     Activation,
     Message,
+    ManagerPlan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -878,6 +883,11 @@ pub enum TraceOperationCode {
     AuthorizeWorkExecution,
     ResolveWorkInput,
     ListExecutionIntents,
+    CreateManagerPlan,
+    GetManagerPlan,
+    AdvanceManagerPlan,
+    TickManagerPlan,
+    ReplanManagerPlan,
     Oracle,
 }
 
@@ -909,6 +919,9 @@ pub enum ArgumentFieldCode {
     ExpectedRevision,
     AfterSequence,
     Limit,
+    PlanId,
+    Steps,
+    Reason,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1226,6 +1239,8 @@ fn map_entity(value: DurableEntity) -> EntityKind {
         DurableEntity::Cursor => EntityKind::Cursor,
         DurableEntity::Permission => EntityKind::Permission,
         DurableEntity::ExecutionIntent => EntityKind::ExecutionIntent,
+        DurableEntity::ManagerPlan => EntityKind::ManagerPlan,
+        DurableEntity::ManagerStep => EntityKind::ManagerStep,
     }
 }
 
@@ -1263,6 +1278,8 @@ fn map_state(value: DurableState) -> DurableStateCode {
         DurableState::Failed => DurableStateCode::Failed,
         DurableState::Cancelled => DurableStateCode::Cancelled,
         DurableState::Interrupted => DurableStateCode::Interrupted,
+        DurableState::NeedsReplan => DurableStateCode::NeedsReplan,
+        DurableState::Superseded => DurableStateCode::Superseded,
     }
 }
 
