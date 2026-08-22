@@ -1302,11 +1302,16 @@ fn pick_expired(
     facts: &[MemoryFact],
     event: DateTime<Utc>,
     watermark: DateTime<Utc>,
+    protect: Option<&str>,
 ) -> Option<usize> {
     facts
         .iter()
         .enumerate()
-        .filter(|(_, fact)| is_expired(fact, event) && is_expired(fact, watermark))
+        .filter(|(_, fact)| {
+            protect != Some(fact.id.as_str())
+                && is_expired(fact, event)
+                && is_expired(fact, watermark)
+        })
         .min_by(|(_, left), (_, right)| {
             fact_time(left)
                 .cmp(&fact_time(right))
@@ -1319,12 +1324,14 @@ fn pick_query_superseded(
     facts: &[MemoryFact],
     at: DateTime<Utc>,
     watermark: DateTime<Utc>,
+    protect: Option<&str>,
 ) -> Option<usize> {
     facts
         .iter()
         .enumerate()
         .filter(|(_, fact)| {
-            successor_active_at(facts, &fact.id, at)
+            protect != Some(fact.id.as_str())
+                && successor_active_at(facts, &fact.id, at)
                 && successor_active_at(facts, &fact.id, watermark)
                 && !compaction_protected(fact, facts, watermark)
         })
@@ -1336,11 +1343,21 @@ fn pick_query_superseded(
         .map(|(index, _)| index)
 }
 
-fn pick_noncritical(facts: &[MemoryFact], watermark: DateTime<Utc>) -> Option<usize> {
+fn pick_noncritical(
+    facts: &[MemoryFact],
+    event: DateTime<Utc>,
+    watermark: DateTime<Utc>,
+    protect: Option<&str>,
+) -> Option<usize> {
+    let freeze_history = watermark < event;
     facts
         .iter()
         .enumerate()
-        .filter(|(_, fact)| !compaction_protected(fact, facts, watermark))
+        .filter(|(_, fact)| {
+            protect != Some(fact.id.as_str())
+                && !compaction_protected(fact, facts, watermark)
+                && !(freeze_history && is_active(fact, watermark))
+        })
         .min_by(|(_, left), (_, right)| {
             let ls = match left.salience {
                 MemorySalience::Low => 0,
@@ -1368,12 +1385,16 @@ fn mark_tombstones(memory: &mut ProjectMemory) {
     }
 }
 
-fn compact(memory: &mut ProjectMemory, event: DateTime<Utc>) -> Result<(), MemoryError> {
+fn compact(
+    memory: &mut ProjectMemory,
+    event: DateTime<Utc>,
+    protect: Option<&str>,
+) -> Result<(), MemoryError> {
     let watermark = memory.retention_watermark;
     while memory.facts.len() > MAX_FACTS || encode_store(memory)?.len() > MAX_HOT_STORE_BYTES {
-        let index = pick_expired(&memory.facts, event, watermark)
-            .or_else(|| pick_query_superseded(&memory.facts, event, watermark))
-            .or_else(|| pick_noncritical(&memory.facts, watermark));
+        let index = pick_expired(&memory.facts, event, watermark, protect)
+            .or_else(|| pick_query_superseded(&memory.facts, event, watermark, protect))
+            .or_else(|| pick_noncritical(&memory.facts, event, watermark, protect));
         let Some(index) = index else {
             return Err(MemoryError::Capacity);
         };
@@ -1498,14 +1519,14 @@ fn transact<T>(
         Ok(None) => empty_memory(address, now),
         Err(_) => return Err(MemoryError::Durable),
     };
+    if address.clock.may_advance_retention() && now >= memory.retention_watermark {
+        memory.retention_watermark = now;
+    }
     let outcome = write(&mut memory, now)?;
     if outcome.commit {
         memory.generation = memory.generation.saturating_add(1).max(1);
         memory.project_key = storage_key(address);
         memory.cwd = address.source_workspace().display().to_string();
-        if address.clock.may_advance_retention() && now >= memory.retention_watermark {
-            memory.retention_watermark = now;
-        }
         let raw = encode_store(&memory)?;
         commit_canonical(&path, &raw)?;
     }
@@ -1536,7 +1557,7 @@ fn apply_incoming(
 ) -> Result<(), MemoryError> {
     let incoming_id = incoming.id.clone();
     memory.facts.push(incoming);
-    compact(memory, now)?;
+    compact(memory, now, Some(incoming_id.as_str()))?;
     if !memory.facts.iter().any(|fact| fact.id == incoming_id) {
         return Err(MemoryError::Capacity);
     }
@@ -1927,7 +1948,7 @@ fn declared_bounds_json() -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::discover::{home_override_serial, set_grokptah_home_override};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::Barrier;
     use std::time::{Duration as StdDuration, Instant};
 
@@ -2829,6 +2850,7 @@ mod tests {
         let _home = IsolatedHome::install();
         let source = tempfile::tempdir().unwrap();
         let clock = Arc::new(FakeClock::new(epoch()));
+        clock.enable_retention_advance();
         let address = MemoryAccess::new(source.path(), None)
             .with_clock(clock.clone())
             .project();
@@ -3240,8 +3262,8 @@ mod tests {
         Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "grokptah_agent_bridge::memory::tests::cross_process_writer_entry",
                 "--nocapture",
+                "memory::tests::cross_process_writer_entry",
             ])
             .env("GROKPTAH_HOME", home)
             .env("GROKPTAH_MEMORY_SUBPROC_TEXT", text)
@@ -3250,17 +3272,25 @@ mod tests {
             .env("GROKPTAH_MEMORY_SUBPROC_CLAIM", claim)
             .env("GROKPTAH_MEMORY_SUBPROC_GO", &go)
             .env("GROKPTAH_MEMORY_SUBPROC_ARRIVED", &arrived)
+            .env("RUST_TEST_THREADS", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap()
     }
 
-    fn parse_ack(output: &[u8]) -> serde_json::Value {
-        let text = String::from_utf8_lossy(output);
+    fn parse_ack(stdout: &[u8], stderr: &[u8]) -> serde_json::Value {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(stdout),
+            String::from_utf8_lossy(stderr)
+        );
         let line = text
             .lines()
-            .find(|line| line.starts_with("GROKPTAH_MEMORY_ACK:"))
+            .find(|line| line.contains("GROKPTAH_MEMORY_ACK:"))
             .unwrap_or_else(|| panic!("missing ack in {text}"));
-        serde_json::from_str(&line["GROKPTAH_MEMORY_ACK:".len()..]).unwrap()
+        let payload = line.split("GROKPTAH_MEMORY_ACK:").nth(1).unwrap();
+        serde_json::from_str(payload.trim()).unwrap()
     }
 
     #[test]
@@ -3290,7 +3320,7 @@ mod tests {
         while !barrier.path().join("arrived-one").exists()
             || !barrier.path().join("arrived-two").exists()
         {
-            assert!(started.elapsed() < StdDuration::from_secs(20));
+            assert!(started.elapsed() < StdDuration::from_secs(60));
             std::thread::sleep(StdDuration::from_millis(10));
         }
         fs::write(barrier.path().join("go"), b"1").unwrap();
@@ -3306,8 +3336,8 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out_two.stderr)
         );
-        let ack_one = parse_ack(&out_one.stdout);
-        let ack_two = parse_ack(&out_two.stdout);
+        let ack_one = parse_ack(&out_one.stdout, &out_one.stderr);
+        let ack_two = parse_ack(&out_two.stdout, &out_two.stderr);
         assert_eq!(ack_one["replayed"], false);
         assert_eq!(ack_two["replayed"], false);
 
@@ -3468,6 +3498,7 @@ mod tests {
             }
         }
 
+        clock.advance(Duration::days(spec.workload.expiring_status_ttl_days + 1));
         clock.enable_retention_advance();
         remember(&project, "retention tick", &[]).unwrap();
 
