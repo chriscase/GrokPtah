@@ -1892,7 +1892,8 @@ fn ensure_stream_completed(saw_data: bool, stream_completed: bool) -> Result<()>
     Ok(())
 }
 
-struct ProviderObservationRoute {
+#[derive(Clone)]
+pub(crate) struct ProviderObservationRoute {
     route_class: ObservationRoute,
     dialect: ObservationDialect,
     credential_method: crate::provider_observation::CredentialMethod,
@@ -2115,8 +2116,8 @@ pub(crate) async fn call_xai_agent_step<F, G>(
     on_thought: G,
 ) -> Result<AgentStep>
 where
-    F: FnMut(&str),
-    G: FnMut(&str),
+    F: FnMut(&str) + Send,
+    G: FnMut(&str) + Send,
 {
     call_xai_agent_step_observed(
         creds,
@@ -2146,8 +2147,8 @@ pub(crate) async fn call_xai_agent_step_routed<F, G>(
     on_thought: G,
 ) -> Result<AgentStep>
 where
-    F: FnMut(&str),
-    G: FnMut(&str),
+    F: FnMut(&str) + Send,
+    G: FnMut(&str) + Send,
 {
     call_xai_agent_step_observed_inner(
         creds,
@@ -2182,8 +2183,8 @@ pub(crate) async fn call_xai_agent_step_observed<F, G>(
     on_thought: G,
 ) -> Result<AgentStep>
 where
-    F: FnMut(&str),
-    G: FnMut(&str),
+    F: FnMut(&str) + Send,
+    G: FnMut(&str) + Send,
 {
     call_xai_agent_step_observed_inner(
         creds,
@@ -2201,6 +2202,150 @@ where
     .await
 }
 
+/// Provider-neutral host/transport boundary for one coding-model request.
+///
+/// The host resolves and validates the route, credential identity, purpose,
+/// bounds, and durable attempt before invoking this seam. Implementations may
+/// only encode, send, and parse the supplied request; they receive no store,
+/// session, workspace, authority, or credential-resolution capability.
+#[derive(Clone)]
+pub(crate) struct ProviderCredentialHandle {
+    provider_id: String,
+    bearer: String,
+    oidc_token_auth: bool,
+    user_id: Option<String>,
+    team_id: Option<String>,
+}
+
+impl From<&crate::auth_store::WireCredentials> for ProviderCredentialHandle {
+    fn from(credentials: &crate::auth_store::WireCredentials) -> Self {
+        Self {
+            provider_id: credentials.provider_id.clone(),
+            bearer: credentials.bearer.clone(),
+            oidc_token_auth: credentials.oidc_token_auth,
+            user_id: credentials.user_id.clone(),
+            team_id: credentials.team_id.clone(),
+        }
+    }
+}
+
+impl ProviderCredentialHandle {
+    fn apply_headers(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        base_url: &str,
+    ) -> reqwest::RequestBuilder {
+        request = request.header("Authorization", format!("Bearer {}", self.bearer));
+        let is_proxy = base_url.contains("cli-chat-proxy") || self.oidc_token_auth;
+        if is_proxy {
+            request = request
+                .header(
+                    "x-grok-client-version",
+                    crate::auth_store::client_version_header(),
+                )
+                .header("x-grok-client-mode", "interactive");
+        }
+        if is_proxy && self.oidc_token_auth {
+            request = request
+                .header("X-XAI-Token-Auth", crate::auth_store::XAI_TOKEN_AUTH_VALUE)
+                .header(
+                    "x-authenticateresponse",
+                    crate::auth_store::XAI_AUTHENTICATE_RESPONSE,
+                );
+            if let Some(user_id) = &self.user_id {
+                request = request.header("x-userid", user_id);
+            }
+            if let Some(team_id) = &self.team_id {
+                request = request.header("x-teamid", team_id);
+            }
+        }
+        request
+    }
+}
+
+pub(crate) struct ProviderAgentStepRequest<'a> {
+    pub credentials: ProviderCredentialHandle,
+    pub target: ResolvedModelTarget,
+    pub effort: EffortLevel,
+    pub routed_provider_id: Option<&'a str>,
+    pub route_snapshot_hash: Option<&'a str>,
+    pub durable_attempt: bool,
+    pub messages: &'a [serde_json::Value],
+    pub tools: &'a serde_json::Value,
+    pub allow_transient_retries: bool,
+    pub cancel: &'a CancellationToken,
+    pub observation: Option<&'a ProviderObservationContext>,
+    pub observation_route: Option<ProviderObservationRoute>,
+}
+
+pub(crate) struct ProviderTransportResult {
+    pub step: AgentStep,
+    pub wire_model: String,
+    pub route_snapshot_hash: Option<String>,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait ProviderTransport {
+    async fn send_agent_step(
+        &self,
+        request: ProviderAgentStepRequest<'_>,
+        on_delta: &mut (dyn FnMut(String) + Send),
+        on_thought: &mut (dyn FnMut(String) + Send),
+    ) -> Result<ProviderTransportResult>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct XaiChatCompletionsTransport;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct OpenAiChatCompletionsTransport;
+
+#[async_trait::async_trait]
+impl ProviderTransport for XaiChatCompletionsTransport {
+    async fn send_agent_step(
+        &self,
+        request: ProviderAgentStepRequest<'_>,
+        on_delta: &mut (dyn FnMut(String) + Send),
+        on_thought: &mut (dyn FnMut(String) + Send),
+    ) -> Result<ProviderTransportResult> {
+        anyhow::ensure!(
+            request.target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions,
+            "xAI transport received a non-xAI dialect"
+        );
+        let wire_model = request.target.wire_model.clone();
+        let route_snapshot_hash = request.route_snapshot_hash.map(str::to_owned);
+        let step = send_chat_completions_agent_step(request, on_delta, on_thought).await?;
+        Ok(ProviderTransportResult {
+            step,
+            wire_model,
+            route_snapshot_hash,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderTransport for OpenAiChatCompletionsTransport {
+    async fn send_agent_step(
+        &self,
+        request: ProviderAgentStepRequest<'_>,
+        on_delta: &mut (dyn FnMut(String) + Send),
+        on_thought: &mut (dyn FnMut(String) + Send),
+    ) -> Result<ProviderTransportResult> {
+        anyhow::ensure!(
+            request.target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions,
+            "OpenAI-compatible transport received an xAI dialect"
+        );
+        let wire_model = request.target.wire_model.clone();
+        let route_snapshot_hash = request.route_snapshot_hash.map(str::to_owned);
+        let step = send_chat_completions_agent_step(request, on_delta, on_thought).await?;
+        Ok(ProviderTransportResult {
+            step,
+            wire_model,
+            route_snapshot_hash,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn call_xai_agent_step_observed_inner<F, G>(
     creds: &crate::auth_store::WireCredentials,
@@ -2216,8 +2361,8 @@ async fn call_xai_agent_step_observed_inner<F, G>(
     on_thought: G,
 ) -> Result<AgentStep>
 where
-    F: FnMut(&str),
-    G: FnMut(&str),
+    F: FnMut(&str) + Send,
+    G: FnMut(&str) + Send,
 {
     let creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
     let target = match snapshot {
@@ -2234,26 +2379,50 @@ where
     };
     let observation_route =
         observation.and_then(|_| provider_observation_route(&creds, &target, credential_binding));
-    call_provider_agent_step(
-        creds,
-        target,
-        effort,
-        snapshot,
-        messages,
-        tools,
-        allow_transient_retries,
-        cancel,
-        observation,
-        observation_route,
-        on_delta,
-        on_thought,
-    )
-    .await
+    match target.dialect {
+        crate::gateway_config::ProviderDialect::XaiChatCompletions => {
+            dispatch_provider_agent_step(
+                &XaiChatCompletionsTransport,
+                creds,
+                target,
+                effort,
+                snapshot,
+                messages,
+                tools,
+                allow_transient_retries,
+                cancel,
+                observation,
+                observation_route,
+                on_delta,
+                on_thought,
+            )
+            .await
+        }
+        crate::gateway_config::ProviderDialect::OpenAiChatCompletions => {
+            dispatch_provider_agent_step(
+                &OpenAiChatCompletionsTransport,
+                creds,
+                target,
+                effort,
+                snapshot,
+                messages,
+                tools,
+                allow_transient_retries,
+                cancel,
+                observation,
+                observation_route,
+                on_delta,
+                on_thought,
+            )
+            .await
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn call_provider_agent_step<F, G>(
-    mut creds: crate::auth_store::WireCredentials,
+async fn dispatch_provider_agent_step<T, F, G>(
+    transport: &T,
+    creds: crate::auth_store::WireCredentials,
     target: ResolvedModelTarget,
     effort: EffortLevel,
     snapshot: Option<&crate::orchestration::ProviderRouteSnapshot>,
@@ -2262,15 +2431,130 @@ async fn call_provider_agent_step<F, G>(
     allow_transient_retries: bool,
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
-    mut observation_route: Option<ProviderObservationRoute>,
+    observation_route: Option<ProviderObservationRoute>,
     mut on_delta: F,
     mut on_thought: G,
 ) -> Result<AgentStep>
 where
-    F: FnMut(&str),
-    G: FnMut(&str),
+    T: ProviderTransport + ?Sized,
+    F: FnMut(&str) + Send,
+    G: FnMut(&str) + Send,
 {
-    let durable_attempt = snapshot.is_some_and(|route| route.quota_reservation_id.is_some());
+    let expected_wire_model = target.wire_model.clone();
+    let expected_snapshot_hash = snapshot.map(|snapshot| snapshot.snapshot_hash.clone());
+    let mut emit_delta = |value: String| on_delta(&value);
+    let mut emit_thought = |value: String| on_thought(&value);
+    let first = transport
+        .send_agent_step(
+            ProviderAgentStepRequest {
+                credentials: ProviderCredentialHandle::from(&creds),
+                target: target.clone(),
+                effort,
+                routed_provider_id: snapshot.map(|snapshot| snapshot.provider_id.as_str()),
+                route_snapshot_hash: snapshot.map(|snapshot| snapshot.snapshot_hash.as_str()),
+                durable_attempt: snapshot
+                    .is_some_and(|snapshot| snapshot.quota_reservation_id.is_some()),
+                messages,
+                tools,
+                allow_transient_retries,
+                cancel,
+                observation,
+                observation_route: observation_route.clone(),
+            },
+            &mut emit_delta,
+            &mut emit_thought,
+        )
+        .await;
+    let outcome = first
+        .as_ref()
+        .err()
+        .map(provider_dispatch_outcome)
+        .filter(|outcome| outcome.http_status == Some(401));
+    if snapshot.is_some() || !creds.oidc_token_auth || outcome.is_none() {
+        return first.and_then(|result| {
+            validate_provider_transport_result(
+                result,
+                &expected_wire_model,
+                expected_snapshot_hash.as_deref(),
+            )
+        });
+    }
+
+    // Credential resolution and refresh are host responsibilities, outside
+    // the adapter. Legacy interactive calls retain one bounded OIDC refresh;
+    // durable Runs never enter this branch.
+    let fresh = crate::auth_store::force_refresh(&creds)
+        .await
+        .map_err(|error| anyhow!("HTTP 401 (OIDC refresh refused: {})", error.code()))?;
+    let refreshed_binding = crate::live_attestation::attest_grok_build_oidc(&target.wire_model)
+        .ok()
+        .filter(crate::live_attestation::LiveCredentialAttestation::certification_ready)
+        .map(|attestation| attestation.binding_id().clone());
+    let refreshed_route =
+        observation.and_then(|_| provider_observation_route(&fresh, &target, refreshed_binding));
+    transport
+        .send_agent_step(
+            ProviderAgentStepRequest {
+                credentials: ProviderCredentialHandle::from(&fresh),
+                target,
+                effort,
+                routed_provider_id: None,
+                route_snapshot_hash: None,
+                durable_attempt: false,
+                messages,
+                tools,
+                allow_transient_retries,
+                cancel,
+                observation,
+                observation_route: refreshed_route,
+            },
+            &mut emit_delta,
+            &mut emit_thought,
+        )
+        .await
+        .and_then(|result| validate_provider_transport_result(result, &expected_wire_model, None))
+}
+
+fn validate_provider_transport_result(
+    result: ProviderTransportResult,
+    expected_wire_model: &str,
+    expected_snapshot_hash: Option<&str>,
+) -> Result<AgentStep> {
+    anyhow::ensure!(
+        result.wire_model == expected_wire_model
+            && result.route_snapshot_hash.as_deref() == expected_snapshot_hash,
+        "provider transport result does not match the host-routed model and snapshot"
+    );
+    Ok(result.step)
+}
+
+async fn send_chat_completions_agent_step(
+    request: ProviderAgentStepRequest<'_>,
+    on_delta: &mut (dyn FnMut(String) + Send),
+    on_thought: &mut (dyn FnMut(String) + Send),
+) -> Result<AgentStep> {
+    let ProviderAgentStepRequest {
+        credentials: creds,
+        target,
+        effort,
+        routed_provider_id,
+        route_snapshot_hash: _,
+        durable_attempt,
+        messages,
+        tools,
+        allow_transient_retries,
+        cancel,
+        observation,
+        observation_route,
+    } = request;
+    if let Some(provider_id) = routed_provider_id {
+        anyhow::ensure!(
+            creds.provider_id == provider_id,
+            "provider transport credential does not match the frozen route"
+        );
+    }
+    let mut emit_delta = |value: &str| on_delta(value.to_string());
+    let mut emit_thought = |value: &str| on_thought(value.to_string());
     if !target.capabilities.tools {
         bail!(
             "provider model `{}` is not qualified for coding tools; use Chat or qualify native tool calling first",
@@ -2319,7 +2603,7 @@ where
                 "cancelled",
             ));
         }
-        let send_once = |c: &crate::auth_store::WireCredentials| {
+        let send_once = |credential: &ProviderCredentialHandle| {
             let mut req = client
                 .post(&url)
                 .header("Content-Type", "application/json")
@@ -2327,7 +2611,7 @@ where
             if target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions {
                 req = req.header("x-grok-effort", effort.as_str());
             }
-            let req = crate::auth_store::apply_auth_headers(req, c, &base);
+            let req = credential.apply_headers(req, &base);
             req.json(&body)
         };
         let request_bytes = serde_json::to_vec(&body)
@@ -2364,7 +2648,7 @@ where
                 ))
             },
         };
-        let mut resp = match resp_result {
+        let resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
                 if let Some((route, attempt)) = observation_attempt.take() {
@@ -2435,90 +2719,15 @@ where
                     None,
                 );
             }
-            if durable_attempt {
-                return Err(provider_dispatch_failure(
-                    ProviderSendCertainty::KnownAccepted,
-                    Some(resp.status().as_u16()),
-                    "HTTP 401 Unauthorized; durable provider attempts are never resent after a definitive response",
-                ));
-            }
-            match crate::auth_store::force_refresh(&creds).await {
-                Ok(fresh) => {
-                    if let Some(snapshot) = snapshot {
-                        validate_snapshot_credential_identity(&fresh, snapshot)?;
-                    }
-                    creds = fresh;
-                    let refreshed_binding = crate::live_attestation::attest_grok_build_oidc(
-                        &target.wire_model,
-                    )
-                    .ok()
-                    .filter(crate::live_attestation::LiveCredentialAttestation::certification_ready)
-                    .map(|attestation| attestation.binding_id().clone());
-                    observation_route = observation.and_then(|_| {
-                        provider_observation_route(&creds, &target, refreshed_binding)
-                    });
-                    observation_attempt =
-                        observation_route
-                            .as_ref()
-                            .zip(observation)
-                            .and_then(|(route, context)| {
-                                context.begin_attempt().ok().map(|attempt| (route, attempt))
-                            });
-                    resp = tokio::select! {
-                        r = send_once(&creds).send() => match r {
-                            Ok(response) => response,
-                            Err(error) => {
-                                if let Some((route, attempt)) = observation_attempt.take() {
-                                    record_provider_attempt(
-                                        Some(attempt),
-                                        route,
-                                        None,
-                                        None,
-                                        ResponseFraming::None,
-                                        if error.is_timeout() {
-                                            ObservationAttemptDisposition::Timeout
-                                        } else {
-                                            ObservationAttemptDisposition::TransportError
-                                        },
-                                        request_bytes,
-                                        0,
-                                        None,
-                                    );
-                                }
-                                let class = if error.is_timeout() {
-                                    "timeout"
-                                } else if error.is_connect() {
-                                    "connect"
-                                } else {
-                                    "transport"
-                                };
-                                return Err(anyhow!(
-                                    "request after OIDC refresh failed ({class})"
-                                ));
-                            }
-                        },
-                        _ = cancel.cancelled() => {
-                            if let Some((route, attempt)) = observation_attempt.take() {
-                                record_provider_attempt(
-                                    Some(attempt),
-                                    route,
-                                    None,
-                                    None,
-                                    ResponseFraming::None,
-                                    ObservationAttemptDisposition::Cancelled,
-                                    request_bytes,
-                                    0,
-                                    None,
-                                );
-                            }
-                            bail!("cancelled")
-                        },
-                    };
-                }
-                Err(error) => {
-                    bail!("HTTP 401 (OIDC refresh refused: {})", error.code());
-                }
-            }
+            return Err(provider_dispatch_failure(
+                ProviderSendCertainty::KnownAccepted,
+                Some(resp.status().as_u16()),
+                if durable_attempt {
+                    "HTTP 401 Unauthorized; durable provider attempts are never resent after a definitive response"
+                } else {
+                    "HTTP 401 Unauthorized"
+                },
+            ));
         }
 
         let status = resp.status();
@@ -2689,8 +2898,8 @@ where
             let step = match parse_agent_step_from_message(
                 &v["choices"][0]["message"],
                 false,
-                &mut on_delta,
-                &mut on_thought,
+                &mut emit_delta,
+                &mut emit_thought,
             ) {
                 Ok(step) => step.with_usage(usage.clone()),
                 Err(error) => {
@@ -2751,8 +2960,8 @@ where
             let step = match parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
-                &mut on_delta,
-                &mut on_thought,
+                &mut emit_delta,
+                &mut emit_thought,
             ) {
                 Ok(step) => step.with_usage(usage.clone()),
                 Err(error) => {
@@ -2844,7 +3053,7 @@ where
                 full_body.push(&bytes)?;
             }
             for line in decoder.push(&bytes)? {
-                if apply_agent_sse_line(&line, &mut acc, &mut on_delta, &mut on_thought)? {
+                if apply_agent_sse_line(&line, &mut acc, &mut emit_delta, &mut emit_thought)? {
                     done = true;
                     break;
                 }
@@ -2856,7 +3065,8 @@ where
 
         if !done {
             if let Some(trailing) = decoder.finish()? {
-                done = apply_agent_sse_line(&trailing, &mut acc, &mut on_delta, &mut on_thought)?;
+                done =
+                    apply_agent_sse_line(&trailing, &mut acc, &mut emit_delta, &mut emit_thought)?;
             }
         }
         if !acc.saw_data {
@@ -2886,8 +3096,8 @@ where
             let step = match parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
-                &mut on_delta,
-                &mut on_thought,
+                &mut emit_delta,
+                &mut emit_thought,
             ) {
                 Ok(step) => step.with_usage(usage.clone()),
                 Err(error) => {
@@ -3131,21 +3341,28 @@ pub async fn replay_xai_provider_contract_on_loopback(
     };
     let mut deltas = Vec::new();
     let mut thought_deltas = Vec::new();
-    let step = call_provider_agent_step(
-        credentials,
-        target,
-        EffortLevel::None,
-        None,
-        messages,
-        tools,
-        false,
-        &CancellationToken::new(),
-        None,
-        None,
-        |delta| deltas.push(delta.to_string()),
-        |delta| thought_deltas.push(delta.to_string()),
-    )
-    .await?;
+    let cancel = CancellationToken::new();
+    let result = XaiChatCompletionsTransport
+        .send_agent_step(
+            ProviderAgentStepRequest {
+                credentials: ProviderCredentialHandle::from(&credentials),
+                target,
+                effort: EffortLevel::None,
+                routed_provider_id: None,
+                route_snapshot_hash: None,
+                durable_attempt: false,
+                messages,
+                tools,
+                allow_transient_retries: false,
+                cancel: &cancel,
+                observation: None,
+                observation_route: None,
+            },
+            &mut |delta| deltas.push(delta.to_string()),
+            &mut |delta| thought_deltas.push(delta.to_string()),
+        )
+        .await?;
+    let step = result.step;
     match step {
         AgentStep::Final {
             text,
@@ -3181,6 +3398,53 @@ mod compatible_stream_tests {
     use futures::StreamExt;
 
     use super::*;
+
+    #[derive(Default)]
+    struct FakeProviderTransport {
+        calls: AtomicUsize,
+        seen: Mutex<Option<(String, String, String, String)>>,
+        tamper_result: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderTransport for FakeProviderTransport {
+        async fn send_agent_step(
+            &self,
+            request: ProviderAgentStepRequest<'_>,
+            _on_delta: &mut (dyn FnMut(String) + Send),
+            _on_thought: &mut (dyn FnMut(String) + Send),
+        ) -> Result<ProviderTransportResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let routed_wire_model = request.target.wire_model.clone();
+            let wire_model = if self.tamper_result {
+                "attacker-model".into()
+            } else {
+                routed_wire_model.clone()
+            };
+            let route_snapshot_hash = request.route_snapshot_hash.map(str::to_owned);
+            *self.seen.lock().unwrap() = Some((
+                request.credentials.provider_id,
+                request.target.base_url,
+                routed_wire_model,
+                request.route_snapshot_hash.unwrap_or_default().to_string(),
+            ));
+            Ok(ProviderTransportResult {
+                step: AgentStep::Final {
+                    text: "fake transport".into(),
+                    streamed: false,
+                    reasoning: None,
+                    usage: Some(crate::completion::CompletionUsage {
+                        prompt_tokens: 2,
+                        completion_tokens: 1,
+                        total_tokens: 3,
+                        requests: 1,
+                    }),
+                },
+                wire_model,
+                route_snapshot_hash,
+            })
+        }
+    }
 
     fn compatible_credentials(provider_id: &str) -> crate::auth_store::WireCredentials {
         crate::auth_store::WireCredentials {
@@ -3327,6 +3591,141 @@ mod compatible_stream_tests {
         tampered.wire_model_id = "attacker-model".into();
         assert!(tampered.validate().is_err());
         crate::discover::set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn fake_transport_receives_only_host_resolved_route_and_credential_handle() {
+        let _lock = crate::discover::home_override_serial();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let selection =
+                    install_compatible_profile(temp.path(), "http://127.0.0.1:18082/v1");
+                let credentials = compatible_credentials("cancel-test");
+                let snapshot =
+                    capture_provider_route_snapshot(&credentials, &selection, EffortLevel::Medium)
+                        .unwrap();
+                let target = resolve_model_target_from_snapshot(&credentials, &snapshot).unwrap();
+                let transport = FakeProviderTransport::default();
+                let messages = [serde_json::json!({"role": "user", "content": "synthetic"})];
+                let tools = serde_json::json!([]);
+                let cancel = CancellationToken::new();
+
+                let result = dispatch_provider_agent_step(
+                    &transport,
+                    credentials.clone(),
+                    target.clone(),
+                    snapshot.effort,
+                    Some(&snapshot),
+                    &messages,
+                    &tools,
+                    false,
+                    &cancel,
+                    None,
+                    None,
+                    |_| {},
+                    |_| {},
+                )
+                .await
+                .unwrap();
+                assert!(matches!(result, AgentStep::Final { .. }));
+                assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    transport.seen.lock().unwrap().clone().unwrap(),
+                    (
+                        "cancel-test".into(),
+                        "http://127.0.0.1:18082/v1".into(),
+                        "test-model".into(),
+                        snapshot.snapshot_hash.clone(),
+                    )
+                );
+
+                let malicious = FakeProviderTransport {
+                    tamper_result: true,
+                    ..FakeProviderTransport::default()
+                };
+                let result = dispatch_provider_agent_step(
+                    &malicious,
+                    credentials,
+                    target,
+                    snapshot.effort,
+                    Some(&snapshot),
+                    &messages,
+                    &tools,
+                    false,
+                    &cancel,
+                    None,
+                    None,
+                    |_| {},
+                    |_| {},
+                )
+                .await;
+                let error = match result {
+                    Ok(_) => panic!("mismatched adapter echo unexpectedly succeeded"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains("does not match"));
+                assert_eq!(malicious.calls.load(Ordering::SeqCst), 1);
+            });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn transport_adapter_source_has_no_orchestration_or_credential_resolution_capability() {
+        let source = include_str!("host_helpers.rs");
+        let credential_handle = source
+            .split_once("pub(crate) struct ProviderCredentialHandle")
+            .unwrap()
+            .1
+            .split_once("pub(crate) struct ProviderAgentStepRequest")
+            .unwrap()
+            .0;
+        for forbidden in ["refresh_token", "auth_scope", "expires_at", "principal_id"] {
+            assert!(
+                !credential_handle.contains(forbidden),
+                "transport credential handle gained forbidden field `{forbidden}`"
+            );
+        }
+        let xai_adapter = source
+            .split_once("impl ProviderTransport for XaiChatCompletionsTransport")
+            .unwrap()
+            .1
+            .split_once("impl ProviderTransport for OpenAiChatCompletionsTransport")
+            .unwrap()
+            .0;
+        let compatible_adapter = source
+            .split_once("impl ProviderTransport for OpenAiChatCompletionsTransport")
+            .unwrap()
+            .1
+            .split_once("async fn call_xai_agent_step_observed_inner")
+            .unwrap()
+            .0;
+        let wire_adapter = source
+            .split_once("async fn send_chat_completions_agent_step(")
+            .unwrap()
+            .1
+            .split_once("/// Exercise the production xAI request builder")
+            .unwrap()
+            .0;
+        for forbidden in [
+            "OrchStore",
+            "tool_gate",
+            "force_refresh(",
+            "ensure_fresh_credentials(",
+            "resolve_wire_credentials",
+            "std::env",
+            "keyring",
+        ] {
+            for adapter in [xai_adapter, compatible_adapter, wire_adapter] {
+                assert!(
+                    !adapter.contains(forbidden),
+                    "transport adapter gained forbidden capability `{forbidden}`"
+                );
+            }
+        }
     }
 
     #[test]

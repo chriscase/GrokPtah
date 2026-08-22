@@ -172,6 +172,23 @@ For quota-linked Runs, definitive 400/401/429/5xx responses and compatibility
 rejections are never hidden behind an internal resend. Non-durable interactive
 calls retain their legacy compatibility behavior outside this native lane.
 
+### Provider transport boundary
+
+The host selects a `ProviderTransport` from the already validated frozen
+dialect, then passes a `ProviderAgentStepRequest` containing only the resolved
+route, exact wire model, short-lived credential handle, request payload,
+deadline/cancellation inputs, and optional structural-observation handle. The
+first concrete adapters are `XaiChatCompletionsTransport` and the existing
+OpenAI-compatible chat-completions dialect; both share the bounded encoder,
+redirect refusal, SSE decoder, and strict usage parser.
+
+The adapter receives no orchestration store, session/workspace controls,
+authority policy, approval path, quota mutation API, catalog resolver, or
+credential resolver. OIDC refresh remains a host operation outside the adapter,
+and a durable Run never refreshes and resends after a definitive 401. A
+source-boundary regression test rejects those capabilities if they enter the
+adapter implementation.
+
 ## Work-attempt / Run relationship
 
 A `ManagedExecutionIntent` binds, under the store lock:
