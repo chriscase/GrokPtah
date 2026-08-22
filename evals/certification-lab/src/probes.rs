@@ -106,7 +106,17 @@ impl<'a> ProbeBuilder<'a> {
             .checked_add(1)
             .ok_or(DiagnosticCode::BoundExceeded)?;
         match client.call_tool(tool, arguments).await {
-            Ok(result) if !result.is_error => Ok(result.structured),
+            Ok(result) if !result.is_error => {
+                if matches!(
+                    tool,
+                    "ptah_get_run" | "ptah_list_runs" | "ptah_get_progress"
+                ) && grokptah_agent_bridge::orchestration::public_run_contains_forbidden_fields(
+                    &result.structured,
+                ) {
+                    return Err(DiagnosticCode::McpResultMalformed);
+                }
+                Ok(result.structured)
+            }
             Ok(_) => {
                 self.counters.errors = self
                     .counters

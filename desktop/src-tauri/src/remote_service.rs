@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
-    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RoutineRecord,
-    RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState, RuntimeConnectionState,
+    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, PublicRun,
+    RoutineRecord, RoutineSnapshot, RunExecutionMode, RunScope, RunState, RuntimeConnectionState,
     RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
@@ -296,7 +296,7 @@ impl RemoteServiceState {
         ))
     }
 
-    pub async fn list_runs(&self) -> Result<Option<Vec<RunRecord>>> {
+    pub async fn list_runs(&self) -> Result<Option<Vec<PublicRun>>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
@@ -569,7 +569,7 @@ impl RemoteServiceState {
         session_id: Uuid,
         workspace: String,
         run_id: String,
-    ) -> Result<Option<Value>> {
+    ) -> Result<Option<PublicRun>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
@@ -914,7 +914,7 @@ impl RemoteServiceClient {
             .ok_or_else(|| anyhow::anyhow!("remote resume response omitted response"))
     }
 
-    async fn list_runs(&mut self) -> Result<Vec<RunRecord>> {
+    async fn list_runs(&mut self) -> Result<Vec<PublicRun>> {
         let sessions = self.list_sessions().await?;
         let mut runs = Vec::new();
         for session in sessions {
@@ -927,7 +927,7 @@ impl RemoteServiceClient {
                     }),
                 )
                 .await?;
-            let mut scoped: Vec<RunRecord> = serde_json::from_value(
+            let mut scoped: Vec<PublicRun> = serde_json::from_value(
                 value
                     .get("runs")
                     .cloned()
@@ -1279,16 +1279,18 @@ impl RemoteServiceClient {
         session_id: Uuid,
         workspace: String,
         run_id: String,
-    ) -> Result<Value> {
-        self.call_tool(
-            "ptah_get_run",
-            json!({
-                "session_id": session_id,
-                "workspace": workspace,
-                "run_id": run_id,
-            }),
-        )
-        .await
+    ) -> Result<PublicRun> {
+        let value = self
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "run_id": run_id,
+                }),
+            )
+            .await?;
+        serde_json::from_value(value).context("decode remote durable run")
     }
 
     async fn get_events(
@@ -1630,7 +1632,7 @@ mod tests {
     use grokptah_agent_bridge::{
         home_override_serial, set_grokptah_home_override, start_control_server,
         start_control_server_with_bind, AgentHost, ControlServerLimits, HostConfig, OrchStore,
-        OrchestrationConfig, OrchestrationService, RunBounds, RunExecutionMode,
+        OrchestrationConfig, OrchestrationService, PublicRun, RunBounds, RunExecutionMode,
         RuntimeConnectionState, RuntimeTarget, WorkspaceAllowlist,
     };
     use tempfile::tempdir;
@@ -1639,6 +1641,72 @@ mod tests {
         normalize_base_url, runtime_target_for_base_url, should_reconnect_remote_error,
         RemoteServiceClient, RemoteServiceState,
     };
+
+    #[test]
+    fn remote_run_decode_drops_leaked_provider_route() {
+        let leaked = serde_json::json!({
+            "runId": "public-run-leak",
+            "sessionId": "11111111-1111-1111-1111-111111111111",
+            "workspace": "/tmp/public-run",
+            "requestId": "public-run-req",
+            "clientId": "mcp",
+            "state": "running",
+            "purpose": "execution",
+            "bounds": {
+                "maxPromptBytes": 1024,
+                "maxRounds": 4,
+                "maxDurationMs": 1000
+            },
+            "promptPreview": "inspect",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "aggregates": {
+                "changes": [],
+                "tests": []
+            },
+            "providerRoute": {
+                "baseUrl": "http://leak-base-url-sentinel-pr352.example/v1",
+                "credentialRef": "keychain:provider/leak-cred-ref-sentinel-pr352",
+                "credentialFingerprint": "v1-sha256:leak-cred-fp-sentinel-pr352",
+                "endpointFingerprint": "v1-sha256:leak-endpoint-fp-sentinel-pr352"
+            }
+        });
+        let decoded: PublicRun = serde_json::from_value(leaked).unwrap();
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert!(encoded.get("providerRoute").is_none());
+        let text = encoded.to_string();
+        for sentinel in [
+            "providerRoute",
+            "leak-base-url-sentinel-pr352",
+            "leak-cred-ref-sentinel-pr352",
+            "leak-cred-fp-sentinel-pr352",
+            "leak-endpoint-fp-sentinel-pr352",
+        ] {
+            assert!(
+                !text.contains(sentinel),
+                "remote decode re-emitted {sentinel}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn tauri_run_surfaces_must_return_public_runs() {
+        let commands = include_str!("commands.rs");
+        assert!(commands.contains("list_public_session_runs"));
+        assert!(commands.contains("get_public_session_run"));
+        assert!(commands.contains("Result<Vec<PublicRun>"));
+        assert!(commands.contains("Result<Option<PublicRun>"));
+        assert!(!commands.contains("host.list_session_runs(id)"));
+        let remote = include_str!("remote_service.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(remote.contains("Vec<PublicRun>"));
+        assert!(
+            !remote.contains("RunRecord"),
+            "remote list/get must decode PublicRun instead of RunRecord"
+        );
+    }
 
     #[test]
     fn local_http_is_allowed_but_remote_http_and_embedded_credentials_are_not() {
@@ -1792,8 +1860,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(remote_run["runId"], submission.run_id);
-        assert!(remote_run.get("providerExecution").is_some());
+        assert_eq!(remote_run.run_id, submission.run_id);
+        let encoded = serde_json::to_value(&remote_run).unwrap();
+        assert!(encoded.get("providerRoute").is_none());
+        assert!(
+            encoded.get("providerExecution").is_some(),
+            "public Run keeps the providerExecution key even when the Run is offline"
+        );
         assert!(RemoteServiceClient::connect(base_url, "wrong-token".into())
             .await
             .is_err());

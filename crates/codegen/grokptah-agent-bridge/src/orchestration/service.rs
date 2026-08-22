@@ -56,36 +56,11 @@ use super::workload::{
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
 
-fn validate_provider_route_capabilities(
-    route: &super::types::ProviderRouteSnapshot,
-    purpose: RunPurpose,
-    stale_measured_qualification: bool,
-) -> Result<(), OrchError> {
-    route.validate()?;
-    crate::native_coding_readiness::admit_purpose(
-        purpose,
-        route.capabilities.source,
-        route.capabilities.chat,
-        route.capabilities.tools,
-        stale_measured_qualification,
-    )
-    .orch_error()
-    .map_or(Ok(()), Err)
-}
-
 fn validate_provider_route_for_purpose(
     route: &super::types::ProviderRouteSnapshot,
     purpose: RunPurpose,
 ) -> Result<(), OrchError> {
-    let stale_measured_qualification =
-        crate::gateway_config::has_measured_xai_qualification(&route.provider_id, &route.model_id)
-            .map_err(|_| {
-                OrchError::new(
-                    OrchErrorCode::Internal,
-                    "provider qualification ledger is unavailable",
-                )
-            })?;
-    validate_provider_route_capabilities(route, purpose, stale_measured_qualification)
+    crate::native_coding_readiness::validate_provider_route_for_purpose(route, purpose)
 }
 
 fn provider_projection_error(_error: anyhow::Error) -> OrchError {
@@ -2120,7 +2095,12 @@ impl OrchestrationService {
             .filter(|run| {
                 run.session_id == session_id && run.workspace == claimed.display().to_string()
             })
-            .collect::<Vec<_>>();
+            .map(|mut run| {
+                self.refresh_queue_position(&mut run);
+                super::project_public_run(&self.store, &run)
+                    .and_then(|projection| super::public_run_to_value(&projection))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({ "runs": runs }))
     }
 
@@ -5175,11 +5155,7 @@ impl OrchestrationService {
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
-        let provider_execution = self.provider_execution_projection(&run)?;
-        let mut value = serde_json::to_value(run)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-        value["providerExecution"] = provider_execution;
-        Ok(value)
+        super::public_run_to_value(&super::project_public_run(&self.store, &run)?)
     }
 
     pub fn get_progress(
@@ -5203,125 +5179,11 @@ impl OrchestrationService {
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
-        let provider_execution = self.provider_execution_projection(&run)?;
-        Ok(json!({
-            "runId": run.run_id,
-            "sessionId": run.session_id,
-            "state": run.state,
-            "queuePosition": run.queue_position,
-            "busy": busy,
-            "startSeq": run.start_seq,
-            "endSeq": run.end_seq,
-            "promptPreview": run.prompt_preview,
-            "progress": run.progress,
-            "createdAt": run.created_at,
-            "updatedAt": run.updated_at,
-            "terminalResult": run.terminal_result,
-            "stopCause": run.stop_cause,
-            "bounds": run.bounds,
-            "errorCode": run.error_code,
-            "providerExecution": provider_execution,
-        }))
-    }
-
-    fn provider_execution_projection(
-        &self,
-        run: &RunRecord,
-    ) -> Result<serde_json::Value, OrchError> {
-        let Some(route) = run.provider_route.as_ref() else {
-            return Ok(serde_json::Value::Null);
-        };
-        route.validate()?;
-        let quota = match route.quota_reservation_id.as_deref() {
-            Some(reservation_id) => {
-                let reservation = self
-                    .store
-                    .load_quota_reservation(reservation_id)
-                    .map_err(provider_projection_error)?
-                    .ok_or_else(|| {
-                        OrchError::new(
-                            OrchErrorCode::Internal,
-                            "provider quota reservation is missing",
-                        )
-                    })?;
-                if reservation.run_id != run.run_id
-                    || reservation.route_snapshot_hash != route.snapshot_hash
-                    || reservation.pool.provider_id != route.provider_id
-                {
-                    return Err(OrchError::new(
-                        OrchErrorCode::Internal,
-                        "provider quota reservation does not match the Run",
-                    ));
-                }
-                json!({
-                    "reservationId": reservation.reservation_id,
-                    "poolId": reservation.pool_id,
-                    "class": reservation.pool.class,
-                    "state": reservation.state,
-                    "tokensReserved": reservation.tokens_reserved,
-                    "tokensConsumed": reservation.tokens_consumed,
-                    "requestsReserved": reservation.requests_reserved,
-                    "requestsConsumed": reservation.requests_consumed,
-                    "windowStartedAt": reservation.window_started_at,
-                    "limits": reservation.limits,
-                    "updatedAt": reservation.updated_at,
-                })
-            }
-            None => serde_json::Value::Null,
-        };
-        let mut attempts = self
-            .store
-            .list_provider_attempts()
-            .map_err(provider_projection_error)?
-            .into_iter()
-            .filter(|attempt| attempt.run_id == run.run_id)
-            .collect::<Vec<_>>();
-        attempts.sort_by(|left, right| {
-            left.ordinal
-                .cmp(&right.ordinal)
-                .then(left.attempt_id.cmp(&right.attempt_id))
-        });
-        let attempt_count = attempts.len();
-        const MAX_PROJECTED_PROVIDER_ATTEMPTS: usize = 128;
-        let truncated = attempt_count > MAX_PROJECTED_PROVIDER_ATTEMPTS;
-        attempts.truncate(MAX_PROJECTED_PROVIDER_ATTEMPTS);
-        let attempts = attempts
-            .into_iter()
-            .map(|attempt| {
-                json!({
-                    "attemptId": attempt.attempt_id,
-                    "ordinal": attempt.ordinal,
-                    "state": attempt.state,
-                    "sendCertainty": attempt.send_certainty,
-                    "retryClass": attempt.retry_class,
-                    "httpStatus": attempt.http_status,
-                    "usage": attempt.usage,
-                    "createdAt": attempt.created_at,
-                    "updatedAt": attempt.updated_at,
-                    "finishedAt": attempt.finished_at,
-                })
-            })
-            .collect::<Vec<_>>();
-        Ok(json!({
-            "route": {
-                "providerId": route.provider_id,
-                "kind": route.kind,
-                "dialect": route.dialect,
-                "modelId": route.model_id,
-                "wireModelId": route.wire_model_id,
-                "capabilitySource": route.capabilities.source,
-                "qualificationSchema": route.capabilities.qualification_schema,
-                "deadlineClass": route.deadline_class,
-                "effort": route.effort,
-                "snapshotHash": route.snapshot_hash,
-            },
-            "quota": quota,
-            "attempts": attempts,
-            "attemptCount": attempt_count,
-            "attemptsTruncated": truncated,
-            "usageComplete": run.aggregates.usage_complete,
-            "pendingRequests": run.aggregates.usage_pending_requests,
-        }))
+        super::public_run_progress_to_value(&super::project_public_run_progress(
+            &self.store,
+            &run,
+            busy,
+        )?)
     }
 
     fn provider_quota_capacity_projection(
@@ -8304,87 +8166,5 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | SteeringInjected { session_id, .. }
         | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
-    }
-}
-
-#[cfg(test)]
-mod provider_route_policy_tests {
-    use super::*;
-    use crate::gateway_config::{
-        CapabilitySource, ModelCapabilities, ProviderDeadlineClass, ProviderDialect, ProviderKind,
-        CAPABILITY_QUALIFICATION_SCHEMA,
-    };
-    use crate::types::EffortLevel;
-
-    fn route(
-        source: CapabilitySource,
-        chat: bool,
-        tools: bool,
-    ) -> super::super::types::ProviderRouteSnapshot {
-        super::super::types::ProviderRouteSnapshot {
-            schema_version: super::super::types::PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
-            provider_id: "env-grokptah".into(),
-            model_id: "policy-model".into(),
-            wire_model_id: "policy-model".into(),
-            selection_key: crate::gateway_config::model_selection_key(
-                "env-grokptah",
-                "policy-model",
-            ),
-            kind: ProviderKind::OpenAiCompatible,
-            dialect: ProviderDialect::OpenAiChatCompletions,
-            base_url: "http://127.0.0.1:41111/v1".into(),
-            endpoint_fingerprint: String::new(),
-            credential_ref: "env:GROKPTAH_API_KEY".into(),
-            credential_fingerprint: "v1-sha256:policy-credential".into(),
-            capabilities: ModelCapabilities {
-                chat,
-                tools,
-                source,
-                qualification_schema: (source == CapabilitySource::Measured)
-                    .then(|| CAPABILITY_QUALIFICATION_SCHEMA.into()),
-                ..ModelCapabilities::default()
-            },
-            deadline_class: ProviderDeadlineClass::Standard,
-            effort: EffortLevel::Medium,
-            qualification_record_id: None,
-            quota_class: None,
-            quota_reservation_id: None,
-            snapshot_hash: String::new(),
-        }
-        .seal()
-        .unwrap()
-    }
-
-    #[test]
-    fn unknown_capabilities_never_enter_autonomous_runs() {
-        let route = route(CapabilitySource::Unknown, true, true);
-        for purpose in [RunPurpose::Execution, RunPurpose::ManagerProposal] {
-            let error = validate_provider_route_capabilities(&route, purpose, false).unwrap_err();
-            assert_eq!(error.code, OrchErrorCode::Conflict);
-            assert!(error.message.contains("qualified or explicitly declared"));
-        }
-    }
-
-    #[test]
-    fn stale_measured_history_blocks_declared_execution_but_not_chat_only_proposals() {
-        let route = route(CapabilitySource::Declared, true, true);
-        validate_provider_route_capabilities(&route, RunPurpose::Execution, false).unwrap();
-        let error =
-            validate_provider_route_capabilities(&route, RunPurpose::Execution, true).unwrap_err();
-        assert!(error.message.contains("requalify"));
-        validate_provider_route_capabilities(&route, RunPurpose::ManagerProposal, true).unwrap();
-    }
-
-    #[test]
-    fn execution_requires_measured_or_declared_coding_tools_while_proposals_need_chat_only() {
-        let chat_only = route(CapabilitySource::Measured, true, false);
-        validate_provider_route_capabilities(&chat_only, RunPurpose::ManagerProposal, false)
-            .unwrap();
-        let error = validate_provider_route_capabilities(&chat_only, RunPurpose::Execution, false)
-            .unwrap_err();
-        assert!(error.message.contains("native coding tools"));
-
-        let coding = route(CapabilitySource::Measured, true, true);
-        validate_provider_route_capabilities(&coding, RunPurpose::Execution, false).unwrap();
     }
 }
