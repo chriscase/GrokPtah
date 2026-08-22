@@ -1974,4 +1974,88 @@ mod tests {
         };
         assert!(trace.validate().is_ok());
     }
+
+    fn always_on_passing_probe() -> (ProbeDefinition, ProbeResult) {
+        let manifest = CampaignManifest::bundled().unwrap();
+        let definition = manifest
+            .probe("always-on-grokbot-lifecycle-v1")
+            .unwrap()
+            .clone();
+        let mut probe = ProbeResult::skipped(
+            definition.id.clone(),
+            definition.catalog_scenario_ids.clone(),
+            DiagnosticCode::Ok,
+        );
+        probe.status = ProbeStatus::Passed;
+        probe.supported = true;
+        probe.failure_class = FailureClass::None;
+        probe.diagnostics = vec![DiagnosticCode::Ok];
+        probe.verified_actions = definition.actions.clone();
+        probe.verified_oracles = definition.oracle_codes.clone();
+        probe.phases = vec![PhaseResult {
+            phase: PhaseCode::Oracle,
+            status: ProbeStatus::Passed,
+            elapsed_millis: 1,
+            diagnostics: vec![DiagnosticCode::Ok],
+        }];
+        probe.transitions = definition
+            .expected_transitions
+            .iter()
+            .map(|expected| TransitionEvidence {
+                entity: map_entity(expected.entity),
+                from: map_state(expected.from),
+                to: map_state(expected.to),
+                opaque_id: None,
+            })
+            .collect();
+        probe.restart = RestartEvidence {
+            attempted: true,
+            host_owned: true,
+            durable_read_recovered: true,
+            event_cursor_recovered: false,
+            implicit_execution_observed: false,
+        };
+        probe.trace = Some(ArtifactReference {
+            relative_path: "traces/always-on-grokbot-lifecycle-v1.json".into(),
+            sha256: "a".repeat(64),
+            bytes: 1,
+        });
+        (definition, probe)
+    }
+
+    #[test]
+    fn always_on_passing_probe_fails_when_any_verified_action_oracle_or_transition_is_dropped() {
+        let (definition, probe) = always_on_passing_probe();
+        assert!(validate_probe_against_definition(&probe, &definition).is_ok());
+        for (i, _) in probe.verified_actions.iter().enumerate() {
+            let mut mutated = probe.clone();
+            mutated.verified_actions.remove(i);
+            assert!(
+                validate_probe_against_definition(&mutated, &definition).is_err(),
+                "dropping verified action {i} must fail"
+            );
+        }
+        for (i, _) in probe.verified_oracles.iter().enumerate() {
+            let mut mutated = probe.clone();
+            mutated.verified_oracles.remove(i);
+            assert!(
+                validate_probe_against_definition(&mutated, &definition).is_err(),
+                "dropping verified oracle {i} must fail"
+            );
+        }
+        for (i, _) in probe.transitions.iter().enumerate() {
+            let mut mutated = probe.clone();
+            mutated.transitions.remove(i);
+            assert!(
+                validate_probe_against_definition(&mutated, &definition).is_err(),
+                "dropping observed transition {i} must fail"
+            );
+        }
+        let mut restart = probe.clone();
+        restart.restart.implicit_execution_observed = true;
+        assert!(validate_probe_against_definition(&restart, &definition).is_err());
+        let mut not_attempted = probe.clone();
+        not_attempted.restart.attempted = false;
+        assert!(validate_probe_against_definition(&not_attempted, &definition).is_err());
+    }
 }

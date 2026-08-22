@@ -1,10 +1,73 @@
 {
   "schema": "grokptah.always_on_grokbot_fixture.v1",
+  "schemaVersion": 1,
   "seed": "always-on-grokbot-v1",
+  "baseSha": "67e29bd34dc64049432c715c93c2cef2185c63ea",
   "sentinels": {
     "success": "GROKBOT_SUCCESS",
     "fail": "GROKBOT_FORCE_FAIL",
-    "ok": "GROKBOT_OK"
+    "ok": "GROKBOT_OK",
+    "setup": "GROKBOT_SETUP"
   },
-  "quotaLedger": "absent-at-67e29bd"
+  "steps": {
+    "first": "step-a",
+    "failing": "step-b",
+    "replacement": "step-b-fix"
+  },
+  "quotaLedger": "absent-at-67e29bd",
+  "proposalOnlyEnforcement": "unverified-pending-pr-352",
+  "internalPersistenceCuts": "not-proven-no-production-failpoint",
+  "attemptEvidence": "public-via-ptah_get_work.attempts-and-intent.attemptId",
+  "clock": "bounded-race-controlled-no-fake-clock-seam",
+  "soak24h": "not-run",
+  "happyPath": {
+    "decisionWork": 1,
+    "proposalRunsObserved": 1,
+    "nativeWorkByStep": {
+      "step-a": 1,
+      "step-b": 1,
+      "step-b-fix": 1
+    },
+    "providerPostsBySemanticId": {
+      "step-a": 1,
+      "step-b": 1,
+      "manager-decision": 1,
+      "step-b-fix": 1
+    }
+  },
+  "requiredAssertions": [
+    "fixture-schema-consumed",
+    "fixture-version-matches",
+    "clock-is-bounded-not-deterministic",
+    "lab-probe-does-not-synthesize",
+    "exact-decision-work-1",
+    "exact-proposal-run-observed-1",
+    "proposal-only-enforcement-unverified-pr-352",
+    "native-step-a-one-work-intent-attempt-run-post",
+    "native-step-b-one-work-intent-attempt-run-post",
+    "native-step-b-fix-one-work-intent-attempt-run-post",
+    "all-terminal-runs-pending-0",
+    "plan-succeeded",
+    "no-manual-tick-before-success",
+    "post-success-tick-idempotent",
+    "in-flight-post-count-1-no-resend",
+    "replay-same-payload",
+    "replay-changed-payload-conflict",
+    "restart-fresh-home-per-scenario",
+    "restart-exact-target-identities",
+    "invalid-directive-zero-replacement",
+    "cancel-restart-no-resend",
+    "malformed-provider-bounded-terminal",
+    "disconnect-provider-bounded-terminal",
+    "timeout-provider-bounded-terminal",
+    "missing-mcp-bearer-rejected",
+    "wrong-mcp-bearer-rejected",
+    "outside-workspace-rejected",
+    "escaping-symlink-rejected",
+    "soak-bounded-cycle-rate",
+    "soak-per-cycle-exact-identities",
+    "soak-restart-at-barrier",
+    "soak-report-schema",
+    "soak-10m-distinct-from-24h"
+  ]
 }

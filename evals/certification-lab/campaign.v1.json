@@ -2241,7 +2241,7 @@
     },
     {
       "id": "always-on-grokbot-lifecycle-v1",
-      "description": "Process-level always-on Grokbot campaign: spawn standalone grokptah-service, drive an autonomous Manager DAG through a loopback fake provider, restart once, and require Succeeded without duplicate decision Work or silently resumed uncertain attempts.",
+      "description": "Process-level always-on Grokbot campaign: spawn standalone grokptah-service, poll authenticated MCP until an autonomous Manager DAG succeeds with exact Work/intent/attempt/Run/provider identities, replay request ids, then prove a held provider POST plus SIGKILL does not resend. Proposal-only enforcement is unverified pending PR 352. Timing is bounded and race-controlled; there is no FakeClock seam.",
       "catalog_scenario_ids": [
         "managed-work-run-001",
         "interrupt-recover-001",
@@ -2261,6 +2261,7 @@
         "ptah_tick_manager_plan",
         "ptah_get_manager_plan",
         "ptah_list_work",
+        "ptah_get_work",
         "ptah_list_runs",
         "ptah_list_execution_intents",
         "ptah_get_capacity"
@@ -2281,7 +2282,7 @@
       "workspace_fixture": "synthetic-disposable-v1",
       "bounds": {
         "bound_profile": "smoke",
-        "max_duration_seconds": 180,
+        "max_duration_seconds": 360,
         "max_rounds": 32,
         "max_run_tokens": 8000,
         "max_total_tokens": 40000,
@@ -2293,8 +2294,14 @@
       },
       "actions": [
         "create_autonomous_manager_plan",
-        "tick_manager_plan",
         "inspect_manager_plan",
+        "inspect_work_set",
+        "inspect_work_attempts",
+        "inspect_run_set",
+        "inspect_execution_intent",
+        "replay_request",
+        "replay_changed_payload",
+        "tick_manager_plan",
         "disconnect_client",
         "restart_service",
         "reconnect_client"
@@ -2311,6 +2318,16 @@
           "to": "completed"
         },
         {
+          "entity": "run",
+          "from": "running",
+          "to": "interrupted"
+        },
+        {
+          "entity": "work",
+          "from": "running",
+          "to": "failed"
+        },
+        {
           "entity": "service",
           "from": "ready",
           "to": "starting"
@@ -2324,9 +2341,12 @@
       "oracle_codes": [
         "always_on_plan_succeeded",
         "no_duplicate_native_run",
+        "request_replay_same_resource",
+        "changed_payload_conflict",
         "uncertain_attempt_not_resumed",
         "durable_read_after_restart",
-        "no_implicit_invocation_resume"
+        "no_implicit_invocation_resume",
+        "restart_reconnect_observed"
       ],
       "missing_requirement": "skip_as_unsupported",
       "incomplete_evidence": "not_applicable"
