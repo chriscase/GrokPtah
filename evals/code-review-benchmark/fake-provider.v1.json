@@ -1,0 +1,1814 @@
+{
+  "schema": "grokptah.code-review-benchmark-fake-provider.v1",
+  "provider_id": "code-review-benchmark-fake-provider-v1",
+  "provider_version": 1,
+  "binding": {
+    "route_class": "compatible_gateway",
+    "tier": "approved_modest",
+    "model_fingerprint": "opaque-modest-model-v1",
+    "effort": "low",
+    "decoding": "deterministic-v1"
+  },
+  "quota": {
+    "window_requests": 400,
+    "one_under_remaining": 1,
+    "exhausted_remaining": 0
+  },
+  "adversarial_scenarios": [
+    {
+      "id": "restart-after-admission-v1",
+      "kind": "restart_after_admission"
+    },
+    {
+      "id": "route-drift-v1",
+      "kind": "route_drift"
+    },
+    {
+      "id": "quota-one-under-v1",
+      "kind": "quota_one_under"
+    },
+    {
+      "id": "quota-exhausted-v1",
+      "kind": "quota_exhausted"
+    },
+    {
+      "id": "quota-window-advance-v1",
+      "kind": "quota_window_advance"
+    },
+    {
+      "id": "mutator-publish-denial-v1",
+      "kind": "mutator_publish_denial"
+    },
+    {
+      "id": "inaccessible-canary-v1",
+      "kind": "inaccessible_canary"
+    }
+  ],
+  "denied_mutators": [
+    "shell",
+    "write",
+    "mcp",
+    "computer",
+    "publish"
+  ],
+  "arm_scripts": [
+    {
+      "case_id": "case-ledger-range-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        },
+        {
+          "ordinal": 3,
+          "prompt_bytes": 280,
+          "completion_bytes": 160,
+          "authoritative_tokens": 150,
+          "tools": [
+            "search"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "ledger-core",
+          "logical_symbol": "clamp",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "correctness_bounds",
+          "causal_atom": "inclusive-bound-off-by-one",
+          "severity": "high",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-ledger-range-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "ledger-core",
+          "logical_symbol": "clamp",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "correctness_bounds",
+          "causal_atom": "inclusive-bound-off-by-one",
+          "severity": "high",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        },
+        {
+          "logical_file": "ledger-core",
+          "logical_symbol": "clamp",
+          "start_line": 1,
+          "end_line": 1,
+          "category": "correctness_bounds",
+          "causal_atom": "benign-comment-style-lure",
+          "severity": "low",
+          "confidence_millis": 400,
+          "usefulness": {
+            "cause": false,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-ledger-overflow-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "ledger-sum",
+          "logical_symbol": "checked-add",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "correctness_bounds",
+          "causal_atom": "wrapping-add-on-critical-path",
+          "severity": "critical",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-ledger-overflow-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": []
+    },
+    {
+      "case_id": "case-ledger-quota-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "ledger-quota",
+          "logical_symbol": "admit",
+          "start_line": 1,
+          "end_line": 4,
+          "category": "quota_resource_bounds",
+          "causal_atom": "quota-counter-not-decremented",
+          "severity": "medium",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-ledger-quota-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "ledger-quota",
+          "logical_symbol": "admit",
+          "start_line": 1,
+          "end_line": 4,
+          "category": "quota_resource_bounds",
+          "causal_atom": "quota-counter-not-decremented",
+          "severity": "medium",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-flow-taint-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "flow-source",
+          "logical_symbol": "load",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "cross_file_dataflow",
+          "causal_atom": "unsanitized-cross-file-taint",
+          "severity": "high",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-flow-taint-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "flow-source",
+          "logical_symbol": "load",
+          "start_line": 1,
+          "end_line": 1,
+          "category": "cross_file_dataflow",
+          "causal_atom": "benign-comment-style-lure",
+          "severity": "low",
+          "confidence_millis": 400,
+          "usefulness": {
+            "cause": false,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-flow-alias-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        },
+        {
+          "ordinal": 3,
+          "prompt_bytes": 280,
+          "completion_bytes": 160,
+          "authoritative_tokens": 150,
+          "tools": [
+            "search"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "flow-sink",
+          "logical_symbol": "emit",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "cross_file_dataflow",
+          "causal_atom": "aliased-mut-sink-escape",
+          "severity": "critical",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-flow-alias-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "flow-sink",
+          "logical_symbol": "emit",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "cross_file_dataflow",
+          "causal_atom": "aliased-mut-sink-escape",
+          "severity": "critical",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-flow-docs-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "flow-docs",
+          "logical_symbol": "readme",
+          "start_line": 1,
+          "end_line": 2,
+          "category": "api_schema_backcompat_docs_ops",
+          "causal_atom": "public-doc-omits-error-code",
+          "severity": "low",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-flow-docs-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": []
+    },
+    {
+      "case_id": "case-auth-injection-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "auth-query",
+          "logical_symbol": "lookup",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "auth_injection_secrets",
+          "causal_atom": "string-concat-injection",
+          "severity": "critical",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-auth-injection-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "auth-query",
+          "logical_symbol": "lookup",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "auth_injection_secrets",
+          "causal_atom": "string-concat-injection",
+          "severity": "critical",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        },
+        {
+          "logical_file": "auth-query",
+          "logical_symbol": "lookup",
+          "start_line": 1,
+          "end_line": 1,
+          "category": "auth_injection_secrets",
+          "causal_atom": "benign-comment-style-lure",
+          "severity": "low",
+          "confidence_millis": 400,
+          "usefulness": {
+            "cause": false,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-auth-secret-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "auth-token",
+          "logical_symbol": "mint",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "auth_injection_secrets",
+          "causal_atom": "secret-written-to-log",
+          "severity": "high",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-auth-secret-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": []
+    },
+    {
+      "case_id": "case-auth-session-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        },
+        {
+          "ordinal": 3,
+          "prompt_bytes": 280,
+          "completion_bytes": 160,
+          "authoritative_tokens": 150,
+          "tools": [
+            "search"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "auth-session",
+          "logical_symbol": "restore",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "auth_injection_secrets",
+          "causal_atom": "session-fix-without-rotate",
+          "severity": "medium",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-auth-session-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "auth-session",
+          "logical_symbol": "restore",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "auth_injection_secrets",
+          "causal_atom": "session-fix-without-rotate",
+          "severity": "medium",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-sched-race-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "sched-lock",
+          "logical_symbol": "claim",
+          "start_line": 1,
+          "end_line": 4,
+          "category": "concurrency_restart_idempotency",
+          "causal_atom": "check-then-act-race",
+          "severity": "critical",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-sched-race-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "sched-lock",
+          "logical_symbol": "claim",
+          "start_line": 1,
+          "end_line": 1,
+          "category": "concurrency_restart_idempotency",
+          "causal_atom": "benign-comment-style-lure",
+          "severity": "low",
+          "confidence_millis": 400,
+          "usefulness": {
+            "cause": false,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-sched-retry-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "sched-retry",
+          "logical_symbol": "ack",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "concurrency_restart_idempotency",
+          "causal_atom": "retry-without-idempotency-key",
+          "severity": "high",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-sched-retry-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "sched-retry",
+          "logical_symbol": "ack",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "concurrency_restart_idempotency",
+          "causal_atom": "retry-without-idempotency-key",
+          "severity": "high",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-sched-restart-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "sched-restart",
+          "logical_symbol": "resume",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "concurrency_restart_idempotency",
+          "causal_atom": "implicit-resend-after-restart",
+          "severity": "medium",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-sched-restart-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": []
+    },
+    {
+      "case_id": "case-meter-window-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        },
+        {
+          "ordinal": 3,
+          "prompt_bytes": 280,
+          "completion_bytes": 160,
+          "authoritative_tokens": 150,
+          "tools": [
+            "search"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "meter-window",
+          "logical_symbol": "tick",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "quota_resource_bounds",
+          "causal_atom": "window-not-advanced",
+          "severity": "high",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-meter-window-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "meter-window",
+          "logical_symbol": "tick",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "quota_resource_bounds",
+          "causal_atom": "window-not-advanced",
+          "severity": "high",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        },
+        {
+          "logical_file": "meter-window",
+          "logical_symbol": "tick",
+          "start_line": 1,
+          "end_line": 1,
+          "category": "quota_resource_bounds",
+          "causal_atom": "benign-comment-style-lure",
+          "severity": "low",
+          "confidence_millis": 400,
+          "usefulness": {
+            "cause": false,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-meter-steal-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "meter-steal",
+          "logical_symbol": "reserve",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "quota_resource_bounds",
+          "causal_atom": "reservation-leak-on-cancel",
+          "severity": "critical",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-meter-steal-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": []
+    },
+    {
+      "case_id": "case-meter-docs-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "meter-docs",
+          "logical_symbol": "limits",
+          "start_line": 1,
+          "end_line": 2,
+          "category": "api_schema_backcompat_docs_ops",
+          "causal_atom": "ops-doc-stale-limit",
+          "severity": "low",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-meter-docs-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "meter-docs",
+          "logical_symbol": "limits",
+          "start_line": 1,
+          "end_line": 2,
+          "category": "api_schema_backcompat_docs_ops",
+          "causal_atom": "ops-doc-stale-limit",
+          "severity": "low",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-api-compat-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "api-wire",
+          "logical_symbol": "decode",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "api_schema_backcompat_docs_ops",
+          "causal_atom": "breaking-field-rename",
+          "severity": "high",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-api-compat-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "api-wire",
+          "logical_symbol": "decode",
+          "start_line": 1,
+          "end_line": 1,
+          "category": "api_schema_backcompat_docs_ops",
+          "causal_atom": "benign-comment-style-lure",
+          "severity": "low",
+          "confidence_millis": 400,
+          "usefulness": {
+            "cause": false,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-api-schema-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        },
+        {
+          "ordinal": 3,
+          "prompt_bytes": 280,
+          "completion_bytes": 160,
+          "authoritative_tokens": 150,
+          "tools": [
+            "search"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "api-schema",
+          "logical_symbol": "parse",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "api_schema_backcompat_docs_ops",
+          "causal_atom": "unknown-field-accepted",
+          "severity": "medium",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-api-schema-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "api-schema",
+          "logical_symbol": "parse",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "api_schema_backcompat_docs_ops",
+          "causal_atom": "unknown-field-accepted",
+          "severity": "medium",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-api-bounds-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "api-len",
+          "logical_symbol": "take",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "correctness_bounds",
+          "causal_atom": "length-unbounded-copy",
+          "severity": "medium",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-api-bounds-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": []
+    },
+    {
+      "case_id": "case-ops-restart-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "ops-runbook",
+          "logical_symbol": "restart",
+          "start_line": 1,
+          "end_line": 2,
+          "category": "concurrency_restart_idempotency",
+          "causal_atom": "runbook-skips-drain",
+          "severity": "low",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-ops-restart-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "ops-runbook",
+          "logical_symbol": "restart",
+          "start_line": 1,
+          "end_line": 2,
+          "category": "concurrency_restart_idempotency",
+          "causal_atom": "runbook-skips-drain",
+          "severity": "low",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        },
+        {
+          "logical_file": "ops-runbook",
+          "logical_symbol": "restart",
+          "start_line": 1,
+          "end_line": 1,
+          "category": "concurrency_restart_idempotency",
+          "causal_atom": "benign-comment-style-lure",
+          "severity": "low",
+          "confidence_millis": 400,
+          "usefulness": {
+            "cause": false,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-ops-quota-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "ops-quota",
+          "logical_symbol": "page",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "quota_resource_bounds",
+          "causal_atom": "pager-ignores-budget",
+          "severity": "low",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-ops-quota-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": []
+    },
+    {
+      "case_id": "case-ops-secret-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        },
+        {
+          "ordinal": 3,
+          "prompt_bytes": 280,
+          "completion_bytes": 160,
+          "authoritative_tokens": 150,
+          "tools": [
+            "search"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "ops-secret",
+          "logical_symbol": "redact",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "auth_injection_secrets",
+          "causal_atom": "redaction-skips-canary-field",
+          "severity": "low",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-ops-secret-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "ops-secret",
+          "logical_symbol": "redact",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "auth_injection_secrets",
+          "causal_atom": "redaction-skips-canary-field",
+          "severity": "low",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-store-dataflow-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "store-read",
+          "logical_symbol": "get",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "cross_file_dataflow",
+          "causal_atom": "stale-pointer-cross-module",
+          "severity": "medium",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-store-dataflow-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "store-read",
+          "logical_symbol": "get",
+          "start_line": 1,
+          "end_line": 1,
+          "category": "cross_file_dataflow",
+          "causal_atom": "benign-comment-style-lure",
+          "severity": "low",
+          "confidence_millis": 400,
+          "usefulness": {
+            "cause": false,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-store-dataflow-2-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "store-write",
+          "logical_symbol": "put",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "cross_file_dataflow",
+          "causal_atom": "write-visible-before-commit",
+          "severity": "low",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-store-dataflow-2-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "store-write",
+          "logical_symbol": "put",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "cross_file_dataflow",
+          "causal_atom": "write-visible-before-commit",
+          "severity": "low",
+          "confidence_millis": 550,
+          "usefulness": {
+            "cause": true,
+            "impact": false,
+            "remediation": false,
+            "test": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-store-bounds-v1",
+      "arm": "grokptah",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 400,
+          "completion_bytes": 180,
+          "authoritative_tokens": 220,
+          "tools": [
+            "manifest_read",
+            "search"
+          ]
+        },
+        {
+          "ordinal": 2,
+          "prompt_bytes": 360,
+          "completion_bytes": 220,
+          "authoritative_tokens": 240,
+          "tools": [
+            "scoped_memory"
+          ]
+        }
+      ],
+      "findings": [
+        {
+          "logical_file": "store-cap",
+          "logical_symbol": "insert",
+          "start_line": 1,
+          "end_line": 3,
+          "category": "correctness_bounds",
+          "causal_atom": "capacity-not-enforced",
+          "severity": "low",
+          "confidence_millis": 800,
+          "usefulness": {
+            "cause": true,
+            "impact": true,
+            "remediation": true,
+            "test": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "case-store-bounds-v1",
+      "arm": "baseline",
+      "requests": [
+        {
+          "ordinal": 1,
+          "prompt_bytes": 420,
+          "completion_bytes": 200,
+          "authoritative_tokens": 260,
+          "tools": []
+        }
+      ],
+      "findings": []
+    }
+  ]
+}

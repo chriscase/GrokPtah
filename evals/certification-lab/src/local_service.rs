@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::provider_observation::ProviderObservationSession;
@@ -16,6 +17,7 @@ use grokptah_agent_bridge::{
     ControlServerHandle, ControlServerLimits, HostConfig, McpControlClient, OrchestrationConfig,
     OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist,
 };
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const OFFLINE_ENV: &str = "GROKPTAH_AGENT_OFFLINE";
@@ -299,6 +301,124 @@ fn generated_token() -> String {
     )
 }
 
+/// Live enterprise-gateway attach for the code-review benchmark.
+///
+/// The current host does not issue a disposable enterprise-gateway lease,
+/// a gateway-signed modest-tier deployment attestation, or an external
+/// egress-firewall attestation. Compatible-gateway ambient routes remain
+/// refused; this API never installs a bypass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnterpriseReviewLiveGap {
+    pub disposable_lease: bool,
+    pub gateway_signed_deployment_attestation: bool,
+    pub egress_firewall_attestation: bool,
+}
+
+pub fn enterprise_review_live_attach() -> Result<(), EnterpriseReviewLiveGap> {
+    Err(EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })
+}
+
+/// Merkle root over a directory tree. Symbolic links fail closed. Relative
+/// paths are mixed into the digest but never returned.
+pub fn workspace_merkle_root(root: &Path) -> Result<String> {
+    let mut entries = Vec::new();
+    collect_merkle_entries(root, root, &mut entries)?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, digest, bytes) in entries {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(digest.as_bytes());
+        hasher.update(bytes.to_le_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRefSnapshot {
+    pub head_digest: String,
+    pub refs_digest: String,
+    pub remote_publication_count: u32,
+}
+
+/// Snapshot git HEAD, refs, and remote-tracking publication count. The raw
+/// refs never leave this function; only SHA-256 fingerprints are returned.
+pub fn git_ref_snapshot(root: &Path) -> Result<GitRefSnapshot> {
+    let head = git_stdout(root, &["rev-parse", "HEAD"])?;
+    let refs = git_stdout(root, &["show-ref", "--head"])?;
+    let remotes = git_stdout(
+        root,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+    )?;
+    let remote_publication_count =
+        u32::try_from(remotes.lines().filter(|line| !line.is_empty()).count())
+            .context("remote publication count overflow")?;
+    Ok(GitRefSnapshot {
+        head_digest: format!("{:x}", Sha256::digest(head.as_bytes())),
+        refs_digest: format!("{:x}", Sha256::digest(refs.as_bytes())),
+        remote_publication_count,
+    })
+}
+
+fn collect_merkle_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<(String, String, u64)>,
+) -> Result<()> {
+    let mut children = Vec::new();
+    for child in std::fs::read_dir(directory).context("read workspace tree")? {
+        children.push(child.context("read workspace entry")?);
+    }
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let path = child.path();
+        let metadata = std::fs::symlink_metadata(&path).context("stat workspace entry")?;
+        if metadata.file_type().is_symlink() {
+            bail!("workspace tree contains a symbolic link");
+        }
+        if child.file_name() == ".git" {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .context("workspace path escaped its root")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if metadata.is_dir() {
+            collect_merkle_entries(root, &path, entries)?;
+        } else if metadata.is_file() {
+            let bytes = std::fs::read(&path).context("read workspace file")?;
+            entries.push((
+                relative,
+                format!("{:x}", Sha256::digest(&bytes)),
+                bytes.len() as u64,
+            ));
+        } else {
+            bail!("workspace tree contains a non-regular entry");
+        }
+    }
+    Ok(())
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .context("invoke git for workspace snapshot")?;
+    if !output.status.success() {
+        bail!("git workspace snapshot failed");
+    }
+    String::from_utf8(output.stdout).context("git snapshot was not UTF-8")
+}
+
 pub(crate) fn validate_public_model(model: &str) -> Result<()> {
     if !(6..=80).contains(&model.len())
         || !model.starts_with("grok-")
@@ -452,5 +572,26 @@ mod tests {
         );
         assert!(config.clone().with_model("opaque-private-route").is_err());
         assert!(config.with_model("grok-build").is_ok());
+    }
+
+    #[test]
+    fn enterprise_review_live_attach_is_unimplemented() {
+        let error = enterprise_review_live_attach().unwrap_err();
+        assert!(!error.disposable_lease);
+        assert!(!error.gateway_signed_deployment_attestation);
+        assert!(!error.egress_firewall_attestation);
+    }
+
+    #[test]
+    fn workspace_merkle_is_stable_and_rejects_symlinks() {
+        let root = tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), b"one").unwrap();
+        let first = workspace_merkle_root(&workspace).unwrap();
+        let second = workspace_merkle_root(&workspace).unwrap();
+        assert_eq!(first, second);
+        std::fs::write(workspace.join("a.txt"), b"two").unwrap();
+        assert_ne!(first, workspace_merkle_root(&workspace).unwrap());
     }
 }
