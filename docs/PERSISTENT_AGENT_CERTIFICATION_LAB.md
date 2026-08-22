@@ -320,6 +320,7 @@ failure. A second forced interrupt may terminate with the platform's standard
 | Routines | Manual activation implemented; schedule/dedupe/lifecycle/recovery declared | Scheduled timing requires deterministic clock support. |
 | Coordinator/messages | Parent/child implemented; workers/messages/cursors/expiry/scope declared | Fixed message expiry without clock control is skipped. |
 | Native managed execution | Default-off policy, Work-to-Run, permission parking, duplicate suppression, restart adoption, and interruption retry implemented | Public discovery, default policy, and `nativeExecutor` health are verified. All five live probes use public MCP oracles; restart/retry additionally require an owned local restart and explicit reconnect. Payload-free capture is bound to a successful provider-capture Run, while interrupted/failed scenario Runs are now retained as explicitly labelled recovery evidence. |
+| Manager plans | Plan lifecycle implemented | One offline vertical slice: creation, a non-executable root container, dependency-ordered advance, revision-fenced observation, a failed step, and an explicit replan that reaches terminal success. |
 | Soak | Declared, bounded, not implemented by the minimal runner | Existing coordinator/continuity/soak suites remain complementary evidence. |
 
 On the merged native-executor main, discovery looks only for the audited public tools
@@ -353,6 +354,31 @@ repeated-tick no-duplicate evidence counts the public Work, attempts, intent,
 and linked Runs; it does not invent a `deduplicated` Run state. The
 newest-200-of-500 message prompt assembly is likewise not externally observable
 and remains indeterminate until a public evidence seam exists.
+
+### Manager plan coverage
+
+`manager-plan-lifecycle-v1` is the first manager probe. It runs offline
+against the local service and asserts only public MCP evidence:
+
+- The plan's root Work reports `isContainer` and refuses a claim, so the
+  coordination container can never execute. This is asserted against the
+  host's refusal, not against prompt text.
+- The first `advance` materializes only the step whose dependencies have
+  succeeded; the dependent step stays `pending`. Replaying that one advance
+  request returns the same Work rather than a second item.
+- An `advance` carrying a superseded plan revision is refused.
+- `ptah_tick_manager_plan` projects the terminal child outcome into one
+  durable notification, and repeating the tick notifies nothing further for
+  the same Work revision. The tick advances the active plan before it
+  observes, so the dependent step's Work is read from the durable plan
+  projection rather than from a second `advance`.
+- A failed child leaves the plan `needs_replan` and creates no replacement
+  Work. Only an explicit `ptah_replan_manager_plan` supersedes the failed step
+  and its blocked descendants, after which the plan reaches `succeeded`.
+
+The probe does not exercise the autonomous supervisor, `manager-decision`
+Runs, or proposal-only capability enforcement; those need native managed
+execution and remain uncovered.
 
 ## Adding a probe or fixture
 
