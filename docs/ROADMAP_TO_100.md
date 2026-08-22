@@ -165,8 +165,9 @@ exits**, and all of the following are true:
     backup/restore, restart, cursor expiry, credential rotation, Computer Use
     Stop / Take over on a packaged identity, upgrade/rollback,
     disk-full/corrupt/torn-state recovery, sole-writer contention,
-    monitoring/alerts, backup confidentiality, RTO/RPO, and shared
-    sccache/target ownership/cleanup policy.
+    monitoring/alerts, backup confidentiality, RTO/RPO, and the
+    sccache / repository-family `CARGO_TARGET_DIR` ownership and cleanup
+    policy in [`BUILD_PERFORMANCE.md`](BUILD_PERFORMANCE.md).
 
 Until every item holds, **do not claim 100%.**
 
@@ -255,9 +256,7 @@ remains draft.** Remaining draft is not an honest exit.
   are not described as shipped.
 - Open issues [#305](https://github.com/chriscase/GrokPtah/issues/305) and
   [#308](https://github.com/chriscase/GrokPtah/issues/308) are not called
-  complete. [#305](https://github.com/chriscase/GrokPtah/issues/305) cannot be
-  descoped; [#308](https://github.com/chriscase/GrokPtah/issues/308) core UX
-  cannot be marked Explicitly unsupported.
+  complete.
 
 **Must not claim:** Native Coding Readiness Center, local quota ledger, or
 hosted-service.yml as shipped while they exist only on PR #352. **Must not
@@ -604,9 +603,10 @@ including least-privilege soak).
 
 **Exists today:** Documented backup/restore and `/ready` behavior
 ([`HEADLESS_SERVICE.md`](HEADLESS_SERVICE.md)); deterministic service
-conformance; Computer Use Stop / Take over tests in-process; compiler-cache
-hygiene in [`BUILD_PERFORMANCE.md`](BUILD_PERFORMANCE.md). No dated
-production-like drill report.
+conformance; Computer Use Stop / Take over tests in-process; authoritative
+local sccache / repository-family target policy in
+[`BUILD_PERFORMANCE.md`](BUILD_PERFORMANCE.md). No dated production-like
+drill report, including no recorded sccache/target drill evidence.
 
 **Exit (all required):**
 
@@ -625,10 +625,29 @@ production-like drill report.
 - **Backup confidentiality:** `GROKPTAH_HOME` copies exclude live bearer
   tokens; restored backups do not leak credentials into logs or MCP.
 - Documented **RTO/RPO** for the hosted home, measured on the drill.
-- **Shared sccache / target ownership and cleanup:** each worktree keeps a
-  private Cargo target; `sccache` is optional, namespaced, and never shares
-  writable targets across concurrent worktrees; cleanup deletes only the
-  documented cache/target paths ([`BUILD_PERFORMANCE.md`](BUILD_PERFORMANCE.md)).
+- **sccache / repository-family target ownership and cleanup** (authoritative
+  policy in [`BUILD_PERFORMANCE.md`](BUILD_PERFORMANCE.md); per-worktree
+  private targets and optional `sccache` are **not** this exit):
+  - After verifying `sccache` on PATH, local operator builds set
+    `RUSTC_WRAPPER=sccache` with the stable shared cache
+    `~/Library/Caches/grokptah/sccache`.
+  - Compatible, **non-concurrent** lanes reuse one stable
+    repository-family `CARGO_TARGET_DIR` **outside checkouts**, keyed and
+    fenced by compatible toolchain, rustc target, features/profile, and
+    lock/dependency graph.
+  - Never concurrently share a writable target. Truly concurrent or
+    incompatible builds get an exact isolated target **only for that lane**,
+    then it is removed when inactive.
+  - Never put multi-GB targets under `/private/tmp` or per review/worktree
+    by default.
+  - Before cleanup: exact target path and size, owner, no `cargo`/`rustc`
+    process, no open handles; refuse deletion of active, protected, or
+    shared-family paths. Build artifacts are disposable; source and commits
+    are deliverables.
+  - Handoffs record target and sccache paths, owner, and reason. Drill
+    evidence covers compatible sequential reuse, concurrent forced
+    isolation, incompatible forced isolation, crash cleanup, and
+    active-target deletion refusal.
 - Credential rotation: API-key, `GROKPTAH_TOKEN_COMMAND`, and OIDC-principal
   change invalidate measured qualifications as documented; ordinary
   access-token refresh does not.
