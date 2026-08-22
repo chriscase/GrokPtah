@@ -280,6 +280,35 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
     );
     let submit_session_id =
         Uuid::parse_str(created.structured["sessionId"].as_str().unwrap()).unwrap();
+    // Isolated offline turns complete immediately. Fill both admission slots so
+    // the smoke submit stays queued; cancel then proves submit+cancel without a
+    // live provider, matching the capacity-matrix harness.
+    let hold_a = client
+        .call_tool(
+            "ptah_create_session",
+            json!({
+                "workspace": workspace_path,
+                "title": "Smoke capacity hold A",
+            }),
+        )
+        .await
+        .unwrap();
+    let hold_b = client
+        .call_tool(
+            "ptah_create_session",
+            json!({
+                "workspace": workspace_path,
+                "title": "Smoke capacity hold B",
+            }),
+        )
+        .await
+        .unwrap();
+    let hold_a_id = Uuid::parse_str(hold_a.structured["sessionId"].as_str().unwrap()).unwrap();
+    let hold_b_id = Uuid::parse_str(hold_b.structured["sessionId"].as_str().unwrap()).unwrap();
+    host.reserve_orchestration_turn("smoke-hold-a", hold_a_id)
+        .unwrap();
+    host.reserve_orchestration_turn("smoke-hold-b", hold_b_id)
+        .unwrap();
     let submitted = client
         .call_tool(
             "ptah_submit_task",
@@ -295,6 +324,7 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         .await
         .unwrap();
     assert!(!submitted.is_error, "submit task: {:?}", submitted.raw);
+    assert_eq!(submitted.structured["state"], "queued");
     let submitted_run_id = submitted.structured["runId"].as_str().unwrap();
     assert_eq!(
         submitted.structured["sessionId"],
@@ -317,6 +347,8 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         "cancel submitted task: {:?}",
         submitted_cancel.raw
     );
+    host.release_orchestration_turn("smoke-hold-a");
+    host.release_orchestration_turn("smoke-hold-b");
 
     let mut stream = client
         .open_event_stream(scope.clone(), Some(first_seq.saturating_sub(1)))
