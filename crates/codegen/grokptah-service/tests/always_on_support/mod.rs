@@ -410,8 +410,7 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
         }
         ProviderDisposition::Slow => {
             thread::sleep(Duration::from_secs(8));
-            let response = scripted_completion(&body, script);
-            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.shutdown(Shutdown::Both);
         }
         ProviderDisposition::Scripted | ProviderDisposition::Hold => {
             let response = scripted_completion(&body, script);
@@ -452,41 +451,58 @@ fn auth_presence(headers: &str) -> (bool, Option<String>) {
 
 fn classify_semantic(body: &str) -> String {
     let all = extract_all_text(body);
-    if all.contains("Return exactly this JSON envelope") {
+    let focus = objective_focus(&all);
+    if focus.contains("Return exactly this JSON envelope") {
         return "manager-decision".into();
     }
-    let content = extract_user_content(body);
-    if content.contains("CERT_MALFORMED") {
+    if focus.contains("CERT_MALFORMED") {
         return "fail-malformed".into();
     }
-    if content.contains("CERT_500") {
+    if focus.contains("CERT_500") {
         return "fail-500".into();
     }
-    if content.contains("CERT_DROP") {
+    if focus.contains("CERT_DROP") {
         return "fail-drop".into();
     }
-    if content.contains("CERT_SLOW") {
+    if focus.contains("CERT_SLOW") {
         return "fail-slow".into();
     }
-    if content.contains("CERT_CANCEL") {
+    if focus.contains("CERT_CANCEL") {
         return "fail-cancel".into();
     }
-    if content.contains("GROKBOT_SETUP") {
+    if focus.contains("GROKBOT_SETUP") {
         return "setup".into();
     }
-    if content.contains("GROKBOT_FORCE_FAIL") {
+    if focus.contains("GROKBOT_FORCE_FAIL") {
         return "step-b".into();
     }
-    if content.contains("GROKBOT_SUCCESS complete the replacement") {
+    if focus.contains("GROKBOT_SUCCESS complete the replacement") {
         return "step-b-fix".into();
     }
-    if content.contains("GROKBOT_SUCCESS first native unit") {
+    if focus.contains("GROKBOT_SUCCESS first native unit") {
         return "step-a".into();
     }
-    if content.contains("GROKBOT_SUCCESS") {
+    if focus.contains("GROKBOT_SUCCESS") {
         return "native-success".into();
     }
     "other".into()
+}
+
+fn objective_focus(all: &str) -> String {
+    if let Some((_, rest)) = all.split_once("Objective:\n") {
+        let mut lines = Vec::new();
+        for line in rest.lines() {
+            if line.starts_with("Verified continuation") || line.starts_with("Relevant messages:") {
+                break;
+            }
+            lines.push(line);
+        }
+        let focused = lines.join("\n");
+        if !focused.trim().is_empty() {
+            return focused;
+        }
+    }
+    all.to_string()
 }
 
 fn read_http_message(stream: &mut TcpStream) -> Option<(String, String, String)> {

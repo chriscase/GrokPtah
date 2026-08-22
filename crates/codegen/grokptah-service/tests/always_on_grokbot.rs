@@ -472,6 +472,7 @@ async fn exact_happy_path_oracle(
         "native-step-a-one-work-intent-attempt-run-post",
     )
     .await;
+    record_assertion("native-step-a-one-work-intent-attempt-run-post");
     assert_native_exact(
         client,
         session,
@@ -484,6 +485,7 @@ async fn exact_happy_path_oracle(
         "native-step-b-one-work-intent-attempt-run-post",
     )
     .await;
+    record_assertion("native-step-b-one-work-intent-attempt-run-post");
     assert_native_exact(
         client,
         session,
@@ -496,6 +498,7 @@ async fn exact_happy_path_oracle(
         "native-step-b-fix-one-work-intent-attempt-run-post",
     )
     .await;
+    record_assertion("native-step-b-fix-one-work-intent-attempt-run-post");
     assert_eq!(provider.count_for("manager-decision"), 1);
     assert_terminal_runs_pending_zero(&runs);
     record_assertion("all-terminal-runs-pending-0");
@@ -858,10 +861,30 @@ async fn restart_scenarios_fresh_home_exact_identities() {
         .await;
         if name == "plan-succeeded" {
             assert_eq!(plan["plan"]["state"].as_str(), Some("succeeded"));
-            assert_eq!(campaign.provider.count_for("step-a"), 1);
-            assert_eq!(campaign.provider.count_for("step-b"), 1);
-            assert_eq!(campaign.provider.count_for("manager-decision"), 1);
-            assert_eq!(campaign.provider.count_for("step-b-fix"), 1);
+            assert_eq!(
+                campaign.provider.count_for("step-a"),
+                1,
+                "step-a posts after {name}: {:?}",
+                campaign.provider.records()
+            );
+            assert_eq!(
+                campaign.provider.count_for("step-b"),
+                1,
+                "step-b posts after {name}: {:?}",
+                campaign.provider.records()
+            );
+            assert_eq!(
+                campaign.provider.count_for("manager-decision"),
+                1,
+                "manager-decision posts after {name}: {:?}",
+                campaign.provider.records()
+            );
+            assert_eq!(
+                campaign.provider.count_for("step-b-fix"),
+                1,
+                "step-b-fix posts after {name}: {:?}",
+                campaign.provider.records()
+            );
         } else {
             let after = snapshot_step(
                 &work,
