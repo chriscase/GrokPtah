@@ -15,10 +15,36 @@ use tempfile::tempdir;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+/// Isolated smoke tests must not capture a live provider route. Conformance
+/// (`ServiceEnv`) already sets `GROKPTAH_AGENT_OFFLINE=1`; this older harness
+/// did not, so `ptah_submit_task` failed closed on missing credentials instead
+/// of proving capacity, scope, and restart.
+struct IsolatedOffline {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl IsolatedOffline {
+    fn enable() -> Self {
+        let previous = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
+        std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+        Self { previous }
+    }
+}
+
+impl Drop for IsolatedOffline {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("GROKPTAH_AGENT_OFFLINE", value),
+            None => std::env::remove_var("GROKPTAH_AGENT_OFFLINE"),
+        }
+    }
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
     let _serial = home_override_serial();
+    let _offline = IsolatedOffline::enable();
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     set_grokptah_home_override(Some(home.path().to_path_buf()));
@@ -76,6 +102,9 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
     assert!(tools.iter().any(|tool| tool.name == "ptah_list_runs"));
     assert!(tools.iter().any(|tool| tool.name == "ptah_create_routine"));
     assert!(tools.iter().any(|tool| tool.name == "ptah_fire_routine"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool.name == "ptah_get_native_coding_readiness"));
 
     let created = client
         .call_tool(
@@ -142,6 +171,7 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
 #[allow(clippy::await_holding_lock)]
 async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart() {
     let _serial = home_override_serial();
+    let _offline = IsolatedOffline::enable();
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let workspace_path = dunce::canonicalize(workspace.path()).unwrap();
@@ -463,6 +493,7 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
 #[allow(clippy::await_holding_lock)]
 async fn service_capacity_and_scope_matrix_is_fail_closed() {
     let _serial = home_override_serial();
+    let _offline = IsolatedOffline::enable();
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let workspace_path = dunce::canonicalize(workspace.path()).unwrap();
