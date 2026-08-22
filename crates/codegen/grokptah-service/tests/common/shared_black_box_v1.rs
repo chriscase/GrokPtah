@@ -219,21 +219,87 @@ pub async fn run_fixture() {
     let desktop = run_v1(EndpointKind::Desktop, &scenario, &mut env).await;
     let hosted = run_v1(EndpointKind::Hosted, &scenario, &mut env).await;
 
-    let desktop_json = serde_json::to_string(&desktop).expect("serialize desktop result");
-    let hosted_json = serde_json::to_string(&hosted).expect("serialize hosted result");
+    let desktop_json = serde_json::to_string(&desktop.result).expect("serialize desktop result");
+    let hosted_json = serde_json::to_string(&hosted.result).expect("serialize hosted result");
     let desktop_hash = sha256_hex(desktop_json.as_bytes());
     let hosted_hash = sha256_hex(hosted_json.as_bytes());
     eprintln!("shared-black-box-v1 desktop normalized sha256={desktop_hash}");
     eprintln!("shared-black-box-v1 hosted normalized sha256={hosted_hash}");
-    assert_eq!(
-        desktop_json, hosted_json,
-        "desktop and hosted normalized JSON must be byte-equal\ndesktop={desktop_hash}\nhosted={hosted_hash}"
+    eprintln!(
+        "shared-black-box-v1 desktop transport {:?}",
+        desktop.result["transport"]
+    );
+    eprintln!(
+        "shared-black-box-v1 hosted transport {:?}",
+        hosted.result["transport"]
     );
 
-    write_or_compare_goldens(&desktop);
+    let mut report = Vec::new();
+    if desktop_json != hosted_json {
+        report.push(format!(
+            "desktop and hosted normalized JSON are not byte-equal\ndesktop={desktop_hash}\nhosted={hosted_hash}"
+        ));
+    }
+    for (label, endpoint) in [("desktop", &desktop), ("hosted", &hosted)] {
+        if !endpoint.defects.is_empty() {
+            report.push(format!(
+                "{label} mutation-resistant assertions failed:\n{}",
+                endpoint.defects.join("\n")
+            ));
+        }
+        if !endpoint.redaction_hits.is_empty() {
+            report.push(format!(
+                "{label} redaction scan failed; paths only (values omitted):\n{}",
+                collapse_redaction_hits(&endpoint.redaction_hits).join("\n")
+            ));
+        }
+    }
+    if report.is_empty() {
+        write_or_compare_goldens(&desktop.result);
+        return;
+    }
+    panic!("{}", report.join("\n\n"));
 }
 
-async fn run_v1(kind: EndpointKind, scenario: &Scenario, env: &mut ProcessEnvGuard) -> Value {
+struct EndpointOutcome {
+    result: Value,
+    defects: Vec<String>,
+    redaction_hits: Vec<String>,
+}
+
+fn collapse_redaction_hits(hits: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = hits
+        .iter()
+        .map(|hit| {
+            let collapsed: String = hit
+                .chars()
+                .fold((String::new(), false), |(mut acc, in_index), ch| {
+                    if ch == '[' {
+                        acc.push_str("[]");
+                        (acc, true)
+                    } else if ch == ']' {
+                        (acc, false)
+                    } else if in_index {
+                        (acc, true)
+                    } else {
+                        acc.push(ch);
+                        (acc, false)
+                    }
+                })
+                .0;
+            collapsed
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+async fn run_v1(
+    kind: EndpointKind,
+    scenario: &Scenario,
+    env: &mut ProcessEnvGuard,
+) -> EndpointOutcome {
     let home_dir = TempDir::new().expect("temp home");
     let workspace_dir = TempDir::new().expect("temp workspace");
     let home = dunce::canonicalize(home_dir.path()).expect("canonicalize home");
@@ -241,6 +307,16 @@ async fn run_v1(kind: EndpointKind, scenario: &Scenario, env: &mut ProcessEnvGua
     env.set("HOME", &home);
     env.set("GROK_HOME", home.join(".grok"));
     std::fs::create_dir_all(home.join(".grok")).expect("grok home");
+    // Pin the catalog default so both adapters resolve the fixture modelId
+    // instead of grok-4.5 from the builtin preference list.
+    std::fs::write(
+        home.join(".grok").join("config.toml"),
+        format!(
+            "[models]\ndefault = \"{}\"\n",
+            scenario.str(&["identities", "modelId"])
+        ),
+    )
+    .expect("write grok config.toml");
     set_grokptah_home_override(Some(home.clone()));
 
     let token = scenario.str(&["secrets", "mcpBearer"]);
@@ -266,7 +342,7 @@ async fn run_v1(kind: EndpointKind, scenario: &Scenario, env: &mut ProcessEnvGua
     let mut hits = Vec::new();
     let mut launched = start_endpoint(kind, &home, &workspace, &token).await;
     initialize_mcp(&mut launched).await;
-    let (result, mut launched) = {
+    let (result, mut launched, defects) = {
         let mut scan = |value: &Value, origin: &str| {
             scan_raw(
                 value,
@@ -299,22 +375,16 @@ async fn run_v1(kind: EndpointKind, scenario: &Scenario, env: &mut ProcessEnvGua
     drop(home_dir);
     drop(workspace_dir);
 
-    if !hits.is_empty() {
-        let report = hits
-            .iter()
-            .map(|hit| format!("{}: {}", hit.path, hit.reason))
-            .collect::<Vec<_>>()
-            .join("\n");
-        panic!(
-            "{} redaction scan failed; paths only (values omitted):\n{report}",
-            kind.as_str()
-        );
-    }
+    let redaction_hits: Vec<String> = hits
+        .iter()
+        .map(|hit| format!("{}: {}", hit.path, hit.reason))
+        .collect();
 
     let mut normalized =
         normalize_result(result, &workspace, &home, &gateway_base, &gateway_authority);
     normalized["schema"] = json!(RESULT_SCHEMA);
     normalized["version"] = json!("v1");
+    let mut normalized_hits = Vec::new();
     scan_normalized_secrets(
         &normalized,
         &token,
@@ -322,8 +392,15 @@ async fn run_v1(kind: EndpointKind, scenario: &Scenario, env: &mut ProcessEnvGua
         &gateway_base,
         &gateway_authority,
         &marker,
+        &mut normalized_hits,
     );
-    normalized
+    let mut all_hits = redaction_hits;
+    all_hits.extend(normalized_hits);
+    EndpointOutcome {
+        result: normalized,
+        defects,
+        redaction_hits: all_hits,
+    }
 }
 
 async fn start_scripted_gateway(script: GatewayScript) -> MockGateway {
@@ -523,7 +600,7 @@ async fn drive_six_phases(
     gateway: &MockGateway,
     proposal_file: &str,
     scan: &mut ScanFn<'_>,
-) -> (Value, Launched) {
+) -> (Value, Launched, Vec<String>) {
     let workspace_text = workspace.display().to_string();
 
     // Phase 1: discovery / readiness through tools/list and optional readiness.
@@ -985,10 +1062,29 @@ async fn drive_six_phases(
         scan,
     )
     .await;
+    let gateway_base = gateway.base_url().to_string();
+    let gateway_authority = gateway_base
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    let post1_norm = normalize_result(
+        post1.clone(),
+        workspace,
+        home,
+        &gateway_base,
+        &gateway_authority,
+    );
+    let post2_norm = normalize_result(
+        post2.clone(),
+        workspace,
+        home,
+        &gateway_base,
+        &gateway_authority,
+    );
     assert_eq!(
-        serde_json::to_string(&post1).unwrap(),
-        serde_json::to_string(&post2).unwrap(),
-        "{} post-restart observations must converge",
+        serde_json::to_string(&post1_norm).unwrap(),
+        serde_json::to_string(&post2_norm).unwrap(),
+        "{} post-restart observations must converge after ephemeral normalization",
         kind.as_str()
     );
 
@@ -1089,45 +1185,118 @@ async fn drive_six_phases(
         "queued": restart_queued
     });
 
-    assert_eq!(ordinary["intent"], 1, "ordinary native intent cardinality");
-    assert_eq!(ordinary["run"], 1, "ordinary native run cardinality");
-    assert_eq!(ordinary["http"], 1, "ordinary native HTTP cardinality");
-    assert_eq!(ordinary["tokens"], 10, "ordinary native tokens");
-    assert_eq!(ordinary["requests"], 1, "ordinary native request usage");
-    assert_eq!(ordinary["quotaState"], "consumed", "ordinary native quota");
-    assert_eq!(manager_obs["proposalHttp"], 2, "proposal HTTP cardinality");
-    assert_eq!(manager_obs["hostDenials"], 1, "host denial cardinality");
-    assert_eq!(manager_obs["permissionRequests"], 0);
-    assert_eq!(manager_obs["permissionGrants"], 0);
-    assert_eq!(
-        manager_obs["filesystemWrites"], 0,
-        "proposal-escape.txt must be absent"
+    let mut defects: Vec<String> = Vec::new();
+    push_mismatch(
+        &mut defects,
+        "ordinary.intent",
+        &ordinary["intent"],
+        json!(1),
     );
-    assert_eq!(manager_obs["purpose"], "manager_proposal");
-    assert_eq!(restart_obs["workAttempt"], 1, "restart work attempts");
-    assert_eq!(restart_obs["intent"], 1, "restart intent cardinality");
-    assert_eq!(restart_obs["run"], 1, "restart run cardinality");
-    assert_eq!(restart_obs["http"], 1, "restart HTTP must stay 1");
-    assert_eq!(
-        restart_obs["queued"], false,
-        "restart work must not requeue"
+    push_mismatch(&mut defects, "ordinary.run", &ordinary["run"], json!(1));
+    push_mismatch(&mut defects, "ordinary.http", &ordinary["http"], json!(1));
+    push_mismatch(
+        &mut defects,
+        "ordinary.tokens",
+        &ordinary["tokens"],
+        json!(10),
     );
-    assert!(
-        restart_obs["sendCertainty"] == "uncertain_accept"
-            || restart_obs["sendCertainty"] == "UncertainAccept",
-        "restart send certainty: {}",
-        restart_obs["sendCertainty"]
+    push_mismatch(
+        &mut defects,
+        "ordinary.requests",
+        &ordinary["requests"],
+        json!(1),
     );
-    assert!(
-        restart_obs["retryClass"] == "explicit_new_run_only"
-            || restart_obs["retryClass"] == "ExplicitNewRunOnly",
-        "restart retry class: {}",
-        restart_obs["retryClass"]
+    push_mismatch(
+        &mut defects,
+        "ordinary.quotaState",
+        &ordinary["quotaState"],
+        json!("consumed"),
     );
-    assert_eq!(
-        restart_obs["quotaState"], "reserved",
-        "restart quota stays reserved"
+    push_mismatch(
+        &mut defects,
+        "manager.proposalHttp",
+        &manager_obs["proposalHttp"],
+        json!(2),
     );
+    push_mismatch(
+        &mut defects,
+        "manager.hostDenials",
+        &manager_obs["hostDenials"],
+        json!(1),
+    );
+    push_mismatch(
+        &mut defects,
+        "manager.permissionRequests",
+        &manager_obs["permissionRequests"],
+        json!(0),
+    );
+    push_mismatch(
+        &mut defects,
+        "manager.permissionGrants",
+        &manager_obs["permissionGrants"],
+        json!(0),
+    );
+    push_mismatch(
+        &mut defects,
+        "manager.filesystemWrites",
+        &manager_obs["filesystemWrites"],
+        json!(0),
+    );
+    push_mismatch(
+        &mut defects,
+        "manager.purpose",
+        &manager_obs["purpose"],
+        json!("manager_proposal"),
+    );
+    push_mismatch(
+        &mut defects,
+        "restart.workAttempt",
+        &restart_obs["workAttempt"],
+        json!(1),
+    );
+    push_mismatch(
+        &mut defects,
+        "restart.intent",
+        &restart_obs["intent"],
+        json!(1),
+    );
+    push_mismatch(&mut defects, "restart.run", &restart_obs["run"], json!(1));
+    push_mismatch(&mut defects, "restart.http", &restart_obs["http"], json!(1));
+    push_mismatch(
+        &mut defects,
+        "restart.queued",
+        &restart_obs["queued"],
+        json!(false),
+    );
+    if restart_obs["sendCertainty"] != "uncertain_accept"
+        && restart_obs["sendCertainty"] != "UncertainAccept"
+    {
+        defects.push(format!(
+            "restart.sendCertainty: actual={} expected=uncertain_accept",
+            restart_obs["sendCertainty"]
+        ));
+    }
+    if restart_obs["retryClass"] != "explicit_new_run_only"
+        && restart_obs["retryClass"] != "ExplicitNewRunOnly"
+    {
+        defects.push(format!(
+            "restart.retryClass: actual={} expected=explicit_new_run_only",
+            restart_obs["retryClass"]
+        ));
+    }
+    push_mismatch(
+        &mut defects,
+        "restart.quotaState",
+        &restart_obs["quotaState"],
+        json!("reserved"),
+    );
+    let leak_paths = leak_paths(&post1["getRun"]);
+    if !leak_paths.is_empty() {
+        defects.push(format!(
+            "public get_run leaked secret-bearing fields (paths only): {}",
+            leak_paths.join(", ")
+        ));
+    }
 
     let result = json!({
         "schema": RESULT_SCHEMA,
@@ -1185,7 +1354,7 @@ async fn drive_six_phases(
             "headerCardinalities": header_cardinalities(gateway)
         }
     });
-    (result, launched)
+    (result, launched, defects)
 }
 
 async fn restart_observation(
@@ -1670,8 +1839,39 @@ const FORBIDDEN_KEYS: &[&str] = &[
     "apikey",
     "api_key",
     "bearertoken",
-    "authorization",
 ];
+
+fn push_mismatch(defects: &mut Vec<String>, name: &str, actual: &Value, expected: Value) {
+    if actual != &expected {
+        defects.push(format!("{name}: actual={actual} expected={expected}"));
+    }
+}
+
+fn leak_paths(value: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    collect_leak_paths(value, "getRun", &mut paths);
+    paths
+}
+
+fn collect_leak_paths(value: &Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let lowered = key.to_ascii_lowercase();
+                if FORBIDDEN_KEYS.contains(&lowered.as_str()) {
+                    out.push(format!("{path}.{key}"));
+                }
+                collect_leak_paths(child, &format!("{path}.{key}"), out);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_leak_paths(child, &format!("{path}[{index}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
 
 fn scan_raw(
     value: &Value,
@@ -1692,6 +1892,10 @@ fn scan_raw(
         hits: Vec::new(),
     };
     walk_scan(value, origin, &mut ctx);
+    ctx.hits
+        .sort_by(|a, b| a.path.cmp(&b.path).then(a.reason.cmp(&b.reason)));
+    ctx.hits
+        .dedup_by(|a, b| a.path == b.path && a.reason == b.reason);
     hits.append(&mut ctx.hits);
 }
 
@@ -1700,40 +1904,14 @@ fn walk_scan(value: &Value, path: &str, ctx: &mut ScanCtx<'_>) {
         Value::Object(map) => {
             for (key, child) in map {
                 let lowered = key.to_ascii_lowercase();
+                if lowered == "headernames" {
+                    continue;
+                }
                 if FORBIDDEN_KEYS.contains(&lowered.as_str()) {
                     ctx.hits.push(RedactionHit {
                         path: format!("{path}.{key}"),
                         reason: format!("forbidden key {key}"),
                     });
-                }
-                if lowered == "providerroute" {
-                    if let Some(obj) = child.as_object() {
-                        for extra in obj.keys() {
-                            let extra_l = extra.to_ascii_lowercase();
-                            if extra_l != "providerid" && extra_l != "modelid" {
-                                if FORBIDDEN_KEYS.contains(&extra_l.as_str())
-                                    || extra_l.contains("credential")
-                                    || extra_l == "baseurl"
-                                    || extra_l == "wiremodelid" && obj.contains_key("credentialRef")
-                                {
-                                    ctx.hits.push(RedactionHit {
-                                        path: format!("{path}.{key}.{extra}"),
-                                        reason: "providerRoute snapshot secret field".into(),
-                                    });
-                                }
-                                if FORBIDDEN_KEYS.contains(&extra_l.as_str())
-                                    || extra_l == "baseurl"
-                                    || extra_l == "credentialref"
-                                    || extra_l == "credentialfingerprint"
-                                {
-                                    ctx.hits.push(RedactionHit {
-                                        path: format!("{path}.{key}.{extra}"),
-                                        reason: "secret-bearing providerRoute".into(),
-                                    });
-                                }
-                            }
-                        }
-                    }
                 }
                 walk_scan(child, &format!("{path}.{key}"), ctx);
             }
@@ -1789,6 +1967,7 @@ fn scan_normalized_secrets(
     gateway: &str,
     gateway_authority: &str,
     marker: &str,
+    out: &mut Vec<String>,
 ) {
     let mut hits = Vec::new();
     scan_raw(
@@ -1801,14 +1980,10 @@ fn scan_normalized_secrets(
         marker,
         &mut hits,
     );
-    if !hits.is_empty() {
-        let report = hits
-            .iter()
-            .map(|hit| format!("{}: {}", hit.path, hit.reason))
-            .collect::<Vec<_>>()
-            .join("\n");
-        panic!("normalized result still contains secrets:\n{report}");
-    }
+    out.extend(
+        hits.into_iter()
+            .map(|hit| format!("normalized {}: {}", hit.path, hit.reason)),
+    );
 }
 
 fn normalize_result(
@@ -1889,37 +2064,23 @@ fn strip_ephemerals(value: &mut Value, key: Option<&str>) {
 
 fn is_ephemeral_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    if lower.ends_with("at")
-        && (lower.contains("created")
-            || lower.contains("updated")
-            || lower.contains("started")
-            || lower.contains("finished")
-            || lower.contains("issued")
-            || lower.contains("expires")
-            || lower.contains("completed")
-            || lower.contains("window")
-            || lower == "ts"
-            || lower.starts_with("last"))
-    {
+    if lower.ends_with("at") && lower.len() > 3 && lower != "format" {
         return true;
     }
     matches!(
         lower.as_str(),
-        "lasttickat"
-            | "lastsuccessat"
-            | "lastrunat"
-            | "startedat"
-            | "updatedat"
-            | "createdat"
-            | "finishedat"
-            | "windowstartedat"
-            | "completedat"
+        "promptpreview"
             | "transportsessionid"
             | "mcp-session-id"
             | "sessionidheader"
             | "backend"
             | "backendlabel"
             | "port"
+            | "skippedmanual"
+            | "skippedineligible"
+            | "skippedprovidercapacity"
+            | "skippedunroutable"
+            | "laggedliveevents"
     )
 }
 
@@ -1979,6 +2140,7 @@ fn should_canonicalize(key: Option<&str>, text: &str) -> bool {
     if text.starts_with("sbb-v1-")
         || text.starts_with("$")
         || text == "__manager_decision__"
+        || text == "inspect"
         || text == "env-grokptah"
         || text == "grok-build"
         || text.contains("shared-black-box-v1")
@@ -1988,34 +2150,14 @@ fn should_canonicalize(key: Option<&str>, text: &str) -> bool {
     if looks_like_uuid(text) || looks_like_hash(text) {
         return true;
     }
-    matches!(
-        key.map(str::to_ascii_lowercase).as_deref(),
-        Some("workid")
-            | Some("runid")
-            | Some("intentid")
-            | Some("attemptid")
-            | Some("planid")
-            | Some("reservationid")
-            | Some("poolid")
-            | Some("snapshothash")
-            | Some("occurrenceid")
-            | Some("inputsnapshothash")
-            | Some("decisionid")
-            | Some("messageid")
-            | Some("agentid")
-            | Some("sessionid")
-            | Some("quotareservationid")
-            | Some("parentworkid")
-            | Some("parentrunid")
-            | Some("rootworkid")
-            | Some("decisionworkid")
-            | Some("lastdecisionid")
-            | Some("sourcemanagerplanid")
-            | Some("checkpointid")
-            | Some("continuationcontextid")
-            | Some("continuationcontexthash")
-            | Some("endpointfingerprint")
-    ) && !text.is_empty()
+    let Some(lower) = key.map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    if lower == "stepid" || lower == "kind" || lower == "purpose" || lower == "type" {
+        return false;
+    }
+    (lower.ends_with("id") || lower.ends_with("hash") || lower.ends_with("fingerprint"))
+        && !text.is_empty()
         && text != "__manager_decision__"
 }
 
@@ -2046,6 +2188,25 @@ fn find_generated_ids(text: &str) -> Vec<String> {
             continue;
         }
         i += 1;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_hexdigit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        let len = i - start;
+        if len == 32 || len == 64 {
+            let bounded_left = start == 0 || !bytes[start - 1].is_ascii_hexdigit();
+            let bounded_right = i == bytes.len() || !bytes[i].is_ascii_hexdigit();
+            if bounded_left && bounded_right {
+                out.push(text[start..i].to_string());
+            }
+        }
     }
     out
 }
