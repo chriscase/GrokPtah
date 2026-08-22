@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use grokptah_agent_bridge::computer_use::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend, ComputerCapabilities,
-    ComputerError, ComputerErrorCode, ComputerObservation, ComputerRun, ComputerRunState,
-    ComputerStore, ComputerTarget, ComputerUseLimits, GrantIssuer, ObservationGeometry,
+    ComputerError, ComputerErrorCode, ComputerObservation, ComputerPrincipal, ComputerRun,
+    ComputerRunState, ComputerStore, ComputerTarget, ComputerUseLimits, ObservationGeometry,
     PointerButton, SemanticAction, SemanticElement, Sensitivity,
 };
 use grokptah_agent_bridge::ComputerUseService;
@@ -36,6 +36,7 @@ enum BackendMode {
 struct ReleaseGateBackend {
     mode: BackendMode,
     action_calls: AtomicUsize,
+    surface: grokptah_agent_bridge::ComputerSurfaceBinding,
 }
 
 impl ReleaseGateBackend {
@@ -43,6 +44,7 @@ impl ReleaseGateBackend {
         Self {
             mode,
             action_calls: AtomicUsize::new(0),
+            surface: grokptah_agent_bridge::ComputerSurfaceBinding::issue(),
         }
     }
 
@@ -54,15 +56,19 @@ impl ReleaseGateBackend {
 #[async_trait]
 impl ComputerBackend for ReleaseGateBackend {
     fn capabilities(&self) -> ComputerCapabilities {
-        ComputerCapabilities {
-            backend_id: "release_gate_fixture".into(),
-            observe: true,
-            semantic_actions: true,
-            text_entry: true,
-            key_chords: false,
-            // Deliberately false: the first safe slice has no host pointer path.
-            pointer_fallback: false,
-        }
+        ComputerCapabilities::from_proof(
+            grokptah_agent_bridge::ComputerCapabilityProof::ForegroundSemantic {
+                backend_id: "release_gate_fixture".into(),
+                observe: true,
+                semantic_actions: true,
+                text_entry: true,
+            },
+        )
+        .expect("release-gate fixture is foreground-semantic")
+    }
+
+    fn surface_binding(&self) -> grokptah_agent_bridge::ComputerSurfaceBinding {
+        self.surface.clone()
     }
 
     async fn observe(
@@ -113,6 +119,7 @@ impl ComputerBackend for ReleaseGateBackend {
             }],
             elements_truncated: false,
             sensitivity: Sensitivity::None,
+            authority: Default::default(),
         };
         observation.validate(limits)?;
         Ok(observation)
@@ -144,17 +151,17 @@ impl ComputerBackend for ReleaseGateBackend {
 
 fn grant(run: &ComputerRun, classes: BTreeSet<ActionClass>) -> ActionGrant {
     let issued_at = Utc::now() - Duration::seconds(1);
-    ActionGrant {
-        grant_id: format!("grant-{}", run.run_id),
-        run_id: run.run_id.clone(),
-        target: run.target.clone(),
-        action_classes: classes,
-        issued_by: GrantIssuer::LocalUser,
+    ActionGrant::for_run(
+        run,
+        classes,
         issued_at,
-        expires_at: issued_at + Duration::minutes(1),
-        uses_remaining: Some(4),
-        revoked_at: None,
-    }
+        issued_at + Duration::minutes(1),
+        Some(4),
+    )
+}
+
+fn caller(run: &ComputerRun) -> ComputerPrincipal {
+    run.effective_principal()
 }
 
 fn fixture(
@@ -182,6 +189,7 @@ fn fixture(
     let run = service
         .authorize(
             "release-gate-authorize",
+            &caller(&run),
             &run.run_id,
             run.version,
             grant(&run, classes),
@@ -207,7 +215,12 @@ async fn observed_instruction_text_cannot_expand_action_scope() {
         BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
     );
     let observation = service
-        .observe("release-gate-observe-injection", &run.run_id, run.version)
+        .observe(
+            "release-gate-observe-injection",
+            &caller(&run),
+            &run.run_id,
+            run.version,
+        )
         .await
         .expect("hostile content is still observable data");
     assert!(observation.elements[0]
@@ -219,6 +232,7 @@ async fn observed_instruction_text_cannot_expand_action_scope() {
     let error = service
         .act(
             "release-gate-invented-action",
+            &caller(&run),
             &run.run_id,
             current.version,
             &observation.observation_id,
@@ -239,7 +253,12 @@ async fn sensitive_observation_fails_before_model_visible_action_or_dispatch() {
         BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
     );
     let error = service
-        .observe("release-gate-observe-sensitive", &run.run_id, run.version)
+        .observe(
+            "release-gate-observe-sensitive",
+            &caller(&run),
+            &run.run_id,
+            run.version,
+        )
         .await
         .expect_err("secure element must be denied");
     assert_eq!(error.code, ComputerErrorCode::SensitiveSurface);
@@ -260,7 +279,12 @@ async fn observation_target_drift_fails_inflight_run_and_revokes_authority() {
         BTreeSet::from([ActionClass::Semantic]),
     );
     let error = service
-        .observe("release-gate-observe-drift", &run.run_id, run.version)
+        .observe(
+            "release-gate-observe-drift",
+            &caller(&run),
+            &run.run_id,
+            run.version,
+        )
         .await
         .expect_err("a changed target must not be committed");
     assert_eq!(error.code, ComputerErrorCode::TargetChanged);
@@ -280,13 +304,19 @@ async fn permission_revocation_fails_action_and_clears_authority() {
         BTreeSet::from([ActionClass::TextEntry]),
     );
     let observation = service
-        .observe("release-gate-observe-revoked", &run.run_id, run.version)
+        .observe(
+            "release-gate-observe-revoked",
+            &caller(&run),
+            &run.run_id,
+            run.version,
+        )
         .await
         .expect("observation");
     let current = service.get_run(&run.run_id).unwrap().unwrap();
     let error = service
         .act(
             "release-gate-act-revoked",
+            &caller(&run),
             &run.run_id,
             current.version,
             &observation.observation_id,
@@ -315,13 +345,19 @@ async fn unsupported_pointer_fallback_never_reaches_backend() {
         BTreeSet::from([ActionClass::PointerFallback]),
     );
     let observation = service
-        .observe("release-gate-observe-pointer", &run.run_id, run.version)
+        .observe(
+            "release-gate-observe-pointer",
+            &caller(&run),
+            &run.run_id,
+            run.version,
+        )
         .await
         .expect("observation");
     let current = service.get_run(&run.run_id).unwrap().unwrap();
     let error = service
         .act(
             "release-gate-act-pointer",
+            &caller(&run),
             &run.run_id,
             current.version,
             &observation.observation_id,
@@ -388,4 +424,57 @@ fn mcp_surface_exposes_only_the_scoped_computer_read_tools() {
     for forbidden in FORBIDDEN_TOOLS {
         assert!(!CONTROL_TOOLS.contains(forbidden));
     }
+}
+
+#[test]
+fn rust_computer_use_sources_remain_free_of_global_input_injection() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/computer_use");
+    let forbidden = [
+        "CGEventCreate",
+        "CGEventPost",
+        "CGWarpMouseCursorPosition",
+        "CGAssociateMouseAndMouseCursorPosition",
+        "NSPasteboard",
+        "NSAppleScript",
+        "kCGKeyboardEventKeycode",
+    ];
+    for name in [
+        "macos_native.rs",
+        "macos_observation.rs",
+        "macos_native_shim.m",
+        "types.rs",
+        "policy.rs",
+        "service.rs",
+        "simulator.rs",
+        "store.rs",
+        "platform.rs",
+    ] {
+        let src = std::fs::read_to_string(root.join(name))
+            .unwrap_or_else(|error| panic!("read {}: {error}", root.join(name).display()));
+        let production = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        for needle in forbidden {
+            assert!(
+                !production.contains(needle),
+                "{} production source must not contain {needle}",
+                name
+            );
+        }
+    }
+}
+
+#[test]
+fn macos_and_default_simulator_advertise_foreground_semantic_only() {
+    let simulator = grokptah_agent_bridge::SimulatorBackend::new();
+    let caps = simulator.capabilities();
+    assert_eq!(
+        caps.tier,
+        grokptah_agent_bridge::ComputerCapabilityTier::ForegroundSemantic
+    );
+    assert!(!caps.pointer_fallback);
+    assert!(!caps.key_chords);
+    assert!(!caps.proof.isolated_input_is_dispatchable());
+    assert_ne!(
+        caps.backend_id,
+        grokptah_agent_bridge::SIMULATOR_ISOLATED_BACKEND_ID
+    );
 }

@@ -14,10 +14,10 @@ use super::platform::{
     ComputerPlatformStatus, ComputerTargetCandidate,
 };
 use super::types::{
-    ActionOutcome, ComputerAction, ComputerBackend, ComputerCapabilities, ComputerError,
-    ComputerErrorCode, ComputerObservation, ComputerResult, ComputerTarget, ComputerUseLimits,
-    EvidenceRef, ObservationGeometry, SemanticAction, SemanticElement, Sensitivity,
-    MAX_LABEL_BYTES,
+    ActionOutcome, ComputerAction, ComputerBackend, ComputerCapabilities, ComputerCapabilityProof,
+    ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult, ComputerSurfaceBinding,
+    ComputerTarget, ComputerUseLimits, EvidenceRef, ObservationGeometry, SemanticAction,
+    SemanticElement, Sensitivity, MACOS_NATIVE_BACKEND_ID, MAX_LABEL_BYTES,
 };
 
 const MAX_TARGET_CANDIDATES: usize = 128;
@@ -232,7 +232,7 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
                 selection_token: selection_token.clone(),
                 target: ComputerTarget {
                     app_id: raw.identity.bundle_id.clone(),
-                    window_id: format!("macos-window-{}", raw.identity.window_id),
+                    window_id: format!("window-{}", Uuid::new_v4()),
                     generation,
                     display_name: bounded_required(&raw.application_name, MAX_LABEL_BYTES)
                         .unwrap_or_else(|| "Application".into()),
@@ -287,6 +287,7 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
             source: self.source.clone(),
             target: lease.candidate.target,
             native_identity: lease.native.identity,
+            surface: ComputerSurfaceBinding::issue(),
             sequence: Mutex::new(0),
             observation_gate: tokio::sync::Mutex::new(()),
             last_capture_started: Mutex::new(None),
@@ -311,6 +312,7 @@ struct MacOsObservationBackend {
     source: Arc<dyn MacObservationSource>,
     target: ComputerTarget,
     native_identity: MacNativeIdentity,
+    surface: ComputerSurfaceBinding,
     sequence: Mutex<u64>,
     observation_gate: tokio::sync::Mutex<()>,
     last_capture_started: Mutex<Option<Instant>>,
@@ -323,14 +325,17 @@ struct MacOsObservationBackend {
 #[async_trait]
 impl ComputerBackend for MacOsObservationBackend {
     fn capabilities(&self) -> ComputerCapabilities {
-        ComputerCapabilities {
-            backend_id: "macos_accessibility_semantic".into(),
+        ComputerCapabilities::from_proof(ComputerCapabilityProof::ForegroundSemantic {
+            backend_id: MACOS_NATIVE_BACKEND_ID.into(),
             observe: true,
             semantic_actions: true,
             text_entry: true,
-            key_chords: false,
-            pointer_fallback: false,
-        }
+        })
+        .expect("macOS native proof is foreground-semantic")
+    }
+
+    fn surface_binding(&self) -> ComputerSurfaceBinding {
+        self.surface.clone()
     }
 
     async fn observe(
@@ -717,6 +722,7 @@ fn normalize_observation(
         elements,
         elements_truncated,
         sensitivity: raw.sensitivity,
+        authority: Default::default(),
     };
     if let Err(error) = observation.validate(limits) {
         evidence.remove_run(run_id);
@@ -1545,6 +1551,22 @@ mod tests {
         assert!(backend.capabilities().semantic_actions);
         assert!(backend.capabilities().text_entry);
         assert!(!backend.capabilities().pointer_fallback);
+        assert!(!backend.capabilities().key_chords);
+        assert_eq!(
+            backend.capabilities().tier,
+            crate::computer_use::ComputerCapabilityTier::ForegroundSemantic
+        );
+        assert!(!backend
+            .capabilities()
+            .proof
+            .isolated_input_is_dispatchable());
+        assert!(!backend.surface_binding().surface_id.contains("window"));
+        assert!(!candidate.target.window_id.contains("macos-window-"));
+        assert!(!candidate
+            .target
+            .window_id
+            .chars()
+            .all(|ch| ch.is_ascii_digit()));
     }
 
     #[tokio::test]

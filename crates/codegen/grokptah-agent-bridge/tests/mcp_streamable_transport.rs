@@ -15,8 +15,8 @@ use grokptah_agent_bridge::orchestration::{
 use grokptah_agent_bridge::{
     canonical_workspace_string, set_grokptah_home_override, start_control_from_env,
     start_control_server, start_control_server_with, ActionClass, ActionGrant, AgentHost,
-    ComputerRun, ComputerUseService, ControlServerLimits, GrantIssuer, HostConfig,
-    McpControlClient, SessionKind, SimulatorBackend, CONTROL_TOOLS,
+    ComputerRun, ComputerUseService, ControlServerLimits, HostConfig, McpControlClient,
+    SessionKind, SimulatorBackend, CONTROL_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -2190,17 +2190,13 @@ fn desktop_computer_use_shares_the_host_store() {
 
 fn smoke_grant(run: &ComputerRun) -> ActionGrant {
     let now = Utc::now();
-    ActionGrant {
-        grant_id: format!("smoke-grant-{}", run.run_id),
-        run_id: run.run_id.clone(),
-        target: run.target.clone(),
-        action_classes: std::collections::BTreeSet::from([ActionClass::Semantic]),
-        issued_by: GrantIssuer::LocalUser,
-        issued_at: now,
-        expires_at: now + ChronoDuration::minutes(10),
-        uses_remaining: None,
-        revoked_at: None,
-    }
+    ActionGrant::for_run(
+        run,
+        std::collections::BTreeSet::from([ActionClass::Semantic]),
+        now,
+        now + ChronoDuration::minutes(10),
+        None,
+    )
 }
 
 /// Live desktop-equivalent proof for the read-only Computer Run tools: the
@@ -2252,13 +2248,19 @@ async fn live_computer_reads_node_smoke() {
     let run_a = computer
         .authorize(
             "smoke-grant-a",
+            &run_a.effective_principal(),
             &run_a.run_id,
             run_a.version,
             smoke_grant(&run_a),
         )
         .unwrap();
     computer
-        .observe("smoke-observe-a", &run_a.run_id, run_a.version)
+        .observe(
+            "smoke-observe-a",
+            &run_a.effective_principal(),
+            &run_a.run_id,
+            run_a.version,
+        )
         .await
         .unwrap();
 
@@ -2287,6 +2289,7 @@ async fn live_computer_reads_node_smoke() {
     let run_c = computer
         .authorize(
             "smoke-grant-c",
+            &run_c.effective_principal(),
             &run_c.run_id,
             run_c.version,
             smoke_grant(&run_c),
@@ -2296,7 +2299,12 @@ async fn live_computer_reads_node_smoke() {
     let mut spins = 0u32;
     loop {
         computer
-            .observe(&format!("smoke-observe-c-{spins}"), &run_c.run_id, version)
+            .observe(
+                &format!("smoke-observe-c-{spins}"),
+                &run_c.effective_principal(),
+                &run_c.run_id,
+                version,
+            )
             .await
             .unwrap();
         let current = computer.get_run(&run_c.run_id).unwrap().unwrap();

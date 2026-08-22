@@ -151,7 +151,7 @@ mod tests {
     use crate::computer_use::project_run_at;
     use crate::computer_use::types::{
         ActionClass, ActionGrant, ActionOutcome, ComputerObservation, ComputerRunState,
-        ComputerTarget, ComputerUseLimits, GrantIssuer, ObservationGeometry,
+        ComputerTarget, ComputerUseLimits, ObservationGeometry,
     };
     use crate::computer_use::Sensitivity;
 
@@ -317,18 +317,15 @@ mod tests {
             elements: Vec::new(),
             elements_truncated: false,
             sensitivity: Sensitivity::None,
+            authority: Default::default(),
         });
-        run.grant = Some(ActionGrant {
-            grant_id: "grant-clock".into(),
-            run_id: run.run_id.clone(),
-            target: run.target.clone(),
-            action_classes: BTreeSet::from([ActionClass::Semantic]),
-            issued_by: GrantIssuer::LocalUser,
-            issued_at: now - Duration::minutes(1),
-            expires_at: now + Duration::minutes(1),
-            uses_remaining: Some(2),
-            revoked_at: None,
-        });
+        run.grant = Some(ActionGrant::for_run(
+            &run,
+            BTreeSet::from([ActionClass::Semantic]),
+            now - Duration::minutes(1),
+            now + Duration::minutes(1),
+            Some(2),
+        ));
         run.last_outcome = Some(ActionOutcome::bounded("set demo name", Some(true)));
         store.save_run(&run).unwrap();
 

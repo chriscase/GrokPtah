@@ -5,10 +5,10 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
-    ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
-    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
+    ComputerAgentProposal, ComputerCapabilities, ComputerCapabilityProof, ComputerError,
+    ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerPrincipal, ComputerRun, ComputerRunProjection,
+    ComputerRunState, ComputerTargetCandidate, ComputerUseLimits, ComputerUseService,
     MacOsObservationPlatform, SemanticAction, SimulatorBackend,
 };
 use serde::Serialize;
@@ -214,35 +214,42 @@ impl DesktopComputerUse {
             )
             .map_err(|error| error.to_string())?;
         let now = Utc::now();
-        let grant = ActionGrant {
-            grant_id: Uuid::new_v4().to_string(),
-            run_id: run.run_id.clone(),
-            target: run.target.clone(),
-            action_classes: BTreeSet::from([ActionClass::Semantic]),
-            issued_by: GrantIssuer::LocalUser,
-            issued_at: now,
-            expires_at: now + Duration::minutes(5),
-            uses_remaining: Some(1),
-            revoked_at: None,
+        let grant = ActionGrant::for_run(
+            &run,
+            BTreeSet::from([ActionClass::Semantic]),
+            now,
+            now + Duration::minutes(5),
+            Some(1),
+        );
+        let caller = ComputerPrincipal::local_operator(owner_session_id);
+        let run = match service.authorize(
+            &Uuid::new_v4().to_string(),
+            &caller,
+            &run.run_id,
+            run.version,
+            grant,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                let _ = service
+                    .cancel(&Uuid::new_v4().to_string(), &caller, &run.run_id)
+                    .await;
+                return Err(error.to_string());
+            }
         };
-        let run =
-            match service.authorize(&Uuid::new_v4().to_string(), &run.run_id, run.version, grant) {
-                Ok(run) => run,
-                Err(error) => {
-                    let _ = service
-                        .cancel(&Uuid::new_v4().to_string(), &run.run_id)
-                        .await;
-                    return Err(error.to_string());
-                }
-            };
         let observed = service
-            .observe(&Uuid::new_v4().to_string(), &run.run_id, run.version)
+            .observe(
+                &Uuid::new_v4().to_string(),
+                &caller,
+                &run.run_id,
+                run.version,
+            )
             .await;
         let preview = match observed {
             Ok(observation) => {
                 let image_data_url = match observation.screenshot.as_ref() {
                     Some(evidence) => service
-                        .read_current_evidence(&run.run_id, &evidence.asset_id)
+                        .read_current_evidence(&caller, &run.run_id, &evidence.asset_id)
                         .await
                         .map(|bytes| {
                             Some(format!(
@@ -261,7 +268,7 @@ impl DesktopComputerUse {
             Err(error) => Err(error.to_string()),
         };
         let cleanup = service
-            .cancel(&Uuid::new_v4().to_string(), &run.run_id)
+            .cancel(&Uuid::new_v4().to_string(), &caller, &run.run_id)
             .await
             .map_err(|error| error.to_string());
         match (preview, cleanup) {
@@ -347,7 +354,11 @@ impl DesktopComputerUse {
             .map_err(|error| error.to_string())?;
         if let Err(error) = authorize_and_observe_once(&service, &run).await {
             let _ = service
-                .cancel(&Uuid::new_v4().to_string(), &run.run_id)
+                .cancel(
+                    &Uuid::new_v4().to_string(),
+                    &ComputerPrincipal::local_operator(owner_session_id),
+                    &run.run_id,
+                )
                 .await;
             return Err(error.to_string());
         }
@@ -411,7 +422,11 @@ impl DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)?;
         if let Err(error) = authorize_and_observe_once(&service, &run).await {
             let _ = service
-                .cancel(&Uuid::new_v4().to_string(), &run.run_id)
+                .cancel(
+                    &Uuid::new_v4().to_string(),
+                    &ComputerPrincipal::local_operator(owner_session_id),
+                    &run.run_id,
+                )
                 .await;
             self.native_services
                 .lock()
@@ -581,7 +596,12 @@ impl DesktopComputerUse {
                     return Err("The Computer Run changed while the model was responding".into());
                 }
                 service
-                    .complete(&Uuid::new_v4().to_string(), run_id, expected_version)
+                    .complete(
+                        &Uuid::new_v4().to_string(),
+                        &ComputerPrincipal::local_operator(owner_session_id),
+                        run_id,
+                        expected_version,
+                    )
                     .map_err(|error| error.to_string())?;
                 Ok(ComputerAgentProposalResult {
                     snapshot: self.cockpit_snapshot(owner_session_id)?,
@@ -622,6 +642,7 @@ impl DesktopComputerUse {
         let result = service
             .act(
                 request_id,
+                &ComputerPrincipal::local_operator(owner_session_id),
                 &pending.run_id,
                 pending.run_version,
                 &pending.observation_id,
@@ -650,7 +671,12 @@ impl DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
         service
-            .pause(&Uuid::new_v4().to_string(), run_id, expected_version)
+            .pause(
+                &Uuid::new_v4().to_string(),
+                &ComputerPrincipal::local_operator(owner_session_id),
+                run_id,
+                expected_version,
+            )
             .await
             .map_err(|error| error.to_string())?;
         self.cockpit_snapshot(owner_session_id)
@@ -665,7 +691,12 @@ impl DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
         service
-            .take_over(&Uuid::new_v4().to_string(), run_id, expected_version)
+            .take_over(
+                &Uuid::new_v4().to_string(),
+                &ComputerPrincipal::local_operator(owner_session_id),
+                run_id,
+                expected_version,
+            )
             .await
             .map_err(|error| error.to_string())?;
         self.cockpit_snapshot(owner_session_id)
@@ -679,7 +710,11 @@ impl DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
         service
-            .cancel(&Uuid::new_v4().to_string(), run_id)
+            .cancel(
+                &Uuid::new_v4().to_string(),
+                &ComputerPrincipal::local_operator(owner_session_id),
+                run_id,
+            )
             .await
             .map_err(|error| error.to_string())?;
         self.cockpit_snapshot(owner_session_id)
@@ -802,14 +837,7 @@ fn owned_run(
 }
 
 fn unavailable_native_capabilities() -> ComputerCapabilities {
-    ComputerCapabilities {
-        backend_id: "macos_interrupted".into(),
-        observe: false,
-        semantic_actions: false,
-        text_entry: false,
-        key_chords: false,
-        pointer_fallback: false,
-    }
+    ComputerCapabilities::unproven(grokptah_agent_bridge::MACOS_INTERRUPTED_BACKEND_ID)
 }
 
 fn approval_copy(
@@ -852,20 +880,28 @@ async fn authorize_and_observe_once(
     run: &ComputerRun,
 ) -> Result<ComputerObservation, ComputerError> {
     let now = Utc::now();
-    let grant = ActionGrant {
-        grant_id: Uuid::new_v4().to_string(),
-        run_id: run.run_id.clone(),
-        target: run.target.clone(),
-        action_classes: BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
-        issued_by: GrantIssuer::LocalUser,
-        issued_at: now,
-        expires_at: now + Duration::minutes(2),
-        uses_remaining: Some(1),
-        revoked_at: None,
-    };
-    let run = service.authorize(&Uuid::new_v4().to_string(), &run.run_id, run.version, grant)?;
+    let grant = ActionGrant::for_run(
+        run,
+        BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        now,
+        now + Duration::minutes(2),
+        Some(1),
+    );
+    let caller = run.effective_principal();
+    let run = service.authorize(
+        &Uuid::new_v4().to_string(),
+        &caller,
+        &run.run_id,
+        run.version,
+        grant,
+    )?;
     service
-        .observe(&Uuid::new_v4().to_string(), &run.run_id, run.version)
+        .observe(
+            &Uuid::new_v4().to_string(),
+            &caller,
+            &run.run_id,
+            run.version,
+        )
         .await
 }
 
@@ -912,19 +948,23 @@ mod tests {
     struct NativeTestBackend {
         target: ComputerTarget,
         actions: Arc<AtomicUsize>,
+        surface: grokptah_agent_bridge::ComputerSurfaceBinding,
     }
 
     #[async_trait]
     impl ComputerBackend for NativeTestBackend {
         fn capabilities(&self) -> ComputerCapabilities {
-            ComputerCapabilities {
+            ComputerCapabilities::from_proof(ComputerCapabilityProof::ForegroundSemantic {
                 backend_id: "native_test_backend".into(),
                 observe: true,
                 semantic_actions: true,
                 text_entry: true,
-                key_chords: false,
-                pointer_fallback: false,
-            }
+            })
+            .expect("native test backend is foreground-semantic")
+        }
+
+        fn surface_binding(&self) -> grokptah_agent_bridge::ComputerSurfaceBinding {
+            self.surface.clone()
         }
 
         async fn observe(
@@ -966,6 +1006,7 @@ mod tests {
                 }],
                 elements_truncated: false,
                 sensitivity: Sensitivity::None,
+                authority: Default::default(),
             };
             observation.validate(limits)?;
             Ok(observation)
@@ -1044,6 +1085,7 @@ mod tests {
             Ok(Arc::new(NativeTestBackend {
                 target: self.candidate.target.clone(),
                 actions: self.actions.clone(),
+                surface: grokptah_agent_bridge::ComputerSurfaceBinding::issue(),
             }))
         }
     }
