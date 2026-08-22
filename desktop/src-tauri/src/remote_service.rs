@@ -4,9 +4,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
-    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient,
-    RoutineRecord, RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState,
-    RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
+    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RoutineRecord,
+    RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState, RuntimeConnectionState,
+    RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -528,7 +528,12 @@ impl RemoteServiceState {
         };
         Ok(Some(
             client
-                .fire_routine(session_id, workspace, routine_id, Uuid::new_v4().to_string())
+                .fire_routine(
+                    session_id,
+                    workspace,
+                    routine_id,
+                    Uuid::new_v4().to_string(),
+                )
                 .await?,
         ))
     }
@@ -1693,10 +1698,39 @@ mod tests {
         assert!(status.last_error.is_some());
     }
 
+    struct IsolatedOffline {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl IsolatedOffline {
+        fn enable() -> Self {
+            let previous = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
+            // SAFETY: this test holds `home_override_serial` and restores the
+            // previous value on drop. Isolated reconnect must not capture a
+            // live provider route.
+            unsafe {
+                std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for IsolatedOffline {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("GROKPTAH_AGENT_OFFLINE", value),
+                    None => std::env::remove_var("GROKPTAH_AGENT_OFFLINE"),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn remote_client_authenticates_and_reconnects_after_service_restart() {
         let _guard = home_override_serial();
+        let _offline = IsolatedOffline::enable();
         let home = tempdir().unwrap();
         set_grokptah_home_override(Some(home.path().join(".grokptah")));
         let workspace = tempdir().unwrap();

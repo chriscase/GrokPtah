@@ -12292,7 +12292,6 @@ mod tests {
             )
             .await
             .unwrap();
-        drop(offline);
         assert_eq!(replay, response);
         assert_eq!(host.list_session_runs(session_id).unwrap().len(), run_count);
         let receipt = store
@@ -12370,6 +12369,7 @@ mod tests {
             host.export_transcript(session_id).unwrap(),
             transcript_before
         );
+        drop(offline);
     }
 
     #[test]
