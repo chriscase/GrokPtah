@@ -649,12 +649,6 @@ async fn always_on_bootstrap(
     always_on_scan(&submitted)?;
     let setup_run = required_string(&submitted, &["runId"])?;
     wait_run_terminal(client, &session_id, workspace, &setup_run).await?;
-    probe.transition(
-        EntityKind::Run,
-        DurableStateCode::Absent,
-        DurableStateCode::Completed,
-        Some(&setup_run),
-    );
     let agents = probe
         .call(
             client,
@@ -777,32 +771,31 @@ async fn always_on_home_a(probe: &mut ProbeBuilder<'_>) -> Result<(), Diagnostic
                 break;
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     if !saw_queued {
         return Err(DiagnosticCode::Timeout);
     }
     wait_plan_succeeded(&mut client, &session_id, &workspace, &plan_id).await?;
-    if saw_queued {
-        let listed = probe
-            .call(
-                &mut client,
-                TraceOperationCode::ListWork,
-                "ptah_list_work",
-                json!({ "session_id": session_id, "workspace": workspace }),
-                vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace],
-            )
-            .await?;
-        let work = work_for_step(&listed, "step-a");
-        if work.first().and_then(|item| item["state"].as_str()) == Some("succeeded") {
-            probe.transition(
-                EntityKind::Work,
-                DurableStateCode::Queued,
-                DurableStateCode::Succeeded,
-                work.first().and_then(|item| item["workId"].as_str()),
-            );
-        }
+    let listed = probe
+        .call(
+            &mut client,
+            TraceOperationCode::ListWork,
+            "ptah_list_work",
+            json!({ "session_id": session_id, "workspace": workspace }),
+            vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace],
+        )
+        .await?;
+    let work = work_for_step(&listed, "step-a");
+    if work.first().and_then(|item| item["state"].as_str()) != Some("succeeded") {
+        return Err(DiagnosticCode::StateTransitionMismatch);
     }
+    probe.transition(
+        EntityKind::Work,
+        DurableStateCode::Queued,
+        DurableStateCode::Succeeded,
+        work.first().and_then(|item| item["workId"].as_str()),
+    );
 
     let plan = probe
         .call(
@@ -912,6 +905,30 @@ async fn always_on_home_a(probe: &mut ProbeBuilder<'_>) -> Result<(), Diagnostic
         }
         if service.provider.count_for(step) != 1 {
             return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        if step == "step-a" {
+            let run_id = attempts[0]["linkedRunIds"]
+                .as_array()
+                .and_then(|ids| ids.first())
+                .and_then(Value::as_str)
+                .ok_or(DiagnosticCode::McpResultMalformed)?;
+            let campaign_run = runs["runs"]
+                .as_array()
+                .ok_or(DiagnosticCode::McpResultMalformed)?
+                .iter()
+                .find(|run| run["runId"].as_str() == Some(run_id))
+                .ok_or(DiagnosticCode::StateTransitionMismatch)?;
+            if campaign_run["state"].as_str() != Some("completed")
+                || campaign_run["purpose"].as_str() == Some("manager_proposal")
+            {
+                return Err(DiagnosticCode::StateTransitionMismatch);
+            }
+            probe.transition(
+                EntityKind::Run,
+                DurableStateCode::Absent,
+                DurableStateCode::Completed,
+                Some(run_id),
+            );
         }
     }
     probe.observe_action(ProbeAction::InspectWorkAttempts);
@@ -1164,6 +1181,7 @@ async fn always_on_home_b(probe: &mut ProbeBuilder<'_>) -> Result<(), Diagnostic
     always_on_scan(&recovered_plan)?;
     probe.restart.durable_read_recovered = true;
     probe.observe_oracle(OracleCode::DurableReadAfterRestart);
+    wait_run_terminal(&mut client, &session_id, &workspace, &run_id).await?;
     let recovered_run = probe
         .call(
             &mut client,
@@ -1192,6 +1210,37 @@ async fn always_on_home_b(probe: &mut ProbeBuilder<'_>) -> Result<(), Diagnostic
         DurableStateCode::Interrupted,
         Some(&run_id),
     );
+    let work_deadline = Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if Instant::now() >= work_deadline {
+            return Err(DiagnosticCode::Timeout);
+        }
+        match client
+            .call_tool(
+                "ptah_get_work",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "work_id": work_id
+                }),
+            )
+            .await
+        {
+            Ok(result) if !result.is_error => {
+                always_on_scan(&result.structured)?;
+                match result.structured["work"]["state"].as_str() {
+                    Some("queued") => {
+                        probe.restart.implicit_execution_observed = true;
+                        return Err(DiagnosticCode::RestartRecoveryFailed);
+                    }
+                    Some("failed") => break,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let recovered_work = probe
         .call(
             &mut client,
@@ -1210,10 +1259,6 @@ async fn always_on_home_b(probe: &mut ProbeBuilder<'_>) -> Result<(), Diagnostic
         )
         .await?;
     always_on_scan(&recovered_work)?;
-    if recovered_work["work"]["state"].as_str() == Some("queued") {
-        probe.restart.implicit_execution_observed = true;
-        return Err(DiagnosticCode::RestartRecoveryFailed);
-    }
     if recovered_work["work"]["state"].as_str() != Some("failed") {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
@@ -1223,7 +1268,7 @@ async fn always_on_home_b(probe: &mut ProbeBuilder<'_>) -> Result<(), Diagnostic
         DurableStateCode::Failed,
         Some(&work_id),
     );
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
     if service.provider.count_for("step-a") != 1 {
         probe.restart.implicit_execution_observed = true;
         return Err(DiagnosticCode::RestartRecoveryFailed);

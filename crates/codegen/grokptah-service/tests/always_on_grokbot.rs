@@ -956,14 +956,15 @@ async fn inflight_barrier_sigkill_does_not_resend() {
     assert_eq!(run["state"].as_str(), Some("interrupted"));
     assert_eq!(pending_usage(&run), 0);
     assert_eq!(campaign.provider.count_for(&campaign.fixture.step_first), 1);
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    assert_eq!(campaign.provider.count_for(&campaign.fixture.step_first), 1);
-    record_assertion("in-flight-post-count-1-no-resend");
-    let detailed = get_work(
+    let detailed = poll_json(
         &mut campaign.client,
-        campaign.session,
-        &campaign.workspace,
-        &work_id,
+        "ptah_get_work",
+        json!({
+            "session_id": campaign.session,
+            "workspace": &campaign.workspace,
+            "work_id": work_id
+        }),
+        |value| value["work"]["state"].as_str() == Some("failed"),
     )
     .await;
     assert_ne!(
@@ -971,17 +972,19 @@ async fn inflight_barrier_sigkill_does_not_resend() {
         Some("queued"),
         "interrupted native work must not be implicitly queued: {detailed}"
     );
-    assert_eq!(
-        detailed["work"]["state"].as_str(),
-        Some("failed"),
-        "retry-ineligible interrupted work must fail: {detailed}"
-    );
     let attempts = detailed["attempts"].as_array().expect("attempts");
     assert_eq!(attempts.len(), 1);
     assert_eq!(
         attempts[0]["linkedRunIds"].as_array().map(|a| a.len()),
         Some(1)
     );
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        campaign.provider.count_for(&campaign.fixture.step_first),
+        1,
+        "post-restart supervisor cycles must not produce a hidden second POST"
+    );
+    record_assertion("in-flight-post-count-1-no-resend");
     let work = list_work(&mut campaign.client, campaign.session, &campaign.workspace).await;
     assert_eq!(work_for_step(&work, &campaign.fixture.step_first).len(), 1);
     let runs = list_runs(&mut campaign.client, campaign.session, &campaign.workspace).await;
@@ -997,6 +1000,20 @@ async fn inflight_barrier_sigkill_does_not_resend() {
     assert_eq!(after.run_id, before.run_id);
     assert_eq!(after.intent_id, before.intent_id);
     assert_eq!(after.attempt_id, before.attempt_id);
+    assert_eq!(
+        runs_array(&runs)
+            .iter()
+            .filter(|run| run["runId"].as_str() == after.run_id.as_deref())
+            .count(),
+        1
+    );
+    assert_eq!(
+        intents_array(&intents)
+            .iter()
+            .filter(|intent| intent["workId"].as_str() == Some(work_id.as_str()))
+            .count(),
+        1
+    );
     let _ = plan_id;
     campaign.scan();
 }
@@ -1015,11 +1032,14 @@ async fn fail_closed_invalid_directive_cancel_auth_workspace_provider_faults() {
             "session_id": invalid.session,
             "workspace": &invalid.workspace
         }),
-        |value| !work_for_step(value, "__manager_decision__").is_empty(),
+        |value| {
+            work_for_step(value, "__manager_decision__")
+                .first()
+                .and_then(|item| item["state"].as_str())
+                .is_some_and(|state| matches!(state, "succeeded" | "failed"))
+        },
     )
     .await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
     let (plan, work, _, _) = observe(
         &mut invalid.client,
         invalid.session,
@@ -1069,6 +1089,17 @@ async fn fail_closed_invalid_directive_cancel_auth_workspace_provider_faults() {
             "workspace": &cancel.workspace,
             "run_id": run_id
         }),
+    )
+    .await;
+    let _ = poll_json(
+        &mut cancel.client,
+        "ptah_get_run",
+        json!({
+            "session_id": cancel.session,
+            "workspace": &cancel.workspace,
+            "run_id": run_id
+        }),
+        |value| value["state"].as_str() == Some("cancelled"),
     )
     .await;
     cancel.service.kill_sigkill();
@@ -1146,6 +1177,13 @@ async fn fail_closed_invalid_directive_cancel_auth_workspace_provider_faults() {
             is_terminal_run(run["state"].as_str()),
             "{semantic} must end bounded terminal: {run}"
         );
+        if semantic == "fail-slow" {
+            assert_ne!(
+                run["state"].as_str(),
+                Some("completed"),
+                "slow provider must not complete inside the 3s run bound: {run}"
+            );
+        }
         record_assertion(assertion);
     }
     faults.scan();
@@ -1256,6 +1294,20 @@ async fn soak_one_bounded_cycle() {
     .await;
     assert_eq!(run["state"].as_str(), Some("interrupted"));
     assert_eq!(pending_usage(&run), 0);
+    assert_eq!(campaign.provider.count_for(&campaign.fixture.step_first), 1);
+    let work_id = before.work_id.clone().expect("soak work id");
+    let _ = poll_json(
+        &mut campaign.client,
+        "ptah_get_work",
+        json!({
+            "session_id": campaign.session,
+            "workspace": &campaign.workspace,
+            "work_id": work_id
+        }),
+        |value| value["work"]["state"].as_str() == Some("failed"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(campaign.provider.count_for(&campaign.fixture.step_first), 1);
     record_assertion("soak-bounded-cycle-rate");
     record_assertion("soak-per-cycle-exact-identities");

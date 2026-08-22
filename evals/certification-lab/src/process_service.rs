@@ -474,7 +474,23 @@ fn rewrite_directive(content: &str) -> String {
             "objective": "GROKBOT_SUCCESS complete the replacement step",
             "priority": 0,
             "dependencies": ["step-a"],
-            "assignedAgentId": agent_id
+            "assignedAgentId": agent_id,
+            "policy": {
+                "bounds": {
+                    "maxPromptBytes": 16384,
+                    "maxRounds": 4,
+                    "maxDurationMs": 45000,
+                    "maxTotalTokens": 8000
+                },
+                "retry": {
+                    "maxAttempts": 1,
+                    "retryFailed": false,
+                    "retryExpired": false,
+                    "backoffMs": 0
+                },
+                "requiresApproval": false,
+                "maxConcurrentAttempts": 1
+            }
         }]
     });
     value.to_string()
