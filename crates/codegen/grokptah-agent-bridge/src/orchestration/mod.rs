@@ -28,11 +28,12 @@ pub use continuation::{
 };
 pub use managed::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
-    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedFinalizationRecord,
-    ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause, ManagedWorkMode,
-    NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
-    MANAGED_FINALIZATION_SCHEMA_VERSION, MANAGED_TRUNCATION_MARKER,
+    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedAdmissionCapacity,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome,
+    ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
+    ManagedWorkMode, NativeExecutorStatus, ProviderRoute, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
+    MANAGED_EXECUTION_SCHEMA_VERSION, MANAGED_FINALIZATION_SCHEMA_VERSION,
+    MANAGED_TRUNCATION_MARKER, MAX_CONCURRENT_PROVIDER_RUNS, PROVIDER_CEILING_EXHAUSTED,
 };
 pub use manager::{
     parse_manager_directive, ManagerCoordinationMode, ManagerCoordinationPolicy,

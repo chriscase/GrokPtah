@@ -72,6 +72,48 @@ and control one home. They do not become extra dispatch owners. The exclusive
 orchestration store lock (`ADR-002`) prevents two processes from opening the
 same home.
 
+## Provider route and admission accounting
+
+Every native admission records the exact provider identity it routes to
+**before** the provider task is spawned. `ManagedExecutionIntent.providerRoute`
+carries `{providerId, modelId}` alongside the opaque `modelSelectionKey`, so
+the durable record names the route rather than an encoded string.
+
+The route is re-derived from the captured AgentSpec revision and must match
+the identity that spec already recorded. A spec whose selection key cannot be
+re-parsed, or whose parsed identity disagrees with its stored
+`provider_id`/`model_id`, is **not admitted**: the tick counts
+`skippedUnroutable` and leaves Work `queued`. There is no default-provider
+fallback.
+
+`MAX_CONCURRENT_PROVIDER_RUNS` (4) is a finite host ceiling on live intents
+that share one provider identity. It is provider-neutral — the same number
+applies to every provider — and it is independent of the per-Agent
+`maxConcurrentRuns` (1-4). Because several Agents may share one provider, the
+per-Agent ceiling alone leaves a provider unbounded across the home; this
+ceiling bounds it. Both ceilings are counted from durable intents in
+`claiming`, `admitted`, `parked`, and `resolving`, so duplicate supervisor
+ticks and process restarts re-derive the same admission answer. A declined
+admission counts `skippedProviderCapacity`, distinct from
+`skippedIneligible`, and never mutates the Work item.
+
+Legacy intents written before this record deserialize with no
+`providerRoute`. Their provider identity is re-derived from the captured
+selection key for accounting, so an upgrade cannot silently under-count live
+capacity.
+
+`ptah_list_execution_intents` reports the ceiling and a per-provider live
+count under `providerAdmission`. The ceiling is home-wide, but
+`liveInScopeByProvider` counts only the intents that caller is already
+authorized to read: a Lane never learns another Lane's provider identities or
+counts. Home-wide pressure is visible without that disclosure through
+`ptah_get_capacity`'s `health.nativeExecutor`, which reports
+`skippedProviderCapacity`, `skippedUnroutable`, and
+`maxConcurrentProviderRuns`.
+
+The ceiling is a host constant in this slice. Making it operator-configurable
+per deployment is deliberate follow-up work, not part of this contract.
+
 ## Work-attempt / Run relationship
 
 A `ManagedExecutionIntent` binds, under the store lock:
@@ -281,6 +323,8 @@ explicit enable/disable; it does not own dispatch.
 
 ## Follow-up
 
+- Operator-configurable per-provider admission ceiling
+- Provider-scoped quota accounting beyond concurrency (tokens, spend, windows)
 - Manager-agent planning and decomposition
 - Message-triggered routine activation
 - Per-principal worker credentials bound to one Agent
