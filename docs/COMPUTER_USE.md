@@ -4,7 +4,10 @@ Computer Use is tracked by epic [#267](https://github.com/chriscase/GrokPtah/iss
 It is intentionally staged. The safety kernel, simulator, desktop operator cockpit, native macOS
 observation, and the first semantic macOS action slice share one bounded run contract. A selected,
 qualified model can now propose one semantic action at a time, but only the local cockpit can stage
-and approve it. Computer Use is not exposed as an MCP mutation surface.
+and approve it. Computer Use MCP **mutations** are unsupported
+([#271](https://github.com/chriscase/GrokPtah/issues/271)); read-only MCP tools
+are on main (see below). Status of each Computer Use tier is
+[`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md).
 
 ## Safety boundary
 
@@ -139,9 +142,15 @@ restart replay, hidden or secure fields, authorization widening, clickjacking, a
 races.
 
 The foundation prevents a backend call unless a valid local grant, exact target, fresh current
-observation, allowed action class, and run budget all agree. It does not yet solve native consent,
-screen redaction, prompt-injection interpretation, or platform-specific target attestation; those
-remain release blockers in later issues.
+observation, allowed action class, and run budget all agree. Native macOS consent, redaction, and
+target attestation **exist in code** on this slice ([`COMPUTER_USE_MACOS.md`](COMPUTER_USE_MACOS.md));
+[#269](https://github.com/chriscase/GrokPtah/issues/269),
+[#270](https://github.com/chriscase/GrokPtah/issues/270), and
+[#274](https://github.com/chriscase/GrokPtah/issues/274) remain **open** as
+packaged-identity and hardware **release gates**, not as proof the adapter is
+absent. Prompt-injection **interpretation** (treating observed content as
+instructions) remains fail-closed at the proposal schema; it is not “solved”
+as a model-alignment problem.
 
 ### Model proposal boundary
 
@@ -185,17 +194,32 @@ non-prompting status, explicit per-permission requests, bounded window discovery
 review, one-use approvals, evidence and audit visibility, pause, Stop, Take over, and
 non-cancelling steering. Native actions are limited to activation, Accessibility invoke, visible
 value entry, selection, and semantic scrolling. Every mutation requires a fresh observation and
-local one-use grant. It does not register a model action or MCP tool. See
+local one-use grant. The **native adapter** does not register an MCP or model
+dispatch tool. The **cockpit** may ask a qualified model for one typed proposal
+(`computer_agent.rs`); that proposal still requires the same local one-use
+approval as a manual action. See
 [Computer Use on macOS](COMPUTER_USE_MACOS.md) for the privacy boundary, dispatch attestation,
 packaging requirements, and disposable smoke fixture.
 
+This semantic slice **deliberately avoids raw global mouse injection**.
+Foreground `activate target` (frontmost app / focused AX window) is **not equivalent to non-disruptive isolated Computer Use**. Background-safe semantic
+([#287](https://github.com/chriscase/GrokPtah/issues/287)) and an isolated
+visual backend ([#288](https://github.com/chriscase/GrokPtah/issues/288)) are
+Planned. An agent-owned interaction surface
+([#286](https://github.com/chriscase/GrokPtah/issues/286)) is Planned.
+
 ## Deliberate non-goals of the current desktop slice
 
-- no Windows UI Automation or Linux portal adapter;
-- no unattended or continuously autonomous model invocation;
-- no MCP Computer Run surface;
-- no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell endpoint;
-- no background or unattended grant;
+These non-goals apply to **Computer Use**. They do not deny the shipped
+manager supervisor or native executor, which are different surfaces
+([`MANAGER_PLANS.md`](MANAGER_PLANS.md),
+[`NATIVE_AGENT_EXECUTION.md`](NATIVE_AGENT_EXECUTION.md)).
+
+- no Windows UI Automation or Linux portal adapter ([#275](https://github.com/chriscase/GrokPtah/issues/275), [#276](https://github.com/chriscase/GrokPtah/issues/276));
+- no unattended or continuously autonomous **Computer Use** model invocation;
+- no MCP Computer Run **mutations**, grants, evidence bytes, or screenshots (read-only tools `ptah_list_computer_runs`, `ptah_get_computer_run`, `ptah_get_computer_run_events`, and `ptah_get_computer_capacity` are on main; [#271](https://github.com/chriscase/GrokPtah/issues/271) remains **open** for mutations);
+- no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell Computer Use endpoint;
+- no background-safe semantic grant ([#287](https://github.com/chriscase/GrokPtah/issues/287)) and no isolated visual backend ([#288](https://github.com/chriscase/GrokPtah/issues/288));
 - no cross-application target switching inside a run.
 
 ## Delivery sequence
@@ -206,8 +230,16 @@ packaging requirements, and disposable smoke fixture.
 | macOS observe | #269 | Consented target selection, capture, redaction, semantic snapshots |
 | Operator UX and model proof | #273, #272 | Visible runs/approvals and capability-based provider conformance |
 | macOS act | #270 | Bounded semantic actions with immediate local takeover |
-| Coordinator interoperability | #271 | Scoped Computer Run MCP tools and event visibility |
+| Coordinator reads | #271 (reads on main; issue **open** for mutations) | Read-only Computer Run MCP tools and event visibility; mutations stay disabled |
+| Coordinator mutations | #271 | Still unsupported until the shared event/approval contract and threat review complete |
 | Other platforms | #275, #276 | Windows and Linux adapters behind the same contract |
+
+[#268](https://github.com/chriscase/GrokPtah/issues/268) is closed. [#269](https://github.com/chriscase/GrokPtah/issues/269),
+[#270](https://github.com/chriscase/GrokPtah/issues/270), [#272](https://github.com/chriscase/GrokPtah/issues/272),
+[#273](https://github.com/chriscase/GrokPtah/issues/273), and [#274](https://github.com/chriscase/GrokPtah/issues/274)
+remain **open** even where substantial code exists. Epic
+[#267](https://github.com/chriscase/GrokPtah/issues/267) checkboxes are stale
+relative to child **state**.
 
 Provider support is capability-based, not model-name based. OpenAI-compatible corporate gateways
 can be evaluated in tiers: coding tools, observation interpretation, semantic action selection,
