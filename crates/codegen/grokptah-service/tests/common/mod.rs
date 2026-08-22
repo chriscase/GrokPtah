@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod shared_black_box_v1;
+
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};

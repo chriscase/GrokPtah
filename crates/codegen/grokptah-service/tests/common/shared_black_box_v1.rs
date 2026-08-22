@@ -1,0 +1,2300 @@
+//! Versioned public-boundary desktop/hosted black-box parity fixture v1.
+//!
+//! After launch, the scenario may interact only through `McpControlClient`
+//! initialize/list_tools/call_tool/close_session. Launch handles are retained
+//! only for stop/restart. Fake transport (MockGateway) is inspected for
+//! request cardinalities without exposing secrets.
+
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, MutexGuard};
+use std::time::Duration;
+
+use grokptah_agent_bridge::{
+    home_override_serial, set_grokptah_home_override, start_control_server, AgentHost,
+    AgentHostHandle, ControlServerHandle, HostConfig, McpControlClient, McpRemoteError,
+    OrchestrationConfig, OrchestrationService, RuntimeHome, WorkspaceAllowlist,
+};
+use grokptah_service::{start_service, ServiceConfig, ServiceHandle};
+use grokptah_test_gateway::{MockGateway, RecordedRequest, Response, Step};
+use serde_json::{json, Map, Value};
+use tempfile::TempDir;
+
+const FIXTURE_SCHEMA: &str = "grokptah.shared-black-box-fixture.v1";
+const RESULT_SCHEMA: &str = "grokptah.shared-black-box-result.v1";
+const SCENARIO_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/shared-black-box/v1/scenario.json"
+);
+const PR_GOLDEN_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/shared-black-box/v1/expected-pr352-4bd2081b.json"
+);
+const MAIN_GOLDEN_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/shared-black-box/v1/expected-main-67e29bd3.json"
+);
+
+/// Serializes process-global environment mutations for this test binary.
+pub struct ProcessEnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous: Vec<(OsString, Option<OsString>)>,
+}
+
+impl ProcessEnvGuard {
+    pub fn new() -> Self {
+        Self {
+            _lock: home_override_serial(),
+            previous: Vec::new(),
+        }
+    }
+
+    pub fn set(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
+        let key = key.as_ref();
+        self.remember(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    pub fn remove(&mut self, key: impl AsRef<OsStr>) {
+        let key = key.as_ref();
+        self.remember(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn remember(&mut self, key: &OsStr) {
+        self.previous
+            .push((key.to_os_string(), std::env::var_os(key)));
+    }
+}
+
+impl Drop for ProcessEnvGuard {
+    fn drop(&mut self) {
+        set_grokptah_home_override(None);
+        for (key, previous) in self.previous.drain(..).rev() {
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EndpointKind {
+    Desktop,
+    Hosted,
+}
+
+impl EndpointKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::Hosted => "hosted",
+        }
+    }
+}
+
+enum EndpointInner {
+    Desktop {
+        server: ControlServerHandle,
+        host: AgentHostHandle,
+    },
+    Hosted {
+        handle: ServiceHandle,
+    },
+}
+
+struct Launched {
+    mcp: McpControlClient,
+    inner: EndpointInner,
+    addr: String,
+}
+
+struct Scenario {
+    raw: Value,
+}
+
+impl Scenario {
+    fn load() -> Self {
+        let text = std::fs::read_to_string(SCENARIO_PATH).expect("read scenario.json");
+        let raw: Value = serde_json::from_str(&text).expect("parse scenario.json");
+        assert_eq!(
+            raw["schema"].as_str(),
+            Some(FIXTURE_SCHEMA),
+            "scenario schema"
+        );
+        Self { raw }
+    }
+
+    fn str(&self, path: &[&str]) -> String {
+        let mut cur = &self.raw;
+        for key in path {
+            cur = &cur[*key];
+        }
+        cur.as_str()
+            .unwrap_or_else(|| panic!("scenario string {}", path.join(".")))
+            .to_string()
+    }
+
+    fn u64(&self, path: &[&str]) -> u64 {
+        let mut cur = &self.raw;
+        for key in path {
+            cur = &cur[*key];
+        }
+        cur.as_u64()
+            .unwrap_or_else(|| panic!("scenario u64 {}", path.join(".")))
+    }
+
+    fn bool(&self, path: &[&str]) -> bool {
+        let mut cur = &self.raw;
+        for key in path {
+            cur = &cur[*key];
+        }
+        cur.as_bool()
+            .unwrap_or_else(|| panic!("scenario bool {}", path.join(".")))
+    }
+
+    fn request_id(&self, name: &str) -> String {
+        self.str(&["requestIds", name])
+    }
+
+    fn max_ticks(&self) -> u64 {
+        self.u64(&["bounds", "maxLogicalTicks"])
+    }
+
+    fn yields(&self) -> u64 {
+        self.u64(&["bounds", "maxYieldsPerWait"])
+    }
+
+    fn native_ms(&self) -> u64 {
+        self.u64(&["bounds", "advanceNativeMs"])
+    }
+
+    fn supervisor_ms(&self) -> u64 {
+        self.u64(&["bounds", "advanceSupervisorMs"])
+    }
+}
+
+struct RedactionHit {
+    path: String,
+    reason: String,
+}
+
+struct ScanCtx<'a> {
+    bearer: &'a str,
+    api_key: &'a str,
+    gateway: &'a str,
+    gateway_authority: &'a str,
+    marker: &'a str,
+    hits: Vec<RedactionHit>,
+}
+
+struct IdCanon {
+    map: BTreeMap<String, String>,
+}
+
+struct GatewayScript {
+    proposal_turns: Arc<AtomicUsize>,
+    restart_objective: String,
+    proposal_path: String,
+}
+
+pub async fn run_fixture() {
+    let scenario = Scenario::load();
+    let mut env = ProcessEnvGuard::new();
+    env.remove("GROKPTAH_AGENT_OFFLINE");
+    env.remove("XAI_API_KEY");
+    env.remove("OPENAI_API_KEY");
+    env.remove("OPENAI_BASE_URL");
+    env.remove("OPENAI_API_BASE");
+
+    let desktop = run_v1(EndpointKind::Desktop, &scenario, &mut env).await;
+    let hosted = run_v1(EndpointKind::Hosted, &scenario, &mut env).await;
+
+    let desktop_json = serde_json::to_string(&desktop).expect("serialize desktop result");
+    let hosted_json = serde_json::to_string(&hosted).expect("serialize hosted result");
+    let desktop_hash = sha256_hex(desktop_json.as_bytes());
+    let hosted_hash = sha256_hex(hosted_json.as_bytes());
+    eprintln!("shared-black-box-v1 desktop normalized sha256={desktop_hash}");
+    eprintln!("shared-black-box-v1 hosted normalized sha256={hosted_hash}");
+    assert_eq!(
+        desktop_json, hosted_json,
+        "desktop and hosted normalized JSON must be byte-equal\ndesktop={desktop_hash}\nhosted={hosted_hash}"
+    );
+
+    write_or_compare_goldens(&desktop);
+}
+
+async fn run_v1(kind: EndpointKind, scenario: &Scenario, env: &mut ProcessEnvGuard) -> Value {
+    let home_dir = TempDir::new().expect("temp home");
+    let workspace_dir = TempDir::new().expect("temp workspace");
+    let home = dunce::canonicalize(home_dir.path()).expect("canonicalize home");
+    let workspace = dunce::canonicalize(workspace_dir.path()).expect("canonicalize workspace");
+    env.set("HOME", &home);
+    env.set("GROK_HOME", home.join(".grok"));
+    std::fs::create_dir_all(home.join(".grok")).expect("grok home");
+    set_grokptah_home_override(Some(home.clone()));
+
+    let token = scenario.str(&["secrets", "mcpBearer"]);
+    let api_key = scenario.str(&["secrets", "apiKey"]);
+    let marker = scenario.str(&["secrets", "privateGatewayMarker"]);
+    let restart_objective = scenario.str(&["objectives", "restartCut"]);
+    let proposal_path = scenario.str(&["proposal", "targetRelativePath"]);
+
+    let script = GatewayScript {
+        proposal_turns: Arc::new(AtomicUsize::new(0)),
+        restart_objective: restart_objective.clone(),
+        proposal_path: proposal_path.clone(),
+    };
+    let gateway = start_scripted_gateway(script).await;
+    let gateway_base = gateway.base_url().to_string();
+    let gateway_authority = gateway_base
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    env.set("GROKPTAH_API_BASE", format!("{gateway_base}/v1"));
+    env.set("GROKPTAH_API_KEY", &api_key);
+
+    let mut hits = Vec::new();
+    let mut launched = start_endpoint(kind, &home, &workspace, &token).await;
+    initialize_mcp(&mut launched).await;
+    let (result, mut launched) = {
+        let mut scan = |value: &Value, origin: &str| {
+            scan_raw(
+                value,
+                origin,
+                &token,
+                &api_key,
+                &gateway_base,
+                &gateway_authority,
+                &marker,
+                &mut hits,
+            );
+        };
+        drive_six_phases(
+            kind,
+            scenario,
+            launched,
+            &home,
+            &workspace,
+            &token,
+            &gateway,
+            &proposal_path,
+            &mut scan,
+        )
+        .await
+    };
+
+    let _ = launched.mcp.close_session().await;
+    stop_endpoint(launched).await;
+    drop(gateway);
+    drop(home_dir);
+    drop(workspace_dir);
+
+    if !hits.is_empty() {
+        let report = hits
+            .iter()
+            .map(|hit| format!("{}: {}", hit.path, hit.reason))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "{} redaction scan failed; paths only (values omitted):\n{report}",
+            kind.as_str()
+        );
+    }
+
+    let mut normalized =
+        normalize_result(result, &workspace, &home, &gateway_base, &gateway_authority);
+    normalized["schema"] = json!(RESULT_SCHEMA);
+    normalized["version"] = json!("v1");
+    scan_normalized_secrets(
+        &normalized,
+        &token,
+        &api_key,
+        &gateway_base,
+        &gateway_authority,
+        &marker,
+    );
+    normalized
+}
+
+async fn start_scripted_gateway(script: GatewayScript) -> MockGateway {
+    let proposal_turns = script.proposal_turns.clone();
+    let restart_objective = script.restart_objective.clone();
+    let proposal_path = script.proposal_path.clone();
+    MockGateway::start_routed(move |request: &RecordedRequest| {
+        if request.path.starts_with("/v1/models") {
+            return Step::respond(Response::json_ok(&json!({
+                "object": "list",
+                "data": [{
+                    "id": "grok-build",
+                    "object": "model",
+                    "created": 1,
+                    "owned_by": "xai"
+                }]
+            })));
+        }
+        let body = request.body_str();
+        if body.contains(&restart_objective) {
+            return Step::stall();
+        }
+        if body.contains("Return exactly this JSON envelope") {
+            let turn = proposal_turns.fetch_add(1, Ordering::SeqCst);
+            if turn == 0 {
+                let arguments = json!({
+                    "path": proposal_path,
+                    "content": "must never be written\n"
+                })
+                .to_string();
+                return Step::respond(Response::json_ok(&json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "proposal-write",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": arguments
+                                }
+                            }]
+                        }
+                    }],
+                    "usage": {
+                        "prompt_tokens": 6,
+                        "completion_tokens": 4,
+                        "total_tokens": 10
+                    }
+                })));
+            }
+            let denied = body.contains("DENIED by deny rule")
+                && body.contains("write_file")
+                && body.contains("proposal-write");
+            if !denied {
+                return Step::respond(Response::json(
+                    500,
+                    &json!({"error": {"type": "fixture", "message": "proposal second turn without host denial"}}),
+                ));
+            }
+            let Some(envelope) = extract_json_object_after(&body, "Envelope: ") else {
+                return Step::respond(Response::json(
+                    500,
+                    &json!({"error": {"type": "fixture", "message": "missing exact envelope substring"}}),
+                ));
+            };
+            return Step::respond(Response::json_ok(&json!({
+                "choices": [{
+                    "message": { "content": envelope }
+                }],
+                "usage": {
+                    "prompt_tokens": 6,
+                    "completion_tokens": 4,
+                    "total_tokens": 10
+                }
+            })));
+        }
+        Step::respond(Response::json_ok(&json!({
+            "choices": [{
+                "message": { "content": "native route snapshot verified" }
+            }],
+            "usage": {
+                "prompt_tokens": 6,
+                "completion_tokens": 4,
+                "total_tokens": 10
+            }
+        })))
+    })
+    .await
+}
+
+async fn start_endpoint(
+    kind: EndpointKind,
+    home: &Path,
+    workspace: &Path,
+    token: &str,
+) -> Launched {
+    match kind {
+        EndpointKind::Desktop => {
+            let runtime_home = RuntimeHome::from_path(home).expect("desktop runtime home");
+            let host = AgentHost::create_with_runtime_home(HostConfig::default(), runtime_home);
+            host.start().expect("start desktop agent host");
+            let store = host
+                .ensure_orchestration_store()
+                .expect("desktop orchestration store");
+            let orch = OrchestrationService::new(
+                host.clone(),
+                host.event_bus(),
+                store,
+                OrchestrationConfig {
+                    bearer_token: token.to_string(),
+                    allowlist: WorkspaceAllowlist::new([workspace.to_path_buf()]),
+                    max_concurrent_runs: 4,
+                    bounds: Default::default(),
+                },
+            );
+            let server = start_control_server(orch, 0)
+                .await
+                .expect("desktop control server");
+            let addr = format!("http://{}", server.addr);
+            let mcp = McpControlClient::new(&addr, token);
+            Launched {
+                mcp,
+                inner: EndpointInner::Desktop { server, host },
+                addr,
+            }
+        }
+        EndpointKind::Hosted => {
+            let config = ServiceConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                token,
+                vec![workspace.to_path_buf()],
+                false,
+                4,
+                Duration::from_secs(120),
+            )
+            .expect("hosted service config")
+            .with_runtime_home(home)
+            .expect("hosted runtime home");
+            let handle = start_service(config).await.expect("start hosted service");
+            let addr = format!("http://{}", handle.addr);
+            let mcp = McpControlClient::new(&addr, token);
+            Launched {
+                mcp,
+                inner: EndpointInner::Hosted { handle },
+                addr,
+            }
+        }
+    }
+}
+
+async fn stop_endpoint(launched: Launched) {
+    match launched.inner {
+        EndpointInner::Desktop { server, host } => {
+            server.stop_and_wait().await;
+            let _ = host.stop();
+        }
+        EndpointInner::Hosted { handle } => {
+            handle.stop_and_wait().await;
+        }
+    }
+}
+
+async fn restart_endpoint(
+    kind: EndpointKind,
+    launched: Launched,
+    home: &Path,
+    workspace: &Path,
+    token: &str,
+) -> Launched {
+    let _ = launched.mcp;
+    stop_endpoint(launched).await;
+    yield_budget(16).await;
+    let mut next = start_endpoint(kind, home, workspace, token).await;
+    initialize_mcp(&mut next).await;
+    next
+}
+
+async fn initialize_mcp(launched: &mut Launched) {
+    yield_budget(16).await;
+    launched
+        .mcp
+        .initialize()
+        .await
+        .unwrap_or_else(|error| panic!("initialize {}: {error}", launched.addr));
+}
+
+type ScanFn<'a> = dyn FnMut(&Value, &str) + 'a;
+
+async fn drive_six_phases(
+    kind: EndpointKind,
+    scenario: &Scenario,
+    mut launched: Launched,
+    home: &Path,
+    workspace: &Path,
+    token: &str,
+    gateway: &MockGateway,
+    proposal_file: &str,
+    scan: &mut ScanFn<'_>,
+) -> (Value, Launched) {
+    let workspace_text = workspace.display().to_string();
+
+    // Phase 1: discovery / readiness through tools/list and optional readiness.
+    let tools = launched.mcp.list_tools().await.expect("tools/list");
+    let advertised: Vec<String> = {
+        let mut names = tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let tools_value = json!(advertised
+        .iter()
+        .map(|name| json!(name))
+        .collect::<Vec<_>>());
+    scan(&tools_value, "tools/list");
+
+    let capacity0 = call_ok(&mut launched.mcp, "ptah_get_capacity", json!({}), scan).await;
+    let readiness_supported = advertised
+        .iter()
+        .any(|name| name == "ptah_get_native_coding_readiness");
+    let readiness = if readiness_supported {
+        call_ok(
+            &mut launched.mcp,
+            "ptah_get_native_coding_readiness",
+            json!({}),
+            scan,
+        )
+        .await
+    } else {
+        json!({ "support": "absent" })
+    };
+
+    // Phase 2: native admission / quota.
+    let session = call_ok(
+        &mut launched.mcp,
+        "ptah_create_session",
+        json!({
+            "workspace": workspace_text,
+            "title": scenario.str(&["identities", "sessionTitle"])
+        }),
+        scan,
+    )
+    .await;
+    let session_id = session["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    let bootstrap = call_ok(
+        &mut launched.mcp,
+        "ptah_submit_task",
+        json!({
+            "request_id": scenario.request_id("bootstrapSubmit"),
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "prompt": scenario.str(&["objectives", "bootstrap"])
+        }),
+        scan,
+    )
+    .await;
+    let bootstrap_run = bootstrap["runId"]
+        .as_str()
+        .expect("bootstrap runId")
+        .to_string();
+    wait_run_terminal(
+        &mut launched,
+        scenario,
+        &session_id,
+        &workspace_text,
+        &bootstrap_run,
+        scan,
+    )
+    .await;
+
+    let agents = call_ok(
+        &mut launched.mcp,
+        "ptah_list_persistent_agents",
+        json!({}),
+        scan,
+    )
+    .await;
+    let agent_id = agents["agents"]
+        .as_array()
+        .expect("agents")
+        .iter()
+        .find_map(|agent| agent["agentId"].as_str())
+        .expect("bootstrap agent")
+        .to_string();
+
+    let managed_policy = json!({
+        "enabled": scenario.bool(&["policies", "managed", "enabled"]),
+        "maxConcurrentRuns": scenario.u64(&["policies", "managed", "maxConcurrentRuns"]),
+        "retryEligible": scenario.bool(&["policies", "managed", "retryEligible"]),
+        "requiresApprovalBeforeExecution": scenario.bool(&["policies", "managed", "requiresApprovalBeforeExecution"]),
+        "allowedWorkKinds": scenario.raw["policies"]["managed"]["allowedWorkKinds"].clone(),
+        "bounds": {
+            "maxPromptBytes": 65536,
+            "maxRounds": 8,
+            "maxDurationMs": 300000,
+            "maxTotalTokens": scenario.u64(&["policies", "managed", "maxTotalTokens"])
+        }
+    });
+    call_ok(
+        &mut launched.mcp,
+        "ptah_set_managed_execution",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "agent_id": agent_id,
+            "policy": managed_policy
+        }),
+        scan,
+    )
+    .await;
+    let managed = call_ok(
+        &mut launched.mcp,
+        "ptah_get_managed_execution",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "agent_id": agent_id
+        }),
+        scan,
+    )
+    .await;
+
+    let native_objective = scenario.str(&["objectives", "ordinaryNative"]);
+    let native_work = call_ok(
+        &mut launched.mcp,
+        "ptah_create_work",
+        json!({
+            "request_id": scenario.request_id("createNativeWork"),
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "kind": "native",
+            "objective": native_objective,
+            "policy": work_policy(&scenario.raw["policies"]["ordinaryNativeWork"])
+        }),
+        scan,
+    )
+    .await;
+    let native_work_id = native_work["work"]["workId"]
+        .as_str()
+        .expect("native workId")
+        .to_string();
+    call_ok(
+        &mut launched.mcp,
+        "ptah_assign_work",
+        json!({
+            "request_id": scenario.request_id("assignNativeWork"),
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "work_id": native_work_id,
+            "assigned_agent_id": agent_id
+        }),
+        scan,
+    )
+    .await;
+
+    wait_work_state(
+        &mut launched,
+        scenario,
+        &session_id,
+        &workspace_text,
+        &native_work_id,
+        &["succeeded"],
+        Duration::from_millis(scenario.native_ms()),
+        scan,
+    )
+    .await;
+
+    let native_get = call_ok(
+        &mut launched.mcp,
+        "ptah_get_work",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "work_id": native_work_id
+        }),
+        scan,
+    )
+    .await;
+    let listed_work = call_ok(
+        &mut launched.mcp,
+        "ptah_list_work",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text
+        }),
+        scan,
+    )
+    .await;
+    let intents = call_ok(
+        &mut launched.mcp,
+        "ptah_list_execution_intents",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text
+        }),
+        scan,
+    )
+    .await;
+    let runs = call_ok(
+        &mut launched.mcp,
+        "ptah_list_runs",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text
+        }),
+        scan,
+    )
+    .await;
+    let native_run_id = run_id_for_work(&runs, &intents, &native_work_id);
+    let native_get_run = call_ok(
+        &mut launched.mcp,
+        "ptah_get_run",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "run_id": native_run_id
+        }),
+        scan,
+    )
+    .await;
+    let capacity_native = call_ok(&mut launched.mcp, "ptah_get_capacity", json!({}), scan).await;
+    let native_http = chat_requests_containing(gateway, &native_objective);
+
+    // Phase 3: autonomous manager plan.
+    let plan = call_ok(
+        &mut launched.mcp,
+        "ptah_create_manager_plan",
+        json!({
+            "request_id": scenario.request_id("createManagerPlan"),
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "manager_agent_id": agent_id,
+            "objective": scenario.str(&["objectives", "managerGoal"]),
+            "steps": [{
+                "stepId": "inspect",
+                "kind": "native",
+                "objective": "shared-black-box-v1-manager-child"
+            }],
+            "max_in_flight": scenario.u64(&["policies", "managerPlan", "maxInFlight"]),
+            "autonomous": scenario.bool(&["policies", "managerPlan", "autonomous"])
+        }),
+        scan,
+    )
+    .await;
+    let plan_id = plan["plan"]["planId"].as_str().expect("planId").to_string();
+    yield_budget(scenario.yields() as usize).await;
+    let child_id = wait_child_work(
+        &mut launched,
+        scenario,
+        &session_id,
+        &workspace_text,
+        &plan_id,
+        scan,
+    )
+    .await;
+    call_ok(
+        &mut launched.mcp,
+        "ptah_cancel_work",
+        json!({
+            "request_id": scenario.request_id("cancelChildWork"),
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "work_id": child_id,
+            "reason": "drive needs_replan for proposal-only decision"
+        }),
+        scan,
+    )
+    .await;
+
+    let decision_work_id = wait_decision_work(
+        &mut launched,
+        scenario,
+        &session_id,
+        &workspace_text,
+        &plan_id,
+        scan,
+    )
+    .await;
+    wait_work_state(
+        &mut launched,
+        scenario,
+        &session_id,
+        &workspace_text,
+        &decision_work_id,
+        &["succeeded", "failed", "cancelled"],
+        Duration::from_millis(scenario.native_ms()),
+        scan,
+    )
+    .await;
+
+    let plans = call_ok(
+        &mut launched.mcp,
+        "ptah_list_manager_plans",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text
+        }),
+        scan,
+    )
+    .await;
+    let got_plan = call_ok(
+        &mut launched.mcp,
+        "ptah_get_manager_plan",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "plan_id": plan_id
+        }),
+        scan,
+    )
+    .await;
+    let decision_get = call_ok(
+        &mut launched.mcp,
+        "ptah_get_work",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "work_id": decision_work_id
+        }),
+        scan,
+    )
+    .await;
+    let intents_manager = call_ok(
+        &mut launched.mcp,
+        "ptah_list_execution_intents",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text
+        }),
+        scan,
+    )
+    .await;
+    let runs_manager = call_ok(
+        &mut launched.mcp,
+        "ptah_list_runs",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text
+        }),
+        scan,
+    )
+    .await;
+    let decision_run_id = run_id_for_work(&runs_manager, &intents_manager, &decision_work_id);
+    let decision_run = call_ok(
+        &mut launched.mcp,
+        "ptah_get_run",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "run_id": decision_run_id
+        }),
+        scan,
+    )
+    .await;
+
+    // Phase 4: proposal-only malicious write_file.
+    let proposal_abs = workspace.join(proposal_file);
+    let file_exists = proposal_abs.exists();
+    let proposal_http = chat_requests_containing(gateway, "Return exactly this JSON envelope");
+    let denial_http = gateway
+        .requests()
+        .iter()
+        .filter(|request| {
+            let body = request.body_str();
+            body.contains("Return exactly this JSON envelope")
+                && body.contains("DENIED by deny rule")
+        })
+        .count();
+    let permission_requests = decision_run
+        .pointer("/aggregates/permissionsRequested")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let permission_grants = decision_run
+        .pointer("/aggregates/permissionsGranted")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+
+    // Phase 5: restart cut.
+    let restart_objective = scenario.str(&["objectives", "restartCut"]);
+    let restart_work = call_ok(
+        &mut launched.mcp,
+        "ptah_create_work",
+        json!({
+            "request_id": scenario.request_id("createRestartWork"),
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "kind": "native",
+            "objective": restart_objective,
+            "policy": work_policy(&scenario.raw["policies"]["restartWork"])
+        }),
+        scan,
+    )
+    .await;
+    let restart_work_id = restart_work["work"]["workId"]
+        .as_str()
+        .expect("restart workId")
+        .to_string();
+    call_ok(
+        &mut launched.mcp,
+        "ptah_assign_work",
+        json!({
+            "request_id": scenario.request_id("assignRestartWork"),
+            "session_id": session_id,
+            "workspace": workspace_text,
+            "work_id": restart_work_id,
+            "assigned_agent_id": agent_id
+        }),
+        scan,
+    )
+    .await;
+    let saw_restart_send = wait_until(
+        scenario,
+        Duration::from_millis(scenario.native_ms()),
+        || async { chat_requests_containing(gateway, &restart_objective) >= 1 },
+    )
+    .await;
+    assert!(
+        saw_restart_send,
+        "{} restart-cut did not reach the fake provider before stop",
+        kind.as_str()
+    );
+    let restart_http_before = chat_requests_containing(gateway, &restart_objective);
+    assert_eq!(
+        restart_http_before,
+        1,
+        "{} restart-cut must send exactly one provider request before stop",
+        kind.as_str()
+    );
+
+    launched = restart_endpoint(kind, launched, home, workspace, token).await;
+    for _ in 0..8 {
+        tokio::time::advance(Duration::from_millis(scenario.native_ms())).await;
+        yield_budget(scenario.yields() as usize).await;
+    }
+
+    let post1 = restart_observation(
+        &mut launched,
+        &session_id,
+        &workspace_text,
+        &restart_work_id,
+        gateway,
+        &restart_objective,
+        scan,
+    )
+    .await;
+    let post2 = restart_observation(
+        &mut launched,
+        &session_id,
+        &workspace_text,
+        &restart_work_id,
+        gateway,
+        &restart_objective,
+        scan,
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_string(&post1).unwrap(),
+        serde_json::to_string(&post2).unwrap(),
+        "{} post-restart observations must converge",
+        kind.as_str()
+    );
+
+    let restart_http_after = chat_requests_containing(gateway, &restart_objective);
+    let listed_after = call_ok(
+        &mut launched.mcp,
+        "ptah_list_work",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace_text
+        }),
+        scan,
+    )
+    .await;
+
+    let native_intent_count = count_matching(&intents["intents"], "workId", &native_work_id);
+    let native_run_count = count_runs_for_work(&runs, &intents, &native_work_id);
+    let native_attempts = native_get["attempts"].as_array().map(Vec::len).unwrap_or(0);
+    let native_provider_attempts = native_get_run
+        .pointer("/providerExecution/attemptCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let native_quota_state = native_get_run
+        .pointer("/providerExecution/quota/state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let native_tokens = native_get_run
+        .pointer("/providerExecution/attempts/0/usage/total_tokens")
+        .or_else(|| native_get_run.pointer("/providerExecution/attempts/0/usage/totalTokens"))
+        .or_else(|| native_get_run.pointer("/aggregates/usage/totalTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let native_requests = native_get_run
+        .pointer("/providerExecution/attempts/0/usage/requests")
+        .or_else(|| native_get_run.pointer("/aggregates/usage/requests"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let decision_intent_count =
+        count_matching(&intents_manager["intents"], "workId", &decision_work_id);
+    let restart_work_row = find_work(&listed_after, &restart_work_id);
+    let restart_attempt_count = post1["work"]["attempts"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+    let restart_intent_count =
+        count_matching(&post1["intents"]["intents"], "workId", &restart_work_id);
+    let restart_run_count =
+        count_runs_for_work(&post1["runs"], &post1["intents"], &restart_work_id);
+    let restart_send = post1["getRun"]
+        .pointer("/providerExecution/attempts/0/sendCertainty")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let restart_retry = post1["getRun"]
+        .pointer("/providerExecution/attempts/0/retryClass")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let restart_quota = post1["getRun"]
+        .pointer("/providerExecution/quota/state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let restart_queued = restart_work_row.get("state").and_then(Value::as_str) == Some("queued");
+
+    let ordinary = json!({
+        "work": 1,
+        "intent": native_intent_count,
+        "run": native_run_count,
+        "providerAttempt": native_provider_attempts,
+        "workAttempts": native_attempts,
+        "http": native_http,
+        "quotaState": native_quota_state,
+        "requests": native_requests,
+        "tokens": native_tokens
+    });
+    let manager_obs = json!({
+        "decisionWork": 1,
+        "decisionIntent": decision_intent_count,
+        "decisionRun": if decision_run_id.is_empty() { 0 } else { 1 },
+        "proposalHttp": proposal_http,
+        "hostDenials": denial_http,
+        "permissionRequests": permission_requests,
+        "permissionGrants": permission_grants,
+        "filesystemWrites": if file_exists { 1 } else { 0 },
+        "purpose": decision_run["purpose"]
+    });
+    let restart_obs = json!({
+        "work": 1,
+        "workAttempt": restart_attempt_count,
+        "intent": restart_intent_count,
+        "run": restart_run_count,
+        "providerAttempt": post1["getRun"].pointer("/providerExecution/attemptCount").cloned().unwrap_or(json!(0)),
+        "sendCertainty": restart_send,
+        "retryClass": restart_retry,
+        "quotaState": restart_quota,
+        "http": restart_http_after,
+        "queued": restart_queued
+    });
+
+    assert_eq!(ordinary["intent"], 1, "ordinary native intent cardinality");
+    assert_eq!(ordinary["run"], 1, "ordinary native run cardinality");
+    assert_eq!(ordinary["http"], 1, "ordinary native HTTP cardinality");
+    assert_eq!(ordinary["tokens"], 10, "ordinary native tokens");
+    assert_eq!(ordinary["requests"], 1, "ordinary native request usage");
+    assert_eq!(ordinary["quotaState"], "consumed", "ordinary native quota");
+    assert_eq!(manager_obs["proposalHttp"], 2, "proposal HTTP cardinality");
+    assert_eq!(manager_obs["hostDenials"], 1, "host denial cardinality");
+    assert_eq!(manager_obs["permissionRequests"], 0);
+    assert_eq!(manager_obs["permissionGrants"], 0);
+    assert_eq!(
+        manager_obs["filesystemWrites"], 0,
+        "proposal-escape.txt must be absent"
+    );
+    assert_eq!(manager_obs["purpose"], "manager_proposal");
+    assert_eq!(restart_obs["workAttempt"], 1, "restart work attempts");
+    assert_eq!(restart_obs["intent"], 1, "restart intent cardinality");
+    assert_eq!(restart_obs["run"], 1, "restart run cardinality");
+    assert_eq!(restart_obs["http"], 1, "restart HTTP must stay 1");
+    assert_eq!(
+        restart_obs["queued"], false,
+        "restart work must not requeue"
+    );
+    assert!(
+        restart_obs["sendCertainty"] == "uncertain_accept"
+            || restart_obs["sendCertainty"] == "UncertainAccept",
+        "restart send certainty: {}",
+        restart_obs["sendCertainty"]
+    );
+    assert!(
+        restart_obs["retryClass"] == "explicit_new_run_only"
+            || restart_obs["retryClass"] == "ExplicitNewRunOnly",
+        "restart retry class: {}",
+        restart_obs["retryClass"]
+    );
+    assert_eq!(
+        restart_obs["quotaState"], "reserved",
+        "restart quota stays reserved"
+    );
+
+    let result = json!({
+        "schema": RESULT_SCHEMA,
+        "version": "v1",
+        "advertisedTools": advertised,
+        "features": {
+            "nativeCodingReadiness": if readiness_supported {
+                json!({ "support": "present" })
+            } else {
+                json!({ "support": "absent" })
+            }
+        },
+        "observations": {
+            "discovery": {
+                "capacity": capacity0,
+                "readiness": readiness
+            },
+            "native": {
+                "session": session,
+                "managed": managed,
+                "work": native_get,
+                "listWork": listed_work,
+                "intents": intents,
+                "runs": runs,
+                "getRun": native_get_run,
+                "capacity": capacity_native
+            },
+            "manager": {
+                "create": plan,
+                "list": plans,
+                "get": got_plan,
+                "childWorkId": child_id,
+                "decisionWork": decision_get,
+                "decisionRun": decision_run
+            },
+            "proposal": {
+                "targetRelativePath": proposal_file,
+                "fileExists": file_exists,
+                "hostDenials": denial_http
+            },
+            "restart": {
+                "httpBeforeStop": restart_http_before,
+                "postRestart": [post1, post2]
+            }
+        },
+        "assertions": {
+            "ordinaryNative": ordinary,
+            "manager": manager_obs,
+            "restart": restart_obs
+        },
+        "transport": {
+            "ordinaryNativeHttp": native_http,
+            "proposalHttp": proposal_http,
+            "restartHttp": restart_http_after,
+            "headerCardinalities": header_cardinalities(gateway)
+        }
+    });
+    (result, launched)
+}
+
+async fn restart_observation(
+    launched: &mut Launched,
+    session_id: &str,
+    workspace: &str,
+    restart_work_id: &str,
+    gateway: &MockGateway,
+    restart_objective: &str,
+    scan: &mut ScanFn<'_>,
+) -> Value {
+    let work = call_ok(
+        &mut launched.mcp,
+        "ptah_get_work",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace,
+            "work_id": restart_work_id
+        }),
+        scan,
+    )
+    .await;
+    let intents = call_ok(
+        &mut launched.mcp,
+        "ptah_list_execution_intents",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace
+        }),
+        scan,
+    )
+    .await;
+    let runs = call_ok(
+        &mut launched.mcp,
+        "ptah_list_runs",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace
+        }),
+        scan,
+    )
+    .await;
+    let run_id = run_id_for_work(&runs, &intents, restart_work_id);
+    let get_run = call_ok(
+        &mut launched.mcp,
+        "ptah_get_run",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace,
+            "run_id": run_id
+        }),
+        scan,
+    )
+    .await;
+    let capacity = call_ok(&mut launched.mcp, "ptah_get_capacity", json!({}), scan).await;
+    json!({
+        "work": work,
+        "intents": intents,
+        "runs": runs,
+        "getRun": get_run,
+        "capacity": capacity,
+        "http": chat_requests_containing(gateway, restart_objective)
+    })
+}
+
+fn count_matching(arr: &Value, field: &str, expected: &str) -> usize {
+    arr.as_array()
+        .map(|items| items.iter().filter(|item| item[field] == expected).count())
+        .unwrap_or(0)
+}
+
+fn count_runs_for_work(runs: &Value, intents: &Value, work_id: &str) -> usize {
+    let ids: Vec<String> = intents["intents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|intent| intent["workId"] == work_id)
+        .filter_map(|intent| intent["runId"].as_str().map(str::to_string))
+        .collect();
+    if ids.is_empty() {
+        return 0;
+    }
+    runs["runs"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|run| {
+                    run["runId"]
+                        .as_str()
+                        .is_some_and(|id| ids.iter().any(|want| want == id))
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn find_work(listed: &Value, work_id: &str) -> Value {
+    listed["work"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["workId"] == work_id))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn work_policy(node: &Value) -> Value {
+    json!({
+        "bounds": node["bounds"],
+        "retry": node["retry"],
+        "requiresApproval": false,
+        "maxConcurrentAttempts": 1
+    })
+}
+
+fn chat_requests_containing(gateway: &MockGateway, needle: &str) -> usize {
+    gateway
+        .requests()
+        .iter()
+        .filter(|request| {
+            request.path.contains("chat/completions") && request.body_str().contains(needle)
+        })
+        .count()
+}
+
+fn header_cardinalities(gateway: &MockGateway) -> Value {
+    let mut rows = Vec::new();
+    for request in gateway.requests() {
+        if !request.path.contains("chat/completions") {
+            continue;
+        }
+        let mut names: BTreeMap<String, usize> = BTreeMap::new();
+        let mut authorization_present = false;
+        for (name, _) in &request.headers {
+            let key = name.to_ascii_lowercase();
+            if key == "authorization" {
+                authorization_present = true;
+            }
+            *names.entry(key).or_insert(0) += 1;
+        }
+        rows.push(json!({
+            "path": "/v1/chat/completions",
+            "method": request.method,
+            "headerNames": names,
+            "authorizationPresent": authorization_present,
+            "bodyLen": request.body.len()
+        }));
+    }
+    json!(rows)
+}
+
+async fn call_ok(
+    mcp: &mut McpControlClient,
+    name: &str,
+    arguments: Value,
+    scan: &mut ScanFn<'_>,
+) -> Value {
+    match mcp.call_tool(name, arguments).await {
+        Ok(result) => {
+            scan(&result.raw, name);
+            scan(&result.structured, name);
+            assert!(!result.is_error, "{name} returned isError: {}", result.raw);
+            result.structured
+        }
+        Err(error) => {
+            if let Some(remote) = error.downcast_ref::<McpRemoteError>() {
+                let code = remote.data_code().unwrap_or("unknown");
+                let wrapped = json!({ "mcpError": { "code": code } });
+                scan(&wrapped, name);
+                panic!("{name} MCP error code={code}");
+            }
+            panic!("{name}: {error}");
+        }
+    }
+}
+
+async fn call_scanned(
+    mcp: &mut McpControlClient,
+    name: &str,
+    arguments: Value,
+    scan: &mut ScanFn<'_>,
+) -> Result<Value, String> {
+    match mcp.call_tool(name, arguments).await {
+        Ok(result) => {
+            scan(&result.raw, name);
+            scan(&result.structured, name);
+            if result.is_error {
+                return Err(format!("{name} isError"));
+            }
+            Ok(result.structured)
+        }
+        Err(error) => {
+            if let Some(remote) = error.downcast_ref::<McpRemoteError>() {
+                let code = remote.data_code().unwrap_or("unknown");
+                scan(&json!({ "mcpError": { "code": code } }), name);
+                return Err(code.to_string());
+            }
+            Err(error.to_string())
+        }
+    }
+}
+
+async fn yield_budget(n: usize) {
+    for _ in 0..n {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_until<F, Fut>(scenario: &Scenario, advance: Duration, mut pred: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..scenario.max_ticks() {
+        yield_budget(scenario.yields() as usize).await;
+        if pred().await {
+            return true;
+        }
+        tokio::time::advance(advance).await;
+    }
+    yield_budget(scenario.yields() as usize).await;
+    pred().await
+}
+
+async fn wait_run_terminal(
+    launched: &mut Launched,
+    scenario: &Scenario,
+    session_id: &str,
+    workspace: &str,
+    run_id: &str,
+    scan: &mut ScanFn<'_>,
+) {
+    let advance = Duration::from_millis(scenario.native_ms());
+    for _ in 0..scenario.max_ticks() {
+        yield_budget(scenario.yields() as usize).await;
+        let run = call_ok(
+            &mut launched.mcp,
+            "ptah_get_run",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "run_id": run_id
+            }),
+            scan,
+        )
+        .await;
+        if matches!(
+            run["state"].as_str(),
+            Some("completed" | "failed" | "cancelled" | "interrupted" | "limit_reached")
+        ) {
+            return;
+        }
+        tokio::time::advance(advance).await;
+    }
+    panic!("bootstrap/run {run_id} did not become terminal");
+}
+
+async fn wait_work_state(
+    launched: &mut Launched,
+    scenario: &Scenario,
+    session_id: &str,
+    workspace: &str,
+    work_id: &str,
+    states: &[&str],
+    advance: Duration,
+    scan: &mut ScanFn<'_>,
+) {
+    for _ in 0..scenario.max_ticks() {
+        yield_budget(scenario.yields() as usize).await;
+        let snap = call_ok(
+            &mut launched.mcp,
+            "ptah_get_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "work_id": work_id
+            }),
+            scan,
+        )
+        .await;
+        if snap["work"]["state"]
+            .as_str()
+            .is_some_and(|state| states.contains(&state))
+        {
+            return;
+        }
+        tokio::time::advance(advance).await;
+    }
+    panic!("work {work_id} did not reach {states:?}");
+}
+
+async fn wait_child_work(
+    launched: &mut Launched,
+    scenario: &Scenario,
+    session_id: &str,
+    workspace: &str,
+    plan_id: &str,
+    scan: &mut ScanFn<'_>,
+) -> String {
+    let advance = Duration::from_millis(scenario.supervisor_ms());
+    let mut tick_seq = 0u64;
+    for _ in 0..scenario.max_ticks() {
+        yield_budget(scenario.yields() as usize).await;
+        wake_manager_plan(
+            launched,
+            scenario,
+            session_id,
+            workspace,
+            plan_id,
+            &mut tick_seq,
+            scan,
+        )
+        .await;
+        let listed = call_ok(
+            &mut launched.mcp,
+            "ptah_list_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace
+            }),
+            scan,
+        )
+        .await;
+        if let Some(id) = listed["work"].as_array().and_then(|items| {
+            items.iter().find_map(|item| {
+                if item["kind"] == "native"
+                    && item["sourceManagerPlanId"] == plan_id
+                    && item["sourceManagerStepId"] != "__manager_decision__"
+                {
+                    item["workId"].as_str().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        }) {
+            return id;
+        }
+        tokio::time::advance(advance).await;
+    }
+    panic!("manager child Work was not created");
+}
+
+async fn wait_decision_work(
+    launched: &mut Launched,
+    scenario: &Scenario,
+    session_id: &str,
+    workspace: &str,
+    plan_id: &str,
+    scan: &mut ScanFn<'_>,
+) -> String {
+    let advance = Duration::from_millis(scenario.supervisor_ms());
+    let mut tick_seq = 1_000u64;
+    for _ in 0..scenario.max_ticks() {
+        yield_budget(scenario.yields() as usize).await;
+        wake_manager_plan(
+            launched,
+            scenario,
+            session_id,
+            workspace,
+            plan_id,
+            &mut tick_seq,
+            scan,
+        )
+        .await;
+        let listed = call_ok(
+            &mut launched.mcp,
+            "ptah_list_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace
+            }),
+            scan,
+        )
+        .await;
+        if let Some(id) = listed["work"].as_array().and_then(|items| {
+            items.iter().find_map(|item| {
+                if item["kind"] == "manager-decision"
+                    || item["sourceManagerStepId"] == "__manager_decision__"
+                {
+                    item["workId"].as_str().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        }) {
+            return id;
+        }
+        tokio::time::advance(advance).await;
+    }
+    panic!("manager-decision Work was not created");
+}
+
+/// Public-boundary supervisor wake. Errors are scanned and ignored so a stale
+/// concurrent supervisor pass cannot abort the fixture.
+async fn wake_manager_plan(
+    launched: &mut Launched,
+    scenario: &Scenario,
+    session_id: &str,
+    workspace: &str,
+    plan_id: &str,
+    tick_seq: &mut u64,
+    scan: &mut ScanFn<'_>,
+) {
+    *tick_seq += 1;
+    let request_id = format!("{}-{}", scenario.request_id("tickManagerPlan"), tick_seq);
+    let _ = call_scanned(
+        &mut launched.mcp,
+        "ptah_tick_manager_plan",
+        json!({
+            "request_id": request_id,
+            "session_id": session_id,
+            "workspace": workspace,
+            "plan_id": plan_id
+        }),
+        scan,
+    )
+    .await;
+}
+
+fn run_id_for_work(runs: &Value, intents: &Value, work_id: &str) -> String {
+    if let Some(id) = intents["intents"].as_array().and_then(|items| {
+        items.iter().find_map(|intent| {
+            if intent["workId"] == work_id {
+                intent["runId"].as_str().map(str::to_string)
+            } else {
+                None
+            }
+        })
+    }) {
+        return id;
+    }
+    runs["runs"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .rev()
+                .find_map(|run| run["runId"].as_str().map(str::to_string))
+        })
+        .expect("run id for work")
+}
+
+fn extract_json_object_after<'a>(haystack: &'a str, marker: &str) -> Option<&'a str> {
+    let start = haystack.find(marker)? + marker.len();
+    let rest = haystack[start..].trim_start();
+    let bytes = rest.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (index, ch) in rest.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+const FORBIDDEN_KEYS: &[&str] = &[
+    "credentialref",
+    "credentialfingerprint",
+    "baseurl",
+    "apikey",
+    "api_key",
+    "bearertoken",
+    "authorization",
+];
+
+fn scan_raw(
+    value: &Value,
+    origin: &str,
+    bearer: &str,
+    api_key: &str,
+    gateway: &str,
+    gateway_authority: &str,
+    marker: &str,
+    hits: &mut Vec<RedactionHit>,
+) {
+    let mut ctx = ScanCtx {
+        bearer,
+        api_key,
+        gateway,
+        gateway_authority,
+        marker,
+        hits: Vec::new(),
+    };
+    walk_scan(value, origin, &mut ctx);
+    hits.append(&mut ctx.hits);
+}
+
+fn walk_scan(value: &Value, path: &str, ctx: &mut ScanCtx<'_>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let lowered = key.to_ascii_lowercase();
+                if FORBIDDEN_KEYS.contains(&lowered.as_str()) {
+                    ctx.hits.push(RedactionHit {
+                        path: format!("{path}.{key}"),
+                        reason: format!("forbidden key {key}"),
+                    });
+                }
+                if lowered == "providerroute" {
+                    if let Some(obj) = child.as_object() {
+                        for extra in obj.keys() {
+                            let extra_l = extra.to_ascii_lowercase();
+                            if extra_l != "providerid" && extra_l != "modelid" {
+                                if FORBIDDEN_KEYS.contains(&extra_l.as_str())
+                                    || extra_l.contains("credential")
+                                    || extra_l == "baseurl"
+                                    || extra_l == "wiremodelid" && obj.contains_key("credentialRef")
+                                {
+                                    ctx.hits.push(RedactionHit {
+                                        path: format!("{path}.{key}.{extra}"),
+                                        reason: "providerRoute snapshot secret field".into(),
+                                    });
+                                }
+                                if FORBIDDEN_KEYS.contains(&extra_l.as_str())
+                                    || extra_l == "baseurl"
+                                    || extra_l == "credentialref"
+                                    || extra_l == "credentialfingerprint"
+                                {
+                                    ctx.hits.push(RedactionHit {
+                                        path: format!("{path}.{key}.{extra}"),
+                                        reason: "secret-bearing providerRoute".into(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                walk_scan(child, &format!("{path}.{key}"), ctx);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                walk_scan(child, &format!("{path}[{index}]"), ctx);
+            }
+        }
+        Value::String(text) => {
+            scan_text(path, text, ctx);
+            if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                if parsed.is_object() || parsed.is_array() {
+                    walk_scan(&parsed, &format!("{path}.json"), ctx);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scan_text(path: &str, text: &str, ctx: &mut ScanCtx<'_>) {
+    if text.contains(ctx.bearer) {
+        ctx.hits.push(RedactionHit {
+            path: path.to_string(),
+            reason: "mcp bearer sentinel".into(),
+        });
+    }
+    if text.contains(ctx.api_key) {
+        ctx.hits.push(RedactionHit {
+            path: path.to_string(),
+            reason: "api-key sentinel".into(),
+        });
+    }
+    if text.contains(ctx.gateway) || text.contains(ctx.gateway_authority) {
+        ctx.hits.push(RedactionHit {
+            path: path.to_string(),
+            reason: "private gateway sentinel".into(),
+        });
+    }
+    if text.contains(ctx.marker) {
+        ctx.hits.push(RedactionHit {
+            path: path.to_string(),
+            reason: "private gateway marker".into(),
+        });
+    }
+}
+
+fn scan_normalized_secrets(
+    value: &Value,
+    bearer: &str,
+    api_key: &str,
+    gateway: &str,
+    gateway_authority: &str,
+    marker: &str,
+) {
+    let mut hits = Vec::new();
+    scan_raw(
+        value,
+        "normalized",
+        bearer,
+        api_key,
+        gateway,
+        gateway_authority,
+        marker,
+        &mut hits,
+    );
+    if !hits.is_empty() {
+        let report = hits
+            .iter()
+            .map(|hit| format!("{}: {}", hit.path, hit.reason))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!("normalized result still contains secrets:\n{report}");
+    }
+}
+
+fn normalize_result(
+    mut value: Value,
+    workspace: &Path,
+    home: &Path,
+    gateway: &str,
+    gateway_authority: &str,
+) -> Value {
+    replace_authorities(&mut value, workspace, home, gateway, gateway_authority);
+    strip_ephemerals(&mut value, None);
+    let mut canon = IdCanon {
+        map: BTreeMap::new(),
+    };
+    collect_ids(&value, None, &mut canon);
+    apply_ids(&mut value, &canon);
+    sort_value(&mut value, None);
+    value
+}
+
+fn replace_authorities(
+    value: &mut Value,
+    workspace: &Path,
+    home: &Path,
+    gateway: &str,
+    gateway_authority: &str,
+) {
+    let workspace_s = workspace.display().to_string();
+    let home_s = home.display().to_string();
+    visit_strings(value, &mut |text| {
+        let mut out = text.replace(&workspace_s, "$WORKSPACE");
+        out = out.replace(&home_s, "$HOME");
+        out = out.replace(gateway, "$GATEWAY");
+        out = out.replace(gateway_authority, "$GATEWAY");
+        out
+    });
+}
+
+fn visit_strings(value: &mut Value, edit: &mut dyn FnMut(&str) -> String) {
+    match value {
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                visit_strings(child, edit);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                visit_strings(child, edit);
+            }
+        }
+        Value::String(text) => *text = edit(text),
+        _ => {}
+    }
+}
+
+fn strip_ephemerals(value: &mut Value, key: Option<&str>) {
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                if is_ephemeral_key(&k) {
+                    map.remove(&k);
+                    continue;
+                }
+                if let Some(child) = map.get_mut(&k) {
+                    strip_ephemerals(child, Some(&k));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                strip_ephemerals(child, key);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_ephemeral_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    if lower.ends_with("at")
+        && (lower.contains("created")
+            || lower.contains("updated")
+            || lower.contains("started")
+            || lower.contains("finished")
+            || lower.contains("issued")
+            || lower.contains("expires")
+            || lower.contains("completed")
+            || lower.contains("window")
+            || lower == "ts"
+            || lower.starts_with("last"))
+    {
+        return true;
+    }
+    matches!(
+        lower.as_str(),
+        "lasttickat"
+            | "lastsuccessat"
+            | "lastrunat"
+            | "startedat"
+            | "updatedat"
+            | "createdat"
+            | "finishedat"
+            | "windowstartedat"
+            | "completedat"
+            | "transportsessionid"
+            | "mcp-session-id"
+            | "sessionidheader"
+            | "backend"
+            | "backendlabel"
+            | "port"
+    )
+}
+
+fn collect_ids(value: &Value, key: Option<&str>, canon: &mut IdCanon) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for k in keys {
+                collect_ids(&map[k], Some(k), canon);
+            }
+        }
+        Value::Array(items) => {
+            let mut items = items.clone();
+            if key.is_some_and(is_set_array_key) {
+                items.sort_by_key(|item| canonical_sort_key(item));
+            }
+            for child in &items {
+                collect_ids(child, key, canon);
+            }
+        }
+        Value::String(text) => {
+            if should_canonicalize(key, text) {
+                if !canon.map.contains_key(text) {
+                    let next = format!("$ID_{}", canon.map.len() + 1);
+                    canon.map.insert(text.clone(), next);
+                }
+            }
+            for captured in find_generated_ids(text) {
+                if !canon.map.contains_key(&captured) {
+                    let next = format!("$ID_{}", canon.map.len() + 1);
+                    canon.map.insert(captured, next);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_ids(value: &mut Value, canon: &IdCanon) {
+    let mut pairs: Vec<(String, String)> = canon
+        .map
+        .iter()
+        .map(|(from, to)| (from.clone(), to.clone()))
+        .collect();
+    pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    visit_strings(value, &mut |text| {
+        let mut out = text.to_string();
+        for (from, to) in &pairs {
+            out = out.replace(from, to);
+        }
+        out
+    });
+}
+
+fn should_canonicalize(key: Option<&str>, text: &str) -> bool {
+    if text.starts_with("sbb-v1-")
+        || text.starts_with("$")
+        || text == "__manager_decision__"
+        || text == "env-grokptah"
+        || text == "grok-build"
+        || text.contains("shared-black-box-v1")
+    {
+        return false;
+    }
+    if looks_like_uuid(text) || looks_like_hash(text) {
+        return true;
+    }
+    matches!(
+        key.map(str::to_ascii_lowercase).as_deref(),
+        Some("workid")
+            | Some("runid")
+            | Some("intentid")
+            | Some("attemptid")
+            | Some("planid")
+            | Some("reservationid")
+            | Some("poolid")
+            | Some("snapshothash")
+            | Some("occurrenceid")
+            | Some("inputsnapshothash")
+            | Some("decisionid")
+            | Some("messageid")
+            | Some("agentid")
+            | Some("sessionid")
+            | Some("quotareservationid")
+            | Some("parentworkid")
+            | Some("parentrunid")
+            | Some("rootworkid")
+            | Some("decisionworkid")
+            | Some("lastdecisionid")
+            | Some("sourcemanagerplanid")
+            | Some("checkpointid")
+            | Some("continuationcontextid")
+            | Some("continuationcontexthash")
+            | Some("endpointfingerprint")
+    ) && !text.is_empty()
+        && text != "__manager_decision__"
+}
+
+fn looks_like_uuid(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && text.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+}
+
+fn looks_like_hash(text: &str) -> bool {
+    let len = text.len();
+    (len == 32 || len == 64) && text.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn find_generated_ids(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 36 <= bytes.len() {
+        let slice = &text[i..i + 36];
+        if looks_like_uuid(slice) {
+            out.push(slice.to_string());
+            i += 36;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn is_set_array_key(key: &str) -> bool {
+    matches!(
+        key,
+        "work"
+            | "runs"
+            | "intents"
+            | "plans"
+            | "tools"
+            | "providers"
+            | "agents"
+            | "sessions"
+            | "advertisedTools"
+            | "triggeringWorkIds"
+            | "triggeringMessageIds"
+            | "allowedWorkKinds"
+            | "headerNames"
+    )
+}
+
+fn canonical_sort_key(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "objective",
+                "kind",
+                "purpose",
+                "promptPreview",
+                "name",
+                "workId",
+                "runId",
+                "planId",
+                "agentId",
+            ] {
+                if let Some(Value::String(text)) = map.get(key) {
+                    return format!("{key}:{text}");
+                }
+            }
+            serde_json::to_string(value).unwrap_or_default()
+        }
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn sort_value(value: &mut Value, key: Option<&str>) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort();
+            let mut ordered = Map::new();
+            for k in keys {
+                if let Some(mut child) = map.remove(&k) {
+                    sort_value(&mut child, Some(&k));
+                    ordered.insert(k, child);
+                }
+            }
+            *map = ordered;
+        }
+        Value::Array(items) => {
+            for child in items.iter_mut() {
+                sort_value(child, key);
+            }
+            if key.is_some_and(is_set_array_key) {
+                items.sort_by_key(canonical_sort_key);
+            } else if key == Some("attempts") {
+                items.sort_by_key(|item| item["ordinal"].as_u64().unwrap_or(0));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn write_or_compare_goldens(pr_result: &Value) {
+    let update = std::env::var("UPDATE_SHARED_BLACK_BOX_GOLDEN").is_ok();
+    let pretty = serde_json::to_string_pretty(pr_result).expect("pretty pr result");
+    if update || golden_is_pending(PR_GOLDEN_PATH) {
+        std::fs::write(PR_GOLDEN_PATH, format!("{pretty}\n")).expect("write PR golden");
+    } else {
+        let expected: Value =
+            serde_json::from_str(&std::fs::read_to_string(PR_GOLDEN_PATH).expect("read PR golden"))
+                .expect("parse PR golden");
+        assert_eq!(
+            serde_json::to_string(pr_result).unwrap(),
+            serde_json::to_string(&expected).unwrap(),
+            "PR-head golden mismatch"
+        );
+    }
+
+    let main = calibrate_main(pr_result);
+    let main_pretty = serde_json::to_string_pretty(&main).expect("pretty main result");
+    if update || golden_is_pending(MAIN_GOLDEN_PATH) {
+        std::fs::write(MAIN_GOLDEN_PATH, format!("{main_pretty}\n")).expect("write main golden");
+    } else {
+        let expected: Value = serde_json::from_str(
+            &std::fs::read_to_string(MAIN_GOLDEN_PATH).expect("read main golden"),
+        )
+        .expect("parse main golden");
+        assert_eq!(
+            serde_json::to_string(&main).unwrap(),
+            serde_json::to_string(&expected).unwrap(),
+            "main calibration golden mismatch"
+        );
+    }
+}
+
+fn golden_is_pending(path: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|value| value.get("calibration") == Some(&json!("pending")))
+}
+
+fn calibrate_main(pr: &Value) -> Value {
+    let mut main = pr.clone();
+    mark_absent(
+        &mut main,
+        &[
+            "providerQuota",
+            "providerExecution",
+            "ptah_get_native_coding_readiness",
+        ],
+    );
+    if let Some(readiness) = main.pointer_mut("/observations/discovery/readiness") {
+        *readiness = json!({ "support": "absent" });
+    }
+    if let Some(features) = main.pointer_mut("/features/nativeCodingReadiness") {
+        *features = json!({ "support": "absent" });
+    }
+    if let Some(tools) = main.pointer_mut("/advertisedTools") {
+        if let Some(arr) = tools.as_array_mut() {
+            arr.retain(|item| item.as_str() != Some("ptah_get_native_coding_readiness"));
+        }
+    }
+    main
+}
+
+fn mark_absent(value: &mut Value, keys: &[&str]) {
+    match value {
+        Value::Object(map) => {
+            let names: Vec<String> = map.keys().cloned().collect();
+            for name in names {
+                if keys.iter().any(|key| *key == name) {
+                    map.insert(name, json!({ "support": "absent" }));
+                } else if let Some(child) = map.get_mut(&name) {
+                    mark_absent(child, keys);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                mark_absent(child, keys);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    sha256(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    // FIPS 180-4 SHA-256, fixture reporting only.
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut msg = bytes.to_vec();
+    let bit_len = (bytes.len() as u64) * 8;
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    let mut h = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = [0u8; 32];
+    for (i, part) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&part.to_be_bytes());
+    }
+    out
+}
