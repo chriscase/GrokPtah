@@ -114,6 +114,40 @@ counts. Home-wide pressure is visible without that disclosure through
 The ceiling is a host constant in this slice. Making it operator-configurable
 per deployment is deliberate follow-up work, not part of this contract.
 
+### Durable provider quota
+
+Online native Runs also reserve a durable, provider-neutral quota row before
+provider execution can begin. The pool key is
+`{owner, workspace, provider, credentialFingerprint, class}`; it contains no
+bearer material. The closed classes distinguish coding execution, manager
+proposals, qualification, and Computer sessions so one authority class never
+borrows another class's accounting identity.
+
+The initial host limits are a one-hour fixed window, four in-flight
+reservations, 10,000,000 reserved tokens, and 4,096 reserved provider
+requests per pool. A Run reserves its finite `maxTotalTokens` and a hard
+provider-request ceiling of `maxRounds + 1` (the extra slot is the bounded
+recovery-grace step). Compaction, planning, and child-model calls share that
+same ceiling. Reaching it records the host-authored
+`provider_request_quota_reached` stop; it is not a prompt convention.
+
+Reservation and Run creation occur under the same store lock. Queued
+admission uses a `quota-admission-intents` recovery journal; immediate Agent
+activation embeds the reservation in the existing activation journal. Store
+open completes either side of a partial write, rejects mismatched immutable
+identities, settles a terminal Run written before its quota update, and
+expires a reservation that has neither a Run nor a recovery intent. A stable
+reservation without a Run, or a quota-linked Run without its reservation,
+cannot be treated as healthy state.
+
+Authoritative terminal usage consumes `min(reservedTokens, measuredTokens)`
+and the measured request count; unused capacity is released. A terminal Run
+with complete zero usage is refunded. Missing usage or an unresolved provider
+request remains reserved deliberately: without a durable provider-attempt
+certainty record, refunding it could turn an accepted-but-unknown request into
+free capacity. The provider-attempt phase closes that operationally
+conservative case.
+
 ## Work-attempt / Run relationship
 
 A `ManagedExecutionIntent` binds, under the store lock:
@@ -324,7 +358,7 @@ explicit enable/disable; it does not own dispatch.
 ## Follow-up
 
 - Operator-configurable per-provider admission ceiling
-- Provider-scoped quota accounting beyond concurrency (tokens, spend, windows)
+- Operator-configurable quota pools, spend conversion, and operator projections
 - Manager-agent planning and decomposition
 - Message-triggered routine activation
 - Per-principal worker credentials bound to one Agent

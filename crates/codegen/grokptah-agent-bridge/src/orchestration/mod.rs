@@ -7,6 +7,7 @@ mod continuation;
 pub(crate) mod managed;
 mod manager;
 mod message;
+mod quota;
 mod routine;
 mod service;
 mod store;
@@ -45,6 +46,11 @@ pub use manager::{
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,
     MESSAGE_SCHEMA_VERSION,
+};
+pub use quota::{
+    QuotaClass, QuotaLimits, QuotaPoolKey, QuotaPoolUsage, QuotaReservation, QuotaReservationState,
+    DEFAULT_MAX_IN_FLIGHT_RESERVATIONS, DEFAULT_MAX_REQUESTS_PER_WINDOW,
+    DEFAULT_MAX_TOKENS_PER_WINDOW, DEFAULT_QUOTA_WINDOW_MS, QUOTA_LEDGER_SCHEMA_VERSION,
 };
 pub use routine::{
     occurrence_dedupe_key, ActivationCause, ActivationDisposition, ActivationRecord,

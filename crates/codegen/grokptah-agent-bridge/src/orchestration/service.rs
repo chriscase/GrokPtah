@@ -32,6 +32,7 @@ use super::manager::{
     ManagerDirective, ManagerPlan, ManagerPlanState, ManagerStepSpec, MANAGER_SCHEMA_VERSION,
 };
 use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
+use super::quota::{QuotaClass, QuotaLimits, QuotaReservation};
 use super::routine::{
     manual_dedupe_key, ActivationCause, ActivationRequest, MissedRunPolicy,
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
@@ -6852,7 +6853,7 @@ impl OrchestrationService {
         }
 
         let agent_spec_revision = agent_spec.revision;
-        let provider_route = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
+        let mut provider_route = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
             None
         } else {
             Some(
@@ -6876,6 +6877,20 @@ impl OrchestrationService {
         // Give older queued work first claim on any newly available capacity.
         self.pump_pending();
         let run_id = Uuid::new_v4().to_string();
+        if let Some(route) = provider_route.take() {
+            let quota_class = if proposal_only {
+                QuotaClass::ManagerProposal
+            } else {
+                QuotaClass::CodingExecution
+            };
+            provider_route = Some(
+                route
+                    .bind_quota(quota_class, format!("quota-{run_id}"))
+                    .map_err(|error| {
+                        self.fail_claim(&mut lease, None, session_id, &claimed, error)
+                    })?,
+            );
+        }
         let queue_ahead = self.host.orchestration_pending_count() > 0;
         let mut queued = false;
         if allow_queue && queue_ahead {
@@ -6893,6 +6908,7 @@ impl OrchestrationService {
             }
         }
         let start_seq = (!queued).then(|| self.bus.next_seq());
+        let now = Utc::now();
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -6933,8 +6949,8 @@ impl OrchestrationService {
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),
             start_seq,
             end_seq: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
             terminal_result: None,
             final_response: None,
             error_code: None,
@@ -6944,18 +6960,51 @@ impl OrchestrationService {
             execution: None,
             approval: None,
         };
-        let persisted = if queued {
-            self.store.save_run(&run)
-        } else {
-            self.store
-                .save_run_and_activate_agent(&run, run.agent_id.as_deref().expect("Run Agent"))
+        let quota_reservation = match run.provider_route.as_ref() {
+            Some(_) => match QuotaReservation::for_run(
+                &run,
+                auth.owner_id.clone(),
+                QuotaLimits::default(),
+                now,
+            ) {
+                Ok(reservation) => Some(reservation),
+                Err(error) => {
+                    if !queued {
+                        self.host.release_turn_reservation(session_id, &run_id);
+                        self.release_capacity(&run_id);
+                    }
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        Some(run_id.clone()),
+                        session_id,
+                        &claimed,
+                        error,
+                    ));
+                }
+            },
+            None => None,
+        };
+        let persisted = match (queued, quota_reservation.as_ref()) {
+            (true, Some(reservation)) => self.store.save_run_with_quota(&run, reservation),
+            (false, Some(reservation)) => self.store.save_run_and_activate_agent_with_quota(
+                &run,
+                run.agent_id.as_deref().expect("Run Agent"),
+                reservation,
+            ),
+            (true, None) => self.store.save_run(&run),
+            (false, None) => self
+                .store
+                .save_run_and_activate_agent(&run, run.agent_id.as_deref().expect("Run Agent")),
         };
         if let Err(e) = persisted {
             if !queued {
                 self.host.release_turn_reservation(session_id, &run_id);
                 self.release_capacity(&run_id);
             }
-            let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
+            let e = e
+                .downcast_ref::<OrchError>()
+                .cloned()
+                .unwrap_or_else(|| OrchError::new(OrchErrorCode::Internal, e.to_string()));
             return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
         }
 

@@ -8,8 +8,8 @@ use axum::{Json, Router};
 use grokptah_agent_bridge::orchestration::{
     AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
     ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, ProviderRoute,
-    RunBounds, RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState,
-    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
+    QuotaClass, QuotaReservationState, RunBounds, RunPurpose, RunRecord, RunState, WorkItem,
+    WorkPolicy, WorkState, WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
     model_selection_key, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
@@ -722,6 +722,19 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
     assert_eq!(run_route.wire_model_id, "native-route-model");
     assert_eq!(run_route.base_url, format!("http://{address}/v1"));
     run_route.validate().unwrap();
+    assert_eq!(run_route.quota_class, Some(QuotaClass::CodingExecution));
+    let quota_id = run_route
+        .quota_reservation_id
+        .as_deref()
+        .expect("online native Run must link its durable quota reservation");
+    let reservation = orch
+        .store()
+        .load_quota_reservation(quota_id)
+        .unwrap()
+        .expect("quota reservation must exist before provider execution");
+    assert_eq!(reservation.run_id, run.run_id);
+    assert_eq!(reservation.route_snapshot_hash, run_route.snapshot_hash);
+    assert_eq!(reservation.state, QuotaReservationState::Reserved);
 
     release.add_permits(1);
     let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -737,6 +750,14 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
+    let settled_reservation = orch
+        .store()
+        .load_quota_reservation(quota_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled_reservation.state, QuotaReservationState::Consumed);
+    assert_eq!(settled_reservation.tokens_consumed, 10);
+    assert_eq!(settled_reservation.requests_consumed, 1);
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 
     orch.stop_background_tasks().await;
