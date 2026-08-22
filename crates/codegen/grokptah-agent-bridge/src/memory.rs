@@ -323,7 +323,7 @@ impl MemoryAddress {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum MemoryError {
     #[error("malformed memory write")]
     Malformed,
@@ -341,15 +341,19 @@ pub(crate) enum MemoryError {
     Unauthorized,
     #[error("memory receipt expired")]
     ReceiptExpired,
-    #[error("memory commit uncertain")]
-    Uncertain,
+    #[error("memory commit uncertain (id={fact_id} revision={revision} request={request_key})")]
+    Uncertain {
+        fact_id: String,
+        revision: u64,
+        request_key: String,
+    },
     #[error("durable memory store error")]
     Durable,
 }
 
 impl MemoryError {
     #[allow(dead_code)]
-    fn code(self) -> &'static str {
+    fn code(&self) -> &'static str {
         match self {
             Self::Malformed => "malformed",
             Self::IdempotencyConflict => "idempotency_conflict",
@@ -359,8 +363,20 @@ impl MemoryError {
             Self::StaleHead => "stale_head",
             Self::Unauthorized => "unauthorized",
             Self::ReceiptExpired => "receipt_expired",
-            Self::Uncertain => "uncertain",
+            Self::Uncertain { .. } => "uncertain",
             Self::Durable => "durable",
+        }
+    }
+
+    fn uncertain(
+        fact_id: impl Into<String>,
+        revision: u64,
+        request_key: impl Into<String>,
+    ) -> Self {
+        Self::Uncertain {
+            fact_id: fact_id.into(),
+            revision,
+            request_key: request_key.into(),
         }
     }
 }
@@ -1222,10 +1238,12 @@ fn commit_canonical(path: &Path, raw: &[u8]) -> Result<(), MemoryError> {
     fs::rename(&temp_path, path).map_err(|_| MemoryError::Durable)?;
     let _ = fs::remove_file(&ready_path);
     if cut == CommitCutpoint::AfterRenameBeforeDirFsync {
-        return Err(MemoryError::Uncertain);
+        return Err(MemoryError::uncertain("", 0, ""));
     }
-    let directory = File::open(parent).map_err(|_| MemoryError::Uncertain)?;
-    directory.sync_all().map_err(|_| MemoryError::Uncertain)?;
+    let directory = File::open(parent).map_err(|_| MemoryError::uncertain("", 0, ""))?;
+    directory
+        .sync_all()
+        .map_err(|_| MemoryError::uncertain("", 0, ""))?;
     Ok(())
 }
 
@@ -1487,13 +1505,24 @@ fn receipt_expired(receipt: &Receipt, watermark: DateTime<Utc>) -> bool {
 struct TxnResult<T> {
     value: T,
     commit: bool,
+    fact_id: String,
+    revision: u64,
+    request_key: String,
 }
 
 impl<T> TxnResult<T> {
-    fn commit(value: T) -> Self {
+    fn commit(
+        value: T,
+        fact_id: impl Into<String>,
+        revision: u64,
+        request_key: impl Into<String>,
+    ) -> Self {
         Self {
             value,
             commit: true,
+            fact_id: fact_id.into(),
+            revision,
+            request_key: request_key.into(),
         }
     }
 
@@ -1501,6 +1530,9 @@ impl<T> TxnResult<T> {
         Self {
             value,
             commit: false,
+            fact_id: String::new(),
+            revision: 0,
+            request_key: String::new(),
         }
     }
 }
@@ -1528,7 +1560,17 @@ fn transact<T>(
         memory.project_key = storage_key(address);
         memory.cwd = address.source_workspace().display().to_string();
         let raw = encode_store(&memory)?;
-        commit_canonical(&path, &raw)?;
+        match commit_canonical(&path, &raw) {
+            Ok(()) => {}
+            Err(MemoryError::Uncertain { .. }) => {
+                return Err(MemoryError::uncertain(
+                    outcome.fact_id,
+                    outcome.revision,
+                    outcome.request_key,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(outcome.value)
 }
@@ -1613,7 +1655,7 @@ pub(crate) fn remember(
             claim_key: None,
         };
         apply_incoming(memory, incoming, now)?;
-        Ok(TxnResult::commit(id))
+        Ok(TxnResult::commit(id.clone(), id.clone(), 1, id))
     })
     .map_err(|error| anyhow!(error))
 }
@@ -1801,11 +1843,16 @@ pub(crate) fn remember_versioned(
             principal: address.actor_agent_id.clone(),
             scope_binding: scope_binding(address),
         });
-        Ok(TxnResult::commit(VersionedWriteAck {
+        Ok(TxnResult::commit(
+            VersionedWriteAck {
+                id: id.clone(),
+                revision,
+                replayed: false,
+            },
             id,
             revision,
-            replayed: false,
-        }))
+            request.idempotency_key.clone(),
+        ))
     })
 }
 
@@ -3173,10 +3220,10 @@ mod tests {
         let uncertain = remember(&address, "new after rename", &[]);
         drop(_cut);
         assert!(uncertain.is_err());
-        assert_eq!(
-            uncertain.unwrap_err().to_string(),
-            "memory commit uncertain"
-        );
+        let err = uncertain.unwrap_err().to_string();
+        assert!(err.contains("memory commit uncertain"), "{err}");
+        assert!(err.contains("revision=1"), "{err}");
+        assert!(err.contains("id="), "{err}");
         assert_complete_canonical(&address);
         let texts: Vec<_> = list_facts(&address)
             .unwrap()
@@ -3189,6 +3236,47 @@ mod tests {
         assert_eq!(again.len(), third.len());
         remember(&address, "new after rename", &[]).unwrap();
         assert_eq!(list_facts(&address).unwrap().len(), again.len());
+    }
+
+    #[test]
+    fn uncertain_commit_carries_identity_and_replay_resolves_from_durable_state() {
+        let _home = IsolatedHome::install();
+        let source = tempfile::tempdir().unwrap();
+        let address = access_at(source.path(), None, epoch()).project();
+        let _cut = cut(CommitCutpoint::AfterRenameBeforeDirFsync);
+        let err = write_normal(
+            &address,
+            VersionedWriteRequest::new("unc-key", "uncertain payload", "unc-claim"),
+        )
+        .unwrap_err();
+        drop(_cut);
+        let MemoryError::Uncertain {
+            fact_id,
+            revision,
+            request_key,
+        } = err
+        else {
+            panic!("expected identified Uncertain, got {err:?}");
+        };
+        assert_eq!(request_key, "unc-key");
+        assert_eq!(revision, 1);
+        assert!(fact_id.starts_with(FACT_ID_PREFIX));
+        assert_complete_canonical(&address);
+        let replay = write_normal(
+            &address,
+            VersionedWriteRequest::new("unc-key", "uncertain payload", "unc-claim"),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.id, fact_id);
+        assert_eq!(replay.revision, revision);
+        let again = write_normal(
+            &address,
+            VersionedWriteRequest::new("unc-key", "uncertain payload", "unc-claim"),
+        )
+        .unwrap();
+        assert!(again.replayed);
+        assert_eq!(again.id, fact_id);
     }
 
     #[test]
@@ -3621,13 +3709,47 @@ mod tests {
             let bytes = fs::metadata(path_for(address).unwrap()).unwrap().len() as usize;
             assert!(bytes <= MAX_HOT_STORE_BYTES);
             assert!(bytes <= MAX_PERSISTED_BYTES);
-            let first = retrieve_at(address, clock.now()).unwrap().current;
-            let second = retrieve_at(address, clock.now()).unwrap().current;
-            assert_eq!(first.len(), second.len());
-            assert_eq!(
-                first.iter().map(|f| &f.id).collect::<Vec<_>>(),
-                second.iter().map(|f| &f.id).collect::<Vec<_>>()
-            );
+        }
+        for _reopen in 0..2 {
+            let project_again = MemoryAccess::new(source.path(), Some(actor.clone()))
+                .with_clock(clock.clone())
+                .with_critical_writes()
+                .project();
+            let private_again = MemoryAccess::new(source.path(), Some(actor.clone()))
+                .with_clock(clock.clone())
+                .with_critical_writes()
+                .resolve(MemoryScope::AgentPrivate {
+                    agent_id: actor.clone(),
+                })
+                .unwrap();
+            let team_again = MemoryAccess::new(source.path(), Some(actor.clone()))
+                .with_clock(clock.clone())
+                .with_critical_writes()
+                .allow_team(&team)
+                .unwrap()
+                .resolve(MemoryScope::Team {
+                    team_id: team.clone(),
+                })
+                .unwrap();
+            for (left, right) in [
+                (
+                    retrieve_at(&project, clock.now()).unwrap().current,
+                    retrieve_at(&project_again, clock.now()).unwrap().current,
+                ),
+                (
+                    retrieve_at(&private, clock.now()).unwrap().current,
+                    retrieve_at(&private_again, clock.now()).unwrap().current,
+                ),
+                (
+                    retrieve_at(&shared, clock.now()).unwrap().current,
+                    retrieve_at(&team_again, clock.now()).unwrap().current,
+                ),
+            ] {
+                assert_eq!(
+                    left.iter().map(|f| f.id.clone()).collect::<Vec<_>>(),
+                    right.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
+                );
+            }
         }
         let (files, bytes) = scope_tree_stats(&memory_dir());
         assert!(
