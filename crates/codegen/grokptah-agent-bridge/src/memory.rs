@@ -71,12 +71,14 @@ impl Clock for SystemClock {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct FakeClock {
     now: Mutex<DateTime<Utc>>,
     advance_retention: std::sync::atomic::AtomicBool,
 }
 
+#[cfg(test)]
 impl FakeClock {
     pub(crate) fn new(now: DateTime<Utc>) -> Self {
         Self {
@@ -99,6 +101,7 @@ impl FakeClock {
     }
 }
 
+#[cfg(test)]
 impl Clock for FakeClock {
     fn now(&self) -> DateTime<Utc> {
         *self.now.lock()
@@ -133,7 +136,7 @@ fn current_cutpoint() -> CommitCutpoint {
         if let Ok(raw) = std::env::var("GROKPTAH_MEMORY_CUTPOINT") {
             return parse_cutpoint(&raw);
         }
-        return COMMIT_CUTPOINT.with(|cell| cell.get());
+        COMMIT_CUTPOINT.with(|cell| cell.get())
     }
     #[cfg(not(test))]
     {
@@ -225,11 +228,13 @@ impl MemoryAccess {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_critical_writes(mut self) -> Self {
         self.critical_writes = true;
         self
@@ -457,11 +462,13 @@ impl VersionedWriteRequest {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_salience_high(mut self) -> Self {
         self.salience = RequestSalience::High;
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_salience_low(mut self) -> Self {
         self.salience = RequestSalience::Low;
         self
@@ -472,16 +479,19 @@ impl VersionedWriteRequest {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_valid_from(mut self, raw: impl Into<String>) -> Self {
         self.valid_from = Some(raw.into());
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_valid_until(mut self, raw: impl Into<String>) -> Self {
         self.valid_until = Some(raw.into());
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn superseding(mut self, id: impl Into<String>, revision: u64) -> Self {
         let id = id.into();
         self.supersedes = Some(id.clone());
@@ -2156,6 +2166,7 @@ struct AuthoritativeRetrieval {
     #[allow(dead_code)]
     at: DateTime<Utc>,
     current: Vec<MemoryFact>,
+    #[allow(dead_code)]
     conflicts: Vec<(String, Vec<MemoryFact>)>,
 }
 
@@ -2266,6 +2277,7 @@ pub(crate) fn inject_context(address: &MemoryAddress) -> anyhow::Result<String> 
     Ok(out)
 }
 
+#[cfg(test)]
 fn declared_bounds_json() -> serde_json::Value {
     serde_json::json!({
         "max_facts": MAX_FACTS,
@@ -3707,6 +3719,7 @@ mod tests {
         command.spawn().unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_writer(
         home: &Path,
         workspace: &Path,
@@ -4532,7 +4545,8 @@ mod tests {
         .unwrap();
         let path = path_for(&address).unwrap();
         let good: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
+        type EnvelopeMutator = Box<dyn Fn(&mut serde_json::Value)>;
+        let cases: Vec<(&str, EnvelopeMutator)> = vec![
             (
                 "future_schema",
                 Box::new(|v| v["schema"] = serde_json::json!("grokptah.memory.v3")),
@@ -4707,7 +4721,7 @@ mod tests {
             CommitCutpoint::AfterRenameBeforeDirFsync,
             CommitCutpoint::BeforeRename
         );
-        assert!(MAX_FACTS < 81);
+        const { assert!(MAX_FACTS < 81) };
         assert_eq!(SCHEMA_V2, "grokptah.memory.v2");
         let lexical_wrong = "2024-01-01T00:00:00-05:00" < "2024-01-01T04:00:00Z";
         let parsed_right = parse_timestamp("2024-01-01T00:00:00-05:00").unwrap()
