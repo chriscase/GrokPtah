@@ -263,6 +263,12 @@ pub enum ProbeAction {
     AttemptInvalidWorkInputResolution,
     ObserveNativeTicks,
     ClaimRetriedWork,
+    FailWork,
+    CreateManagerPlan,
+    InspectManagerPlan,
+    AdvanceManagerPlan,
+    TickManagerPlan,
+    ReplanManagerPlan,
 }
 
 impl ProbeAction {
@@ -293,6 +299,12 @@ impl ProbeAction {
             Self::CreateWork | Self::CreateDependency | Self::CreateChildWork => {
                 &["ptah_create_work"]
             }
+            Self::FailWork => &["ptah_fail_work"],
+            Self::CreateManagerPlan => &["ptah_create_manager_plan"],
+            Self::InspectManagerPlan => &["ptah_get_manager_plan"],
+            Self::AdvanceManagerPlan => &["ptah_advance_manager_plan"],
+            Self::TickManagerPlan => &["ptah_tick_manager_plan"],
+            Self::ReplanManagerPlan => &["ptah_replan_manager_plan"],
             Self::InspectWork => &["ptah_get_work"],
             Self::InspectWorkSet => &["ptah_list_work"],
             Self::InspectWorkAttempts => &["ptah_get_work"],
@@ -396,6 +408,7 @@ impl ProbeAction {
                 | Self::InspectManagedPolicy
                 | Self::ObserveNativeTicks
                 | Self::WaitForManagedAdmission
+                | Self::InspectManagerPlan
         )
     }
 }
@@ -425,6 +438,8 @@ pub enum DurableEntity {
     Cursor,
     Permission,
     ExecutionIntent,
+    ManagerPlan,
+    ManagerStep,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -462,6 +477,8 @@ pub enum DurableState {
     Failed,
     Cancelled,
     Interrupted,
+    NeedsReplan,
+    Superseded,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -518,6 +535,11 @@ pub enum OracleCode {
     ContinuationRunCreated,
     CheckpointUsedForContinuation,
     ResumeRequestReplayStable,
+    ManagerContainerNotExecutable,
+    ManagerAdvanceRespectsDependencies,
+    ManagerNotificationFencedByWorkRevision,
+    ManagerStalePlanRevisionRejected,
+    ManagerReplanSupersedesAndSucceeds,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1175,6 +1197,7 @@ fn validate_action_sequence(probe: &ProbeDefinition, actions: &HashSet<ProbeActi
         ProbeAction::AttemptCrossWorkspaceMutation,
         ProbeAction::RepeatBoundedCycle,
         ProbeAction::InspectManagedPolicy,
+        ProbeAction::CreateManagerPlan,
     ] {
         if let Some(consumer_at) = position(consumer) {
             let setup_at = setup_at.context("probe action has no self-contained Agent setup")?;
@@ -1331,6 +1354,9 @@ fn validate_action_sequence(probe: &ProbeDefinition, actions: &HashSet<ProbeActi
     if actions.contains(&ProbeAction::ClaimWork)
         && !actions.contains(&ProbeAction::AssignWork)
         && !actions.contains(&ProbeAction::AcceptWork)
+        // A manager plan materializes its own child Work, so advancing the
+        // plan is that Work's admission path.
+        && !actions.contains(&ProbeAction::AdvanceManagerPlan)
     {
         bail!("Work claim has no direct assignment or accepted offer");
     }
