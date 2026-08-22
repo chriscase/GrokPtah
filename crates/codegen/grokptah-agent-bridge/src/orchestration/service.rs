@@ -56,6 +56,20 @@ use super::workload::{
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
 
+fn provider_projection_error(_error: anyhow::Error) -> OrchError {
+    OrchError::new(
+        OrchErrorCode::Internal,
+        "provider execution ledger is unavailable",
+    )
+}
+
+fn provider_projection_overflow() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::Internal,
+        "provider execution ledger totals overflowed",
+    )
+}
+
 #[derive(Default)]
 struct AdmissionQueueState {
     pending: VecDeque<PendingRun>,
@@ -5004,7 +5018,7 @@ impl OrchestrationService {
         }))
     }
 
-    pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+    pub fn get_capacity(&self, auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
         let max = self.host.orchestration_capacity_limit();
         let active = self.host.orchestration_active_count();
         let queued = self.host.orchestration_pending_count();
@@ -5047,12 +5061,14 @@ impl OrchestrationService {
             .last_error
             .as_deref()
             .map(|error| self.bus.redact_text(error, 500));
+        let provider_quota = self.provider_quota_capacity_projection(auth)?;
         Ok(json!({
             "maxConcurrentRuns": max,
             "activeRuns": active,
             "available": max.saturating_sub(active),
             "queuedRuns": queued,
             "queueLimit": MAX_PENDING_ADMISSIONS,
+            "providerQuota": provider_quota,
             "health": {
                 "laggedLiveEvents": self.bus.lagged_event_count(),
                 "eventJournalPersistenceError": event_error,
@@ -5090,8 +5106,11 @@ impl OrchestrationService {
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
-        serde_json::to_value(run)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
+        let provider_execution = self.provider_execution_projection(&run)?;
+        let mut value = serde_json::to_value(run)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        value["providerExecution"] = provider_execution;
+        Ok(value)
     }
 
     pub fn get_progress(
@@ -5115,6 +5134,7 @@ impl OrchestrationService {
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
+        let provider_execution = self.provider_execution_projection(&run)?;
         Ok(json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
@@ -5131,6 +5151,168 @@ impl OrchestrationService {
             "stopCause": run.stop_cause,
             "bounds": run.bounds,
             "errorCode": run.error_code,
+            "providerExecution": provider_execution,
+        }))
+    }
+
+    fn provider_execution_projection(
+        &self,
+        run: &RunRecord,
+    ) -> Result<serde_json::Value, OrchError> {
+        let Some(route) = run.provider_route.as_ref() else {
+            return Ok(serde_json::Value::Null);
+        };
+        route.validate()?;
+        let quota = match route.quota_reservation_id.as_deref() {
+            Some(reservation_id) => {
+                let reservation = self
+                    .store
+                    .load_quota_reservation(reservation_id)
+                    .map_err(provider_projection_error)?
+                    .ok_or_else(|| {
+                        OrchError::new(
+                            OrchErrorCode::Internal,
+                            "provider quota reservation is missing",
+                        )
+                    })?;
+                if reservation.run_id != run.run_id
+                    || reservation.route_snapshot_hash != route.snapshot_hash
+                    || reservation.pool.provider_id != route.provider_id
+                {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Internal,
+                        "provider quota reservation does not match the Run",
+                    ));
+                }
+                json!({
+                    "reservationId": reservation.reservation_id,
+                    "poolId": reservation.pool_id,
+                    "class": reservation.pool.class,
+                    "state": reservation.state,
+                    "tokensReserved": reservation.tokens_reserved,
+                    "tokensConsumed": reservation.tokens_consumed,
+                    "requestsReserved": reservation.requests_reserved,
+                    "requestsConsumed": reservation.requests_consumed,
+                    "windowStartedAt": reservation.window_started_at,
+                    "limits": reservation.limits,
+                    "updatedAt": reservation.updated_at,
+                })
+            }
+            None => serde_json::Value::Null,
+        };
+        let mut attempts = self
+            .store
+            .list_provider_attempts()
+            .map_err(provider_projection_error)?
+            .into_iter()
+            .filter(|attempt| attempt.run_id == run.run_id)
+            .collect::<Vec<_>>();
+        attempts.sort_by(|left, right| {
+            left.ordinal
+                .cmp(&right.ordinal)
+                .then(left.attempt_id.cmp(&right.attempt_id))
+        });
+        let attempt_count = attempts.len();
+        const MAX_PROJECTED_PROVIDER_ATTEMPTS: usize = 128;
+        let truncated = attempt_count > MAX_PROJECTED_PROVIDER_ATTEMPTS;
+        attempts.truncate(MAX_PROJECTED_PROVIDER_ATTEMPTS);
+        let attempts = attempts
+            .into_iter()
+            .map(|attempt| {
+                json!({
+                    "attemptId": attempt.attempt_id,
+                    "ordinal": attempt.ordinal,
+                    "state": attempt.state,
+                    "sendCertainty": attempt.send_certainty,
+                    "retryClass": attempt.retry_class,
+                    "httpStatus": attempt.http_status,
+                    "usage": attempt.usage,
+                    "createdAt": attempt.created_at,
+                    "updatedAt": attempt.updated_at,
+                    "finishedAt": attempt.finished_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "route": {
+                "providerId": route.provider_id,
+                "kind": route.kind,
+                "dialect": route.dialect,
+                "modelId": route.model_id,
+                "wireModelId": route.wire_model_id,
+                "capabilitySource": route.capabilities.source,
+                "qualificationSchema": route.capabilities.qualification_schema,
+                "deadlineClass": route.deadline_class,
+                "effort": route.effort,
+                "snapshotHash": route.snapshot_hash,
+            },
+            "quota": quota,
+            "attempts": attempts,
+            "attemptCount": attempt_count,
+            "attemptsTruncated": truncated,
+            "usageComplete": run.aggregates.usage_complete,
+            "pendingRequests": run.aggregates.usage_pending_requests,
+        }))
+    }
+
+    fn provider_quota_capacity_projection(
+        &self,
+        auth: &AuthContext,
+    ) -> Result<serde_json::Value, OrchError> {
+        let reservations = self
+            .store
+            .list_quota_reservations()
+            .map_err(provider_projection_error)?;
+        let mut active = 0u64;
+        let mut consumed = 0u64;
+        let mut released = 0u64;
+        let mut tokens_reserved = 0u64;
+        let mut tokens_consumed = 0u64;
+        let mut requests_reserved = 0u64;
+        let mut requests_consumed = 0u64;
+        let mut providers = std::collections::BTreeSet::new();
+        for reservation in reservations
+            .into_iter()
+            .filter(|reservation| reservation.pool.owner_id == auth.owner_id)
+        {
+            providers.insert(reservation.pool.provider_id.clone());
+            match reservation.state {
+                super::quota::QuotaReservationState::Reserved => {
+                    active += 1;
+                    tokens_reserved = tokens_reserved
+                        .checked_add(reservation.tokens_reserved)
+                        .ok_or_else(provider_projection_overflow)?;
+                    requests_reserved = requests_reserved
+                        .checked_add(reservation.requests_reserved)
+                        .ok_or_else(provider_projection_overflow)?;
+                }
+                super::quota::QuotaReservationState::Consumed => {
+                    consumed += 1;
+                    tokens_consumed = tokens_consumed
+                        .checked_add(reservation.tokens_consumed)
+                        .ok_or_else(provider_projection_overflow)?;
+                    requests_consumed = requests_consumed
+                        .checked_add(reservation.requests_consumed)
+                        .ok_or_else(provider_projection_overflow)?;
+                }
+                super::quota::QuotaReservationState::Refunded
+                | super::quota::QuotaReservationState::Expired => released += 1,
+            }
+        }
+        const MAX_PROJECTED_PROVIDERS: usize = 64;
+        let provider_count = providers.len();
+        let providers_truncated = provider_count > MAX_PROJECTED_PROVIDERS;
+        Ok(json!({
+            "activeReservations": active,
+            "consumedReservations": consumed,
+            "releasedReservations": released,
+            "tokensReserved": tokens_reserved,
+            "tokensConsumed": tokens_consumed,
+            "requestsReserved": requests_reserved,
+            "requestsConsumed": requests_consumed,
+            "providers": providers.into_iter().take(MAX_PROJECTED_PROVIDERS).collect::<Vec<_>>(),
+            "providerCount": provider_count,
+            "providersTruncated": providers_truncated,
         }))
     }
 

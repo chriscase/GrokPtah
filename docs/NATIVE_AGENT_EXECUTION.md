@@ -189,6 +189,30 @@ and a durable Run never refreshes and resends after a definitive 401. A
 source-boundary regression test rejects those capabilities if they enter the
 adapter implementation.
 
+### Operator projection
+
+`ptah_get_run` and `ptah_get_progress` expose a bounded
+`providerExecution` projection for Runs with a frozen provider route. It joins
+the route, its quota reservation, and durable provider attempts, and refuses
+missing or mismatched ledger links instead of showing a partial healthy view.
+Attempts are ordered by ordinal and stable ID and capped at 128 with explicit
+count and truncation fields.
+
+The projection includes provider/model identity, route snapshot hash, quota
+state and limits, attempt state and retry classification, and authoritative
+usage completeness. It deliberately omits the provider base URL, credential
+reference and fingerprint, bearer material, request/response bodies, and any
+provider error body. The persisted Run remains backward compatible; the
+projection is the safe operator-facing summary rather than a replacement for
+the frozen route contract.
+
+`ptah_get_capacity` adds an owner-scoped `providerQuota` summary. It reports
+reservation counts, token/request totals, and a bounded sorted set of provider
+IDs only for the authenticated owner. It does not disclose another owner's
+workspace, provider identity, credential identity, or quota use. The desktop
+remote client preserves this projection as JSON and the desktop protocol gives
+it an explicit typed contract.
+
 ## Work-attempt / Run relationship
 
 A `ManagedExecutionIntent` binds, under the store lock:

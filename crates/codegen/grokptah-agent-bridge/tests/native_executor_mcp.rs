@@ -741,6 +741,49 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
     assert_eq!(admitted_attempts[0].run_id, run.run_id);
     assert_eq!(admitted_attempts[0].state, ProviderAttemptState::Admitted);
     assert_eq!(admitted_attempts[0].send_certainty, None);
+    let admitted_view = orch
+        .get_run_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
+        .unwrap();
+    let provider_execution = &admitted_view["providerExecution"];
+    assert_eq!(provider_execution["route"]["providerId"], "env-grokptah");
+    assert_eq!(
+        provider_execution["route"]["wireModelId"],
+        "native-route-model"
+    );
+    assert_eq!(
+        provider_execution["route"]["snapshotHash"],
+        run_route.snapshot_hash
+    );
+    assert_eq!(provider_execution["quota"]["state"], "reserved");
+    assert_eq!(provider_execution["attemptCount"], 1);
+    assert_eq!(provider_execution["attempts"][0]["state"], "admitted");
+    assert!(provider_execution["route"].get("credentialRef").is_none());
+    assert!(provider_execution["route"]
+        .get("credentialFingerprint")
+        .is_none());
+    assert!(provider_execution["route"].get("baseUrl").is_none());
+    let projection_text = provider_execution.to_string();
+    assert!(!projection_text.contains(&run_route.credential_ref));
+    assert!(!projection_text.contains(&run_route.credential_fingerprint));
+    assert!(!projection_text.contains(&run_route.base_url));
+    let progress = orch
+        .get_progress_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
+        .unwrap();
+    assert_eq!(progress["providerExecution"], *provider_execution);
+    let admitted_capacity = orch.get_capacity(&auth()).unwrap();
+    assert_eq!(admitted_capacity["providerQuota"]["activeReservations"], 1);
+    assert_eq!(
+        admitted_capacity["providerQuota"]["providers"][0],
+        "env-grokptah"
+    );
+    let foreign_capacity = orch
+        .get_capacity(&AuthContext {
+            token_id: "foreign-token".into(),
+            owner_id: "foreign-owner".into(),
+        })
+        .unwrap();
+    assert_eq!(foreign_capacity["providerQuota"]["activeReservations"], 0);
+    assert_eq!(foreign_capacity["providerQuota"]["providerCount"], 0);
 
     release.add_permits(1);
     let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -783,6 +826,25 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         Some(10)
     );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
+    let settled_view = orch
+        .get_run_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
+        .unwrap();
+    assert_eq!(
+        settled_view["providerExecution"]["quota"]["state"],
+        "consumed"
+    );
+    assert_eq!(
+        settled_view["providerExecution"]["attempts"][0]["sendCertainty"],
+        "known_accepted"
+    );
+    assert_eq!(
+        settled_view["providerExecution"]["attempts"][0]["retryClass"],
+        "explicit_new_run_only"
+    );
+    let settled_capacity = orch.get_capacity(&auth()).unwrap();
+    assert_eq!(settled_capacity["providerQuota"]["activeReservations"], 0);
+    assert_eq!(settled_capacity["providerQuota"]["consumedReservations"], 1);
+    assert_eq!(settled_capacity["providerQuota"]["tokensConsumed"], 10);
 
     orch.stop_background_tasks().await;
     host.stop().unwrap();

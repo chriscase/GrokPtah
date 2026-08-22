@@ -596,7 +596,7 @@ pub async fn remote_service_run_get(
     session_id: String,
     workspace: String,
     run_id: String,
-) -> Result<grokptah_agent_bridge::RunRecord, String> {
+) -> Result<serde_json::Value, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .remote_service

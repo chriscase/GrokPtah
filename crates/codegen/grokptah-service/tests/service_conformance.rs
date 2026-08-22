@@ -1049,6 +1049,11 @@ async fn hosted_service_exposes_native_executor_controls() {
         .get("nativeExecutor")
         .is_some());
     assert_eq!(
+        capacity.structured["providerQuota"]["activeReservations"],
+        0
+    );
+    assert_eq!(capacity.structured["providerQuota"]["providerCount"], 0);
+    assert_eq!(
         capacity.structured["health"]["managerSupervisor"]["enabled"],
         true
     );

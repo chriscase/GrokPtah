@@ -564,7 +564,7 @@ impl RemoteServiceState {
         session_id: Uuid,
         workspace: String,
         run_id: String,
-    ) -> Result<Option<RunRecord>> {
+    ) -> Result<Option<Value>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
@@ -1274,18 +1274,16 @@ impl RemoteServiceClient {
         session_id: Uuid,
         workspace: String,
         run_id: String,
-    ) -> Result<RunRecord> {
-        let value = self
-            .call_tool(
-                "ptah_get_run",
-                json!({
-                    "session_id": session_id,
-                    "workspace": workspace,
-                    "run_id": run_id,
-                }),
-            )
-            .await?;
-        serde_json::from_value(value).context("decode remote durable run")
+    ) -> Result<Value> {
+        self.call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "run_id": run_id,
+            }),
+        )
+        .await
     }
 
     async fn get_events(
@@ -1752,6 +1750,16 @@ mod tests {
             .unwrap()
             .iter()
             .any(|run| run.run_id == submission.run_id));
+        let remote_run = client
+            .get_run(
+                session.session_id,
+                session.workspace.clone(),
+                submission.run_id.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remote_run["runId"], submission.run_id);
+        assert!(remote_run.get("providerExecution").is_some());
         assert!(RemoteServiceClient::connect(base_url, "wrong-token".into())
             .await
             .is_err());
