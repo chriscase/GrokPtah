@@ -7561,23 +7561,29 @@ impl AgentHostHandle {
             if let Some(rounds) = effective_max_rounds {
                 bounds.max_rounds = bounds.max_rounds.min(rounds).max(1);
             }
-            Some(
-                self.admit_desktop_build_run(
-                    session_id,
-                    &cwd,
-                    &prompt,
-                    bounds,
-                    start_seq,
-                    turn_id,
-                    provider_route.clone(),
-                    agent.as_ref().map(|agent| agent.agent_id.clone()),
-                    agent
-                        .as_ref()
-                        .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
-                    resume.as_ref().map(|plan| plan.parent_run_id.clone()),
-                    resume.as_ref(),
-                )?,
-            )
+            match self.admit_desktop_build_run(
+                session_id,
+                &cwd,
+                &prompt,
+                bounds,
+                start_seq,
+                turn_id,
+                provider_route.clone(),
+                agent.as_ref().map(|agent| agent.agent_id.clone()),
+                agent
+                    .as_ref()
+                    .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
+                resume.as_ref().map(|plan| plan.parent_run_id.clone()),
+                resume.as_ref(),
+            ) {
+                Ok(admitted) => Some(admitted),
+                Err(error) if resume.is_some() => {
+                    return Err(anyhow!(
+                        "persistent continuation could not create and activate its durable Run: {error}"
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
