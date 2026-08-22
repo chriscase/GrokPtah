@@ -1,0 +1,122 @@
+{
+  "schema": "grokptah.shared-black-box-fixture.v1",
+  "version": "v1",
+  "requestIds": {
+    "createSession": "sbb-v1-create-session",
+    "bootstrapSubmit": "sbb-v1-bootstrap-submit",
+    "setManaged": "sbb-v1-set-managed",
+    "createNativeWork": "sbb-v1-create-native-work",
+    "assignNativeWork": "sbb-v1-assign-native-work",
+    "createManagerPlan": "sbb-v1-create-manager-plan",
+    "tickManagerPlan": "sbb-v1-tick-manager-plan",
+    "cancelChildWork": "sbb-v1-cancel-child-work",
+    "createRestartWork": "sbb-v1-create-restart-work",
+    "assignRestartWork": "sbb-v1-assign-restart-work"
+  },
+  "identities": {
+    "providerId": "env-grokptah",
+    "modelId": "grok-build",
+    "sessionTitle": "shared-black-box-v1",
+    "nativeWorkTitle": "sbb-v1-ordinary-native",
+    "restartWorkTitle": "sbb-v1-restart-cut",
+    "managerPlanTitle": "sbb-v1-manager-plan"
+  },
+  "objectives": {
+    "bootstrap": "shared-black-box-v1-bootstrap-session-agent",
+    "ordinaryNative": "shared-black-box-v1-ordinary-native",
+    "managerGoal": "shared-black-box-v1-manager-goal",
+    "restartCut": "shared-black-box-v1-restart-cut"
+  },
+  "proposal": {
+    "targetRelativePath": "proposal-escape.txt"
+  },
+  "policies": {
+    "managed": {
+      "enabled": true,
+      "maxConcurrentRuns": 1,
+      "maxTotalTokens": 100000,
+      "retryEligible": true,
+      "requiresApprovalBeforeExecution": false,
+      "allowedWorkKinds": ["native", "manager-decision"]
+    },
+    "ordinaryNativeWork": {
+      "retry": {
+        "maxAttempts": 1,
+        "retryFailed": false,
+        "retryExpired": false,
+        "backoffMs": 0
+      },
+      "bounds": {
+        "maxPromptBytes": 65536,
+        "maxRounds": 4,
+        "maxDurationMs": 60000,
+        "maxTotalTokens": 1000
+      }
+    },
+    "restartWork": {
+      "retry": {
+        "maxAttempts": 2,
+        "retryFailed": true,
+        "retryExpired": true,
+        "backoffMs": 0
+      },
+      "bounds": {
+        "maxPromptBytes": 65536,
+        "maxRounds": 4,
+        "maxDurationMs": 3600000,
+        "maxTotalTokens": 1000
+      }
+    },
+    "managerPlan": {
+      "autonomous": true,
+      "maxInFlight": 1
+    }
+  },
+  "secrets": {
+    "mcpBearer": "sbb-v1-mcp-bearer-7f3c9e1a4b8d2e6f0c5a9d3b7e1f4a8c",
+    "apiKey": "sbb-v1-api-key-1a2b3c4d5e6f708192a3b4c5d6e7f809",
+    "privateGatewayMarker": "sbb-v1-private-gateway-sentinel"
+  },
+  "bounds": {
+    "maxLogicalTicks": 64,
+    "advanceNativeMs": 1000,
+    "advanceSupervisorMs": 2000,
+    "maxYieldsPerWait": 32
+  },
+  "expectedObservations": {
+    "ordinaryNative": {
+      "work": 1,
+      "intent": 1,
+      "run": 1,
+      "providerAttempt": 1,
+      "http": 1,
+      "quotaReservation": 1,
+      "quotaConsumed": true,
+      "requests": 1,
+      "tokens": 10
+    },
+    "manager": {
+      "decision": 1,
+      "decisionWork": 1,
+      "decisionRun": 1,
+      "proposalHttp": 2,
+      "permissionRequests": 0,
+      "permissionGrants": 0,
+      "filesystemWrites": 0
+    },
+    "restart": {
+      "work": 1,
+      "workAttempt": 1,
+      "intent": 1,
+      "run": 1,
+      "providerAttempt": 1,
+      "sendCertainty": "UncertainAccept",
+      "retryClass": "ExplicitNewRunOnly",
+      "quotaReservation": 1,
+      "quotaStatus": "Reserved",
+      "refund": false,
+      "http": 1,
+      "queued": false
+    }
+  }
+}
