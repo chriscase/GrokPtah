@@ -904,6 +904,54 @@ export interface ProviderQualificationReport {
   computerUseTier: ComputerUseTier;
 }
 
+export type QualificationEvidence = "measured" | "declared" | "stale" | "unknown";
+
+export type AdmissionEligibility =
+  | "measured_eligible"
+  | "declared_unmeasured"
+  | "requalify_required"
+  | "discussion_only"
+  | "credential_missing"
+  | "unknown"
+  | "configuration_incomplete";
+
+export type AdmissionReasonCode =
+  | "measured_eligible"
+  | "declared_first_use"
+  | "requalify_required"
+  | "tools_not_permitted"
+  | "chat_eligible"
+  | "unknown_capabilities"
+  | "chat_not_permitted"
+  | "credential_missing"
+  | "configuration_incomplete";
+
+export interface PurposeAdmission {
+  eligibility: AdmissionEligibility;
+  permitted: boolean;
+  reasonCode: AdmissionReasonCode;
+}
+
+export interface ComputerUseAdmission {
+  tier: ComputerUseTier;
+  source: "declared" | "measured" | "unknown";
+  enabled: boolean;
+}
+
+export interface NativeCodingReadinessProjection {
+  schema: "grokptah.native-coding-readiness.v1" | string;
+  ownerId: string;
+  providerId: string;
+  modelId: string;
+  qualificationEvidence: QualificationEvidence;
+  execution: PurposeAdmission;
+  managerProposal: PurposeAdmission;
+  computerUse: ComputerUseAdmission;
+  credentialPresent: boolean;
+  configurationComplete: boolean;
+  managedByEnv: boolean;
+}
+
 export type ComputerUseTier =
   | "none"
   | "observe"

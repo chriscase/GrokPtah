@@ -9,7 +9,9 @@ mod common;
 use std::time::Duration;
 
 use grokptah_agent_bridge::{
-    AuthCredential, LiveNotification, McpControlClient, McpRemoteError, RunScope,
+    save_gateway_config, scan_value_for_forbidden_data, AuthCredential, CapabilitySource,
+    GatewayConfig, LiveNotification, McpControlClient, McpRemoteError, ModelCapabilities,
+    ProviderModel, ProviderProfile, RunScope,
 };
 use grokptah_service::{start_service, ServiceConfig};
 use serde_json::json;
@@ -1171,4 +1173,66 @@ async fn wait_run_not_queued(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn seed_declared_coding_profile() {
+    let mut model = ProviderModel::unqualified("Team/Code:Cheap");
+    model.capabilities = ModelCapabilities {
+        chat: true,
+        tools: true,
+        stream: true,
+        source: CapabilitySource::Declared,
+        ..ModelCapabilities::default()
+    };
+    let mut profile = ProviderProfile::openai_compatible(
+        "company-gateway",
+        "Company gateway",
+        "http://127.0.0.1:9/v1",
+    );
+    profile.upsert_model(model);
+    let mut config = GatewayConfig::default();
+    config.upsert_profile(profile).unwrap();
+    save_gateway_config(&config).unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn hosted_service_reports_the_same_native_coding_readiness_as_the_host() {
+    let env = ServiceEnv::new();
+    seed_declared_coding_profile();
+    let workspace = env.workspace_path();
+    let handle = start_isolated(&env, vec![workspace], 2).await;
+    let host = handle.host();
+    let from_host =
+        serde_json::to_value(host.native_coding_readiness("company-gateway", "Team/Code:Cheap"))
+            .unwrap();
+    assert_eq!(from_host["schema"], "grokptah.native-coding-readiness.v1");
+    assert_eq!(from_host["ownerId"], "primary");
+    assert_eq!(from_host["qualificationEvidence"], "declared");
+    assert_eq!(from_host["execution"]["eligibility"], "credential_missing");
+    assert_eq!(from_host["computerUse"]["enabled"], false);
+    scan_value_for_forbidden_data(&from_host).unwrap();
+    assert!(!from_host.to_string().contains("http://"));
+    assert!(!from_host.to_string().contains("127.0.0.1"));
+
+    let mut client = mcp_client(handle.addr).await;
+    let tools = client.list_tools().await.unwrap();
+    assert!(tools
+        .iter()
+        .any(|tool| tool.name == "ptah_get_native_coding_readiness"));
+    let from_mcp = client
+        .call_tool(
+            "ptah_get_native_coding_readiness",
+            json!({
+                "providerId": "company-gateway",
+                "modelId": "Team/Code:Cheap",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!from_mcp.is_error, "{:?}", from_mcp.raw);
+    assert_eq!(from_mcp.structured, from_host);
+
+    client.close_session().await.unwrap();
+    handle.stop_and_wait().await;
 }

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
   ComputerUseTier,
+  NativeCodingReadinessProjection,
   ProviderModelSummary,
   ProviderProfileSummary,
   ProviderQualificationReport,
@@ -16,6 +17,7 @@ import {
   computerUseTierLabel,
   deriveProviderReadiness,
   ProviderReadinessCenter,
+  QUALIFICATION_EVIDENCE_LABEL,
   READINESS_VERDICT_LABEL,
   sanitizeReadinessText,
   type ProviderReadinessInput,
@@ -85,6 +87,33 @@ function report(
   };
 }
 
+function hostAdmission(
+  overrides: Partial<NativeCodingReadinessProjection> = {},
+): NativeCodingReadinessProjection {
+  return {
+    schema: "grokptah.native-coding-readiness.v1",
+    ownerId: "primary",
+    providerId: "company-gateway",
+    modelId: "Team/Code:Cheap",
+    qualificationEvidence: "unknown",
+    execution: {
+      eligibility: "unknown",
+      permitted: false,
+      reasonCode: "unknown_capabilities",
+    },
+    managerProposal: {
+      eligibility: "unknown",
+      permitted: false,
+      reasonCode: "unknown_capabilities",
+    },
+    computerUse: { tier: "none", source: "unknown", enabled: false },
+    credentialPresent: true,
+    configurationComplete: true,
+    managedByEnv: false,
+    ...overrides,
+  };
+}
+
 function input(
   overrides: Partial<ProviderReadinessInput> = {},
 ): ProviderReadinessInput {
@@ -96,6 +125,7 @@ function input(
     modelId: selected.models[0].id,
     profile: selected,
     report: null,
+    admission: hostAdmission(),
     busy: false,
     error: null,
     saveDisabled: false,
@@ -144,6 +174,21 @@ describe("deriveProviderReadiness", () => {
     const view = deriveProviderReadiness(
       input({
         profile: profile({ credentialSet: false, models: [measured] }),
+        admission: hostAdmission({
+          qualificationEvidence: "measured",
+          credentialPresent: false,
+          execution: {
+            eligibility: "credential_missing",
+            permitted: false,
+            reasonCode: "credential_missing",
+          },
+          managerProposal: {
+            eligibility: "credential_missing",
+            permitted: false,
+            reasonCode: "credential_missing",
+          },
+          computerUse: { tier: "none", source: "measured", enabled: false },
+        }),
       }),
     );
     expect(view.verdict).toBe("credential_missing");
@@ -157,9 +202,10 @@ describe("deriveProviderReadiness", () => {
     expectSecretFree(serialized(view));
   });
 
-  it("never treats unknown or declared capabilities as coding-ready", () => {
+  it("distinguishes unknown from declared first-use eligibility", () => {
     const unknown = deriveProviderReadiness(input());
     expect(unknown.verdict).toBe("not_qualified");
+    expect(unknown.qualificationEvidence).toBe("unknown");
     expect(unknown.nextAction.id).toBe("qualify_model");
 
     const declaredModel = model({
@@ -170,13 +216,37 @@ describe("deriveProviderReadiness", () => {
       computerCapabilitySource: "declared",
     });
     const declared = deriveProviderReadiness(
-      input({ profile: profile({ models: [declaredModel] }) }),
+      input({
+        profile: profile({ models: [declaredModel] }),
+        admission: hostAdmission({
+          qualificationEvidence: "declared",
+          execution: {
+            eligibility: "declared_unmeasured",
+            permitted: true,
+            reasonCode: "declared_first_use",
+          },
+          managerProposal: {
+            eligibility: "declared_unmeasured",
+            permitted: true,
+            reasonCode: "chat_eligible",
+          },
+          computerUse: {
+            tier: "semantic_act",
+            source: "declared",
+            enabled: false,
+          },
+        }),
+      }),
     );
-    expect(declared.verdict).toBe("not_qualified");
-    expect(declared.verdictLabel).toBe(READINESS_VERDICT_LABEL.not_qualified);
+    expect(declared.verdict).toBe("eligible_unmeasured");
+    expect(declared.verdictLabel).toBe(READINESS_VERDICT_LABEL.eligible_unmeasured);
+    expect(declared.qualificationEvidence).toBe("declared");
+    expect(declared.evidenceLabel).toBe(QUALIFICATION_EVIDENCE_LABEL.declared);
     expect(declared.codingProvenance).toBe("declared");
     expect(declared.computerUse.source).toBe("declared");
+    expect(declared.computerUse.enabled).toBe(false);
     expect(declared.computerUse.summary).toMatch(/not a measured qualification/i);
+    expect(declared.managerProposalPermitted).toBe(true);
     expect(declared.checks.find((item) => item.id === "native_tool_call")?.status).toBe(
       "declared",
     );
@@ -192,6 +262,20 @@ describe("deriveProviderReadiness", () => {
           codingReady: true,
           computerUseTier: "none",
         }),
+        admission: hostAdmission({
+          qualificationEvidence: "measured",
+          execution: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "measured_eligible",
+          },
+          managerProposal: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "chat_eligible",
+          },
+          computerUse: { tier: "none", source: "measured", enabled: false },
+        }),
       }),
     );
     expect(view.verdict).toBe("ready");
@@ -204,7 +288,22 @@ describe("deriveProviderReadiness", () => {
   });
 
   it("uses discussion only with the exact tool or continuation failure", () => {
-    const tools = deriveProviderReadiness(input({ report: report() }));
+    const discussionAdmission = hostAdmission({
+      qualificationEvidence: "measured",
+      execution: {
+        eligibility: "discussion_only",
+        permitted: false,
+        reasonCode: "tools_not_permitted",
+      },
+      managerProposal: {
+        eligibility: "measured_eligible",
+        permitted: true,
+        reasonCode: "chat_eligible",
+      },
+    });
+    const tools = deriveProviderReadiness(
+      input({ report: report(), admission: discussionAdmission }),
+    );
     expect(tools.verdict).toBe("discussion_only");
     expect(tools.blockingReasons.map((item) => item.label)).toEqual(
       expect.arrayContaining(["Native tool calls", "Tool-result continuation"]),
@@ -220,6 +319,7 @@ describe("deriveProviderReadiness", () => {
           toolResultContinuation: check("fail", "Continuation rejected"),
           codingReady: false,
         }),
+        admission: discussionAdmission,
       }),
     );
     expect(continuation.verdict).toBe("discussion_only");
@@ -251,6 +351,24 @@ describe("deriveProviderReadiness", () => {
           staleObservationRecovery: check("pass", "Replacement frame used"),
           computerUseTier: tier,
         }),
+        admission: hostAdmission({
+          qualificationEvidence: "measured",
+          execution: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "measured_eligible",
+          },
+          managerProposal: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "chat_eligible",
+          },
+          computerUse: {
+            tier,
+            source: "measured",
+            enabled: tier !== "none",
+          },
+        }),
       }),
     );
     expect(view.verdict).toBe("ready");
@@ -272,6 +390,21 @@ describe("deriveProviderReadiness", () => {
         profile: profile({
           managedByEnv: true,
           models: [measured],
+        }),
+        admission: hostAdmission({
+          qualificationEvidence: "measured",
+          managedByEnv: true,
+          execution: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "measured_eligible",
+          },
+          managerProposal: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "chat_eligible",
+          },
+          computerUse: { tier: "observe", source: "measured", enabled: true },
         }),
         qualifyDisabled: true,
         saveDisabled: true,
@@ -304,6 +437,20 @@ describe("deriveProviderReadiness", () => {
         profile: selected,
         modelId: chatOnly.id,
         report: report({ modelId: chatOnly.id, codingReady: false }),
+        admission: hostAdmission({
+          modelId: chatOnly.id,
+          qualificationEvidence: "measured",
+          execution: {
+            eligibility: "discussion_only",
+            permitted: false,
+            reasonCode: "tools_not_permitted",
+          },
+          managerProposal: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "chat_eligible",
+          },
+        }),
       }),
     );
     const switched = deriveProviderReadiness(
@@ -311,6 +458,20 @@ describe("deriveProviderReadiness", () => {
         profile: selected,
         modelId: readyModel.id,
         report: null,
+        admission: hostAdmission({
+          modelId: readyModel.id,
+          qualificationEvidence: "measured",
+          execution: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "measured_eligible",
+          },
+          managerProposal: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "chat_eligible",
+          },
+        }),
       }),
     );
     expect(stale.verdict).toBe("discussion_only");
@@ -343,6 +504,19 @@ describe("deriveProviderReadiness", () => {
           streaming: check("pass", "Streaming passed"),
           codingReady: true,
         }),
+        admission: hostAdmission({
+          qualificationEvidence: "measured",
+          execution: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "measured_eligible",
+          },
+          managerProposal: {
+            eligibility: "measured_eligible",
+            permitted: true,
+            reasonCode: "chat_eligible",
+          },
+        }),
         error: `401 api_key=${SECRET}`,
       }),
     );
@@ -359,6 +533,22 @@ describe("deriveProviderReadiness", () => {
         baseUrl: "",
         modelId: "",
         profile: null,
+        admission: hostAdmission({
+          providerId: "",
+          modelId: "",
+          configurationComplete: false,
+          credentialPresent: false,
+          execution: {
+            eligibility: "configuration_incomplete",
+            permitted: false,
+            reasonCode: "configuration_incomplete",
+          },
+          managerProposal: {
+            eligibility: "configuration_incomplete",
+            permitted: false,
+            reasonCode: "configuration_incomplete",
+          },
+        }),
         saveDisabled: true,
       }),
     );
@@ -369,12 +559,63 @@ describe("deriveProviderReadiness", () => {
     const unsaved = deriveProviderReadiness(
       input({
         profile: null,
+        admission: hostAdmission({
+          configurationComplete: false,
+          execution: {
+            eligibility: "configuration_incomplete",
+            permitted: false,
+            reasonCode: "configuration_incomplete",
+          },
+          managerProposal: {
+            eligibility: "configuration_incomplete",
+            permitted: false,
+            reasonCode: "configuration_incomplete",
+          },
+        }),
         saveDisabled: false,
       }),
     );
     expect(unsaved.verdict).toBe("configuration_incomplete");
     expect(unsaved.nextAction.id).toBe("save_provider");
     expect(unsaved.nextAction.disabled).toBe(false);
+  });
+
+  it("separates admission eligibility from stale qualification evidence", () => {
+    const view = deriveProviderReadiness(
+      input({
+        profile: profile({
+          models: [
+            model({
+              capabilitySource: "declared",
+              supportsTools: true,
+              supportsStream: true,
+            }),
+          ],
+        }),
+        admission: hostAdmission({
+          qualificationEvidence: "stale",
+          execution: {
+            eligibility: "requalify_required",
+            permitted: false,
+            reasonCode: "requalify_required",
+          },
+          managerProposal: {
+            eligibility: "declared_unmeasured",
+            permitted: true,
+            reasonCode: "chat_eligible",
+          },
+        }),
+      }),
+    );
+    expect(view.verdict).toBe("requalify_required");
+    expect(view.verdictLabel).toBe(READINESS_VERDICT_LABEL.requalify_required);
+    expect(view.admissionLabel).toBe(READINESS_VERDICT_LABEL.requalify_required);
+    expect(view.qualificationEvidence).toBe("stale");
+    expect(view.evidenceLabel).toBe(QUALIFICATION_EVIDENCE_LABEL.stale);
+    expect(view.managerProposalPermitted).toBe(true);
+    expect(view.nextAction.id).toBe("qualify_model");
+    expect(view.summary).toMatch(/requalif/i);
+    expect(view.nextAction.description).toMatch(/Qualify this exact model before Execution/);
   });
 });
 
@@ -387,6 +628,19 @@ describe("ProviderReadinessCenter", () => {
         {...input({
           report: report({
             nativeToolCall: check("fail", `No native tool call ${SECRET}`),
+          }),
+          admission: hostAdmission({
+            qualificationEvidence: "measured",
+            execution: {
+              eligibility: "discussion_only",
+              permitted: false,
+              reasonCode: "tools_not_permitted",
+            },
+            managerProposal: {
+              eligibility: "measured_eligible",
+              permitted: true,
+              reasonCode: "chat_eligible",
+            },
           }),
         })}
         {...noop}
@@ -410,6 +664,15 @@ describe("ProviderReadinessCenter", () => {
     expect(screen.getByTestId("readiness-details")).toHaveTextContent("codingReady");
     expect(screen.getByTestId("readiness-details")).toHaveTextContent("Team/Code:Cheap");
     expect(screen.getByTestId("readiness-next-action")).toHaveAccessibleName("Qualify model");
+    expect(screen.getByTestId("readiness-admission-eligibility")).toHaveTextContent(
+      READINESS_VERDICT_LABEL.discussion_only,
+    );
+    expect(screen.getByTestId("readiness-qualification-evidence")).toHaveTextContent(
+      QUALIFICATION_EVIDENCE_LABEL.measured,
+    );
+    expect(screen.getByTestId("readiness-manager-proposal")).toHaveTextContent(
+      /Eligible for ManagerProposal/,
+    );
     expectSecretFree(region.textContent ?? "");
     fireEvent.click(screen.getByTestId("readiness-next-action"));
     expect(onQualify).toHaveBeenCalledOnce();
@@ -426,6 +689,20 @@ describe("ProviderReadinessCenter", () => {
       <ProviderReadinessCenter
         {...input({
           profile: profile({ credentialSet: false, models: [measured] }),
+          admission: hostAdmission({
+            qualificationEvidence: "measured",
+            credentialPresent: false,
+            execution: {
+              eligibility: "credential_missing",
+              permitted: false,
+              reasonCode: "credential_missing",
+            },
+            managerProposal: {
+              eligibility: "credential_missing",
+              permitted: false,
+              reasonCode: "credential_missing",
+            },
+          }),
         })}
         {...noop}
         onResolveCredentials={onResolve}
@@ -450,7 +727,23 @@ describe("ProviderReadinessCenter", () => {
     const onQualify = vi.fn();
     render(
       <ProviderReadinessCenter
-        {...input({ busy: true, report: report() })}
+        {...input({
+          busy: true,
+          report: report(),
+          admission: hostAdmission({
+            qualificationEvidence: "measured",
+            execution: {
+              eligibility: "discussion_only",
+              permitted: false,
+              reasonCode: "tools_not_permitted",
+            },
+            managerProposal: {
+              eligibility: "measured_eligible",
+              permitted: true,
+              reasonCode: "chat_eligible",
+            },
+          }),
+        })}
         {...noop}
         onQualifyModel={onQualify}
       />,

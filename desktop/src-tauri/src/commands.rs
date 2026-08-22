@@ -2117,6 +2117,15 @@ pub fn settings_snapshot(state: State<'_, AppState>) -> serde_json::Value {
 }
 
 #[tauri::command]
+pub fn native_coding_readiness(
+    state: State<'_, AppState>,
+    provider_id: String,
+    model_id: String,
+) -> grokptah_agent_bridge::NativeCodingReadinessProjection {
+    state.host.native_coding_readiness(&provider_id, &model_id)
+}
+
+#[tauri::command]
 pub fn set_sandbox(state: State<'_, AppState>, profile: String) {
     state.host.set_sandbox(profile);
 }

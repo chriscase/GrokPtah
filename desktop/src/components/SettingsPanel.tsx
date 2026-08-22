@@ -7,6 +7,7 @@ import type {
   ComputerPlatformStatus,
   ComputerTargetCandidate,
   ModelInfo,
+  NativeCodingReadinessProjection,
   ProviderProfileSummary,
   ProviderQualificationReport,
 } from "../lib/protocol";
@@ -88,6 +89,8 @@ export function SettingsPanel({
   const [qualificationError, setQualificationError] = useState<string | null>(
     null,
   );
+  const [hostAdmission, setHostAdmission] =
+    useState<NativeCodingReadinessProjection | null>(null);
   const gatewayKeyRef = useRef<HTMLInputElement>(null);
   const qualifyInFlight = useRef(false);
   const readinessSelection = useRef(0);
@@ -175,6 +178,22 @@ export function SettingsPanel({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
+  useEffect(() => {
+    if (!open || section !== "auth") return;
+    let cancelled = false;
+    void api
+      .nativeCodingReadiness(gatewayProvider, gatewayModel)
+      .then((projection) => {
+        if (!cancelled) setHostAdmission(projection);
+      })
+      .catch(() => {
+        if (!cancelled) setHostAdmission(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, section, gatewayProvider, gatewayModel, snap]);
+
   if (!open) return null;
 
   async function apply<T>(fn: () => Promise<T>, okMsg?: string) {
@@ -241,6 +260,7 @@ export function SettingsPanel({
     readinessSelection.current += 1;
     setLiveQualification(null);
     setQualificationError(null);
+    setHostAdmission(null);
   }
 
   function applyGatewayModel(value: string) {
@@ -322,6 +342,9 @@ export function SettingsPanel({
       if (readinessSelection.current !== selectionAtStart) return;
       setLiveQualification(report);
       readinessReportSelection.current = selectionAtStart;
+      const projection = await api.nativeCodingReadiness(providerId, modelId);
+      if (readinessSelection.current !== selectionAtStart) return;
+      setHostAdmission(projection);
       await refresh();
       onChromeChange();
     } catch (error) {
@@ -1057,6 +1080,7 @@ export function SettingsPanel({
                     modelId={gatewayModel}
                     profile={selectedGateway ?? null}
                     report={activeQualification}
+                    admission={hostAdmission}
                     busy={busy}
                     error={qualificationError}
                     saveDisabled={providerWriteDisabled}

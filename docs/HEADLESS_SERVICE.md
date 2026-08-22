@@ -156,6 +156,12 @@ The protocol-level conformance and soak suite lives beside the service smoke
 tests. It starts disposable temporary workspaces and a real loopback listener.
 It never requires model credentials or outbound network.
 
+CI (`.github/workflows/hosted-service.yml`) formats the crate, runs clippy with
+warnings denied, and executes the complete hosted-service test suite, including
+standalone conformance, on locked dependencies. Manual `workflow_dispatch` is
+supported. Bridge compilation in the desktop workflow is not a substitute for
+these tests.
+
 ```sh
 # Full service crate: unit, smoke, and protocol conformance.
 cargo test --locked --manifest-path crates/codegen/grokptah-service/Cargo.toml

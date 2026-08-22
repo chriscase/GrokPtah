@@ -1651,6 +1651,7 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_list_persistent_agents",
     "ptah_get_persistent_agent",
     "ptah_get_capacity",
+    "ptah_get_native_coding_readiness",
     "ptah_list_runs",
     "ptah_get_run",
     "ptah_get_progress",

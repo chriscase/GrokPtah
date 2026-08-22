@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { SettingsPanel } from "./SettingsPanel";
 import { api } from "../lib/api";
 import { READINESS_VERDICT_LABEL } from "./ProviderReadinessCenter";
+import type { NativeCodingReadinessProjection } from "../lib/protocol";
 
 vi.mock("../lib/api", () => ({
   api: {
@@ -11,6 +12,7 @@ vi.mock("../lib/api", () => ({
     upsertProviderProfile: vi.fn(),
     discoverProviderModels: vi.fn(),
     qualifyProviderModel: vi.fn(),
+    nativeCodingReadiness: vi.fn(),
     deleteProviderProfile: vi.fn(),
   },
 }));
@@ -62,6 +64,113 @@ const discussionReport = {
   computerUseTier: "none" as const,
 };
 
+function admission(
+  overrides: Partial<NativeCodingReadinessProjection> = {},
+): NativeCodingReadinessProjection {
+  return {
+    schema: "grokptah.native-coding-readiness.v1",
+    ownerId: "primary",
+    providerId: profile.id,
+    modelId: unknownModel.id,
+    qualificationEvidence: "unknown",
+    execution: {
+      eligibility: "unknown",
+      permitted: false,
+      reasonCode: "unknown_capabilities",
+    },
+    managerProposal: {
+      eligibility: "unknown",
+      permitted: false,
+      reasonCode: "unknown_capabilities",
+    },
+    computerUse: { tier: "none", source: "unknown", enabled: false },
+    credentialPresent: true,
+    configurationComplete: true,
+    managedByEnv: false,
+    ...overrides,
+  };
+}
+
+function admissionFromReport(
+  report: typeof discussionReport,
+): NativeCodingReadinessProjection {
+  if (report.codingReady) {
+    return admission({
+      modelId: report.modelId,
+      qualificationEvidence: "measured",
+      execution: {
+        eligibility: "measured_eligible",
+        permitted: true,
+        reasonCode: "measured_eligible",
+      },
+      managerProposal: {
+        eligibility: "measured_eligible",
+        permitted: true,
+        reasonCode: "chat_eligible",
+      },
+      computerUse: {
+        tier: report.computerUseTier,
+        source: "measured",
+        enabled: report.computerUseTier !== "none",
+      },
+    });
+  }
+  return admission({
+    modelId: report.modelId,
+    qualificationEvidence: "measured",
+    execution: {
+      eligibility: "discussion_only",
+      permitted: false,
+      reasonCode: "tools_not_permitted",
+    },
+    managerProposal: {
+      eligibility: "measured_eligible",
+      permitted: true,
+      reasonCode: "chat_eligible",
+    },
+  });
+}
+
+function admissionForModel(modelId: string): NativeCodingReadinessProjection {
+  const trimmed = modelId.trim();
+  if (trimmed === readyModel.id) {
+    return admission({
+      modelId,
+      qualificationEvidence: "measured",
+      execution: {
+        eligibility: "measured_eligible",
+        permitted: true,
+        reasonCode: "measured_eligible",
+      },
+      managerProposal: {
+        eligibility: "measured_eligible",
+        permitted: true,
+        reasonCode: "chat_eligible",
+      },
+      computerUse: { tier: "observe", source: "measured", enabled: true },
+    });
+  }
+  return admission({ modelId });
+}
+
+async function hostAdmission(
+  modelId: string,
+): Promise<NativeCodingReadinessProjection> {
+  const results = vi.mocked(api.qualifyProviderModel).mock.results;
+  for (let index = results.length - 1; index >= 0; index -= 1) {
+    const result = results[index];
+    if (result.type !== "return") continue;
+    const report = await result.value;
+    if (
+      report &&
+      (report.modelId === modelId || report.modelId === modelId.trim())
+    ) {
+      return admissionFromReport(report);
+    }
+  }
+  return admissionForModel(modelId);
+}
+
 function renderSettings() {
   return render(
     <SettingsPanel
@@ -93,6 +202,9 @@ describe("provider profile settings (#278)", () => {
     vi.mocked(api.upsertProviderProfile).mockResolvedValue(undefined);
     vi.mocked(api.discoverProviderModels).mockResolvedValue([]);
     vi.mocked(api.qualifyProviderModel).mockResolvedValue(discussionReport);
+    vi.mocked(api.nativeCodingReadiness).mockImplementation(
+      async (_providerId: string, modelId: string) => hostAdmission(modelId),
+    );
   });
 
   afterEach(cleanup);
@@ -190,7 +302,7 @@ describe("provider profile settings (#278)", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /Team\/Code:Ready/ }));
-    expect(screen.getByTestId("readiness-verdict")).toHaveTextContent(
+    expect(await screen.findByTestId("readiness-verdict")).toHaveTextContent(
       READINESS_VERDICT_LABEL.ready,
     );
     expect(screen.queryByTestId("readiness-blocking-reasons")).toBeNull();
@@ -232,6 +344,24 @@ describe("provider profile settings (#278)", () => {
         },
       ],
     });
+    vi.mocked(api.nativeCodingReadiness).mockResolvedValue(
+      admission({
+        modelId: readyModel.id,
+        qualificationEvidence: "measured",
+        managedByEnv: true,
+        execution: {
+          eligibility: "measured_eligible",
+          permitted: true,
+          reasonCode: "measured_eligible",
+        },
+        managerProposal: {
+          eligibility: "measured_eligible",
+          permitted: true,
+          reasonCode: "chat_eligible",
+        },
+        computerUse: { tier: "observe", source: "measured", enabled: true },
+      }),
+    );
     await openGateway();
     expect(screen.getByTestId("gateway-qualify")).toBeDisabled();
     expect(screen.getByTestId("gateway-save")).toBeDisabled();
@@ -255,6 +385,24 @@ describe("provider profile settings (#278)", () => {
         },
       ],
     });
+    vi.mocked(api.nativeCodingReadiness).mockResolvedValue(
+      admission({
+        modelId: readyModel.id,
+        qualificationEvidence: "measured",
+        credentialPresent: false,
+        execution: {
+          eligibility: "credential_missing",
+          permitted: false,
+          reasonCode: "credential_missing",
+        },
+        managerProposal: {
+          eligibility: "credential_missing",
+          permitted: false,
+          reasonCode: "credential_missing",
+        },
+        computerUse: { tier: "observe", source: "measured", enabled: true },
+      }),
+    );
     await openGateway();
     expect(screen.getByTestId("readiness-verdict")).toHaveTextContent(
       READINESS_VERDICT_LABEL.credential_missing,

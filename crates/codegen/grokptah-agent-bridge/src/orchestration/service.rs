@@ -62,35 +62,15 @@ fn validate_provider_route_capabilities(
     stale_measured_qualification: bool,
 ) -> Result<(), OrchError> {
     route.validate()?;
-    if route.capabilities.source == crate::gateway_config::CapabilitySource::Unknown {
-        return Err(OrchError::new(
-            OrchErrorCode::Conflict,
-            "provider route must be qualified or explicitly declared before autonomous admission",
-        ));
-    }
-    if !route.capabilities.chat {
-        return Err(OrchError::new(
-            OrchErrorCode::Conflict,
-            "provider qualification does not allow chat generation",
-        ));
-    }
-    if purpose == RunPurpose::Execution {
-        if stale_measured_qualification
-            && route.capabilities.source == crate::gateway_config::CapabilitySource::Declared
-        {
-            return Err(OrchError::new(
-                OrchErrorCode::Conflict,
-                "provider qualification changed; requalify before autonomous execution",
-            ));
-        }
-        if !route.capabilities.tools {
-            return Err(OrchError::new(
-                OrchErrorCode::Conflict,
-                "provider qualification does not allow native coding tools",
-            ));
-        }
-    }
-    Ok(())
+    crate::native_coding_readiness::admit_purpose(
+        purpose,
+        route.capabilities.source,
+        route.capabilities.chat,
+        route.capabilities.tools,
+        stale_measured_qualification,
+    )
+    .orch_error()
+    .map_or(Ok(()), Err)
 }
 
 fn validate_provider_route_for_purpose(
@@ -5136,6 +5116,43 @@ impl OrchestrationService {
                 "nativeExecutor": self.native_executor.lock().clone(),
             },
         }))
+    }
+
+    pub fn get_native_coding_readiness(
+        &self,
+        auth: &AuthContext,
+        provider_id: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (provider_id, model_id) = match (
+            provider_id.map(str::trim).filter(|value| !value.is_empty()),
+            model_id.map(str::trim).filter(|value| !value.is_empty()),
+        ) {
+            (None, None) => self
+                .host
+                .current_provider_model_selection()
+                .unwrap_or_default(),
+            (Some(provider_id), Some(model_id)) => (provider_id.to_string(), model_id.to_string()),
+            _ => {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "providerId and modelId must both be supplied or both omitted",
+                ))
+            }
+        };
+        let projection = crate::native_coding_readiness::project_for_owner(
+            &auth.owner_id,
+            &provider_id,
+            &model_id,
+        );
+        let value = crate::native_coding_readiness::projection_value(&projection);
+        if crate::native_coding_readiness::projection_contains_forbidden_fields(&value) {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "native coding readiness projection refused to serialize",
+            ));
+        }
+        Ok(value)
     }
 
     pub fn get_run(

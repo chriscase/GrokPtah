@@ -134,6 +134,30 @@ real native admission lifecycle. Ambient bypass settings and a permissive
 Agent policy cannot turn a ManagerProposal tool request into a mutation or an
 approval prompt; the model receives a host-authored denial as tool output.
 
+### Native coding readiness projection
+
+Desktop, loopback MCP, and standalone `grokptah-service` expose one
+host-authored admission record for an exact provider/model:
+
+- schema `grokptah.native-coding-readiness.v1`
+- MCP tool `ptah_get_native_coding_readiness`
+- desktop command `native_coding_readiness`
+
+The record separates **admission eligibility** (what the host will currently
+permit for Execution and ManagerProposal) from **qualification evidence**
+(measured, declared, stale, or unknown). TypeScript may label that record; it
+must not recreate the capability gate. Computer Use is projected independently
+and never becomes enabled merely because coding tools are ready.
+
+The projection is owner-scoped and secret-free. It omits API keys, bearer
+values, credential references and fingerprints, base URLs, raw provider
+bodies, unrelated provider identities, and cross-owner quota.
+
+Declared chat+tools routes remain eligible for first-use Execution before any
+measured history exists. After a measured xAI record exists, falling back to
+declared capabilities blocks Execution and reports requalification. Chat-only
+measured capability admits ManagerProposal and refuses Execution.
+
 ### Durable provider quota
 
 Online native Runs also reserve a durable, provider-neutral quota row before

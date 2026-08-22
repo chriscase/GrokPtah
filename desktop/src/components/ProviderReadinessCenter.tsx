@@ -1,18 +1,30 @@
 import type {
+  AdmissionEligibility,
   ComputerUseTier,
+  NativeCodingReadinessProjection,
   ProviderModelSummary,
   ProviderProfileSummary,
   ProviderQualificationReport,
   QualificationCheck,
+  QualificationEvidence,
 } from "../lib/protocol";
 import "./ProviderReadinessCenter.css";
 
 export const READINESS_VERDICT_LABEL = {
   ready: "Ready for native coding",
+  eligible_unmeasured: "Eligible — not yet measured",
+  requalify_required: "Requalification required",
   discussion_only: "Discussion only",
   credential_missing: "Credential missing",
   not_qualified: "Not qualified",
   configuration_incomplete: "Configuration incomplete",
+} as const;
+
+export const QUALIFICATION_EVIDENCE_LABEL = {
+  measured: "Measured",
+  declared: "Declared; not yet measured",
+  stale: "Stale; requalification required",
+  unknown: "Unknown",
 } as const;
 
 export type ReadinessVerdict = keyof typeof READINESS_VERDICT_LABEL;
@@ -58,6 +70,7 @@ export type ProviderReadinessInput = {
   modelId: string;
   profile: ProviderProfileSummary | null;
   report: ProviderQualificationReport | null;
+  admission: NativeCodingReadinessProjection | null;
   busy: boolean;
   error: string | null;
   saveDisabled: boolean;
@@ -71,6 +84,11 @@ export type ProviderReadinessView = {
   tone: "ok" | "attention" | "danger" | "neutral";
   announce: "status" | "alert";
   summary: string;
+  admissionLabel: string;
+  evidenceLabel: string;
+  qualificationEvidence: QualificationEvidence;
+  managerProposalPermitted: boolean;
+  managerProposalLabel: string;
   providerId: string;
   providerLabel: string;
   modelId: string;
@@ -84,6 +102,7 @@ export type ProviderReadinessView = {
     tier: ComputerUseTier;
     label: string;
     source: CapabilityProvenance;
+    enabled: boolean;
     summary: string;
     observationDetail: string | null;
     staleRecoveryDetail: string | null;
@@ -206,6 +225,27 @@ function computerSummary(
   }
 }
 
+export function verdictFromEligibility(
+  eligibility: AdmissionEligibility,
+): ReadinessVerdict {
+  switch (eligibility) {
+    case "measured_eligible":
+      return "ready";
+    case "declared_unmeasured":
+      return "eligible_unmeasured";
+    case "requalify_required":
+      return "requalify_required";
+    case "discussion_only":
+      return "discussion_only";
+    case "credential_missing":
+      return "credential_missing";
+    case "configuration_incomplete":
+      return "configuration_incomplete";
+    default:
+      return "not_qualified";
+  }
+}
+
 function nextActionFor(
   verdict: ReadinessVerdict,
   input: ProviderReadinessInput,
@@ -221,7 +261,7 @@ function nextActionFor(
     };
   }
 
-  if (!configurationComplete(input) || !input.profile) {
+  if (verdict === "configuration_incomplete" || !input.profile) {
     return {
       id: "save_provider",
       label: "Save provider",
@@ -231,7 +271,7 @@ function nextActionFor(
     };
   }
 
-  if (!input.profile.credentialSet) {
+  if (verdict === "credential_missing") {
     return {
       id: "resolve_credentials",
       label: "Add provider key",
@@ -277,7 +317,11 @@ function nextActionFor(
     description:
       verdict === "discussion_only"
         ? "Qualification already measured this exact model as discussion-only. Re-run only after the provider or model changes."
-        : "Qualify this exact model to measure native tool calls, continuation, streaming, and Computer Use.",
+        : verdict === "eligible_unmeasured"
+        ? "The host will currently admit native coding on this declared route. Qualify to measure the exact model."
+        : verdict === "requalify_required"
+          ? "Measured evidence is stale for this route or credential. Qualify this exact model before Execution."
+          : "Qualify this exact model to measure native tool calls, continuation, streaming, and Computer Use.",
     disabled: input.qualifyDisabled,
   };
 }
@@ -288,36 +332,37 @@ export function deriveProviderReadiness(
   const profile = input.profile;
   const selectedModel = selectModelSummary(profile, input.modelId);
   const report = input.report;
-  const managedByEnv = Boolean(profile?.managedByEnv);
-  const credentialSet = Boolean(profile?.credentialSet);
+  const admission =
+    input.admission &&
+    input.admission.providerId === input.providerId &&
+    (input.admission.modelId === input.modelId ||
+      input.admission.modelId.trim() === input.modelId.trim())
+      ? input.admission
+      : null;
+  const managedByEnv = Boolean(admission?.managedByEnv ?? profile?.managedByEnv);
+  const credentialSet = Boolean(
+    admission?.credentialPresent ?? profile?.credentialSet,
+  );
   const hasSavedProfile = profile !== null;
-  const complete = configurationComplete(input);
-  const codingProvenance: CapabilityProvenance = report
-    ? "measured"
-    : provenanceFrom(selectedModel?.capabilitySource);
-  const computerSource: CapabilityProvenance = report
-    ? "measured"
-    : provenanceFrom(selectedModel?.computerCapabilitySource);
-  const computerTier: ComputerUseTier =
-    report?.computerUseTier ?? selectedModel?.computerUseTier ?? "none";
   const error = input.error ? sanitizeReadinessText(input.error) : null;
-
-  let verdict: ReadinessVerdict;
-  if (!complete || !hasSavedProfile) {
-    verdict = "configuration_incomplete";
-  } else if (!credentialSet) {
-    verdict = "credential_missing";
-  } else if (report) {
-    verdict = report.codingReady ? "ready" : "discussion_only";
-  } else if (!selectedModel || codingProvenance === "unknown") {
-    verdict = "not_qualified";
-  } else if (codingProvenance === "declared") {
-    verdict = "not_qualified";
-  } else if (selectedModel.supportsTools) {
-    verdict = "ready";
-  } else {
-    verdict = "discussion_only";
-  }
+  const verdict = admission
+    ? verdictFromEligibility(admission.execution.eligibility)
+    : !configurationComplete(input) || !hasSavedProfile
+      ? "configuration_incomplete"
+      : "not_qualified";
+  const qualificationEvidence: QualificationEvidence =
+    admission?.qualificationEvidence ?? "unknown";
+  const codingProvenance: CapabilityProvenance =
+    qualificationEvidence === "stale" ? "declared" : qualificationEvidence;
+  const computerSource: CapabilityProvenance = provenanceFrom(
+    admission?.computerUse.source ?? selectedModel?.computerCapabilitySource,
+  );
+  const computerTier: ComputerUseTier =
+    admission?.computerUse.tier ??
+    report?.computerUseTier ??
+    selectedModel?.computerUseTier ??
+    "none";
+  const computerEnabled = Boolean(admission?.computerUse.enabled);
 
   const credentialCheck: ReadinessCheckView = {
     id: "credential",
@@ -361,7 +406,7 @@ export function deriveProviderReadiness(
       id: "native_tool_call",
       label: "Native tool calls",
       ...checkText(report.nativeToolCall),
-      blocking: report.nativeToolCall.status !== "pass" && verdict !== "ready",
+      blocking: report.nativeToolCall.status !== "pass" && verdict === "discussion_only",
     };
   } else if (codingProvenance === "declared") {
     native = {
@@ -369,10 +414,10 @@ export function deriveProviderReadiness(
       label: "Native tool calls",
       status: "declared",
       summary: selectedModel?.supportsTools
-        ? "The catalog declares native tools. That is not a measured qualification."
+        ? "The catalog declares native tools. Qualification evidence is still unmeasured."
         : "The catalog does not declare native tools, and nothing has been measured.",
       detail: `declared supportsTools=${String(selectedModel?.supportsTools ?? false)}`,
-      blocking: true,
+      blocking: verdict === "requalify_required" || verdict === "not_qualified",
     };
   } else if (codingProvenance === "measured") {
     native = {
@@ -402,7 +447,8 @@ export function deriveProviderReadiness(
         label: "Tool-result continuation",
         ...checkText(report.toolResultContinuation),
         blocking:
-          report.toolResultContinuation.status !== "pass" && verdict !== "ready",
+          report.toolResultContinuation.status !== "pass" &&
+          verdict === "discussion_only",
       }
     : {
         id: "tool_result_continuation",
@@ -481,14 +527,15 @@ export function deriveProviderReadiness(
           ? "declared"
           : "unknown",
     summary:
-      codingProvenance === "measured"
-        ? "Coding capabilities come from a measured qualification of this exact model."
-        : codingProvenance === "declared"
-          ? "Coding capabilities are declared by the catalog, not measured. This model is not coding-ready."
-          : "Coding capabilities are unknown until this exact model is qualified.",
-    detail: `coding=${codingProvenance} computer=${computerSource}`,
-    blocking:
-      verdict === "not_qualified" && codingProvenance !== "measured",
+      qualificationEvidence === "measured"
+        ? "Qualification evidence is measured for this exact model."
+        : qualificationEvidence === "declared"
+          ? "Qualification evidence is declared, not measured. Admission eligibility is decided by the host."
+          : qualificationEvidence === "stale"
+            ? "Measured evidence exists for this model, but the current route or credential is declared and requires requalification."
+            : "Qualification evidence is unknown until this exact model is qualified.",
+    detail: `coding=${qualificationEvidence} computer=${computerSource}`,
+    blocking: verdict === "requalify_required" || verdict === "not_qualified",
   };
 
   const checks = [
@@ -518,9 +565,15 @@ export function deriveProviderReadiness(
       break;
     case "not_qualified":
       summary =
-        codingProvenance === "declared"
-          ? "Declared catalog capabilities are not a measured qualification. This model is not ready for native coding."
-          : "This exact model has not been qualified. It is not ready for native coding.";
+        "This exact model is unknown to the host. Autonomous Execution and ManagerProposal stay refused until it is declared or measured.";
+      break;
+    case "eligible_unmeasured":
+      summary =
+        "The host will currently admit native coding on this declared first-use route. Qualification evidence has not been measured yet. Computer Use is listed separately and is not implied.";
+      break;
+    case "requalify_required":
+      summary =
+        "Measured qualification history exists for this model, but the current route or credential fell back to declared capabilities. Execution is blocked until this exact route is requalified. ManagerProposal may still use chat.";
       break;
     case "discussion_only": {
       const reasons = blockingReasons
@@ -550,9 +603,16 @@ export function deriveProviderReadiness(
       ? "ok"
       : verdict === "credential_missing"
         ? "danger"
-        : verdict === "discussion_only" || verdict === "not_qualified"
+        : verdict === "discussion_only" ||
+            verdict === "not_qualified" ||
+            verdict === "requalify_required" ||
+            verdict === "eligible_unmeasured"
           ? "attention"
           : "neutral";
+
+  const managerProposalPermitted = Boolean(
+    admission?.managerProposal.permitted,
+  );
 
   return {
     verdict,
@@ -560,6 +620,13 @@ export function deriveProviderReadiness(
     tone,
     announce: verdict === "credential_missing" ? "alert" : "status",
     summary,
+    admissionLabel: READINESS_VERDICT_LABEL[verdict],
+    evidenceLabel: QUALIFICATION_EVIDENCE_LABEL[qualificationEvidence],
+    qualificationEvidence,
+    managerProposalPermitted,
+    managerProposalLabel: managerProposalPermitted
+      ? "Eligible for ManagerProposal (chat only; tools host-denied)"
+      : "Not eligible for ManagerProposal",
     providerId: input.providerId,
     providerLabel: input.providerLabel,
     modelId: input.modelId,
@@ -573,6 +640,7 @@ export function deriveProviderReadiness(
       tier: computerTier,
       label: computerUseTierLabel(computerTier),
       source: computerSource,
+      enabled: computerEnabled,
       summary: computerSummary(computerTier, computerSource),
       observationDetail: report
         ? sanitizeReadinessText(
@@ -627,7 +695,10 @@ export function ProviderReadinessCenter(props: ProviderReadinessCenterProps) {
       className="provider-readiness"
       data-testid="native-coding-readiness"
       data-verdict={view.verdict}
+      data-admission={view.verdict}
+      data-evidence={view.qualificationEvidence}
       data-computer-tier={view.computerUse.tier}
+      data-computer-enabled={String(view.computerUse.enabled)}
       aria-labelledby={headingId}
     >
       <div className="provider-readiness-header">
@@ -656,6 +727,27 @@ export function ProviderReadinessCenter(props: ProviderReadinessCenterProps) {
           {view.verdictLabel}
         </p>
         <p className="provider-readiness-summary">{view.summary}</p>
+      </div>
+
+      <div className="provider-readiness-axes">
+        <div data-testid="readiness-admission-eligibility">
+          <p className="provider-readiness-reasons-label">Admission eligibility</p>
+          <p className="provider-readiness-axis-value">{view.admissionLabel}</p>
+        </div>
+        <div data-testid="readiness-qualification-evidence">
+          <p className="provider-readiness-reasons-label">Qualification evidence</p>
+          <p className="provider-readiness-axis-value">{view.evidenceLabel}</p>
+        </div>
+      </div>
+
+      <div
+        className="provider-readiness-manager"
+        data-testid="readiness-manager-proposal"
+      >
+        <p className="provider-readiness-reasons-label">ManagerProposal</p>
+        <p className="provider-readiness-axis-value">
+          {view.managerProposalLabel}
+        </p>
       </div>
 
       {view.busy && (
@@ -751,6 +843,12 @@ export function ProviderReadinessCenter(props: ProviderReadinessCenterProps) {
             <dd>
               <code>{view.providerId || "(none)"}</code>
             </dd>
+            <dt>Admission eligibility</dt>
+            <dd>{view.admissionLabel}</dd>
+            <dt>Qualification evidence</dt>
+            <dd>{view.qualificationEvidence}</dd>
+            <dt>ManagerProposal</dt>
+            <dd>{view.managerProposalPermitted ? "eligible" : "refused"}</dd>
             <dt>Live report</dt>
             <dd>{view.hasLiveReport ? "yes" : "no"}</dd>
             <dt>codingReady</dt>

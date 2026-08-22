@@ -5695,6 +5695,25 @@ impl AgentHostHandle {
         Ok(found)
     }
 
+    pub fn current_provider_model_selection(&self) -> Option<(String, String)> {
+        let model = self.inner.lock().model.clone();
+        crate::gateway_config::parse_model_selection(&model)
+            .ok()
+            .map(|selection| (selection.provider_id, selection.model_id))
+    }
+
+    pub fn native_coding_readiness(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> crate::native_coding_readiness::NativeCodingReadinessProjection {
+        crate::native_coding_readiness::project_for_owner(
+            crate::native_coding_readiness::DESKTOP_OWNER_ID,
+            provider_id,
+            model_id,
+        )
+    }
+
     pub fn settings_snapshot(&self) -> serde_json::Value {
         // Reconcile legacy dual-control drift so UI never shows conflicting state (#113).
         {

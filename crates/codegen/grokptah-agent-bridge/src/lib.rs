@@ -29,6 +29,7 @@ pub mod mcp_control_client;
 mod mcp_runtime;
 mod memory;
 mod models_catalog;
+mod native_coding_readiness;
 pub mod orchestration;
 mod permission;
 mod process_tree;
@@ -138,6 +139,11 @@ pub use mcp_control_client::{
 };
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
+pub use native_coding_readiness::{
+    project_for_owner as project_native_coding_readiness, AdmissionEligibility,
+    AdmissionReasonCode, ComputerUseAdmission, NativeCodingReadinessProjection, PurposeAdmission,
+    QualificationEvidence, DESKTOP_OWNER_ID, NATIVE_CODING_READINESS_SCHEMA,
+};
 pub use orchestration::{
     is_recognized_test_command, merge_bounds, prompt_preview, safe_id_filename,
     ActivationDisposition, ActivationRecord, AgentAuthorityPolicy, AgentContinuationPlan,

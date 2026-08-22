@@ -170,6 +170,32 @@
   word-break: break-word;
 }
 
+.provider-readiness-axes,
+.provider-readiness-manager {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0.55rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.provider-readiness-manager {
+  grid-template-columns: minmax(0, 1fr);
+  padding: 0.5rem 0.55rem;
+  border-radius: 8px;
+  background: var(--overlay-soft);
+}
+
+.provider-readiness-axis-value {
+  min-width: 0;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .provider-readiness-computer {
   display: flex;
   flex-direction: column;
@@ -300,7 +326,8 @@
 
   .provider-readiness-reason,
   .provider-readiness-check,
-  .provider-readiness-dl {
+  .provider-readiness-dl,
+  .provider-readiness-axes {
     grid-template-columns: minmax(0, 1fr);
   }
 }
