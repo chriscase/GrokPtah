@@ -11,17 +11,17 @@ mod always_on_support;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use grokptah_agent_bridge::orchestration::hash_payload;
 use grokptah_agent_bridge::McpControlClient;
-use serde_json::{json, Value};
+use grokptah_agent_bridge::orchestration::hash_payload;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use always_on_support::{
-    assert_no_duplicate_step, assert_no_quota_ledger, call, call_expect_error, clear_assertions,
-    intents_array, mcp, pending_usage, poll_json, record_assertion, recorded_assertions,
-    repository_commit, rid, runs_array, scan_service_artifacts, scan_text, serial_lock,
-    snapshot_step, try_mcp, work_for_step, work_items, work_kind_count, FakeProvider, Fixture,
-    ProviderDisposition, ProviderScript, ResourceSample, ServiceProcess, FIXTURE_SCHEMA,
+    FIXTURE_SCHEMA, FakeProvider, Fixture, ProviderDisposition, ProviderScript, ResourceSample,
+    ServiceProcess, assert_no_duplicate_step, assert_no_quota_ledger, call, call_expect_error,
+    clear_assertions, intents_array, mcp, pending_usage, poll_json, record_assertion,
+    recorded_assertions, repository_commit, rid, runs_array, scan_service_artifacts, scan_text,
+    serial_lock, snapshot_step, try_mcp, work_for_step, work_items, work_kind_count,
 };
 
 fn managed_policy() -> Value {
@@ -1291,12 +1291,7 @@ async fn fail_closed_invalid_directive_cancel_auth_workspace_provider_faults() {
     auth.scan();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn soak_one_bounded_cycle() {
-    let _serial = serial_lock();
-    clear_assertions();
-    let started = Instant::now();
-    let mut campaign = Campaign::start().await;
+async fn barrier_restart_cycle(campaign: &mut Campaign) -> always_on_support::TargetSnapshot {
     campaign
         .provider
         .arm(&campaign.fixture.step_first, ProviderDisposition::Hold);
@@ -1304,6 +1299,7 @@ async fn soak_one_bounded_cycle() {
     campaign
         .provider
         .wait_accepted(&campaign.fixture.step_first, Duration::from_secs(90));
+    assert_eq!(campaign.provider.count_for(&campaign.fixture.step_first), 1);
     let before = wait_target_in_flight(
         &mut campaign.client,
         campaign.session,
@@ -1312,11 +1308,10 @@ async fn soak_one_bounded_cycle() {
         campaign.provider.count_for(&campaign.fixture.step_first),
     )
     .await;
-    let mut max = campaign.service.sample();
+    let run_id = before.run_id.clone().expect("barrier run id");
+    let work_id = before.work_id.clone().expect("barrier work id");
     campaign.service.kill_sigkill();
     campaign.reopen().await;
-    max.max_with(&campaign.service.sample());
-    let run_id = before.run_id.clone().expect("soak run id");
     let run = poll_json(
         &mut campaign.client,
         "ptah_get_run",
@@ -1331,7 +1326,6 @@ async fn soak_one_bounded_cycle() {
     assert_eq!(run["state"].as_str(), Some("interrupted"));
     assert_eq!(pending_usage(&run), 0);
     assert_eq!(campaign.provider.count_for(&campaign.fixture.step_first), 1);
-    let work_id = before.work_id.clone().expect("soak work id");
     let _ = poll_json(
         &mut campaign.client,
         "ptah_get_work",
@@ -1343,6 +1337,19 @@ async fn soak_one_bounded_cycle() {
         |value| value["work"]["state"].as_str() == Some("failed"),
     )
     .await;
+    let _ = plan_id;
+    before
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn soak_one_bounded_cycle() {
+    let _serial = serial_lock();
+    clear_assertions();
+    let started = Instant::now();
+    let mut campaign = Campaign::start().await;
+    let mut max = campaign.service.sample();
+    let before = barrier_restart_cycle(&mut campaign).await;
+    max.max_with(&campaign.service.sample());
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(campaign.provider.count_for(&campaign.fixture.step_first), 1);
     record_assertion("soak-bounded-cycle-rate");
@@ -1368,7 +1375,6 @@ async fn soak_one_bounded_cycle() {
         "soak10m": "not-run",
         "soak24h": "not-run",
         "clock": campaign.fixture.clock,
-        "planId": plan_id,
         "workId": before.work_id,
         "runId": before.run_id,
         "intentId": before.intent_id,
@@ -1387,29 +1393,28 @@ async fn soak_loop(seconds: u64) {
     let mut cycles = 0u64;
     let mut restarts = 0u64;
     let mut max = ResourceSample::default();
+    let mut max_cycle_latency_ms = 0u64;
+    let mut sends = 0u64;
     let started = Instant::now();
-    let mut last_sends = 0u64;
     let fixture = Fixture::load();
     while Instant::now() < deadline {
+        let cycle_started = Instant::now();
         let mut campaign = Campaign::start().await;
-        campaign
-            .provider
-            .arm(&campaign.fixture.step_first, ProviderDisposition::Hold);
-        let (_plan_id, _) = campaign.create_plan().await;
-        campaign
-            .provider
-            .wait_accepted(&campaign.fixture.step_first, Duration::from_secs(90));
         max.max_with(&campaign.service.sample());
-        campaign.service.kill_sigkill();
-        campaign.reopen().await;
+        let before = barrier_restart_cycle(&mut campaign).await;
+        assert!(before.work_id.is_some() && before.run_id.is_some() && before.attempt_id.is_some());
+        max.max_with(&campaign.service.sample());
+        sends = sends.saturating_add(campaign.provider.send_count());
         restarts += 1;
-        max.max_with(&campaign.service.sample());
-        assert_eq!(campaign.provider.count_for(&campaign.fixture.step_first), 1);
-        last_sends = campaign.provider.send_count();
         cycles += 1;
+        max_cycle_latency_ms = max_cycle_latency_ms.max(cycle_started.elapsed().as_millis() as u64);
         campaign.scan();
     }
-    assert!(cycles >= 1);
+    assert_eq!(restarts, cycles);
+    assert_ne!(
+        cycles, 0,
+        "soak window produced zero barrier-restart cycles"
+    );
     let mut report = json!({
         "schema": "grokptah.always_on_grokbot_soak_report.v1",
         "commitSha": repository_commit(),
@@ -1419,11 +1424,13 @@ async fn soak_loop(seconds: u64) {
         "durationMs": started.elapsed().as_millis() as u64,
         "cycles": cycles,
         "restarts": restarts,
-        "sends": last_sends,
+        "sends": sends,
         "maxRssBytes": max.rss_bytes,
         "maxFdCount": max.fd_count,
         "maxThreads": max.threads,
         "maxDiskBytes": max.disk_bytes,
+        "maxCycleLatencyMs": max_cycle_latency_ms,
+        "redaction": "passed",
         "soak10m": if seconds == 600 { "executed" } else { "not-this-command" },
         "soak24h": if seconds == 86400 { "executed" } else { "not-run" },
         "clock": fixture.clock
