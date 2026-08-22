@@ -6,8 +6,8 @@ use chrono::{Duration, Utc};
 #[cfg(target_os = "macos")]
 use grokptah_agent_bridge::{
     ActionClass, ActionGrant, ComputerAction, ComputerObservation, ComputerObservationPlatform,
-    ComputerRun, ComputerStore, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction,
+    ComputerRun, ComputerStore, ComputerUseLimits, ComputerUseService, MacOsObservationPlatform,
+    SemanticAction,
 };
 #[cfg(target_os = "macos")]
 use uuid::Uuid;
@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
     service
         .act(
             &Uuid::new_v4().to_string(),
+            &ready.effective_principal(),
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -83,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
     service
         .act(
             &Uuid::new_v4().to_string(),
+            &ready.effective_principal(),
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -106,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
     service
         .act(
             &Uuid::new_v4().to_string(),
+            &ready.effective_principal(),
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -142,23 +145,21 @@ async fn authorize_and_observe(
     let now = Utc::now();
     let authorized = service.authorize(
         &Uuid::new_v4().to_string(),
+        &run.effective_principal(),
         &run.run_id,
         run.version,
-        ActionGrant {
-            grant_id: Uuid::new_v4().to_string(),
-            run_id: run.run_id.clone(),
-            target: run.target.clone(),
-            action_classes: BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
-            issued_by: GrantIssuer::LocalUser,
-            issued_at: now,
-            expires_at: now + Duration::seconds(30),
-            uses_remaining: Some(1),
-            revoked_at: None,
-        },
+        ActionGrant::for_run(
+            run,
+            BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+            now,
+            now + Duration::seconds(30),
+            Some(1),
+        ),
     )?;
     let observation = service
         .observe(
             &Uuid::new_v4().to_string(),
+            &authorized.effective_principal(),
             &authorized.run_id,
             authorized.version,
         )

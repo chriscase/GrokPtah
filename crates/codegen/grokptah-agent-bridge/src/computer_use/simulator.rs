@@ -5,14 +5,18 @@ use chrono::Utc;
 use parking_lot::Mutex;
 
 use super::types::{
-    ActionOutcome, ComputerAction, ComputerBackend, ComputerCapabilities, ComputerError,
-    ComputerErrorCode, ComputerObservation, ComputerResult, ComputerTarget, ComputerUseLimits,
-    ObservationGeometry, SemanticAction, SemanticElement, Sensitivity,
+    ActionOutcome, ComputerAction, ComputerBackend, ComputerCapabilities, ComputerCapabilityProof,
+    ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult, ComputerSurfaceBinding,
+    ComputerTarget, ComputerUseLimits, IsolationProofOrigin, ObservationGeometry, SemanticAction,
+    SemanticElement, Sensitivity, SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
+    SIMULATOR_ISOLATED_BACKEND_ID,
 };
 
 #[derive(Debug)]
 pub struct SimulatorBackend {
     state: Mutex<SimulatorState>,
+    proof: ComputerCapabilityProof,
+    surface: ComputerSurfaceBinding,
 }
 
 #[derive(Debug)]
@@ -36,11 +40,64 @@ impl Default for SimulatorBackend {
 
 impl SimulatorBackend {
     pub fn new() -> Self {
+        Self::foreground_semantic()
+    }
+
+    pub fn foreground_semantic() -> Self {
+        Self::with_proof(
+            ComputerCapabilityProof::ForegroundSemantic {
+                backend_id: SIMULATOR_FOREGROUND_BACKEND_ID.into(),
+                observe: true,
+                semantic_actions: true,
+                text_entry: true,
+            },
+            ComputerSurfaceBinding::issue(),
+        )
+    }
+
+    pub fn measured_background_safe() -> Self {
+        Self::with_proof(
+            ComputerCapabilityProof::MeasuredBackgroundSafeSemantic {
+                backend_id: SIMULATOR_BACKGROUND_BACKEND_ID.into(),
+                observe: true,
+                semantic_actions: true,
+                text_entry: true,
+                measurement_id: format!("measurement-{}", uuid::Uuid::new_v4()),
+            },
+            ComputerSurfaceBinding::issue(),
+        )
+    }
+
+    /// Explicit simulator-only isolated fixture. This proof cannot attest a
+    /// native backend as isolated.
+    pub fn independently_isolated() -> Self {
+        let surface = ComputerSurfaceBinding::issue();
+        Self::with_proof(
+            ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+                backend_id: SIMULATOR_ISOLATED_BACKEND_ID.into(),
+                surface_id: surface.surface_id.clone(),
+                incarnation: surface.incarnation.clone(),
+                input_domain_id: format!("input-domain-{}", uuid::Uuid::new_v4()),
+                origin: IsolationProofOrigin::SimulatorFixture,
+                observe: true,
+                semantic_actions: true,
+                text_entry: true,
+                key_chords: true,
+                pointer_fallback: true,
+            },
+            surface,
+        )
+    }
+
+    fn with_proof(proof: ComputerCapabilityProof, surface: ComputerSurfaceBinding) -> Self {
+        proof.validate().expect("simulator fixture proof is valid");
         Self {
             state: Mutex::new(SimulatorState {
                 target: Self::demo_target(),
                 runs: BTreeMap::new(),
             }),
+            proof,
+            surface,
         }
     }
 
@@ -62,14 +119,11 @@ impl SimulatorBackend {
 #[async_trait]
 impl ComputerBackend for SimulatorBackend {
     fn capabilities(&self) -> ComputerCapabilities {
-        ComputerCapabilities {
-            backend_id: "deterministic_simulator".into(),
-            observe: true,
-            semantic_actions: true,
-            text_entry: true,
-            key_chords: false,
-            pointer_fallback: false,
-        }
+        ComputerCapabilities::from_proof(self.proof.clone()).expect("simulator proof is valid")
+    }
+
+    fn surface_binding(&self) -> ComputerSurfaceBinding {
+        self.surface.clone()
     }
 
     async fn observe(
@@ -159,6 +213,7 @@ impl ComputerBackend for SimulatorBackend {
             ],
             elements_truncated: false,
             sensitivity: Sensitivity::None,
+            authority: Default::default(),
         };
         observation.validate(limits)?;
         Ok(observation)
@@ -208,9 +263,25 @@ impl ComputerBackend for SimulatorBackend {
                 run.submitted = true;
                 Ok(ActionOutcome::bounded("submitted demo form", Some(true)))
             }
-            ComputerAction::ActivateTarget | ComputerAction::Wait { .. } => Ok(
+            ComputerAction::ActivateTarget if self.proof.tier().allows_activate_target() => Ok(
                 ActionOutcome::bounded("simulator action completed", Some(true)),
             ),
+            ComputerAction::ActivateTarget => Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "background-safe simulator fixture cannot activate a target",
+            )),
+            ComputerAction::Wait { .. } => Ok(ActionOutcome::bounded(
+                "simulator action completed",
+                Some(true),
+            )),
+            ComputerAction::PointerClick { .. } | ComputerAction::KeyChord { .. }
+                if self.proof.is_simulator_only_isolation() =>
+            {
+                Ok(ActionOutcome::bounded(
+                    "simulator isolated fixture input",
+                    Some(true),
+                ))
+            }
             _ => Err(ComputerError::new(
                 ComputerErrorCode::ForbiddenAction,
                 "simulator does not support this action",
@@ -302,5 +373,84 @@ mod tests {
             .await
             .unwrap();
         assert!(second_again.elements[0].value.is_none());
+    }
+
+    #[tokio::test]
+    async fn capability_fixtures_are_explicit_and_isolated_is_simulator_only() {
+        let background = SimulatorBackend::measured_background_safe();
+        assert_eq!(
+            background.capabilities().tier,
+            crate::computer_use::ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
+        );
+        assert!(!background.capabilities().pointer_fallback);
+        assert!(!background.capabilities().key_chords);
+        let target = SimulatorBackend::demo_target();
+        let observation = background
+            .observe(
+                "bg",
+                "bg-observation",
+                &target,
+                &ComputerUseLimits::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            background
+                .act("bg", &observation, &ComputerAction::ActivateTarget)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::ForbiddenAction
+        );
+
+        let isolated = SimulatorBackend::independently_isolated();
+        assert_eq!(
+            isolated.capabilities().tier,
+            crate::computer_use::ComputerCapabilityTier::IndependentlyIsolatedVisualInputDomain
+        );
+        assert_eq!(
+            isolated.capabilities().proof.isolation_origin(),
+            Some(IsolationProofOrigin::SimulatorFixture)
+        );
+        assert!(isolated.capabilities().proof.is_simulator_only_isolation());
+        assert_ne!(
+            isolated.capabilities().backend_id,
+            crate::computer_use::MACOS_NATIVE_BACKEND_ID
+        );
+        let isolated_obs = isolated
+            .observe(
+                "iso",
+                "iso-observation",
+                &target,
+                &ComputerUseLimits::default(),
+            )
+            .await
+            .unwrap();
+        isolated
+            .act(
+                "iso",
+                &isolated_obs,
+                &ComputerAction::PointerClick {
+                    x: 10.0,
+                    y: 10.0,
+                    button: crate::computer_use::PointerButton::Primary,
+                },
+            )
+            .await
+            .unwrap();
+        isolated
+            .act(
+                "iso",
+                &isolated_obs,
+                &ComputerAction::KeyChord {
+                    keys: vec![crate::computer_use::ComputerKey::Enter],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!SimulatorBackend::new()
+            .capabilities()
+            .proof
+            .isolated_input_is_dispatchable());
     }
 }

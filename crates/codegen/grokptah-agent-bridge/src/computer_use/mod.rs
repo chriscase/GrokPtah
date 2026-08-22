@@ -52,8 +52,12 @@ pub use simulator::SimulatorBackend;
 pub use store::ComputerStore;
 pub use types::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
-    ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
-    ComputerObservation, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
-    EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton, SemanticAction, SemanticElement,
-    Sensitivity,
+    ComputerCapabilities, ComputerCapabilityProof, ComputerCapabilityTier,
+    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerKey, ComputerObservation,
+    ComputerPrincipal, ComputerRun, ComputerRunState, ComputerSurfaceBinding, ComputerTarget,
+    ComputerUseLimits, EvidenceRef, GrantIssuer, IsolationProofOrigin, ObservationAuthority,
+    ObservationGeometry, PointerButton, SemanticAction, SemanticElement, Sensitivity,
+    SurfaceFreshnessFence, MACOS_INTERRUPTED_BACKEND_ID, MACOS_NATIVE_BACKEND_ID,
+    SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
+    SIMULATOR_ISOLATED_BACKEND_ID,
 };

@@ -11,12 +11,13 @@ untrusted app/window content, screenshots, accessibility labels, model output, M
                               |
                               v
        bridge-owned typed run + policy + exact target/observation/grant checks
+       + capability proof, principal, surface incarnation, freshness fence
                               |
              +----------------+----------------+
              |                                 |
        local operator UI                  platform adapter
        approval / Stop / Take over        ScreenCaptureKit + AX
-             |                                 |
+             |                                 |  foreground-semantic only
              +---------------+-----------------+
                              v
                  bounded semantic action only
@@ -35,7 +36,11 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 | Target/window generation drift during observation | Proven fail-closed; the run becomes `failed` and authority is revoked | `computer_use_release_gate::observation_target_drift_fails_inflight_run_and_revokes_authority` |
 | Stale semantic element or geometry/action mismatch | Proven by exact observation, target, element, enabled-state, advertised-action, and bounds checks | policy tests; service stale-observation tests; native action tests |
 | Permission revoked during action | Proven fail-closed; in-flight action fails and authority is cleared | `computer_use_release_gate::permission_revocation_fails_action_and_clears_authority`; native permission-revocation tests |
-| Unsupported host pointer/coordinate fallback | Explicitly unsupported in the first slice; service rejects it before backend dispatch | `computer_use_release_gate::unsupported_pointer_fallback_never_reaches_backend`; proposal schema excludes pointer/key actions |
+| Unsupported host pointer/coordinate fallback | Explicitly unsupported; pointer/key require an independently isolated input-domain proof even if legacy booleans or blanket grant classes are true | `computer_use_release_gate::unsupported_pointer_fallback_never_reaches_backend`; policy `pointer_and_key_require_isolated_proof_even_with_grant_class`; typed `ComputerCapabilityProof` |
+| Legacy/missing isolation fields | Deserialize to unproven or foreground-only; cannot authorize background, isolated, pointer, or key actions | `types` hydrate/from_wire tests; store restart coerces isolated/background proof to unproven |
+| Principal mismatch (session / Agent / spec revision) | Denied before grant, observation, action, evidence read, and takeover | policy and `ComputerUseService` principal-mismatch tests |
+| Surface/incarnation/epoch/frame/freshness mismatch | Denied before backend dispatch; wall-clock alone is not proof | policy surface/epoch/freshness tests |
+| Simulator isolated fixture used as native isolation | Simulator-only origin; native macOS backends cannot carry isolated proof | simulator fixture tests; `ComputerRun::new_with_isolation` native stamp tests |
 | Duplicate mutation or conflicting request ID | Proven idempotent replay and conflict rejection | `ComputerUseService` idempotency tests; durable store receipt tests |
 | Stop/Take over versus in-flight action completion | Proven that cancellation wins and late completion becomes `uncertain` without incrementing action count | `ComputerUseService::cancellation_wins_over_an_inflight_action_completion`; desktop cockpit takeover tests |
 | Restart during a run or mutation | Proven: active runs become `interrupted`, grants/observations clear, and claimed receipts become `uncertain` | durable store restart tests |
@@ -55,7 +60,10 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 - Keep #271 Computer MCP mutations disabled until the shared event/approval contract and its threat
   review are complete.
 - Keep #288 isolated visual execution disabled until a backend provides a genuinely separate input
-  surface; hidden windows, separate Spaces, and global `CGEvent` injection do not qualify.
+  surface; hidden windows, separate Spaces, and global `CGEvent` injection do not qualify. Stage 1
+  only makes isolation a typed, host-enforced contract. Remaining stages: durable dispatch journal;
+  authenticated isolated helper/input domain; out-of-band preemptive takeover; semantic-first
+  isolated visual fallback; cockpit agent cursor and always-available Stop.
 
 ## Verification command
 

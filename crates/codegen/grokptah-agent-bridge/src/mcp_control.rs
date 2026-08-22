@@ -3848,7 +3848,7 @@ mod tests {
 
     use crate::computer_use::{
         canonical_workspace_string, ActionClass, ActionGrant, ComputerStore, ComputerUseService,
-        GrantIssuer, SimulatorBackend,
+        SimulatorBackend,
     };
 
     struct ComputerFixture {
@@ -4398,19 +4398,16 @@ mod tests {
             computer
                 .authorize(
                     "grant-restart",
+                    &run.effective_principal(),
                     &run.run_id,
                     run.version,
-                    ActionGrant {
-                        grant_id: "grant-restart".into(),
-                        run_id: run.run_id.clone(),
-                        target: run.target.clone(),
-                        action_classes: std::collections::BTreeSet::from([ActionClass::Semantic]),
-                        issued_by: GrantIssuer::LocalUser,
-                        issued_at: now,
-                        expires_at: now + chrono::Duration::minutes(5),
-                        uses_remaining: None,
-                        revoked_at: None,
-                    },
+                    ActionGrant::for_run(
+                        &run,
+                        std::collections::BTreeSet::from([ActionClass::Semantic]),
+                        now,
+                        now + chrono::Duration::minutes(5),
+                        None,
+                    ),
                 )
                 .unwrap();
         }

@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
@@ -16,13 +19,96 @@ use super::store::{ComputerStore, MutationClaim};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
     ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
-    ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
+    ComputerPrincipal, ComputerResult, ComputerRun, ComputerRunState, ComputerSurfaceBinding,
+    ComputerTarget, ComputerUseLimits, ObservationAuthority, SurfaceFreshnessFence,
 };
+
+struct LiveSurface {
+    incarnation: String,
+    tick: AtomicU64,
+}
+
+#[derive(Default)]
+struct LiveSurfaceRegistry {
+    surfaces: Mutex<HashMap<String, LiveSurface>>,
+}
+
+impl LiveSurfaceRegistry {
+    fn register(&self, surface: &ComputerSurfaceBinding) -> ComputerResult<()> {
+        surface.validate()?;
+        let mut surfaces = self.surfaces.lock();
+        if let Some(existing) = surfaces.get(&surface.surface_id) {
+            if existing.incarnation != surface.incarnation {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::TargetChanged,
+                    "live surface incarnation changed",
+                ));
+            }
+            return Ok(());
+        }
+        surfaces.insert(
+            surface.surface_id.clone(),
+            LiveSurface {
+                incarnation: surface.incarnation.clone(),
+                tick: AtomicU64::new(0),
+            },
+        );
+        Ok(())
+    }
+
+    fn snapshot(&self, surface: &ComputerSurfaceBinding) -> ComputerResult<SurfaceFreshnessFence> {
+        surface.validate()?;
+        let surfaces = self.surfaces.lock();
+        let live = surfaces.get(&surface.surface_id).ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "surface incarnation was invalidated by restart",
+            )
+        })?;
+        if live.incarnation != surface.incarnation {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "surface incarnation was invalidated by restart",
+            ));
+        }
+        Ok(SurfaceFreshnessFence {
+            surface_id: surface.surface_id.clone(),
+            incarnation: surface.incarnation.clone(),
+            tick: live.tick.load(Ordering::SeqCst),
+            wall_clock: Some(Utc::now()),
+        })
+    }
+
+    fn tick(&self, surface: &ComputerSurfaceBinding) -> ComputerResult<SurfaceFreshnessFence> {
+        surface.validate()?;
+        let surfaces = self.surfaces.lock();
+        let live = surfaces.get(&surface.surface_id).ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "surface incarnation was invalidated by restart",
+            )
+        })?;
+        if live.incarnation != surface.incarnation {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "surface incarnation was invalidated by restart",
+            ));
+        }
+        let tick = live.tick.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(SurfaceFreshnessFence {
+            surface_id: surface.surface_id.clone(),
+            incarnation: surface.incarnation.clone(),
+            tick,
+            wall_clock: Some(Utc::now()),
+        })
+    }
+}
 
 pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
     store: ComputerStore,
     policy: ComputerPolicy,
+    live_surfaces: LiveSurfaceRegistry,
 }
 
 impl ComputerUseService {
@@ -31,11 +117,14 @@ impl ComputerUseService {
             backend,
             store,
             policy: ComputerPolicy,
+            live_surfaces: LiveSurfaceRegistry::default(),
         }
     }
 
     pub fn capabilities(&self) -> super::types::ComputerCapabilities {
-        self.backend.capabilities()
+        let mut capabilities = self.backend.capabilities();
+        capabilities.hydrate_legacy();
+        capabilities
     }
 
     pub fn list_runs(&self) -> ComputerResult<Vec<ComputerRun>> {
@@ -122,14 +211,20 @@ impl ComputerUseService {
             .ok_or_else(not_available)
     }
 
+    fn require_caller(&self, run: &ComputerRun, caller: &ComputerPrincipal) -> ComputerResult<()> {
+        self.policy.authorize_caller(run, caller)
+    }
+
     pub async fn read_current_evidence(
         &self,
+        caller: &ComputerPrincipal,
         run_id: &str,
         asset_id: &str,
     ) -> ComputerResult<Vec<u8>> {
         validate_id("run_id", run_id)?;
         validate_id("asset_id", asset_id)?;
         let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        self.require_caller(&run, caller)?;
         let evidence = run
             .current_observation
             .as_ref()
@@ -183,7 +278,86 @@ impl ComputerUseService {
         }
         let result = (|| {
             self.store.can_create_run()?;
-            let mut run = ComputerRun::new(owner_session_id, workspace, target, limits)?;
+            let mut capabilities = self.backend.capabilities();
+            capabilities.hydrate_legacy();
+            capabilities.validate()?;
+            if capabilities.proof.backend_id() == crate::computer_use::MACOS_NATIVE_BACKEND_ID
+                && !matches!(
+                    capabilities.proof,
+                    crate::computer_use::ComputerCapabilityProof::ForegroundSemantic { .. }
+                )
+            {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::ForbiddenAction,
+                    "native macOS Computer Use can only advertise foreground-semantic capability",
+                ));
+            }
+            let surface = self.backend.surface_binding();
+            self.live_surfaces.register(&surface)?;
+            let principal = ComputerPrincipal::local_operator(owner_session_id);
+            let mut run = ComputerRun::new_with_isolation(
+                owner_session_id,
+                workspace,
+                target,
+                limits,
+                principal,
+                surface,
+                capabilities.proof,
+            )?;
+            run.record_audit("create_run", "accepted", None, None, None);
+            self.store.save_run(&run)?;
+            Ok(run)
+        })();
+        self.finish_mutation(request_id, &result)?;
+        result
+    }
+
+    pub fn create_run_for(
+        &self,
+        request_id: &str,
+        owner_session_id: Uuid,
+        principal: ComputerPrincipal,
+        workspace: Option<String>,
+        target: ComputerTarget,
+        limits: ComputerUseLimits,
+    ) -> ComputerResult<ComputerRun> {
+        principal.validate()?;
+        if let ComputerPrincipal::LocalOperatorSession { session_id } = &principal {
+            if *session_id != owner_session_id {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "local operator principal does not match the owning session",
+                ));
+            }
+        }
+        target.validate()?;
+        limits.validate()?;
+        let payload = json!({
+            "ownerSessionId": owner_session_id,
+            "principal": principal,
+            "workspace": workspace.as_deref(),
+            "target": target,
+            "limits": limits,
+        });
+        if let Some(replayed) = self.begin_mutation(request_id, "create_run_for", &payload)? {
+            return replayed;
+        }
+        let result = (|| {
+            self.store.can_create_run()?;
+            let mut capabilities = self.backend.capabilities();
+            capabilities.hydrate_legacy();
+            capabilities.validate()?;
+            let surface = self.backend.surface_binding();
+            self.live_surfaces.register(&surface)?;
+            let mut run = ComputerRun::new_with_isolation(
+                owner_session_id,
+                workspace,
+                target,
+                limits,
+                principal,
+                surface,
+                capabilities.proof,
+            )?;
             run.record_audit("create_run", "accepted", None, None, None);
             self.store.save_run(&run)?;
             Ok(run)
@@ -195,6 +369,7 @@ impl ComputerUseService {
     pub fn authorize(
         &self,
         request_id: &str,
+        caller: &ComputerPrincipal,
         run_id: &str,
         expected_version: u64,
         grant: ActionGrant,
@@ -219,7 +394,8 @@ impl ComputerUseService {
                         "operator takeover is absorbing; create a new computer run",
                     ));
                 }
-                self.policy.authorize_grant(run, &grant, Utc::now())?;
+                self.policy
+                    .authorize_grant(run, &grant, Utc::now(), caller)?;
                 run.grant = Some(grant.clone());
                 run.last_error = None;
                 run.transition(ComputerRunState::Ready)?;
@@ -238,6 +414,7 @@ impl ComputerUseService {
     pub async fn observe(
         &self,
         request_id: &str,
+        caller: &ComputerPrincipal,
         run_id: &str,
         expected_version: u64,
     ) -> ComputerResult<ComputerObservation> {
@@ -262,7 +439,7 @@ impl ComputerUseService {
                     budget_error = Some(error);
                     return Ok(());
                 }
-                self.policy.authorize_observation(run, now)?;
+                self.policy.authorize_observation(run, now, caller)?;
                 run.transition(ComputerRunState::Observing)?;
                 run.record_audit("observe", "started", None, None, None);
                 Ok(())
@@ -292,7 +469,17 @@ impl ComputerUseService {
                             observation.validate(&prepared.limits)
                         }
                         .and_then(|()| self.policy.authorize_observation_exposure(&observation))
-                        .map(|()| observation);
+                        .and_then(|()| {
+                            self.live_surfaces.register(&prepared.surface)?;
+                            let freshness = self.live_surfaces.tick(&prepared.surface)?;
+                            let mut observation = observation;
+                            observation.authority = ObservationAuthority::bind(
+                                &prepared,
+                                observation.sequence,
+                                freshness,
+                            )?;
+                            Ok(observation)
+                        });
                         match validated {
                             Ok(observation) => match self.commit_observation(run_id, observation) {
                                 Ok(observation) => Ok(observation),
@@ -325,6 +512,7 @@ impl ComputerUseService {
     pub async fn act(
         &self,
         request_id: &str,
+        caller: &ComputerPrincipal,
         run_id: &str,
         expected_version: u64,
         observation_id: &str,
@@ -376,9 +564,16 @@ impl ComputerUseService {
                         "action observation id is stale",
                     ));
                 }
-                self.policy
-                    .authorize_action(run, &observation, &action, now)?;
-                if !backend_supports_action(&self.backend.capabilities(), action.class()) {
+                let live_fence = self.live_surfaces.snapshot(&run.surface)?;
+                self.policy.authorize_action(
+                    run,
+                    &observation,
+                    &action,
+                    now,
+                    caller,
+                    &live_fence,
+                )?;
+                if !self.backend.capabilities().allows_action(&action) {
                     return Err(ComputerError::new(
                         ComputerErrorCode::ForbiddenAction,
                         "the backend does not support this action class",
@@ -427,6 +622,7 @@ impl ComputerUseService {
     pub async fn pause(
         &self,
         request_id: &str,
+        caller: &ComputerPrincipal,
         run_id: &str,
         expected_version: u64,
     ) -> ComputerResult<ComputerRun> {
@@ -439,6 +635,7 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                self.policy.authorize_caller(run, caller)?;
                 if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
                     return Err(ComputerError::new(
                         ComputerErrorCode::InvalidState,
@@ -469,6 +666,7 @@ impl ComputerUseService {
     pub async fn take_over(
         &self,
         request_id: &str,
+        caller: &ComputerPrincipal,
         run_id: &str,
         expected_version: u64,
     ) -> ComputerResult<ComputerRun> {
@@ -481,6 +679,7 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                self.policy.authorize_caller(run, caller)?;
                 run.transition(ComputerRunState::Paused)?;
                 revoke_authority(run);
                 run.set_control_disposition(ComputerControlDisposition::OperatorTakeover);
@@ -499,7 +698,12 @@ impl ComputerUseService {
         result
     }
 
-    pub async fn cancel(&self, request_id: &str, run_id: &str) -> ComputerResult<ComputerRun> {
+    pub async fn cancel(
+        &self,
+        request_id: &str,
+        caller: &ComputerPrincipal,
+        run_id: &str,
+    ) -> ComputerResult<ComputerRun> {
         validate_id("run_id", run_id)?;
         let payload = json!({ "runId": run_id });
         if let Some(replayed) = self.begin_mutation(request_id, "cancel", &payload)? {
@@ -508,6 +712,7 @@ impl ComputerUseService {
         let cancelled = self
             .store
             .update_run(run_id, |run| {
+                self.policy.authorize_caller(run, caller)?;
                 if !run.state.is_terminal() {
                     run.transition(ComputerRunState::Cancelled)?;
                     revoke_authority(run);
@@ -531,6 +736,7 @@ impl ComputerUseService {
     pub fn complete(
         &self,
         request_id: &str,
+        caller: &ComputerPrincipal,
         run_id: &str,
         expected_version: u64,
     ) -> ComputerResult<ComputerRun> {
@@ -543,6 +749,7 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                self.policy.authorize_caller(run, caller)?;
                 run.transition(ComputerRunState::Completed)?;
                 revoke_authority(run);
                 run.record_audit("complete", "completed", None, None, None);
@@ -580,6 +787,17 @@ impl ComputerUseService {
                         "backend observed a different target",
                     ));
                 }
+                if observation.authority.surface != run.surface
+                    || observation.authority.authority_epoch != run.authority_epoch
+                    || observation.authority.control_epoch != run.control_epoch
+                    || observation.authority.target_generation != run.target.generation
+                {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::StaleObservation,
+                        "observation is not bound to the live surface incarnation and authority epoch",
+                    ));
+                }
+                run.freshness_tick = observation.authority.freshness.tick;
                 if run
                     .current_observation
                     .as_ref()
@@ -789,23 +1007,12 @@ fn ensure_version(run: &ComputerRun, expected_version: u64) -> ComputerResult<()
     Ok(())
 }
 
-fn backend_supports_action(
-    capabilities: &super::types::ComputerCapabilities,
-    action_class: super::types::ActionClass,
-) -> bool {
-    match action_class {
-        super::types::ActionClass::Semantic => capabilities.semantic_actions,
-        super::types::ActionClass::TextEntry => capabilities.text_entry,
-        super::types::ActionClass::KeyChord => capabilities.key_chords,
-        super::types::ActionClass::PointerFallback => capabilities.pointer_fallback,
-    }
-}
-
 fn revoke_authority(run: &mut ComputerRun) {
     if let Some(grant) = &mut run.grant {
         grant.revoked_at.get_or_insert_with(Utc::now);
     }
     run.current_observation = None;
+    run.bump_authority_epoch();
 }
 
 fn unknown_run() -> ComputerError {
@@ -865,6 +1072,10 @@ mod tests {
             self.inner.capabilities()
         }
 
+        fn surface_binding(&self) -> crate::computer_use::ComputerSurfaceBinding {
+            self.inner.surface_binding()
+        }
+
         async fn observe(
             &self,
             run_id: &str,
@@ -919,6 +1130,10 @@ mod tests {
             self.inner.capabilities()
         }
 
+        fn surface_binding(&self) -> crate::computer_use::ComputerSurfaceBinding {
+            self.inner.surface_binding()
+        }
+
         async fn observe(
             &self,
             run_id: &str,
@@ -953,6 +1168,10 @@ mod tests {
     impl ComputerBackend for MismatchedObservationBackend {
         fn capabilities(&self) -> ComputerCapabilities {
             self.inner.capabilities()
+        }
+
+        fn surface_binding(&self) -> crate::computer_use::ComputerSurfaceBinding {
+            self.inner.surface_binding()
         }
 
         async fn observe(
@@ -996,17 +1215,17 @@ mod tests {
 
     fn grant(run: &ComputerRun) -> ActionGrant {
         let now = Utc::now();
-        ActionGrant {
-            grant_id: Uuid::new_v4().to_string(),
-            run_id: run.run_id.clone(),
-            target: run.target.clone(),
-            action_classes: BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
-            issued_by: crate::computer_use::GrantIssuer::LocalUser,
-            issued_at: now,
-            expires_at: now + Duration::minutes(5),
-            uses_remaining: Some(8),
-            revoked_at: None,
-        }
+        ActionGrant::for_run(
+            run,
+            BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+            now,
+            now + Duration::minutes(5),
+            Some(8),
+        )
+    }
+
+    fn caller(run: &ComputerRun) -> crate::computer_use::ComputerPrincipal {
+        run.effective_principal()
     }
 
     #[tokio::test]
@@ -1027,11 +1246,17 @@ mod tests {
             )
             .unwrap();
         let run = service
-            .authorize("grant-host-id", &run.run_id, run.version, grant(&run))
+            .authorize(
+                "grant-host-id",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
             .unwrap();
 
         let error = service
-            .observe("observe-host-id", &run.run_id, run.version)
+            .observe("observe-host-id", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::BackendFailure);
@@ -1065,10 +1290,16 @@ mod tests {
             )
             .unwrap();
         let run = service
-            .authorize("grant-1", &run.run_id, run.version, grant(&run))
+            .authorize(
+                "grant-1",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
             .unwrap();
         let observation = service
-            .observe("observe-1", &run.run_id, run.version)
+            .observe("observe-1", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap();
         let after_observe = service.get_run(&run.run_id).unwrap().unwrap();
@@ -1076,6 +1307,7 @@ mod tests {
         let outcome = service
             .act(
                 "act-1",
+                &caller(&run),
                 &run.run_id,
                 after_observe.version,
                 &observation.observation_id,
@@ -1089,6 +1321,7 @@ mod tests {
         let replay = service
             .act(
                 "act-1",
+                &caller(&run),
                 &run.run_id,
                 after_observe.version,
                 &observation.observation_id,
@@ -1104,13 +1337,14 @@ mod tests {
         let after_name = service.get_run(&run.run_id).unwrap().unwrap();
         assert_eq!(after_name.action_count, 1);
         let observation = service
-            .observe("observe-2", &run.run_id, after_name.version)
+            .observe("observe-2", &caller(&run), &run.run_id, after_name.version)
             .await
             .unwrap();
         let after_observe = service.get_run(&run.run_id).unwrap().unwrap();
         service
             .act(
                 "act-2",
+                &caller(&run),
                 &run.run_id,
                 after_observe.version,
                 &observation.observation_id,
@@ -1140,10 +1374,16 @@ mod tests {
             )
             .unwrap();
         let run = service
-            .authorize("grant-conflict", &run.run_id, run.version, grant(&run))
+            .authorize(
+                "grant-conflict",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
             .unwrap();
         let observation = service
-            .observe("observe-conflict", &run.run_id, run.version)
+            .observe("observe-conflict", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap();
         let current = service.get_run(&run.run_id).unwrap().unwrap();
@@ -1154,6 +1394,7 @@ mod tests {
         service
             .act(
                 "same-request",
+                &caller(&run),
                 &run.run_id,
                 current.version,
                 &observation.observation_id,
@@ -1164,6 +1405,7 @@ mod tests {
         let error = service
             .act(
                 "same-request",
+                &caller(&run),
                 &run.run_id,
                 current.version,
                 &observation.observation_id,
@@ -1190,10 +1432,16 @@ mod tests {
             )
             .unwrap();
         let run = service
-            .authorize("grant-pause", &run.run_id, run.version, grant(&run))
+            .authorize(
+                "grant-pause",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
             .unwrap();
         let paused = service
-            .pause("pause-1", &run.run_id, run.version)
+            .pause("pause-1", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap();
         assert_eq!(paused.state, ComputerRunState::Paused);
@@ -1203,7 +1451,7 @@ mod tests {
         );
         assert!(paused.grant.unwrap().revoked_at.is_some());
         let error = service
-            .observe("observe-paused", &run.run_id, paused.version)
+            .observe("observe-paused", &caller(&run), &run.run_id, paused.version)
             .await
             .unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::InvalidState);
@@ -1222,10 +1470,16 @@ mod tests {
             )
             .unwrap();
         let run = service
-            .authorize("grant-takeover", &run.run_id, run.version, grant(&run))
+            .authorize(
+                "grant-takeover",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
             .unwrap();
         let taken_over = service
-            .take_over("takeover-1", &run.run_id, run.version)
+            .take_over("takeover-1", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap();
 
@@ -1255,19 +1509,21 @@ mod tests {
         let run = service
             .authorize(
                 "grant-takeover-fence",
+                &caller(&run),
                 &run.run_id,
                 run.version,
                 grant(&run),
             )
             .unwrap();
         let taken_over = service
-            .take_over("takeover-fence", &run.run_id, run.version)
+            .take_over("takeover-fence", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap();
 
         let error = service
             .authorize(
                 "stale-authorize-after-takeover",
+                &caller(&run),
                 &run.run_id,
                 taken_over.version,
                 grant(&taken_over),
@@ -1283,7 +1539,12 @@ mod tests {
         assert!(persisted.control_epoch > run.control_epoch);
 
         let error = service
-            .pause("pause-after-takeover", &run.run_id, taken_over.version)
+            .pause(
+                "pause-after-takeover",
+                &caller(&run),
+                &run.run_id,
+                taken_over.version,
+            )
             .await
             .unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::InvalidState);
@@ -1310,16 +1571,23 @@ mod tests {
         let mut semantic_only = grant(&run);
         semantic_only.action_classes = BTreeSet::from([ActionClass::Semantic]);
         let run = service
-            .authorize("grant-denied", &run.run_id, run.version, semantic_only)
+            .authorize(
+                "grant-denied",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                semantic_only,
+            )
             .unwrap();
         let observation = service
-            .observe("observe-denied", &run.run_id, run.version)
+            .observe("observe-denied", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap();
         let current = service.get_run(&run.run_id).unwrap().unwrap();
         let error = service
             .act(
                 "deny-action",
+                &caller(&run),
                 &run.run_id,
                 current.version,
                 &observation.observation_id,
@@ -1354,6 +1622,7 @@ mod tests {
         let error = service
             .act(
                 "oversized-action",
+                &crate::computer_use::ComputerPrincipal::local_operator(Uuid::new_v4()),
                 "missing-run",
                 1,
                 "missing-observation",
@@ -1396,13 +1665,19 @@ mod tests {
         let run = service
             .authorize(
                 "grant-evidence-limit",
+                &caller(&run),
                 &run.run_id,
                 run.version,
                 grant(&run),
             )
             .unwrap();
         let error = service
-            .observe("observe-evidence-limit", &run.run_id, run.version)
+            .observe(
+                "observe-evidence-limit",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+            )
             .await
             .unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::LimitReached);
@@ -1430,24 +1705,35 @@ mod tests {
             )
             .unwrap();
         let run = service
-            .authorize("grant-evidence-read", &run.run_id, run.version, grant(&run))
+            .authorize(
+                "grant-evidence-read",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
             .unwrap();
         let observation = service
-            .observe("observe-evidence-read", &run.run_id, run.version)
+            .observe(
+                "observe-evidence-read",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+            )
             .await
             .unwrap();
         let evidence = observation.screenshot.unwrap();
 
         assert_eq!(
             service
-                .read_current_evidence(&run.run_id, &evidence.asset_id)
+                .read_current_evidence(&caller(&run), &run.run_id, &evidence.asset_id)
                 .await
                 .unwrap(),
             b"ok"
         );
         assert_eq!(
             service
-                .read_current_evidence(&run.run_id, "not-current")
+                .read_current_evidence(&caller(&run), &run.run_id, "not-current")
                 .await
                 .unwrap_err()
                 .code,
@@ -1457,7 +1743,7 @@ mod tests {
         *backend.bytes.lock() = b"no".to_vec();
         assert_eq!(
             service
-                .read_current_evidence(&run.run_id, &evidence.asset_id)
+                .read_current_evidence(&caller(&run), &run.run_id, &evidence.asset_id)
                 .await
                 .unwrap_err()
                 .code,
@@ -1480,6 +1766,7 @@ mod tests {
         let run = service
             .authorize(
                 "grant-duration-limit",
+                &caller(&run),
                 &run.run_id,
                 run.version,
                 grant(&run),
@@ -1493,7 +1780,12 @@ mod tests {
             })
             .unwrap();
         let error = service
-            .observe("observe-duration-limit", &run.run_id, run.version)
+            .observe(
+                "observe-duration-limit",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+            )
             .await
             .unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::LimitReached);
@@ -1517,16 +1809,23 @@ mod tests {
         let mut one_use = grant(&run);
         one_use.uses_remaining = Some(1);
         let run = service
-            .authorize("grant-one-use", &run.run_id, run.version, one_use)
+            .authorize(
+                "grant-one-use",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                one_use,
+            )
             .unwrap();
         let observation = service
-            .observe("observe-one-use", &run.run_id, run.version)
+            .observe("observe-one-use", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap();
         let current = service.get_run(&run.run_id).unwrap().unwrap();
         service
             .act(
                 "act-one-use",
+                &caller(&run),
                 &run.run_id,
                 current.version,
                 &observation.observation_id,
@@ -1565,10 +1864,16 @@ mod tests {
             )
             .unwrap();
         let run = service
-            .authorize("grant-race", &run.run_id, run.version, grant(&run))
+            .authorize(
+                "grant-race",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
             .unwrap();
         let observation = service
-            .observe("observe-race", &run.run_id, run.version)
+            .observe("observe-race", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap();
         let current = service.get_run(&run.run_id).unwrap().unwrap();
@@ -1576,10 +1881,12 @@ mod tests {
         let first_service = service.clone();
         let first_run_id = run.run_id.clone();
         let first_observation = observation.clone();
+        let first_caller = caller(&run);
         let first = tokio::spawn(async move {
             first_service
                 .act(
                     "act-race-first",
+                    &first_caller,
                     &first_run_id,
                     expected_version,
                     &first_observation.observation_id,
@@ -1595,6 +1902,7 @@ mod tests {
         let error = service
             .act(
                 "act-race-second",
+                &caller(&run),
                 &run.run_id,
                 expected_version,
                 &observation.observation_id,
@@ -1631,20 +1939,33 @@ mod tests {
             )
             .unwrap();
         let run = service
-            .authorize("grant-cancel-race", &run.run_id, run.version, grant(&run))
+            .authorize(
+                "grant-cancel-race",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
             .unwrap();
         let observation = service
-            .observe("observe-cancel-race", &run.run_id, run.version)
+            .observe(
+                "observe-cancel-race",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+            )
             .await
             .unwrap();
         let current = service.get_run(&run.run_id).unwrap().unwrap();
         let action_service = service.clone();
         let action_run_id = run.run_id.clone();
         let action_observation = observation.clone();
+        let action_caller = caller(&run);
         let action = tokio::spawn(async move {
             action_service
                 .act(
                     "act-cancel-race",
+                    &action_caller,
                     &action_run_id,
                     current.version,
                     &action_observation.observation_id,
@@ -1657,7 +1978,10 @@ mod tests {
         });
         backend.action_entered.notified().await;
 
-        let cancelled = service.cancel("cancel-race", &run.run_id).await.unwrap();
+        let cancelled = service
+            .cancel("cancel-race", &caller(&run), &run.run_id)
+            .await
+            .unwrap();
         assert_eq!(cancelled.state, ComputerRunState::Cancelled);
         assert_eq!(
             cancelled.control_disposition,
@@ -1777,7 +2101,10 @@ mod tests {
         );
 
         // Cancelling the owner's run must not change the other session's view.
-        service.cancel("cancel-mine", &mine.run_id).await.unwrap();
+        service
+            .cancel("cancel-mine", &caller(&mine), &mine.run_id)
+            .await
+            .unwrap();
         assert_eq!(
             service.session_capacity(owner).unwrap().session_active_runs,
             0
@@ -1802,10 +2129,16 @@ mod tests {
             )
             .unwrap();
         let run = service
-            .authorize("grant-parity", &run.run_id, run.version, grant(&run))
+            .authorize(
+                "grant-parity",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
             .unwrap();
         service
-            .observe("observe-parity", &run.run_id, run.version)
+            .observe("observe-parity", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap();
 
@@ -1844,10 +2177,16 @@ mod tests {
             )
             .unwrap();
         let run = service
-            .authorize("grant-redaction", &run.run_id, run.version, grant(&run))
+            .authorize(
+                "grant-redaction",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
             .unwrap();
         let observation = service
-            .observe("observe-redaction", &run.run_id, run.version)
+            .observe("observe-redaction", &caller(&run), &run.run_id, run.version)
             .await
             .unwrap();
         assert!(
@@ -1913,6 +2252,8 @@ mod tests {
                 "hasScreenshot",
                 "screenshotRedacted",
                 "stale",
+                "surfaceId",
+                "frameEpoch",
             ])
         );
         assert_eq!(
@@ -1954,7 +2295,13 @@ mod tests {
                 .unwrap();
             run_id = run.run_id.clone();
             service
-                .authorize("grant-restart", &run.run_id, run.version, grant(&run))
+                .authorize(
+                    "grant-restart",
+                    &caller(&run),
+                    &run.run_id,
+                    run.version,
+                    grant(&run),
+                )
                 .unwrap();
         }
 
@@ -2002,5 +2349,199 @@ mod tests {
         assert!(tail.entries.is_empty());
         assert!(!tail.cursor_expired);
         assert_eq!(tail.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn principal_mismatch_denies_service_mutations_before_dispatch() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-principal",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let intruder = crate::computer_use::ComputerPrincipal::local_operator(Uuid::new_v4());
+        let agent =
+            crate::computer_use::ComputerPrincipal::agent(format!("agent-{}", Uuid::new_v4()), 1)
+                .unwrap();
+        for (index, caller) in [intruder, agent].into_iter().enumerate() {
+            assert_eq!(
+                service
+                    .authorize(
+                        &format!("grant-intruder-{index}"),
+                        &caller,
+                        &run.run_id,
+                        run.version,
+                        grant(&run),
+                    )
+                    .unwrap_err()
+                    .code,
+                ComputerErrorCode::Unauthorized
+            );
+        }
+
+        let run = service
+            .authorize(
+                "grant-ok",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let other = crate::computer_use::ComputerPrincipal::local_operator(Uuid::new_v4());
+        assert_eq!(
+            service
+                .observe("observe-intruder", &other, &run.run_id, run.version)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+        assert_eq!(
+            service
+                .take_over("takeover-intruder", &other, &run.run_id, run.version)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+        assert_eq!(
+            service
+                .read_current_evidence(&other, &run.run_id, "asset")
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+    }
+
+    #[tokio::test]
+    async fn background_fixture_cannot_activate_and_isolated_fixture_can_pointer() {
+        let dir = tempdir().unwrap();
+        let background = ComputerUseService::new(
+            Arc::new(SimulatorBackend::measured_background_safe()),
+            ComputerStore::open(dir.path().join("bg")).unwrap(),
+        );
+        let owner = Uuid::new_v4();
+        let run = background
+            .create_run(
+                "bg-create",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            run.capability_proof.tier(),
+            crate::computer_use::ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
+        );
+        let run = background
+            .authorize(
+                "bg-grant",
+                &caller(&run),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let observation = background
+            .observe("bg-observe", &caller(&run), &run.run_id, run.version)
+            .await
+            .unwrap();
+        let current = background.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            background
+                .act(
+                    "bg-activate",
+                    &caller(&current),
+                    &current.run_id,
+                    current.version,
+                    &observation.observation_id,
+                    ComputerAction::ActivateTarget,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::ForbiddenAction
+        );
+
+        let isolated = ComputerUseService::new(
+            Arc::new(SimulatorBackend::independently_isolated()),
+            ComputerStore::open(dir.path().join("iso")).unwrap(),
+        );
+        let run = isolated
+            .create_run(
+                "iso-create",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        assert!(run.capability_proof.is_simulator_only_isolation());
+        let now = Utc::now();
+        let grant = ActionGrant::for_run(
+            &run,
+            BTreeSet::from([
+                ActionClass::Semantic,
+                ActionClass::TextEntry,
+                ActionClass::PointerFallback,
+                ActionClass::KeyChord,
+            ]),
+            now,
+            now + Duration::minutes(5),
+            Some(8),
+        );
+        let run = isolated
+            .authorize("iso-grant", &caller(&run), &run.run_id, run.version, grant)
+            .unwrap();
+        let observation = isolated
+            .observe("iso-observe", &caller(&run), &run.run_id, run.version)
+            .await
+            .unwrap();
+        let current = isolated.get_run(&run.run_id).unwrap().unwrap();
+        isolated
+            .act(
+                "iso-pointer",
+                &caller(&current),
+                &current.run_id,
+                current.version,
+                &observation.observation_id,
+                ComputerAction::PointerClick {
+                    x: 10.0,
+                    y: 10.0,
+                    button: crate::computer_use::PointerButton::Primary,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn isolation_contract_comparisons_are_present_in_service() {
+        let source = include_str!("service.rs");
+        for needle in [
+            "authorize_caller",
+            "authorize_grant",
+            "authorize_observation",
+            "authorize_action",
+            "effective_principal",
+            "live_surfaces",
+            "authority_epoch",
+            "surface_binding",
+            "allows_action",
+            "MACOS_NATIVE_BACKEND_ID",
+        ] {
+            assert!(
+                source.contains(needle),
+                "deleting {needle} must fail this focused comparison test"
+            );
+        }
     }
 }

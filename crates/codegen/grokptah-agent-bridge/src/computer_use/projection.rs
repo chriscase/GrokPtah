@@ -80,6 +80,8 @@ pub struct ObservationSummary {
     /// True once the observation is older than the run's staleness bound, at
     /// which point the policy layer refuses to act on it.
     pub stale: bool,
+    pub surface_id: String,
+    pub frame_epoch: u64,
 }
 
 /// Safe last-action result. Backend-chosen summary text is deliberately
@@ -153,6 +155,11 @@ pub struct ComputerRunProjection {
     pub last_outcome: Option<ActionOutcomeSummary>,
     pub last_error: Option<ComputerErrorSummary>,
     pub event_range: Option<ComputerRunEventRange>,
+    pub capability_tier: super::types::ComputerCapabilityTier,
+    pub surface_id: String,
+    pub surface_incarnation: String,
+    pub authority_epoch: u64,
+    pub initiating_principal_kind: String,
 }
 
 /// One bounded, cursor-addressed page of a run's durable event journal.
@@ -264,6 +271,8 @@ pub fn project_run_at(run: &ComputerRun, now: DateTime<Utc>) -> ComputerRunProje
                     .as_ref()
                     .map(|evidence| evidence.redacted),
                 stale: observation_is_stale(observation.captured_at, &run.limits, now),
+                surface_id: observation.authority.surface.surface_id.clone(),
+                frame_epoch: observation.authority.frame_epoch,
             }),
         last_outcome: run
             .last_outcome
@@ -276,6 +285,11 @@ pub fn project_run_at(run: &ComputerRun, now: DateTime<Utc>) -> ComputerRunProje
             .as_ref()
             .map(|error| ComputerErrorSummary { code: error.code }),
         event_range: event_range(run),
+        capability_tier: run.capability_proof.tier(),
+        surface_id: run.surface.surface_id.clone(),
+        surface_incarnation: run.surface.incarnation.clone(),
+        authority_epoch: run.authority_epoch,
+        initiating_principal_kind: run.effective_principal().public_kind().to_string(),
     }
 }
 
@@ -446,6 +460,7 @@ mod tests {
             }],
             elements_truncated: false,
             sensitivity: Sensitivity::None,
+            authority: Default::default(),
         }
     }
 
@@ -548,17 +563,14 @@ mod tests {
     fn grant_expiry_and_revocation_are_reported_without_target_secrets() {
         let mut run = run();
         let now = Utc::now();
-        run.grant = Some(ActionGrant {
-            grant_id: "grant-1".into(),
-            run_id: run.run_id.clone(),
-            target: run.target.clone(),
-            action_classes: BTreeSet::from([ActionClass::Semantic]),
-            issued_by: GrantIssuer::LocalUser,
-            issued_at: now - Duration::minutes(10),
-            expires_at: now - Duration::minutes(5),
-            uses_remaining: Some(2),
-            revoked_at: Some(now),
-        });
+        run.grant = Some(ActionGrant::for_run(
+            &run,
+            BTreeSet::from([ActionClass::Semantic]),
+            now - Duration::minutes(10),
+            now - Duration::minutes(5),
+            Some(2),
+        ));
+        run.grant.as_mut().unwrap().revoked_at = Some(now);
         let grant = project_run_at(&run, now).grant.unwrap();
         assert!(grant.expired);
         assert!(grant.revoked);
@@ -693,5 +705,95 @@ mod tests {
         assert!(!page.cursor_expired);
         assert_eq!(page.range, None);
         assert_eq!(project_run_at(&run, Utc::now()).event_range, None);
+    }
+
+    #[test]
+    fn public_projection_pins_isolation_keys_and_hides_native_and_principal_secrets() {
+        let mut run = run();
+        run.initiating_principal = Some(
+            crate::computer_use::ComputerPrincipal::agent(format!("agent-{}", Uuid::new_v4()), 3)
+                .unwrap(),
+        );
+        run.current_observation = Some(observation_with_secrets(&run.target.clone()));
+        let projection = project_run_at(&run, Utc::now());
+        let encoded = serde_json::to_value(&projection).unwrap();
+        let keys: BTreeSet<&str> = encoded
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(keys.contains("capabilityTier"));
+        assert!(keys.contains("surfaceId"));
+        assert!(keys.contains("surfaceIncarnation"));
+        assert!(keys.contains("authorityEpoch"));
+        assert!(keys.contains("initiatingPrincipalKind"));
+        assert_eq!(
+            projection.initiating_principal_kind, "agent",
+            "projection may expose principal kind only"
+        );
+        let wire = serde_json::to_string(&projection).unwrap();
+        assert!(!wire.contains("agent-"));
+        assert!(!wire.contains("specRevision"));
+        assert!(!wire.contains("process_id"));
+        assert!(!wire.contains("processId"));
+        assert!(!wire.contains("pid"));
+        assert!(!wire.contains("CGWindow"));
+        assert!(!wire.contains("attestation"));
+        assert!(!wire.contains("input-domain-"));
+        assert!(!wire.contains("measurement-"));
+        let observation_keys: BTreeSet<&str> = encoded["observation"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            observation_keys,
+            BTreeSet::from([
+                "observationId",
+                "sequence",
+                "capturedAt",
+                "elementCount",
+                "elementsTruncated",
+                "sensitivity",
+                "hasScreenshot",
+                "screenshotRedacted",
+                "stale",
+                "surfaceId",
+                "frameEpoch",
+            ])
+        );
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "runId",
+                "ownerSessionId",
+                "parentRunId",
+                "campaignId",
+                "target",
+                "state",
+                "controlDisposition",
+                "controlEpoch",
+                "version",
+                "agentActive",
+                "terminal",
+                "createdAt",
+                "updatedAt",
+                "startedAt",
+                "endedAt",
+                "progress",
+                "grant",
+                "observation",
+                "lastOutcome",
+                "lastError",
+                "eventRange",
+                "capabilityTier",
+                "surfaceId",
+                "surfaceIncarnation",
+                "authorityEpoch",
+                "initiatingPrincipalKind",
+            ])
+        );
     }
 }

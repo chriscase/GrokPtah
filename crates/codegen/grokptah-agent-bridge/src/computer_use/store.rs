@@ -276,6 +276,20 @@ impl ComputerStore {
             run.ended_at = Some(run.updated_at);
             run.grant = None;
             run.current_observation = None;
+            if run.surface.is_issued() {
+                if let Ok(rotated) = run.surface.rotate_incarnation() {
+                    run.surface = rotated;
+                }
+            }
+            run.freshness_tick = 0;
+            run.bump_authority_epoch();
+            run.capability_proof = match &run.capability_proof {
+                crate::computer_use::ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain { .. }
+                | crate::computer_use::ComputerCapabilityProof::MeasuredBackgroundSafeSemantic { .. } => {
+                    crate::computer_use::ComputerCapabilityProof::Unproven
+                }
+                other => other.clone(),
+            };
             // A prior action summary can carry backend-chosen text. Clearing it
             // is the same fail-closed move as dropping the observation: restart
             // must not keep a leaky last_outcome on the durable record.
@@ -388,6 +402,29 @@ fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
     }
     run.target.validate()?;
     run.limits.validate()?;
+    if let Ok(()) = run.capability_proof.validate() {
+        if matches!(
+            run.capability_proof,
+            crate::computer_use::ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+                origin: crate::computer_use::IsolationProofOrigin::HostNative,
+                ..
+            }
+        ) {
+            return Err(invalid_record());
+        }
+    } else if !matches!(
+        run.capability_proof,
+        crate::computer_use::ComputerCapabilityProof::Unproven
+    ) {
+        return Err(invalid_record());
+    }
+    if run
+        .initiating_principal
+        .as_ref()
+        .is_some_and(|principal| principal.validate().is_err())
+    {
+        return Err(invalid_record());
+    }
     if run.version == 0
         || run.action_count > run.limits.max_actions
         || run.evidence_bytes > run.limits.max_evidence_bytes
@@ -595,17 +632,13 @@ mod tests {
                     .unwrap();
             run_id = run.run_id.clone();
             let now = Utc::now();
-            run.grant = Some(ActionGrant {
-                grant_id: "grant".into(),
-                run_id: run.run_id.clone(),
-                target: run.target.clone(),
-                action_classes: BTreeSet::from([ActionClass::Semantic]),
-                issued_by: crate::computer_use::GrantIssuer::LocalUser,
-                issued_at: now,
-                expires_at: now + Duration::minutes(5),
-                uses_remaining: None,
-                revoked_at: None,
-            });
+            run.grant = Some(ActionGrant::for_run(
+                &run,
+                BTreeSet::from([ActionClass::Semantic]),
+                now,
+                now + Duration::minutes(5),
+                None,
+            ));
             run.transition(ComputerRunState::Ready).unwrap();
             run.last_outcome = Some(ActionOutcome::bounded(
                 "PRIVATE_DOCUMENT_TITLE leaked from AX",
@@ -635,6 +668,87 @@ mod tests {
         assert_eq!(last.operation, "recover");
         assert_eq!(last.disposition, "interrupted");
         assert_eq!(last.error_code, Some(ComputerErrorCode::Interrupted));
+    }
+
+    #[test]
+    fn restart_rotates_incarnation_coerces_isolated_proof_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let run_id;
+        let original_incarnation;
+        let original_surface_id;
+        {
+            let store = ComputerStore::open(dir.path()).unwrap();
+            let surface = crate::computer_use::ComputerSurfaceBinding::issue();
+            original_incarnation = surface.incarnation.clone();
+            original_surface_id = surface.surface_id.clone();
+            let owner = Uuid::new_v4();
+            let mut run = ComputerRun::new_with_isolation(
+                owner,
+                None,
+                target(),
+                ComputerUseLimits::default(),
+                crate::computer_use::ComputerPrincipal::local_operator(owner),
+                surface.clone(),
+                crate::computer_use::ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+                    backend_id: crate::computer_use::SIMULATOR_ISOLATED_BACKEND_ID.into(),
+                    surface_id: surface.surface_id.clone(),
+                    incarnation: surface.incarnation.clone(),
+                    input_domain_id: format!("input-domain-{}", Uuid::new_v4()),
+                    origin: crate::computer_use::IsolationProofOrigin::SimulatorFixture,
+                    observe: true,
+                    semantic_actions: true,
+                    text_entry: true,
+                    key_chords: true,
+                    pointer_fallback: true,
+                },
+            )
+            .unwrap();
+            run_id = run.run_id.clone();
+            let now = Utc::now();
+            run.grant = Some(ActionGrant::for_run(
+                &run,
+                BTreeSet::from([ActionClass::Semantic]),
+                now,
+                now + Duration::minutes(5),
+                None,
+            ));
+            run.transition(ComputerRunState::Ready).unwrap();
+            store.save_run(&run).unwrap();
+        }
+
+        let first = ComputerStore::open(dir.path())
+            .unwrap()
+            .load_run(&run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.state, ComputerRunState::Interrupted);
+        assert!(first.grant.is_none());
+        assert_eq!(first.surface.surface_id, original_surface_id);
+        assert_ne!(first.surface.incarnation, original_incarnation);
+        assert_eq!(
+            first.capability_proof,
+            crate::computer_use::ComputerCapabilityProof::Unproven
+        );
+        assert_eq!(first.freshness_tick, 0);
+        assert!(first.authority_epoch > 0);
+        let first_incarnation = first.surface.incarnation.clone();
+        let first_epoch = first.authority_epoch;
+        let first_version = first.version;
+
+        let second = ComputerStore::open(dir.path())
+            .unwrap()
+            .load_run(&run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.state, ComputerRunState::Interrupted);
+        assert!(second.grant.is_none());
+        assert_eq!(second.surface.incarnation, first_incarnation);
+        assert_eq!(second.authority_epoch, first_epoch);
+        assert_eq!(second.version, first_version);
+        assert_eq!(
+            second.capability_proof,
+            crate::computer_use::ComputerCapabilityProof::Unproven
+        );
     }
 
     #[test]
