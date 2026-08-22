@@ -2950,6 +2950,21 @@ impl OrchStore {
             .count())
     }
 
+    /// Live native admissions that already route to `provider_id`.
+    ///
+    /// Counted from durable intents so duplicate supervisor ticks and process
+    /// restarts re-derive the same provider capacity answer.
+    pub fn live_managed_intents_for_provider(&self, provider_id: &str) -> Result<usize, OrchError> {
+        Ok(self
+            .list_managed_intents()?
+            .into_iter()
+            .filter(|intent| {
+                intent.state.is_live()
+                    && intent.effective_provider_id().as_deref() == Some(provider_id)
+            })
+            .count())
+    }
+
     pub fn live_managed_intent_for_work(
         &self,
         work_id: &str,

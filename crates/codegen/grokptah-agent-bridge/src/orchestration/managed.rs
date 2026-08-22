@@ -150,6 +150,73 @@ impl ManagedExecutionPolicy {
     }
 }
 
+/// Finite host-owned ceiling on live native admissions that share one
+/// provider identity.
+///
+/// The per-Agent `maxConcurrentRuns` ceiling is 1-4 and several Agents may
+/// share one provider, so without this bound a single provider can hold an
+/// unbounded number of live intents across the home. The ceiling is the
+/// host's, not an Agent's or a provider's, and it is provider-neutral: the
+/// same number applies to every provider identity.
+pub const MAX_CONCURRENT_PROVIDER_RUNS: usize = 4;
+
+/// Single source of truth for the provider-ceiling rejection, so the executor
+/// can attribute a declined admission without re-deriving policy order.
+pub const PROVIDER_CEILING_EXHAUSTED: &str = "provider concurrent run ceiling is exhausted";
+
+pub const MAX_PROVIDER_ROUTE_COMPONENT_BYTES: usize = 256;
+
+/// Exact provider route captured for one native admission.
+///
+/// This is deliberately provider-neutral. The host records whichever profile
+/// identity and exact model id the Agent's captured selection already
+/// resolved to; no provider is special-cased and no provider-specific field
+/// is carried here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRoute {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+impl ProviderRoute {
+    pub fn validate(&self) -> Result<(), OrchError> {
+        for (value, field) in [
+            (self.provider_id.as_str(), "provider_route.provider_id"),
+            (self.model_id.as_str(), "provider_route.model_id"),
+        ] {
+            if value.is_empty()
+                || value.len() > MAX_PROVIDER_ROUTE_COMPONENT_BYTES
+                || value.contains('\0')
+            {
+                return Err(invalid(format!("{field} is empty or exceeds its bound")));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Live-capacity inputs for one native admission decision.
+///
+/// Both ceilings are counted from durable intents, so a duplicate supervisor
+/// tick or a process restart re-derives the same admission answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedAdmissionCapacity {
+    pub live_intents_for_agent: usize,
+    pub live_intents_for_provider: usize,
+    pub max_concurrent_provider_runs: usize,
+}
+
+impl ManagedAdmissionCapacity {
+    pub fn agent_ceiling_exhausted(&self, policy: &ManagedExecutionPolicy) -> bool {
+        self.live_intents_for_agent >= policy.max_concurrent_runs as usize
+    }
+
+    pub fn provider_ceiling_exhausted(&self) -> bool {
+        self.live_intents_for_provider >= self.max_concurrent_provider_runs
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedRetryCause {
@@ -242,6 +309,13 @@ pub struct ManagedExecutionIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_activation_id: Option<String>,
     pub model_selection_key: String,
+    /// Exact provider identity and model this admission routes to.
+    ///
+    /// Legacy intents written before provider accounting deserialize as
+    /// `None`; `effective_provider_id` re-derives their identity from the
+    /// captured selection key so accounting never silently under-counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_route: Option<ProviderRoute>,
     pub bounds: RunBounds,
     pub input_hash: String,
     pub state: ManagedIntentState,
@@ -268,8 +342,24 @@ impl ManagedExecutionIntent {
                 return Err(invalid(format!("{field} is empty or exceeds its bound")));
             }
         }
+        if let Some(route) = &self.provider_route {
+            route.validate()?;
+        }
         self.bounds.validate()?;
         Ok(())
+    }
+
+    /// Provider identity this intent consumes capacity against.
+    ///
+    /// Prefers the recorded route and falls back to the captured selection
+    /// key so intents written before provider accounting still count.
+    pub fn effective_provider_id(&self) -> Option<String> {
+        if let Some(route) = &self.provider_route {
+            return Some(route.provider_id.clone());
+        }
+        crate::gateway_config::parse_model_selection(&self.model_selection_key)
+            .ok()
+            .map(|selection| selection.provider_id)
     }
 }
 
@@ -286,6 +376,15 @@ pub struct NativeExecutorStatus {
     pub finalized: u64,
     pub skipped_manual: u64,
     pub skipped_ineligible: u64,
+    /// Admissions declined because the provider identity was already at the
+    /// host ceiling. Counted separately from `skipped_ineligible` so an
+    /// operator can tell capacity pressure from policy rejection.
+    pub skipped_provider_capacity: u64,
+    /// Admissions declined because the captured Agent model route could not
+    /// be re-derived. Native admission fails closed rather than routing an
+    /// unproven provider identity.
+    pub skipped_unroutable: u64,
+    pub max_concurrent_provider_runs: u64,
 }
 
 impl NativeExecutorStatus {
@@ -301,6 +400,9 @@ impl NativeExecutorStatus {
             finalized: 0,
             skipped_manual: 0,
             skipped_ineligible: 0,
+            skipped_provider_capacity: 0,
+            skipped_unroutable: 0,
+            max_concurrent_provider_runs: MAX_CONCURRENT_PROVIDER_RUNS as u64,
         }
     }
 }
@@ -339,7 +441,7 @@ pub fn managed_execution_eligible(
     agent: &AgentRecord,
     spec: &AgentSpec,
     decisions: &[WorkDecision],
-    live_intents_for_agent: usize,
+    capacity: ManagedAdmissionCapacity,
     server_ceiling: &RunBounds,
 ) -> Result<RunBounds, OrchError> {
     let policy = &spec.managed_execution;
@@ -413,10 +515,16 @@ pub fn managed_execution_eligible(
             "managed execution requires an explicit authorization decision",
         ));
     }
-    if live_intents_for_agent >= policy.max_concurrent_runs as usize {
+    if capacity.agent_ceiling_exhausted(policy) {
         return Err(OrchError::new(
             OrchErrorCode::CapacityExhausted,
             "managed execution concurrent run ceiling is exhausted",
+        ));
+    }
+    if capacity.provider_ceiling_exhausted() {
+        return Err(OrchError::new(
+            OrchErrorCode::CapacityExhausted,
+            PROVIDER_CEILING_EXHAUSTED,
         ));
     }
     let bounds = intersect_run_bounds(&[
