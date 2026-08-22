@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::completion::{CompletionEvidence, CompletionUsage};
+use crate::gateway_config::{
+    ModelCapabilities, ProviderDeadlineClass, ProviderDialect, ProviderKind,
+};
+use crate::types::EffortLevel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +48,159 @@ pub enum RunPurpose {
     #[default]
     Execution,
     ManagerProposal,
+}
+
+pub const PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const MAX_PROVIDER_ROUTE_VALUE_BYTES: usize = 2_048;
+
+/// Immutable, non-secret provider route captured before a finite Run exists.
+///
+/// Dispatch must use this record rather than consulting mutable environment,
+/// catalog, or provider-profile state. The credential fingerprint binds the
+/// route to the current credential identity without persisting bearer
+/// material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRouteSnapshot {
+    pub schema_version: u32,
+    pub provider_id: String,
+    pub model_id: String,
+    pub wire_model_id: String,
+    pub selection_key: String,
+    pub kind: ProviderKind,
+    pub dialect: ProviderDialect,
+    pub base_url: String,
+    pub endpoint_fingerprint: String,
+    pub credential_ref: String,
+    pub credential_fingerprint: String,
+    pub capabilities: ModelCapabilities,
+    pub deadline_class: ProviderDeadlineClass,
+    pub effort: EffortLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualification_record_id: Option<String>,
+    pub snapshot_hash: String,
+}
+
+impl ProviderRouteSnapshot {
+    fn expected_endpoint_fingerprint(&self) -> String {
+        hash_payload(&serde_json::json!({
+            "kind": self.kind,
+            "dialect": self.dialect,
+            "baseUrl": self.base_url,
+        }))
+    }
+
+    fn expected_qualification_record_id(&self) -> Option<String> {
+        (self.capabilities.source == crate::gateway_config::CapabilitySource::Measured).then(|| {
+            hash_payload(&serde_json::json!({
+                "providerId": self.provider_id,
+                "modelId": self.model_id,
+                "wireModelId": self.wire_model_id,
+                "endpointFingerprint": self.endpoint_fingerprint,
+                "credentialFingerprint": self.credential_fingerprint,
+                "qualificationSchema": self.capabilities.qualification_schema,
+            }))
+        })
+    }
+
+    fn hash_material(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": self.schema_version,
+            "providerId": self.provider_id,
+            "modelId": self.model_id,
+            "wireModelId": self.wire_model_id,
+            "selectionKey": self.selection_key,
+            "kind": self.kind,
+            "dialect": self.dialect,
+            "baseUrl": self.base_url,
+            "endpointFingerprint": self.endpoint_fingerprint,
+            "credentialRef": self.credential_ref,
+            "credentialFingerprint": self.credential_fingerprint,
+            "capabilities": self.capabilities,
+            "deadlineClass": self.deadline_class,
+            "effort": self.effort,
+            "qualificationRecordId": self.qualification_record_id,
+        })
+    }
+
+    pub(crate) fn seal(mut self) -> Result<Self, OrchError> {
+        self.endpoint_fingerprint = self.expected_endpoint_fingerprint();
+        self.qualification_record_id = self.expected_qualification_record_id();
+        self.snapshot_hash = hash_payload(&self.hash_material());
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "provider route snapshot schema is invalid",
+            ));
+        }
+        for (value, field) in [
+            (self.provider_id.as_str(), "provider_id"),
+            (self.model_id.as_str(), "model_id"),
+            (self.wire_model_id.as_str(), "wire_model_id"),
+            (self.selection_key.as_str(), "selection_key"),
+            (self.base_url.as_str(), "base_url"),
+            (self.endpoint_fingerprint.as_str(), "endpoint_fingerprint"),
+            (self.credential_ref.as_str(), "credential_ref"),
+            (
+                self.credential_fingerprint.as_str(),
+                "credential_fingerprint",
+            ),
+            (self.snapshot_hash.as_str(), "snapshot_hash"),
+        ] {
+            if value.is_empty()
+                || value.len() > MAX_PROVIDER_ROUTE_VALUE_BYTES
+                || value.contains('\0')
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    format!("provider route snapshot {field} is invalid"),
+                ));
+            }
+        }
+        crate::gateway_config::validate_base_url(&self.base_url)
+            .map_err(|message| OrchError::new(OrchErrorCode::InvalidRequest, message))?;
+        let selection = crate::gateway_config::parse_model_selection(&self.selection_key)
+            .map_err(|message| OrchError::new(OrchErrorCode::InvalidRequest, message))?;
+        if selection.provider_id != self.provider_id || selection.model_id != self.model_id {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "provider route snapshot does not match its selection key",
+            ));
+        }
+        if self.endpoint_fingerprint != self.expected_endpoint_fingerprint() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider route endpoint fingerprint does not match its immutable endpoint",
+            ));
+        }
+        if self.capabilities.source == crate::gateway_config::CapabilitySource::Measured
+            && self.capabilities.qualification_schema.as_deref()
+                != Some(crate::gateway_config::CAPABILITY_QUALIFICATION_SCHEMA)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "measured provider route snapshot has no valid qualification schema",
+            ));
+        }
+        if self.qualification_record_id != self.expected_qualification_record_id() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider route qualification identity does not match its immutable fields",
+            ));
+        }
+        if self.snapshot_hash != hash_payload(&self.hash_material()) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider route snapshot hash does not match its immutable fields",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Host-decided terminal cause. Unlike `terminal_result`/`final_response`,
@@ -423,6 +580,10 @@ pub struct RunRecord {
     /// Immutable host-authored capability class for this Run.
     #[serde(default)]
     pub purpose: RunPurpose,
+    /// Immutable provider route for this finite Run. `None` is accepted only
+    /// when reading legacy records created before route snapshots existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_route: Option<ProviderRouteSnapshot>,
     /// Durable agent identity owning this run. Optional for legacy runs and
     /// non-agent orchestration clients.
     #[serde(default)]

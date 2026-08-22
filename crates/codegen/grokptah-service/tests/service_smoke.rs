@@ -637,6 +637,7 @@ fn seed_active_run(
             client_id: Some("mcp".into()),
             state: RunState::Running,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: Some(agent_id.clone()),
             retry_of: None,
             parent_run_id: None,

@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::managed::{
     ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome,
     ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
-    MANAGED_FINALIZATION_SCHEMA_VERSION,
+    AGENT_CEILING_EXHAUSTED, MANAGED_FINALIZATION_SCHEMA_VERSION, PROVIDER_CEILING_EXHAUSTED,
 };
 use super::manager::{ManagerDecisionRecord, ManagerPlan};
 use super::message::{MessagePage, WorkMessage, MAX_RETAINED_MESSAGES};
@@ -91,6 +91,19 @@ struct RoutineFireIntent {
 struct ManagerCreationIntent {
     plan: ManagerPlan,
     root_work: WorkItem,
+}
+
+fn validate_run_provider_route_for_spec(run: &RunRecord, spec: &AgentSpec) -> anyhow::Result<()> {
+    if let Some(route) = &run.provider_route {
+        route
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            route.selection_key == spec.model.selection_key,
+            "Run provider route does not match its captured Agent specification"
+        );
+    }
+    Ok(())
 }
 
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
@@ -421,6 +434,17 @@ impl OrchStore {
 
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
         let _g = self.inner.lock.lock();
+        if let Some(route) = &run.provider_route {
+            route
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        if let Some(existing) = self.load_run_unlocked(&run.run_id)? {
+            anyhow::ensure!(
+                existing.provider_route == run.provider_route,
+                "Run provider route snapshot is immutable"
+            );
+        }
         let result = self
             .run_path(&run.run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -465,10 +489,12 @@ impl OrchStore {
             agent.known_lane_ids().contains(&run.session_id),
             "Run Lane is not currently associated with the persistent Agent"
         );
+        let current_spec = agent.current_spec()?;
         anyhow::ensure!(
-            run.agent_spec_revision == Some(agent.current_spec()?.revision),
+            run.agent_spec_revision == Some(current_spec.revision),
             "Run Agent specification revision is stale"
         );
+        validate_run_provider_route_for_spec(run, current_spec)?;
         let run_path = self
             .run_path(&run.run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -572,10 +598,12 @@ impl OrchStore {
             agent.known_lane_ids().contains(&prior_run.session_id),
             "Run Lane is not currently associated with the persistent Agent"
         );
+        let current_spec = agent.current_spec()?;
         anyhow::ensure!(
-            prior_run.agent_spec_revision == Some(agent.current_spec()?.revision),
+            prior_run.agent_spec_revision == Some(current_spec.revision),
             "Run Agent specification revision is stale"
         );
+        validate_run_provider_route_for_spec(&prior_run, current_spec)?;
 
         let mut run = prior_run.clone();
         run.state = RunState::Running;
@@ -679,7 +707,17 @@ impl OrchStore {
         let Some(mut run) = self.load_run_unlocked(run_id)? else {
             return Ok(None);
         };
+        let provider_route = run.provider_route.clone();
         update(&mut run)?;
+        anyhow::ensure!(
+            run.provider_route == provider_route,
+            "Run provider route snapshot is immutable"
+        );
+        if let Some(route) = &run.provider_route {
+            route
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
         let path = self
             .run_path(run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -2878,6 +2916,83 @@ impl OrchStore {
         Ok(intent.clone())
     }
 
+    /// Reserve one live native admission while enforcing both durable
+    /// capacity ceilings under the same store lock as the intent write.
+    ///
+    /// Callers may perform an earlier eligibility check for diagnostics, but
+    /// this operation is the authority: concurrent executor drives cannot
+    /// both observe the last provider or Agent slot and consume it.
+    pub fn reserve_managed_intent(
+        &self,
+        intent: &ManagedExecutionIntent,
+        max_concurrent_runs_for_agent: usize,
+        max_concurrent_runs_for_provider: usize,
+    ) -> Result<ManagedExecutionIntent, OrchError> {
+        intent.validate()?;
+        if !intent.state.is_live() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "managed execution reservation must start in a live state",
+            ));
+        }
+        let provider_id = intent
+            .provider_route
+            .as_ref()
+            .map(|route| route.provider_id.as_str())
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "managed execution reservation requires an exact provider route",
+                )
+            })?;
+        let _guard = self.inner.lock.lock();
+        let existing = self.list_managed_intents_unlocked()?;
+        if existing
+            .iter()
+            .any(|current| current.state.is_live() && current.work_id == intent.work_id)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work already has a live managed execution intent",
+            ));
+        }
+        let live_for_agent = existing
+            .iter()
+            .filter(|current| current.state.is_live() && current.agent_id == intent.agent_id)
+            .count();
+        if live_for_agent >= max_concurrent_runs_for_agent {
+            return Err(OrchError::new(
+                OrchErrorCode::CapacityExhausted,
+                AGENT_CEILING_EXHAUSTED,
+            ));
+        }
+        let live_for_provider = existing
+            .iter()
+            .filter(|current| {
+                current.state.is_live()
+                    && current
+                        .effective_provider_id()
+                        .as_deref()
+                        .is_none_or(|current_provider| current_provider == provider_id)
+            })
+            .count();
+        if live_for_provider >= max_concurrent_runs_for_provider {
+            return Err(OrchError::new(
+                OrchErrorCode::CapacityExhausted,
+                PROVIDER_CEILING_EXHAUSTED,
+            ));
+        }
+        let path = self.managed_intent_path(&intent.intent_id)?;
+        if path.is_file() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed execution intent ID already exists",
+            ));
+        }
+        self.save_managed_intent_unlocked(intent)?;
+        Ok(intent.clone())
+    }
+
     fn save_managed_intent_unlocked(
         &self,
         intent: &ManagedExecutionIntent,
@@ -2960,7 +3075,10 @@ impl OrchStore {
             .into_iter()
             .filter(|intent| {
                 intent.state.is_live()
-                    && intent.effective_provider_id().as_deref() == Some(provider_id)
+                    && intent
+                        .effective_provider_id()
+                        .as_deref()
+                        .is_none_or(|current_provider| current_provider == provider_id)
             })
             .count())
     }
@@ -4743,6 +4861,11 @@ impl OrchStore {
         if !candidate.state.is_terminal() {
             anyhow::bail!("finalization candidate must be terminal");
         }
+        if let Some(route) = &candidate.provider_route {
+            route
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
         let _guard = self.inner.lock.lock();
         let activation_path = self
             .agent_activation_path(&candidate.run_id)
@@ -4764,6 +4887,10 @@ impl OrchStore {
                 .and_then(|text| serde_json::from_str::<RunRecord>(&text).map_err(Into::into))
             {
                 Ok(current) => {
+                    anyhow::ensure!(
+                        current.provider_route == candidate.provider_route,
+                        "Run provider route snapshot is immutable"
+                    );
                     merge_run_observations(&mut final_run, &current);
                     if current.state.is_terminal() {
                         final_run.state = current.state;
@@ -5076,6 +5203,29 @@ impl OrchStore {
                         == Some(intent.run.run_id.as_str()),
                 "Agent activation recovery intent is inconsistent"
             );
+            let spec = intent.activated_agent.current_spec()?;
+            // A route-less activation journal from before AgentSpec fencing
+            // must still be installed so startup can mark it Interrupted. It
+            // is never resumed. Any newer record that names either fence must
+            // match the exact captured specification before recovery writes.
+            if intent.run.provider_route.is_some() || intent.run.agent_spec_revision.is_some() {
+                anyhow::ensure!(
+                    intent.run.agent_spec_revision == Some(spec.revision),
+                    "Agent activation recovery Run specification is stale"
+                );
+            }
+            validate_run_provider_route_for_spec(&intent.run, spec)?;
+            if let Some(prior) = &intent.prior_run {
+                anyhow::ensure!(
+                    prior.provider_route == intent.run.provider_route,
+                    "Agent activation recovery cannot replace the Run provider route"
+                );
+                if let Some(route) = &prior.provider_route {
+                    route
+                        .validate()
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+            }
             let run_path = self
                 .run_path(&intent.run.run_id)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -5356,6 +5506,29 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
+    fn provider_route_snapshot(model_id: &str) -> super::super::types::ProviderRouteSnapshot {
+        super::super::types::ProviderRouteSnapshot {
+            schema_version: super::super::types::PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+            provider_id: "xai".into(),
+            model_id: model_id.into(),
+            wire_model_id: model_id.into(),
+            selection_key: model_id.into(),
+            kind: crate::gateway_config::ProviderKind::Xai,
+            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
+            base_url: "https://api.x.ai/v1".into(),
+            endpoint_fingerprint: "endpoint-fingerprint".into(),
+            credential_ref: "managed:xai:api-key".into(),
+            credential_fingerprint: "credential-fingerprint".into(),
+            capabilities: crate::gateway_config::ModelCapabilities::default(),
+            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
+            effort: crate::types::EffortLevel::Medium,
+            qualification_record_id: None,
+            snapshot_hash: String::new(),
+        }
+        .seal()
+        .unwrap()
+    }
+
     fn terminal_run(run_id: &str) -> RunRecord {
         RunRecord {
             run_id: run_id.into(),
@@ -5365,6 +5538,7 @@ mod tests {
             client_id: None,
             state: RunState::Completed,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -5423,6 +5597,7 @@ mod tests {
             client_id: None,
             state: RunState::Running,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -5452,6 +5627,45 @@ mod tests {
         let store2 = OrchStore::open(d.path()).unwrap();
         let loaded = store2.load_run("r1").unwrap().unwrap();
         assert_eq!(loaded.state, RunState::Interrupted);
+    }
+
+    #[test]
+    fn persisted_run_provider_route_is_immutable() {
+        let directory = tempdir().unwrap();
+        let store = OrchStore::open(directory.path()).unwrap();
+        let mut run = terminal_run("immutable-route");
+        run.provider_route = Some(provider_route_snapshot("grok-4"));
+        store.save_run(&run).unwrap();
+
+        let error = store
+            .update_run(&run.run_id, |current| {
+                current.provider_route = None;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider route snapshot is immutable"));
+        assert_eq!(
+            store.load_run(&run.run_id).unwrap().unwrap().provider_route,
+            run.provider_route
+        );
+
+        let mut replacement = run.clone();
+        replacement.provider_route = Some(provider_route_snapshot("grok-4-fast"));
+        let error = store.save_run(&replacement).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider route snapshot is immutable"));
+
+        let error = store.persist_finalization(&replacement).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider route snapshot is immutable"));
+        assert_eq!(
+            store.load_run(&run.run_id).unwrap().unwrap().provider_route,
+            run.provider_route
+        );
     }
 
     #[test]
@@ -5789,6 +6003,7 @@ mod tests {
             client_id: None,
             state: RunState::Running,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -6024,6 +6239,7 @@ mod tests {
             client_id: None,
             state: RunState::Running,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -6267,6 +6483,17 @@ mod tests {
         first.terminal_result = None;
         first.final_response = None;
         first.end_seq = None;
+        first.provider_route = Some(provider_route_snapshot("wrong-model"));
+        let error = store
+            .save_run_and_activate_agent(&first, "agent-activation-race")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not match its captured Agent specification"),
+            "unexpected error: {error}"
+        );
+        assert!(store.load_run(&first.run_id).unwrap().is_none());
+        first.provider_route = Some(provider_route_snapshot("grok"));
         let mut second = first.clone();
         second.run_id = "activation-second".into();
         second.request_id = "req-activation-second".into();

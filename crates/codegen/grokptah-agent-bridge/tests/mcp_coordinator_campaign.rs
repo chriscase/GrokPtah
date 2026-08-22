@@ -193,6 +193,7 @@ fn service_store_seed(
             client_id: Some("mcp".into()),
             state: RunState::Interrupted,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,

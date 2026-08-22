@@ -529,6 +529,7 @@ fn soak_restart_recovery_matrix() {
         client_id: None,
         state: RunState::Completed,
         purpose: Default::default(),
+        provider_route: None,
         agent_id: None,
         retry_of: None,
         parent_run_id: None,

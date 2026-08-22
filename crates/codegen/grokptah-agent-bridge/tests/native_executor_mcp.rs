@@ -2,6 +2,9 @@
 
 mod common;
 
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
 use grokptah_agent_bridge::orchestration::{
     AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
     ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, ProviderRoute,
@@ -9,12 +12,15 @@ use grokptah_agent_bridge::orchestration::{
     WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
-    McpRemoteError, SessionKind, SessionUpdate,
+    model_selection_key, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
+    McpControlClient, McpRemoteError, SessionKind, SessionUpdate,
 };
 use serde_json::json;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tempfile::tempdir;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use common::ProcessEnvGuard;
@@ -422,6 +428,7 @@ fn run_record(
         client_id: Some("native-executor".into()),
         state,
         purpose: Default::default(),
+        provider_route: None,
         agent_id: Some(agent_id.into()),
         retry_of: None,
         parent_run_id: None,
@@ -567,6 +574,174 @@ async fn boot_native(
         agent.agent_id,
         workspace_text,
     )
+}
+
+#[derive(Clone)]
+struct BlockingProviderState {
+    requests: Arc<AtomicUsize>,
+    release: Arc<Semaphore>,
+}
+
+async fn blocking_provider(State(state): State<BlockingProviderState>) -> Json<serde_json::Value> {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    let permit = state
+        .release
+        .acquire()
+        .await
+        .expect("provider response release semaphore must stay open");
+    permit.forget();
+    Json(json!({
+        "choices": [{"message": {"content": "native route snapshot verified"}}],
+        "usage": {
+            "prompt_tokens": 6,
+            "completion_tokens": 4,
+            "total_tokens": 10
+        }
+    }))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(blocking_provider))
+        .with_state(BlockingProviderState {
+            requests: requests.clone(),
+            release: release.clone(),
+        });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.remove("GROKPTAH_AGENT_OFFLINE");
+    env.set("GROKPTAH_API_BASE", format!("http://{address}/v1"));
+    env.set("GROKPTAH_API_KEY", "synthetic-native-route-key");
+
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let selection = model_selection_key("env-grokptah", "native-route-model");
+    host.set_model(selection.clone());
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let agent = host.ensure_session_agent(lane.id).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orchestration")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let workspace_text = workspace.path().display().to_string();
+    orch.set_managed_execution(
+        &auth(),
+        lane.id,
+        workspace.path(),
+        &agent.agent_id,
+        retry_policy(false),
+    )
+    .unwrap();
+
+    let admitted_agent = orch.store().load_agent(&agent.agent_id).unwrap().unwrap();
+    let admitted_spec = admitted_agent.current_spec().unwrap().clone();
+    assert_eq!(admitted_spec.model.selection_key, selection);
+
+    let mut work = WorkItem::new(
+        "native",
+        "Verify the frozen provider route at native admission",
+        lane.id,
+        workspace_text,
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    work.assigned_agent_id = Some(agent.agent_id.clone());
+    work.assignment_status = AssignmentStatus::Accepted;
+    work.validate().unwrap();
+    orch.store().save_work_item(&work).unwrap();
+
+    orch.drive_native_executor_once().await;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let (intent, run) = loop {
+        let intent = orch
+            .store()
+            .list_managed_intents()
+            .unwrap()
+            .into_iter()
+            .find(|intent| intent.work_id == work.work_id);
+        let run = intent.as_ref().and_then(|intent| {
+            orch.store()
+                .find_run_by_request_id(&intent.intent_id)
+                .unwrap()
+        });
+        if requests.load(Ordering::SeqCst) > 0 {
+            if let (Some(intent), Some(run)) = (intent, run) {
+                break (intent, run);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "provider execution did not reach the blocked fake transport"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    };
+
+    let intent_route = intent
+        .provider_route
+        .as_ref()
+        .expect("native intent must record its exact provider identity");
+    let run_route = run
+        .provider_route
+        .as_ref()
+        .expect("online native Run must persist a frozen provider route");
+    assert_eq!(intent.agent_spec_revision, admitted_spec.revision);
+    assert_eq!(run.agent_spec_revision, Some(admitted_spec.revision));
+    assert_eq!(
+        intent.model_selection_key,
+        admitted_spec.model.selection_key
+    );
+    assert_eq!(run_route.selection_key, admitted_spec.model.selection_key);
+    assert_eq!(intent_route.provider_id, run_route.provider_id);
+    assert_eq!(intent_route.model_id, run_route.model_id);
+    assert_eq!(run_route.provider_id, admitted_spec.model.provider_id);
+    assert_eq!(run_route.model_id, admitted_spec.model.model_id);
+    assert_eq!(run_route.wire_model_id, "native-route-model");
+    assert_eq!(run_route.base_url, format!("http://{address}/v1"));
+    run_route.validate().unwrap();
+
+    release.add_permits(1);
+    let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let current = orch.store().load_run(&run.run_id).unwrap().unwrap();
+        if current.state.is_terminal() {
+            assert_eq!(current.provider_route.as_ref(), Some(run_route));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < settle_deadline,
+            "native Run did not settle after releasing the fake provider"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+    orch.stop_background_tasks().await;
+    host.stop().unwrap();
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

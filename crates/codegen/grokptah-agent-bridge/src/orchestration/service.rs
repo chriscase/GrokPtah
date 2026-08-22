@@ -23,8 +23,9 @@ use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
     ManagedAdmissionCapacity, ManagedExecutionIntent, ManagedExecutionPolicy,
     ManagedFinalizationOutcome, ManagedIntentState, ManagedRetryCause, NativeExecutorStatus,
-    ProviderRoute, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
-    MAX_CONCURRENT_PROVIDER_RUNS, MAX_MANAGED_MESSAGES, PROVIDER_CEILING_EXHAUSTED,
+    ProviderRoute, AGENT_CEILING_EXHAUSTED, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
+    MANAGED_EXECUTION_SCHEMA_VERSION, MAX_CONCURRENT_PROVIDER_RUNS, MAX_MANAGED_MESSAGES,
+    PROVIDER_CEILING_EXHAUSTED,
 };
 use super::manager::{
     parse_manager_directive, ManagerCoordinationMode, ManagerDecisionRecord, ManagerDecisionState,
@@ -1277,8 +1278,14 @@ impl OrchestrationService {
                 .await
             {
                 let mut status = self.native_executor.lock();
-                status.last_error = Some(error.to_string());
-                status.skipped_ineligible += 1;
+                if error.message == PROVIDER_CEILING_EXHAUSTED {
+                    status.skipped_provider_capacity += 1;
+                } else if error.message == AGENT_CEILING_EXHAUSTED {
+                    status.skipped_ineligible += 1;
+                } else {
+                    status.last_error = Some(error.to_string());
+                    status.skipped_ineligible += 1;
+                }
                 continue;
             }
             self.native_executor.lock().admitted += 1;
@@ -1351,7 +1358,11 @@ impl OrchestrationService {
             created_at: now,
             updated_at: now,
         };
-        self.store.save_managed_intent(&intent)?;
+        self.store.reserve_managed_intent(
+            &intent,
+            spec.managed_execution.max_concurrent_runs as usize,
+            MAX_CONCURRENT_PROVIDER_RUNS,
+        )?;
         let claim = match self.store.claim_work_with_lease_secret(
             &work.work_id,
             &agent.agent_id,
@@ -6814,12 +6825,13 @@ impl OrchestrationService {
                 ));
             }
         };
-        let agent_bounds = match agent.current_spec() {
-            Ok(spec) => &spec.default_run_bounds,
+        let agent_spec = match agent.current_spec() {
+            Ok(spec) => spec.clone(),
             Err(error) => {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
             }
         };
+        let agent_bounds = &agent_spec.default_run_bounds;
         bounds.max_prompt_bytes = bounds.max_prompt_bytes.min(agent_bounds.max_prompt_bytes);
         bounds.max_rounds = bounds.max_rounds.min(agent_bounds.max_rounds);
         bounds.max_duration_ms = bounds.max_duration_ms.min(agent_bounds.max_duration_ms);
@@ -6838,6 +6850,28 @@ impl OrchestrationService {
             );
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+
+        let agent_spec_revision = agent_spec.revision;
+        let provider_route = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
+            None
+        } else {
+            Some(
+                self.host
+                    .capture_provider_route(
+                        &agent_spec.model.selection_key,
+                        self.host.current_effort(),
+                    )
+                    .map_err(|error| {
+                        self.fail_claim(
+                            &mut lease,
+                            None,
+                            session_id,
+                            &claimed,
+                            OrchError::new(OrchErrorCode::Conflict, error.to_string()),
+                        )
+                    })?,
+            )
+        };
 
         // Give older queued work first claim on any newly available capacity.
         self.pump_pending();
@@ -6859,10 +6893,6 @@ impl OrchestrationService {
             }
         }
         let start_seq = (!queued).then(|| self.bus.next_seq());
-        let agent_spec_revision = agent
-            .current_spec()
-            .map_err(|error| self.fail_claim(&mut lease, None, session_id, &claimed, error))?
-            .revision;
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -6889,6 +6919,7 @@ impl OrchestrationService {
             } else {
                 RunPurpose::Execution
             },
+            provider_route,
             agent_id: Some(agent.agent_id),
             retry_of: retry_of.map(str::to_string),
             parent_run_id: None,

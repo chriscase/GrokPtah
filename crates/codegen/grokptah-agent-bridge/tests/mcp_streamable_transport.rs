@@ -1226,6 +1226,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
             client_id: Some("mcp".into()),
             state: RunState::Interrupted,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
