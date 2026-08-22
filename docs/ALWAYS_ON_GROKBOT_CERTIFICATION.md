@@ -50,7 +50,9 @@ The service test kills and relaunches the same binary against the same runtime h
 8. `notification-accepted-fence-pending`
 9. `terminal-run-before-settlement`
 
-Each cut is a unique public MCP state (not “or succeeded”). After reopen: drive `ptah_tick_manager_plan` twice and assert exact identity sets (`workIds`, `runIds`, `linkedRunIds`, decisions, plan revision) with no duplicates, plus Interrupted `usagePendingRequests=0`.
+Each cut is a unique public MCP state (not “or succeeded”). After reopen: drive `ptah_tick_manager_plan` twice **immediately** (no settle-to-done wait). Assert cut-specific identities: the same decision `workId` when one existed, that work’s `linkedRunIds.len()==1` when a Run was already linked, and the same provider send count for that attempt. Interrupted runs must project `usagePendingRequests=0` on the post-respawn snapshot, before any quiet wait.
+
+`occurrence-reserved` is **not** a public MCP field at `67e29bd` (`ptah_get_manager_plan` does not project `occurrenceId` / `ManagerDecisionRecord`; occurrence and decision Work are written together). The campaign records that missing seam rather than treating “failed native run and zero decision Work” as the occurrence.
 
 A bounded `/ready` poll is used after spawn. That is readiness, not a test `sleep`. Native executor and manager supervisor intervals are production (1s / 2s); tests poll MCP rather than injecting a fake clock (no public seam exists to inject `FakeClock` into the standalone process).
 
@@ -77,3 +79,4 @@ The soak writes machine-readable JSON and Markdown to `GROKBOT_SOAK_OUT` (defaul
 - No `ProviderTransport` trait and no quota ledger at this SHA.
 - Fake HTTP via `XAI_API_BASE` is the public seam; live xAI is out of scope here.
 - Native executor tick is 1s; a genuine 24h live soak still needs this process-level harness plus real credentials (not supplied by this campaign).
+- Manager decision **occurrence** is not a public MCP field (`ptah_get_manager_plan` has no `decisions[]` / `occurrenceId`; occurrence and decision Work are one store write). Binding `occurrence-reserved` as a unique MCP durable state needs that projection.

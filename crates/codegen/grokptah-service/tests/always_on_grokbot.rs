@@ -17,9 +17,9 @@ use uuid::Uuid;
 use always_on_support::{
     assert_exact_after_restart, assert_no_quota_ledger, assert_no_secret_leak, call,
     call_expect_error, collect_identity, git_head, home_bytes, mcp, openssl_sha256_hex,
-    pending_usage, poll_json, rid, rss_kb, serial_lock, snapshot, succeeded_kind_count,
-    usage_complete, work_id_of, work_items, work_kind_count, FakeProvider, ProviderScript,
-    ServiceProcess,
+    pending_usage, pending_usage_opt, poll_json, rid, rss_kb, serial_lock, snapshot,
+    succeeded_kind_count, usage_complete, work_id_of, work_items, work_kind_count, FakeProvider,
+    ProviderScript, ServiceProcess,
 };
 
 const CUTS: &[&str] = &[
@@ -730,61 +730,151 @@ async fn observe_for_cut(
     }
 }
 
-async fn wait_until_quiet(
-    client: &mut McpControlClient,
-    session: Uuid,
-    workspace: &Path,
-    plan_id: &str,
-    provider: &FakeProvider,
-) {
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut last =
-        collect_identity(client, session, workspace, plan_id, provider.send_count()).await;
-    let mut quiet_since = Instant::now();
-    while Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let current =
-            collect_identity(client, session, workspace, plan_id, provider.send_count()).await;
-        let plan = call(
-            client,
-            "ptah_get_manager_plan",
-            json!({
-                "session_id": session,
-                "workspace": workspace,
-                "plan_id": plan_id
-            }),
-        )
-        .await;
-        let terminal = matches!(
-            plan["plan"]["state"].as_str(),
-            Some("succeeded" | "failed" | "cancelled")
-        );
-        let same = current.work_ids == last.work_ids
-            && current.run_ids == last.run_ids
-            && current.linked_run_ids == last.linked_run_ids
-            && current.decision_ids == last.decision_ids
-            && current.message_ids == last.message_ids
-            && current.sends == last.sends
-            && current.plan_revision == last.plan_revision;
-        if same {
-            if terminal || quiet_since.elapsed() >= Duration::from_millis(4500) {
-                return;
-            }
-        } else {
-            last = current;
-            quiet_since = Instant::now();
-        }
-    }
-}
-
 fn assert_no_uncertain_resume(runs: &Value) {
     for run in runs["runs"].as_array().unwrap_or(&vec![]) {
         assert_no_secret_leak(run);
         if run["state"].as_str() == Some("interrupted") {
             assert_eq!(
-                pending_usage(run),
-                0,
-                "uncertain attempt left pending after restart: {run}"
+                pending_usage_opt(run),
+                Some(0),
+                "interrupted run must project usagePendingRequests=0 immediately after restart: {run}"
+            );
+        }
+    }
+}
+
+fn plan_projects_occurrence(plan: &Value) -> bool {
+    let encoded = plan.to_string();
+    encoded.contains("occurrenceId")
+        || encoded.contains("occurrence_id")
+        || encoded.contains("\"decisions\"")
+        || encoded.contains("decisionId")
+}
+
+fn send_needle_for_cut(cut: &str) -> &'static str {
+    match cut {
+        "decision-work-persisted"
+        | "native-intent-persisted"
+        | "run-submitted"
+        | "directive-proposed" => "Return exactly this JSON envelope",
+        "orchestration-mutation-persisted" | "decision-applied-pending" => {
+            "GROKBOT_SUCCESS complete the replacement step"
+        }
+        "notification-accepted-fence-pending" | "terminal-run-before-settlement" => {
+            "GROKBOT_SUCCESS first native unit"
+        }
+        "occurrence-reserved" => "GROKBOT_FORCE_FAIL",
+        _ => "GROKBOT_SUCCESS",
+    }
+}
+
+async fn focal_work_detail(
+    client: &mut McpControlClient,
+    session: Uuid,
+    workspace: &Path,
+    cut: &str,
+    plan: &Value,
+    work: &Value,
+) -> Option<Value> {
+    let work_id = match cut {
+        "orchestration-mutation-persisted" | "decision-applied-pending" => {
+            plan_step(plan, "step-b-fix").and_then(|step| step["workId"].as_str())
+        }
+        "notification-accepted-fence-pending" | "terminal-run-before-settlement" => {
+            work_items(work)
+                .iter()
+                .find(|item| item["kind"].as_str() == Some("native"))
+                .and_then(work_id_of)
+        }
+        _ => decision_item(work).and_then(work_id_of),
+    }?;
+    Some(
+        call(
+            client,
+            "ptah_get_work",
+            json!({
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": work_id
+            }),
+        )
+        .await,
+    )
+}
+
+fn assert_focal_after_restart(
+    cut: &str,
+    before_decision_ids: &std::collections::BTreeSet<String>,
+    after_decision_ids: &std::collections::BTreeSet<String>,
+    again_decision_ids: &std::collections::BTreeSet<String>,
+    before_links: &[String],
+    after_detail: Option<&Value>,
+    again_detail: Option<&Value>,
+    before_sends: u64,
+    after_sends: u64,
+    again_sends: u64,
+) {
+    if !before_decision_ids.is_empty() {
+        assert_eq!(
+            after_decision_ids, before_decision_ids,
+            "restart replaced decision workId at {cut}: {before_decision_ids:?} vs {after_decision_ids:?}"
+        );
+    } else {
+        assert!(
+            after_decision_ids.len() <= 1,
+            "restart created duplicate decisions at {cut}: {after_decision_ids:?}"
+        );
+    }
+    assert_eq!(
+        after_decision_ids, again_decision_ids,
+        "duplicate tick created a new decision at {cut}"
+    );
+    let after_links = after_detail.map(linked_run_ids).unwrap_or_default();
+    let again_links = again_detail.map(linked_run_ids).unwrap_or_default();
+    if !before_links.is_empty() {
+        assert_eq!(
+            after_links, before_links,
+            "restart changed linkedRunIds for the cut work at {cut}: {before_links:?} vs {after_links:?}"
+        );
+        assert_eq!(
+            after_links.len(),
+            1,
+            "cut work must keep exactly one linkedRunId at {cut}: {after_links:?}"
+        );
+        assert_eq!(
+            after_sends, before_sends,
+            "restart resumed provider sends for the cut attempt at {cut}: {before_sends} -> {after_sends}"
+        );
+    } else {
+        assert!(
+            after_links.len() <= 1,
+            "restart linked more than one Run for the cut work at {cut}: {after_links:?}"
+        );
+        assert!(
+            after_sends <= before_sends.saturating_add(1),
+            "restart created extra provider sends for the cut attempt at {cut}: {before_sends} -> {after_sends}"
+        );
+    }
+    assert_eq!(
+        after_links, again_links,
+        "duplicate tick created linkedRunIds at {cut}: {after_links:?} vs {again_links:?}"
+    );
+    assert_eq!(
+        after_sends, again_sends,
+        "duplicate tick created provider sends for the cut attempt at {cut}: {after_sends} vs {again_sends}"
+    );
+    if let Some(detail) = after_detail {
+        let attempts = detail["attempts"].as_array().cloned().unwrap_or_default();
+        if !attempts.is_empty() {
+            assert_eq!(
+                attempts.len(),
+                1,
+                "cut work must have exactly one attempt at {cut}: {detail}"
+            );
+            let links = linked_run_ids(detail);
+            assert!(
+                links.len() <= 1,
+                "cut work attempt must have at most one linkedRunId at {cut}: {detail}"
             );
         }
     }
@@ -1096,6 +1186,38 @@ async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
                 );
                 continue;
             }
+            let before_plan = call(
+                &mut client,
+                "ptah_get_manager_plan",
+                json!({
+                    "session_id": session,
+                    "workspace": &service.workspace,
+                    "plan_id": plan_id
+                }),
+            )
+            .await;
+            if *cut == "occurrence-reserved" {
+                assert!(
+                    !plan_projects_occurrence(&before_plan),
+                    "occurrence-reserved proxy is not a public occurrence field: {before_plan}"
+                );
+            }
+            let before_work = list_work(&mut client, session, &service.workspace).await;
+            let before_detail = focal_work_detail(
+                &mut client,
+                session,
+                &service.workspace,
+                cut,
+                &before_plan,
+                &before_work,
+            )
+            .await;
+            let before_links = before_detail
+                .as_ref()
+                .map(linked_run_ids)
+                .unwrap_or_default();
+            let needle = send_needle_for_cut(cut);
+            let before_sends = provider.sends_matching(needle);
             let before = collect_identity(
                 &mut client,
                 session,
@@ -1117,13 +1239,27 @@ async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
                 |value| value.get("plan").is_some(),
             )
             .await;
+            let post_respawn_runs = list_runs(&mut client, session, &service.workspace).await;
+            assert_no_uncertain_resume(&post_respawn_runs);
             tick_twice(&mut client, session, &service.workspace, &plan_id).await;
-            wait_until_quiet(
+            let after_plan = call(
+                &mut client,
+                "ptah_get_manager_plan",
+                json!({
+                    "session_id": session,
+                    "workspace": &service.workspace,
+                    "plan_id": plan_id
+                }),
+            )
+            .await;
+            let after_work = list_work(&mut client, session, &service.workspace).await;
+            let after_detail = focal_work_detail(
                 &mut client,
                 session,
                 &service.workspace,
-                &plan_id,
-                &provider,
+                cut,
+                &after_plan,
+                &after_work,
             )
             .await;
             let after = collect_identity(
@@ -1134,7 +1270,29 @@ async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
                 provider.send_count(),
             )
             .await;
+            let after_sends = provider.sends_matching(needle);
+            assert_no_uncertain_resume(&list_runs(&mut client, session, &service.workspace).await);
             tick_twice(&mut client, session, &service.workspace, &plan_id).await;
+            let again_plan = call(
+                &mut client,
+                "ptah_get_manager_plan",
+                json!({
+                    "session_id": session,
+                    "workspace": &service.workspace,
+                    "plan_id": plan_id
+                }),
+            )
+            .await;
+            let again_work = list_work(&mut client, session, &service.workspace).await;
+            let again_detail = focal_work_detail(
+                &mut client,
+                session,
+                &service.workspace,
+                cut,
+                &again_plan,
+                &again_work,
+            )
+            .await;
             let again = collect_identity(
                 &mut client,
                 session,
@@ -1143,9 +1301,20 @@ async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
                 provider.send_count(),
             )
             .await;
+            let again_sends = provider.sends_matching(needle);
             assert_exact_after_restart(&before, &after, &again, cut);
-            let runs = list_runs(&mut client, session, &service.workspace).await;
-            assert_no_uncertain_resume(&runs);
+            assert_focal_after_restart(
+                cut,
+                &before.decision_ids,
+                &after.decision_ids,
+                &again.decision_ids,
+                &before_links,
+                after_detail.as_ref(),
+                again_detail.as_ref(),
+                before_sends,
+                after_sends,
+                again_sends,
+            );
             caught = true;
             break;
         }
