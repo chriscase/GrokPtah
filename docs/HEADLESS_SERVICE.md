@@ -19,7 +19,10 @@ Shipped ManagerSupervisor is not hosted Grokbot certification.
 See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) and
 [`ROADMAP_TO_100.md`](ROADMAP_TO_100.md). Always-on “Grokbot” language in
 ADR-002 / [#301](https://github.com/chriscase/GrokPtah/issues/301) is not a
-shipped binary name.
+shipped binary name. Independent long-running workers
+([#305](https://github.com/chriscase/GrokPtah/issues/305)) are a **mandatory
+unmet** 100% exit and cannot be descoped; the first workload supervisor on
+this service is not that exit.
 
 ## Run locally
 

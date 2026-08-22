@@ -26,7 +26,7 @@ before treating this document as current.
 | --- | --- | --- |
 | **Deterministic** | In-tree unit, integration, and protocol tests on a named SHA | Live provider behavior, packaged TCC identity, years-long retention, 72-hour hosted operations |
 | **Hardware** | Packaged-identity Computer Use, Screen Recording / Accessibility, display/focus matrices ([#274](https://github.com/chriscase/GrokPtah/issues/274)) | Logical-years memory, Grok Build account balance, least-privilege production tokens |
-| **Live-provider** | Named Grok Build campaign with `certification_ready == true` and catalog IDs | Host quota ledger, account-balance sync (not implemented), isolated visual Computer Use |
+| **Live-provider** | Named Grok Build campaign with `certification_ready == true`, required catalog IDs, **and** a named secret-free provider-quota receipt (campaign/credential/route-bound consumption **and** exhaustion/429) | GrokPtah local host quota ledger; Grok Build account-balance sync (not implemented, **not** a 100% requirement); isolated visual Computer Use |
 | **Soak** | Dated 72-hour sole-writer hosted operations (restarts, resource bounds, no implicit resume) | Accelerated logical-years memory; elapsed wall-clock soak is not a memory proof |
 
 Named deterministic artifacts on `origin/main` `67e29bd34dc64049432c715c93c2cef2185c63ea`
@@ -53,6 +53,19 @@ GrokPtah does not synchronize a Grok Build account balance. The PR #352 local
 host quota ledger is a **separate pending feature until merged**.
 `LiveCredentialAttestation.certification_ready` is a stricter campaign gate
 and is not recorded as passed.
+
+A **named, secret-free provider-quota receipt** is a **mandatory 100%
+live-provider exit** (stage 2): campaign/credential/route-bound evidence of
+provider-side request/quota **consumption** and **exhaustion/429** behavior.
+That receipt is distinct from GrokPtah’s local host ledger and from full
+account-balance synchronization. Account-balance synchronization is **not
+implemented and not a 100% requirement**. A live report that says quota was
+“not observed” **fails** the stage 2 exit. Hermetic catalog `http_429` checks
+and replay fixture `rate-limit-backoff-recovery` are not that receipt. The
+live attestation seam
+([`GROK_BUILD_LIVE_ATTESTATION.md`](GROK_BUILD_LIVE_ATTESTATION.md),
+`live_attestation.rs` `attest_grok_build_oidc_with_min_validity`) is
+secret-free by design; it does **not** itself record the quota receipt.
 
 **Executable xAI credential order** (`auth_store.rs` `resolve_xai_credentials`):
 `XAI_API_KEY`, then the OS keychain API key, then `GROKPTAH_TOKEN_COMMAND`,
@@ -109,14 +122,25 @@ exits**, and all of the following are true:
    closing issue, covering the catalog IDs in
    [`PERSISTENT_AGENT_CERTIFICATION.md`](PERSISTENT_AGENT_CERTIFICATION.md)
    that this roadmap requires, with `certification_ready == true` for that
-   campaign’s credential binding.
+   campaign’s credential binding. The same campaign record includes a
+   **positive, named, secret-free provider-quota receipt**:
+   campaign/credential/route-bound evidence of provider-side request/quota
+   consumption **and** exhaustion/429 behavior. A statement that quota was
+   “not observed” **fails** this item. The receipt is not a GrokPtah host
+   ledger and is not full account-balance synchronization.
 5. Least-privilege remote authority (stage 3) is shipped: `LocalOperator`,
    `RemoteCoordinator`, and `Observer` are separated; bearer authentication
    does not imply approve, promote, or Computer Use authority.
 6. An always-on hosted **operational** soak report exists (duration ≥72 hours,
    restart count, zero implicit resumes, bounded resource growth) **and** is
    distinct from the long-horizon memory exit. Elapsed soak alone is
-   insufficient.
+   insufficient. The **independent long-running worker / multi-worker**
+   outcome ([#305](https://github.com/chriscase/GrokPtah/issues/305)) is
+   proven: durable ownership, bounded delegated workloads, crash/restart
+   recovery, no duplicate execution, capability/authority isolation, and
+   retained evidence. That core product goal cannot be descoped, marked
+   Explicitly unsupported, or otherwise status-relabeled away. Documented
+   #305 non-goals may remain unsupported.
 7. Long-horizon durable memory (stage 5) has accelerated logical-years
    evidence. Wall-clock soak is not a substitute.
 8. Desktop and `grokptah-service` advertise a declared capability document
@@ -131,7 +155,12 @@ exits**, and all of the following are true:
    actually proven **without** global injection.
 10. Packaged UX and accessibility certification for the Computer cockpit and
     the selected product UX direction ([#273](https://github.com/chriscase/GrokPtah/issues/273),
-    [#308](https://github.com/chriscase/GrokPtah/issues/308)) is recorded.
+    [#308](https://github.com/chriscase/GrokPtah/issues/308)) is recorded: a
+    **selected, documented UX direction** plus its **bounded packaged-desktop
+    acceptance set** (keyboard/accessibility, operator workflows,
+    wide/narrow/light/dark, reconnect/error/quota/authority states, visual
+    evidence). Explicitly unsupported may cover **documented non-goals only**,
+    not the Codex-class core interface.
 11. Operations and release drills have a dated runbook execution covering
     backup/restore, restart, cursor expiry, credential rotation, Computer Use
     Stop / Take over on a packaged identity, upgrade/rollback,
@@ -140,6 +169,44 @@ exits**, and all of the following are true:
     sccache/target ownership/cleanup policy.
 
 Until every item holds, **do not claim 100%.**
+
+## No-Unverified-at-100
+
+The [Unverified](#unverified-explicit) list is the **current** 2026-08-22 gap
+list. A trustworthy 100% claim is **invalid** if any of the following still
+appear there, are omitted from recorded evidence, or are waived by descope /
+Explicitly unsupported / “not observed” status-relabeling.
+
+**This follow-up’s three exits — forbidden to remain Unverified at 100%:**
+
+1. **Named secret-free provider-quota receipt** — campaign/credential/route-bound
+   evidence of provider-side request/quota consumption **and** exhaustion/429
+   behavior. Distinct from the GrokPtah local host ledger and from full
+   account-balance synchronization. A report that says “not observed” fails.
+2. **Independent long-running worker / multi-worker outcome**
+   ([#305](https://github.com/chriscase/GrokPtah/issues/305) core) — durable
+   ownership, bounded delegated workloads, crash/restart recovery, no
+   duplicate execution, capability/authority isolation, retained evidence.
+   Cannot be descoped. Documented non-goals may stay unsupported.
+3. **Selected UX direction plus bounded packaged-desktop acceptance set**
+   ([#308](https://github.com/chriscase/GrokPtah/issues/308) core) —
+   keyboard/accessibility, operator workflows, wide/narrow/light/dark,
+   reconnect/error/quota/authority states, visual evidence. Explicitly
+   unsupported covers documented non-goals only, not the Codex-class core
+   interface.
+
+**Already forbidden by earlier corrections (preserved):** isolated visual
+Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288)); named
+live Grok Build campaign with `certification_ready == true`; least-privilege
+tokens before any production-shaped soak; versioned black-box parity fixture;
+logical-years memory evidence; 72-hour operational soak; packaged-identity
+hardware matrix ([#274](https://github.com/chriscase/GrokPtah/issues/274)).
+
+**May remain honestly absent at 100%:** full Grok Build account-balance
+synchronization (not implemented, not required); raw **global** Computer Use
+injection; documented #305 / #308 non-goals; Windows/Linux native Computer Use
+until [#275](https://github.com/chriscase/GrokPtah/issues/275) /
+[#276](https://github.com/chriscase/GrokPtah/issues/276) ship.
 
 ## Stage 1 — Merge-blocker repair
 
@@ -188,7 +255,9 @@ remains draft.** Remaining draft is not an honest exit.
   are not described as shipped.
 - Open issues [#305](https://github.com/chriscase/GrokPtah/issues/305) and
   [#308](https://github.com/chriscase/GrokPtah/issues/308) are not called
-  complete.
+  complete. [#305](https://github.com/chriscase/GrokPtah/issues/305) cannot be
+  descoped; [#308](https://github.com/chriscase/GrokPtah/issues/308) core UX
+  cannot be marked Explicitly unsupported.
 
 **Must not claim:** Native Coding Readiness Center, local quota ledger, or
 hosted-service.yml as shipped while they exist only on PR #352. **Must not
@@ -201,7 +270,11 @@ certified P1 repair).
 
 **Exists today:** Supported OIDC/gateway **routing**; attestation module;
 hermetic certification lab; catalog
-[`evals/persistent-agent-scenarios.v1.json`](../evals/persistent-agent-scenarios.v1.json).
+[`evals/persistent-agent-scenarios.v1.json`](../evals/persistent-agent-scenarios.v1.json)
+(`retry-transient-001` replay checks include `http_429`); hermetic replay
+[`evals/certification-lab/replay-fixtures/provider-behaviors.v1.json`](../evals/certification-lab/replay-fixtures/provider-behaviors.v1.json)
+(`rate-limit-backoff-recovery`). Those hermetic 429 fixtures are **not** a
+live provider-quota receipt.
 `certification_ready` stays false without an authoritatively verified client
 policy ([`GROK_BUILD_LIVE_ATTESTATION.md`](GROK_BUILD_LIVE_ATTESTATION.md)).
 The lab does not claim model quality or a passed live campaign
@@ -219,14 +292,27 @@ The lab does not claim model quality or a passed live campaign
   only hermetic replay.
 - Provider observations carry the opaque credential binding only after
   attestation succeeds.
-- Complete quota observability remains a **separate** question: the live
-  report must state whether Grok Build gateway quota was observed, and must
-  **not** claim GrokPtah account-balance sync unless a cited main object
-  implements it. Compatible gateway requests still consume provider quota.
-  A merged local host ledger is still not a Grok Build balance.
+- A **positive, named, secret-free provider-quota receipt** is recorded for
+  the same campaign: campaign/credential/route-bound evidence of
+  **provider-side** request/quota **consumption** and **exhaustion/429**
+  behavior. The artifact follows the live-attestation positive schema (no
+  tokens, client identifiers, subjects, user/team identifiers, filesystem
+  paths, arbitrary URLs, or provider response bodies).
+- That receipt is **mandatory**. A live report that says Grok Build gateway
+  quota was “not observed,” “not applicable,” or equivalent **fails this
+  exit**.
+- Hermetic `http_429` catalog checks and replay fixture
+  `rate-limit-backoff-recovery` **do not** satisfy this exit.
+- The receipt is **not** GrokPtah’s local host quota ledger (PR #352,
+  pending until merged after certified P1 repair) and **not** full Grok Build
+  account-balance synchronization. Account-balance synchronization remains
+  **not implemented and not a 100% requirement**. Compatible gateway
+  requests still consume provider quota as a provider-side effect. A merged
+  local host ledger is still not a Grok Build balance.
 
 **Must not claim:** “Grok Build certified” from hermetic replay or from
-routing-only unit tests.
+routing-only unit tests. **Must not claim** stage 2 pass from a report that
+omits the named provider-quota receipt or states that quota was not observed.
 
 ## Stage 3 — Least-privilege remote authority
 
@@ -331,9 +417,19 @@ from a 72-hour uptime report.
 memory contract exist before production-shaped autonomy).
 
 **Exists today:** Experimental manager supervisor + hosted home; native
-executor; routines (manual/schedule). Grokbot is not a binary. Unattended
-Computer Use is Explicitly unsupported. Certification-lab smoke checks that
-managed execution is **disabled by default**. No 72-hour soak report exists.
+executor; routines (manual/schedule); first transport-neutral workload and
+coordinator/worker slices
+([`DURABLE_WORKLOADS.md`](DURABLE_WORKLOADS.md),
+[`COORDINATOR_WORKERS.md`](COORDINATOR_WORKERS.md);
+`tests/coordinator_mcp.rs` `independent_worker_recovers_assignment_and_messages`).
+[#307](https://github.com/chriscase/GrokPtah/issues/307) is **closed**.
+[#305](https://github.com/chriscase/GrokPtah/issues/305) remains **open**.
+Those first slices are **not** the independent long-running multi-worker 100%
+exit. Grokbot is not a binary. Unattended Computer Use is Explicitly
+unsupported. Certification-lab smoke checks that managed execution is
+**disabled by default**. No 72-hour soak report exists. Per-principal worker
+credentials are still deferred; current configured remote bearers remain
+operator-equivalent.
 
 **Exit (all required):**
 
@@ -351,13 +447,42 @@ managed execution is **disabled by default**. No 72-hour soak report exists.
 - [#301](https://github.com/chriscase/GrokPtah/issues/301) is closed only
   when its remaining **open** children that this stage owns are closed;
   stale epic checkboxes are not evidence.
-- [#305](https://github.com/chriscase/GrokPtah/issues/305) is closed with
-  independent-worker proof, or explicitly descoped in the matrix.
-- This soak is **operational**. It does not replace stage 5 memory evidence.
+- [#305](https://github.com/chriscase/GrokPtah/issues/305) is **closed with
+  independent-worker / multi-worker proof**. Descope, Explicitly unsupported,
+  and other status-relabeling of that core product goal **fail this exit**.
+  Required, retained evidence:
+  - **durable ownership** (WorkItem / WorkAttempt / Agent identity;
+    lease-token scoped claims; lane archival does not mutate workload state);
+  - **bounded delegated workloads** (parent/child Work, assignment states,
+    native-executor bounds; Computer Use / `bypassPermissions` still
+    rejected on this path);
+  - **crash/restart recovery** (store reopen preserves workers, decisions,
+    messages, Work, leases, attempts, progress, and terminal results);
+  - **no duplicate execution** (two workers cannot both hold a valid lease;
+    request-id idempotency; expired leases do not complete on a stale token);
+  - **capability/authority isolation** (a worker cannot widen bounds or
+    Computer Use the manager does not possess; caller-supplied Agent IDs are
+    not authentication; least-privilege / per-principal worker credentials
+    from stage 3 apply);
+  - **retained evidence** (attempt history, artifacts, ordered events
+    suitable for cursor replay and audit).
+  Documented #305 **non-goals** may remain Explicitly unsupported: scheduler
+  or webhook adapters, model-based prioritizer, automatic permission
+  approval/promotion, distributed consensus or multi-node scheduler, public
+  multi-tenant queue, and a second storage subsystem. Message-triggered
+  `RoutineTrigger::External` may stay unsupported. The independent
+  long-running agent outcome itself cannot.
+- First-slice objects (`independent_worker_recovers_assignment_and_messages`,
+  closed [#307](https://github.com/chriscase/GrokPtah/issues/307)) do **not**
+  close this exit while [#305](https://github.com/chriscase/GrokPtah/issues/305)
+  remains open.
+- This soak is **operational**. It does not replace stage 5 memory evidence
+  and does not replace the independent-worker proof above.
 
 **Must not claim:** always-on Grokbot, unattended Computer Use, or soak
 from desktop-focused sessions only. **Must not claim** years-long agents
-from this soak.
+from this soak. **Must not claim** the independent long-running worker
+outcome from the first workload/coordinator slice or by descoping #305.
 
 ## Stage 7 — Agent-owned Computer Use surface
 
@@ -424,7 +549,13 @@ foreground `ActivateTarget`, hidden windows, or Spaces.
 shared language.
 
 **Exists today:** UX audit artifacts under `docs/ux-audit/` and
-`docs/ux-design/`. [#273](https://github.com/chriscase/GrokPtah/issues/273)
+`docs/ux-design/`. Phase 2 comparison
+([`ux-design/phase-2/comparison-and-recommendation.md`](ux-design/phase-2/comparison-and-recommendation.md))
+recommends Direction 1 Focused Lane Workbench as the first-ship bet
+(scores D1 88.75 / D2 86.25 / D3 77.50) composed with D2’s Agents spine and
+D3’s opt-in supervision. That package is **not** a packaged-desktop
+acceptance set and does **not** by itself select the 100% direction.
+[#273](https://github.com/chriscase/GrokPtah/issues/273)
 and [#308](https://github.com/chriscase/GrokPtah/issues/308) **open**.
 [#274](https://github.com/chriscase/GrokPtah/issues/274) packaged-identity
 proof still required.
@@ -438,13 +569,33 @@ proof still required.
 - [#273](https://github.com/chriscase/GrokPtah/issues/273) a11y criteria
   (keyboard, names, focus return, reduced motion, narrow layout) pass on
   that packaged build.
-- [#308](https://github.com/chriscase/GrokPtah/issues/308) selected
-  direction is implemented far enough that Agents vs Lanes vs finite Run
-  language matches ADR-002, **or** remaining gaps are Explicitly
-  unsupported in the matrix.
+- [#308](https://github.com/chriscase/GrokPtah/issues/308) has a **selected,
+  documented UX direction** (Agents vs Lanes vs finite Run language matches
+  ADR-002) and a **bounded packaged-desktop acceptance set** executed on
+  that packaged identity, covering at least:
+  - keyboard and accessibility;
+  - operator workflows (first launch/provider setup, local project or hosted
+    home, steer a coding lane, inspect tools/terminal/diffs/tests/evidence,
+    review/approve/promote or discard, recover from errors/disconnects/
+    restarts/interrupted Runs);
+  - wide / narrow / light / dark;
+  - reconnect, error, quota, and authority states;
+  - visual evidence (before/after captures of the packaged build, not only
+    the Phase 2 HTML prototype).
+- Marking remaining **core** UX gaps Explicitly unsupported **fails this
+  exit**. Explicitly unsupported may cover documented #308 **non-goals
+  only**: no immediate full rewrite, no design chosen solely from a static
+  beauty shot, no removal of advanced functionality without workflow
+  evidence, no forced desktop/mobile layout parity, and no dependency on one
+  model or design tool. Web/mobile clients need not share the desktop
+  layout. The Codex-class core desktop interface cannot be status-relabeled
+  away.
+- The Phase 2 design package and D1 recommendation are inputs. They do not
+  satisfy this exit until a direction is selected in the 100% record and the
+  packaged-desktop acceptance set passes.
 
-**Must not claim:** packaged UX certified from `tauri:dev` or terminal-owned
-TCC grants.
+**Must not claim:** packaged UX certified from `tauri:dev`, terminal-owned
+TCC grants, or prototype screenshots alone.
 
 ## Stage 11 — Operations and release drills
 
@@ -509,7 +660,7 @@ production-like drill report.
 5 long-horizon durable memory
         │
         ▼
-6 72-hour operational soak (not a memory proof)
+6 72-hour operational soak + independent-worker/#305 (cannot descope)
         │
         ├──────────────► 7 agent-owned Computer Use surface
         │                         │
@@ -519,7 +670,7 @@ production-like drill report.
         │              │                     │
         └──────────────┴──────────┬──────────┘
                                   ▼
-                 10 packaged UX and accessibility certification
+                 10 packaged UX + selected direction + packaged-desktop acceptance (#308 core)
                                   │
                                   ▼
                  11 operations and release drills
@@ -530,25 +681,44 @@ production-like drill report.
 
 Stages 7–9 may be implemented locally after stage 2, but they **do not
 count toward 100%** until stages 3–6 and 10–11 are also done. Isolated
-visual (stage 9) has no Explicitly unsupported waiver.
+visual (stage 9) has no Explicitly unsupported waiver. Independent
+long-running workers (stage 6 / #305) have no descope waiver. Packaged
+core UX (stage 10 / #308) has no Explicitly unsupported waiver for the
+Codex-class interface.
 
 ## Unverified (explicit)
 
 The following remain **unverified** as of 2026-08-22. They are not
-shipped facts:
+shipped facts. Items marked **must not remain Unverified at 100%** are
+listed in [No-Unverified-at-100](#no-unverified-at-100); a 100% claim that
+still carries them here is invalid.
 
 - Any live Grok Build campaign result (`certification_ready`, catalog IDs
-  above).
-- Grok Build gateway quota observability and any account-balance API.
+  above). **Must not remain Unverified at 100%.**
+- Named secret-free **provider-quota receipt** (campaign/credential/route-bound
+  consumption and exhaustion/429). **Must not remain Unverified at 100%.**
+  Hermetic `http_429` / `rate-limit-backoff-recovery` do not close this.
+- Full Grok Build **account-balance API / synchronization** — not implemented
+  and **not** a 100% requirement. May remain absent.
+- GrokPtah **local host quota ledger** until PR #352 (or successor) merges
+  after certified P1 repair.
 - Packaged-identity Computer Use hardware matrix ([#274](https://github.com/chriscase/GrokPtah/issues/274)).
+  **Must not remain Unverified at 100%.**
 - Isolated visual Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288)).
-- Always-on 72-hour operational soak.
-- Long-horizon / logical-years memory evidence.
-- Least-privilege tokens in production-shaped configs.
+  **Must not remain Unverified at 100%.**
+- Always-on 72-hour operational soak. **Must not remain Unverified at 100%.**
+- Independent long-running worker / multi-worker outcome
+  ([#305](https://github.com/chriscase/GrokPtah/issues/305) core).
+  **Must not remain Unverified at 100%.** Cannot be closed by descope.
+- Long-horizon / logical-years memory evidence. **Must not remain Unverified at 100%.**
+- Least-privilege tokens in production-shaped configs. **Must not remain Unverified at 100%.**
 - Versioned desktop-loopback vs hosted black-box parity fixture.
-- Native Coding Readiness Center / local quota ledger / hosted-service CI
-  until those objects exist on `origin/main` after certified P1 repair.
-- Whether [#305](https://github.com/chriscase/GrokPtah/issues/305) will close
-  as complete or be descoped.
+  **Must not remain Unverified at 100%.**
+- Native Coding Readiness Center / hosted-service CI until those objects
+  exist on `origin/main` after certified P1 repair.
+- Selected UX direction plus bounded packaged-desktop acceptance set
+  ([#308](https://github.com/chriscase/GrokPtah/issues/308) core).
+  **Must not remain Unverified at 100%.** Cannot be closed by marking the
+  Codex-class core interface Explicitly unsupported.
 
 See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) for per-row evidence.

@@ -78,7 +78,7 @@ The bridge:
 - Runs **local tools** (read/list/grep, shell, write with permission) in-process
 - **Build sessions** run a multi-round **tool-calling agent loop** (list/read/grep/glob/write/apply_patch/shell) with permissions; **Chat sessions** are single-shot completions
 - Injects project instructions (`AGENTS.md`, etc.) into Build context; sends effort on the wire
-- When `XAI_API_KEY`, an OS keychain API key, `GROKPTAH_TOKEN_COMMAND`, or OIDC/`~/.grok/auth.json` is present (executable order: env key → keychain → token command → Grok Build session), calls cli-chat-proxy / API for model steps. Session/gateway **routing is Supported**; compatible gateway requests consume provider quota; GrokPtah does not sync a Grok Build account balance; the PR #352 local host quota ledger is pending until merged; exact live certification remains a distinct question ([`CAPABILITY_MATRIX.md`](./CAPABILITY_MATRIX.md)).
+- When `XAI_API_KEY`, an OS keychain API key, `GROKPTAH_TOKEN_COMMAND`, or OIDC/`~/.grok/auth.json` is present (executable order: env key → keychain → token command → Grok Build session), calls cli-chat-proxy / API for model steps. Session/gateway **routing is Supported**; compatible gateway requests consume provider quota; GrokPtah does not sync a Grok Build account balance; a named secret-free provider-quota receipt is a mandatory unmet 100% exit (“not observed” fails); account-balance sync is not implemented and not required; the PR #352 local host quota ledger is pending until merged; exact live certification remains a distinct question ([`CAPABILITY_MATRIX.md`](./CAPABILITY_MATRIX.md)).
 - Discovers MCP servers from `~/.grokptah/mcp.json` / project `.mcp.json` and dispatches enabled **stdio** MCP tools into the Build loop as `mcp__server__tool` (`mcp_runtime.rs`). Skills live under `~/.grokptah/skills` and project skill dirs; plugins under `~/.grokptah/plugins` plus a local catalog. The authenticated control plane is a **separate** MCP surface (`CONTROL_TOOLS`). Computer Use MCP **mutations** remain unsupported ([#271](https://github.com/chriscase/GrokPtah/issues/271)); read-only Computer Run tools (`ptah_list_computer_runs`, `ptah_get_computer_run`, `ptah_get_computer_run_events`, `ptah_get_computer_capacity`) are on main. Isolated visual Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288)) is a mandatory unmet 100% exit, not an unsupported alternative.
 - Background tasks run real async work (directory walk) via `tokio::spawn`
 - Integrated terminal PTYs forward stdout to the UI (`pty://output`) with multi-tab backlog replay
@@ -119,7 +119,11 @@ have identical capabilities; declared host-capability advertisement and
 hosted-service CI are not on `origin/main` (see the matrix). Shipped
 ManagerSupervisor is not hosted Grokbot certification. “Grokbot” in
 ADR-002 / [#301](https://github.com/chriscase/GrokPtah/issues/301) is hosted
-always-on language, not a shipped binary name.
+always-on language, not a shipped binary name. Independent long-running
+workers ([#305](https://github.com/chriscase/GrokPtah/issues/305)) and
+selected packaged-desktop UX ([#308](https://github.com/chriscase/GrokPtah/issues/308))
+are mandatory unmet 100% exits; they cannot be descoped or waived as
+Explicitly unsupported for the core product outcome.
 
 ```sh
 # CLI / TUI (root workspace)

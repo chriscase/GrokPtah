@@ -239,8 +239,12 @@ confirmed P1s.
 
 GrokPtah **already routes** Grok Build session/gateway traffic via
 `~/.grok/auth.json` / OIDC. Compatible gateway requests consume provider quota.
-GrokPtah does not sync a Grok Build account balance. The PR #352 local host
-quota ledger is a separate pending feature until merged. Exact live
+GrokPtah does not sync a Grok Build account balance. A **named secret-free
+provider-quota receipt** (campaign/credential/route-bound consumption and
+exhaustion/429) is a **mandatory unmet** 100% live-provider exit; a report
+that says quota was “not observed” fails that exit. Account-balance
+synchronization is not implemented and **not** a 100% requirement. The PR #352
+local host quota ledger is a separate pending feature until merged. Exact live
 certification remains unproven.
 
 Known intentional limits (today):
@@ -250,6 +254,8 @@ Known intentional limits (today):
 - Plugin “marketplace” is a **local catalog** on disk, not a remote store.
 - Primary packaging target is **macOS**.
 - Computer Use is Experimental foreground-semantic on macOS; raw global input is Explicitly unsupported; isolated visual Computer Use is a **mandatory unmet** 100% exit ([#288](https://github.com/chriscase/GrokPtah/issues/288)).
+- Independent long-running workers ([#305](https://github.com/chriscase/GrokPtah/issues/305)) are a **mandatory unmet** 100% exit and cannot be descoped.
+- Selected packaged-desktop UX ([#308](https://github.com/chriscase/GrokPtah/issues/308)) is a **mandatory unmet** 100% exit; Explicitly unsupported covers documented non-goals only, not the Codex-class core interface.
 - **Every configured remote bearer can approve and promote within service scope.** Least-privilege `LocalOperator` / `RemoteCoordinator` / `Observer` separation is Planned and must precede any production-shaped 72-hour soak.
 
 ---

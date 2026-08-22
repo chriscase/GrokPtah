@@ -11,7 +11,10 @@ xAI credential order is `XAI_API_KEY`, OS keychain API key,
 `GROKPTAH_TOKEN_COMMAND`, then the Grok Build session
 (`auth_store.rs` `resolve_xai_credentials`). Compatible gateway requests
 consume provider quota. GrokPtah does not synchronize a Grok Build account
-balance. Exact live certification is a distinct question. A local durable
+balance. A named secret-free **provider-quota receipt** (consumption and
+exhaustion/429) is a mandatory unmet 100% live-provider exit; “not observed”
+fails that exit. Account-balance synchronization is not implemented and not a
+100% requirement. Exact live certification is a distinct question. A local durable
 host quota ledger and the Native Coding Readiness Center are **Pending — not
 shipped** on [PR #352](https://github.com/chriscase/GrokPtah/pull/352).
 Stage 1 cannot pass while that PR remains draft. Status:
@@ -131,4 +134,6 @@ does not combine one profile's endpoint with another profile's credential.
 The built-in xAI profile retains its existing API-key, `GROKPTAH_TOKEN_COMMAND`,
 and Grok Build OIDC refresh/header behavior. That is routing, not a passed
 live-certification campaign and not a Grok Build account-balance feed.
-Compatible gateway requests still consume provider quota.
+Compatible gateway requests still consume provider quota. A named secret-free
+provider-quota receipt remains a mandatory unmet 100% exit
+([`ROADMAP_TO_100.md`](ROADMAP_TO_100.md) stage 2).

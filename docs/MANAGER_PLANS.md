@@ -164,13 +164,19 @@ contract do not hard-code a provider. **Grok Build session/gateway routing is
 already Supported** on that path (`~/.grok/auth.json` / OIDC, after
 `XAI_API_KEY`, keychain, and `GROKPTAH_TOKEN_COMMAND`). Compatible gateway
 requests consume provider quota. GrokPtah does not synchronize a Grok Build
-account balance. Exact live certification remains a distinct, unproven
+account balance. A named secret-free provider-quota receipt is a mandatory
+unmet 100% live-provider exit; “not observed” fails that exit. Account-balance
+synchronization is not implemented and not a 100% requirement. Exact live
+certification remains a distinct, unproven
 question. A local durable host quota ledger is **Pending — not shipped** on
 [PR #352](https://github.com/chriscase/GrokPtah/pull/352) and cannot be treated
 as shipped while that PR remains draft; merge requires independently certified
 repair of the five confirmed P1s ([`ROADMAP_TO_100.md`](ROADMAP_TO_100.md)
-stage 1). First live certification of this supervisor is roadmap stage 2;
-hosted Grokbot soak is stage 6 and requires least-privilege tokens first
-(stage 3). Draft manager-cert PRs
+stage 1). First live certification of this supervisor is roadmap stage 2
+(including the named provider-quota receipt); hosted Grokbot soak is stage 6
+and requires least-privilege tokens first (stage 3) **and** the independent
+long-running worker / multi-worker outcome
+([#305](https://github.com/chriscase/GrokPtah/issues/305)), which cannot be
+descoped. Draft manager-cert PRs
 [#344](https://github.com/chriscase/GrokPtah/pull/344)–[#348](https://github.com/chriscase/GrokPtah/pull/348)
 are **Pending — not shipped**.
