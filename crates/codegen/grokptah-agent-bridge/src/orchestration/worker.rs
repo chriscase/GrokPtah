@@ -257,4 +257,189 @@ mod tests {
         assert!(attempt.lease_active_at(now));
         assert_ne!(attempt.claimant_id, presence.agent_id);
     }
+
+    fn bounds(
+        max_prompt_bytes: usize,
+        max_rounds: u32,
+        max_duration_ms: u64,
+        max_total_tokens: Option<u64>,
+    ) -> RunBounds {
+        RunBounds {
+            max_prompt_bytes,
+            max_rounds,
+            max_duration_ms,
+            max_total_tokens,
+        }
+    }
+
+    fn spec(default_run_bounds: RunBounds) -> AgentSpec {
+        let mut spec = AgentSpec::initial(
+            "worker-1",
+            "/tmp/ws",
+            "grok",
+            crate::orchestration::types::AgentAuthorityPolicy::default(),
+            Utc::now(),
+            "privilege-amplification-test",
+        )
+        .unwrap();
+        spec.default_run_bounds = default_run_bounds;
+        spec
+    }
+
+    /// Computer Use is never delegated through assignment, whatever the
+    /// bounds say.
+    #[test]
+    fn a_computer_use_worker_is_never_assignable() {
+        let server = bounds(10_000, 8, 60_000, Some(10_000));
+        let mut worker = spec(server.clone());
+        worker.authority.computer_use_allowed = true;
+        let error = reject_privilege_amplification(None, &worker, &server, &server).unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::ForbiddenScope);
+        assert!(
+            error.message.contains("Computer Use"),
+            "unexpected message: {}",
+            error.message
+        );
+
+        // The same assignment is admissible once Computer Use is not claimed,
+        // so the rejection above is about authority and not about bounds.
+        worker.authority.computer_use_allowed = false;
+        reject_privilege_amplification(None, &worker, &server, &server).unwrap();
+    }
+
+    /// Work may never request more than the narrowest of the manager, worker,
+    /// and server ceilings, on every axis, whichever party is narrowest.
+    #[test]
+    fn work_bounds_cannot_exceed_the_narrowest_ceiling_on_any_axis() {
+        let wide = bounds(10_000, 20, 600_000, Some(100_000));
+        let narrow_prompt = bounds(1_000, 20, 600_000, Some(100_000));
+        let narrow_rounds = bounds(10_000, 2, 600_000, Some(100_000));
+        let narrow_duration = bounds(10_000, 20, 60_000, Some(100_000));
+        let narrow_tokens = bounds(10_000, 20, 600_000, Some(5_000));
+
+        // Each row narrows exactly one axis, on exactly one of the three
+        // parties, and asks for one unit more than that narrowed axis allows.
+        let cases: Vec<(&str, Option<RunBounds>, RunBounds, RunBounds, RunBounds)> = vec![
+            (
+                "manager narrows prompt bytes",
+                Some(narrow_prompt.clone()),
+                wide.clone(),
+                wide.clone(),
+                bounds(1_001, 2, 60_000, Some(5_000)),
+            ),
+            (
+                "worker narrows rounds",
+                Some(wide.clone()),
+                narrow_rounds.clone(),
+                wide.clone(),
+                bounds(1_000, 3, 60_000, Some(5_000)),
+            ),
+            (
+                "server narrows duration",
+                Some(wide.clone()),
+                wide.clone(),
+                narrow_duration.clone(),
+                bounds(1_000, 2, 60_001, Some(5_000)),
+            ),
+            (
+                "worker narrows total tokens",
+                Some(wide.clone()),
+                narrow_tokens.clone(),
+                wide.clone(),
+                bounds(1_000, 2, 60_000, Some(5_001)),
+            ),
+        ];
+
+        for (case, manager, worker, server, work) in cases {
+            let manager_spec = manager.map(spec);
+            let worker_spec = spec(worker);
+            let error =
+                reject_privilege_amplification(manager_spec.as_ref(), &worker_spec, &work, &server)
+                    .unwrap_err();
+            assert_eq!(error.code, OrchErrorCode::ForbiddenScope, "{case}");
+            assert!(
+                error.message.contains("amplify bounds"),
+                "{case}: unexpected message {}",
+                error.message
+            );
+        }
+
+        // Exactly at the intersection is admissible, so the rejections above
+        // are the ceiling and not an off-by-one that forbids the limit.
+        let manager_spec = spec(narrow_prompt);
+        let worker_spec = spec(narrow_rounds);
+        reject_privilege_amplification(
+            Some(&manager_spec),
+            &worker_spec,
+            &bounds(1_000, 2, 60_000, Some(5_000)),
+            &narrow_duration,
+        )
+        .unwrap();
+    }
+
+    /// A manager-less assignment falls back to the server ceiling. It must not
+    /// fall back to an open one.
+    #[test]
+    fn an_absent_manager_falls_back_to_the_server_ceiling() {
+        let server = bounds(1_000, 2, 60_000, Some(5_000));
+        let worker = spec(bounds(10_000, 20, 600_000, Some(100_000)));
+
+        reject_privilege_amplification(None, &worker, &server, &server).unwrap();
+        let error = reject_privilege_amplification(
+            None,
+            &worker,
+            &bounds(1_001, 2, 60_000, Some(5_000)),
+            &server,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::ForbiddenScope);
+    }
+
+    /// The token ceiling is the smallest limit anyone declared. A party that
+    /// declares no limit does not widen the ones that did.
+    #[test]
+    fn the_token_ceiling_is_the_smallest_declared_limit() {
+        let open = bounds(10_000, 20, 600_000, None);
+        let manager = spec(open.clone());
+        let worker = spec(bounds(10_000, 20, 600_000, Some(5_000)));
+
+        // Manager and server declare no token limit; the worker's stands.
+        reject_privilege_amplification(
+            Some(&manager),
+            &worker,
+            &bounds(1_000, 2, 60_000, Some(5_000)),
+            &open,
+        )
+        .unwrap();
+        let error = reject_privilege_amplification(
+            Some(&manager),
+            &worker,
+            &bounds(1_000, 2, 60_000, Some(5_001)),
+            &open,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::ForbiddenScope);
+
+        // Work that declares no token bound is not a request for an unbounded
+        // Run: it simply does not override, and the effective ceiling is still
+        // intersected when the Run is admitted. Pinned so a later change does
+        // not turn a non-override into a rejection.
+        reject_privilege_amplification(
+            Some(&manager),
+            &worker,
+            &bounds(1_000, 2, 60_000, None),
+            &open,
+        )
+        .unwrap();
+
+        // Nobody declares a token limit: there is nothing to amplify past.
+        let open_worker = spec(open.clone());
+        reject_privilege_amplification(
+            Some(&manager),
+            &open_worker,
+            &bounds(1_000, 2, 60_000, Some(u64::MAX)),
+            &open,
+        )
+        .unwrap();
+    }
 }
