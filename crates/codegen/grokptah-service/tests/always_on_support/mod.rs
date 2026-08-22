@@ -3,6 +3,7 @@
 //! Spawns the shipped `grokptah-service` binary, a loopback fake provider, and
 //! an authenticated MCP client. No production crate is modified.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -164,6 +165,13 @@ fn scripted_completion(body: &str, script: ProviderScript) -> String {
     if content.contains("GROKBOT_FORCE_FAIL") {
         return "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 16\r\nConnection: close\r\n\r\nprovider-fail-v1".into();
     }
+    if content.contains("GROKBOT_CANCEL_TARGET") {
+        thread::sleep(Duration::from_secs(3));
+        return sse_ok("GROKBOT_OK");
+    }
+    // Hold the HTTP response long enough that usagePendingRequests is observable
+    // via public MCP before the Run leaves `running`.
+    thread::sleep(Duration::from_millis(150));
     sse_ok("GROKBOT_OK")
 }
 
@@ -329,6 +337,10 @@ impl ServiceProcess {
             _home_dir: home_dir,
             _workspace_dir: workspace_dir,
         }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     pub fn respawn(&mut self, provider_base: &str) {
@@ -599,4 +611,305 @@ pub fn pending_usage(run: &Value) -> u64 {
         .or_else(|| run.pointer("/aggregates/usage_pending_requests"))
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+pub fn usage_complete(run: &Value) -> bool {
+    run.pointer("/aggregates/usageComplete")
+        .or_else(|| run.pointer("/aggregates/usage_complete"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+pub fn run_id_of(run: &Value) -> Option<&str> {
+    run["runId"].as_str().or_else(|| run["run_id"].as_str())
+}
+
+pub fn work_id_of(item: &Value) -> Option<&str> {
+    item["workId"].as_str().or_else(|| item["work_id"].as_str())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Identity {
+    pub sends: u64,
+    pub work_ids: BTreeSet<String>,
+    pub run_ids: BTreeSet<String>,
+    pub linked_run_ids: BTreeSet<String>,
+    pub intent_ids: BTreeSet<String>,
+    pub decision_ids: BTreeSet<String>,
+    pub message_ids: BTreeSet<String>,
+    pub plan_revision: u64,
+}
+
+impl Identity {
+    pub fn hash_hex(&self) -> String {
+        fnv1a_hex(&format!("{self:?}"))
+    }
+}
+
+pub fn fnv1a_hex(input: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+pub async fn collect_identity(
+    client: &mut McpControlClient,
+    session: Uuid,
+    workspace: &Path,
+    plan_id: &str,
+    sends: u64,
+) -> Identity {
+    let ws = workspace.display().to_string();
+    let runs = call(
+        client,
+        "ptah_list_runs",
+        json!({ "session_id": session, "workspace": ws }),
+    )
+    .await;
+    let work = call(
+        client,
+        "ptah_list_work",
+        json!({ "session_id": session, "workspace": ws }),
+    )
+    .await;
+    let intents = call(
+        client,
+        "ptah_list_execution_intents",
+        json!({ "session_id": session, "workspace": ws }),
+    )
+    .await;
+    let plan = call(
+        client,
+        "ptah_get_manager_plan",
+        json!({ "session_id": session, "workspace": ws, "plan_id": plan_id }),
+    )
+    .await;
+    let messages = call(
+        client,
+        "ptah_list_inbox",
+        json!({
+            "session_id": session,
+            "workspace": ws,
+            "agent_id": plan["plan"]["managerAgentId"]
+        }),
+    )
+    .await;
+    let mut linked_run_ids = BTreeSet::new();
+    let mut linked_raw = 0usize;
+    let mut decision_ids = BTreeSet::new();
+    for item in work_items(&work) {
+        let Some(id) = work_id_of(item) else {
+            continue;
+        };
+        if item["kind"].as_str() == Some("manager-decision") {
+            decision_ids.insert(id.to_string());
+        }
+        let detail = call(
+            client,
+            "ptah_get_work",
+            json!({
+                "session_id": session,
+                "workspace": ws,
+                "work_id": id
+            }),
+        )
+        .await;
+        for attempt in detail["attempts"].as_array().unwrap_or(&vec![]) {
+            for run in attempt["linkedRunIds"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(Value::as_str)
+            {
+                linked_raw += 1;
+                linked_run_ids.insert(run.to_string());
+            }
+        }
+    }
+    assert_eq!(
+        linked_raw,
+        linked_run_ids.len(),
+        "duplicate linkedRunIds: {linked_run_ids:?}"
+    );
+    let work_ids = work_items(&work)
+        .iter()
+        .filter_map(work_id_of)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let run_ids = runs["runs"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(run_id_of)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let intent_ids = intents["intents"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|intent| {
+            intent["intentId"]
+                .as_str()
+                .or_else(|| intent["intent_id"].as_str())
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let message_ids = messages["messages"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|message| {
+            message["messageId"]
+                .as_str()
+                .or_else(|| message["message_id"].as_str())
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        work_ids.len(),
+        work_ids.iter().collect::<BTreeSet<_>>().len(),
+        "duplicate workIds: {work_ids:?}"
+    );
+    assert_eq!(
+        run_ids.len(),
+        run_ids.iter().collect::<BTreeSet<_>>().len(),
+        "duplicate runIds: {run_ids:?}"
+    );
+    Identity {
+        sends,
+        work_ids: work_ids.into_iter().collect(),
+        run_ids: run_ids.into_iter().collect(),
+        linked_run_ids,
+        intent_ids: intent_ids.into_iter().collect(),
+        decision_ids,
+        message_ids: message_ids.into_iter().collect(),
+        plan_revision: plan
+            .pointer("/plan/revision")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }
+}
+
+pub fn assert_exact_after_restart(
+    before: &Identity,
+    after: &Identity,
+    again: &Identity,
+    cut: &str,
+) {
+    assert!(
+        before.work_ids.is_subset(&after.work_ids),
+        "restart dropped workIds at {cut}: {before:?} -> {after:?}"
+    );
+    assert!(
+        before.run_ids.is_subset(&after.run_ids),
+        "restart dropped runIds at {cut}: {before:?} -> {after:?}"
+    );
+    assert!(
+        before.linked_run_ids.is_subset(&after.linked_run_ids),
+        "restart dropped linkedRunIds at {cut}: {before:?} -> {after:?}"
+    );
+    assert!(
+        before.decision_ids.is_subset(&after.decision_ids),
+        "restart dropped decisions at {cut}: {before:?} -> {after:?}"
+    );
+    assert_eq!(
+        after.sends, again.sends,
+        "duplicate tick after restart created provider sends at {cut}: {after:?} vs {again:?}"
+    );
+    assert_eq!(
+        after.work_ids, again.work_ids,
+        "duplicate tick after restart created work at {cut}"
+    );
+    assert_eq!(
+        after.run_ids, again.run_ids,
+        "duplicate tick after restart created runs at {cut}: {after:?} vs {again:?}"
+    );
+    assert_eq!(
+        after.linked_run_ids, again.linked_run_ids,
+        "duplicate tick after restart created linkedRunIds at {cut}"
+    );
+    assert_eq!(
+        after.decision_ids, again.decision_ids,
+        "duplicate tick after restart created decisions at {cut}"
+    );
+    assert_eq!(
+        after.message_ids, again.message_ids,
+        "duplicate tick after restart created messages at {cut}"
+    );
+    assert_eq!(
+        after.plan_revision, again.plan_revision,
+        "duplicate tick after restart mutated plan revision at {cut}"
+    );
+}
+
+pub fn home_bytes(path: &Path) -> u64 {
+    fn walk(path: &Path, total: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, total);
+            } else if let Ok(meta) = entry.metadata() {
+                *total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    let mut total = 0u64;
+    walk(path, &mut total);
+    total
+}
+
+pub fn rss_kb(pid: u32) -> u64 {
+    let output = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output();
+    let Ok(output) = output else {
+        return 0;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+pub fn git_head(repo: &Path) -> String {
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+pub fn openssl_sha256_hex(bytes: &[u8]) -> String {
+    let mut child = match Command::new("openssl")
+        .args(["dgst", "-sha256"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return fnv1a_hex(&String::from_utf8_lossy(bytes)),
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(bytes);
+    }
+    let output = child.wait_with_output().ok();
+    output
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| {
+            text.split_whitespace()
+                .last()
+                .map(|value| value.trim().to_string())
+        })
+        .filter(|value| value.len() == 64)
+        .unwrap_or_else(|| fnv1a_hex(&String::from_utf8_lossy(bytes)))
 }

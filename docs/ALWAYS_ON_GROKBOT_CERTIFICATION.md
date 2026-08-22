@@ -50,7 +50,7 @@ The service test kills and relaunches the same binary against the same runtime h
 8. `notification-accepted-fence-pending`
 9. `terminal-run-before-settlement`
 
-After each cut: reopen MCP, drive `ptah_tick_manager_plan` twice, assert cardinalities do not shrink and Interrupted runs have `usagePendingRequests=0`.
+Each cut is a unique public MCP state (not “or succeeded”). After reopen: drive `ptah_tick_manager_plan` twice and assert exact identity sets (`workIds`, `runIds`, `linkedRunIds`, decisions, plan revision) with no duplicates, plus Interrupted `usagePendingRequests=0`.
 
 A bounded `/ready` poll is used after spawn. That is readiness, not a test `sleep`. Native executor and manager supervisor intervals are production (1s / 2s); tests poll MCP rather than injecting a fake clock (no public seam exists to inject `FakeClock` into the standalone process).
 
@@ -70,7 +70,7 @@ GROKBOT_SOAK_SECS=86400 cargo test --locked --manifest-path crates/codegen/grokp
 
 The soak periodically kills and respawns the real process, creates bounded autonomous plans, injects the same controlled child failure, and requires `succeeded` plus stable cardinalities. It does not require a live provider.
 
-Record in the soak log (stdout): commit SHA, seed `always-on-grokbot-v1`, duration, restart count, cycle count, provider send count. Hash the uncommitted JSON report if you wrap this command with `grokptah-cert`.
+The soak writes machine-readable JSON and Markdown to `GROKBOT_SOAK_OUT` (default: the process runtime home `soak/` directory, not committed). The report includes commit SHA, seed `always-on-grokbot-v1`, duration, restart count, cycle count, provider sends, invariant counts, home/RSS sizes, snapshot hash, and `reportSha256`. Disk and RSS growth are bounded.
 
 ## Remaining limits before a live-provider 24h run
 

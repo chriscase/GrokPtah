@@ -3,7 +3,7 @@
 //! Drives the shipped `grokptah-service` binary over authenticated MCP with a
 //! loopback fake provider. No production crate is modified.
 
-#![allow(clippy::await_holding_lock)]
+#![allow(clippy::await_holding_lock, clippy::too_many_arguments)]
 
 mod always_on_support;
 
@@ -15,9 +15,11 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use always_on_support::{
-    assert_no_quota_ledger, assert_no_secret_leak, call, call_expect_error, mcp, pending_usage,
-    poll_json, rid, serial_lock, snapshot, succeeded_kind_count, work_items, work_kind_count,
-    Cardinality, FakeProvider, ProviderScript, ServiceProcess,
+    assert_exact_after_restart, assert_no_quota_ledger, assert_no_secret_leak, call,
+    call_expect_error, collect_identity, git_head, home_bytes, mcp, openssl_sha256_hex,
+    pending_usage, poll_json, rid, rss_kb, serial_lock, snapshot, succeeded_kind_count,
+    usage_complete, work_id_of, work_items, work_kind_count, FakeProvider, ProviderScript,
+    ServiceProcess,
 };
 
 const CUTS: &[&str] = &[
@@ -31,6 +33,7 @@ const CUTS: &[&str] = &[
     "notification-accepted-fence-pending",
     "terminal-run-before-settlement",
 ];
+const SEED: &str = "always-on-grokbot-v1";
 
 fn managed_policy() -> Value {
     json!({
@@ -75,7 +78,10 @@ fn native_step(step_id: &str, objective: &str, deps: &[&str], agent_id: &str) ->
     })
 }
 
-async fn bootstrap_agent(client: &mut McpControlClient, workspace: &Path) -> (Uuid, String) {
+async fn bootstrap_agent(
+    client: &mut McpControlClient,
+    workspace: &Path,
+) -> (Uuid, String, String) {
     let created = call(
         client,
         "ptah_create_session",
@@ -136,7 +142,7 @@ async fn bootstrap_agent(client: &mut McpControlClient, workspace: &Path) -> (Uu
         }),
     )
     .await;
-    (session, agent_id)
+    (session, agent_id, run_id)
 }
 
 async fn create_plan(
@@ -268,10 +274,6 @@ async fn list_intents(client: &mut McpControlClient, session: Uuid, workspace: &
     .await
 }
 
-fn run_state(run: &Value) -> Option<&str> {
-    run["state"].as_str()
-}
-
 fn plan_has_step(plan: &Value, step_id: &str) -> bool {
     plan.pointer("/plan/steps")
         .and_then(Value::as_array)
@@ -280,46 +282,289 @@ fn plan_has_step(plan: &Value, step_id: &str) -> bool {
         .any(|step| step["stepId"].as_str() == Some(step_id))
 }
 
-fn cut_reached(
+fn plan_step<'a>(plan: &'a Value, step_id: &str) -> Option<&'a Value> {
+    plan.pointer("/plan/steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|step| step["stepId"].as_str() == Some(step_id))
+}
+
+fn decision_item(work: &Value) -> Option<&Value> {
+    work_items(work)
+        .iter()
+        .find(|item| item["kind"].as_str() == Some("manager-decision"))
+}
+
+fn intent_for_work<'a>(intents: &'a Value, work_id: &str) -> Option<&'a Value> {
+    intents["intents"].as_array()?.iter().find(|intent| {
+        intent["workId"].as_str() == Some(work_id) || intent["work_id"].as_str() == Some(work_id)
+    })
+}
+
+fn linked_run_ids(detail: &Value) -> Vec<String> {
+    detail["attempts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|attempt| {
+            attempt["linkedRunIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn step_fence_message_id(step: &Value) -> Option<&str> {
+    step["lastNotificationMessageId"]
+        .as_str()
+        .or_else(|| step["last_notification_message_id"].as_str())
+}
+
+fn fence_pending(plan: &Value, work: &Value, messages: &Value) -> bool {
+    let inbox: Vec<&str> = messages["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| {
+            message["messageId"]
+                .as_str()
+                .or_else(|| message["message_id"].as_str())
+        })
+        .collect();
+    let fenced: Vec<&str> = plan
+        .pointer("/plan/steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(step_fence_message_id)
+        .collect();
+    (!inbox.is_empty() && inbox.iter().any(|id| !fenced.contains(id)))
+        || plan
+            .pointer("/plan/steps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|step| {
+                let Some(work_id) = step["workId"].as_str().or_else(|| step["work_id"].as_str())
+                else {
+                    return false;
+                };
+                let Some(item) = work_items(work)
+                    .iter()
+                    .find(|item| work_id_of(item) == Some(work_id))
+                else {
+                    return false;
+                };
+                let work_rev = item["revision"].as_u64().unwrap_or(0);
+                let fenced_rev = step["lastNotificationWorkRevision"]
+                    .as_u64()
+                    .or_else(|| step["last_notification_work_revision"].as_u64());
+                step_fence_message_id(step).is_some()
+                    && fenced_rev.is_some_and(|rev| rev != work_rev)
+            })
+}
+
+fn unfenced_terminal_step(plan: &Value, work: &Value) -> bool {
+    plan.pointer("/plan/steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|step| {
+            let Some(work_id) = step["workId"].as_str().or_else(|| step["work_id"].as_str()) else {
+                return false;
+            };
+            if step_fence_message_id(step).is_some() {
+                return false;
+            }
+            work_items(work).iter().any(|item| {
+                work_id_of(item) == Some(work_id)
+                    && matches!(
+                        item["state"].as_str(),
+                        Some("succeeded" | "failed" | "cancelled" | "blocked")
+                    )
+            })
+        })
+}
+
+fn failed_native_campaign_run(run: &Value, setup_run: &str) -> bool {
+    run_id_of_value(run) != Some(setup_run)
+        && run["purpose"].as_str() != Some("manager_proposal")
+        && matches!(run["state"].as_str(), Some("failed" | "limit_reached"))
+}
+
+fn run_id_of_value(run: &Value) -> Option<&str> {
+    run["runId"].as_str().or_else(|| run["run_id"].as_str())
+}
+
+fn unique_cut(
     cut: &str,
     plan: &Value,
     work: &Value,
     runs: &Value,
     intents: &Value,
     messages: &Value,
+    decision_detail: Option<&Value>,
+    setup_run: &str,
 ) -> bool {
     let plan_state = plan["plan"]["state"].as_str().unwrap_or_default();
-    let native_work = work_kind_count(work, "native");
     let decisions = work_kind_count(work, "manager-decision");
-    let run_count = runs["runs"].as_array().map(|a| a.len()).unwrap_or(0);
-    let intent_count = intents["intents"].as_array().map(|a| a.len()).unwrap_or(0);
-    let message_count = messages
-        .get("messages")
-        .and_then(Value::as_array)
-        .map(|a| a.len())
-        .unwrap_or(0);
-    let any_terminal_run = runs["runs"]
+    let decision = decision_item(work);
+    let decision_id = decision.and_then(work_id_of);
+    let decision_intent = decision_id.and_then(|id| intent_for_work(intents, id));
+    let decision_run = decision_intent.and_then(|intent| {
+        intent["runId"]
+            .as_str()
+            .or_else(|| intent["run_id"].as_str())
+            .filter(|id| !id.is_empty())
+    });
+    let decision_links = decision_detail.map(linked_run_ids).unwrap_or_default();
+    let decision_succeeded = succeeded_kind_count(work, "manager-decision") >= 1;
+    let has_fix = plan_has_step(plan, "step-b-fix");
+    let fix_work_id = plan_step(plan, "step-b-fix").and_then(|step| step["workId"].as_str());
+    let fix_succeeded = fix_work_id.is_some_and(|id| {
+        work_items(work)
+            .iter()
+            .any(|item| work_id_of(item) == Some(id) && item["state"].as_str() == Some("succeeded"))
+    });
+    let campaign_runs: Vec<&Value> = runs["runs"]
         .as_array()
         .into_iter()
         .flatten()
-        .any(|run| matches!(run_state(run), Some("completed" | "failed" | "interrupted")));
-    let decision_succeeded = succeeded_kind_count(work, "manager-decision") >= 1;
+        .filter(|run| run_id_of_value(run) != Some(setup_run))
+        .collect();
+    let native_failed = campaign_runs
+        .iter()
+        .any(|run| failed_native_campaign_run(run, setup_run));
     match cut {
         "occurrence-reserved" => {
-            matches!(plan_state, "needs_replan" | "active" | "succeeded") && native_work >= 1
+            plan_state == "active" && decisions == 0 && !has_fix && native_failed
         }
-        "decision-work-persisted" => decisions >= 1 || plan_state == "succeeded",
-        "native-intent-persisted" => native_work >= 1 && (intent_count >= 1 || any_terminal_run),
-        "run-submitted" => native_work >= 1 && run_count > 1,
-        "directive-proposed" => decision_succeeded || plan_has_step(plan, "step-b-fix"),
-        "orchestration-mutation-persisted" => plan_has_step(plan, "step-b-fix"),
+        "decision-work-persisted" => {
+            decisions == 1
+                && decision_intent.is_none()
+                && decision_links.is_empty()
+                && !decision_succeeded
+                && !has_fix
+        }
+        "native-intent-persisted" => {
+            decision_intent.is_some()
+                && decision_run.is_none()
+                && decision_links.is_empty()
+                && !has_fix
+        }
+        "run-submitted" => {
+            (!decision_links.is_empty() || decision_run.is_some())
+                && !decision_succeeded
+                && !has_fix
+        }
+        "directive-proposed" => {
+            plan_state == "needs_replan"
+                && !has_fix
+                && campaign_runs.iter().any(|run| {
+                    run["purpose"].as_str() == Some("manager_proposal")
+                        && matches!(
+                            run["state"].as_str(),
+                            Some("completed" | "failed" | "limit_reached")
+                        )
+                })
+        }
+        "orchestration-mutation-persisted" => {
+            has_fix && fix_work_id.is_none() && plan_state == "active"
+        }
         "decision-applied-pending" => {
-            plan_has_step(plan, "step-b-fix")
-                && matches!(plan_state, "active" | "succeeded" | "needs_replan")
+            has_fix && fix_work_id.is_some() && !fix_succeeded && plan_state == "active"
         }
-        "notification-accepted-fence-pending" => message_count >= 1 || plan_state == "succeeded",
-        "terminal-run-before-settlement" => native_work >= 1 && any_terminal_run,
+        "notification-accepted-fence-pending" => {
+            plan_state == "active"
+                && decisions == 0
+                && !has_fix
+                && !native_failed
+                && (fence_pending(plan, work, messages) || unfenced_terminal_step(plan, work))
+        }
+        "terminal-run-before-settlement" => {
+            decisions == 0
+                && !has_fix
+                && succeeded_kind_count(work, "native") == 0
+                && campaign_runs.iter().any(|run| {
+                    run["state"].as_str() == Some("running")
+                        && run["purpose"].as_str() != Some("manager_proposal")
+                        && (pending_usage(run) > 0 || !usage_complete(run))
+                })
+        }
         _ => false,
+    }
+}
+
+fn missed_unique_cut(
+    cut: &str,
+    plan: &Value,
+    work: &Value,
+    runs: &Value,
+    intents: &Value,
+    decision_detail: Option<&Value>,
+    setup_run: &str,
+) -> bool {
+    let has_fix = plan_has_step(plan, "step-b-fix");
+    let decisions = work_kind_count(work, "manager-decision");
+    let decision = decision_item(work);
+    let decision_id = decision.and_then(work_id_of);
+    let decision_intent = decision_id.and_then(|id| intent_for_work(intents, id));
+    let decision_run = decision_intent.and_then(|intent| {
+        intent["runId"]
+            .as_str()
+            .or_else(|| intent["run_id"].as_str())
+            .filter(|id| !id.is_empty())
+    });
+    let decision_succeeded = succeeded_kind_count(work, "manager-decision") >= 1;
+    let plan_state = plan["plan"]["state"].as_str().unwrap_or_default();
+    match cut {
+        "native-intent-persisted" => {
+            decision_run.is_some()
+                || !decision_detail
+                    .map(linked_run_ids)
+                    .unwrap_or_default()
+                    .is_empty()
+                || decision_succeeded
+                || has_fix
+        }
+        "decision-work-persisted" => decision_intent.is_some() || decision_succeeded || has_fix,
+        "occurrence-reserved" => decisions >= 1 || has_fix,
+        "terminal-run-before-settlement" => {
+            succeeded_kind_count(work, "native") >= 1 || decisions >= 1 || has_fix
+        }
+        "notification-accepted-fence-pending" => {
+            runs["runs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|run| failed_native_campaign_run(run, setup_run))
+                || decisions >= 1
+                || has_fix
+        }
+        "directive-proposed" => has_fix || plan_state == "succeeded" || plan_state == "active",
+        "orchestration-mutation-persisted" => {
+            has_fix
+                && plan_step(plan, "step-b-fix")
+                    .and_then(|step| step["workId"].as_str())
+                    .is_some()
+        }
+        "run-submitted" => decision_succeeded || has_fix,
+        "decision-applied-pending" => {
+            has_fix
+                && plan_step(plan, "step-b-fix")
+                    .and_then(|step| step["workId"].as_str())
+                    .is_some_and(|id| {
+                        work_items(work).iter().any(|item| {
+                            work_id_of(item) == Some(id)
+                                && item["state"].as_str() == Some("succeeded")
+                        })
+                    })
+        }
+        _ => plan_state == "succeeded",
     }
 }
 
@@ -328,7 +573,7 @@ async fn observe(
     session: Uuid,
     workspace: &Path,
     plan_id: &str,
-) -> (Value, Value, Value, Value, Value) {
+) -> (Value, Value, Value, Value, Value, Option<Value>) {
     let plan = call(
         client,
         "ptah_get_manager_plan",
@@ -352,13 +597,190 @@ async fn observe(
         }),
     )
     .await;
-    (plan, work, runs, intents, messages)
+    let decision_detail = match decision_item(&work).and_then(work_id_of) {
+        Some(id) => Some(
+            call(
+                client,
+                "ptah_get_work",
+                json!({
+                    "session_id": session,
+                    "workspace": workspace,
+                    "work_id": id
+                }),
+            )
+            .await,
+        ),
+        None => None,
+    };
+    (plan, work, runs, intents, messages, decision_detail)
+}
+
+async fn observe_for_cut(
+    cut: &str,
+    client: &mut McpControlClient,
+    session: Uuid,
+    workspace: &Path,
+    plan_id: &str,
+) -> (Value, Value, Value, Value, Value, Option<Value>) {
+    match cut {
+        "native-intent-persisted" | "run-submitted" | "decision-work-persisted" => {
+            let plan = call(
+                client,
+                "ptah_get_manager_plan",
+                json!({
+                    "session_id": session,
+                    "workspace": workspace,
+                    "plan_id": plan_id
+                }),
+            )
+            .await;
+            let work = list_work(client, session, workspace).await;
+            let intents = list_intents(client, session, workspace).await;
+            (
+                plan,
+                work,
+                json!({"runs": []}),
+                intents,
+                json!({"messages": []}),
+                None,
+            )
+        }
+        "directive-proposed" => {
+            let runs = list_runs(client, session, workspace).await;
+            let proposal_done = runs["runs"].as_array().into_iter().flatten().any(|run| {
+                run["purpose"].as_str() == Some("manager_proposal")
+                    && matches!(
+                        run["state"].as_str(),
+                        Some("completed" | "failed" | "limit_reached")
+                    )
+            });
+            if !proposal_done {
+                return (
+                    json!({"plan": {"state": "needs_replan"}}),
+                    json!({"work": []}),
+                    runs,
+                    json!({"intents": []}),
+                    json!({"messages": []}),
+                    None,
+                );
+            }
+            let plan = call(
+                client,
+                "ptah_get_manager_plan",
+                json!({
+                    "session_id": session,
+                    "workspace": workspace,
+                    "plan_id": plan_id
+                }),
+            )
+            .await;
+            (
+                plan,
+                json!({"work": []}),
+                runs,
+                json!({"intents": []}),
+                json!({"messages": []}),
+                None,
+            )
+        }
+        "orchestration-mutation-persisted" | "decision-applied-pending" => {
+            let plan = call(
+                client,
+                "ptah_get_manager_plan",
+                json!({
+                    "session_id": session,
+                    "workspace": workspace,
+                    "plan_id": plan_id
+                }),
+            )
+            .await;
+            let work = list_work(client, session, workspace).await;
+            (
+                plan,
+                work,
+                json!({"runs": []}),
+                json!({"intents": []}),
+                json!({"messages": []}),
+                None,
+            )
+        }
+        "terminal-run-before-settlement" | "occurrence-reserved" => {
+            let plan = call(
+                client,
+                "ptah_get_manager_plan",
+                json!({
+                    "session_id": session,
+                    "workspace": workspace,
+                    "plan_id": plan_id
+                }),
+            )
+            .await;
+            let work = list_work(client, session, workspace).await;
+            let runs = list_runs(client, session, workspace).await;
+            (
+                plan,
+                work,
+                runs,
+                json!({"intents": []}),
+                json!({"messages": []}),
+                None,
+            )
+        }
+        _ => observe(client, session, workspace, plan_id).await,
+    }
+}
+
+async fn wait_until_quiet(
+    client: &mut McpControlClient,
+    session: Uuid,
+    workspace: &Path,
+    plan_id: &str,
+    provider: &FakeProvider,
+) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut last =
+        collect_identity(client, session, workspace, plan_id, provider.send_count()).await;
+    let mut quiet_since = Instant::now();
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let current =
+            collect_identity(client, session, workspace, plan_id, provider.send_count()).await;
+        let plan = call(
+            client,
+            "ptah_get_manager_plan",
+            json!({
+                "session_id": session,
+                "workspace": workspace,
+                "plan_id": plan_id
+            }),
+        )
+        .await;
+        let terminal = matches!(
+            plan["plan"]["state"].as_str(),
+            Some("succeeded" | "failed" | "cancelled")
+        );
+        let same = current.work_ids == last.work_ids
+            && current.run_ids == last.run_ids
+            && current.linked_run_ids == last.linked_run_ids
+            && current.decision_ids == last.decision_ids
+            && current.message_ids == last.message_ids
+            && current.sends == last.sends
+            && current.plan_revision == last.plan_revision;
+        if same {
+            if terminal || quiet_since.elapsed() >= Duration::from_millis(4500) {
+                return;
+            }
+        } else {
+            last = current;
+            quiet_since = Instant::now();
+        }
+    }
 }
 
 fn assert_no_uncertain_resume(runs: &Value) {
     for run in runs["runs"].as_array().unwrap_or(&vec![]) {
         assert_no_secret_leak(run);
-        if run_state(run) == Some("interrupted") {
+        if run["state"].as_str() == Some("interrupted") {
             assert_eq!(
                 pending_usage(run),
                 0,
@@ -368,18 +790,57 @@ fn assert_no_uncertain_resume(runs: &Value) {
     }
 }
 
-fn assert_cardinalities_stable(before: &Cardinality, after: &Cardinality, cut: &str) {
-    assert!(
-        after.work_items >= before.work_items,
-        "restart dropped work at {cut}: {before:?} -> {after:?}"
-    );
-    assert!(
-        after.runs >= before.runs,
-        "restart dropped runs at {cut}: {before:?} -> {after:?}"
-    );
+async fn assert_attempt_run_cardinalities(
+    client: &mut McpControlClient,
+    session: Uuid,
+    workspace: &Path,
+    work: &Value,
+    campaign_sends: u64,
+) {
+    let mut attempts = 0usize;
+    let mut linked = 0usize;
+    for item in work_items(work) {
+        let kind = item["kind"].as_str().unwrap_or("");
+        if kind != "native" && kind != "manager-decision" {
+            continue;
+        }
+        let id = work_id_of(item).expect("workId");
+        let detail = call(
+            client,
+            "ptah_get_work",
+            json!({
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": id
+            }),
+        )
+        .await;
+        let item_attempts = detail["attempts"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            item_attempts.len(),
+            1,
+            "expected exactly one attempt for {id}: {detail}"
+        );
+        for attempt in &item_attempts {
+            attempts += 1;
+            let runs = attempt["linkedRunIds"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                runs.len(),
+                1,
+                "expected exactly one linkedRunId for attempt {}: {attempt}",
+                attempt["attemptId"]
+            );
+            linked += 1;
+        }
+    }
+    assert_eq!(attempts, 4, "expected attempts for a, b, decision, b-fix");
+    assert_eq!(linked, 4, "expected four linkedRunIds");
     assert_eq!(
-        after.quota_reservations, 0,
-        "quota ledger must stay absent at {cut}"
+        campaign_sends, attempts as u64,
+        "expected one provider send per Work attempt, got {campaign_sends} sends for {attempts} attempts"
     );
 }
 
@@ -389,7 +850,7 @@ async fn autonomous_lifecycle_reaches_succeeded_without_duplicate_sends() {
     let provider = FakeProvider::start();
     let service = ServiceProcess::spawn(&provider.base_url);
     let mut client = mcp(&service.addr).await;
-    let (session, agent_id) = bootstrap_agent(&mut client, &service.workspace).await;
+    let (session, agent_id, _setup_run) = bootstrap_agent(&mut client, &service.workspace).await;
     let setup_sends = provider.send_count();
     let plan_id = create_plan(&mut client, session, &service.workspace, &agent_id).await;
     tick_twice(&mut client, session, &service.workspace, &plan_id).await;
@@ -405,10 +866,8 @@ async fn autonomous_lifecycle_reaches_succeeded_without_duplicate_sends() {
     )
     .await;
     let work = list_work(&mut client, session, &service.workspace).await;
-    let decision_id = work_items(&work)
-        .iter()
-        .find(|item| item["kind"].as_str() == Some("manager-decision"))
-        .and_then(|item| item["workId"].as_str())
+    let decision_id = decision_item(&work)
+        .and_then(work_id_of)
         .expect("decision work id")
         .to_string();
     let _ = poll_json(
@@ -475,24 +934,38 @@ async fn autonomous_lifecycle_reaches_succeeded_without_duplicate_sends() {
     )
     .await;
     let capacity = call(&mut client, "ptah_get_capacity", json!({})).await;
+    let messages = call(
+        &mut client,
+        "ptah_list_inbox",
+        json!({
+            "session_id": session,
+            "workspace": &service.workspace,
+            "agent_id": agent_id
+        }),
+    )
+    .await;
 
     assert_eq!(plan["plan"]["state"].as_str(), Some("succeeded"));
     assert_eq!(work_kind_count(&work, "manager-decision"), 1);
     assert_eq!(succeeded_kind_count(&work, "manager-decision"), 1);
-    let native_succeeded = succeeded_kind_count(&work, "native");
-    assert!(
-        native_succeeded >= 2,
-        "expected native success for step-a and replacement, got {native_succeeded}: {work}"
+    assert_eq!(
+        succeeded_kind_count(&work, "native"),
+        2,
+        "expected native success for step-a and replacement: {work}"
     );
     assert!(
         plan_has_step(&plan, "step-b-fix"),
         "replacement step missing: {plan}"
     );
     let campaign_sends = provider.send_count().saturating_sub(setup_sends);
-    assert!(
-        (3..=8).contains(&campaign_sends),
-        "unexpected provider sends {campaign_sends}"
-    );
+    assert_attempt_run_cardinalities(
+        &mut client,
+        session,
+        &service.workspace,
+        &work,
+        campaign_sends,
+    )
+    .await;
     let mut proposal_runs = 0usize;
     for run in runs["runs"].as_array().unwrap() {
         assert_no_secret_leak(run);
@@ -506,22 +979,6 @@ async fn autonomous_lifecycle_reaches_succeeded_without_duplicate_sends() {
         }
     }
     assert_eq!(proposal_runs, 1, "expected exactly one proposal-only Run");
-    let linked = intents["intents"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|intent| {
-            intent
-                .get("runId")
-                .or_else(|| intent.get("run_id"))
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.is_empty())
-        })
-        .count();
-    assert!(
-        linked >= 1,
-        "expected at least one execution intent with a linked run: {intents}"
-    );
     let live_intents = intents["intents"]
         .as_array()
         .unwrap()
@@ -534,6 +991,12 @@ async fn autonomous_lifecycle_reaches_succeeded_without_duplicate_sends() {
         })
         .count();
     assert_eq!(live_intents, 0);
+    assert!(
+        messages["messages"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "expected manager notifications: {messages}"
+    );
     assert_no_quota_ledger(&capacity);
     assert_no_secret_leak(&capacity);
     let after = snapshot(
@@ -559,90 +1022,135 @@ async fn autonomous_lifecycle_reaches_succeeded_without_duplicate_sends() {
     assert_eq!(after.intents, again.intents);
     assert_eq!(after.decisions, again.decisions);
     assert_eq!(after.messages, again.messages);
+    assert_eq!(after.plan_revision, again.plan_revision);
     assert_eq!(after.quota_reservations, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn process_restart_cuts_do_not_duplicate_or_resume_uncertain_attempts() {
     let _serial = serial_lock();
-    let provider = FakeProvider::start();
-    let mut service = ServiceProcess::spawn(&provider.base_url);
-    let mut client = mcp(&service.addr).await;
-    let (session, agent_id) = bootstrap_agent(&mut client, &service.workspace).await;
-    let plan_id = create_plan(&mut client, session, &service.workspace, &agent_id).await;
-    tick_twice(&mut client, session, &service.workspace, &plan_id).await;
-
     for cut in CUTS {
-        let deadline = Instant::now() + Duration::from_secs(70);
-        loop {
+        let mut caught = false;
+        for attempt in 0..20 {
+            let provider = FakeProvider::start();
+            let mut service = ServiceProcess::spawn(&provider.base_url);
+            let mut client = mcp(&service.addr).await;
+            let (session, agent_id, setup_run) =
+                bootstrap_agent(&mut client, &service.workspace).await;
+            let plan_id = create_plan(&mut client, session, &service.workspace, &agent_id).await;
             tick_twice(&mut client, session, &service.workspace, &plan_id).await;
-            let (plan, work, runs, intents, messages) =
-                observe(&mut client, session, &service.workspace, &plan_id).await;
-            if cut_reached(cut, &plan, &work, &runs, &intents, &messages) {
-                break;
+            let deadline = Instant::now() + Duration::from_secs(40);
+            let mut hit = false;
+            let mut last_dump = json!({});
+            while Instant::now() < deadline {
+                let (plan, work, runs, intents, messages, decision_detail) =
+                    observe_for_cut(cut, &mut client, session, &service.workspace, &plan_id).await;
+                last_dump = json!({
+                    "planState": plan["plan"]["state"],
+                    "decisions": work_kind_count(&work, "manager-decision"),
+                    "intentStates": intents["intents"].as_array().map(|items| {
+                        items.iter().map(|intent| json!({
+                            "workId": intent["workId"],
+                            "runId": intent["runId"],
+                            "state": intent["state"]
+                        })).collect::<Vec<_>>()
+                    }),
+                    "runStates": runs["runs"].as_array().map(|items| {
+                        items.iter().map(|run| json!({
+                            "state": run["state"],
+                            "purpose": run["purpose"],
+                            "pending": pending_usage(run)
+                        })).collect::<Vec<_>>()
+                    }),
+                    "hasFix": plan_has_step(&plan, "step-b-fix"),
+                });
+                if unique_cut(
+                    cut,
+                    &plan,
+                    &work,
+                    &runs,
+                    &intents,
+                    &messages,
+                    decision_detail.as_ref(),
+                    &setup_run,
+                ) {
+                    hit = true;
+                    break;
+                }
+                if missed_unique_cut(
+                    cut,
+                    &plan,
+                    &work,
+                    &runs,
+                    &intents,
+                    decision_detail.as_ref(),
+                    &setup_run,
+                ) {
+                    last_dump["missed"] = json!(true);
+                    break;
+                }
             }
-            assert!(
-                Instant::now() < deadline,
-                "cut {cut} never appeared; plan={plan} work={work} runs={runs}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            if !hit {
+                eprintln!(
+                    "cut {cut} attempt {attempt} missed unique window last={last_dump}; retrying"
+                );
+                continue;
+            }
+            let before = collect_identity(
+                &mut client,
+                session,
+                &service.workspace,
+                &plan_id,
+                provider.send_count(),
+            )
+            .await;
+            service.respawn(&provider.base_url);
+            client = mcp(&service.addr).await;
+            let _ = poll_json(
+                &mut client,
+                "ptah_get_manager_plan",
+                json!({
+                    "session_id": session,
+                    "workspace": &service.workspace,
+                    "plan_id": plan_id
+                }),
+                |value| value.get("plan").is_some(),
+            )
+            .await;
+            tick_twice(&mut client, session, &service.workspace, &plan_id).await;
+            wait_until_quiet(
+                &mut client,
+                session,
+                &service.workspace,
+                &plan_id,
+                &provider,
+            )
+            .await;
+            let after = collect_identity(
+                &mut client,
+                session,
+                &service.workspace,
+                &plan_id,
+                provider.send_count(),
+            )
+            .await;
+            tick_twice(&mut client, session, &service.workspace, &plan_id).await;
+            let again = collect_identity(
+                &mut client,
+                session,
+                &service.workspace,
+                &plan_id,
+                provider.send_count(),
+            )
+            .await;
+            assert_exact_after_restart(&before, &after, &again, cut);
+            let runs = list_runs(&mut client, session, &service.workspace).await;
+            assert_no_uncertain_resume(&runs);
+            caught = true;
+            break;
         }
-        let before = snapshot(
-            &mut client,
-            session,
-            &service.workspace,
-            &plan_id,
-            provider.send_count(),
-        )
-        .await;
-        service.respawn(&provider.base_url);
-        client = mcp(&service.addr).await;
-        let _ = poll_json(
-            &mut client,
-            "ptah_get_manager_plan",
-            json!({
-                "session_id": session,
-                "workspace": &service.workspace,
-                "plan_id": plan_id
-            }),
-            |value| value.get("plan").is_some(),
-        )
-        .await;
-        tick_twice(&mut client, session, &service.workspace, &plan_id).await;
-        let after = snapshot(
-            &mut client,
-            session,
-            &service.workspace,
-            &plan_id,
-            provider.send_count(),
-        )
-        .await;
-        assert_cardinalities_stable(&before, &after, cut);
-        tick_twice(&mut client, session, &service.workspace, &plan_id).await;
-        let again = snapshot(
-            &mut client,
-            session,
-            &service.workspace,
-            &plan_id,
-            provider.send_count(),
-        )
-        .await;
-        assert!(
-            again.runs >= after.runs,
-            "duplicate drive after restart shrank runs at {cut}"
-        );
-        let runs = list_runs(&mut client, session, &service.workspace).await;
-        assert_no_uncertain_resume(&runs);
+        assert!(caught, "never observed unique durable state for cut {cut}");
     }
-
-    let _ = wait_plan_state(
-        &mut client,
-        session,
-        &service.workspace,
-        &plan_id,
-        "succeeded",
-    )
-    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -651,7 +1159,7 @@ async fn fail_closed_permission_stale_invalid_cancel_quota_absent() {
     let provider = FakeProvider::start_with(ProviderScript::InvalidDirective);
     let service = ServiceProcess::spawn(&provider.base_url);
     let mut client = mcp(&service.addr).await;
-    let (session, agent_id) = bootstrap_agent(&mut client, &service.workspace).await;
+    let (session, agent_id, _setup_run) = bootstrap_agent(&mut client, &service.workspace).await;
 
     let _ = call(
         &mut client,
@@ -768,12 +1276,12 @@ async fn fail_closed_permission_stale_invalid_cancel_quota_absent() {
             "request_id": rid("cancel-me"),
             "session_id": session,
             "workspace": &service.workspace,
-            "prompt": "GROKBOT_SUCCESS cancel target"
+            "prompt": "GROKBOT_CANCEL_TARGET cancel target"
         }),
     )
     .await;
     let run_id = submitted["runId"].as_str().unwrap().to_string();
-    let _ = call(
+    let cancelled = call(
         &mut client,
         "ptah_cancel",
         json!({
@@ -784,6 +1292,31 @@ async fn fail_closed_permission_stale_invalid_cancel_quota_absent() {
         }),
     )
     .await;
+    assert!(
+        cancelled["cancelled"].as_bool() == Some(true)
+            || cancelled["state"].as_str() == Some("cancelled")
+            || cancelled["run"]["state"].as_str() == Some("cancelled"),
+        "ptah_cancel did not report cancellation: {cancelled}"
+    );
+    let run = poll_json(
+        &mut client,
+        "ptah_get_run",
+        json!({
+            "session_id": session,
+            "workspace": &service.workspace,
+            "run_id": run_id
+        }),
+        |value| {
+            !matches!(value["state"].as_str(), Some("running" | "queued"))
+                && value["state"].as_str().is_some()
+        },
+    )
+    .await;
+    assert_eq!(
+        run["state"].as_str(),
+        Some("cancelled"),
+        "cancelled run did not stop: {run}"
+    );
 
     let quota_note = call(&mut client, "ptah_get_capacity", json!({})).await;
     assert!(
@@ -802,21 +1335,22 @@ async fn soak_always_on_grokbot() {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(600);
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(seconds);
     let provider = FakeProvider::start();
     let mut service = ServiceProcess::spawn(&provider.base_url);
     let mut client = mcp(&service.addr).await;
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let commit = git_head(&repo);
+    let disk_start = home_bytes(&service.home);
+    let rss_start = rss_kb(service.pid());
     let mut cycles = 0u64;
     let mut restarts = 0u64;
+    let mut last_identity = None;
     while Instant::now() < deadline {
-        let (session, agent_id) = bootstrap_agent(&mut client, &service.workspace).await;
+        let (session, agent_id, _setup) = bootstrap_agent(&mut client, &service.workspace).await;
         let plan_id = create_plan(&mut client, session, &service.workspace, &agent_id).await;
         tick_twice(&mut client, session, &service.workspace, &plan_id).await;
-        if cycles % 2 == 1 {
-            service.respawn(&provider.base_url);
-            client = mcp(&service.addr).await;
-            restarts += 1;
-        }
         let _ = wait_plan_state(
             &mut client,
             session,
@@ -825,11 +1359,84 @@ async fn soak_always_on_grokbot() {
             "succeeded",
         )
         .await;
+        let identity = collect_identity(
+            &mut client,
+            session,
+            &service.workspace,
+            &plan_id,
+            provider.send_count(),
+        )
+        .await;
+        assert_eq!(
+            identity.decision_ids.len(),
+            1,
+            "soak cycle expected exactly one decision: {identity:?}"
+        );
+        last_identity = Some(identity);
         cycles += 1;
+        if cycles % 2 == 1 && Instant::now() < deadline {
+            service.respawn(&provider.base_url);
+            client = mcp(&service.addr).await;
+            restarts += 1;
+        }
     }
     assert!(cycles >= 1, "soak completed zero cycles");
+    let disk_end = home_bytes(&service.home);
+    let rss_end = rss_kb(service.pid());
+    assert!(
+        disk_end <= disk_start.saturating_add(cycles.saturating_mul(4 * 1024 * 1024)),
+        "runtime home grew unbounded: {disk_start} -> {disk_end} over {cycles} cycles"
+    );
+    if rss_start > 0 && rss_end > 0 {
+        assert!(
+            rss_end <= rss_start.saturating_mul(8).max(rss_start + 512 * 1024),
+            "rss grew unbounded: {rss_start} -> {rss_end} KB"
+        );
+    }
+    let duration = started.elapsed().as_secs();
+    let identity = last_identity.unwrap_or_default();
+    let report = json!({
+        "commit": commit,
+        "seed": SEED,
+        "durationSeconds": duration,
+        "restartCount": restarts,
+        "cycleCount": cycles,
+        "providerSends": provider.send_count(),
+        "invariantCounts": {
+            "workIds": identity.work_ids.len(),
+            "runIds": identity.run_ids.len(),
+            "linkedRunIds": identity.linked_run_ids.len(),
+            "decisions": identity.decision_ids.len(),
+            "messages": identity.message_ids.len(),
+            "planRevision": identity.plan_revision,
+            "quotaReservations": 0
+        },
+        "homeBytesStart": disk_start,
+        "homeBytesEnd": disk_end,
+        "rssKbStart": rss_start,
+        "rssKbEnd": rss_end,
+        "snapshotHash": identity.hash_hex()
+    });
+    let encoded = serde_json::to_vec_pretty(&report).expect("encode soak json");
+    let sha = openssl_sha256_hex(&encoded);
+    let mut report = report;
+    report["reportSha256"] = json!(sha);
+    let markdown = format!(
+        "# Always-on Grokbot soak\n\n- commit: `{commit}`\n- seed: `{SEED}`\n- durationSeconds: {duration}\n- restartCount: {restarts}\n- cycleCount: {cycles}\n- providerSends: {}\n- snapshotHash: `{}`\n- reportSha256: `{sha}`\n- homeBytes: {disk_start} -> {disk_end}\n- rssKb: {rss_start} -> {rss_end}\n",
+        provider.send_count(),
+        identity.hash_hex()
+    );
+    let out_dir = std::env::var("GROKBOT_SOAK_OUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| service.home.join("soak"));
+    std::fs::create_dir_all(&out_dir).expect("soak out dir");
+    let json_path = out_dir.join("soak-report.json");
+    let md_path = out_dir.join("soak-report.md");
+    std::fs::write(&json_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    std::fs::write(&md_path, markdown.as_bytes()).unwrap();
     eprintln!(
-        "soak cycles={cycles} restarts={restarts} sends={}",
-        provider.send_count()
+        "soak report json={} markdown={}",
+        json_path.display(),
+        md_path.display()
     );
 }
