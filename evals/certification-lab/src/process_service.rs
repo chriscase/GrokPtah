@@ -291,28 +291,39 @@ fn auth_presence(headers: &str) -> (bool, Option<String>) {
 }
 
 fn classify_semantic(body: &str) -> String {
-    let all = extract_all_text(body);
-    let focus = objective_focus(&all);
-    if focus.contains("Return exactly this JSON envelope") {
-        return "manager-decision".into();
+    let current = current_user_text(body);
+    let focus = objective_focus(&current);
+    let kind = prompt_kind(&current);
+    match kind {
+        Some("manager-decision") => "manager-decision".into(),
+        Some("native") if focus.contains("GROKBOT_SUCCESS complete the replacement") => {
+            "step-b-fix".into()
+        }
+        Some("native") if focus.contains("GROKBOT_FORCE_FAIL") => "step-b".into(),
+        Some("native") if focus.contains("GROKBOT_SUCCESS first native unit") => "step-a".into(),
+        _ if focus.contains("Return exactly this JSON envelope") => "manager-decision".into(),
+        _ if current.contains("GROKBOT_SETUP") => "setup".into(),
+        _ => "other".into(),
     }
-    if focus.contains("GROKBOT_SETUP") {
-        return "setup".into();
-    }
-    if focus.contains("GROKBOT_FORCE_FAIL") {
-        return "step-b".into();
-    }
-    if focus.contains("GROKBOT_SUCCESS complete the replacement") {
-        return "step-b-fix".into();
-    }
-    if focus.contains("GROKBOT_SUCCESS first native unit") {
-        return "step-a".into();
-    }
-    "other".into()
 }
 
-fn objective_focus(all: &str) -> String {
-    if let Some((_, rest)) = all.split_once("Objective:\n") {
+fn prompt_kind(text: &str) -> Option<&str> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("Objective:") || line.starts_with("Relevant messages:") {
+            break;
+        }
+        if let Some(kind) = line.strip_prefix("Kind: ").map(str::trim) {
+            if matches!(kind, "native" | "manager-decision") {
+                return Some(kind);
+            }
+        }
+    }
+    None
+}
+
+fn objective_focus(text: &str) -> String {
+    if let Some((_, rest)) = text.split_once("Objective:\n") {
         let mut lines = Vec::new();
         for line in rest.lines() {
             if line.starts_with("Verified continuation") || line.starts_with("Relevant messages:") {
@@ -325,7 +336,55 @@ fn objective_focus(all: &str) -> String {
             return focused;
         }
     }
-    all.to_string()
+    text.to_string()
+}
+
+fn message_text(message: &Value) -> Option<String> {
+    match message.get("content") {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn current_user_text(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return body.to_string();
+    };
+    let Some(messages) = value.get("messages").and_then(Value::as_array) else {
+        return body.to_string();
+    };
+    for message in messages.iter().rev() {
+        if message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            != "user"
+        {
+            continue;
+        }
+        if let Some(text) = message_text(message) {
+            if !text.trim().is_empty() {
+                return text;
+            }
+        }
+    }
+    extract_all_text(body)
 }
 
 fn read_http_message(stream: &mut TcpStream) -> Option<(String, String, String)> {
@@ -357,7 +416,8 @@ fn read_http_message(stream: &mut TcpStream) -> Option<(String, String, String)>
                 }
                 buf.extend_from_slice(&tmp[..n]);
             }
-            let body = String::from_utf8_lossy(&buf[body_start..]).into_owned();
+            let body_end = (body_start + len).min(buf.len());
+            let body = String::from_utf8_lossy(&buf[body_start..body_end]).into_owned();
             return Some((first, headers, body));
         }
         if buf.len() > 1024 * 1024 {
@@ -405,33 +465,6 @@ fn extract_all_text(body: &str) -> String {
     } else {
         out
     }
-}
-
-fn extract_user_content(body: &str) -> String {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return body.to_string();
-    };
-    let Some(messages) = value.get("messages").and_then(Value::as_array) else {
-        return body.to_string();
-    };
-    for message in messages.iter().rev() {
-        match message.get("content") {
-            Some(Value::String(text)) => return text.clone(),
-            Some(Value::Array(parts)) => {
-                let mut out = String::new();
-                for part in parts {
-                    if let Some(text) = part.get("text").and_then(Value::as_str) {
-                        out.push_str(text);
-                    }
-                }
-                if !out.is_empty() {
-                    return out;
-                }
-            }
-            _ => {}
-        }
-    }
-    body.to_string()
 }
 
 fn take_json_object(input: &str) -> String {
@@ -527,15 +560,13 @@ fn sse_ok(content: &str) -> String {
 }
 
 fn scripted_completion(body: &str) -> String {
-    let all = extract_all_text(body);
-    if all.contains("Return exactly this JSON envelope") {
-        return sse_ok(&rewrite_directive(&all));
+    match classify_semantic(body).as_str() {
+        "manager-decision" => sse_ok(&rewrite_directive(&current_user_text(body))),
+        "step-b" => {
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 16\r\nConnection: close\r\n\r\nprovider-fail-v1".into()
+        }
+        _ => sse_ok("GROKBOT_OK"),
     }
-    let content = extract_user_content(body);
-    if content.contains("GROKBOT_FORCE_FAIL") {
-        return "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 16\r\nConnection: close\r\n\r\nprovider-fail-v1".into();
-    }
-    sse_ok("GROKBOT_OK")
 }
 
 pub struct ProcessService {

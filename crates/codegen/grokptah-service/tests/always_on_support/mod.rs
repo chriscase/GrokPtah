@@ -159,6 +159,7 @@ pub struct ProviderRecord {
     pub body_digest: String,
     pub semantic_id: String,
     pub route_ok: bool,
+    pub focus_preview: String,
 }
 
 struct ProviderState {
@@ -301,7 +302,9 @@ impl FakeProvider {
             assert!(
                 !record.body_digest.contains(SYNTHETIC_KEY)
                     && !record.body_digest.contains(TOKEN)
-                    && !record.semantic_id.contains(SYNTHETIC_KEY),
+                    && !record.semantic_id.contains(SYNTHETIC_KEY)
+                    && !record.focus_preview.contains(SYNTHETIC_KEY)
+                    && !record.focus_preview.contains(TOKEN),
                 "provider log stored a raw secret"
             );
             if record.method != "POST" {
@@ -335,6 +338,8 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
     }
     let auth = auth_presence(&headers);
     let semantic_id = classify_semantic(&body);
+    let focus = objective_focus(&current_user_text(&body));
+    let focus_preview: String = focus.chars().take(96).collect();
     let record = ProviderRecord {
         method: method.clone(),
         path: path.clone(),
@@ -343,6 +348,7 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
         body_digest: hash_payload(&Value::String(body.clone())),
         semantic_id: semantic_id.clone(),
         route_ok: path == "/v1/chat/completions",
+        focus_preview,
     };
     state.posts.fetch_add(1, Ordering::SeqCst);
     {
@@ -449,47 +455,60 @@ fn auth_presence(headers: &str) -> (bool, Option<String>) {
     (false, None)
 }
 
-fn classify_semantic(body: &str) -> String {
-    let all = extract_all_text(body);
-    let focus = objective_focus(&all);
-    if focus.contains("Return exactly this JSON envelope") {
-        return "manager-decision".into();
-    }
-    if focus.contains("CERT_MALFORMED") {
-        return "fail-malformed".into();
-    }
-    if focus.contains("CERT_500") {
-        return "fail-500".into();
-    }
-    if focus.contains("CERT_DROP") {
-        return "fail-drop".into();
-    }
-    if focus.contains("CERT_SLOW") {
-        return "fail-slow".into();
-    }
-    if focus.contains("CERT_CANCEL") {
-        return "fail-cancel".into();
-    }
-    if focus.contains("GROKBOT_SETUP") {
-        return "setup".into();
-    }
-    if focus.contains("GROKBOT_FORCE_FAIL") {
-        return "step-b".into();
-    }
-    if focus.contains("GROKBOT_SUCCESS complete the replacement") {
-        return "step-b-fix".into();
-    }
-    if focus.contains("GROKBOT_SUCCESS first native unit") {
-        return "step-a".into();
-    }
-    if focus.contains("GROKBOT_SUCCESS") {
-        return "native-success".into();
-    }
-    "other".into()
+pub fn classify_provider_body(body: &str) -> String {
+    classify_semantic(body)
 }
 
-fn objective_focus(all: &str) -> String {
-    if let Some((_, rest)) = all.split_once("Objective:\n") {
+fn classify_semantic(body: &str) -> String {
+    let current = current_user_text(body);
+    let focus = objective_focus(&current);
+    let kind = prompt_kind(&current);
+    if current.contains("CERT_MALFORMED") {
+        return "fail-malformed".into();
+    }
+    if current.contains("CERT_500") {
+        return "fail-500".into();
+    }
+    if current.contains("CERT_DROP") {
+        return "fail-drop".into();
+    }
+    if current.contains("CERT_SLOW") {
+        return "fail-slow".into();
+    }
+    if current.contains("CERT_CANCEL") {
+        return "fail-cancel".into();
+    }
+    match kind {
+        Some("manager-decision") => "manager-decision".into(),
+        Some("native") if focus.contains("GROKBOT_SUCCESS complete the replacement") => {
+            "step-b-fix".into()
+        }
+        Some("native") if focus.contains("GROKBOT_FORCE_FAIL") => "step-b".into(),
+        Some("native") if focus.contains("GROKBOT_SUCCESS first native unit") => "step-a".into(),
+        Some("native") if focus.contains("GROKBOT_SUCCESS") => "native-success".into(),
+        _ if focus.contains("Return exactly this JSON envelope") => "manager-decision".into(),
+        _ if current.contains("GROKBOT_SETUP") => "setup".into(),
+        _ => "other".into(),
+    }
+}
+
+fn prompt_kind(text: &str) -> Option<&str> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("Objective:") || line.starts_with("Relevant messages:") {
+            break;
+        }
+        if let Some(kind) = line.strip_prefix("Kind: ").map(str::trim) {
+            if matches!(kind, "native" | "manager-decision") {
+                return Some(kind);
+            }
+        }
+    }
+    None
+}
+
+fn objective_focus(text: &str) -> String {
+    if let Some((_, rest)) = text.split_once("Objective:\n") {
         let mut lines = Vec::new();
         for line in rest.lines() {
             if line.starts_with("Verified continuation") || line.starts_with("Relevant messages:") {
@@ -502,7 +521,55 @@ fn objective_focus(all: &str) -> String {
             return focused;
         }
     }
-    all.to_string()
+    text.to_string()
+}
+
+fn message_text(message: &Value) -> Option<String> {
+    match message.get("content") {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn current_user_text(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return body.to_string();
+    };
+    let Some(messages) = value.get("messages").and_then(Value::as_array) else {
+        return body.to_string();
+    };
+    for message in messages.iter().rev() {
+        if message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            != "user"
+        {
+            continue;
+        }
+        if let Some(text) = message_text(message) {
+            if !text.trim().is_empty() {
+                return text;
+            }
+        }
+    }
+    extract_all_text(body)
 }
 
 fn read_http_message(stream: &mut TcpStream) -> Option<(String, String, String)> {
@@ -534,7 +601,8 @@ fn read_http_message(stream: &mut TcpStream) -> Option<(String, String, String)>
                 }
                 buf.extend_from_slice(&tmp[..n]);
             }
-            let body = String::from_utf8_lossy(&buf[body_start..]).into_owned();
+            let body_end = (body_start + len).min(buf.len());
+            let body = String::from_utf8_lossy(&buf[body_start..body_end]).into_owned();
             return Some((first, headers, body));
         }
         if buf.len() > 1024 * 1024 {
@@ -557,18 +625,16 @@ fn models_list() -> String {
 }
 
 fn scripted_completion(body: &str, script: ProviderScript) -> String {
-    let all = extract_all_text(body);
-    if all.contains("Return exactly this JSON envelope") {
-        return match script {
+    match classify_semantic(body).as_str() {
+        "manager-decision" => match script {
             ProviderScript::InvalidDirective => sse_ok(r#"{"not":"a-valid-manager-directive"}"#),
-            ProviderScript::Lifecycle => sse_ok(&rewrite_directive(&all)),
-        };
+            ProviderScript::Lifecycle => sse_ok(&rewrite_directive(&current_user_text(body))),
+        },
+        "step-b" => {
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 16\r\nConnection: close\r\n\r\nprovider-fail-v1".into()
+        }
+        _ => sse_ok("GROKBOT_OK"),
     }
-    let content = extract_user_content(body);
-    if content.contains("GROKBOT_FORCE_FAIL") {
-        return "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 16\r\nConnection: close\r\n\r\nprovider-fail-v1".into();
-    }
-    sse_ok("GROKBOT_OK")
 }
 
 fn extract_all_text(body: &str) -> String {
@@ -601,33 +667,6 @@ fn extract_all_text(body: &str) -> String {
     } else {
         out
     }
-}
-
-fn extract_user_content(body: &str) -> String {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return body.to_string();
-    };
-    let Some(messages) = value.get("messages").and_then(Value::as_array) else {
-        return body.to_string();
-    };
-    for message in messages.iter().rev() {
-        match message.get("content") {
-            Some(Value::String(text)) => return text.clone(),
-            Some(Value::Array(parts)) => {
-                let mut out = String::new();
-                for part in parts {
-                    if let Some(text) = part.get("text").and_then(Value::as_str) {
-                        out.push_str(text);
-                    }
-                }
-                if !out.is_empty() {
-                    return out;
-                }
-            }
-            _ => {}
-        }
-    }
-    body.to_string()
 }
 
 fn rewrite_directive(content: &str) -> String {
@@ -1220,4 +1259,74 @@ pub fn recorded_assertions() -> BTreeSet<String> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::classify_provider_body;
+    use serde_json::{json, Value};
+
+    fn chat(messages: Vec<Value>) -> String {
+        json!({
+            "model": "grok-build",
+            "messages": messages,
+            "stream": true
+        })
+        .to_string()
+    }
+
+    fn managed(kind: &str, objective: &str, relevant: &str) -> String {
+        format!(
+            "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: work-1\nKind: {kind}\nAttempt: 1\nObjective:\n{objective}\nRelevant messages:\n{relevant}\n"
+        )
+    }
+
+    #[test]
+    fn manager_decision_ignores_history_and_snapshot_force_fail() {
+        let body = chat(vec![
+            json!({"role":"system","content":"You are GrokPtah. Kind: native is documented."}),
+            json!({"role":"user","content": managed("native", "GROKBOT_SUCCESS first native unit", "")}),
+            json!({"role":"assistant","content":"GROKBOT_OK"}),
+            json!({"role":"user","content": managed("native", "GROKBOT_FORCE_FAIL child that must be replaced", "")}),
+            json!({"role":"assistant","content":"provider-fail-v1"}),
+            json!({"role":"user","content": managed(
+                "manager-decision",
+                "Return exactly this JSON envelope with only directive replaced, and no prose. You have no tool authority. Envelope: {\"directive\":{\"type\":\"no_safe_action\"}} Snapshot: {\"kind\":\"native\",\"objective\":\"GROKBOT_FORCE_FAIL child that must be replaced\",\"first\":\"GROKBOT_SUCCESS first native unit\"}",
+                "- [result] Kind: native\n- [result] GROKBOT_FORCE_FAIL child that must be replaced"
+            )}),
+        ]);
+        assert_eq!(classify_provider_body(&body), "manager-decision");
+    }
+
+    #[test]
+    fn native_step_b_ignores_setup_and_step_a_history() {
+        let body = chat(vec![
+            json!({"role":"user","content":"GROKBOT_SETUP materialize the lane Agent"}),
+            json!({"role":"assistant","content":"GROKBOT_OK"}),
+            json!({"role":"user","content": managed("native", "GROKBOT_SUCCESS first native unit", "")}),
+            json!({"role":"assistant","content":"GROKBOT_OK"}),
+            json!({"role":"user","content": managed("native", "GROKBOT_FORCE_FAIL child that must be replaced", "")}),
+        ]);
+        assert_eq!(classify_provider_body(&body), "step-b");
+    }
+
+    #[test]
+    fn replacement_native_is_not_manager_decision_when_envelope_is_in_relevant_messages() {
+        let body = chat(vec![json!({"role":"user","content": managed(
+            "native",
+            "GROKBOT_SUCCESS complete the replacement step",
+            "- [manager] Return exactly this JSON envelope Envelope: {\"directive\":{}} Snapshot: {\"kind\":\"native\"}"
+        )})]);
+        assert_eq!(classify_provider_body(&body), "step-b-fix");
+    }
+
+    #[test]
+    fn cert_fault_uses_current_user_not_prior_managed_kind() {
+        let body = chat(vec![
+            json!({"role":"user","content": managed("native", "GROKBOT_FORCE_FAIL child that must be replaced", "")}),
+            json!({"role":"assistant","content":"GROKBOT_OK"}),
+            json!({"role":"user","content":"CERT_DROP provider disconnect"}),
+        ]);
+        assert_eq!(classify_provider_body(&body), "fail-drop");
+    }
 }
