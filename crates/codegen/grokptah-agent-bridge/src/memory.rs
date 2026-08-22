@@ -3441,16 +3441,17 @@ mod tests {
         let partial = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
         fs::write(&partial, b"{").unwrap();
         assert!(is_production_temp(&path, &partial));
-        let texts: Vec<_> = list_facts(&address)
+        let mut texts: Vec<_> = list_facts(&address)
             .unwrap()
             .into_iter()
             .map(|f| f.text)
             .collect();
+        texts.sort();
         assert_eq!(
             texts,
             vec![
-                "seed-two".to_string(),
-                "recovered from ready temp".to_string()
+                "recovered from ready temp".to_string(),
+                "seed-two".to_string()
             ]
         );
         assert!(!partial.exists());
