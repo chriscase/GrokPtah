@@ -2,8 +2,11 @@
 //!
 //! v2 is a fail-closed hot-store core. Authorization stays on host-resolved
 //! [`MemoryAccess`] / [`MemoryAddress`]. This module does not expose a public
-//! self-serve storage API. `remember` remains the compatibility writer; the
-//! versioned writer is crate-private and host-stamped.
+//! self-serve storage API. Compatibility [`remember`] and [`list_facts`] are
+//! the AgentHost/tool seams: they call the versioned CAS/receipt writer and
+//! return authoritative current retrieval. Typed `Durable`/`Uncertain` tool
+//! JSON and continuation revision/validity fields still require `host.rs`
+//! and `orchestration/continuation.rs`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -41,10 +44,13 @@ const MAX_SCOPE_FILES: usize = 24;
 const MAX_CRITICAL_FACTS: usize = 16;
 const MAX_CRITICAL_BYTES: usize = 16 * 1024;
 const MAX_INJECT_CHARS: usize = 6_000;
-const RECEIPT_HORIZON_DAYS: i64 = 3650;
+const MAX_CWD_CHARS: usize = 4_096;
+const MAX_EXPIRED_KEYS: usize = 4_096;
+const RECEIPT_HORIZON_DAYS: i64 = 365;
 const SCHEMA_V2: &str = "grokptah.memory.v2";
 const SCOPED_WORKSPACE_KEY_VERSION: &str = "v1-sha256";
 const FACT_ID_PREFIX: &str = "m2-";
+const PAYLOAD_DIGEST_CHARS: usize = 64;
 
 static ADDRESS_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -132,6 +138,27 @@ fn current_cutpoint() -> CommitCutpoint {
     #[cfg(not(test))]
     {
         CommitCutpoint::None
+    }
+}
+
+fn hang_if_requested(label: &str) {
+    #[cfg(test)]
+    {
+        if std::env::var("GROKPTAH_MEMORY_HANG_CUTPOINT")
+            .ok()
+            .as_deref()
+            == Some(label)
+        {
+            println!("GROKPTAH_MEMORY_CUTPOINT_REACHED:{label}");
+            let _ = std::io::stdout().flush();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = label;
     }
 }
 
@@ -483,6 +510,13 @@ struct Receipt {
     scope_binding: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpiredKey {
+    key: String,
+    payload_digest: String,
+}
+
 #[derive(Debug, Clone)]
 struct ProjectMemory {
     project_key: String,
@@ -492,6 +526,7 @@ struct ProjectMemory {
     receipt_epoch: u64,
     facts: Vec<MemoryFact>,
     receipts: Vec<Receipt>,
+    expired_keys: Vec<ExpiredKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,14 +535,14 @@ pub struct MemoryFact {
     pub text: String,
     pub tags: Vec<String>,
     pub updated_at: String,
-    revision: u64,
-    valid_from: Option<String>,
-    valid_until: Option<String>,
+    pub revision: u64,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub claim_key: Option<String>,
     supersedes: Option<String>,
     criticality: MemoryCriticality,
     salience: MemorySalience,
     source: Option<PersistedSource>,
-    claim_key: Option<String>,
 }
 
 impl Default for MemoryFact {
@@ -520,11 +555,11 @@ impl Default for MemoryFact {
             revision: 0,
             valid_from: None,
             valid_until: None,
+            claim_key: None,
             supersedes: None,
             criticality: MemoryCriticality::Normal,
             salience: MemorySalience::Medium,
             source: None,
-            claim_key: None,
         }
     }
 }
@@ -582,6 +617,8 @@ struct V2Envelope {
     receipt_epoch: u64,
     facts: Vec<V2Fact>,
     receipts: Vec<V2Receipt>,
+    #[serde(default)]
+    expired_keys: Vec<ExpiredKey>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -717,6 +754,7 @@ fn empty_memory(address: &MemoryAddress, now: DateTime<Utc>) -> ProjectMemory {
         receipt_epoch: 1,
         facts: Vec::new(),
         receipts: Vec::new(),
+        expired_keys: Vec::new(),
     }
 }
 
@@ -802,12 +840,50 @@ fn read_bounded(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
     Ok(raw)
 }
 
+fn validate_hex_digest(digest: &str) -> anyhow::Result<()> {
+    if digest.chars().count() != PAYLOAD_DIGEST_CHARS
+        || !digest.chars().all(|ch| matches!(ch, '0'..='9' | 'a'..='f'))
+    {
+        bail!("invalid memory payload digest");
+    }
+    Ok(())
+}
+
+fn validate_loaded_id(id: &str) -> anyhow::Result<()> {
+    if id.is_empty() || !bounded_chars(id, MAX_ID_CHARS) {
+        bail!("invalid memory fact id");
+    }
+    Ok(())
+}
+
+fn validate_loaded_key(key: &str, field: &str) -> anyhow::Result<()> {
+    if key.is_empty() || !bounded_chars(key, MAX_KEY_CHARS) {
+        bail!("invalid memory {field}");
+    }
+    Ok(())
+}
+
 fn v2_from_envelope(env: V2Envelope) -> anyhow::Result<ProjectMemory> {
     if env.schema != SCHEMA_V2 {
         bail!("unsupported memory schema");
     }
-    if env.generation == 0 || env.receipt_epoch == 0 {
+    if env.generation == 0 || env.generation == u64::MAX || env.receipt_epoch == 0 {
         bail!("memory generation overflow");
+    }
+    if env.facts.len() > MAX_FACTS {
+        bail!("memory fact count exceeds bound");
+    }
+    if env.receipts.len() > MAX_RECEIPTS {
+        bail!("memory receipt count exceeds bound");
+    }
+    if env.expired_keys.len() > MAX_EXPIRED_KEYS {
+        bail!("memory expired-key count exceeds bound");
+    }
+    if env.project_key.is_empty() || !bounded_chars(&env.project_key, MAX_KEY_CHARS) {
+        bail!("invalid memory project key");
+    }
+    if env.cwd.is_empty() || !bounded_chars(&env.cwd, MAX_CWD_CHARS) {
+        bail!("invalid memory cwd");
     }
     let watermark = parse_timestamp(&env.retention_watermark)
         .ok_or_else(|| anyhow!("malformed memory watermark"))?;
@@ -815,23 +891,52 @@ fn v2_from_envelope(env: V2Envelope) -> anyhow::Result<ProjectMemory> {
     let mut seen_keys = HashSet::new();
     let mut facts = Vec::new();
     for fact in env.facts {
+        validate_loaded_id(&fact.id)?;
         if fact.revision == 0 || fact.revision == u64::MAX {
             bail!("invalid memory revision");
         }
         if !seen_ids.insert(fact.id.clone()) {
             bail!("duplicate memory fact id");
         }
-        if parse_timestamp(&fact.updated_at).is_none()
+        if fact.text.is_empty() || !bounded_chars(&fact.text, MAX_FACT_CHARS) {
+            bail!("invalid memory fact text");
+        }
+        if fact.tags.len() > MAX_TAGS
             || fact
-                .valid_from
-                .as_deref()
-                .is_some_and(|raw| parse_timestamp(raw).is_none())
-            || fact
-                .valid_until
-                .as_deref()
-                .is_some_and(|raw| parse_timestamp(raw).is_none())
+                .tags
+                .iter()
+                .any(|tag| tag.is_empty() || !bounded_chars(tag, MAX_TAG_CHARS))
         {
-            bail!("malformed memory timestamp");
+            bail!("invalid memory fact tags");
+        }
+        if let Some(claim) = &fact.claim_key {
+            validate_loaded_key(claim, "claim_key")?;
+        }
+        if let Some(pred) = &fact.supersedes {
+            validate_loaded_id(pred)?;
+        }
+        if let Some(actor) = &fact.source.actor {
+            if actor.is_empty() || !bounded_chars(actor, MAX_SOURCE_ACTOR_CHARS) {
+                bail!("invalid memory source actor");
+            }
+        }
+        parse_timestamp(&fact.updated_at).ok_or_else(|| anyhow!("malformed memory timestamp"))?;
+        let valid_from = match fact.valid_from.as_deref() {
+            Some(raw) => {
+                Some(parse_timestamp(raw).ok_or_else(|| anyhow!("malformed memory timestamp"))?)
+            }
+            None => None,
+        };
+        let valid_until = match fact.valid_until.as_deref() {
+            Some(raw) => {
+                Some(parse_timestamp(raw).ok_or_else(|| anyhow!("malformed memory timestamp"))?)
+            }
+            None => None,
+        };
+        if let (Some(from), Some(until)) = (valid_from, valid_until) {
+            if from >= until {
+                bail!("memory valid_from must precede valid_until");
+            }
         }
         facts.push(MemoryFact {
             id: fact.id,
@@ -841,15 +946,19 @@ fn v2_from_envelope(env: V2Envelope) -> anyhow::Result<ProjectMemory> {
             revision: fact.revision,
             valid_from: fact.valid_from,
             valid_until: fact.valid_until,
+            claim_key: fact.claim_key,
             supersedes: fact.supersedes,
             criticality: fact.criticality,
             salience: fact.salience,
             source: Some(fact.source),
-            claim_key: fact.claim_key,
         });
     }
     let mut receipts = Vec::new();
+    let mut scope_bindings = HashSet::new();
     for receipt in env.receipts {
+        validate_loaded_key(&receipt.key, "receipt key")?;
+        validate_hex_digest(&receipt.payload_digest)?;
+        validate_loaded_id(&receipt.fact_id)?;
         if receipt.revision == 0 || receipt.revision == u64::MAX {
             bail!("invalid memory receipt revision");
         }
@@ -859,6 +968,16 @@ fn v2_from_envelope(env: V2Envelope) -> anyhow::Result<ProjectMemory> {
         if parse_timestamp(&receipt.created_at).is_none() {
             bail!("malformed memory receipt timestamp");
         }
+        if receipt.scope_binding.is_empty() || !bounded_chars(&receipt.scope_binding, MAX_CWD_CHARS)
+        {
+            bail!("invalid memory receipt scope binding");
+        }
+        if let Some(principal) = &receipt.principal {
+            if principal.is_empty() || !bounded_chars(principal, MAX_SOURCE_ACTOR_CHARS) {
+                bail!("invalid memory receipt principal");
+            }
+        }
+        scope_bindings.insert(receipt.scope_binding.clone());
         receipts.push(Receipt {
             key: receipt.key,
             payload_digest: receipt.payload_digest,
@@ -870,13 +989,33 @@ fn v2_from_envelope(env: V2Envelope) -> anyhow::Result<ProjectMemory> {
             scope_binding: receipt.scope_binding,
         });
     }
+    if scope_bindings.len() > 1 {
+        bail!("memory receipts span multiple scope bindings");
+    }
+    let mut expired_keys = Vec::new();
+    for expired in env.expired_keys {
+        validate_loaded_key(&expired.key, "expired key")?;
+        validate_hex_digest(&expired.payload_digest)?;
+        if !seen_keys.insert(expired.key.clone()) {
+            bail!("duplicate memory receipt key");
+        }
+        expired_keys.push(expired);
+    }
     validate_graph(&facts)?;
+    let facts_by_id: HashMap<&str, &MemoryFact> =
+        facts.iter().map(|fact| (fact.id.as_str(), fact)).collect();
     for receipt in &receipts {
-        if !receipt.tombstone && !seen_ids.contains(&receipt.fact_id) {
+        if receipt.tombstone {
+            continue;
+        }
+        let Some(fact) = facts_by_id.get(receipt.fact_id.as_str()) else {
             bail!("dangling memory receipt");
+        };
+        if fact.effective_revision() != receipt.revision {
+            bail!("memory receipt revision does not match fact");
         }
     }
-    Ok(ProjectMemory {
+    let memory = ProjectMemory {
         project_key: env.project_key,
         cwd: env.cwd,
         generation: env.generation,
@@ -884,7 +1023,14 @@ fn v2_from_envelope(env: V2Envelope) -> anyhow::Result<ProjectMemory> {
         receipt_epoch: env.receipt_epoch,
         facts,
         receipts,
-    })
+        expired_keys,
+    };
+    let encoded =
+        encode_store(&memory).map_err(|_| anyhow!("memory encoded footprint is invalid"))?;
+    if encoded.len() > MAX_PERSISTED_BYTES || encoded.len() > MAX_SCOPE_FOOTPRINT_BYTES {
+        bail!("memory encoded footprint exceeds bound");
+    }
+    Ok(memory)
 }
 
 fn validate_graph(facts: &[MemoryFact]) -> anyhow::Result<()> {
@@ -976,6 +1122,7 @@ fn parse_store_bytes(raw: &[u8]) -> anyhow::Result<ProjectMemory> {
             receipt_epoch: 1,
             facts,
             receipts: Vec::new(),
+            expired_keys: Vec::new(),
         });
     }
     let env: V2Envelope = serde_json::from_value(value)?;
@@ -1025,6 +1172,7 @@ fn encode_store(memory: &ProjectMemory) -> Result<Vec<u8>, MemoryError> {
                 scope_binding: receipt.scope_binding.clone(),
             })
             .collect(),
+        expired_keys: memory.expired_keys.clone(),
     };
     let raw = serde_json::to_vec_pretty(&env).map_err(|_| MemoryError::Durable)?;
     if raw.len() > MAX_PERSISTED_BYTES {
@@ -1050,10 +1198,7 @@ fn sibling_temps(canonical: &Path) -> Vec<(PathBuf, bool)> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name.starts_with(&prefix) && name.ends_with(".tmp.ready") {
-            continue;
-        }
-        if name.starts_with(&prefix) && name.ends_with(".tmp") {
+        if name.starts_with(&prefix) && name.ends_with(".tmp") && !name.ends_with(".tmp.ready") {
             let ready = parent.join(format!("{name}.ready"));
             found.push((path, ready.is_file()));
         }
@@ -1061,16 +1206,41 @@ fn sibling_temps(canonical: &Path) -> Vec<(PathBuf, bool)> {
     found
 }
 
+fn is_owned_scratch(canonical: &Path, candidate: &Path) -> bool {
+    let Some(file) = canonical.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(name) = candidate.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !name.starts_with(&format!(".{file}.")) {
+        return false;
+    }
+    name.ends_with(".tmp")
+        || name.ends_with(".tmp.ready")
+        || name.ends_with(".tmp.quarantine")
+        || (name.ends_with(".quarantine") && name.contains(".tmp"))
+}
+
+fn quarantine_dest(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let name = path.file_name()?.to_str()?;
+    if name.starts_with('.') {
+        Some(parent.join(format!("{name}.quarantine")))
+    } else {
+        Some(parent.join(format!(".{name}.quarantine")))
+    }
+}
+
 fn quarantine(path: &Path) {
-    let Some(parent) = path.parent() else {
+    let Some(dest) = quarantine_dest(path) else {
         return;
     };
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("memory.tmp");
-    let dest = parent.join(format!(".{name}.quarantine"));
     let _ = fs::rename(path, dest);
+}
+
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 fn enforce_footprint(canonical: &Path) {
@@ -1080,8 +1250,10 @@ fn enforce_footprint(canonical: &Path) {
     let Ok(entries) = fs::read_dir(parent) else {
         return;
     };
-    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let lock = lock_path_for(canonical);
+    let mut scratch: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
     let mut total = 0u64;
+    let mut count = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(meta) = entry.metadata() else {
@@ -1090,33 +1262,58 @@ fn enforce_footprint(canonical: &Path) {
         if !meta.is_file() {
             continue;
         }
-        let len = meta.len();
-        total = total.saturating_add(len);
-        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        files.push((path, len, modified));
-    }
-    files.sort_by(|a, b| a.2.cmp(&b.2));
-    while files.len() > MAX_SCOPE_FILES || total > MAX_SCOPE_FOOTPRINT_BYTES as u64 {
-        let Some((path, len, _)) = files.first().cloned() else {
-            break;
-        };
-        if path == canonical || path == lock_path_for(canonical) {
-            files.remove(0);
+        let owned = path == canonical || path == lock || is_owned_scratch(canonical, &path);
+        if !owned {
             continue;
         }
+        count += 1;
+        let len = meta.len();
+        total = total.saturating_add(len);
+        if is_owned_scratch(canonical, &path) {
+            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            scratch.push((path, len, modified));
+        }
+    }
+    scratch.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    while (count > MAX_SCOPE_FILES || total > MAX_SCOPE_FOOTPRINT_BYTES as u64)
+        && !scratch.is_empty()
+    {
+        let (path, len, _) = scratch.remove(0);
         let _ = fs::remove_file(&path);
         total = total.saturating_sub(len);
-        files.remove(0);
+        count = count.saturating_sub(1);
     }
 }
 
-fn recover_scope(canonical: &Path) {
+fn parse_ready_candidate(address: &MemoryAddress, temp: &Path) -> Option<(u64, Vec<u8>)> {
+    let raw = read_bounded(temp, MAX_PERSISTED_BYTES).ok()?;
+    let memory = parse_store_bytes(&raw).ok()?;
+    verify_workspace_identity(address, temp, &memory.project_key, &memory.cwd).ok()?;
+    Some((memory.generation, raw))
+}
+
+fn recover_scope(address: &MemoryAddress, canonical: &Path) {
     let temps = sibling_temps(canonical);
-    let canonical_ok = canonical.is_file()
+    let canonical_exists = canonical.is_file();
+    let canonical_ok = canonical_exists
         && read_bounded(canonical, MAX_PERSISTED_BYTES)
             .ok()
             .and_then(|raw| parse_store_bytes(&raw).ok())
+            .and_then(|memory| {
+                verify_workspace_identity(address, canonical, &memory.project_key, &memory.cwd)
+                    .ok()
+                    .map(|_| ())
+            })
             .is_some();
+    if canonical_exists && !canonical_ok {
+        for (temp, _) in &temps {
+            let ready = PathBuf::from(format!("{}.ready", temp.display()));
+            let _ = fs::remove_file(&ready);
+            quarantine(temp);
+        }
+        enforce_footprint(canonical);
+        return;
+    }
     if canonical_ok {
         for (temp, _) in temps {
             let ready = PathBuf::from(format!("{}.ready", temp.display()));
@@ -1126,7 +1323,7 @@ fn recover_scope(canonical: &Path) {
         enforce_footprint(canonical);
         return;
     }
-    let mut promoted = false;
+    let mut ranked: Vec<(u64, PathBuf, PathBuf)> = Vec::new();
     for (temp, ready) in temps {
         let ready_path = PathBuf::from(format!("{}.ready", temp.display()));
         if !ready {
@@ -1134,33 +1331,54 @@ fn recover_scope(canonical: &Path) {
             quarantine(&temp);
             continue;
         }
-        if promoted {
+        match parse_ready_candidate(address, &temp) {
+            Some((generation, _)) => ranked.push((generation, temp, ready_path)),
+            None => {
+                let _ = fs::remove_file(&ready_path);
+                quarantine(&temp);
+            }
+        }
+    }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let Some(max_gen) = ranked.first().map(|item| item.0) else {
+        enforce_footprint(canonical);
+        return;
+    };
+    let winners: Vec<_> = ranked
+        .iter()
+        .filter(|item| item.0 == max_gen)
+        .cloned()
+        .collect();
+    if winners.len() != 1 {
+        for (_, temp, ready_path) in ranked {
             let _ = fs::remove_file(&ready_path);
             quarantine(&temp);
+        }
+        enforce_footprint(canonical);
+        return;
+    }
+    let (_, winner, winner_ready) = winners.into_iter().next().unwrap();
+    if fs::rename(&winner, canonical).is_ok() {
+        let _ = fs::remove_file(&winner_ready);
+        if let Some(parent) = canonical.parent() {
+            let _ = fsync_dir(parent);
+        }
+    } else {
+        quarantine(&winner);
+        let _ = fs::remove_file(&winner_ready);
+    }
+    for (generation, temp, ready_path) in ranked {
+        if generation == max_gen && temp == winner {
             continue;
         }
-        let Ok(raw) = read_bounded(&temp, MAX_PERSISTED_BYTES) else {
-            let _ = fs::remove_file(&ready_path);
-            quarantine(&temp);
-            continue;
-        };
-        if parse_store_bytes(&raw).is_err() {
-            let _ = fs::remove_file(&ready_path);
-            quarantine(&temp);
-            continue;
-        }
-        if fs::rename(&temp, canonical).is_ok() {
-            let _ = fs::remove_file(&ready_path);
-            promoted = true;
-        } else {
-            quarantine(&temp);
-        }
+        let _ = fs::remove_file(&ready_path);
+        quarantine(&temp);
     }
     enforce_footprint(canonical);
 }
 
 fn load_from_path(address: &MemoryAddress, path: &Path) -> anyhow::Result<Option<ProjectMemory>> {
-    recover_scope(path);
+    recover_scope(address, path);
     let raw = match read_bounded(path, MAX_PERSISTED_BYTES) {
         Ok(raw) => raw,
         Err(error) => {
@@ -1174,6 +1392,12 @@ fn load_from_path(address: &MemoryAddress, path: &Path) -> anyhow::Result<Option
     let memory = parse_store_bytes(&raw)
         .with_context(|| format!("parse memory scope {}", path.display()))?;
     verify_workspace_identity(address, path, &memory.project_key, &memory.cwd)?;
+    let expected_binding = scope_binding(address);
+    for receipt in &memory.receipts {
+        if receipt.scope_binding != expected_binding {
+            bail!("memory receipt scope binding mismatch");
+        }
+    }
     Ok(Some(memory))
 }
 
@@ -1196,6 +1420,7 @@ fn commit_canonical(path: &Path, raw: &[u8]) -> Result<(), MemoryError> {
         options.mode(0o600);
     }
     let mut temp = options.open(&temp_path).map_err(|_| MemoryError::Durable)?;
+    hang_if_requested("after_temp_create");
     if cut == CommitCutpoint::AfterTempCreate {
         drop(temp);
         let _ = fs::remove_file(&temp_path);
@@ -1206,6 +1431,7 @@ fn commit_canonical(path: &Path, raw: &[u8]) -> Result<(), MemoryError> {
         let _ = fs::remove_file(&temp_path);
         return Err(MemoryError::Durable);
     }
+    hang_if_requested("after_write");
     if cut == CommitCutpoint::AfterWrite {
         drop(temp);
         return Err(MemoryError::Durable);
@@ -1215,6 +1441,7 @@ fn commit_canonical(path: &Path, raw: &[u8]) -> Result<(), MemoryError> {
         let _ = fs::remove_file(&temp_path);
         return Err(MemoryError::Durable);
     }
+    hang_if_requested("after_flush");
     if cut == CommitCutpoint::AfterFlush {
         drop(temp);
         return Err(MemoryError::Durable);
@@ -1225,9 +1452,11 @@ fn commit_canonical(path: &Path, raw: &[u8]) -> Result<(), MemoryError> {
         return Err(MemoryError::Durable);
     }
     drop(temp);
+    hang_if_requested("after_file_fsync");
     if cut == CommitCutpoint::AfterFileFsync {
         return Err(MemoryError::Durable);
     }
+    hang_if_requested("before_rename");
     if cut == CommitCutpoint::BeforeRename {
         return Err(MemoryError::Durable);
     }
@@ -1237,6 +1466,7 @@ fn commit_canonical(path: &Path, raw: &[u8]) -> Result<(), MemoryError> {
     }
     fs::rename(&temp_path, path).map_err(|_| MemoryError::Durable)?;
     let _ = fs::remove_file(&ready_path);
+    hang_if_requested("after_rename_before_dir_fsync");
     if cut == CommitCutpoint::AfterRenameBeforeDirFsync {
         return Err(MemoryError::uncertain("", 0, ""));
     }
@@ -1403,13 +1633,40 @@ fn mark_tombstones(memory: &mut ProjectMemory) {
     }
 }
 
+fn encoded_facts_len(facts: &[MemoryFact]) -> Result<usize, MemoryError> {
+    let payload: Vec<V2Fact> = facts
+        .iter()
+        .map(|fact| V2Fact {
+            id: fact.id.clone(),
+            text: fact.text.clone(),
+            tags: fact.tags.clone(),
+            updated_at: fact.updated_at.clone(),
+            revision: fact.effective_revision(),
+            valid_from: fact.valid_from.clone(),
+            valid_until: fact.valid_until.clone(),
+            supersedes: fact.supersedes.clone(),
+            criticality: fact.criticality,
+            salience: fact.salience,
+            source: fact.source.clone().unwrap_or(PersistedSource {
+                kind: MemorySourceKind::Caller,
+                actor: None,
+            }),
+            claim_key: fact.claim_key.clone(),
+        })
+        .collect();
+    serde_json::to_vec(&payload)
+        .map(|raw| raw.len())
+        .map_err(|_| MemoryError::Durable)
+}
+
 fn compact(
     memory: &mut ProjectMemory,
     event: DateTime<Utc>,
     protect: Option<&str>,
 ) -> Result<(), MemoryError> {
     let watermark = memory.retention_watermark;
-    while memory.facts.len() > MAX_FACTS || encode_store(memory)?.len() > MAX_HOT_STORE_BYTES {
+    while memory.facts.len() > MAX_FACTS || encoded_facts_len(&memory.facts)? > MAX_HOT_STORE_BYTES
+    {
         let index = pick_expired(&memory.facts, event, watermark, protect)
             .or_else(|| pick_query_superseded(&memory.facts, event, watermark, protect))
             .or_else(|| pick_noncritical(&memory.facts, event, watermark, protect));
@@ -1423,7 +1680,15 @@ fn compact(
 }
 
 fn scope_binding(address: &MemoryAddress) -> String {
-    format!("{}:{}", address.scope().label(), storage_key(address))
+    match address.scope() {
+        MemoryScope::Project => format!("project:{}", storage_key(address)),
+        MemoryScope::AgentPrivate { agent_id } => {
+            format!("agent_private:{}:{agent_id}", storage_key(address))
+        }
+        MemoryScope::Team { team_id } => {
+            format!("team:{}:{team_id}", storage_key(address))
+        }
+    }
 }
 
 fn fact_id_for(address: &MemoryAddress, idempotency_key: &str) -> String {
@@ -1497,9 +1762,46 @@ fn truncate_tags(tags: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn receipt_expired(receipt: &Receipt, watermark: DateTime<Utc>) -> bool {
-    parse_timestamp(&receipt.created_at)
-        .is_some_and(|created| watermark - created >= Duration::days(RECEIPT_HORIZON_DAYS))
+fn receipt_past_horizon(created_at: &str, at: DateTime<Utc>) -> bool {
+    parse_timestamp(created_at)
+        .map(|created| at.signed_duration_since(created) >= Duration::days(RECEIPT_HORIZON_DAYS))
+        .unwrap_or(true)
+}
+
+fn compact_receipt_horizon(
+    memory: &mut ProjectMemory,
+    now: DateTime<Utc>,
+) -> Result<(), MemoryError> {
+    let mut live = Vec::new();
+    let mut moved = false;
+    for receipt in memory.receipts.drain(..) {
+        if receipt_past_horizon(&receipt.created_at, now) {
+            if !memory
+                .expired_keys
+                .iter()
+                .any(|expired| expired.key == receipt.key)
+            {
+                memory.expired_keys.push(ExpiredKey {
+                    key: receipt.key,
+                    payload_digest: receipt.payload_digest,
+                });
+            }
+            moved = true;
+        } else {
+            live.push(receipt);
+        }
+    }
+    memory.receipts = live;
+    if memory.expired_keys.len() > MAX_EXPIRED_KEYS {
+        return Err(MemoryError::Capacity);
+    }
+    if moved {
+        memory.receipt_epoch = memory.receipt_epoch.saturating_add(1).max(1);
+        if memory.receipt_epoch == 0 || memory.receipt_epoch == u64::MAX {
+            return Err(MemoryError::Capacity);
+        }
+    }
+    Ok(())
 }
 
 struct TxnResult<T> {
@@ -1625,39 +1927,18 @@ pub(crate) fn remember(
     if text.is_empty() {
         bail!("empty memory fact");
     }
+    if secret_shaped(text) {
+        return Err(anyhow!(MemoryError::Malformed));
+    }
     let text: String = text.chars().take(MAX_FACT_CHARS).collect();
     let tags = truncate_tags(tags);
-    transact(address, |memory, now| {
-        if let Some(existing) = memory.facts.iter().find(|fact| {
-            fact.text == text
-                && is_active(fact, now)
-                && !successor_active_at(&memory.facts, &fact.id, now)
-        }) {
-            return Ok(TxnResult::replay(existing.id.clone()));
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        let stamped = format_timestamp(now);
-        let incoming = MemoryFact {
-            id: id.clone(),
-            text,
-            tags,
-            updated_at: stamped.clone(),
-            revision: 1,
-            valid_from: Some(stamped),
-            valid_until: None,
-            supersedes: None,
-            criticality: MemoryCriticality::Normal,
-            salience: MemorySalience::Medium,
-            source: Some(PersistedSource {
-                kind: MemorySourceKind::Caller,
-                actor: address.actor_agent_id.clone(),
-            }),
-            claim_key: None,
-        };
-        apply_incoming(memory, incoming, now)?;
-        Ok(TxnResult::commit(id.clone(), id.clone(), 1, id))
-    })
-    .map_err(|error| anyhow!(error))
+    let key = format!("compat:{:x}", Sha256::digest(text.as_bytes()));
+    let ack = remember_versioned(
+        address,
+        VersionedWriteRequest::new(key.clone(), text, key).with_tags(tags),
+        WriteClass::Normal,
+    )?;
+    Ok(ack.id)
 }
 
 pub(crate) fn remember_versioned(
@@ -1702,11 +1983,6 @@ pub(crate) fn remember_versioned(
         Some(raw) => Some(parse_timestamp(raw).ok_or(MemoryError::Malformed)?),
         None => None,
     };
-    if let Some(until) = valid_until {
-        if valid_from >= until {
-            return Err(MemoryError::Malformed);
-        }
-    }
     if address
         .actor_agent_id
         .as_ref()
@@ -1716,6 +1992,7 @@ pub(crate) fn remember_versioned(
     }
     let digest = canonical_payload_digest(&request);
     transact(address, move |memory, now| {
+        compact_receipt_horizon(memory, now)?;
         if let Some(existing) = memory
             .receipts
             .iter()
@@ -1727,7 +2004,7 @@ pub(crate) fn remember_versioned(
             {
                 return Err(MemoryError::CrossScope);
             }
-            if receipt_expired(&existing, memory.retention_watermark) {
+            if receipt_past_horizon(&existing.created_at, now) {
                 return Err(MemoryError::ReceiptExpired);
             }
             if existing.payload_digest != digest {
@@ -1738,6 +2015,18 @@ pub(crate) fn remember_versioned(
                 revision: existing.revision,
                 replayed: true,
             }));
+        }
+        if memory
+            .expired_keys
+            .iter()
+            .any(|expired| expired.key == request.idempotency_key)
+        {
+            return Err(MemoryError::ReceiptExpired);
+        }
+        if let Some(until) = valid_until {
+            if valid_from >= until {
+                return Err(MemoryError::Malformed);
+            }
         }
         if memory.receipts.len() >= MAX_RECEIPTS {
             return Err(MemoryError::Capacity);
@@ -1857,7 +2146,10 @@ pub(crate) fn remember_versioned(
 }
 
 pub(crate) fn list_facts(address: &MemoryAddress) -> anyhow::Result<Vec<MemoryFact>> {
-    transact_read(address, |memory| Ok(memory.facts.clone())).map_err(|error| anyhow!(error))
+    let now = address.clock.now();
+    retrieve_at(address, now)
+        .map(|retrieved| retrieved.current)
+        .map_err(|error| anyhow!(error))
 }
 
 struct AuthoritativeRetrieval {
@@ -1952,9 +2244,13 @@ pub(crate) fn inject_context(address: &MemoryAddress) -> anyhow::Result<String> 
             continue;
         }
         let line = format!(
-            "<memory_item id=\"{}\" claim=\"{}\">{}</memory_item>\n",
+            "<memory_item id=\"{}\" claim=\"{}\" revision=\"{}\" valid_from=\"{}\" valid_until=\"{}\" scope=\"{}\">{}</memory_item>\n",
             escape_evidence(&fact.id),
             escape_evidence(fact.claim_key.as_deref().unwrap_or("")),
+            fact.effective_revision(),
+            escape_evidence(fact.valid_from.as_deref().unwrap_or("")),
+            escape_evidence(fact.valid_until.as_deref().unwrap_or("")),
+            escape_evidence(address.scope().label()),
             escape_evidence(&fact.text)
         );
         if used + line.len() > MAX_INJECT_CHARS {
@@ -1995,6 +2291,7 @@ fn declared_bounds_json() -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::discover::{home_override_serial, set_grokptah_home_override};
+    use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
     use std::sync::Barrier;
     use std::time::{Duration as StdDuration, Instant};
@@ -2126,7 +2423,9 @@ mod tests {
         let file = canonical.file_name().and_then(|n| n.to_str()).unwrap();
         let name = candidate.file_name().and_then(|n| n.to_str()).unwrap();
         name.starts_with(&format!(".{file}."))
-            && (name.ends_with(".tmp") || name.ends_with(".tmp.ready"))
+            && (name.ends_with(".tmp")
+                || name.ends_with(".tmp.ready")
+                || name.ends_with(".tmp.quarantine"))
     }
 
     fn assert_complete_canonical(address: &MemoryAddress) {
@@ -2408,14 +2707,18 @@ mod tests {
         remember(&address, "written before discard", &[]).unwrap();
         drop(discarded_execution);
 
-        let texts: Vec<_> = list_facts(&address)
+        let mut texts: Vec<_> = list_facts(&address)
             .unwrap()
             .into_iter()
             .map(|fact| fact.text)
             .collect();
+        texts.sort();
         assert_eq!(
             texts,
-            vec!["written before promotion", "written before discard"]
+            vec![
+                "written before discard".to_string(),
+                "written before promotion".to_string()
+            ]
         );
     }
 
@@ -2465,9 +2768,13 @@ mod tests {
         assert_eq!(facts[0].updated_at, format_timestamp(epoch()));
         clock.advance(Duration::days(365));
         remember(&address, "one logical year later", &[]).unwrap();
+        let facts = list_facts(&address).unwrap();
         assert_eq!(
-            list_facts(&address).unwrap()[1].updated_at,
-            format_timestamp(epoch() + Duration::days(365))
+            facts
+                .iter()
+                .find(|fact| fact.text == "one logical year later")
+                .map(|fact| fact.updated_at.as_str()),
+            Some(format_timestamp(epoch() + Duration::days(365))).as_deref()
         );
         clock.set(epoch());
         let rolled_back = retrieve_at(&address, clock.now()).unwrap();
@@ -2806,7 +3113,9 @@ mod tests {
                 .superseding(&second.id, second.revision),
         )
         .unwrap();
-        assert_eq!(list_facts(&address).unwrap().len(), 3);
+        assert_eq!(stored_facts(&address).len(), 3);
+        assert_eq!(list_facts(&address).unwrap().len(), 1);
+        assert_eq!(list_facts(&address).unwrap()[0].text, "v3");
     }
 
     #[test]
@@ -2846,10 +3155,7 @@ mod tests {
             clock.advance(Duration::seconds(1));
             remember(&address, &format!("pressure {}", clock.now()), &[]).unwrap();
         }
-        assert!(list_facts(&address)
-            .unwrap()
-            .iter()
-            .any(|fact| fact.id == pred.id));
+        assert!(stored_facts(&address).iter().any(|fact| fact.id == pred.id));
     }
 
     #[test]
@@ -2892,6 +3198,18 @@ mod tests {
         transact_read(address, |memory| Ok(memory.receipts.clone())).unwrap()
     }
 
+    fn expired_keys_for(address: &MemoryAddress) -> Vec<ExpiredKey> {
+        transact_read(address, |memory| Ok(memory.expired_keys.clone())).unwrap()
+    }
+
+    fn stored_facts(address: &MemoryAddress) -> Vec<MemoryFact> {
+        transact_read(address, |memory| Ok(memory.facts.clone())).unwrap()
+    }
+
+    fn store_generation(address: &MemoryAddress) -> u64 {
+        transact_read(address, |memory| Ok(memory.generation)).unwrap()
+    }
+
     #[test]
     fn receipts_survive_count_byte_expired_and_superseded_compaction_and_restart() {
         let _home = IsolatedHome::install();
@@ -2914,8 +3232,7 @@ mod tests {
         assert!(receipts_for(&address)
             .iter()
             .any(|receipt| receipt.key == "count-key" && receipt.tombstone));
-        assert!(!list_facts(&address)
-            .unwrap()
+        assert!(!stored_facts(&address)
             .iter()
             .any(|fact| fact.id == counted.id));
         let replay = write_normal(
@@ -2926,8 +3243,7 @@ mod tests {
         .unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.id, counted.id);
-        assert!(!list_facts(&address)
-            .unwrap()
+        assert!(!stored_facts(&address)
             .iter()
             .any(|fact| fact.id == counted.id));
         let changed =
@@ -2947,19 +3263,19 @@ mod tests {
             clock.advance(Duration::seconds(1));
             remember(&address, &format!("{}-{index}", "z".repeat(200)), &[]).unwrap();
         }
-        assert!(receipts_for(&address).iter().any(|r| r.key == "byte-key"
-            && (r.tombstone
-                || list_facts(&address)
-                    .unwrap()
-                    .iter()
-                    .all(|f| f.id != byte_ack.id)
-                    && r.fact_id == byte_ack.id)));
+        assert!(receipts_for(&address)
+            .iter()
+            .any(|receipt| receipt.key == "byte-key" && receipt.tombstone));
+        assert!(stored_facts(&address)
+            .iter()
+            .all(|fact| fact.id != byte_ack.id));
 
         clock.enable_retention_advance();
+        let exp_until = format_timestamp(clock.now() + Duration::days(1));
         let exp = write_normal(
             &address,
             VersionedWriteRequest::new("exp-key", "expires", "exp-claim")
-                .with_valid_until(format_timestamp(clock.now() + Duration::days(1))),
+                .with_valid_until(exp_until.clone()),
         )
         .unwrap();
         clock.advance(Duration::days(40));
@@ -2967,28 +3283,27 @@ mod tests {
         for index in 0..80 {
             remember(&address, &format!("exp-fill-{index}"), &[]).unwrap();
         }
-        assert!(receipts_for(&address).iter().any(|r| r.key == "exp-key"));
-        assert!(
-            !list_facts(&address)
-                .unwrap()
-                .iter()
-                .any(|fact| fact.id == exp.id)
-                || receipts_for(&address)
-                    .iter()
-                    .any(|r| r.key == "exp-key" && r.tombstone)
+        assert!(receipts_for(&address)
+            .iter()
+            .any(|receipt| receipt.key == "exp-key" && receipt.tombstone));
+        assert!(stored_facts(&address).iter().all(|fact| fact.id != exp.id));
+        assert_eq!(
+            write_normal(
+                &address,
+                VersionedWriteRequest::new("exp-key", "expires", "exp-claim")
+                    .with_valid_until(format_timestamp(epoch() + Duration::days(41))),
+            )
+            .unwrap_err(),
+            MemoryError::IdempotencyConflict
         );
-        match write_normal(
+        let exp_replay = write_normal(
             &address,
             VersionedWriteRequest::new("exp-key", "expires", "exp-claim")
-                .with_valid_until(format_timestamp(epoch() + Duration::days(41))),
-        ) {
-            Ok(ack) => assert!(
-                ack.replayed,
-                "expired payload must not resurrect as a new fact"
-            ),
-            Err(MemoryError::IdempotencyConflict | MemoryError::ReceiptExpired) => {}
-            Err(other) => panic!("unexpected expired replay error {other:?}"),
-        }
+                .with_valid_until(exp_until),
+        )
+        .unwrap();
+        assert!(exp_replay.replayed);
+        assert_eq!(exp_replay.id, exp.id);
 
         let pred = write_normal(
             &address,
@@ -3107,7 +3422,8 @@ mod tests {
         fs::write(&ready, b"ready").unwrap();
         let recovered = list_facts(&address).unwrap();
         assert_eq!(recovered[0].text, "recovered from ready temp");
-        assert!(is_production_temp(&path, &temp) || !temp.exists());
+        assert!(!temp.exists());
+        assert!(path.is_file());
 
         remember(&address, "seed-two", &[]).unwrap();
         let partial = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
@@ -3118,19 +3434,20 @@ mod tests {
             .into_iter()
             .map(|f| f.text)
             .collect();
-        assert!(
-            texts.contains(&"seed-two".into())
-                || texts.contains(&"recovered from ready temp".into())
+        assert_eq!(
+            texts,
+            vec![
+                "seed-two".to_string(),
+                "recovered from ready temp".to_string()
+            ]
         );
-        assert!(
-            !partial.exists()
-                || parent
-                    .join(format!(
-                        ".{}.quarantine",
-                        partial.file_name().unwrap().to_str().unwrap()
-                    ))
-                    .exists()
-        );
+        assert!(!partial.exists());
+        assert!(parent
+            .join(format!(
+                "{}.quarantine",
+                partial.file_name().unwrap().to_str().unwrap()
+            ))
+            .is_file());
     }
 
     #[test]
@@ -3159,7 +3476,18 @@ mod tests {
             &[],
         )
         .unwrap();
-        remember(&address, "api_key=sk-secret-canary-value", &[]).unwrap();
+        assert!(remember(&address, "api_key=sk-secret-canary-value", &[]).is_err());
+        let path = path_for(&address).unwrap();
+        let mut planted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        planted["facts"].as_array_mut().unwrap().push(v2_fact(
+            "m2-secret-plant",
+            "api_key=sk-secret-canary-value",
+            Some("secret-plant"),
+            &format_timestamp(Utc::now()),
+            None,
+        ));
+        fs::write(&path, serde_json::to_vec_pretty(&planted).unwrap()).unwrap();
         let injected = inject_context(&address).unwrap();
         assert!(injected.contains("Untrusted memory evidence"));
         assert!(injected.contains("quoted data"));
@@ -3198,7 +3526,11 @@ mod tests {
             let _cut = cut(stage);
             let err = remember(&address, &format!("new {stage:?}"), &[]).unwrap_err();
             drop(_cut);
-            assert!(err.to_string().contains("durable") || err.to_string().contains("uncertain"));
+            assert!(
+                err.to_string().contains("durable memory store error"),
+                "{err}"
+            );
+            assert!(!err.to_string().contains("uncertain"), "{err}");
             let now = fs::read(&path).unwrap();
             parse_store_bytes(&now).unwrap();
             let texts: Vec<_> = list_facts(&address)
@@ -3336,6 +3668,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cross_process_reopen_entry() {
+        let Ok(workspace) = std::env::var("GROKPTAH_MEMORY_SUBPROC_WORKSPACE") else {
+            return;
+        };
+        if std::env::var("GROKPTAH_MEMORY_SUBPROC_ROLE")
+            .ok()
+            .as_deref()
+            != Some("reopen")
+        {
+            return;
+        }
+        let access = MemoryAccess::new(&workspace, Some("horizon-agent".into()));
+        let address = access.project();
+        let generation = store_generation(&address);
+        let mut ids: Vec<_> = stored_facts(&address).into_iter().map(|f| f.id).collect();
+        ids.sort();
+        println!(
+            "GROKPTAH_MEMORY_ACK:{}",
+            serde_json::json!({"generation": generation, "ids": ids, "count": ids.len()})
+        );
+    }
+
+    fn spawn_lib_test(filter: &str, home: &Path, extra: &[(&str, &str)]) -> std::process::Child {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "--nocapture", filter])
+            .env("GROKPTAH_HOME", home)
+            .env("RUST_TEST_THREADS", "1")
+            .env_remove("GROKPTAH_MEMORY_CUTPOINT")
+            .env_remove("GROKPTAH_MEMORY_HANG_CUTPOINT")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in extra {
+            command.env(key, value);
+        }
+        command.spawn().unwrap()
+    }
+
     fn spawn_writer(
         home: &Path,
         workspace: &Path,
@@ -3344,41 +3715,118 @@ mod tests {
         text: &str,
         key: &str,
         claim: &str,
+        hang: Option<&str>,
     ) -> std::process::Child {
         let arrived = barrier.join(format!("arrived-{name}"));
         let go = barrier.join("go");
-        Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "--nocapture",
-                "memory::tests::cross_process_writer_entry",
-            ])
-            .env("GROKPTAH_HOME", home)
-            .env("GROKPTAH_MEMORY_SUBPROC_TEXT", text)
-            .env("GROKPTAH_MEMORY_SUBPROC_WORKSPACE", workspace)
-            .env("GROKPTAH_MEMORY_SUBPROC_KEY", key)
-            .env("GROKPTAH_MEMORY_SUBPROC_CLAIM", claim)
-            .env("GROKPTAH_MEMORY_SUBPROC_GO", &go)
-            .env("GROKPTAH_MEMORY_SUBPROC_ARRIVED", &arrived)
-            .env("RUST_TEST_THREADS", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
+        let mut envs = vec![
+            ("GROKPTAH_MEMORY_SUBPROC_TEXT", text.to_string()),
+            (
+                "GROKPTAH_MEMORY_SUBPROC_WORKSPACE",
+                workspace.display().to_string(),
+            ),
+            ("GROKPTAH_MEMORY_SUBPROC_KEY", key.to_string()),
+            ("GROKPTAH_MEMORY_SUBPROC_CLAIM", claim.to_string()),
+            ("GROKPTAH_MEMORY_SUBPROC_GO", go.display().to_string()),
+            (
+                "GROKPTAH_MEMORY_SUBPROC_ARRIVED",
+                arrived.display().to_string(),
+            ),
+        ];
+        if let Some(cut) = hang {
+            envs.push(("GROKPTAH_MEMORY_HANG_CUTPOINT", cut.to_string()));
+        }
+        let owned: Vec<(String, String)> =
+            envs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let refs: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        spawn_lib_test("memory::tests::cross_process_writer_entry", home, &refs)
     }
 
-    fn parse_ack(stdout: &[u8], stderr: &[u8]) -> serde_json::Value {
-        let text = format!(
+    fn spawn_reopen(home: &Path, workspace: &Path) -> std::process::Child {
+        let workspace = workspace.display().to_string();
+        spawn_lib_test(
+            "memory::tests::cross_process_reopen_entry",
+            home,
+            &[
+                ("GROKPTAH_MEMORY_SUBPROC_WORKSPACE", &workspace),
+                ("GROKPTAH_MEMORY_SUBPROC_ROLE", "reopen"),
+            ],
+        )
+    }
+
+    fn combined_output(output: &std::process::Output) -> String {
+        format!(
             "{}{}",
-            String::from_utf8_lossy(stdout),
-            String::from_utf8_lossy(stderr)
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    fn assert_child_executed_exactly_one_test(output: &std::process::Output) -> serde_json::Value {
+        let text = combined_output(output);
+        assert!(output.status.success(), "child failed: {text}");
+        assert!(
+            !text.contains("running 0 tests"),
+            "child matched 0 tests: {text}"
         );
+        assert!(
+            text.contains("running 1 test"),
+            "child must run exactly one test: {text}"
+        );
+        assert!(
+            text.contains("1 passed"),
+            "child must report 1 passed: {text}"
+        );
+        parse_ack_from(&text)
+    }
+
+    fn parse_ack_from(text: &str) -> serde_json::Value {
         let line = text
             .lines()
             .find(|line| line.contains("GROKPTAH_MEMORY_ACK:"))
             .unwrap_or_else(|| panic!("missing ack in {text}"));
         let payload = line.split("GROKPTAH_MEMORY_ACK:").nth(1).unwrap();
         serde_json::from_str(payload.trim()).unwrap()
+    }
+
+    fn wait_until(path: &Path, secs: u64) {
+        let started = Instant::now();
+        while !path.exists() {
+            assert!(started.elapsed() < StdDuration::from_secs(secs));
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+    }
+
+    fn wait_for_cutpoint(child: &mut std::process::Child, label: &str) {
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let started = Instant::now();
+        let needle = format!("GROKPTAH_MEMORY_CUTPOINT_REACHED:{label}");
+        loop {
+            assert!(
+                started.elapsed() < StdDuration::from_secs(30),
+                "cutpoint {label}"
+            );
+            match rx.recv_timeout(StdDuration::from_millis(50)) {
+                Ok(line) if line.contains(&needle) => return,
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("child exited before cutpoint {label}")
+                }
+            }
+        }
     }
 
     #[test]
@@ -3394,6 +3842,7 @@ mod tests {
             "process one fact",
             "proc-one",
             "proc-one-claim",
+            None,
         );
         let two = spawn_writer(
             home.path(),
@@ -3403,29 +3852,15 @@ mod tests {
             "process two fact",
             "proc-two",
             "proc-two-claim",
+            None,
         );
-        let started = Instant::now();
-        while !barrier.path().join("arrived-one").exists()
-            || !barrier.path().join("arrived-two").exists()
-        {
-            assert!(started.elapsed() < StdDuration::from_secs(60));
-            std::thread::sleep(StdDuration::from_millis(10));
-        }
+        wait_until(&barrier.path().join("arrived-one"), 60);
+        wait_until(&barrier.path().join("arrived-two"), 60);
         fs::write(barrier.path().join("go"), b"1").unwrap();
         let out_one = one.wait_with_output().unwrap();
         let out_two = two.wait_with_output().unwrap();
-        assert!(
-            out_one.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out_one.stderr)
-        );
-        assert!(
-            out_two.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out_two.stderr)
-        );
-        let ack_one = parse_ack(&out_one.stdout, &out_one.stderr);
-        let ack_two = parse_ack(&out_two.stdout, &out_two.stderr);
+        let ack_one = assert_child_executed_exactly_one_test(&out_one);
+        let ack_two = assert_child_executed_exactly_one_test(&out_two);
         assert_eq!(ack_one["replayed"], false);
         assert_eq!(ack_two["replayed"], false);
 
@@ -3450,6 +3885,54 @@ mod tests {
     }
 
     #[test]
+    fn subprocess_kill_at_cutpoint_then_relaunch_recovers() {
+        let home = IsolatedHome::install();
+        let source = tempfile::tempdir().unwrap();
+        let barrier = tempfile::tempdir().unwrap();
+        let mut child = spawn_writer(
+            home.path(),
+            source.path(),
+            barrier.path(),
+            "cut",
+            "cutpoint payload",
+            "cut-key",
+            "cut-claim",
+            Some("before_rename"),
+        );
+        wait_until(&barrier.path().join("arrived-cut"), 60);
+        fs::write(barrier.path().join("go"), b"1").unwrap();
+        wait_for_cutpoint(&mut child, "before_rename");
+        child.kill().unwrap();
+        let _ = child.wait();
+        let relaunch_barrier = tempfile::tempdir().unwrap();
+        let relaunch = spawn_writer(
+            home.path(),
+            source.path(),
+            relaunch_barrier.path(),
+            "relaunch",
+            "cutpoint payload",
+            "cut-key",
+            "cut-claim",
+            None,
+        );
+        wait_until(&relaunch_barrier.path().join("arrived-relaunch"), 60);
+        fs::write(relaunch_barrier.path().join("go"), b"1").unwrap();
+        let out = relaunch.wait_with_output().unwrap();
+        let ack = assert_child_executed_exactly_one_test(&out);
+        assert_eq!(ack["replayed"], false);
+        let first = spawn_reopen(home.path(), source.path())
+            .wait_with_output()
+            .unwrap();
+        let second = spawn_reopen(home.path(), source.path())
+            .wait_with_output()
+            .unwrap();
+        let one = assert_child_executed_exactly_one_test(&first);
+        let two = assert_child_executed_exactly_one_test(&second);
+        assert_eq!(one, two);
+        assert_eq!(one["count"], 1);
+    }
+
+    #[test]
     fn logical_years_certification_is_independent_of_fixture_echo() {
         let spec = fixture();
         assert_eq!(spec.schema, "grokptah.memory_long_horizon_fixture.v2");
@@ -3468,12 +3951,14 @@ mod tests {
             spec.workload.min_critical_sample >= spec.workload.critical_invariants_per_scope * 3
         );
         assert_eq!(spec.workload.writes_per_year, 3);
-        let _ = spec.seed;
-        let _ = spec.logical_year_days;
-        let _ = spec.workload.preference_revisions;
-        let _ = spec.workload.expiring_status_ttl_days;
-        let _ = spec.workload.conflict_pairs;
-        let _ = spec.workload.lexical_topk;
+        assert_eq!(spec.seed, 1_296_386_353);
+        assert_eq!(spec.logical_years, 10);
+        assert_eq!(spec.logical_year_days, 365);
+        assert_eq!(spec.workload.preference_revisions, 2);
+        assert_eq!(spec.workload.expiring_status_ttl_days, 30);
+        assert_eq!(spec.workload.conflict_pairs, 1);
+        assert_eq!(spec.workload.lexical_topk, 5);
+        assert_eq!(spec.epoch, "2000-01-01T00:00:00.000Z");
 
         let home = IsolatedHome::install();
         let source = tempfile::tempdir().unwrap();
@@ -3558,6 +4043,17 @@ mod tests {
                 )
                 .unwrap();
                 status_keys.push((address.clone(), format!("{scope_name} status {year}")));
+                for write_idx in 0..spec.workload.writes_per_year {
+                    write_normal(
+                        address,
+                        VersionedWriteRequest::new(
+                            format!("{scope_name}-y{year}-w{write_idx}-{}", spec.seed),
+                            format!("year-write {scope_name} {year} {write_idx} {}", spec.seed),
+                            format!("{scope_name}-y{year}-w{write_idx}-claim"),
+                        ),
+                    )
+                    .unwrap();
+                }
                 if year + 1 == spec.workload.preference_revisions {
                     let (head_addr, head, claim) = expected_pref
                         .iter()
@@ -3583,6 +4079,17 @@ mod tests {
                         lexical.push((address.clone(), token));
                     }
                 }
+            }
+            if year == 0 || year + 1 == spec.logical_years {
+                let reopen = spawn_reopen(home.path(), source.path())
+                    .wait_with_output()
+                    .unwrap();
+                let first = assert_child_executed_exactly_one_test(&reopen);
+                let reopen_again = spawn_reopen(home.path(), source.path())
+                    .wait_with_output()
+                    .unwrap();
+                let second = assert_child_executed_exactly_one_test(&reopen_again);
+                assert_eq!(first, second, "second year-boundary reopen must be a no-op");
             }
         }
 
@@ -3630,61 +4137,87 @@ mod tests {
         };
         assert_eq!(stale_pct, spec.oracle.stale_as_current_pct as f64);
 
-        let stamp = format_timestamp(clock.now());
-        let mut planted: serde_json::Value =
-            serde_json::from_slice(&fs::read(path_for(&project).unwrap()).unwrap()).unwrap();
-        planted["facts"].as_array_mut().unwrap().push(v2_fact(
-            "m2-conflict-a",
-            "channel stable",
-            Some("planted-conflict"),
-            &stamp,
-            None,
-        ));
-        planted["facts"].as_array_mut().unwrap().push(v2_fact(
-            "m2-conflict-b",
-            "channel beta",
-            Some("planted-conflict"),
-            &stamp,
-            None,
-        ));
-        fs::write(
-            path_for(&project).unwrap(),
-            serde_json::to_vec_pretty(&planted).unwrap(),
-        )
-        .unwrap();
-        let conflicts = retrieve_at(&project, clock.now()).unwrap();
-        let hit = conflicts
-            .conflicts
-            .iter()
-            .any(|(claim, heads)| claim == "planted-conflict" && heads.len() == 2);
-        assert!(hit);
-        let false_positive = conflicts
-            .conflicts
-            .iter()
-            .any(|(claim, _)| claim.ends_with("-inv-0-claim") || claim.ends_with("-pref-claim"));
-        assert!(!false_positive);
-        let conflict_recall = if hit { 100 } else { 0 };
-        let conflict_fp = if false_positive { 100 } else { 0 };
-        assert_eq!(conflict_recall, spec.oracle.conflict_recall_pct);
-        assert_eq!(conflict_fp, spec.oracle.conflict_false_positive_pct);
+        for (address, status_text) in &status_keys {
+            assert!(retrieve_at(address, clock.now())
+                .unwrap()
+                .current
+                .iter()
+                .all(|fact| fact.text != *status_text));
+        }
 
+        let mut conflict_hits = 0usize;
+        let mut conflict_fp = 0usize;
+        for pair in 0..spec.workload.conflict_pairs {
+            let key = format!("idem-conflict-{pair}-{}", spec.seed);
+            let claim = format!("idem-conflict-{pair}-claim");
+            write_normal(
+                &project,
+                VersionedWriteRequest::new(&key, "payload-a", &claim),
+            )
+            .unwrap();
+            match write_normal(
+                &project,
+                VersionedWriteRequest::new(&key, "payload-b", &claim),
+            ) {
+                Err(MemoryError::IdempotencyConflict) => conflict_hits += 1,
+                Ok(_) => conflict_fp += 1,
+                Err(_) => conflict_fp += 1,
+            }
+            let replay = write_normal(
+                &project,
+                VersionedWriteRequest::new(&key, "payload-a", &claim),
+            )
+            .unwrap();
+            assert!(replay.replayed);
+        }
+        let conflict_recall = if spec.workload.conflict_pairs == 0 {
+            100
+        } else {
+            100 * conflict_hits / spec.workload.conflict_pairs
+        };
+        let conflict_fp_pct = if spec.workload.conflict_pairs == 0 {
+            0
+        } else {
+            100 * conflict_fp / spec.workload.conflict_pairs
+        };
+        assert_eq!(conflict_recall, spec.oracle.conflict_recall_pct as usize);
+        assert_eq!(
+            conflict_fp_pct,
+            spec.oracle.conflict_false_positive_pct as usize
+        );
+
+        let last_year = spec.logical_years.saturating_sub(1);
         let before_dup = list_facts(&project).unwrap().len()
             + list_facts(&private).unwrap().len()
             + list_facts(&shared).unwrap().len();
         for (scope_name, address) in &scopes {
-            for idx in 0..spec.workload.critical_invariants_per_scope {
-                let replay = write_critical(
+            for write_idx in 0..spec.workload.writes_per_year {
+                let replay = write_normal(
                     address,
                     VersionedWriteRequest::new(
-                        format!("{scope_name}-inv-{idx}"),
-                        format!("invariant {scope_name} {idx} seed-{}", spec.seed),
-                        format!("{scope_name}-inv-{idx}-claim"),
-                    )
-                    .with_salience_high(),
+                        format!("{scope_name}-y{last_year}-w{write_idx}-{}", spec.seed),
+                        format!(
+                            "year-write {scope_name} {last_year} {write_idx} {}",
+                            spec.seed
+                        ),
+                        format!("{scope_name}-y{last_year}-w{write_idx}-claim"),
+                    ),
                 )
                 .unwrap();
                 assert!(replay.replayed);
             }
+            assert_eq!(
+                write_normal(
+                    address,
+                    VersionedWriteRequest::new(
+                        format!("{scope_name}-y0-w0-{}", spec.seed),
+                        format!("year-write {scope_name} 0 0 {}", spec.seed),
+                        format!("{scope_name}-y0-w0-claim"),
+                    ),
+                )
+                .unwrap_err(),
+                MemoryError::ReceiptExpired
+            );
         }
         let after_dup = list_facts(&project).unwrap().len()
             + list_facts(&private).unwrap().len()
@@ -3758,8 +4291,414 @@ mod tests {
         );
         assert!(bytes <= MAX_SCOPE_FOOTPRINT_BYTES as u64 * 8);
 
+        let expected_year_writes = spec.logical_years
+            * spec.workload.writes_per_year
+            * u32::try_from(scopes.len()).unwrap();
+        assert_eq!(expected_year_writes, 90);
         let _ = home.path();
-        let _ = spec.workload.writes_per_year;
+    }
+
+    #[test]
+    fn footprint_cleanup_never_deletes_sibling_canonicals_or_live_locks() {
+        let _home = IsolatedHome::install();
+        let mut held = Vec::new();
+        let sibling_count = MAX_SCOPE_FILES + 6;
+        for index in 0..sibling_count {
+            let source = tempfile::tempdir().unwrap();
+            let project =
+                MemoryAccess::new(source.path(), Some(format!("agent-{index}"))).project();
+            remember(&project, &format!("project-sib {index}"), &[]).unwrap();
+            let project_path = path_for(&project).unwrap();
+            let project_bytes = fs::read(&project_path).unwrap();
+            let project_lock = File::open(lock_path_for(&project_path)).unwrap();
+            project_lock.lock_exclusive().unwrap();
+
+            let private = MemoryAccess::new(source.path(), Some(format!("agent-{index}")))
+                .resolve(MemoryScope::AgentPrivate {
+                    agent_id: format!("agent-{index}"),
+                })
+                .unwrap();
+            remember(&private, &format!("private-sib {index}"), &[]).unwrap();
+            let private_path = path_for(&private).unwrap();
+            let private_bytes = fs::read(&private_path).unwrap();
+            let private_lock = File::open(lock_path_for(&private_path)).unwrap();
+            private_lock.lock_exclusive().unwrap();
+
+            let team = MemoryAccess::new(source.path(), Some(format!("agent-{index}")))
+                .allow_team(format!("team-{index}"))
+                .unwrap()
+                .resolve(MemoryScope::Team {
+                    team_id: format!("team-{index}"),
+                })
+                .unwrap();
+            remember(&team, &format!("team-sib {index}"), &[]).unwrap();
+            let team_path = path_for(&team).unwrap();
+            let team_bytes = fs::read(&team_path).unwrap();
+            let team_lock = File::open(lock_path_for(&team_path)).unwrap();
+            team_lock.lock_exclusive().unwrap();
+
+            held.push((
+                source,
+                project_path,
+                project_bytes,
+                project_lock,
+                private_path,
+                private_bytes,
+                private_lock,
+                team_path,
+                team_bytes,
+                team_lock,
+            ));
+        }
+        assert!(held.len() > MAX_SCOPE_FILES);
+
+        let pressure_source = tempfile::tempdir().unwrap();
+        let pressure = MemoryAccess::new(pressure_source.path(), None).project();
+        remember(&pressure, "pressure victim", &[]).unwrap();
+        let pressure_path = path_for(&pressure).unwrap();
+        let parent = pressure_path.parent().unwrap();
+        let file = pressure_path.file_name().unwrap().to_str().unwrap();
+        for _ in 0..(MAX_SCOPE_FILES + 8) {
+            let tmp = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+            fs::write(&tmp, vec![b'x'; 2048]).unwrap();
+        }
+        list_facts(&pressure).unwrap();
+        remember(&pressure, "after cleanup", &[]).unwrap();
+
+        for item in &held {
+            assert_eq!(fs::read(&item.1).unwrap(), item.2, "project canonical");
+            assert!(lock_path_for(&item.1).is_file(), "project lock");
+            assert_eq!(fs::read(&item.4).unwrap(), item.5, "private canonical");
+            assert!(lock_path_for(&item.4).is_file(), "private lock");
+            assert_eq!(fs::read(&item.7).unwrap(), item.8, "team canonical");
+            assert!(lock_path_for(&item.7).is_file(), "team lock");
+        }
+        drop(held);
+        drop(pressure_source);
+    }
+
+    #[test]
+    fn recover_promotes_unique_highest_generation_and_quarantines_ties() {
+        let _home = IsolatedHome::install();
+        let source = tempfile::tempdir().unwrap();
+        let address = access_at(source.path(), None, epoch()).project();
+        remember(&address, "canonical seed", &[]).unwrap();
+        let path = path_for(&address).unwrap();
+        let parent = path.parent().unwrap();
+        let file = path.file_name().unwrap().to_str().unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut high = serde_json::from_slice::<serde_json::Value>(&original).unwrap();
+        high["generation"] = serde_json::json!(9);
+        high["facts"][0]["text"] = serde_json::json!("high generation");
+        let mut low = high.clone();
+        low["generation"] = serde_json::json!(3);
+        low["facts"][0]["text"] = serde_json::json!("low generation");
+        fs::remove_file(&path).unwrap();
+        let high_temp = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+        let low_temp = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+        fs::write(&high_temp, serde_json::to_vec_pretty(&high).unwrap()).unwrap();
+        fs::write(format!("{}.ready", high_temp.display()), b"ready").unwrap();
+        fs::write(&low_temp, serde_json::to_vec_pretty(&low).unwrap()).unwrap();
+        fs::write(format!("{}.ready", low_temp.display()), b"ready").unwrap();
+        assert_eq!(list_facts(&address).unwrap()[0].text, "high generation");
+        assert_eq!(store_generation(&address), 9);
+
+        fs::remove_file(&path).unwrap();
+        let tie_a = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+        let tie_b = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+        let mut tie = high.clone();
+        tie["generation"] = serde_json::json!(12);
+        fs::write(&tie_a, serde_json::to_vec_pretty(&tie).unwrap()).unwrap();
+        fs::write(format!("{}.ready", tie_a.display()), b"ready").unwrap();
+        fs::write(&tie_b, serde_json::to_vec_pretty(&tie).unwrap()).unwrap();
+        fs::write(format!("{}.ready", tie_b.display()), b"ready").unwrap();
+        assert!(list_facts(&address).unwrap().is_empty());
+        assert!(!path.exists());
+        assert!(quarantine_dest(&tie_a).unwrap().is_file() || !tie_a.exists());
+        assert!(quarantine_dest(&tie_b).unwrap().is_file() || !tie_b.exists());
+        assert!(!tie_a.exists());
+        assert!(!tie_b.exists());
+    }
+
+    #[test]
+    fn recover_two_fresh_process_reopens_converge() {
+        let home = IsolatedHome::install();
+        let source = tempfile::tempdir().unwrap();
+        let address = MemoryAccess::new(source.path(), Some("horizon-agent".into())).project();
+        remember(&address, "recover me", &[]).unwrap();
+        let path = path_for(&address).unwrap();
+        let parent = path.parent().unwrap();
+        let file = path.file_name().unwrap().to_str().unwrap();
+        let body = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let temp = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+        fs::write(&temp, &body).unwrap();
+        fs::write(format!("{}.ready", temp.display()), b"ready").unwrap();
+        let first = spawn_reopen(home.path(), source.path())
+            .wait_with_output()
+            .unwrap();
+        let second = spawn_reopen(home.path(), source.path())
+            .wait_with_output()
+            .unwrap();
+        let one = assert_child_executed_exactly_one_test(&first);
+        let two = assert_child_executed_exactly_one_test(&second);
+        assert_eq!(one, two);
+        assert_eq!(one["count"], 1);
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn receipt_horizon_compacts_past_512_writes_without_silent_reuse() {
+        let _home = IsolatedHome::install();
+        let source = tempfile::tempdir().unwrap();
+        let clock = Arc::new(FakeClock::new(epoch()));
+        let address = MemoryAccess::new(source.path(), None)
+            .with_clock(clock.clone())
+            .project();
+        let mut in_horizon = None;
+        for year in 0..10 {
+            if year > 0 {
+                clock.advance(Duration::days(RECEIPT_HORIZON_DAYS));
+            }
+            for index in 0..60 {
+                let key = format!("y{year}-k{index}");
+                write_normal(
+                    &address,
+                    VersionedWriteRequest::new(
+                        &key,
+                        format!("payload {key}"),
+                        format!("{key}-claim"),
+                    ),
+                )
+                .unwrap();
+                if year == 9 && index == 0 {
+                    in_horizon = Some(key);
+                }
+            }
+        }
+        assert!(stored_facts(&address).len() <= MAX_FACTS);
+        assert!(receipts_for(&address).len() <= MAX_RECEIPTS);
+        assert!(receipts_for(&address).len() + expired_keys_for(&address).len() > MAX_RECEIPTS);
+        let horizon_key = in_horizon.unwrap();
+        let replay = write_normal(
+            &address,
+            VersionedWriteRequest::new(
+                &horizon_key,
+                format!("payload {horizon_key}"),
+                format!("{horizon_key}-claim"),
+            ),
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(
+            write_normal(
+                &address,
+                VersionedWriteRequest::new(
+                    &horizon_key,
+                    "different payload",
+                    format!("{horizon_key}-claim"),
+                ),
+            )
+            .unwrap_err(),
+            MemoryError::IdempotencyConflict
+        );
+        assert_eq!(
+            write_normal(
+                &address,
+                VersionedWriteRequest::new("y0-k0", "payload y0-k0", "y0-k0-claim"),
+            )
+            .unwrap_err(),
+            MemoryError::ReceiptExpired
+        );
+        assert_eq!(
+            write_normal(
+                &address,
+                VersionedWriteRequest::new("y0-k0", "brand new", "y0-k0-claim"),
+            )
+            .unwrap_err(),
+            MemoryError::ReceiptExpired
+        );
+    }
+
+    #[test]
+    fn v2_load_validation_table_preserves_bytes_and_fails_closed() {
+        let _home = IsolatedHome::install();
+        let source = tempfile::tempdir().unwrap();
+        let address = access_at(source.path(), None, epoch()).project();
+        write_normal(
+            &address,
+            VersionedWriteRequest::new("seed-key", "seed text", "seed-claim"),
+        )
+        .unwrap();
+        let path = path_for(&address).unwrap();
+        let good: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
+            (
+                "future_schema",
+                Box::new(|v| v["schema"] = serde_json::json!("grokptah.memory.v3")),
+            ),
+            (
+                "unknown_field",
+                Box::new(|v| v["nope"] = serde_json::json!(true)),
+            ),
+            (
+                "unknown_enum",
+                Box::new(|v| v["facts"][0]["criticality"] = serde_json::json!("ultra")),
+            ),
+            (
+                "invalid_timestamp",
+                Box::new(|v| v["facts"][0]["updated_at"] = serde_json::json!("nope")),
+            ),
+            (
+                "generation_zero",
+                Box::new(|v| v["generation"] = serde_json::json!(0)),
+            ),
+            (
+                "receipt_epoch_zero",
+                Box::new(|v| v["receipt_epoch"] = serde_json::json!(0)),
+            ),
+            (
+                "revision_zero",
+                Box::new(|v| v["facts"][0]["revision"] = serde_json::json!(0)),
+            ),
+            (
+                "duplicate_fact_id",
+                Box::new(|v| {
+                    let clone = v["facts"][0].clone();
+                    v["facts"].as_array_mut().unwrap().push(clone);
+                }),
+            ),
+            (
+                "duplicate_receipt_key",
+                Box::new(|v| {
+                    let clone = v["receipts"][0].clone();
+                    v["receipts"].as_array_mut().unwrap().push(clone);
+                }),
+            ),
+            (
+                "valid_from_not_before_until",
+                Box::new(|v| {
+                    v["facts"][0]["valid_from"] = serde_json::json!("2001-01-01T00:00:00.000Z");
+                    v["facts"][0]["valid_until"] = serde_json::json!("2000-01-01T00:00:00.000Z");
+                }),
+            ),
+            (
+                "id_too_long",
+                Box::new(|v| v["facts"][0]["id"] = serde_json::json!("i".repeat(MAX_ID_CHARS + 1))),
+            ),
+            (
+                "text_too_long",
+                Box::new(|v| {
+                    v["facts"][0]["text"] = serde_json::json!("t".repeat(MAX_FACT_CHARS + 1))
+                }),
+            ),
+            (
+                "too_many_tags",
+                Box::new(|v| {
+                    v["facts"][0]["tags"] = serde_json::json!(vec!["t".to_string(); MAX_TAGS + 1]);
+                }),
+            ),
+            (
+                "tag_too_long",
+                Box::new(|v| {
+                    v["facts"][0]["tags"] = serde_json::json!(["t".repeat(MAX_TAG_CHARS + 1)])
+                }),
+            ),
+            (
+                "key_too_long",
+                Box::new(|v| {
+                    v["receipts"][0]["key"] = serde_json::json!("k".repeat(MAX_KEY_CHARS + 1))
+                }),
+            ),
+            (
+                "digest_invalid",
+                Box::new(|v| v["receipts"][0]["payload_digest"] = serde_json::json!("not-hex")),
+            ),
+            (
+                "claim_too_long",
+                Box::new(|v| {
+                    v["facts"][0]["claim_key"] = serde_json::json!("c".repeat(MAX_KEY_CHARS + 1))
+                }),
+            ),
+            (
+                "actor_too_long",
+                Box::new(|v| {
+                    v["facts"][0]["source"]["actor"] =
+                        serde_json::json!("a".repeat(MAX_SOURCE_ACTOR_CHARS + 1))
+                }),
+            ),
+            (
+                "cwd_too_long",
+                Box::new(|v| v["cwd"] = serde_json::json!("/".repeat(MAX_CWD_CHARS + 1))),
+            ),
+            (
+                "receipt_scope_mismatch",
+                Box::new(|v| v["receipts"][0]["scope_binding"] = serde_json::json!("team:other")),
+            ),
+            (
+                "receipt_fact_mismatch",
+                Box::new(|v| v["receipts"][0]["fact_id"] = serde_json::json!("m2-missing")),
+            ),
+            (
+                "receipt_revision_mismatch",
+                Box::new(|v| v["receipts"][0]["revision"] = serde_json::json!(9)),
+            ),
+            (
+                "graph_cycle",
+                Box::new(|v| v["facts"][0]["supersedes"] = v["facts"][0]["id"].clone()),
+            ),
+            (
+                "too_many_facts",
+                Box::new(|v| {
+                    let template = v["facts"][0].clone();
+                    let facts = v["facts"].as_array_mut().unwrap();
+                    while facts.len() <= MAX_FACTS {
+                        let mut extra = template.clone();
+                        extra["id"] = serde_json::json!(format!("m2-extra-{}", facts.len()));
+                        extra["claim_key"] = serde_json::json!(format!("claim-{}", facts.len()));
+                        extra["supersedes"] = serde_json::Value::Null;
+                        facts.push(extra);
+                    }
+                }),
+            ),
+        ];
+        for (name, mutate) in cases {
+            let mut corrupted = good.clone();
+            mutate(&mut corrupted);
+            let bytes = serde_json::to_vec_pretty(&corrupted).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert!(
+                list_facts(&address).is_err(),
+                "case {name} must fail closed"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "case {name} must preserve bytes"
+            );
+        }
+        let oversize = vec![b'x'; MAX_PERSISTED_BYTES + 1];
+        fs::write(&path, &oversize).unwrap();
+        assert!(list_facts(&address).is_err(), "oversize must fail closed");
+        assert_eq!(fs::read(&path).unwrap(), oversize);
+        fs::write(&path, serde_json::to_vec_pretty(&good).unwrap()).unwrap();
+        let mut extra_receipts = good.clone();
+        let template = extra_receipts["receipts"][0].clone();
+        let receipts = extra_receipts["receipts"].as_array_mut().unwrap();
+        while receipts.len() <= MAX_RECEIPTS {
+            let mut extra = template.clone();
+            extra["key"] = serde_json::json!(format!("extra-key-{}", receipts.len()));
+            extra["tombstone"] = serde_json::json!(true);
+            extra["fact_id"] = serde_json::json!(format!("m2-gone-{}", receipts.len()));
+            receipts.push(extra);
+        }
+        let bytes = serde_json::to_vec_pretty(&extra_receipts).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            list_facts(&address).is_err(),
+            "too many receipts must fail closed"
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
