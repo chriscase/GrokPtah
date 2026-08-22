@@ -8,6 +8,7 @@ pub(crate) mod managed;
 mod manager;
 mod message;
 mod provider_attempt;
+mod public_run;
 mod quota;
 mod routine;
 mod service;
@@ -51,6 +52,12 @@ pub use message::{
 pub use provider_attempt::{
     ProviderAttemptRecord, ProviderAttemptState, ProviderRetryClass, ProviderSendCertainty,
     PROVIDER_ATTEMPT_SCHEMA_VERSION,
+};
+pub use public_run::{
+    project_public_run, project_public_run_progress, public_run_contains_forbidden_fields,
+    public_run_progress_to_value, public_run_to_value, PublicProviderAttempt,
+    PublicProviderExecution, PublicProviderQuota, PublicProviderRouteSummary, PublicRun,
+    PublicRunProgress,
 };
 pub use quota::{
     QuotaClass, QuotaLimits, QuotaPoolKey, QuotaPoolUsage, QuotaReservation, QuotaReservationState,

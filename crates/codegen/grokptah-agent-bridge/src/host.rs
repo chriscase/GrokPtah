@@ -48,7 +48,7 @@ use crate::orchestration::{
     AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
     ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, ProviderRouteSnapshot,
-    ProviderSendCertainty, QuotaReservation, RoutineConcurrencyPolicy, RoutineLifecycle,
+    ProviderSendCertainty, PublicRun, QuotaReservation, RoutineConcurrencyPolicy, RoutineLifecycle,
     RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger, RunAggregates, RunBounds,
     RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState, RunStopCause, WorkAttemptView,
     WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
@@ -2361,6 +2361,33 @@ impl AgentHostHandle {
         Ok(store
             .load_run(run_id)?
             .filter(|run| run.session_id == session_id))
+    }
+
+    /// Project one persisted session Run onto the public allowlist.
+    pub fn project_public_session_run(&self, mut run: RunRecord) -> Result<PublicRun> {
+        let store = self.ensure_orchestration_store()?;
+        run.queue_position = self.orchestration_pending_position(&run.run_id);
+        crate::orchestration::project_public_run(&store, &run)
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
+    /// Desktop-visible Runs for one session, using the shared public projection.
+    pub fn list_public_session_runs(&self, session_id: Uuid) -> Result<Vec<PublicRun>> {
+        self.list_session_runs(session_id)?
+            .into_iter()
+            .map(|run| self.project_public_session_run(run))
+            .collect()
+    }
+
+    /// One desktop-visible Run, using the shared public projection.
+    pub fn get_public_session_run(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+    ) -> Result<Option<PublicRun>> {
+        self.get_session_run(session_id, run_id)?
+            .map(|run| self.project_public_session_run(run))
+            .transpose()
     }
 
     /// Read the bounded journal range belonging to one durable run.
@@ -7311,6 +7338,14 @@ impl AgentHostHandle {
             }
             None => None,
         };
+        if external_run.is_none() {
+            if let Some(route) = provider_route.as_ref() {
+                crate::native_coding_readiness::validate_provider_route_for_purpose(
+                    route,
+                    RunPurpose::Execution,
+                )?;
+            }
+        }
         // Durably append the user turn before the long model call.
         self.persist_session(session_id);
         let start_seq = event_tx.current_seq();
@@ -12870,3 +12905,7 @@ mod tests {
         assert_eq!(runs[0].bounds.max_duration_ms, 50);
     }
 }
+
+#[cfg(test)]
+#[path = "host_admission_gate_tests.rs"]
+mod host_admission_gate_tests;

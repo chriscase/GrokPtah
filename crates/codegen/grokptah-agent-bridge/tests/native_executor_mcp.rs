@@ -6,9 +6,10 @@ use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use grokptah_agent_bridge::orchestration::{
-    AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, ProviderAttemptState,
-    ProviderRetryClass, ProviderRoute, ProviderSendCertainty, QuotaClass, QuotaReservationState,
+    public_run_contains_forbidden_fields, AssignmentStatus, AuthContext, ManagedExecutionIntent,
+    ManagedExecutionPolicy, ManagedIntentState, OrchStore, OrchestrationConfig,
+    OrchestrationService, ProviderAttemptState, ProviderRetryClass, ProviderRoute,
+    ProviderRouteSnapshot, ProviderSendCertainty, PublicRun, QuotaClass, QuotaReservationState,
     RunBounds, RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState,
     WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
@@ -414,6 +415,83 @@ fn auth() -> AuthContext {
     }
 }
 
+fn assert_public_payload_hides_route(
+    payload: &serde_json::Value,
+    route: &ProviderRouteSnapshot,
+    extra_sentinels: &[&str],
+) {
+    fn walk(value: &serde_json::Value, path: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    assert!(
+                        !key.eq_ignore_ascii_case("providerRoute")
+                            && !key.eq_ignore_ascii_case("provider_route"),
+                        "providerRoute leaked at {path}.{key}"
+                    );
+                    walk(child, &format!("{path}.{key}"));
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for (index, child) in values.iter().enumerate() {
+                    walk(child, &format!("{path}[{index}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(payload, "$");
+    let encoded = payload.to_string();
+    for sentinel in [route.base_url.as_str(), route.credential_ref.as_str()]
+        .into_iter()
+        .chain([
+            route.credential_fingerprint.as_str(),
+            route.endpoint_fingerprint.as_str(),
+        ])
+        .chain(extra_sentinels.iter().copied())
+    {
+        if sentinel.is_empty() {
+            continue;
+        }
+        assert!(
+            !encoded.contains(sentinel),
+            "public payload leaked {sentinel}: {encoded}"
+        );
+    }
+    assert!(!public_run_contains_forbidden_fields(payload));
+}
+
+fn assert_public_surfaces_hide_route(
+    get_run: &serde_json::Value,
+    list_runs: &serde_json::Value,
+    progress: &serde_json::Value,
+    host_list: &[PublicRun],
+    host_get: &PublicRun,
+    route: &ProviderRouteSnapshot,
+    extra_sentinels: &[&str],
+) {
+    assert_public_payload_hides_route(get_run, route, extra_sentinels);
+    assert_public_payload_hides_route(list_runs, route, extra_sentinels);
+    assert_public_payload_hides_route(&list_runs["runs"][0], route, extra_sentinels);
+    assert_public_payload_hides_route(progress, route, extra_sentinels);
+    let host_list_value = serde_json::to_value(host_list).unwrap();
+    let host_get_value = serde_json::to_value(host_get).unwrap();
+    assert_public_payload_hides_route(&host_list_value, route, extra_sentinels);
+    assert_public_payload_hides_route(&host_get_value, route, extra_sentinels);
+    let decoded: PublicRun = serde_json::from_value(get_run.clone()).unwrap();
+    assert_public_payload_hides_route(
+        &serde_json::to_value(&decoded).unwrap(),
+        route,
+        extra_sentinels,
+    );
+    let decoded_list: Vec<PublicRun> = serde_json::from_value(list_runs["runs"].clone()).unwrap();
+    assert_public_payload_hides_route(
+        &serde_json::to_value(&decoded_list).unwrap(),
+        route,
+        extra_sentinels,
+    );
+}
+
 fn run_record(
     intent_id: &str,
     session: Uuid,
@@ -711,7 +789,7 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         "native",
         "Verify the frozen provider route at native admission",
         lane.id,
-        workspace_text,
+        workspace_text.clone(),
         "operator",
         WorkPolicy::default(),
     )
@@ -816,6 +894,68 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         .get_progress_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
         .unwrap();
     assert_eq!(progress["providerExecution"], *provider_execution);
+    let listed = orch
+        .list_runs_scoped(&auth(), lane.id, workspace.path())
+        .unwrap();
+    let control = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let mcp_get = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    let mcp_list = client
+        .call_tool(
+            "ptah_list_runs",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+            }),
+        )
+        .await
+        .unwrap();
+    let mcp_progress = client
+        .call_tool(
+            "ptah_get_progress",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    let host_list = host.list_public_session_runs(lane.id).unwrap();
+    let host_get = host
+        .get_public_session_run(lane.id, &run.run_id)
+        .unwrap()
+        .expect("desktop get must see the admitted Run");
+    let sentinels = ["synthetic-native-route-key"];
+    assert_public_surfaces_hide_route(
+        &admitted_view,
+        &listed,
+        &progress,
+        &host_list,
+        &host_get,
+        run_route,
+        &sentinels,
+    );
+    assert_public_surfaces_hide_route(
+        &mcp_get.structured,
+        &mcp_list.structured,
+        &mcp_progress.structured,
+        &host_list,
+        &host_get,
+        run_route,
+        &sentinels,
+    );
     let admitted_capacity = orch.get_capacity(&auth()).unwrap();
     assert_eq!(admitted_capacity["providerQuota"]["activeReservations"], 1);
     assert_eq!(

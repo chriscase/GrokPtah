@@ -5,6 +5,10 @@
 //! other clients may format this record; they must not recreate the policy.
 //! The projection never carries secrets, credential material, endpoints, or
 //! cross-owner quota.
+//!
+//! [`admit_purpose`] is the shared capability gate. Readiness projection,
+//! orchestration Execution, and interactive desktop Build all call it;
+//! captured routes go through [`validate_provider_route_for_purpose`].
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +16,7 @@ use crate::gateway_config::{
     CapabilitySource, ComputerUseTier, ModelCapabilities, ModelSelection, ProviderModel,
     ProviderProfile, XAI_PROVIDER_ID,
 };
-use crate::orchestration::RunPurpose;
+use crate::orchestration::{OrchError, OrchErrorCode, ProviderRouteSnapshot, RunPurpose};
 
 pub const NATIVE_CODING_READINESS_SCHEMA: &str = "grokptah.native-coding-readiness.v1";
 pub const DESKTOP_OWNER_ID: &str = "primary";
@@ -147,9 +151,10 @@ impl PurposeAdmission {
             | AdmissionReasonCode::DeclaredFirstUse
             | AdmissionReasonCode::ChatEligible => return None,
         };
-        Some(crate::orchestration::OrchError::new(
+        Some(crate::orchestration::OrchError::with_data(
             crate::orchestration::OrchErrorCode::Conflict,
             message,
+            serde_json::json!({ "reasonCode": self.reason_code }),
         ))
     }
 }
@@ -206,6 +211,44 @@ pub fn admit_purpose(
             eligible_from_source
         }
     }
+}
+
+/// Exact-route wrapper around [`admit_purpose`]. Callers that already captured
+/// a frozen route use this so readiness, orchestration Execution, and
+/// interactive desktop Build cannot drift.
+pub fn admit_route_for_purpose(
+    route: &ProviderRouteSnapshot,
+    purpose: RunPurpose,
+    stale_measured_qualification: bool,
+) -> Result<(), OrchError> {
+    route.validate()?;
+    admit_purpose(
+        purpose,
+        route.capabilities.source,
+        route.capabilities.chat,
+        route.capabilities.tools,
+        stale_measured_qualification,
+    )
+    .orch_error()
+    .map_or(Ok(()), Err)
+}
+
+/// Exact route/purpose admission used by orchestration Execution and
+/// interactive desktop Build. Readiness projection uses [`admit_purpose`]
+/// against the same capability fields after resolving the live catalog route.
+pub fn validate_provider_route_for_purpose(
+    route: &ProviderRouteSnapshot,
+    purpose: RunPurpose,
+) -> Result<(), OrchError> {
+    let stale_measured_qualification =
+        crate::gateway_config::has_measured_xai_qualification(&route.provider_id, &route.model_id)
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "provider qualification ledger is unavailable",
+                )
+            })?;
+    admit_route_for_purpose(route, purpose, stale_measured_qualification)
 }
 
 /// Computer Use is projected independently of coding-tool readiness.
@@ -1047,5 +1090,81 @@ mod tests {
         let after_restart = project_for_owner("owner-a", "company-gateway", "Team/Code:Cheap");
         assert_eq!(after_restart, current);
         set_grokptah_home_override(None);
+    }
+
+    fn policy_route(source: CapabilitySource, chat: bool, tools: bool) -> ProviderRouteSnapshot {
+        ProviderRouteSnapshot {
+            schema_version: PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+            provider_id: "env-grokptah".into(),
+            model_id: "policy-model".into(),
+            wire_model_id: "policy-model".into(),
+            selection_key: model_selection_key("env-grokptah", "policy-model"),
+            kind: ProviderKind::OpenAiCompatible,
+            dialect: ProviderDialect::OpenAiChatCompletions,
+            base_url: "http://127.0.0.1:41111/v1".into(),
+            endpoint_fingerprint: String::new(),
+            credential_ref: "env:GROKPTAH_API_KEY".into(),
+            credential_fingerprint: "v1-sha256:policy-credential".into(),
+            capabilities: ModelCapabilities {
+                chat,
+                tools,
+                source,
+                qualification_schema: (source == CapabilitySource::Measured)
+                    .then(|| CAPABILITY_QUALIFICATION_SCHEMA.into()),
+                ..ModelCapabilities::default()
+            },
+            deadline_class: ProviderDeadlineClass::Standard,
+            effort: EffortLevel::Medium,
+            qualification_record_id: None,
+            quota_class: None,
+            quota_reservation_id: None,
+            snapshot_hash: String::new(),
+        }
+        .seal()
+        .unwrap()
+    }
+
+    fn reason_code(error: &crate::orchestration::OrchError) -> &str {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reasonCode"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn unknown_capabilities_never_enter_autonomous_runs() {
+        let route = policy_route(CapabilitySource::Unknown, true, true);
+        for purpose in [RunPurpose::Execution, RunPurpose::ManagerProposal] {
+            let error = admit_route_for_purpose(&route, purpose, false).unwrap_err();
+            assert_eq!(error.code, OrchErrorCode::Conflict);
+            assert!(error.message.contains("qualified or explicitly declared"));
+            assert_eq!(reason_code(&error), "unknown_capabilities");
+        }
+    }
+
+    #[test]
+    fn stale_measured_history_blocks_declared_execution_but_not_chat_only_proposals() {
+        let route = policy_route(CapabilitySource::Declared, true, true);
+        admit_route_for_purpose(&route, RunPurpose::Execution, false).unwrap();
+        let error = admit_route_for_purpose(&route, RunPurpose::Execution, true).unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::Conflict);
+        assert!(error.message.contains("requalify"));
+        assert_eq!(reason_code(&error), "requalify_required");
+        admit_route_for_purpose(&route, RunPurpose::ManagerProposal, true).unwrap();
+    }
+
+    #[test]
+    fn execution_requires_measured_or_declared_coding_tools_while_proposals_need_chat_only() {
+        let chat_only = policy_route(CapabilitySource::Measured, true, false);
+        admit_route_for_purpose(&chat_only, RunPurpose::ManagerProposal, false).unwrap();
+        let error = admit_route_for_purpose(&chat_only, RunPurpose::Execution, false).unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::Conflict);
+        assert!(error.message.contains("native coding tools"));
+        assert_eq!(reason_code(&error), "tools_not_permitted");
+
+        let coding = policy_route(CapabilitySource::Measured, true, true);
+        admit_route_for_purpose(&coding, RunPurpose::Execution, false).unwrap();
     }
 }
