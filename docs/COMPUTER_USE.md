@@ -15,7 +15,9 @@ Computer Use treats observation and action as separate privileged operations:
 3. A local-user grant binds that run, target generation, allowed action classes, expiry, and
    optional remaining-use count.
 4. An observation receives a monotonic ID. Every action must reference the current observation.
-5. Policy is checked again immediately before the backend action.
+5. Policy is checked again immediately before the backend action. Takeover is durable
+   bookkeeping-safe (revokes grants, bumps epochs, cancels later work). It is not physically
+   preemptive once an action is already inside the native action gate.
 6. Successful actions invalidate the observation, forcing the caller to observe again.
 
 Authorization is fail-closed. Grants do not survive restart, pause, cancellation, completion,
@@ -46,14 +48,23 @@ claim only observe/semantic/text entry, or stay unproven when they claim pointer
 authority. Unknown, malformed, host-native isolated, or contradictory tier/proof/boolean
 combinations cannot deserialize into background or isolated authority.
 
-Every run, grant, observation, and policy check is bound to a host-issued opaque surface ID and
-incarnation, target generation, frame/observation epoch, and control/authority epoch. A
-serialized wall-clock timestamp is not dispatch proof. Monotonic freshness ticks are meaningful
-only for the live surface incarnation and are invalidated on restart.
+Every run, grant, observation, and policy check is bound to a host-interned opaque surface ID and
+incarnation for an attested physical input domain, plus target generation, a host-minted
+frame epoch, and control/authority epoch. Backends do not mint surface authority; syntactic
+prefixes are not proof of issuance. A serialized wall-clock timestamp is not dispatch proof.
+Monotonic freshness ticks are exact-current for the live surface incarnation: an older tick is
+stale. Restart invalidates the live clocks.
 
-The initiating principal is host-issued: a local operator session or an Agent with an `agent-*`
-ID and nonzero spec revision. Model- and user-provided IDs are rejected. Service mutations
-compare the caller principal intrinsically rather than trusting only a desktop session wrapper.
+Local-operator caller identity is a host-resolved `ComputerAuthorityToken`. Public principal,
+proof, surface, and grant constructors do not mint authority. Agent principal creation is
+fail-closed in this allowlist: resolving a durable Agent ID and the exact current spec revision
+requires `AgentHost` / orchestration `AgentRecord` integration owned by the active PR #352
+security repair. Stage 1 does not accept `agent-*` strings as host-issued identity.
+
+Unproven capability fails closed for observe, evidence, grant, and act. Missing initiating
+principal is not treated as the local operator. Idempotency receipts are bound to the immutable
+caller principal and run authority/control epochs; replay reauthorizes before returning typed
+data. Legacy unstamped receipts fail closed.
 
 `ActivateTarget` is valid only for explicitly authorized foreground-semantic execution. It is
 never non-disruptive. Restart/reopen rotates the surface incarnation, zeros the freshness tick,
@@ -68,7 +79,10 @@ measurement IDs.
 This stage does **not** implement an isolated helper process, visual compositor, agent cursor
 UI, background Accessibility execution, a durable dispatch-intent journal, pointer/keyboard
 injection, or out-of-band preemptive takeover. Those remain later stages; this contract makes
-them structurally representable without lying that macOS is isolated today.
+them structurally representable without lying that macOS is isolated today. Stage 1 is not
+stable or release-ready: MCP Computer read methods still ignore authenticated bearer identity
+in `orchestration/service.rs`, which is owned by the active PR #352 security repair and is an
+unresolved least-privilege blocker.
 
 ## Foundation (#268)
 
@@ -242,7 +256,7 @@ attestation, packaging requirements, and disposable smoke fixture.
 
 - no Windows UI Automation or Linux portal adapter;
 - no unattended or continuously autonomous model invocation;
-- no MCP Computer Run surface;
+- no MCP mutation/evidence surface;
 - no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell endpoint;
 - no background or unattended grant;
 - no cross-application target switching inside a run.
@@ -252,10 +266,10 @@ attestation, packaging requirements, and disposable smoke fixture.
 | Stage | Issues | Outcome |
 |---|---|---|
 | Safety kernel | #268, #274 | Typed contract, simulator, durable authority, adversarial gates |
-| Isolation contract | stage 1 | Host-enforced tier, principal, surface incarnation, epochs, typed proof |
+| Isolation contract | stage 1 | Host-enforced tier, sealed token, interned surface, exact freshness, typed proof. Not isolated or preemptive. Not release-ready until the PR #352 authority slice lands. |
 | macOS observe | #269 | Consented target selection, capture, redaction, semantic snapshots |
 | Operator UX and model proof | #273, #272 | Visible runs/approvals and capability-based provider conformance |
-| macOS act | #270 | Bounded semantic actions with immediate local takeover |
+| macOS act | #270 | Bounded semantic actions with durable bookkeeping-safe local takeover (not physically preemptive inside the native action gate) |
 | Coordinator interoperability | #271 | Scoped Computer Run MCP tools and event visibility |
 | Durable dispatch journal | later | Authenticated in-flight intent so takeover can preempt a native gate |
 | Isolated helper / input domain | later | Host-native independently isolated visual input, not a simulator fixture |
@@ -277,3 +291,24 @@ from a stale-frame tool error against a replacement observation. Compatible-prov
 persists the same measured tier for its exact route. Image input and `visual_fallback_act` remain
 unqualified. A qualified tier permits proposals only; it never replaces the cockpit's exact target
 review, one-use local grant, reobservation, or native dispatch checks.
+
+## Acceptance commands
+
+Stage 1 is not isolated Computer Use, not physically preemptive, and not release-ready. Packaged
+hardware focus, TCC, and takeover evidence remain explicitly unverified.
+
+```sh
+cargo fmt --check --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --lib computer_use -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --lib computer_agent -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --lib mcp_control::tests::computer -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --test computer_use_release_gate -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --test mcp_streamable_transport live_computer -- --test-threads=1
+cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml \
+  --lib computer_use -- --test-threads=1
+```

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const MAX_ID_BYTES: usize = 256;
@@ -53,6 +54,15 @@ impl ComputerError {
 }
 
 pub type ComputerResult<T> = Result<T, ComputerError>;
+
+/// Durable Computer Run schema. `0` means a legacy record missing the field.
+pub const COMPUTER_RUN_SCHEMA_VERSION: u32 = 1;
+
+/// Agent ComputerPrincipal minting is fail-closed in this allowlist. Resolving a
+/// durable Agent ID and the exact current spec revision requires `AgentHost` /
+/// orchestration `AgentRecord` integration owned by the active PR #352 security
+/// repair. Stage 1 must not accept `agent-*` strings as host-issued identity.
+pub const AGENT_PRINCIPAL_INTEGRATION_BLOCKER: &str = "Agent ComputerPrincipal minting requires durable host Agent ID + exact current spec revision from AgentHost/AgentRecord; that integration lives in orchestration files owned by the active PR #352 security repair and is out of this allowlist. Stage-1 fails closed rather than accepting agent-* strings.";
 
 /// Closed Computer Use isolation/capability tier.
 ///
@@ -234,6 +244,75 @@ impl ComputerCapabilityProof {
         }
     }
 
+    pub fn isolated_surface(&self) -> Option<ComputerSurfaceBinding> {
+        match self {
+            Self::IndependentlyIsolatedVisualInputDomain {
+                surface_id,
+                incarnation,
+                ..
+            } => Some(ComputerSurfaceBinding {
+                surface_id: surface_id.clone(),
+                incarnation: incarnation.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn input_domain_id(&self) -> Option<&str> {
+        match self {
+            Self::IndependentlyIsolatedVisualInputDomain {
+                input_domain_id, ..
+            } => Some(input_domain_id.as_str()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn bind_to_interned_surface(
+        self,
+        surface: &ComputerSurfaceBinding,
+        input_domain_id: &str,
+        measurement_id: &str,
+    ) -> ComputerResult<Self> {
+        match self {
+            Self::Unproven => Ok(Self::Unproven),
+            Self::ForegroundSemantic { .. } => Ok(self),
+            Self::MeasuredBackgroundSafeSemantic {
+                backend_id,
+                observe,
+                semantic_actions,
+                text_entry,
+                ..
+            } => Ok(Self::MeasuredBackgroundSafeSemantic {
+                backend_id,
+                observe,
+                semantic_actions,
+                text_entry,
+                measurement_id: measurement_id.to_string(),
+            }),
+            Self::IndependentlyIsolatedVisualInputDomain {
+                backend_id,
+                origin,
+                observe,
+                semantic_actions,
+                text_entry,
+                key_chords,
+                pointer_fallback,
+                ..
+            } => Ok(Self::IndependentlyIsolatedVisualInputDomain {
+                backend_id,
+                surface_id: surface.surface_id.clone(),
+                incarnation: surface.incarnation.clone(),
+                input_domain_id: input_domain_id.to_string(),
+                origin,
+                observe,
+                semantic_actions,
+                text_entry,
+                key_chords,
+                pointer_fallback,
+            }),
+        }
+    }
+
     pub fn is_simulator_only_isolation(&self) -> bool {
         matches!(
             self,
@@ -278,12 +357,6 @@ impl ComputerCapabilityProof {
             } => {
                 validate_id("backend_id", backend_id)?;
                 validate_id("measurement_id", measurement_id)?;
-                if !measurement_id.starts_with("measurement-") {
-                    return Err(ComputerError::new(
-                        ComputerErrorCode::InvalidRequest,
-                        "background-safe measurement identity must be host-issued",
-                    ));
-                }
                 if is_native_macos_backend(backend_id) {
                     return Err(ComputerError::new(
                         ComputerErrorCode::ForbiddenAction,
@@ -307,12 +380,6 @@ impl ComputerCapabilityProof {
                 }
                 .validate()?;
                 validate_id("input_domain_id", input_domain_id)?;
-                if !input_domain_id.starts_with("input-domain-") {
-                    return Err(ComputerError::new(
-                        ComputerErrorCode::InvalidRequest,
-                        "isolated input-domain identity must be host-issued",
-                    ));
-                }
                 if is_native_macos_backend(backend_id) {
                     return Err(ComputerError::new(
                         ComputerErrorCode::ForbiddenAction,
@@ -480,41 +547,85 @@ pub const SIMULATOR_FOREGROUND_BACKEND_ID: &str = "deterministic_simulator";
 pub const SIMULATOR_BACKGROUND_BACKEND_ID: &str = "deterministic_simulator_background_safe";
 pub const SIMULATOR_ISOLATED_BACKEND_ID: &str = "deterministic_simulator_isolated";
 
-/// Opaque host-issued surface identity plus incarnation. Native process and
-/// window handles must never appear here.
+/// Typed macOS native capability. Public booleans are a derived projection of
+/// this foreground-semantic proof; they never grant pointer, key, background,
+/// or isolated authority.
+pub fn macos_native_capability_proof() -> ComputerCapabilityProof {
+    ComputerCapabilityProof::ForegroundSemantic {
+        backend_id: MACOS_NATIVE_BACKEND_ID.into(),
+        observe: true,
+        semantic_actions: true,
+        text_entry: true,
+    }
+}
+
+/// Opaque attested physical input-domain identity. Backends supply a stable
+/// fingerprint; the host hashes it and never projects native handles.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PhysicalInputDomain {
+    key: String,
+}
+
+impl PhysicalInputDomain {
+    pub fn attested(kind: &str, attested_fingerprint: &str) -> ComputerResult<Self> {
+        validate_id("physical_input_domain_kind", kind)?;
+        if attested_fingerprint.is_empty()
+            || attested_fingerprint.len() > 4096
+            || attested_fingerprint.contains('\0')
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "physical input-domain fingerprint is missing or malformed",
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(attested_fingerprint.as_bytes());
+        Ok(Self {
+            key: format!("{:x}", hasher.finalize()),
+        })
+    }
+
+    pub fn as_key(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Host-minted opaque surface identity plus incarnation. Native process and
+/// window handles must never appear here. Prefixes are not proof of issuance;
+/// only the host surface registry mints these identities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ComputerSurfaceBinding {
     #[serde(default)]
-    pub surface_id: String,
+    pub(crate) surface_id: String,
     #[serde(default)]
-    pub incarnation: String,
+    pub(crate) incarnation: String,
 }
 
 impl ComputerSurfaceBinding {
-    pub fn issue() -> Self {
+    pub fn surface_id(&self) -> &str {
+        &self.surface_id
+    }
+
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+
+    pub(crate) fn issue() -> Self {
         Self {
-            surface_id: format!("surface-{}", Uuid::new_v4()),
-            incarnation: format!("incarnation-{}", Uuid::new_v4()),
+            surface_id: Uuid::new_v4().to_string(),
+            incarnation: Uuid::new_v4().to_string(),
         }
     }
 
-    pub fn issue_with_surface_id(surface_id: String) -> ComputerResult<Self> {
-        validate_id("surface_id", &surface_id)?;
-        if !surface_id.starts_with("surface-") {
-            return Err(ComputerError::new(
-                ComputerErrorCode::InvalidRequest,
-                "surface identity must be host-issued",
-            ));
-        }
+    pub(crate) fn rotate_incarnation(&self) -> ComputerResult<Self> {
+        validate_id("surface_id", &self.surface_id)?;
         Ok(Self {
-            surface_id,
-            incarnation: format!("incarnation-{}", Uuid::new_v4()),
+            surface_id: self.surface_id.clone(),
+            incarnation: Uuid::new_v4().to_string(),
         })
-    }
-
-    pub fn rotate_incarnation(&self) -> ComputerResult<Self> {
-        Self::issue_with_surface_id(self.surface_id.clone())
     }
 
     pub fn is_issued(&self) -> bool {
@@ -524,13 +635,6 @@ impl ComputerSurfaceBinding {
     pub fn validate(&self) -> ComputerResult<()> {
         validate_id("surface_id", &self.surface_id)?;
         validate_id("incarnation", &self.incarnation)?;
-        if !self.surface_id.starts_with("surface-") || !self.incarnation.starts_with("incarnation-")
-        {
-            return Err(ComputerError::new(
-                ComputerErrorCode::InvalidRequest,
-                "surface identity must be host-issued",
-            ));
-        }
         Ok(())
     }
 }
@@ -567,44 +671,73 @@ impl SurfaceFreshnessFence {
     }
 }
 
-/// Immutable initiating principal. Model- and user-provided IDs are not
-/// accepted as Agent identity; Agent IDs must be host-issued.
+/// Durable principal recorded on a Computer Run. Agent records exist so
+/// malicious or legacy disk records can deserialize; [`Self::validate`] fails
+/// closed for Agent identity until the out-of-allowlist host Agent registry
+/// lands. The wrapper is opaque so other crates cannot mint self-issued
+/// authority. The public issue path is
+/// `ComputerUseService::local_operator_token`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ComputerPrincipal {
+    inner: ComputerPrincipalInner,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ComputerPrincipal {
+enum ComputerPrincipalInner {
     LocalOperatorSession {
+        #[serde(rename = "sessionId", alias = "session_id")]
         session_id: Uuid,
     },
     Agent {
+        #[serde(rename = "agentId", alias = "agent_id")]
         agent_id: String,
+        #[serde(rename = "specRevision", alias = "spec_revision")]
         spec_revision: u64,
     },
 }
 
 impl ComputerPrincipal {
-    pub fn local_operator(session_id: Uuid) -> Self {
-        Self::LocalOperatorSession { session_id }
+    pub(crate) fn local_operator(session_id: Uuid) -> Self {
+        Self {
+            inner: ComputerPrincipalInner::LocalOperatorSession { session_id },
+        }
     }
 
-    pub fn agent(agent_id: impl Into<String>, spec_revision: u64) -> ComputerResult<Self> {
-        let principal = Self::Agent {
-            agent_id: agent_id.into(),
-            spec_revision,
-        };
-        principal.validate()?;
-        Ok(principal)
+    /// Public Agent minting is fail-closed. See
+    /// [`AGENT_PRINCIPAL_INTEGRATION_BLOCKER`].
+    pub fn agent(_agent_id: impl Into<String>, _spec_revision: u64) -> ComputerResult<Self> {
+        Err(ComputerError::new(
+            ComputerErrorCode::Unauthorized,
+            AGENT_PRINCIPAL_INTEGRATION_BLOCKER,
+        ))
     }
 
     pub fn session_id(&self) -> Option<Uuid> {
-        match self {
-            Self::LocalOperatorSession { session_id } => Some(*session_id),
-            Self::Agent { .. } => None,
+        match &self.inner {
+            ComputerPrincipalInner::LocalOperatorSession { session_id } => Some(*session_id),
+            ComputerPrincipalInner::Agent { .. } => None,
+        }
+    }
+
+    pub(crate) fn agent_id(&self) -> Option<&str> {
+        match &self.inner {
+            ComputerPrincipalInner::Agent { agent_id, .. } => Some(agent_id.as_str()),
+            ComputerPrincipalInner::LocalOperatorSession { .. } => None,
+        }
+    }
+
+    pub(crate) fn agent_spec_revision(&self) -> Option<u64> {
+        match &self.inner {
+            ComputerPrincipalInner::Agent { spec_revision, .. } => Some(*spec_revision),
+            ComputerPrincipalInner::LocalOperatorSession { .. } => None,
         }
     }
 
     pub fn validate(&self) -> ComputerResult<()> {
-        match self {
-            Self::LocalOperatorSession { session_id } => {
+        match &self.inner {
+            ComputerPrincipalInner::LocalOperatorSession { session_id } => {
                 if session_id.is_nil() {
                     return Err(ComputerError::new(
                         ComputerErrorCode::Unauthorized,
@@ -613,27 +746,37 @@ impl ComputerPrincipal {
                 }
                 Ok(())
             }
-            Self::Agent {
-                agent_id,
-                spec_revision,
-            } => {
-                validate_id("agent_id", agent_id)?;
-                if !agent_id.starts_with("agent-") || *spec_revision == 0 {
-                    return Err(ComputerError::new(
-                        ComputerErrorCode::Unauthorized,
-                        "agent principal must be a host-issued agent id and spec revision",
-                    ));
-                }
-                Ok(())
-            }
+            ComputerPrincipalInner::Agent { .. } => Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                AGENT_PRINCIPAL_INTEGRATION_BLOCKER,
+            )),
         }
     }
 
     pub fn public_kind(&self) -> &'static str {
-        match self {
-            Self::LocalOperatorSession { .. } => "local_operator_session",
-            Self::Agent { .. } => "agent",
+        match &self.inner {
+            ComputerPrincipalInner::LocalOperatorSession { .. } => "local_operator_session",
+            ComputerPrincipalInner::Agent { .. } => "agent",
         }
+    }
+}
+
+/// Host-resolved caller identity. Fields are private so callers cannot mint
+/// authority; [`crate::computer_use::ComputerUseService::local_operator_token`]
+/// is the public issue path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerAuthorityToken {
+    principal: ComputerPrincipal,
+}
+
+impl ComputerAuthorityToken {
+    pub(crate) fn from_host_principal(principal: ComputerPrincipal) -> ComputerResult<Self> {
+        principal.validate()?;
+        Ok(Self { principal })
+    }
+
+    pub fn principal(&self) -> &ComputerPrincipal {
+        &self.principal
     }
 }
 
@@ -1429,7 +1572,7 @@ impl ActionGrant {
             revoked_at: None,
             surface: run.surface.clone(),
             authority_epoch: run.authority_epoch,
-            principal: Some(run.effective_principal()),
+            principal: run.initiating_principal.clone(),
             capability_tier: run.capability_proof.tier(),
         }
     }
@@ -1444,38 +1587,31 @@ impl ActionGrant {
                 "grant must have action classes and a positive lifetime",
             ));
         }
-        if self.uses_remaining == Some(0) {
+        if self.uses_remaining == Some(0) && self.revoked_at.is_none() {
             return Err(ComputerError::new(
                 ComputerErrorCode::InvalidRequest,
                 "grant has no remaining uses",
             ));
         }
-        if self.surface.is_issued() {
-            self.surface.validate()?;
-        }
-        if let Some(principal) = &self.principal {
-            principal.validate()?;
-        }
-        if matches!(
-            self.capability_tier,
-            ComputerCapabilityTier::IndependentlyIsolatedVisualInputDomain
-                | ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
-        ) && !self.surface.is_issued()
-        {
+        self.surface.validate()?;
+        let Some(principal) = &self.principal else {
             return Err(ComputerError::new(
-                ComputerErrorCode::InvalidRequest,
-                "background or isolated grants require a host-issued surface binding",
+                ComputerErrorCode::Unauthorized,
+                "grant is missing an initiating principal",
+            ));
+        };
+        principal.validate()?;
+        if matches!(self.capability_tier, ComputerCapabilityTier::Unproven) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "unproven capability cannot issue a grant",
             ));
         }
         Ok(())
     }
 
     pub fn effective_tier(&self) -> ComputerCapabilityTier {
-        if matches!(self.capability_tier, ComputerCapabilityTier::Unproven) {
-            ComputerCapabilityTier::ForegroundSemantic
-        } else {
-            self.capability_tier
-        }
+        self.capability_tier
     }
 }
 
@@ -1523,6 +1659,8 @@ pub struct ComputerRun {
     pub capability_proof: ComputerCapabilityProof,
     #[serde(default)]
     pub freshness_tick: u64,
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 impl ComputerRun {
@@ -1559,20 +1697,16 @@ impl ComputerRun {
             last_outcome: None,
             audit: Vec::new(),
             last_error: None,
-            surface: ComputerSurfaceBinding::issue(),
-            initiating_principal: Some(ComputerPrincipal::local_operator(owner_session_id)),
+            surface: ComputerSurfaceBinding::default(),
+            initiating_principal: None,
             authority_epoch: 0,
-            capability_proof: ComputerCapabilityProof::ForegroundSemantic {
-                backend_id: "host_unbound".into(),
-                observe: true,
-                semantic_actions: true,
-                text_entry: true,
-            },
+            capability_proof: ComputerCapabilityProof::Unproven,
             freshness_tick: 0,
+            schema_version: COMPUTER_RUN_SCHEMA_VERSION,
         })
     }
 
-    pub fn new_with_isolation(
+    pub(crate) fn new_with_isolation(
         owner_session_id: Uuid,
         workspace: Option<String>,
         target: ComputerTarget,
@@ -1582,13 +1716,14 @@ impl ComputerRun {
         proof: ComputerCapabilityProof,
     ) -> ComputerResult<Self> {
         principal.validate()?;
-        if let ComputerPrincipal::LocalOperatorSession { session_id } = &principal {
-            if *session_id != owner_session_id {
-                return Err(ComputerError::new(
-                    ComputerErrorCode::Unauthorized,
-                    "local operator principal does not match the owning session",
-                ));
-            }
+        if principal
+            .session_id()
+            .is_some_and(|session_id| session_id != owner_session_id)
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "local operator principal does not match the owning session",
+            ));
         }
         surface.validate()?;
         proof.validate()?;
@@ -1600,19 +1735,63 @@ impl ComputerRun {
                 "native macOS Computer Use can only be stamped foreground-semantic",
             ));
         }
+        if let Some(isolated_surface) = proof.isolated_surface() {
+            if isolated_surface != surface {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::ForbiddenTarget,
+                    "isolated capability proof is not bound to this backend surface",
+                ));
+            }
+        }
+        if matches!(proof.tier(), ComputerCapabilityTier::Unproven) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "unproven capability cannot create an attested computer run",
+            ));
+        }
         let mut run = Self::new(owner_session_id, workspace, target, limits)?;
         run.surface = surface;
         run.initiating_principal = Some(principal);
         run.capability_proof = proof;
         run.authority_epoch = 0;
         run.freshness_tick = 0;
+        run.schema_version = COMPUTER_RUN_SCHEMA_VERSION;
         Ok(run)
     }
 
-    pub fn effective_principal(&self) -> ComputerPrincipal {
-        self.initiating_principal
-            .clone()
-            .unwrap_or_else(|| ComputerPrincipal::local_operator(self.owner_session_id))
+    #[cfg(test)]
+    pub(crate) fn attested_foreground_for_test(
+        owner_session_id: Uuid,
+        workspace: Option<String>,
+        target: ComputerTarget,
+        limits: ComputerUseLimits,
+    ) -> ComputerResult<Self> {
+        let surface = ComputerSurfaceBinding::issue();
+        Self::new_with_isolation(
+            owner_session_id,
+            workspace,
+            target,
+            limits,
+            ComputerPrincipal::local_operator(owner_session_id),
+            surface,
+            ComputerCapabilityProof::ForegroundSemantic {
+                backend_id: "test_foreground".into(),
+                observe: true,
+                semantic_actions: true,
+                text_entry: true,
+            },
+        )
+    }
+
+    pub fn required_principal(&self) -> ComputerResult<&ComputerPrincipal> {
+        let Some(principal) = self.initiating_principal.as_ref() else {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "computer run has no initiating principal",
+            ));
+        };
+        principal.validate()?;
+        Ok(principal)
     }
 
     pub fn bump_authority_epoch(&mut self) {
@@ -1719,8 +1898,9 @@ impl ComputerRun {
 pub trait ComputerBackend: Send + Sync + std::fmt::Debug {
     fn capabilities(&self) -> ComputerCapabilities;
 
-    /// Host-issued opaque surface identity for this backend incarnation.
-    fn surface_binding(&self) -> ComputerSurfaceBinding;
+    /// Stable attested physical input domain. The host interns this into a
+    /// shared surface binding; backends must not mint surface authority.
+    fn physical_input_domain(&self) -> PhysicalInputDomain;
 
     async fn observe(
         &self,
@@ -1818,7 +1998,13 @@ mod tests {
 
     #[test]
     fn state_machine_never_leaves_terminal_state() {
-        let mut run = ComputerRun::new(Uuid::new_v4(), None, target(), Default::default()).unwrap();
+        let mut run = ComputerRun::attested_foreground_for_test(
+            Uuid::new_v4(),
+            None,
+            target(),
+            Default::default(),
+        )
+        .unwrap();
         run.transition(ComputerRunState::Ready).unwrap();
         run.transition(ComputerRunState::Cancelled).unwrap();
         assert!(run.transition(ComputerRunState::Ready).is_err());
@@ -2064,33 +2250,107 @@ mod tests {
     }
 
     #[test]
-    fn agent_principal_rejects_model_provided_ids() {
+    fn agent_principal_minting_is_fail_closed_without_host_agent_registry() {
+        let blocked = ComputerPrincipal::agent(format!("agent-{}", Uuid::new_v4()), 1).unwrap_err();
+        assert_eq!(blocked.code, ComputerErrorCode::Unauthorized);
+        assert!(blocked.message.contains("PR #352"));
         assert!(ComputerPrincipal::agent("user-supplied", 1).is_err());
-        assert!(ComputerPrincipal::agent(format!("agent-{}", Uuid::new_v4()), 0).is_err());
-        assert!(ComputerPrincipal::agent(format!("agent-{}", Uuid::new_v4()), 1).is_ok());
+        let deserialized: ComputerPrincipal = serde_json::from_value(serde_json::json!({
+            "kind": "agent",
+            "agentId": format!("agent-{}", Uuid::new_v4()),
+            "specRevision": 1
+        }))
+        .unwrap();
+        assert_eq!(
+            deserialized.validate().unwrap_err().code,
+            ComputerErrorCode::Unauthorized
+        );
+        assert_eq!(
+            ComputerAuthorityToken::from_host_principal(deserialized)
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+        let snake_legacy: ComputerPrincipal = serde_json::from_value(serde_json::json!({
+            "kind": "agent",
+            "agent_id": "agent-legacy",
+            "spec_revision": 1
+        }))
+        .unwrap();
+        assert_eq!(
+            snake_legacy.validate().unwrap_err().code,
+            ComputerErrorCode::Unauthorized
+        );
         assert!(ComputerPrincipal::local_operator(Uuid::nil())
             .validate()
             .is_err());
     }
 
     #[test]
-    fn isolation_contract_typed_proof_helpers_are_present() {
-        let source = include_str!("types.rs");
-        for needle in [
-            "ComputerCapabilityTier",
-            "ComputerCapabilityProof",
-            "ComputerPrincipal",
-            "ComputerSurfaceBinding",
-            "ObservationAuthority",
-            "hydrate_legacy",
-            "from_wire",
-            "isolated_input_is_dispatchable",
-            "effective_principal",
-        ] {
-            assert!(
-                source.contains(needle),
-                "deleting {needle} must fail this focused comparison test"
-            );
-        }
+    fn isolated_proof_must_bind_the_exact_run_surface() {
+        let owner = Uuid::new_v4();
+        let surface = ComputerSurfaceBinding::issue();
+        let other = ComputerSurfaceBinding::issue();
+        let proof = ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+            backend_id: SIMULATOR_ISOLATED_BACKEND_ID.into(),
+            surface_id: other.surface_id.clone(),
+            incarnation: other.incarnation.clone(),
+            input_domain_id: Uuid::new_v4().to_string(),
+            origin: IsolationProofOrigin::SimulatorFixture,
+            observe: true,
+            semantic_actions: true,
+            text_entry: true,
+            key_chords: true,
+            pointer_fallback: true,
+        };
+        assert_eq!(
+            ComputerRun::new_with_isolation(
+                owner,
+                None,
+                target(),
+                Default::default(),
+                ComputerPrincipal::local_operator(owner),
+                surface,
+                proof,
+            )
+            .unwrap_err()
+            .code,
+            ComputerErrorCode::ForbiddenTarget
+        );
+    }
+
+    #[test]
+    fn macos_native_capability_helper_is_foreground_semantic_only() {
+        let proof = macos_native_capability_proof();
+        assert_eq!(proof.tier(), ComputerCapabilityTier::ForegroundSemantic);
+        assert!(proof.observe());
+        assert!(proof.semantic_actions());
+        assert!(proof.text_entry());
+        assert!(!proof.key_chords());
+        assert!(!proof.pointer_fallback());
+        assert!(!proof.isolated_input_is_dispatchable());
+        assert_eq!(proof.backend_id(), MACOS_NATIVE_BACKEND_ID);
+        let caps = ComputerCapabilities::from_proof(proof).unwrap();
+        assert_eq!(caps.tier, ComputerCapabilityTier::ForegroundSemantic);
+        assert!(!caps.pointer_fallback);
+        assert!(!caps.key_chords);
+        assert!(!caps.allows_action(&ComputerAction::PointerClick {
+            x: 1.0,
+            y: 1.0,
+            button: PointerButton::Primary,
+        }));
+        assert!(caps.allows_action(&ComputerAction::ActivateTarget));
+    }
+
+    #[test]
+    fn public_new_is_unproven_without_self_issued_authority() {
+        let run = ComputerRun::new(Uuid::new_v4(), None, target(), Default::default()).unwrap();
+        assert_eq!(run.capability_proof, ComputerCapabilityProof::Unproven);
+        assert!(run.initiating_principal.is_none());
+        assert!(!run.surface.is_issued());
+        assert_eq!(
+            run.required_principal().unwrap_err().code,
+            ComputerErrorCode::Unauthorized
+        );
     }
 }

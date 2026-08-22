@@ -4398,7 +4398,7 @@ mod tests {
             computer
                 .authorize(
                     "grant-restart",
-                    &run.effective_principal(),
+                    &computer.local_operator_token(run.owner_session_id).unwrap(),
                     &run.run_id,
                     run.version,
                     ActionGrant::for_run(

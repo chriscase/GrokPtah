@@ -20,9 +20,8 @@ impl ComputerPolicy {
         caller: &ComputerPrincipal,
     ) -> ComputerResult<()> {
         caller.validate()?;
-        let expected = run.effective_principal();
-        expected.validate()?;
-        if caller != &expected {
+        let expected = run.required_principal()?;
+        if caller != expected {
             return Err(ComputerError::new(
                 ComputerErrorCode::Unauthorized,
                 "caller principal does not match the initiating principal",
@@ -66,12 +65,10 @@ impl ComputerPolicy {
                 "freshness fence is not bound to the live surface incarnation",
             ));
         }
-        if observation.authority.freshness.tick == 0
-            || observation.authority.freshness.tick > live.tick
-        {
+        if observation.authority.freshness.tick != live.tick {
             return Err(ComputerError::new(
                 ComputerErrorCode::StaleObservation,
-                "monotonic freshness tick is not live for this surface incarnation",
+                "monotonic freshness tick is not the host-minted current surface tick",
             ));
         }
         Ok(())
@@ -128,11 +125,17 @@ impl ComputerPolicy {
         let grant_tier = grant.effective_tier();
         let run_tier = run.capability_proof.tier();
         if matches!(run_tier, ComputerCapabilityTier::Unproven)
-            && !matches!(grant_tier, ComputerCapabilityTier::ForegroundSemantic)
+            || matches!(grant_tier, ComputerCapabilityTier::Unproven)
         {
             return Err(ComputerError::new(
                 ComputerErrorCode::ForbiddenAction,
-                "unproven capability cannot issue background or isolated authority",
+                "unproven capability cannot issue a grant",
+            ));
+        }
+        if grant_tier != run_tier {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "grant capability tier does not match the run proof",
             ));
         }
         if grant_tier.allows_isolated_input()
@@ -217,7 +220,24 @@ impl ComputerPolicy {
         caller: &ComputerPrincipal,
     ) -> ComputerResult<()> {
         self.authorize_caller(run, caller)?;
+        self.authorize_proven_observe(run)?;
         self.authorize_active_run(run, now)?;
+        Ok(())
+    }
+
+    pub fn authorize_evidence(
+        &self,
+        run: &ComputerRun,
+        caller: &ComputerPrincipal,
+    ) -> ComputerResult<()> {
+        self.authorize_caller(run, caller)?;
+        self.authorize_proven_observe(run)?;
+        if run.current_observation.is_none() {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "evidence is not attached to a proven current observation",
+            ));
+        }
         Ok(())
     }
 
@@ -398,12 +418,36 @@ impl ComputerPolicy {
         Ok(())
     }
 
+    fn authorize_proven_observe(&self, run: &ComputerRun) -> ComputerResult<()> {
+        run.capability_proof.validate()?;
+        if matches!(
+            run.capability_proof.tier(),
+            ComputerCapabilityTier::Unproven
+        ) || !run.capability_proof.observe()
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "unproven or unattested capability cannot observe or read evidence",
+            ));
+        }
+        Ok(())
+    }
+
     fn authorize_capability(
         &self,
         run: &ComputerRun,
         action: &ComputerAction,
     ) -> ComputerResult<()> {
         run.capability_proof.validate()?;
+        if matches!(
+            run.capability_proof.tier(),
+            ComputerCapabilityTier::Unproven
+        ) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "unproven capability cannot dispatch computer actions",
+            ));
+        }
         if action.is_activate_target() {
             if !run.capability_proof.tier().allows_activate_target() {
                 return Err(ComputerError::new(
@@ -511,8 +555,13 @@ mod tests {
             display_name: "Demo".into(),
             sensitivity: Sensitivity::None,
         };
-        let mut run =
-            ComputerRun::new(Uuid::new_v4(), None, target.clone(), Default::default()).unwrap();
+        let mut run = ComputerRun::attested_foreground_for_test(
+            Uuid::new_v4(),
+            None,
+            target.clone(),
+            Default::default(),
+        )
+        .unwrap();
         let now = Utc::now();
         run.grant = Some(ActionGrant::for_run(
             &run,
@@ -566,7 +615,7 @@ mod tests {
     }
 
     fn caller(run: &ComputerRun) -> ComputerPrincipal {
-        run.effective_principal()
+        run.required_principal().unwrap().clone()
     }
 
     fn authorize(
@@ -665,7 +714,7 @@ mod tests {
 
     #[test]
     fn grant_lifetime_cannot_exceed_run_limit() {
-        let run = ComputerRun::new(
+        let run = ComputerRun::attested_foreground_for_test(
             Uuid::new_v4(),
             None,
             ready_run().target,
@@ -694,9 +743,9 @@ mod tests {
         let run = ready_run();
         let observation = run.current_observation.clone().unwrap();
         let intruder = ComputerPrincipal::local_operator(Uuid::new_v4());
-        let agent = ComputerPrincipal::agent(format!("agent-{}", Uuid::new_v4()), 1).unwrap();
+        let other_owner = ComputerPrincipal::local_operator(Uuid::new_v4());
         let now = Utc::now();
-        for caller in [intruder.clone(), agent.clone()] {
+        for caller in [intruder, other_owner] {
             assert_eq!(
                 ComputerPolicy
                     .authorize_action(
@@ -870,33 +919,74 @@ mod tests {
     }
 
     #[test]
-    fn isolation_contract_comparisons_are_present_in_policy() {
-        let source = include_str!("policy.rs");
-        for needle in [
-            "authorize_caller",
-            "authorize_surface",
-            "authorize_live_freshness",
-            "authorize_capability",
-            "authority_epoch",
-            "control_epoch",
-            "frame_epoch",
-            "target_generation",
-            "effective_principal",
-            "isolated_input_is_dispatchable",
-            "allows_activate_target",
-        ] {
-            assert!(
-                source.contains(needle),
-                "deleting {needle} must fail this focused comparison test"
-            );
-        }
+    fn older_freshness_tick_is_stale_not_live() {
+        let run = ready_run();
+        let mut observation = run.current_observation.clone().unwrap();
+        let action = ComputerAction::SetValue {
+            element_id: "field".into(),
+            text: "Ada".into(),
+        };
+        let mut live = live_fence(&run);
+        live.tick = 2;
+        observation.authority.freshness.tick = 1;
+        assert_eq!(
+            ComputerPolicy
+                .authorize_action(
+                    &run,
+                    &observation,
+                    &action,
+                    Utc::now(),
+                    &caller(&run),
+                    &live,
+                )
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::StaleObservation
+        );
     }
 
     #[test]
-    fn missing_grant_principal_and_spec_revision_mismatch_deny() {
+    fn unproven_capability_cannot_observe_or_read_evidence() {
+        let mut run = ready_run();
+        run.capability_proof = ComputerCapabilityProof::Unproven;
+        assert_eq!(
+            ComputerPolicy
+                .authorize_observation(&run, Utc::now(), &caller(&run))
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::ForbiddenAction
+        );
+        assert_eq!(
+            ComputerPolicy
+                .authorize_evidence(&run, &caller(&run))
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::ForbiddenAction
+        );
+        run.initiating_principal = None;
+        assert_eq!(
+            ComputerPolicy
+                .authorize_observation(
+                    &run,
+                    Utc::now(),
+                    &ComputerPrincipal::local_operator(run.owner_session_id)
+                )
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+    }
+
+    #[test]
+    fn missing_grant_principal_and_cross_session_mismatch_deny() {
         let owner = Uuid::new_v4();
-        let mut awaiting =
-            ComputerRun::new(owner, None, ready_run().target, Default::default()).unwrap();
+        let mut awaiting = ComputerRun::attested_foreground_for_test(
+            owner,
+            None,
+            ready_run().target,
+            Default::default(),
+        )
+        .unwrap();
         let now = Utc::now();
         awaiting.grant = Some(ActionGrant::for_run(
             &awaiting,
@@ -912,7 +1002,7 @@ mod tests {
                     &awaiting,
                     awaiting.grant.as_ref().unwrap(),
                     now,
-                    &caller(&awaiting),
+                    awaiting.required_principal().unwrap(),
                 )
                 .unwrap_err()
                 .code,
@@ -941,14 +1031,11 @@ mod tests {
             ComputerErrorCode::Unauthorized
         );
 
-        let agent_id = format!("agent-{}", Uuid::new_v4());
-        let agent = ComputerPrincipal::agent(&agent_id, 1).unwrap();
-        let other_revision = ComputerPrincipal::agent(&agent_id, 2).unwrap();
-        run.initiating_principal = Some(agent.clone());
-        run.grant.as_mut().unwrap().principal = Some(agent);
+        let other = ComputerPrincipal::local_operator(Uuid::new_v4());
+        run.grant.as_mut().unwrap().principal = Some(caller.clone());
         assert_eq!(
             ComputerPolicy
-                .authorize_caller(&run, &other_revision)
+                .authorize_caller(&run, &other)
                 .unwrap_err()
                 .code,
             ComputerErrorCode::Unauthorized

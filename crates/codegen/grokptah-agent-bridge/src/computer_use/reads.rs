@@ -151,7 +151,8 @@ mod tests {
     use crate::computer_use::project_run_at;
     use crate::computer_use::types::{
         ActionClass, ActionGrant, ActionOutcome, ComputerObservation, ComputerRunState,
-        ComputerTarget, ComputerUseLimits, ObservationGeometry,
+        ComputerTarget, ComputerUseLimits, ObservationAuthority, ObservationGeometry,
+        SurfaceFreshnessFence,
     };
     use crate::computer_use::Sensitivity;
 
@@ -298,9 +299,21 @@ mod tests {
         let store = ComputerStore::open(dir.path()).unwrap();
         let owner = Uuid::new_v4();
         let now = Utc::now();
-        let mut run = saved_run(&store, owner, Some("/workspace/a"));
+        let mut run = ComputerRun::attested_foreground_for_test(
+            owner,
+            Some("/workspace/a".into()),
+            target(),
+            ComputerUseLimits::default(),
+        )
+        .unwrap();
         run.transition(ComputerRunState::Ready).unwrap();
         run.started_at = Some(now - Duration::seconds(10));
+        let freshness = SurfaceFreshnessFence {
+            surface_id: run.surface.surface_id.clone(),
+            incarnation: run.surface.incarnation.clone(),
+            tick: 1,
+            wall_clock: Some(now),
+        };
         run.current_observation = Some(ComputerObservation {
             observation_id: "obs-clock".into(),
             sequence: 1,
@@ -317,7 +330,7 @@ mod tests {
             elements: Vec::new(),
             elements_truncated: false,
             sensitivity: Sensitivity::None,
-            authority: Default::default(),
+            authority: ObservationAuthority::bind(&run, 1, freshness).unwrap(),
         });
         run.grant = Some(ActionGrant::for_run(
             &run,

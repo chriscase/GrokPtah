@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     service
         .act(
             &Uuid::new_v4().to_string(),
-            &ready.effective_principal(),
+            &service.local_operator_token(ready.owner_session_id)?,
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     service
         .act(
             &Uuid::new_v4().to_string(),
-            &ready.effective_principal(),
+            &service.local_operator_token(ready.owner_session_id)?,
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
     service
         .act(
             &Uuid::new_v4().to_string(),
-            &ready.effective_principal(),
+            &service.local_operator_token(ready.owner_session_id)?,
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -145,7 +145,7 @@ async fn authorize_and_observe(
     let now = Utc::now();
     let authorized = service.authorize(
         &Uuid::new_v4().to_string(),
-        &run.effective_principal(),
+        &service.local_operator_token(run.owner_session_id)?,
         &run.run_id,
         run.version,
         ActionGrant::for_run(
@@ -159,7 +159,7 @@ async fn authorize_and_observe(
     let observation = service
         .observe(
             &Uuid::new_v4().to_string(),
-            &authorized.effective_principal(),
+            &service.local_operator_token(authorized.owner_session_id)?,
             &authorized.run_id,
             authorized.version,
         )

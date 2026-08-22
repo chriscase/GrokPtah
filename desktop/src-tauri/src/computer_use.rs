@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use base64::Engine;
 use chrono::{Duration, Utc};
+#[cfg(target_os = "macos")]
+use grokptah_agent_bridge::MacOsObservationPlatform;
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
     ComputerAgentProposal, ComputerCapabilities, ComputerCapabilityProof, ComputerError,
     ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerPrincipal, ComputerRun, ComputerRunProjection,
-    ComputerRunState, ComputerTargetCandidate, ComputerUseLimits, ComputerUseService,
-    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
+    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, PhysicalInputDomain,
+    SemanticAction, SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -221,7 +223,9 @@ impl DesktopComputerUse {
             now + Duration::minutes(5),
             Some(1),
         );
-        let caller = ComputerPrincipal::local_operator(owner_session_id);
+        let caller = service
+            .local_operator_token(owner_session_id)
+            .map_err(|error| error.to_string())?;
         let run = match service.authorize(
             &Uuid::new_v4().to_string(),
             &caller,
@@ -356,7 +360,9 @@ impl DesktopComputerUse {
             let _ = service
                 .cancel(
                     &Uuid::new_v4().to_string(),
-                    &ComputerPrincipal::local_operator(owner_session_id),
+                    &service
+                        .local_operator_token(owner_session_id)
+                        .map_err(|error| error.to_string())?,
                     &run.run_id,
                 )
                 .await;
@@ -424,7 +430,9 @@ impl DesktopComputerUse {
             let _ = service
                 .cancel(
                     &Uuid::new_v4().to_string(),
-                    &ComputerPrincipal::local_operator(owner_session_id),
+                    &service
+                        .local_operator_token(owner_session_id)
+                        .map_err(|error| error.to_string())?,
                     &run.run_id,
                 )
                 .await;
@@ -598,7 +606,9 @@ impl DesktopComputerUse {
                 service
                     .complete(
                         &Uuid::new_v4().to_string(),
-                        &ComputerPrincipal::local_operator(owner_session_id),
+                        &service
+                            .local_operator_token(owner_session_id)
+                            .map_err(|error| error.to_string())?,
                         run_id,
                         expected_version,
                     )
@@ -642,7 +652,9 @@ impl DesktopComputerUse {
         let result = service
             .act(
                 request_id,
-                &ComputerPrincipal::local_operator(owner_session_id),
+                &service
+                    .local_operator_token(owner_session_id)
+                    .map_err(|error| error.to_string())?,
                 &pending.run_id,
                 pending.run_version,
                 &pending.observation_id,
@@ -673,7 +685,9 @@ impl DesktopComputerUse {
         service
             .pause(
                 &Uuid::new_v4().to_string(),
-                &ComputerPrincipal::local_operator(owner_session_id),
+                &service
+                    .local_operator_token(owner_session_id)
+                    .map_err(|error| error.to_string())?,
                 run_id,
                 expected_version,
             )
@@ -693,7 +707,9 @@ impl DesktopComputerUse {
         service
             .take_over(
                 &Uuid::new_v4().to_string(),
-                &ComputerPrincipal::local_operator(owner_session_id),
+                &service
+                    .local_operator_token(owner_session_id)
+                    .map_err(|error| error.to_string())?,
                 run_id,
                 expected_version,
             )
@@ -712,7 +728,9 @@ impl DesktopComputerUse {
         service
             .cancel(
                 &Uuid::new_v4().to_string(),
-                &ComputerPrincipal::local_operator(owner_session_id),
+                &service
+                    .local_operator_token(owner_session_id)
+                    .map_err(|error| error.to_string())?,
                 run_id,
             )
             .await
@@ -887,7 +905,7 @@ async fn authorize_and_observe_once(
         now + Duration::minutes(2),
         Some(1),
     );
-    let caller = run.effective_principal();
+    let caller = service.local_operator_token(run.owner_session_id)?;
     let run = service.authorize(
         &Uuid::new_v4().to_string(),
         &caller,
@@ -948,7 +966,7 @@ mod tests {
     struct NativeTestBackend {
         target: ComputerTarget,
         actions: Arc<AtomicUsize>,
-        surface: grokptah_agent_bridge::ComputerSurfaceBinding,
+        domain: PhysicalInputDomain,
     }
 
     #[async_trait]
@@ -963,8 +981,8 @@ mod tests {
             .expect("native test backend is foreground-semantic")
         }
 
-        fn surface_binding(&self) -> grokptah_agent_bridge::ComputerSurfaceBinding {
-            self.surface.clone()
+        fn physical_input_domain(&self) -> PhysicalInputDomain {
+            self.domain.clone()
         }
 
         async fn observe(
@@ -1085,7 +1103,8 @@ mod tests {
             Ok(Arc::new(NativeTestBackend {
                 target: self.candidate.target.clone(),
                 actions: self.actions.clone(),
-                surface: grokptah_agent_bridge::ComputerSurfaceBinding::issue(),
+                domain: PhysicalInputDomain::attested("desktop-native-test", NATIVE_TEST_APP_ID)
+                    .expect("native test domain is attested"),
             }))
         }
     }

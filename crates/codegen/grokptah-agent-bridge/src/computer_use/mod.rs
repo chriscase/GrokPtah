@@ -51,13 +51,14 @@ pub use service::ComputerUseService;
 pub use simulator::SimulatorBackend;
 pub use store::ComputerStore;
 pub use types::{
-    ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
-    ComputerCapabilities, ComputerCapabilityProof, ComputerCapabilityTier,
-    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerKey, ComputerObservation,
-    ComputerPrincipal, ComputerRun, ComputerRunState, ComputerSurfaceBinding, ComputerTarget,
-    ComputerUseLimits, EvidenceRef, GrantIssuer, IsolationProofOrigin, ObservationAuthority,
-    ObservationGeometry, PointerButton, SemanticAction, SemanticElement, Sensitivity,
-    SurfaceFreshnessFence, MACOS_INTERRUPTED_BACKEND_ID, MACOS_NATIVE_BACKEND_ID,
-    SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
+    macos_native_capability_proof, ActionClass, ActionGrant, ActionOutcome, ComputerAction,
+    ComputerAuditEntry, ComputerAuthorityToken, ComputerBackend, ComputerCapabilities,
+    ComputerCapabilityProof, ComputerCapabilityTier, ComputerControlDisposition, ComputerError,
+    ComputerErrorCode, ComputerKey, ComputerObservation, ComputerPrincipal, ComputerRun,
+    ComputerRunState, ComputerSurfaceBinding, ComputerTarget, ComputerUseLimits, EvidenceRef,
+    GrantIssuer, IsolationProofOrigin, ObservationAuthority, ObservationGeometry,
+    PhysicalInputDomain, PointerButton, SemanticAction, SemanticElement, Sensitivity,
+    SurfaceFreshnessFence, AGENT_PRINCIPAL_INTEGRATION_BLOCKER, MACOS_INTERRUPTED_BACKEND_ID,
+    MACOS_NATIVE_BACKEND_ID, SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
     SIMULATOR_ISOLATED_BACKEND_ID,
 };

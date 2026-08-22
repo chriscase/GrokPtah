@@ -16,10 +16,11 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use grokptah_agent_bridge::computer_use::{
-    ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend, ComputerCapabilities,
-    ComputerError, ComputerErrorCode, ComputerObservation, ComputerPrincipal, ComputerRun,
-    ComputerRunState, ComputerStore, ComputerTarget, ComputerUseLimits, ObservationGeometry,
-    PointerButton, SemanticAction, SemanticElement, Sensitivity,
+    ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuthorityToken,
+    ComputerBackend, ComputerCapabilities, ComputerError, ComputerErrorCode, ComputerObservation,
+    ComputerRun, ComputerRunState, ComputerStore, ComputerTarget, ComputerUseLimits,
+    ObservationGeometry, PhysicalInputDomain, PointerButton, SemanticAction, SemanticElement,
+    Sensitivity,
 };
 use grokptah_agent_bridge::ComputerUseService;
 
@@ -36,7 +37,6 @@ enum BackendMode {
 struct ReleaseGateBackend {
     mode: BackendMode,
     action_calls: AtomicUsize,
-    surface: grokptah_agent_bridge::ComputerSurfaceBinding,
 }
 
 impl ReleaseGateBackend {
@@ -44,7 +44,6 @@ impl ReleaseGateBackend {
         Self {
             mode,
             action_calls: AtomicUsize::new(0),
-            surface: grokptah_agent_bridge::ComputerSurfaceBinding::issue(),
         }
     }
 
@@ -67,8 +66,9 @@ impl ComputerBackend for ReleaseGateBackend {
         .expect("release-gate fixture is foreground-semantic")
     }
 
-    fn surface_binding(&self) -> grokptah_agent_bridge::ComputerSurfaceBinding {
-        self.surface.clone()
+    fn physical_input_domain(&self) -> PhysicalInputDomain {
+        PhysicalInputDomain::attested("release-gate", "fixture")
+            .expect("release-gate domain is attested")
     }
 
     async fn observe(
@@ -160,8 +160,10 @@ fn grant(run: &ComputerRun, classes: BTreeSet<ActionClass>) -> ActionGrant {
     )
 }
 
-fn caller(run: &ComputerRun) -> ComputerPrincipal {
-    run.effective_principal()
+fn caller(run: &ComputerRun, service: &ComputerUseService) -> ComputerAuthorityToken {
+    service
+        .local_operator_token(run.owner_session_id)
+        .expect("release-gate owner is a valid local operator")
 }
 
 fn fixture(
@@ -189,7 +191,7 @@ fn fixture(
     let run = service
         .authorize(
             "release-gate-authorize",
-            &caller(&run),
+            &caller(&run, &service),
             &run.run_id,
             run.version,
             grant(&run, classes),
@@ -217,7 +219,7 @@ async fn observed_instruction_text_cannot_expand_action_scope() {
     let observation = service
         .observe(
             "release-gate-observe-injection",
-            &caller(&run),
+            &caller(&run, &service),
             &run.run_id,
             run.version,
         )
@@ -232,7 +234,7 @@ async fn observed_instruction_text_cannot_expand_action_scope() {
     let error = service
         .act(
             "release-gate-invented-action",
-            &caller(&run),
+            &caller(&run, &service),
             &run.run_id,
             current.version,
             &observation.observation_id,
@@ -255,7 +257,7 @@ async fn sensitive_observation_fails_before_model_visible_action_or_dispatch() {
     let error = service
         .observe(
             "release-gate-observe-sensitive",
-            &caller(&run),
+            &caller(&run, &service),
             &run.run_id,
             run.version,
         )
@@ -281,7 +283,7 @@ async fn observation_target_drift_fails_inflight_run_and_revokes_authority() {
     let error = service
         .observe(
             "release-gate-observe-drift",
-            &caller(&run),
+            &caller(&run, &service),
             &run.run_id,
             run.version,
         )
@@ -306,7 +308,7 @@ async fn permission_revocation_fails_action_and_clears_authority() {
     let observation = service
         .observe(
             "release-gate-observe-revoked",
-            &caller(&run),
+            &caller(&run, &service),
             &run.run_id,
             run.version,
         )
@@ -316,7 +318,7 @@ async fn permission_revocation_fails_action_and_clears_authority() {
     let error = service
         .act(
             "release-gate-act-revoked",
-            &caller(&run),
+            &caller(&run, &service),
             &run.run_id,
             current.version,
             &observation.observation_id,
@@ -347,7 +349,7 @@ async fn unsupported_pointer_fallback_never_reaches_backend() {
     let observation = service
         .observe(
             "release-gate-observe-pointer",
-            &caller(&run),
+            &caller(&run, &service),
             &run.run_id,
             run.version,
         )
@@ -357,7 +359,7 @@ async fn unsupported_pointer_fallback_never_reaches_backend() {
     let error = service
         .act(
             "release-gate-act-pointer",
-            &caller(&run),
+            &caller(&run, &service),
             &run.run_id,
             current.version,
             &observation.observation_id,

@@ -6,17 +6,17 @@ use parking_lot::Mutex;
 
 use super::types::{
     ActionOutcome, ComputerAction, ComputerBackend, ComputerCapabilities, ComputerCapabilityProof,
-    ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult, ComputerSurfaceBinding,
-    ComputerTarget, ComputerUseLimits, IsolationProofOrigin, ObservationGeometry, SemanticAction,
-    SemanticElement, Sensitivity, SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
-    SIMULATOR_ISOLATED_BACKEND_ID,
+    ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult, ComputerTarget,
+    ComputerUseLimits, IsolationProofOrigin, ObservationGeometry, PhysicalInputDomain,
+    SemanticAction, SemanticElement, Sensitivity, SIMULATOR_BACKGROUND_BACKEND_ID,
+    SIMULATOR_FOREGROUND_BACKEND_ID, SIMULATOR_ISOLATED_BACKEND_ID,
 };
 
 #[derive(Debug)]
 pub struct SimulatorBackend {
     state: Mutex<SimulatorState>,
     proof: ComputerCapabilityProof,
-    surface: ComputerSurfaceBinding,
+    domain: PhysicalInputDomain,
 }
 
 #[derive(Debug)]
@@ -51,7 +51,8 @@ impl SimulatorBackend {
                 semantic_actions: true,
                 text_entry: true,
             },
-            ComputerSurfaceBinding::issue(),
+            PhysicalInputDomain::attested("simulator", SIMULATOR_FOREGROUND_BACKEND_ID)
+                .expect("simulator foreground domain is attested"),
         )
     }
 
@@ -62,22 +63,22 @@ impl SimulatorBackend {
                 observe: true,
                 semantic_actions: true,
                 text_entry: true,
-                measurement_id: format!("measurement-{}", uuid::Uuid::new_v4()),
+                measurement_id: uuid::Uuid::new_v4().to_string(),
             },
-            ComputerSurfaceBinding::issue(),
+            PhysicalInputDomain::attested("simulator", SIMULATOR_BACKGROUND_BACKEND_ID)
+                .expect("simulator background domain is attested"),
         )
     }
 
     /// Explicit simulator-only isolated fixture. This proof cannot attest a
     /// native backend as isolated.
     pub fn independently_isolated() -> Self {
-        let surface = ComputerSurfaceBinding::issue();
         Self::with_proof(
             ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
                 backend_id: SIMULATOR_ISOLATED_BACKEND_ID.into(),
-                surface_id: surface.surface_id.clone(),
-                incarnation: surface.incarnation.clone(),
-                input_domain_id: format!("input-domain-{}", uuid::Uuid::new_v4()),
+                surface_id: uuid::Uuid::new_v4().to_string(),
+                incarnation: uuid::Uuid::new_v4().to_string(),
+                input_domain_id: uuid::Uuid::new_v4().to_string(),
                 origin: IsolationProofOrigin::SimulatorFixture,
                 observe: true,
                 semantic_actions: true,
@@ -85,11 +86,12 @@ impl SimulatorBackend {
                 key_chords: true,
                 pointer_fallback: true,
             },
-            surface,
+            PhysicalInputDomain::attested("simulator", SIMULATOR_ISOLATED_BACKEND_ID)
+                .expect("simulator isolated domain is attested"),
         )
     }
 
-    fn with_proof(proof: ComputerCapabilityProof, surface: ComputerSurfaceBinding) -> Self {
+    fn with_proof(proof: ComputerCapabilityProof, domain: PhysicalInputDomain) -> Self {
         proof.validate().expect("simulator fixture proof is valid");
         Self {
             state: Mutex::new(SimulatorState {
@@ -97,7 +99,7 @@ impl SimulatorBackend {
                 runs: BTreeMap::new(),
             }),
             proof,
-            surface,
+            domain,
         }
     }
 
@@ -122,8 +124,8 @@ impl ComputerBackend for SimulatorBackend {
         ComputerCapabilities::from_proof(self.proof.clone()).expect("simulator proof is valid")
     }
 
-    fn surface_binding(&self) -> ComputerSurfaceBinding {
-        self.surface.clone()
+    fn physical_input_domain(&self) -> PhysicalInputDomain {
+        self.domain.clone()
     }
 
     async fn observe(

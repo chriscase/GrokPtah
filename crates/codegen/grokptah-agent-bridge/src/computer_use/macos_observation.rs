@@ -14,10 +14,10 @@ use super::platform::{
     ComputerPlatformStatus, ComputerTargetCandidate,
 };
 use super::types::{
-    ActionOutcome, ComputerAction, ComputerBackend, ComputerCapabilities, ComputerCapabilityProof,
-    ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult, ComputerSurfaceBinding,
-    ComputerTarget, ComputerUseLimits, EvidenceRef, ObservationGeometry, SemanticAction,
-    SemanticElement, Sensitivity, MACOS_NATIVE_BACKEND_ID, MAX_LABEL_BYTES,
+    macos_native_capability_proof, ActionOutcome, ComputerAction, ComputerBackend,
+    ComputerCapabilities, ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult,
+    ComputerTarget, ComputerUseLimits, EvidenceRef, ObservationGeometry, PhysicalInputDomain,
+    SemanticAction, SemanticElement, Sensitivity, MAX_LABEL_BYTES,
 };
 
 const MAX_TARGET_CANDIDATES: usize = 128;
@@ -65,6 +65,14 @@ impl MacNativeIdentity {
             ));
         }
         Ok(())
+    }
+
+    fn physical_input_domain(&self) -> PhysicalInputDomain {
+        PhysicalInputDomain::attested(
+            "macos-native",
+            &format!("{}:{}:{}", self.window_id, self.process_id, self.bundle_id),
+        )
+        .expect("validated native identity is an attested physical domain")
     }
 }
 
@@ -287,7 +295,6 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
             source: self.source.clone(),
             target: lease.candidate.target,
             native_identity: lease.native.identity,
-            surface: ComputerSurfaceBinding::issue(),
             sequence: Mutex::new(0),
             observation_gate: tokio::sync::Mutex::new(()),
             last_capture_started: Mutex::new(None),
@@ -312,7 +319,6 @@ struct MacOsObservationBackend {
     source: Arc<dyn MacObservationSource>,
     target: ComputerTarget,
     native_identity: MacNativeIdentity,
-    surface: ComputerSurfaceBinding,
     sequence: Mutex<u64>,
     observation_gate: tokio::sync::Mutex<()>,
     last_capture_started: Mutex<Option<Instant>>,
@@ -325,17 +331,12 @@ struct MacOsObservationBackend {
 #[async_trait]
 impl ComputerBackend for MacOsObservationBackend {
     fn capabilities(&self) -> ComputerCapabilities {
-        ComputerCapabilities::from_proof(ComputerCapabilityProof::ForegroundSemantic {
-            backend_id: MACOS_NATIVE_BACKEND_ID.into(),
-            observe: true,
-            semantic_actions: true,
-            text_entry: true,
-        })
-        .expect("macOS native proof is foreground-semantic")
+        ComputerCapabilities::from_proof(macos_native_capability_proof())
+            .expect("macOS native proof is foreground-semantic")
     }
 
-    fn surface_binding(&self) -> ComputerSurfaceBinding {
-        self.surface.clone()
+    fn physical_input_domain(&self) -> PhysicalInputDomain {
+        self.native_identity.physical_input_domain()
     }
 
     async fn observe(
@@ -1560,7 +1561,7 @@ mod tests {
             .capabilities()
             .proof
             .isolated_input_is_dispatchable());
-        assert!(!backend.surface_binding().surface_id.contains("window"));
+        assert!(!backend.physical_input_domain().as_key().contains("window"));
         assert!(!candidate.target.window_id.contains("macos-window-"));
         assert!(!candidate
             .target

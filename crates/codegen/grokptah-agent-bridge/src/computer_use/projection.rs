@@ -289,7 +289,11 @@ pub fn project_run_at(run: &ComputerRun, now: DateTime<Utc>) -> ComputerRunProje
         surface_id: run.surface.surface_id.clone(),
         surface_incarnation: run.surface.incarnation.clone(),
         authority_epoch: run.authority_epoch,
-        initiating_principal_kind: run.effective_principal().public_kind().to_string(),
+        initiating_principal_kind: run
+            .initiating_principal
+            .as_ref()
+            .map(|principal| principal.public_kind().to_string())
+            .unwrap_or_else(|| "unproven".to_string()),
     }
 }
 
@@ -711,8 +715,12 @@ mod tests {
     fn public_projection_pins_isolation_keys_and_hides_native_and_principal_secrets() {
         let mut run = run();
         run.initiating_principal = Some(
-            crate::computer_use::ComputerPrincipal::agent(format!("agent-{}", Uuid::new_v4()), 3)
-                .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "agent",
+                "agentId": format!("agent-{}", Uuid::new_v4()),
+                "specRevision": 3
+            }))
+            .unwrap(),
         );
         run.current_observation = Some(observation_with_secrets(&run.target.clone()));
         let projection = project_run_at(&run, Utc::now());

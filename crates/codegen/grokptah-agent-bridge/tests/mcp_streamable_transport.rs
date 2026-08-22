@@ -2248,7 +2248,9 @@ async fn live_computer_reads_node_smoke() {
     let run_a = computer
         .authorize(
             "smoke-grant-a",
-            &run_a.effective_principal(),
+            &computer
+                .local_operator_token(run_a.owner_session_id)
+                .unwrap(),
             &run_a.run_id,
             run_a.version,
             smoke_grant(&run_a),
@@ -2257,7 +2259,9 @@ async fn live_computer_reads_node_smoke() {
     computer
         .observe(
             "smoke-observe-a",
-            &run_a.effective_principal(),
+            &computer
+                .local_operator_token(run_a.owner_session_id)
+                .unwrap(),
             &run_a.run_id,
             run_a.version,
         )
@@ -2289,7 +2293,9 @@ async fn live_computer_reads_node_smoke() {
     let run_c = computer
         .authorize(
             "smoke-grant-c",
-            &run_c.effective_principal(),
+            &computer
+                .local_operator_token(run_c.owner_session_id)
+                .unwrap(),
             &run_c.run_id,
             run_c.version,
             smoke_grant(&run_c),
@@ -2301,7 +2307,9 @@ async fn live_computer_reads_node_smoke() {
         computer
             .observe(
                 &format!("smoke-observe-c-{spins}"),
-                &run_c.effective_principal(),
+                &computer
+                    .local_operator_token(run_c.owner_session_id)
+                    .unwrap(),
                 &run_c.run_id,
                 version,
             )

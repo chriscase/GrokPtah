@@ -4,7 +4,9 @@ The first native Computer Use adapter observes one exact window and performs a d
 set of semantic Accessibility actions on macOS 14 or later. That adapter is **foreground-semantic**:
 it operates the real foreground OS application and may activate it. It is not an isolated visual
 input domain, not background-safe, and must never be advertised as isolated from pointer, key,
-clipboard, or focus effects. GrokPtah itself keeps its macOS 11 minimum: ScreenCaptureKit is loaded
+clipboard, or focus effects. Packaged hardware focus, TCC, and takeover evidence remain explicitly
+unverified. Takeover is durable bookkeeping-safe; it is not physically preemptive once an action is
+already inside the native action gate. GrokPtah itself keeps its macOS 11 minimum: ScreenCaptureKit is loaded
 from its fixed system-framework path only on a supported OS, and every native entry point checks
 runtime availability before use.
 
