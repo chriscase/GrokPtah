@@ -415,7 +415,7 @@ async fn hosted_execution_agrees_on_requalify_after_measured_xai_history() {
     assert_eq!(remote.data_code(), Some("conflict"));
     assert!(handle
         .host()
-        .list_session_runs(session_id)
+        .list_public_session_runs(session_id)
         .unwrap()
         .is_empty());
     let store = handle.host().ensure_orchestration_store().unwrap();

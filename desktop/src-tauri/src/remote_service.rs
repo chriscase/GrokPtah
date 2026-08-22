@@ -1643,7 +1643,7 @@ mod tests {
     };
 
     #[test]
-    fn remote_run_decode_drops_leaked_provider_route() {
+    fn remote_run_decode_rejects_leaked_provider_route() {
         let leaked = serde_json::json!({
             "runId": "public-run-leak",
             "sessionId": "11111111-1111-1111-1111-111111111111",
@@ -1693,33 +1693,11 @@ mod tests {
                 "pendingRequests": 0
             }
         });
-        let decoded: PublicRun = serde_json::from_value(leaked).unwrap();
-        let encoded = serde_json::to_value(&decoded).unwrap();
-        assert!(encoded.get("providerRoute").is_none());
-        assert_eq!(
-            encoded["providerExecution"]["route"]["snapshotHash"],
-            "keep-public-route-hash"
+        let decoded = serde_json::from_value::<PublicRun>(leaked);
+        assert!(
+            decoded.is_err(),
+            "unknown nested providerRoute must fail remote decode: {decoded:?}"
         );
-        assert_eq!(
-            encoded["providerExecution"]["route"]["providerId"],
-            "company-gateway"
-        );
-        let text = encoded.to_string();
-        for sentinel in [
-            "providerRoute",
-            "leak-base-url-sentinel-pr352",
-            "leak-cred-ref-sentinel-pr352",
-            "leak-cred-fp-sentinel-pr352",
-            "leak-endpoint-fp-sentinel-pr352",
-            "leak-qualification-record-sentinel-pr352",
-            "leak-selection-key-sentinel-pr352",
-            "quota-leak-reservation-sentinel-pr352",
-        ] {
-            assert!(
-                !text.contains(sentinel),
-                "remote decode re-emitted {sentinel}: {text}"
-            );
-        }
     }
 
     #[test]
@@ -1731,7 +1709,7 @@ mod tests {
         assert!(commands.contains("discard_public_session_run"));
         assert!(commands.contains("Result<Vec<PublicRun>"));
         assert!(commands.contains("Result<Option<PublicRun>"));
-        assert!(!commands.contains("host.list_session_runs(id)"));
+        assert!(!commands.contains("host.get_session_run("));
         assert!(!commands.contains("host.promote_run("));
         assert!(!commands.contains("host.discard_run("));
         let remote = include_str!("remote_service.rs")

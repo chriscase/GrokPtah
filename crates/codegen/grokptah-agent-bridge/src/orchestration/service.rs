@@ -2086,6 +2086,17 @@ impl OrchestrationService {
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.list_runs_scoped_page(_auth, session_id, workspace, None, None)
+    }
+
+    pub fn list_runs_scoped_page(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, OrchError> {
         let claimed = self.authorize_queue_request(session_id, workspace)?;
         let runs = self
             .store
@@ -2098,10 +2109,20 @@ impl OrchestrationService {
             .map(|mut run| {
                 self.refresh_queue_position(&mut run);
                 super::project_public_run(&self.store, &run)
-                    .and_then(|projection| super::public_run_to_value(&projection))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(json!({ "runs": runs }))
+        let page = super::page_public_runs(runs, cursor, limit);
+        let runs = page
+            .runs
+            .iter()
+            .map(super::public_run_to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(json!({
+            "runs": runs,
+            "totalCount": page.total_count,
+            "truncated": page.truncated,
+            "nextCursor": page.next_cursor,
+        }))
     }
 
     // ── durable workloads ----------------------------------------------
@@ -5204,7 +5225,7 @@ impl OrchestrationService {
         let mut providers = std::collections::BTreeSet::new();
         for reservation in reservations
             .into_iter()
-            .filter(|reservation| reservation.pool.owner_id == auth.owner_id)
+            .filter(|reservation| reservation.owner_id == auth.owner_id)
         {
             providers.insert(reservation.pool.provider_id.clone());
             match reservation.state {
@@ -7113,27 +7134,45 @@ impl OrchestrationService {
             None => None,
         };
         let persisted = match (queued, quota_reservation.as_ref()) {
-            (true, Some(reservation)) => self.store.save_run_with_quota(&run, reservation),
-            (false, Some(reservation)) => self.store.save_run_and_activate_agent_with_quota(
+            (true, Some(reservation)) => self.store.admit_run_with_quota(&run, reservation),
+            (false, Some(reservation)) => self.store.admit_run_and_activate_agent(
                 &run,
                 run.agent_id.as_deref().expect("Run Agent"),
-                reservation,
+                Some(reservation),
             ),
-            (true, None) => self.store.save_run(&run),
-            (false, None) => self
-                .store
-                .save_run_and_activate_agent(&run, run.agent_id.as_deref().expect("Run Agent")),
+            (true, None) => match self.store.save_run(&run) {
+                Ok(()) => crate::orchestration::DurableAdmission::Committed,
+                Err(error) => crate::orchestration::DurableAdmission::DefinitelyNotCommitted(error),
+            },
+            (false, None) => self.store.admit_run_and_activate_agent(
+                &run,
+                run.agent_id.as_deref().expect("Run Agent"),
+                None,
+            ),
         };
-        if let Err(e) = persisted {
-            if !queued {
-                self.host.release_turn_reservation(session_id, &run_id);
-                self.release_capacity(&run_id);
+        match persisted {
+            crate::orchestration::DurableAdmission::Committed => {}
+            crate::orchestration::DurableAdmission::DefinitelyNotCommitted(e) => {
+                if !queued {
+                    self.host.release_turn_reservation(session_id, &run_id);
+                    self.release_capacity(&run_id);
+                }
+                let e = e
+                    .downcast_ref::<OrchError>()
+                    .cloned()
+                    .unwrap_or_else(|| OrchError::new(OrchErrorCode::Internal, e.to_string()));
+                return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
             }
-            let e = e
-                .downcast_ref::<OrchError>()
-                .cloned()
-                .unwrap_or_else(|| OrchError::new(OrchErrorCode::Internal, e.to_string()));
-            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
+            crate::orchestration::DurableAdmission::Uncertain(e) => {
+                // Recovery may still commit. Do not release quota/reservation.
+                let e = e.downcast_ref::<OrchError>().cloned().unwrap_or_else(|| {
+                    OrchError::new(
+                        OrchErrorCode::Internal,
+                        format!("durable admission is uncertain: {e}"),
+                    )
+                });
+                return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
+            }
         }
 
         let queued_position = if queued {

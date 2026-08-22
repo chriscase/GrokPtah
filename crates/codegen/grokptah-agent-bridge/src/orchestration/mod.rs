@@ -54,12 +54,14 @@ pub use provider_attempt::{
     PROVIDER_ATTEMPT_SCHEMA_VERSION,
 };
 pub use public_run::{
-    encode_public_run_receipt, project_public_run, project_public_run_progress,
+    encode_public_run_receipt, page_public_runs, project_public_run, project_public_run_progress,
     public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
-    public_run_from_receipt, public_run_progress_to_value, public_run_to_value,
+    public_run_from_receipt, public_run_progress_to_value, public_run_to_value, PublicChangeRecord,
     PublicProviderAttempt, PublicProviderExecution, PublicProviderQuota,
-    PublicProviderRouteSummary, PublicRun, PublicRunProgress, PUBLIC_PROVIDER_ROUTE_KEYS,
-    PUBLIC_RUN_RECEIPT_SCHEMA,
+    PublicProviderRouteSummary, PublicQuotaLimits, PublicRun, PublicRunAggregates,
+    PublicRunApproval, PublicRunBounds, PublicRunExecution, PublicRunPage, PublicRunProgress,
+    PublicRunProgressDetail, PublicTestObservation, PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
+    PUBLIC_PROVIDER_ROUTE_KEYS, PUBLIC_RUN_LIST_PAGE_LIMIT, PUBLIC_RUN_RECEIPT_SCHEMA,
 };
 pub use quota::{
     QuotaClass, QuotaLimits, QuotaPoolKey, QuotaPoolUsage, QuotaReservation, QuotaReservationState,
@@ -76,7 +78,10 @@ pub use routine::{
 pub(crate) use service::apply_run_aggregate;
 pub use service::{OrchestrationConfig, OrchestrationService};
 pub(crate) use store::workspaces_match;
-pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
+pub use store::{
+    AdmissionPersistCut, DurableAdmission, IdempotencyClaim, OrchStore, ProviderAttemptPage,
+    RetentionPolicy, RetentionReport, MAX_PROVIDER_ATTEMPTS_PER_RUN_PAGE, MAX_PUBLIC_RUN_LIST,
+};
 pub use supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
     WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,

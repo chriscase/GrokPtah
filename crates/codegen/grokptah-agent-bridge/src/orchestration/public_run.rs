@@ -20,14 +20,17 @@ use crate::types::EffortLevel;
 use super::provider_attempt::{
     ProviderAttemptRecord, ProviderAttemptState, ProviderRetryClass, ProviderSendCertainty,
 };
-use super::quota::{QuotaClass, QuotaLimits, QuotaReservation, QuotaReservationState};
+use super::quota::{QuotaClass, QuotaReservation, QuotaReservationState};
 use super::store::OrchStore;
+use super::store::MAX_PUBLIC_RUN_LIST;
 use super::types::{
-    OrchError, OrchErrorCode, ProviderRouteSnapshot, RunAggregates, RunApproval, RunBounds,
-    RunExecution, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause,
+    OrchError, OrchErrorCode, PromotionState, ProviderRouteSnapshot, RunAggregates, RunApproval,
+    RunBounds, RunExecution, RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState,
+    RunStopCause,
 };
 
-const MAX_PROJECTED_PROVIDER_ATTEMPTS: usize = 128;
+pub const PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS: &str = "privileged_diagnostics";
+pub const PUBLIC_RUN_LIST_PAGE_LIMIT: usize = MAX_PUBLIC_RUN_LIST;
 
 const FORBIDDEN_PUBLIC_RUN_KEYS: &[&str] = &[
     "apiKey",
@@ -74,7 +77,7 @@ pub const PUBLIC_RUN_RECEIPT_SCHEMA: &str = "grokptah.public-run-receipt.v1";
 
 /// Secret-free route identity that operators and coordinators may observe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicProviderRouteSummary {
     pub provider_id: String,
     pub kind: ProviderKind,
@@ -89,9 +92,18 @@ pub struct PublicProviderRouteSummary {
     pub snapshot_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicQuotaLimits {
+    pub window_ms: u64,
+    pub max_in_flight_reservations: u32,
+    pub max_tokens_per_window: u64,
+    pub max_requests_per_window: u64,
+}
+
 /// Quota row joined into the public provider-execution summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicProviderQuota {
     pub reservation_id: String,
     pub pool_id: String,
@@ -102,13 +114,13 @@ pub struct PublicProviderQuota {
     pub requests_reserved: u64,
     pub requests_consumed: u64,
     pub window_started_at: DateTime<Utc>,
-    pub limits: QuotaLimits,
+    pub limits: PublicQuotaLimits,
     pub updated_at: DateTime<Utc>,
 }
 
 /// One durable provider attempt in the public summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicProviderAttempt {
     pub attempt_id: String,
     pub ordinal: u64,
@@ -124,7 +136,7 @@ pub struct PublicProviderAttempt {
 
 /// Bounded provider-execution overlay shared by list, get, and progress.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicProviderExecution {
     pub route: PublicProviderRouteSummary,
     pub quota: Option<PublicProviderQuota>,
@@ -135,10 +147,114 @@ pub struct PublicProviderExecution {
     pub pending_requests: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicRunBounds {
+    pub max_prompt_bytes: usize,
+    pub max_rounds: u32,
+    pub max_duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicChangeRecord {
+    pub path: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicTestObservation {
+    pub call_id: String,
+    pub command: Option<String>,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub cancelled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicRunAggregates {
+    pub changes: Vec<PublicChangeRecord>,
+    pub tests: Vec<PublicTestObservation>,
+    #[serde(default)]
+    pub permissions_requested: u32,
+    #[serde(default)]
+    pub permissions_granted: u32,
+    #[serde(default)]
+    pub permissions_denied: u32,
+    #[serde(default)]
+    pub usage: CompletionUsage,
+    #[serde(default)]
+    pub usage_complete: bool,
+    #[serde(default)]
+    pub usage_pending_requests: u32,
+    #[serde(default)]
+    pub verification: Option<crate::completion::CompletionEvidence>,
+}
+
+impl Default for PublicRunAggregates {
+    fn default() -> Self {
+        Self {
+            changes: Vec::new(),
+            tests: Vec::new(),
+            permissions_requested: 0,
+            permissions_granted: 0,
+            permissions_denied: 0,
+            usage: CompletionUsage::default(),
+            usage_complete: true,
+            usage_pending_requests: 0,
+            verification: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicRunProgressDetail {
+    pub round: u32,
+    pub max_rounds: u32,
+    pub last_tool: Option<String>,
+    pub detail: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicRunExecution {
+    pub mode: RunExecutionMode,
+    pub source_workspace: String,
+    pub execution_workspace: String,
+    pub base_revision: String,
+    pub source_fingerprint: String,
+    #[serde(default)]
+    pub final_fingerprint: Option<String>,
+    #[serde(default)]
+    pub promotion_state: PromotionState,
+    #[serde(default)]
+    pub promoted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicRunApproval {
+    pub approval_id: String,
+    pub run_id: String,
+    pub session_id: Uuid,
+    pub workspace: String,
+    pub source_fingerprint: String,
+    pub final_fingerprint: String,
+    pub changed_files: Vec<PublicChangeRecord>,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
 /// Allowlisted public Run. This is the only Run shape MCP, hosted service,
 /// local Tauri, and remote-desktop decoding may serialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicRun {
     pub run_id: String,
     pub session_id: Uuid,
@@ -166,7 +282,7 @@ pub struct PublicRun {
     pub continuation_fidelity: Option<String>,
     #[serde(default)]
     pub queue_position: Option<usize>,
-    pub bounds: RunBounds,
+    pub bounds: PublicRunBounds,
     pub prompt_preview: String,
     pub start_seq: Option<u64>,
     pub end_seq: Option<u64>,
@@ -178,13 +294,13 @@ pub struct PublicRun {
     #[serde(default)]
     pub stop_cause: Option<RunStopCause>,
     #[serde(default)]
-    pub aggregates: RunAggregates,
+    pub aggregates: PublicRunAggregates,
     #[serde(default)]
-    pub progress: Option<RunProgress>,
+    pub progress: Option<PublicRunProgressDetail>,
     #[serde(default)]
-    pub execution: Option<RunExecution>,
+    pub execution: Option<PublicRunExecution>,
     #[serde(default)]
-    pub approval: Option<RunApproval>,
+    pub approval: Option<PublicRunApproval>,
     #[serde(default)]
     pub provider_execution: Option<PublicProviderExecution>,
 }
@@ -192,7 +308,7 @@ pub struct PublicRun {
 /// Allowlisted progress view. Built from the same provider-execution helper
 /// as [`PublicRun`]; it never serializes a [`RunRecord`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicRunProgress {
     pub run_id: String,
     pub session_id: Uuid,
@@ -202,20 +318,37 @@ pub struct PublicRunProgress {
     pub start_seq: Option<u64>,
     pub end_seq: Option<u64>,
     pub prompt_preview: String,
-    pub progress: Option<RunProgress>,
+    pub progress: Option<PublicRunProgressDetail>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub terminal_result: Option<String>,
     pub stop_cause: Option<RunStopCause>,
-    pub bounds: RunBounds,
+    pub bounds: PublicRunBounds,
     pub error_code: Option<String>,
     pub provider_execution: Option<PublicProviderExecution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicRunPage {
+    pub runs: Vec<PublicRun>,
+    pub total_count: usize,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublicRunReceiptV1 {
+    schema: String,
+    run: PublicRun,
 }
 
 /// Project one persisted Run into the public allowlist.
 pub fn project_public_run(store: &OrchStore, run: &RunRecord) -> Result<PublicRun, OrchError> {
     let provider_execution = project_provider_execution(store, run)?;
-    Ok(PublicRun {
+    let mut projected = PublicRun {
         run_id: run.run_id.clone(),
         session_id: run.session_id,
         workspace: run.workspace.clone(),
@@ -232,7 +365,7 @@ pub fn project_public_run(store: &OrchStore, run: &RunRecord) -> Result<PublicRu
         continuation_context_hash: run.continuation_context_hash.clone(),
         continuation_fidelity: run.continuation_fidelity.clone(),
         queue_position: run.queue_position,
-        bounds: run.bounds.clone(),
+        bounds: project_bounds(&run.bounds),
         prompt_preview: run.prompt_preview.clone(),
         start_seq: run.start_seq,
         end_seq: run.end_seq,
@@ -242,12 +375,14 @@ pub fn project_public_run(store: &OrchStore, run: &RunRecord) -> Result<PublicRu
         final_response: run.final_response.clone(),
         error_code: run.error_code.clone(),
         stop_cause: run.stop_cause,
-        aggregates: run.aggregates.clone(),
-        progress: run.progress.clone(),
-        execution: run.execution.clone(),
-        approval: run.approval.clone(),
+        aggregates: project_aggregates(&run.aggregates),
+        progress: run.progress.as_ref().map(project_progress_detail),
+        execution: run.execution.as_ref().map(project_execution),
+        approval: run.approval.as_ref().map(project_approval),
         provider_execution,
-    })
+    };
+    scrub_public_run(&mut projected, run.provider_route.as_ref())?;
+    Ok(projected)
 }
 
 /// Project progress from the same allowlisted provider-execution helper.
@@ -256,7 +391,7 @@ pub fn project_public_run_progress(
     run: &RunRecord,
     busy: bool,
 ) -> Result<PublicRunProgress, OrchError> {
-    Ok(PublicRunProgress {
+    let mut projected = PublicRunProgress {
         run_id: run.run_id.clone(),
         session_id: run.session_id,
         state: run.state,
@@ -265,15 +400,90 @@ pub fn project_public_run_progress(
         start_seq: run.start_seq,
         end_seq: run.end_seq,
         prompt_preview: run.prompt_preview.clone(),
-        progress: run.progress.clone(),
+        progress: run.progress.as_ref().map(project_progress_detail),
         created_at: run.created_at,
         updated_at: run.updated_at,
         terminal_result: run.terminal_result.clone(),
         stop_cause: run.stop_cause,
-        bounds: run.bounds.clone(),
+        bounds: project_bounds(&run.bounds),
         error_code: run.error_code.clone(),
         provider_execution: project_provider_execution(store, run)?,
-    })
+    };
+    let mut as_run = PublicRun {
+        run_id: projected.run_id.clone(),
+        session_id: projected.session_id,
+        workspace: run.workspace.clone(),
+        request_id: run.request_id.clone(),
+        client_id: run.client_id.clone(),
+        state: projected.state,
+        purpose: run.purpose,
+        agent_id: run.agent_id.clone(),
+        retry_of: run.retry_of.clone(),
+        parent_run_id: run.parent_run_id.clone(),
+        agent_spec_revision: run.agent_spec_revision,
+        checkpoint_id: run.checkpoint_id.clone(),
+        continuation_context_id: run.continuation_context_id.clone(),
+        continuation_context_hash: run.continuation_context_hash.clone(),
+        continuation_fidelity: run.continuation_fidelity.clone(),
+        queue_position: projected.queue_position,
+        bounds: projected.bounds.clone(),
+        prompt_preview: projected.prompt_preview.clone(),
+        start_seq: projected.start_seq,
+        end_seq: projected.end_seq,
+        created_at: projected.created_at,
+        updated_at: projected.updated_at,
+        terminal_result: projected.terminal_result.clone(),
+        final_response: None,
+        error_code: projected.error_code.clone(),
+        stop_cause: projected.stop_cause,
+        aggregates: PublicRunAggregates::default(),
+        progress: projected.progress.clone(),
+        execution: None,
+        approval: None,
+        provider_execution: projected.provider_execution.clone(),
+    };
+    scrub_public_run(&mut as_run, run.provider_route.as_ref())?;
+    projected.prompt_preview = as_run.prompt_preview;
+    projected.progress = as_run.progress;
+    projected.terminal_result = as_run.terminal_result;
+    projected.error_code = as_run.error_code;
+    projected.provider_execution = as_run.provider_execution;
+    Ok(projected)
+}
+
+pub fn page_public_runs(
+    mut runs: Vec<PublicRun>,
+    cursor: Option<&str>,
+    limit: Option<usize>,
+) -> PublicRunPage {
+    runs.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then(right.run_id.cmp(&left.run_id))
+    });
+    let total_count = runs.len();
+    if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+        if let Some(index) = runs.iter().position(|run| run.run_id == cursor) {
+            runs = runs.split_off(index.saturating_add(1));
+        } else {
+            runs.clear();
+        }
+    }
+    let limit = limit
+        .unwrap_or(PUBLIC_RUN_LIST_PAGE_LIMIT)
+        .clamp(1, PUBLIC_RUN_LIST_PAGE_LIMIT);
+    let truncated = runs.len() > limit;
+    runs.truncate(limit);
+    let next_cursor = truncated
+        .then(|| runs.last().map(|run| run.run_id.clone()))
+        .flatten();
+    PublicRunPage {
+        runs,
+        total_count,
+        truncated,
+        next_cursor,
+    }
 }
 
 pub fn public_run_to_value(run: &PublicRun) -> Result<Value, OrchError> {
@@ -310,13 +520,19 @@ pub fn encode_public_run_receipt(run: &PublicRun) -> Result<Value, OrchError> {
 /// from the durable store and never returned as stored.
 pub fn public_run_from_receipt(store: &OrchStore, value: Value) -> Result<Value, OrchError> {
     if value.get("schema").and_then(Value::as_str) == Some(PUBLIC_RUN_RECEIPT_SCHEMA) {
-        let run = value.get("run").cloned().ok_or_else(|| {
+        let receipt: PublicRunReceiptV1 = serde_json::from_value(value).map_err(|error| {
             OrchError::new(
                 OrchErrorCode::Internal,
-                "versioned public run receipt is missing its run",
+                format!("public run receipt is not exact: {error}"),
             )
         })?;
-        return encode_decoded_public_run(run);
+        if receipt.schema != PUBLIC_RUN_RECEIPT_SCHEMA {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "public run receipt schema is invalid",
+            ));
+        }
+        return public_run_to_value(&receipt.run);
     }
     if public_run_contains_forbidden_fields(&value) || value.get("providerRoute").is_some() {
         let run_id = value
@@ -361,7 +577,7 @@ fn encode_decoded_public_run(value: Value) -> Result<Value, OrchError> {
 fn encode_allowlisted<T: Serialize>(value: &T) -> Result<Value, OrchError> {
     let encoded = serde_json::to_value(value)
         .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-    if contains_forbidden_key(&encoded) {
+    if contains_forbidden_key(&encoded) || contains_forbidden_value(&encoded, &[]) {
         return Err(OrchError::new(
             OrchErrorCode::Internal,
             "public run projection refused to serialize",
@@ -380,6 +596,21 @@ fn contains_forbidden_key(value: &Value) -> bool {
             }) || map.values().any(contains_forbidden_key)
         }
         Value::Array(values) => values.iter().any(contains_forbidden_key),
+        _ => false,
+    }
+}
+
+fn contains_forbidden_value(value: &Value, extra_needles: &[&str]) -> bool {
+    match value {
+        Value::Object(map) => map
+            .values()
+            .any(|child| contains_forbidden_value(child, extra_needles)),
+        Value::Array(values) => values
+            .iter()
+            .any(|child| contains_forbidden_value(child, extra_needles)),
+        Value::String(text) => extra_needles
+            .iter()
+            .any(|needle| !needle.is_empty() && text.contains(needle)),
         _ => false,
     }
 }
@@ -416,26 +647,15 @@ fn project_provider_execution(
         }
         None => None,
     };
-    let mut attempts = store
-        .list_provider_attempts()
-        .map_err(provider_projection_error)?
-        .into_iter()
-        .filter(|attempt| attempt.run_id == run.run_id)
-        .collect::<Vec<_>>();
-    attempts.sort_by(|left, right| {
-        left.ordinal
-            .cmp(&right.ordinal)
-            .then(left.attempt_id.cmp(&right.attempt_id))
-    });
-    let attempt_count = attempts.len();
-    let truncated = attempt_count > MAX_PROJECTED_PROVIDER_ATTEMPTS;
-    attempts.truncate(MAX_PROJECTED_PROVIDER_ATTEMPTS);
+    let page = store
+        .list_provider_attempts_for_run(&run.run_id)
+        .map_err(provider_projection_error)?;
     Ok(Some(PublicProviderExecution {
         route: project_route_summary(route),
         quota,
-        attempts: attempts.into_iter().map(project_attempt).collect(),
-        attempt_count,
-        attempts_truncated: truncated,
+        attempts: page.attempts.into_iter().map(project_attempt).collect(),
+        attempt_count: page.total_count,
+        attempts_truncated: page.truncated,
         usage_complete: run.aggregates.usage_complete,
         pending_requests: run.aggregates.usage_pending_requests,
     }))
@@ -467,7 +687,12 @@ fn project_quota(reservation: &QuotaReservation) -> PublicProviderQuota {
         requests_reserved: reservation.requests_reserved,
         requests_consumed: reservation.requests_consumed,
         window_started_at: reservation.window_started_at,
-        limits: reservation.limits,
+        limits: PublicQuotaLimits {
+            window_ms: reservation.limits.window_ms,
+            max_in_flight_reservations: reservation.limits.max_in_flight_reservations,
+            max_tokens_per_window: reservation.limits.max_tokens_per_window,
+            max_requests_per_window: reservation.limits.max_requests_per_window,
+        },
         updated_at: reservation.updated_at,
     }
 }
@@ -484,6 +709,183 @@ fn project_attempt(attempt: ProviderAttemptRecord) -> PublicProviderAttempt {
         created_at: attempt.created_at,
         updated_at: attempt.updated_at,
         finished_at: attempt.finished_at,
+    }
+}
+
+fn project_bounds(bounds: &RunBounds) -> PublicRunBounds {
+    PublicRunBounds {
+        max_prompt_bytes: bounds.max_prompt_bytes,
+        max_rounds: bounds.max_rounds,
+        max_duration_ms: bounds.max_duration_ms,
+        max_total_tokens: bounds.max_total_tokens,
+    }
+}
+
+fn project_aggregates(aggregates: &RunAggregates) -> PublicRunAggregates {
+    PublicRunAggregates {
+        changes: aggregates
+            .changes
+            .iter()
+            .map(|change| PublicChangeRecord {
+                path: change.path.clone(),
+                summary: change.summary.clone(),
+            })
+            .collect(),
+        tests: aggregates
+            .tests
+            .iter()
+            .map(|test| PublicTestObservation {
+                call_id: test.call_id.clone(),
+                command: test.command.clone(),
+                status: test.status.clone(),
+                exit_code: test.exit_code,
+                cancelled: test.cancelled,
+            })
+            .collect(),
+        permissions_requested: aggregates.permissions_requested,
+        permissions_granted: aggregates.permissions_granted,
+        permissions_denied: aggregates.permissions_denied,
+        usage: aggregates.usage.clone(),
+        usage_complete: aggregates.usage_complete,
+        usage_pending_requests: aggregates.usage_pending_requests,
+        verification: aggregates.verification.clone(),
+    }
+}
+
+fn project_progress_detail(progress: &RunProgress) -> PublicRunProgressDetail {
+    PublicRunProgressDetail {
+        round: progress.round,
+        max_rounds: progress.max_rounds,
+        last_tool: progress.last_tool.clone(),
+        detail: progress.detail.clone(),
+        updated_at: progress.updated_at,
+    }
+}
+
+fn project_execution(execution: &RunExecution) -> PublicRunExecution {
+    PublicRunExecution {
+        mode: execution.mode,
+        source_workspace: execution.source_workspace.clone(),
+        execution_workspace: execution.execution_workspace.clone(),
+        base_revision: execution.base_revision.clone(),
+        source_fingerprint: execution.source_fingerprint.clone(),
+        final_fingerprint: execution.final_fingerprint.clone(),
+        promotion_state: execution.promotion_state,
+        promoted_at: execution.promoted_at,
+    }
+}
+
+fn project_approval(approval: &RunApproval) -> PublicRunApproval {
+    PublicRunApproval {
+        approval_id: approval.approval_id.clone(),
+        run_id: approval.run_id.clone(),
+        session_id: approval.session_id,
+        workspace: approval.workspace.clone(),
+        source_fingerprint: approval.source_fingerprint.clone(),
+        final_fingerprint: approval.final_fingerprint.clone(),
+        changed_files: approval
+            .changed_files
+            .iter()
+            .map(|change| PublicChangeRecord {
+                path: change.path.clone(),
+                summary: change.summary.clone(),
+            })
+            .collect(),
+        issued_at: approval.issued_at,
+        expires_at: approval.expires_at,
+    }
+}
+
+fn route_secret_needles(route: Option<&ProviderRouteSnapshot>) -> Vec<String> {
+    let Some(route) = route else {
+        return Vec::new();
+    };
+    [
+        route.base_url.as_str(),
+        route.credential_ref.as_str(),
+        route.credential_fingerprint.as_str(),
+        route.endpoint_fingerprint.as_str(),
+        route.selection_key.as_str(),
+        route.qualification_record_id.as_deref().unwrap_or(""),
+    ]
+    .into_iter()
+    .filter(|needle| !needle.is_empty())
+    .map(str::to_string)
+    .collect()
+}
+
+fn scrub_public_run(
+    run: &mut PublicRun,
+    route: Option<&ProviderRouteSnapshot>,
+) -> Result<(), OrchError> {
+    let needles = route_secret_needles(route);
+    if needles.is_empty() {
+        return Ok(());
+    }
+    let mut redacted = false;
+    redacted |= scrub_string(&mut run.prompt_preview, &needles);
+    redacted |= scrub_opt_string(&mut run.final_response, &needles);
+    redacted |= scrub_opt_string(&mut run.terminal_result, &needles);
+    if let Some(progress) = run.progress.as_mut() {
+        redacted |= scrub_string(&mut progress.detail, &needles);
+        if let Some(tool) = progress.last_tool.as_mut() {
+            redacted |= scrub_string(tool, &needles);
+        }
+    }
+    for change in &mut run.aggregates.changes {
+        redacted |= scrub_string(&mut change.path, &needles);
+        redacted |= scrub_string(&mut change.summary, &needles);
+    }
+    for test in &mut run.aggregates.tests {
+        redacted |= scrub_opt_string(&mut test.command, &needles);
+        redacted |= scrub_string(&mut test.status, &needles);
+    }
+    if let Some(execution) = run.execution.as_mut() {
+        redacted |= scrub_string(&mut execution.source_workspace, &needles);
+        redacted |= scrub_string(&mut execution.execution_workspace, &needles);
+    }
+    if redacted {
+        run.error_code = Some(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS.into());
+    }
+    let needle_refs: Vec<&str> = needles.iter().map(String::as_str).collect();
+    if let Some(evidence) = run.aggregates.verification.as_ref() {
+        let encoded = serde_json::to_value(evidence)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if contains_forbidden_value(&encoded, &needle_refs) {
+            run.aggregates.verification = None;
+            run.error_code = Some(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS.into());
+        }
+    }
+    let encoded = serde_json::to_value(&*run)
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+    let needle_refs: Vec<&str> = needles.iter().map(String::as_str).collect();
+    if contains_forbidden_value(&encoded, &needle_refs) {
+        return Err(OrchError::new(
+            OrchErrorCode::Internal,
+            "public run projection refused to serialize privileged diagnostics",
+        ));
+    }
+    Ok(())
+}
+
+fn scrub_string(value: &mut String, needles: &[String]) -> bool {
+    if needles.iter().any(|needle| value.contains(needle)) {
+        *value = String::new();
+        true
+    } else {
+        false
+    }
+}
+
+fn scrub_opt_string(value: &mut Option<String>, needles: &[String]) -> bool {
+    let Some(text) = value.as_mut() else {
+        return false;
+    };
+    if needles.iter().any(|needle| text.contains(needle)) {
+        *value = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -708,9 +1110,9 @@ mod tests {
     fn reintroducing_raw_run_record_serialization_fails() {
         let service = include_str!("service.rs");
         let list_runs = service
-            .split("pub fn list_runs_scoped")
+            .split("pub fn list_runs_scoped_page")
             .nth(1)
-            .expect("list_runs_scoped")
+            .expect("list_runs_scoped_page")
             .split("// ── durable workloads")
             .next()
             .unwrap();
@@ -789,9 +1191,9 @@ mod tests {
 
         let host = include_str!("../host.rs");
         let public_list = host
-            .split("pub fn list_public_session_runs")
+            .split("pub fn list_public_session_runs_page")
             .nth(1)
-            .expect("list_public_session_runs")
+            .expect("list_public_session_runs_page")
             .split("\n    pub fn ")
             .next()
             .unwrap();
@@ -818,5 +1220,165 @@ mod tests {
             !public_get.contains("serde_json::to_value"),
             "desktop get must not serialize RunRecord"
         );
+    }
+
+    #[test]
+    fn nested_public_run_dtos_are_exact_and_deny_unknown_fields() {
+        let temp = tempdir().unwrap();
+        let store = OrchStore::open(temp.path()).unwrap();
+        let run = leaky_run(leaky_route());
+        let reservation =
+            QuotaReservation::for_run(&run, "owner-a", QuotaLimits::default(), Utc::now()).unwrap();
+        store.save_run_with_quota(&run, &reservation).unwrap();
+        let projected =
+            project_public_run(&store, &store.load_run(&run.run_id).unwrap().unwrap()).unwrap();
+        let encoded = public_run_to_value(&projected).unwrap();
+        let decoded: PublicRun = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.run_id, projected.run_id);
+        assert!(encoded.get("providerRoute").is_none());
+        assert!(encoded["aggregates"]
+            .get("accountedProviderAttemptIds")
+            .is_none());
+        let mut with_unknown_bounds = encoded.clone();
+        with_unknown_bounds["bounds"]["leakedBaseUrl"] = json!(BASE_URL_SENTINEL);
+        assert!(
+            serde_json::from_value::<PublicRun>(with_unknown_bounds).is_err(),
+            "unknown nested bounds keys must fail"
+        );
+        let mut with_unknown_route = encoded.clone();
+        with_unknown_route["providerExecution"]["route"]["selectionKey"] =
+            json!("ptah.model.v1:leaked");
+        assert!(
+            serde_json::from_value::<PublicRun>(with_unknown_route).is_err(),
+            "unknown nested providerExecution.route keys must fail"
+        );
+        let mut with_unknown_aggregates = encoded.clone();
+        with_unknown_aggregates["aggregates"]["internalFence"] = json!(["attempt-1"]);
+        assert!(
+            serde_json::from_value::<PublicRun>(with_unknown_aggregates).is_err(),
+            "unknown nested aggregates keys must fail"
+        );
+    }
+
+    #[test]
+    fn failing_provider_values_are_scrubbed_on_get_list_progress_promote_discard_and_replay() {
+        let temp = tempdir().unwrap();
+        let store = OrchStore::open(temp.path()).unwrap();
+        let route = leaky_route();
+        let mut run = leaky_run(route.clone());
+        run.final_response = Some(format!("failed calling {}", BASE_URL_SENTINEL));
+        run.terminal_result = Some(format!("credential {} rejected", CREDENTIAL_REF_SENTINEL));
+        run.prompt_preview = format!("retry {}", route.selection_key);
+        run.progress = Some(crate::orchestration::types::RunProgress {
+            round: 1,
+            max_rounds: 4,
+            last_tool: Some(format!("mcp:{}", CREDENTIAL_FP_SENTINEL)),
+            detail: format!("upstream {} fingerprint", route.endpoint_fingerprint),
+            updated_at: Utc::now(),
+        });
+        run.aggregates
+            .changes
+            .push(crate::orchestration::types::ChangeRecord {
+                path: format!("called {}", BASE_URL_SENTINEL),
+                summary: format!("ref {}", CREDENTIAL_REF_SENTINEL),
+            });
+        let reservation =
+            QuotaReservation::for_run(&run, "owner-a", QuotaLimits::default(), Utc::now()).unwrap();
+        store.save_run_with_quota(&run, &reservation).unwrap();
+        let loaded = store.load_run(&run.run_id).unwrap().unwrap();
+        let projected = project_public_run(&store, &loaded).unwrap();
+        let get_payload = public_run_to_value(&projected).unwrap();
+        let list_page = page_public_runs(vec![projected.clone()], None, None);
+        let list_payload = json!({
+            "runs": list_page.runs.iter().map(public_run_to_value).collect::<Result<Vec<_>, _>>().unwrap(),
+            "totalCount": list_page.total_count,
+            "truncated": list_page.truncated,
+        });
+        let progress = public_run_progress_to_value(
+            &project_public_run_progress(&store, &loaded, false).unwrap(),
+        )
+        .unwrap();
+        let receipt = encode_public_run_receipt(&projected).unwrap();
+        let replayed = public_run_from_receipt(&store, receipt.clone()).unwrap();
+        let legacy = serde_json::to_value(&loaded).unwrap();
+        let legacy_replayed = public_run_from_receipt(&store, legacy).unwrap();
+        for (name, payload) in [
+            ("get", &get_payload),
+            ("list", &list_payload["runs"][0]),
+            ("progress", &progress),
+            ("promote-receipt", &receipt["run"]),
+            ("discard-replay", &replayed),
+            ("legacy-replay", &legacy_replayed),
+        ] {
+            assert_payload_hides_route(payload, &route);
+            let encoded = payload.to_string();
+            let pretty = serde_json::to_string_pretty(payload).unwrap();
+            for haystack in [&encoded, &pretty] {
+                assert!(
+                    !haystack.contains(BASE_URL_SENTINEL),
+                    "{name} MCP text leaked base_url: {haystack}"
+                );
+                assert!(
+                    !haystack.contains(CREDENTIAL_REF_SENTINEL),
+                    "{name} MCP text leaked credential ref"
+                );
+            }
+            assert_eq!(
+                payload["errorCode"], PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
+                "{name} must use the typed public error code"
+            );
+        }
+        assert!(projected.final_response.is_none());
+        assert!(projected.terminal_result.is_none());
+    }
+
+    #[test]
+    fn public_run_list_caps_at_128_with_exact_truncation_count() {
+        let now = Utc::now();
+        let runs = (0..200)
+            .map(|index| PublicRun {
+                run_id: format!("run-{index:03}"),
+                session_id: Uuid::nil(),
+                workspace: "/tmp/public-run".into(),
+                request_id: format!("req-{index}"),
+                client_id: None,
+                state: RunState::Completed,
+                purpose: RunPurpose::Execution,
+                agent_id: None,
+                retry_of: None,
+                parent_run_id: None,
+                agent_spec_revision: None,
+                checkpoint_id: None,
+                continuation_context_id: None,
+                continuation_context_hash: None,
+                continuation_fidelity: None,
+                queue_position: None,
+                bounds: PublicRunBounds {
+                    max_prompt_bytes: 1,
+                    max_rounds: 1,
+                    max_duration_ms: 1,
+                    max_total_tokens: None,
+                },
+                prompt_preview: "x".into(),
+                start_seq: None,
+                end_seq: None,
+                created_at: now,
+                updated_at: now,
+                terminal_result: None,
+                final_response: None,
+                error_code: None,
+                stop_cause: None,
+                aggregates: PublicRunAggregates::default(),
+                progress: None,
+                execution: None,
+                approval: None,
+                provider_execution: None,
+            })
+            .collect();
+        let page = page_public_runs(runs, None, None);
+        assert_eq!(page.total_count, 200);
+        assert!(page.truncated);
+        assert_eq!(page.runs.len(), PUBLIC_RUN_LIST_PAGE_LIMIT);
+        assert_eq!(page.next_cursor.as_deref(), Some("run-072"));
     }
 }

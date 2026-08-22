@@ -160,6 +160,22 @@ fn save_measured_history(base_url: &str, model_id: &str) {
     save_managed_profile_capabilities(&profile, &model, &fingerprint).unwrap();
 }
 
+fn xai_host_without_agent(model_id: &str) -> (AgentHostHandle, Uuid, tempfile::TempDir) {
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.set_model(model_id.into());
+    host.start().expect("start host");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = host
+        .session_new_kind(SessionKind::Build)
+        .expect("create build session");
+    host.session_set_cwd(session.id, workspace.path())
+        .expect("set cwd");
+    (host, session.id, workspace)
+}
+
 fn xai_host(model_id: &str) -> (AgentHostHandle, Uuid, tempfile::TempDir) {
     let host = AgentHost::create(HostConfig {
         always_approve: true,
@@ -265,66 +281,21 @@ fn drain_turn_started(rx: &mut crate::event_bus::EventReceiver) {
 
 #[test]
 fn session_prompt_inner_must_admit_before_session_mutation() {
+    // Behavioral coverage lives in the cutpoint, requalify, quota, and
+    // accepted-plan tests below: admission failure leaves zero provider
+    // attempts, no TurnStarted, and an unchanged transcript/title.
     let host_src = include_str!("host.rs");
-    let inner = host_src
-        .split("async fn session_prompt_inner")
-        .nth(1)
-        .expect("session_prompt_inner");
-    let admission = inner
-        .split("// ── desktop Build admission (no session mutation) ──")
-        .nth(1)
-        .expect("admission marker")
-        .split("// ── session mutation after durable admission ──")
-        .next()
-        .unwrap();
-    let mutation = inner
-        .split("// ── session mutation after durable admission ──")
-        .nth(1)
-        .expect("mutation marker");
     assert!(
-        admission.contains("validate_provider_route_for_purpose"),
-        "desktop Build must call the shared admission validator after route capture"
-    );
-    assert!(
-        admission.contains("RunPurpose::Execution"),
-        "desktop Build must admit as Execution"
-    );
-    assert!(
-        admission.contains("admit_desktop_build_run"),
+        host_src.contains("admit_desktop_build_run"),
         "desktop Build must persist the admitted Run before session mutation"
     );
     assert!(
-        admission.contains("save_run_and_activate_agent_with_quota")
-            || include_str!("host.rs").contains("save_run_and_activate_agent_with_quota"),
-        "desktop Build must reserve quota atomically with Run+Agent activation"
+        host_src.contains("validate_provider_route_for_purpose"),
+        "desktop Build must call the shared admission validator"
     );
     assert!(
-        !admission.contains("commit_admitted_turn"),
-        "session mutation must not run inside the admission window"
-    );
-    assert!(
-        !admission.contains("TurnBusyGuard"),
-        "busy state must not be taken before durable admission"
-    );
-    assert!(
-        !admission.contains("persist_session"),
-        "transcript persistence must wait until after admission"
-    );
-    assert!(
-        !admission.contains("TurnStarted"),
-        "TurnStarted must wait until after admission"
-    );
-    assert!(
-        !admission.contains("run_promotion::prepare"),
-        "worktree mutation must wait until after admission"
-    );
-    assert!(
-        mutation.contains("commit_admitted_turn"),
-        "session mutation must happen only after admission"
-    );
-    assert!(
-        inner.contains("external_provider_route"),
-        "already-admitted frozen routes stay on the captured snapshot"
+        host_src.contains("terminalize_unstarted_admission"),
+        "post-admit failures must terminalize rather than delete the Run"
     );
 }
 
@@ -598,7 +569,11 @@ async fn accepted_plan_refuses_stale_admission_without_session_effects() {
         .unwrap()
         .plan_status
         .clone();
-    assert_eq!(status, "accepted");
+    assert_eq!(status, "proposed");
+    assert!(
+        host.inner.lock().sessions.get(&lane_id).unwrap().plan_mode,
+        "admission failure must restore prior plan_mode"
+    );
     host.stop().unwrap();
     server.abort();
 }
@@ -654,7 +629,6 @@ async fn ledger_unavailable_and_fault_cutpoints_leave_zero_effects() {
         DesktopAdmissionCutpoint::AfterRouteCapture,
         DesktopAdmissionCutpoint::AfterValidation,
         DesktopAdmissionCutpoint::BeforePersist,
-        DesktopAdmissionCutpoint::AfterPersistBeforeSessionCommit,
         DesktopAdmissionCutpoint::LedgerUnavailable,
     ] {
         let mut events = host.subscribe_events();
@@ -666,6 +640,29 @@ async fn ledger_unavailable_and_fault_cutpoints_leave_zero_effects() {
         assert_no_dispatch(&host, lane_id, &requests);
         assert_session_unmutated(&host, lane_id, &before_title, &before_transcript, None);
         drain_turn_started(&mut events);
+    }
+    {
+        let mut events = host.subscribe_events();
+        host.set_desktop_admission_cutpoint(Some(
+            DesktopAdmissionCutpoint::AfterPersistBeforeSessionCommit,
+        ));
+        assert!(host
+            .session_prompt_with_max_rounds(lane_id, "must not dispatch".into(), Some(1))
+            .await
+            .is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_session_unmutated(&host, lane_id, &before_title, &before_transcript, None);
+        drain_turn_started(&mut events);
+        let runs = host.list_session_runs(lane_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].state.is_terminal());
+        assert_eq!(runs[0].error_code.as_deref(), Some("admission_aborted"));
+        let store = host.ensure_orchestration_store().unwrap();
+        assert!(store.list_provider_attempts().unwrap().is_empty());
+        assert_eq!(
+            host.ensure_session_agent(lane_id).unwrap().current_run_id,
+            None
+        );
     }
     host.stop().unwrap();
     server.abort();
@@ -856,6 +853,113 @@ async fn already_service_admitted_frozen_route_does_not_double_reserve() {
             .reservation_id,
         "quota-frozen-external"
     );
+    host.stop().unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn first_use_rejection_leaves_no_agent_or_session_binding() {
+    let (base_url, requests, server) = spawn_xai_sse().await;
+    let mut home = IsolatedHome::enter();
+    home.remove("GROKPTAH_AGENT_OFFLINE");
+    home.set("XAI_API_BASE", &base_url);
+    home.set("XAI_API_KEY", "synthetic-p2-first-use-key");
+    save_measured_history(&base_url, "grok-route");
+    let (host, lane_id, _workspace) = xai_host_without_agent("grok-route");
+    assert!(host.session_inspect(lane_id).unwrap().agent_id.is_none());
+    let before_title = host.session_inspect(lane_id).unwrap().title;
+    let before_transcript = host.session_transcript(lane_id).unwrap();
+    let mut events = host.subscribe_events();
+    host.set_desktop_admission_cutpoint(Some(DesktopAdmissionCutpoint::BeforePersist));
+    assert!(host
+        .session_prompt_with_max_rounds(lane_id, "must not dispatch".into(), Some(1))
+        .await
+        .is_err());
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert!(host.list_session_runs(lane_id).unwrap().is_empty());
+    let store = host.ensure_orchestration_store().unwrap();
+    assert!(store.list_agents().unwrap().is_empty());
+    assert!(store.list_quota_reservations().unwrap().is_empty());
+    assert!(host.session_inspect(lane_id).unwrap().agent_id.is_none());
+    assert_session_unmutated(&host, lane_id, &before_title, &before_transcript, None);
+    drain_turn_started(&mut events);
+    host.stop().unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn inspect_admit_commit_fence_rejects_close_rebind_model_spec_reservation_races() {
+    let (base_url, requests, server) = spawn_xai_sse().await;
+    let mut home = IsolatedHome::enter();
+    home.remove("GROKPTAH_AGENT_OFFLINE");
+    home.set("XAI_API_BASE", &base_url);
+    home.set("XAI_API_KEY", "synthetic-p2-fence-key");
+    save_measured_history(&base_url, "grok-route");
+    for cut in [
+        DesktopAdmissionCutpoint::FenceCloseSession,
+        DesktopAdmissionCutpoint::FenceRebindAgent,
+        DesktopAdmissionCutpoint::FenceChangeModel,
+        DesktopAdmissionCutpoint::FenceChangeSpec,
+        DesktopAdmissionCutpoint::FenceStealReservation,
+    ] {
+        let (host, lane_id, _workspace) = xai_host("grok-route");
+        let mut events = host.subscribe_events();
+        host.set_desktop_admission_cutpoint(Some(cut));
+        assert!(
+            host.session_prompt_with_max_rounds(lane_id, "must not dispatch".into(), Some(1))
+                .await
+                .is_err(),
+            "{cut:?} must fail closed"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        if cut != DesktopAdmissionCutpoint::FenceCloseSession {
+            let store = host.ensure_orchestration_store().unwrap();
+            assert!(
+                host.list_session_runs(lane_id).unwrap().is_empty(),
+                "{cut:?} must not admit a Run"
+            );
+            assert!(store.list_provider_attempts().unwrap().is_empty());
+        }
+        drain_turn_started(&mut events);
+        host.stop().unwrap();
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn worktree_prepare_failure_terminalizes_and_retains_the_run() {
+    let (base_url, requests, server) = spawn_xai_sse().await;
+    let mut home = IsolatedHome::enter();
+    home.remove("GROKPTAH_AGENT_OFFLINE");
+    home.set("XAI_API_BASE", &base_url);
+    home.set("XAI_API_KEY", "synthetic-p2-worktree-key");
+    save_measured_history(&base_url, "grok-route");
+    let (host, lane_id, _workspace) = xai_host("grok-route");
+    host.session_set_execution_mode(lane_id, RunExecutionMode::IsolatedWorktree)
+        .unwrap();
+    let mut events = host.subscribe_events();
+    assert!(host
+        .session_prompt_with_max_rounds(lane_id, "must not dispatch".into(), Some(1))
+        .await
+        .is_err());
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    let runs = host.list_session_runs(lane_id).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].state.is_terminal());
+    assert_eq!(
+        runs[0].error_code.as_deref(),
+        Some("worktree_prepare_failed")
+    );
+    let store = host.ensure_orchestration_store().unwrap();
+    assert!(store.list_provider_attempts().unwrap().is_empty());
+    assert_eq!(
+        host.ensure_session_agent(lane_id).unwrap().current_run_id,
+        None
+    );
+    drain_turn_started(&mut events);
     host.stop().unwrap();
     server.abort();
 }

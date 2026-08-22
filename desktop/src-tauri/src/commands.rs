@@ -1579,7 +1579,7 @@ pub async fn run_approve(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -1627,7 +1627,7 @@ pub async fn run_promote(
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     run_blocking(move || {
         let run = host
-            .get_session_run(id, &run_id)
+            .get_public_session_run(id, &run_id)
             .map_err(map_err)?
             .ok_or_else(|| "unknown run for this session".to_string())?;
         host.promote_public_session_run(
@@ -1679,7 +1679,7 @@ pub async fn run_retry(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -1724,7 +1724,7 @@ pub async fn run_steer(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -1763,7 +1763,7 @@ pub async fn run_cancel(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {

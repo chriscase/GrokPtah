@@ -217,6 +217,9 @@ pub(crate) struct Inner {
     turn_generations: HashMap<Uuid, u64>,
     /// Monotonic across all sessions; a generation is never reused.
     next_turn_generation: u64,
+    /// Inspect→admit→commit fence. One token covers session identity,
+    /// cwd/model/spec/mode/reservation until commit consumes it.
+    admission_fences: HashMap<Uuid, AdmissionFence>,
     /// Explicit, short-lived model qualification/proposal calls from the
     /// Computer cockpit. These are independent from Build turns and always
     /// cancelled by local Stop/Take over.
@@ -883,6 +886,16 @@ pub(crate) enum DesktopAdmissionCutpoint {
     BeforePersist,
     AfterPersistBeforeSessionCommit,
     LedgerUnavailable,
+    FenceCloseSession,
+    FenceRebindAgent,
+    FenceChangeModel,
+    FenceChangeSpec,
+    FenceStealReservation,
+}
+
+struct SessionAgentBinding {
+    agent: AgentRecord,
+    created_new: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -892,6 +905,7 @@ pub(crate) struct ExternalRunContext {
 }
 
 struct DesktopTurnSnapshot {
+    fence: AdmissionFence,
     cwd: PathBuf,
     model: String,
     effort: EffortLevel,
@@ -899,6 +913,19 @@ struct DesktopTurnSnapshot {
     kind: SessionKind,
     execution_mode: RunExecutionMode,
     event_tx: crate::event_bus::EventBus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdmissionFence {
+    token: u64,
+    cwd: PathBuf,
+    model: String,
+    agent_id: Option<String>,
+    spec_revision: Option<u64>,
+    plan_mode: bool,
+    kind: SessionKind,
+    execution_mode: RunExecutionMode,
+    reservation_owner: Option<String>,
 }
 
 pub struct AgentHost;
@@ -1044,6 +1071,7 @@ impl AgentHost {
             turn_cancels: HashMap::new(),
             turn_generations: HashMap::new(),
             next_turn_generation: 0,
+            admission_fences: HashMap::new(),
             computer_agent_operations: HashMap::new(),
             computer_agent_qualifications: HashMap::new(),
             turn_reservations: HashMap::new(),
@@ -1411,6 +1439,33 @@ impl AgentHostHandle {
     /// session owns the binding, while the orchestration store owns lifecycle
     /// state; this keeps transport adapters from inventing identity.
     pub fn ensure_session_agent(&self, session_id: Uuid) -> Result<AgentRecord> {
+        Ok(self.session_agent_binding(session_id, true)?.agent)
+    }
+
+    fn prepare_session_agent(&self, session_id: Uuid) -> Result<(AgentRecord, bool)> {
+        let binding = self.session_agent_binding(session_id, false)?;
+        Ok((binding.agent, binding.created_new))
+    }
+
+    fn bind_session_agent_id(&self, session_id: Uuid, agent_id: &str) -> Result<()> {
+        let session = {
+            let mut g = self.inner.lock();
+            let session = g
+                .sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            session.agent_id = Some(agent_id.to_string());
+            session.clone()
+        };
+        session_store::save_session_meta(&session)
+            .map_err(|error| anyhow!("failed to persist session agent binding: {error:#}"))
+    }
+
+    fn session_agent_binding(
+        &self,
+        session_id: Uuid,
+        persist_new: bool,
+    ) -> Result<SessionAgentBinding> {
         let (cwd, model, kind, existing_id, authority, default_bounds) = {
             let g = self.inner.lock();
             let selected_model = g.model.clone();
@@ -1468,12 +1523,12 @@ impl AgentHostHandle {
             .clone()
             .unwrap_or_else(|| format!("agent-{session_id}"));
         let now = Utc::now();
-        let mut agent = match store.load_agent(&agent_id)? {
+        let (mut agent, created_new) = match store.load_agent(&agent_id)? {
             Some(agent) => {
                 if !agent.known_lane_ids().contains(&session_id) || agent.workspace != workspace {
                     bail!("session is bound to a different persistent agent workspace");
                 }
-                agent
+                (agent, false)
             }
             None => {
                 let mut spec =
@@ -1482,31 +1537,34 @@ impl AgentHostHandle {
                 spec.default_run_bounds = default_bounds;
                 spec.validate()
                     .map_err(|error| anyhow!(error.to_string()))?;
-                AgentRecord {
-                    agent_id: agent_id.clone(),
-                    owner_principal_id: None,
-                    session_id,
-                    lane_ids: vec![session_id],
-                    lane_associations: vec![AgentLaneAssociation {
-                        lane_id: session_id,
-                        source_workspace: workspace.clone(),
-                        attached_at: now,
-                        attached_by: "desktop".into(),
-                        detached_at: None,
-                        detached_by: None,
-                    }],
-                    workspace: workspace.clone(),
-                    model: model.clone(),
-                    spec: Some(spec),
-                    state: AgentState::Waiting,
-                    current_run_id: None,
-                    last_run_id: None,
-                    last_lane_id: Some(session_id),
-                    latest_checkpoint_id: None,
-                    continuation_ordinal: 0,
-                    created_at: now,
-                    updated_at: now,
-                }
+                (
+                    AgentRecord {
+                        agent_id: agent_id.clone(),
+                        owner_principal_id: None,
+                        session_id,
+                        lane_ids: vec![session_id],
+                        lane_associations: vec![AgentLaneAssociation {
+                            lane_id: session_id,
+                            source_workspace: workspace.clone(),
+                            attached_at: now,
+                            attached_by: "desktop".into(),
+                            detached_at: None,
+                            detached_by: None,
+                        }],
+                        workspace: workspace.clone(),
+                        model: model.clone(),
+                        spec: Some(spec),
+                        state: AgentState::Waiting,
+                        current_run_id: None,
+                        last_run_id: None,
+                        last_lane_id: Some(session_id),
+                        latest_checkpoint_id: None,
+                        continuation_ordinal: 0,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    true,
+                )
             }
         };
         let was_associated = agent.known_lane_ids().contains(&session_id);
@@ -1528,26 +1586,16 @@ impl AgentHostHandle {
         }
         if association_changed {
             agent.updated_at = now;
-            store.save_agent(&agent)?;
         }
-        if store.load_agent(&agent_id)?.is_none() {
-            store.save_agent(&agent)?;
-        }
-        if existing_id.is_none() {
-            let session = {
-                let mut g = self.inner.lock();
-                let session = g
-                    .sessions
-                    .get_mut(&session_id)
-                    .ok_or_else(|| anyhow!("unknown session"))?;
-                session.agent_id = Some(agent_id.clone());
-                session.clone()
-            };
-            if let Err(error) = session_store::save_session_meta(&session) {
-                bail!("failed to persist session agent binding: {error:#}");
+        if persist_new || !created_new {
+            if association_changed || created_new {
+                store.save_agent(&agent)?;
+            }
+            if persist_new && existing_id.is_none() {
+                self.bind_session_agent_id(session_id, &agent_id)?;
             }
         }
-        Ok(agent)
+        Ok(SessionAgentBinding { agent, created_new })
     }
 
     /// Attach an existing Build session to a durable Agent identity.
@@ -2371,7 +2419,7 @@ impl AgentHostHandle {
 
     /// Read desktop-visible runs for one session. Session scoping prevents a
     /// local inspector from displaying another workspace's coordinator data.
-    pub fn list_session_runs(&self, session_id: Uuid) -> Result<Vec<RunRecord>> {
+    pub(crate) fn list_session_runs(&self, session_id: Uuid) -> Result<Vec<RunRecord>> {
         let store = self.ensure_orchestration_store()?;
         Ok(store
             .list_runs()?
@@ -2381,7 +2429,11 @@ impl AgentHostHandle {
     }
 
     /// Read one run only when it belongs to the requested session.
-    pub fn get_session_run(&self, session_id: Uuid, run_id: &str) -> Result<Option<RunRecord>> {
+    pub(crate) fn get_session_run(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+    ) -> Result<Option<RunRecord>> {
         let store = self.ensure_orchestration_store()?;
         Ok(store
             .load_run(run_id)?
@@ -2389,7 +2441,7 @@ impl AgentHostHandle {
     }
 
     /// Project one persisted session Run onto the public allowlist.
-    pub fn project_public_session_run(&self, mut run: RunRecord) -> Result<PublicRun> {
+    pub(crate) fn project_public_session_run(&self, mut run: RunRecord) -> Result<PublicRun> {
         let store = self.ensure_orchestration_store()?;
         run.queue_position = self.orchestration_pending_position(&run.run_id);
         crate::orchestration::project_public_run(&store, &run)
@@ -2417,10 +2469,23 @@ impl AgentHostHandle {
 
     /// Desktop-visible Runs for one session, using the shared public projection.
     pub fn list_public_session_runs(&self, session_id: Uuid) -> Result<Vec<PublicRun>> {
-        self.list_session_runs(session_id)?
+        Ok(self
+            .list_public_session_runs_page(session_id, None, None)?
+            .runs)
+    }
+
+    pub fn list_public_session_runs_page(
+        &self,
+        session_id: Uuid,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<crate::orchestration::PublicRunPage> {
+        let runs = self
+            .list_session_runs(session_id)?
             .into_iter()
             .map(|run| self.project_public_session_run(run))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(crate::orchestration::page_public_runs(runs, cursor, limit))
     }
 
     /// One desktop-visible Run, using the shared public projection.
@@ -2522,14 +2587,15 @@ impl AgentHostHandle {
     /// Promote an explicitly reviewed isolated run into its original clean
     /// source workspace. Repeated calls are idempotent when the final
     /// fingerprint is already present in the source workspace.
-    pub fn promote_run(&self, session_id: Uuid, run_id: &str) -> Result<RunRecord> {
+    #[allow(dead_code)] // crate-private raw RunRecord helper; product APIs use PublicRun.
+    pub(crate) fn promote_run(&self, session_id: Uuid, run_id: &str) -> Result<RunRecord> {
         self.promote_run_with_approval(session_id, run_id, None)
     }
 
     /// Promote a run using a persisted, exact-scope approval. Unlike the
     /// desktop-only review marker, this survives restart and is revalidated
     /// against the current worktree immediately before Git is changed.
-    pub fn promote_run_with_approval(
+    pub(crate) fn promote_run_with_approval(
         &self,
         session_id: Uuid,
         run_id: &str,
@@ -2636,7 +2702,7 @@ impl AgentHostHandle {
     }
 
     /// Explicitly discard an isolated run's managed worktree.
-    pub fn discard_run(&self, session_id: Uuid, run_id: &str) -> Result<RunRecord> {
+    pub(crate) fn discard_run(&self, session_id: Uuid, run_id: &str) -> Result<RunRecord> {
         self.with_promotion_lock(run_id, || {
             let store = self.ensure_orchestration_store()?;
             let run = store
@@ -2685,7 +2751,7 @@ impl AgentHostHandle {
         persistent_agent: Option<&AgentRecord>,
         external_provider_route: Option<&ProviderRouteSnapshot>,
     ) -> Result<DesktopTurnSnapshot> {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
         if !g.running {
             bail!("agent not started");
         }
@@ -2717,19 +2783,123 @@ impl AgentHostHandle {
         let effort = external_provider_route
             .map(|route| route.effort)
             .unwrap_or(g.effort);
+        let (cwd, plan_mode, kind, execution_mode) = {
+            let session = g
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            (
+                session.cwd.clone(),
+                session.plan_mode,
+                session.kind,
+                session.execution_mode,
+            )
+        };
+        g.next_turn_generation += 1;
+        let fence = AdmissionFence {
+            token: g.next_turn_generation,
+            cwd: cwd.clone(),
+            model: model.clone(),
+            agent_id: persistent_agent.map(|agent| agent.agent_id.clone()),
+            spec_revision: persistent_agent
+                .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
+            plan_mode,
+            kind,
+            execution_mode,
+            reservation_owner: reservation_owner.map(str::to_string),
+        };
+        g.admission_fences.insert(session_id, fence.clone());
+        Ok(DesktopTurnSnapshot {
+            fence,
+            cwd,
+            model,
+            effort,
+            plan_mode,
+            kind,
+            execution_mode,
+            event_tx: g.event_tx.clone(),
+        })
+    }
+
+    fn validate_admission_fence(
+        g: &Inner,
+        session_id: Uuid,
+        snapshot: &DesktopTurnSnapshot,
+        reservation_owner: Option<&str>,
+    ) -> Result<()> {
+        let current_fence = g
+            .admission_fences
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("admission fence is missing"))?;
+        if current_fence != &snapshot.fence {
+            bail!("admission fence does not match inspect snapshot");
+        }
         let session = g
             .sessions
             .get(&session_id)
             .ok_or_else(|| anyhow!("unknown session"))?;
-        Ok(DesktopTurnSnapshot {
-            cwd: session.cwd.clone(),
-            model,
-            effort,
-            plan_mode: session.plan_mode,
-            kind: session.kind,
-            execution_mode: session.execution_mode,
-            event_tx: g.event_tx.clone(),
-        })
+        if session.cwd != snapshot.fence.cwd
+            || snapshot.model != snapshot.fence.model
+            || session.plan_mode != snapshot.fence.plan_mode
+            || session.kind != snapshot.fence.kind
+            || session.execution_mode != snapshot.fence.execution_mode
+        {
+            bail!("session identity changed after inspect");
+        }
+        if session.agent_id.is_some() && session.agent_id != snapshot.fence.agent_id {
+            bail!("session agent rebinding after inspect");
+        }
+        if snapshot.fence.spec_revision.is_none() && g.model != snapshot.fence.model {
+            bail!("model changed after inspect");
+        }
+        match reservation_owner {
+            Some(owner)
+                if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner)
+                    && snapshot.fence.reservation_owner.as_deref() == Some(owner) => {}
+            Some(_) => bail!("missing or mismatched turn reservation"),
+            None if g.turn_reservations.contains_key(&session_id)
+                || snapshot.fence.reservation_owner.is_some() =>
+            {
+                bail!("session already has an active turn");
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn preflight_admission_fence(
+        &self,
+        session_id: Uuid,
+        reservation_owner: Option<&str>,
+        snapshot: &DesktopTurnSnapshot,
+    ) -> Result<()> {
+        if let (Some(agent_id), Some(expected_revision)) = (
+            snapshot.fence.agent_id.as_deref(),
+            snapshot.fence.spec_revision,
+        ) {
+            if let Some(store) = self.orchestration_store() {
+                if let Some(agent) = store.load_agent(agent_id)? {
+                    let revision = agent
+                        .current_spec()
+                        .map_err(|error| anyhow!(error.to_string()))?
+                        .revision;
+                    if revision != expected_revision {
+                        bail!("agent specification changed after inspect");
+                    }
+                    let selection_key = agent
+                        .current_spec()
+                        .map_err(|error| anyhow!(error.to_string()))?
+                        .model
+                        .selection_key
+                        .clone();
+                    if selection_key != snapshot.fence.model {
+                        bail!("agent model changed after inspect");
+                    }
+                }
+            }
+        }
+        let g = self.inner.lock();
+        Self::validate_admission_fence(&g, session_id, snapshot, reservation_owner)
     }
 
     fn commit_admitted_turn(
@@ -2748,19 +2918,24 @@ impl AgentHostHandle {
         if g.turn_cancels.contains_key(&session_id) {
             bail!("session already has an active turn");
         }
+        Self::validate_admission_fence(&g, session_id, snapshot, reservation_owner)?;
         match reservation_owner {
             Some(owner)
-                if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) =>
+                if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner)
+                    && snapshot.fence.reservation_owner.as_deref() == Some(owner) =>
             {
                 g.turn_reservations.remove(&session_id);
                 g.drain_reservations.remove(&session_id);
             }
             Some(_) => bail!("missing or mismatched turn reservation"),
-            None if g.turn_reservations.contains_key(&session_id) => {
+            None if g.turn_reservations.contains_key(&session_id)
+                || snapshot.fence.reservation_owner.is_some() =>
+            {
                 bail!("session already has an active turn");
             }
             None => {}
         }
+        g.admission_fences.remove(&session_id);
         let cancel = CancellationToken::new();
         g.turn_cancels.insert(session_id, cancel.clone());
         g.begin_turn_generation(session_id);
@@ -2813,6 +2988,61 @@ impl AgentHostHandle {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn inject_fence_race(&self, session_id: Uuid) -> Result<()> {
+        let cut = *self.desktop_admission_cutpoint.lock();
+        let Some(cut) = cut else {
+            return Ok(());
+        };
+        match cut {
+            DesktopAdmissionCutpoint::FenceCloseSession => {
+                *self.desktop_admission_cutpoint.lock() = None;
+                self.inner.lock().sessions.remove(&session_id);
+            }
+            DesktopAdmissionCutpoint::FenceRebindAgent => {
+                *self.desktop_admission_cutpoint.lock() = None;
+                if let Some(session) = self.inner.lock().sessions.get_mut(&session_id) {
+                    session.agent_id = Some("rebound-agent".into());
+                }
+            }
+            DesktopAdmissionCutpoint::FenceChangeModel => {
+                *self.desktop_admission_cutpoint.lock() = None;
+                let mut g = self.inner.lock();
+                g.model = "fence-model-race".into();
+                if let Some(fence) = g.admission_fences.get_mut(&session_id) {
+                    fence.model = "fence-model-race".into();
+                }
+            }
+            DesktopAdmissionCutpoint::FenceChangeSpec => {
+                *self.desktop_admission_cutpoint.lock() = None;
+                let agent_id = self
+                    .inner
+                    .lock()
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.agent_id.clone());
+                if let Some(agent_id) = agent_id {
+                    let store = self.ensure_orchestration_store()?;
+                    store
+                        .revise_agent_spec(&agent_id, "fence-race", |spec| {
+                            spec.role = "fence-race".into();
+                            Ok(())
+                        })
+                        .map_err(|error| anyhow!(error))?;
+                }
+            }
+            DesktopAdmissionCutpoint::FenceStealReservation => {
+                *self.desktop_admission_cutpoint.lock() = None;
+                self.inner
+                    .lock()
+                    .turn_reservations
+                    .insert(session_id, "thief".into());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // Keeps durable run identity inputs explicit.
     fn admit_desktop_build_run(
         &self,
@@ -2827,6 +3057,7 @@ impl AgentHostHandle {
         agent_spec_revision: Option<u64>,
         parent_run_id: Option<String>,
         continuation: Option<&AgentContinuationPlan>,
+        pending_agent: Option<&AgentRecord>,
     ) -> Result<(String, OrchStore)> {
         #[cfg(test)]
         self.fail_admission_cutpoint(
@@ -2909,15 +3140,35 @@ impl AgentHostHandle {
             None => None,
         };
         let persisted = match (agent_id.as_deref(), reservation.as_ref()) {
-            (Some(agent_id), Some(reservation)) => {
-                store.save_run_and_activate_agent_with_quota(&run, agent_id, reservation)
-            }
-            (Some(agent_id), None) => store.save_run_and_activate_agent(&run, agent_id),
-            (None, Some(reservation)) => store.save_run_with_quota(&run, reservation),
-            (None, None) => store.save_run(&run),
+            (Some(agent_id), Some(reservation)) => store
+                .admit_run_and_activate_agent_with_candidate(
+                    &run,
+                    agent_id,
+                    Some(reservation),
+                    pending_agent,
+                ),
+            (Some(agent_id), None) => store.admit_run_and_activate_agent_with_candidate(
+                &run,
+                agent_id,
+                None,
+                pending_agent,
+            ),
+            (None, Some(reservation)) => store.admit_run_with_quota(&run, reservation),
+            (None, None) => match store.save_run(&run) {
+                Ok(()) => crate::orchestration::DurableAdmission::Committed,
+                Err(error) => crate::orchestration::DurableAdmission::DefinitelyNotCommitted(error),
+            },
         };
-        if let Err(error) = persisted {
-            return Err(Self::map_desktop_admission_error(error));
+        match persisted {
+            crate::orchestration::DurableAdmission::Committed => {}
+            crate::orchestration::DurableAdmission::DefinitelyNotCommitted(error) => {
+                return Err(Self::map_desktop_admission_error(error));
+            }
+            crate::orchestration::DurableAdmission::Uncertain(error) => {
+                return Err(Self::map_desktop_admission_error(anyhow!(
+                    "durable admission is uncertain: {error}"
+                )));
+            }
         }
         #[cfg(test)]
         if self
@@ -2929,7 +3180,13 @@ impl AgentHostHandle {
             })
         {
             *self.desktop_admission_cutpoint.lock() = None;
-            let _ = store.abort_unstarted_run_admission(&run_id);
+            store
+                .terminalize_unstarted_admission(
+                    &run_id,
+                    "admission_aborted",
+                    "injected post-persist admission fault",
+                )
+                .into_result()?;
             bail!("injected post-persist admission fault");
         }
         Ok((run_id, store))
@@ -3356,6 +3613,7 @@ impl AgentHostHandle {
         self.invalidate_computer_agent_authority();
         let mut g = self.inner.lock();
         g.turn_generations.clear();
+        g.admission_fences.clear();
         for (_, c) in g.turn_cancels.drain() {
             c.cancel();
         }
@@ -6293,30 +6551,23 @@ impl AgentHostHandle {
     /// follows those steps (plan → execute pipeline).
     pub async fn accept_plan(&self, session_id: Uuid) -> Result<String> {
         self.ensure_session_accepts_new_work(session_id)?;
-        let (steps, goal) = {
-            let mut g = self.inner.lock();
+        let (steps, goal, prior_mode, prior_status) = {
+            let g = self.inner.lock();
             let s = g
                 .sessions
-                .get_mut(&session_id)
+                .get(&session_id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
             if s.plan_steps.is_empty() {
                 bail!("no plan to accept");
             }
-            s.plan_mode = false;
-            s.plan_status = "accepted".into();
-            let steps = s.plan_steps.clone();
-            let goal = s
-                .plan_goal
-                .clone()
-                .unwrap_or_else(|| "complete the proposed plan".into());
-            let tx = g.event_tx.clone();
-            drop(g);
-            let _ = tx.send(SessionUpdate::Plan {
-                session_id,
-                steps: steps.clone(),
-                status: "accepted".into(),
-            });
-            (steps, goal)
+            (
+                s.plan_steps.clone(),
+                s.plan_goal
+                    .clone()
+                    .unwrap_or_else(|| "complete the proposed plan".into()),
+                s.plan_mode,
+                s.plan_status.clone(),
+            )
         };
 
         let mut numbered = String::new();
@@ -6329,20 +6580,13 @@ impl AgentHostHandle {
              Goal: {goal}\n\nPlan:\n{numbered}"
         );
 
-        {
-            let mut g = self.inner.lock();
-            if let Some(s) = g.sessions.get_mut(&session_id) {
-                s.plan_status = "executing".into();
-            }
-        }
         let reply = match self.session_prompt(session_id, exec_prompt).await {
             Ok(reply) => reply,
             Err(error) => {
                 let mut g = self.inner.lock();
                 if let Some(session) = g.sessions.get_mut(&session_id) {
-                    if session.plan_status == "executing" {
-                        session.plan_status = "accepted".into();
-                    }
+                    session.plan_mode = prior_mode;
+                    session.plan_status = prior_status;
                 }
                 return Err(error);
             }
@@ -6350,6 +6594,7 @@ impl AgentHostHandle {
         {
             let mut g = self.inner.lock();
             if let Some(s) = g.sessions.get_mut(&session_id) {
+                s.plan_mode = false;
                 s.plan_status = "done".into();
             }
             let tx = g.event_tx.clone();
@@ -7367,11 +7612,16 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("unknown session"))?
                 .kind;
             if kind == SessionKind::Build {
-                Some(self.ensure_session_agent(session_id)?)
+                let (agent, created_new) = self.prepare_session_agent(session_id)?;
+                Some((agent, created_new))
             } else {
                 None
             }
         };
+        let first_use_unpersisted = persistent_agent
+            .as_ref()
+            .is_some_and(|(_, created_new)| *created_new);
+        let persistent_agent = persistent_agent.map(|(agent, _)| agent);
         let (external_agent_spec, external_provider_route) = if let Some(external) =
             external_run.as_ref()
         {
@@ -7510,6 +7760,9 @@ impl AgentHostHandle {
             persistent_agent.as_ref(),
             external_provider_route.as_ref(),
         )?;
+        #[cfg(test)]
+        self.inject_fence_race(session_id)?;
+        self.preflight_admission_fence(session_id, reservation_owner, &snapshot)?;
         let cwd = snapshot.cwd.clone();
         let model = snapshot.model.clone();
         let effort = snapshot.effort;
@@ -7553,9 +7806,11 @@ impl AgentHostHandle {
             }
             None => None,
         };
+        self.preflight_admission_fence(session_id, reservation_owner, &snapshot)?;
         let turn_id = Uuid::new_v4();
         let start_seq = event_tx.current_seq();
         let agent = persistent_agent;
+        let pending_agent = first_use_unpersisted.then_some(agent.as_ref()).flatten();
         let desktop_run = if external_run.is_none() && kind == SessionKind::Build {
             let mut bounds = effective_agent_bounds.clone().unwrap_or_default();
             if let Some(rounds) = effective_max_rounds {
@@ -7575,6 +7830,7 @@ impl AgentHostHandle {
                     .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
                 resume.as_ref().map(|plan| plan.parent_run_id.clone()),
                 resume.as_ref(),
+                pending_agent,
             ) {
                 Ok(admitted) => Some(admitted),
                 Err(error) if resume.is_some() => {
@@ -7590,6 +7846,22 @@ impl AgentHostHandle {
         if resume.is_some() && desktop_run.is_none() {
             bail!("persistent continuation could not create and activate its durable Run");
         }
+        if first_use_unpersisted {
+            if let Some(agent) = agent.as_ref() {
+                if let Err(error) = self.bind_session_agent_id(session_id, &agent.agent_id) {
+                    if let Some((run_id, store)) = desktop_run.as_ref() {
+                        store
+                            .terminalize_unstarted_admission(
+                                run_id,
+                                "session_bind_failed",
+                                &error.to_string(),
+                            )
+                            .into_result()?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
 
         // ── session mutation after durable admission ──
         let cancel = match self.commit_admitted_turn(
@@ -7603,7 +7875,13 @@ impl AgentHostHandle {
             Ok(cancel) => cancel,
             Err(error) => {
                 if let Some((run_id, store)) = desktop_run.as_ref() {
-                    let _ = store.abort_unstarted_run_admission(run_id);
+                    store
+                        .terminalize_unstarted_admission(
+                            run_id,
+                            "session_commit_failed",
+                            &error.to_string(),
+                        )
+                        .into_result()?;
                 }
                 return Err(error);
             }
@@ -7629,7 +7907,13 @@ impl AgentHostHandle {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     if let Some((run_id, store)) = desktop_run.as_ref() {
-                        let _ = store.abort_unstarted_run_admission(run_id);
+                        store
+                            .terminalize_unstarted_admission(
+                                run_id,
+                                "worktree_prepare_failed",
+                                &error.to_string(),
+                            )
+                            .into_result()?;
                     }
                     return Err(error);
                 }
@@ -7711,9 +7995,22 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("external run disappeared before token accounting"))?;
             Some(RunUsageTracker::from_run(store, &run))
         } else if let Some((run_id, store)) = desktop_run.as_ref() {
-            store
-                .load_run(run_id)?
-                .map(|run| RunUsageTracker::from_run(store.clone(), &run))
+            match store.load_run(run_id) {
+                Ok(Some(run)) => Some(RunUsageTracker::from_run(store.clone(), &run)),
+                other => {
+                    let detail = match other {
+                        Ok(None) => {
+                            "admitted Run disappeared before tracker construction".to_string()
+                        }
+                        Err(error) => error.to_string(),
+                        Ok(Some(_)) => unreachable!(),
+                    };
+                    store
+                        .terminalize_unstarted_admission(run_id, "run_reload_failed", &detail)
+                        .into_result()?;
+                    bail!("{detail}");
+                }
+            }
         } else {
             None
         };
