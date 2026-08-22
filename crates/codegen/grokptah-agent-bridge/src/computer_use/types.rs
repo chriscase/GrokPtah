@@ -116,9 +116,10 @@ pub enum IsolationProofOrigin {
 }
 
 /// Host-attested capability proof. This is the security boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ComputerCapabilityProof {
+    #[default]
     Unproven,
     ForegroundSemantic {
         backend_id: String,
@@ -146,12 +147,6 @@ pub enum ComputerCapabilityProof {
         key_chords: bool,
         pointer_fallback: bool,
     },
-}
-
-impl Default for ComputerCapabilityProof {
-    fn default() -> Self {
-        Self::Unproven
-    }
 }
 
 impl ComputerCapabilityProof {
@@ -289,10 +284,7 @@ impl ComputerCapabilityProof {
                         "background-safe measurement identity must be host-issued",
                     ));
                 }
-                if MACOS_NATIVE_BACKEND_IDS
-                    .iter()
-                    .any(|id| *id == backend_id.as_str())
-                {
+                if is_native_macos_backend(backend_id) {
                     return Err(ComputerError::new(
                         ComputerErrorCode::ForbiddenAction,
                         "a native macOS backend cannot carry background-safe proof",
@@ -321,10 +313,7 @@ impl ComputerCapabilityProof {
                         "isolated input-domain identity must be host-issued",
                     ));
                 }
-                if MACOS_NATIVE_BACKEND_IDS
-                    .iter()
-                    .any(|id| *id == backend_id.as_str())
-                {
+                if is_native_macos_backend(backend_id) {
                     return Err(ComputerError::new(
                         ComputerErrorCode::ForbiddenAction,
                         "a native macOS backend cannot carry isolated-input proof",
@@ -483,6 +472,10 @@ fn parse_isolated_proof(value: &serde_json::Value) -> ComputerResult<ComputerCap
 pub const MACOS_NATIVE_BACKEND_ID: &str = "macos_accessibility_semantic";
 pub const MACOS_INTERRUPTED_BACKEND_ID: &str = "macos_interrupted";
 const MACOS_NATIVE_BACKEND_IDS: &[&str] = &[MACOS_NATIVE_BACKEND_ID, MACOS_INTERRUPTED_BACKEND_ID];
+
+fn is_native_macos_backend(backend_id: &str) -> bool {
+    MACOS_NATIVE_BACKEND_IDS.contains(&backend_id)
+}
 pub const SIMULATOR_FOREGROUND_BACKEND_ID: &str = "deterministic_simulator";
 pub const SIMULATOR_BACKGROUND_BACKEND_ID: &str = "deterministic_simulator_background_safe";
 pub const SIMULATOR_ISOLATED_BACKEND_ID: &str = "deterministic_simulator_isolated";
@@ -1599,9 +1592,7 @@ impl ComputerRun {
         }
         surface.validate()?;
         proof.validate()?;
-        if MACOS_NATIVE_BACKEND_IDS
-            .iter()
-            .any(|id| *id == proof.backend_id())
+        if is_native_macos_backend(proof.backend_id())
             && !matches!(proof, ComputerCapabilityProof::ForegroundSemantic { .. })
         {
             return Err(ComputerError::new(
