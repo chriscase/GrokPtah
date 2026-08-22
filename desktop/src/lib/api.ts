@@ -22,6 +22,7 @@ import type {
   RunReview,
   WorkspaceUiState,
   ProviderQualificationReport,
+  NativeCodingReadinessProjection,
   PersistentAgent,
   PersistentAgentResumePlan,
   LaneSummary,
@@ -772,6 +773,11 @@ export const api = {
   scheduleBackgroundTask: (title: string) =>
     invoke("schedule_background_task", { title }),
   settingsSnapshot: () => invoke<Record<string, unknown>>("settings_snapshot"),
+  nativeCodingReadiness: (providerId: string, modelId: string) =>
+    invoke<NativeCodingReadinessProjection>("native_coding_readiness", {
+      providerId,
+      modelId,
+    }),
   setSandbox: (profile: string) => invoke<void>("set_sandbox", { profile }),
   setSubagentIsolation: (mode: "worktree" | "shared") =>
     invoke<void>("set_subagent_isolation", { mode }),

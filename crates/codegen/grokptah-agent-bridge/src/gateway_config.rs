@@ -857,6 +857,32 @@ fn load_managed_qualifications() -> io::Result<ManagedQualificationStore> {
     Ok(store)
 }
 
+/// True when the host has measured this xAI model before, regardless of the
+/// route or credential identity that produced the measurement.
+///
+/// Admission uses this only as a downgrade fence: a new autonomous Execution
+/// Run may start from declared capabilities before first qualification, but it
+/// may not silently fall back to declared tool claims after a measured route
+/// becomes stale. The operator must requalify the new exact route first.
+pub(crate) fn has_measured_xai_qualification(
+    provider_id: &str,
+    model_id: &str,
+) -> io::Result<bool> {
+    if provider_id != XAI_PROVIDER_ID {
+        return Ok(false);
+    }
+    Ok(load_managed_qualifications()?
+        .qualifications
+        .into_iter()
+        .any(|record| {
+            record.provider_id == provider_id
+                && record.model_id == model_id
+                && record.capabilities.source == CapabilitySource::Measured
+                && record.capabilities.qualification_schema.as_deref()
+                    == Some(CAPABILITY_QUALIFICATION_SCHEMA)
+        }))
+}
+
 fn save_managed_qualifications(store: &ManagedQualificationStore) -> io::Result<()> {
     let path = managed_qualifications_path();
     if path.exists() {
@@ -1395,6 +1421,9 @@ mod tests {
 
         let store = load_managed_qualifications().unwrap();
         assert_eq!(store.qualifications.len(), 3);
+        assert!(has_measured_xai_qualification(XAI_PROVIDER_ID, "grok-route").unwrap());
+        assert!(!has_measured_xai_qualification(XAI_PROVIDER_ID, "never-measured").unwrap());
+        assert!(!has_measured_xai_qualification("compatible-provider", "grok-route").unwrap());
         let failed = store
             .qualifications
             .iter()

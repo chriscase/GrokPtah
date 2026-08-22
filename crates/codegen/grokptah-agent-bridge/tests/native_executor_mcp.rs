@@ -2,19 +2,26 @@
 
 mod common;
 
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
 use grokptah_agent_bridge::orchestration::{
     AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
-    MANAGED_EXECUTION_SCHEMA_VERSION,
+    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, ProviderAttemptState,
+    ProviderRetryClass, ProviderRoute, ProviderSendCertainty, QuotaClass, QuotaReservationState,
+    RunBounds, RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState,
+    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
-    McpRemoteError, SessionKind, SessionUpdate,
+    model_selection_key, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
+    McpControlClient, McpRemoteError, SessionKind, SessionUpdate,
 };
 use serde_json::json;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tempfile::tempdir;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use common::ProcessEnvGuard;
@@ -223,14 +230,46 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
         .filter(|intent| intent["workId"] == work_id)
         .count();
     assert!(work_intents <= 1);
+    for intent in listed {
+        let route = intent["providerRoute"]
+            .as_object()
+            .expect("every admitted intent carries an exact provider route");
+        assert!(route["providerId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert!(route["modelId"].as_str().is_some_and(|id| !id.is_empty()));
+    }
+    let admission = &intents.structured["providerAdmission"];
+    assert!(admission["maxConcurrentRunsPerProvider"]
+        .as_u64()
+        .is_some_and(|ceiling| ceiling > 0));
+    assert!(admission["liveInScopeByProvider"].is_object());
+    // Every live intent this caller can read is accounted for, and nothing
+    // from another Lane leaks into the breakdown.
+    let in_scope: u64 = admission["liveInScopeByProvider"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|count| count.as_u64().unwrap())
+        .sum();
+    assert!(in_scope <= listed.len() as u64);
 
     let capacity = client
         .call_tool("ptah_get_capacity", json!({}))
         .await
         .unwrap();
-    assert!(capacity.structured["health"]["nativeExecutor"]["enabled"]
-        .as_bool()
-        .unwrap());
+    let executor = &capacity.structured["health"]["nativeExecutor"];
+    assert!(executor["enabled"].as_bool().unwrap());
+    for counter in [
+        "skippedProviderCapacity",
+        "skippedUnroutable",
+        "maxConcurrentProviderRuns",
+    ] {
+        assert!(
+            executor[counter].as_u64().is_some(),
+            "missing provider counter {counter}"
+        );
+    }
 
     orch.stop_background_tasks().await;
     client.close_session().await.unwrap();
@@ -390,6 +429,7 @@ fn run_record(
         client_id: Some("native-executor".into()),
         state,
         purpose: Default::default(),
+        provider_route: None,
         agent_id: Some(agent_id.into()),
         retry_of: None,
         parent_run_id: None,
@@ -465,6 +505,10 @@ fn seed_admitted_work(
         source_routine_id: None,
         source_activation_id: None,
         model_selection_key: "grok".into(),
+        provider_route: Some(ProviderRoute {
+            provider_id: "xai".into(),
+            model_id: "grok".into(),
+        }),
         bounds: RunBounds::default(),
         input_hash: "hash".into(),
         state: ManagedIntentState::Admitted,
@@ -533,11 +577,381 @@ async fn boot_native(
     )
 }
 
+#[derive(Clone)]
+struct BlockingProviderState {
+    requests: Arc<AtomicUsize>,
+    release: Arc<Semaphore>,
+}
+
+async fn blocking_provider(State(state): State<BlockingProviderState>) -> Json<serde_json::Value> {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    let permit = state
+        .release
+        .acquire()
+        .await
+        .expect("provider response release semaphore must stay open");
+    permit.forget();
+    Json(json!({
+        "choices": [{"message": {"content": "native route snapshot verified"}}],
+        "usage": {
+            "prompt_tokens": 6,
+            "completion_tokens": 4,
+            "total_tokens": 10
+        }
+    }))
+}
+
+#[derive(Clone)]
+struct ProposalProviderState {
+    requests: Arc<AtomicUsize>,
+    saw_host_denial: Arc<AtomicBool>,
+}
+
+async fn proposal_only_provider(
+    State(state): State<ProposalProviderState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let request = state.requests.fetch_add(1, Ordering::SeqCst);
+    let message = if request == 0 {
+        json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "proposal-write",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": "{\"path\":\"proposal-escape.txt\",\"content\":\"must never be written\\n\"}"
+                }
+            }]
+        })
+    } else {
+        let saw_denial = body["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "proposal-write"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("DENIED by deny rule"))
+            })
+        });
+        state.saw_host_denial.store(saw_denial, Ordering::SeqCst);
+        json!({"content": "No safe mutation was performed; returning a proposal only."})
+    };
+    Json(json!({
+        "choices": [{"message": message}],
+        "usage": {
+            "prompt_tokens": 6,
+            "completion_tokens": 4,
+            "total_tokens": 10
+        }
+    }))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(blocking_provider))
+        .with_state(BlockingProviderState {
+            requests: requests.clone(),
+            release: release.clone(),
+        });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.remove("GROKPTAH_AGENT_OFFLINE");
+    env.set("GROKPTAH_API_BASE", format!("http://{address}/v1"));
+    env.set("GROKPTAH_API_KEY", "synthetic-native-route-key");
+
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let selection = model_selection_key("env-grokptah", "native-route-model");
+    host.set_model(selection.clone());
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let agent = host.ensure_session_agent(lane.id).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orchestration")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let workspace_text = workspace.path().display().to_string();
+    orch.set_managed_execution(
+        &auth(),
+        lane.id,
+        workspace.path(),
+        &agent.agent_id,
+        retry_policy(false),
+    )
+    .unwrap();
+
+    let admitted_agent = orch.store().load_agent(&agent.agent_id).unwrap().unwrap();
+    let admitted_spec = admitted_agent.current_spec().unwrap().clone();
+    assert_eq!(admitted_spec.model.selection_key, selection);
+
+    let mut work = WorkItem::new(
+        "native",
+        "Verify the frozen provider route at native admission",
+        lane.id,
+        workspace_text,
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    work.assigned_agent_id = Some(agent.agent_id.clone());
+    work.assignment_status = AssignmentStatus::Accepted;
+    work.validate().unwrap();
+    orch.store().save_work_item(&work).unwrap();
+
+    orch.drive_native_executor_once().await;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let (intent, run) = loop {
+        let intent = orch
+            .store()
+            .list_managed_intents()
+            .unwrap()
+            .into_iter()
+            .find(|intent| intent.work_id == work.work_id);
+        let run = intent.as_ref().and_then(|intent| {
+            orch.store()
+                .find_run_by_request_id(&intent.intent_id)
+                .unwrap()
+        });
+        if requests.load(Ordering::SeqCst) > 0 {
+            if let (Some(intent), Some(run)) = (intent, run) {
+                break (intent, run);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "provider execution did not reach the blocked fake transport"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    };
+
+    let intent_route = intent
+        .provider_route
+        .as_ref()
+        .expect("native intent must record its exact provider identity");
+    let run_route = run
+        .provider_route
+        .as_ref()
+        .expect("online native Run must persist a frozen provider route");
+    assert_eq!(intent.agent_spec_revision, admitted_spec.revision);
+    assert_eq!(run.agent_spec_revision, Some(admitted_spec.revision));
+    assert_eq!(
+        intent.model_selection_key,
+        admitted_spec.model.selection_key
+    );
+    assert_eq!(run_route.selection_key, admitted_spec.model.selection_key);
+    assert_eq!(intent_route.provider_id, run_route.provider_id);
+    assert_eq!(intent_route.model_id, run_route.model_id);
+    assert_eq!(run_route.provider_id, admitted_spec.model.provider_id);
+    assert_eq!(run_route.model_id, admitted_spec.model.model_id);
+    assert_eq!(run_route.wire_model_id, "native-route-model");
+    assert_eq!(run_route.base_url, format!("http://{address}/v1"));
+    run_route.validate().unwrap();
+    assert_eq!(run_route.quota_class, Some(QuotaClass::CodingExecution));
+    let quota_id = run_route
+        .quota_reservation_id
+        .as_deref()
+        .expect("online native Run must link its durable quota reservation");
+    let reservation = orch
+        .store()
+        .load_quota_reservation(quota_id)
+        .unwrap()
+        .expect("quota reservation must exist before provider execution");
+    assert_eq!(reservation.run_id, run.run_id);
+    assert_eq!(reservation.route_snapshot_hash, run_route.snapshot_hash);
+    assert_eq!(reservation.state, QuotaReservationState::Reserved);
+    let admitted_attempts = orch.store().list_provider_attempts().unwrap();
+    assert_eq!(admitted_attempts.len(), 1);
+    assert_eq!(admitted_attempts[0].run_id, run.run_id);
+    assert_eq!(admitted_attempts[0].state, ProviderAttemptState::Admitted);
+    assert_eq!(admitted_attempts[0].send_certainty, None);
+    let admitted_view = orch
+        .get_run_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
+        .unwrap();
+    let provider_execution = &admitted_view["providerExecution"];
+    assert_eq!(provider_execution["route"]["providerId"], "env-grokptah");
+    assert_eq!(
+        provider_execution["route"]["wireModelId"],
+        "native-route-model"
+    );
+    assert_eq!(
+        provider_execution["route"]["snapshotHash"],
+        run_route.snapshot_hash
+    );
+    assert_eq!(provider_execution["quota"]["state"], "reserved");
+    assert_eq!(provider_execution["attemptCount"], 1);
+    assert_eq!(provider_execution["attempts"][0]["state"], "admitted");
+    assert!(provider_execution["route"].get("credentialRef").is_none());
+    assert!(provider_execution["route"]
+        .get("credentialFingerprint")
+        .is_none());
+    assert!(provider_execution["route"].get("baseUrl").is_none());
+    let projection_text = provider_execution.to_string();
+    assert!(!projection_text.contains(&run_route.credential_ref));
+    assert!(!projection_text.contains(&run_route.credential_fingerprint));
+    assert!(!projection_text.contains(&run_route.base_url));
+    let progress = orch
+        .get_progress_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
+        .unwrap();
+    assert_eq!(progress["providerExecution"], *provider_execution);
+    let admitted_capacity = orch.get_capacity(&auth()).unwrap();
+    assert_eq!(admitted_capacity["providerQuota"]["activeReservations"], 1);
+    assert_eq!(
+        admitted_capacity["providerQuota"]["providers"][0],
+        "env-grokptah"
+    );
+    let foreign_capacity = orch
+        .get_capacity(&AuthContext {
+            token_id: "foreign-token".into(),
+            owner_id: "foreign-owner".into(),
+        })
+        .unwrap();
+    assert_eq!(foreign_capacity["providerQuota"]["activeReservations"], 0);
+    assert_eq!(foreign_capacity["providerQuota"]["providerCount"], 0);
+
+    release.add_permits(1);
+    let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let current = orch.store().load_run(&run.run_id).unwrap().unwrap();
+        if current.state.is_terminal() {
+            assert_eq!(current.provider_route.as_ref(), Some(run_route));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < settle_deadline,
+            "native Run did not settle after releasing the fake provider"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    let settled_reservation = orch
+        .store()
+        .load_quota_reservation(quota_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled_reservation.state, QuotaReservationState::Consumed);
+    assert_eq!(settled_reservation.tokens_consumed, 10);
+    assert_eq!(settled_reservation.requests_consumed, 1);
+    let settled_attempts = orch.store().list_provider_attempts().unwrap();
+    assert_eq!(settled_attempts.len(), 1);
+    assert_eq!(settled_attempts[0].state, ProviderAttemptState::Finished);
+    assert_eq!(
+        settled_attempts[0].send_certainty,
+        Some(ProviderSendCertainty::KnownAccepted)
+    );
+    assert_eq!(
+        settled_attempts[0].retry_class,
+        Some(ProviderRetryClass::ExplicitNewRunOnly)
+    );
+    assert_eq!(
+        settled_attempts[0]
+            .usage
+            .as_ref()
+            .map(|usage| usage.total_tokens),
+        Some(10)
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    let settled_view = orch
+        .get_run_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
+        .unwrap();
+    assert_eq!(
+        settled_view["providerExecution"]["quota"]["state"],
+        "consumed"
+    );
+    assert_eq!(
+        settled_view["providerExecution"]["attempts"][0]["sendCertainty"],
+        "known_accepted"
+    );
+    assert_eq!(
+        settled_view["providerExecution"]["attempts"][0]["retryClass"],
+        "explicit_new_run_only"
+    );
+    let settled_capacity = orch.get_capacity(&auth()).unwrap();
+    assert_eq!(settled_capacity["providerQuota"]["activeReservations"], 0);
+    assert_eq!(settled_capacity["providerQuota"]["consumedReservations"], 1);
+    assert_eq!(settled_capacity["providerQuota"]["tokensConsumed"], 10);
+
+    orch.stop_background_tasks().await;
+    host.stop().unwrap();
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn manager_decision_native_admission_has_durable_proposal_purpose() {
-    let (_env, _home, _workspace, _host, orch, session, agent_id, workspace_text) =
-        boot_native(false).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let saw_host_denial = Arc::new(AtomicBool::new(false));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(proposal_only_provider))
+        .with_state(ProposalProviderState {
+            requests: requests.clone(),
+            saw_host_denial: saw_host_denial.clone(),
+        });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.remove("GROKPTAH_AGENT_OFFLINE");
+    env.set("GROKPTAH_API_BASE", format!("http://{address}/v1"));
+    env.set("GROKPTAH_API_KEY", "synthetic-proposal-key");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.set_model(model_selection_key("env-grokptah", "proposal-model"));
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let agent = host.ensure_session_agent(lane.id).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orchestration")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let session = lane.id;
+    let agent_id = agent.agent_id;
+    let workspace_text = workspace.path().display().to_string();
+    orch.set_managed_execution(
+        &auth(),
+        session,
+        workspace.path(),
+        &agent_id,
+        retry_policy(false),
+    )
+    .unwrap();
     let mut work = WorkItem::new(
         "manager-decision",
         "return exactly one typed manager directive envelope",
@@ -593,6 +1007,28 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     assert_eq!(run.agent_id.as_deref(), Some(agent_id.as_str()));
     assert_eq!(run.agent_spec_revision, Some(intent.agent_spec_revision));
 
+    // The durable intent names the exact provider identity and model the host
+    // routed to, captured before the provider task was spawned.
+    let admitted_agent = orch.store().load_agent(&agent_id).unwrap().unwrap();
+    let admitted_spec = admitted_agent.current_spec().unwrap();
+    let route = intent
+        .provider_route
+        .as_ref()
+        .expect("native admission records an exact provider route");
+    assert_eq!(route.provider_id, admitted_spec.model.provider_id);
+    assert_eq!(route.model_id, admitted_spec.model.model_id);
+    assert!(!route.provider_id.is_empty() && !route.model_id.is_empty());
+    assert_eq!(
+        intent.effective_provider_id().as_deref(),
+        Some(admitted_spec.model.provider_id.as_str())
+    );
+    assert_eq!(
+        run.provider_route
+            .as_ref()
+            .and_then(|route| route.quota_class),
+        Some(QuotaClass::ManagerProposal)
+    );
+
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         let agent = orch.store().load_agent(&agent_id).unwrap().unwrap();
@@ -603,8 +1039,21 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
         run = orch.store().load_run(&run_id).unwrap().unwrap();
     }
     assert!(run.state.is_terminal(), "proposal Run did not settle");
+    orch.drive_native_executor_once().await;
     let agent = orch.store().load_agent(&agent_id).unwrap().unwrap();
     assert_ne!(agent.current_run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert!(saw_host_denial.load(Ordering::SeqCst));
+    assert!(!workspace.path().join("proposal-escape.txt").exists());
+    assert_eq!(run.aggregates.permissions_requested, 0);
+    assert_eq!(run.aggregates.permissions_granted, 0);
+    let events = host
+        .event_bus()
+        .read_range_all(0, None, Some(session))
+        .unwrap();
+    assert!(!events
+        .iter()
+        .any(|entry| matches!(&entry.update, SessionUpdate::PermissionRequired { .. })));
 
     orch.store()
         .update_run(&run_id, |run| {
@@ -634,6 +1083,8 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     assert!(retry.message.contains("cannot be retried"));
 
     orch.stop_background_tasks().await;
+    host.stop().unwrap();
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -925,6 +1376,10 @@ async fn resolve_work_input_requires_parked_scope() {
         source_routine_id: None,
         source_activation_id: None,
         model_selection_key: "grok".into(),
+        provider_route: Some(ProviderRoute {
+            provider_id: "xai".into(),
+            model_id: "grok".into(),
+        }),
         bounds: RunBounds::default(),
         input_hash: "hash".into(),
         state: ManagedIntentState::Parked,

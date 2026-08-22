@@ -4,9 +4,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
-    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient,
-    RoutineRecord, RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState,
-    RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
+    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RoutineRecord,
+    RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState, RuntimeConnectionState,
+    RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -528,7 +528,12 @@ impl RemoteServiceState {
         };
         Ok(Some(
             client
-                .fire_routine(session_id, workspace, routine_id, Uuid::new_v4().to_string())
+                .fire_routine(
+                    session_id,
+                    workspace,
+                    routine_id,
+                    Uuid::new_v4().to_string(),
+                )
                 .await?,
         ))
     }
@@ -564,7 +569,7 @@ impl RemoteServiceState {
         session_id: Uuid,
         workspace: String,
         run_id: String,
-    ) -> Result<Option<RunRecord>> {
+    ) -> Result<Option<Value>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
@@ -1274,18 +1279,16 @@ impl RemoteServiceClient {
         session_id: Uuid,
         workspace: String,
         run_id: String,
-    ) -> Result<RunRecord> {
-        let value = self
-            .call_tool(
-                "ptah_get_run",
-                json!({
-                    "session_id": session_id,
-                    "workspace": workspace,
-                    "run_id": run_id,
-                }),
-            )
-            .await?;
-        serde_json::from_value(value).context("decode remote durable run")
+    ) -> Result<Value> {
+        self.call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "run_id": run_id,
+            }),
+        )
+        .await
     }
 
     async fn get_events(
@@ -1695,10 +1698,39 @@ mod tests {
         assert!(status.last_error.is_some());
     }
 
+    struct IsolatedOffline {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl IsolatedOffline {
+        fn enable() -> Self {
+            let previous = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
+            // SAFETY: this test holds `home_override_serial` and restores the
+            // previous value on drop. Isolated reconnect must not capture a
+            // live provider route.
+            unsafe {
+                std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for IsolatedOffline {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("GROKPTAH_AGENT_OFFLINE", value),
+                    None => std::env::remove_var("GROKPTAH_AGENT_OFFLINE"),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn remote_client_authenticates_and_reconnects_after_service_restart() {
         let _guard = home_override_serial();
+        let _offline = IsolatedOffline::enable();
         let home = tempdir().unwrap();
         set_grokptah_home_override(Some(home.path().join(".grokptah")));
         let workspace = tempdir().unwrap();
@@ -1752,6 +1784,16 @@ mod tests {
             .unwrap()
             .iter()
             .any(|run| run.run_id == submission.run_id));
+        let remote_run = client
+            .get_run(
+                session.session_id,
+                session.workspace.clone(),
+                submission.run_id.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remote_run["runId"], submission.run_id);
+        assert!(remote_run.get("providerExecution").is_some());
         assert!(RemoteServiceClient::connect(base_url, "wrong-token".into())
             .await
             .is_err());

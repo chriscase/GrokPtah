@@ -7,6 +7,8 @@ mod continuation;
 pub(crate) mod managed;
 mod manager;
 mod message;
+mod provider_attempt;
+mod quota;
 mod routine;
 mod service;
 mod store;
@@ -28,11 +30,12 @@ pub use continuation::{
 };
 pub use managed::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
-    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedFinalizationRecord,
-    ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause, ManagedWorkMode,
-    NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
-    MANAGED_FINALIZATION_SCHEMA_VERSION, MANAGED_TRUNCATION_MARKER,
+    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedAdmissionCapacity,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome,
+    ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
+    ManagedWorkMode, NativeExecutorStatus, ProviderRoute, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
+    MANAGED_EXECUTION_SCHEMA_VERSION, MANAGED_FINALIZATION_SCHEMA_VERSION,
+    MANAGED_TRUNCATION_MARKER, MAX_CONCURRENT_PROVIDER_RUNS, PROVIDER_CEILING_EXHAUSTED,
 };
 pub use manager::{
     parse_manager_directive, ManagerCoordinationMode, ManagerCoordinationPolicy,
@@ -44,6 +47,15 @@ pub use manager::{
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,
     MESSAGE_SCHEMA_VERSION,
+};
+pub use provider_attempt::{
+    ProviderAttemptRecord, ProviderAttemptState, ProviderRetryClass, ProviderSendCertainty,
+    PROVIDER_ATTEMPT_SCHEMA_VERSION,
+};
+pub use quota::{
+    QuotaClass, QuotaLimits, QuotaPoolKey, QuotaPoolUsage, QuotaReservation, QuotaReservationState,
+    DEFAULT_MAX_IN_FLIGHT_RESERVATIONS, DEFAULT_MAX_REQUESTS_PER_WINDOW,
+    DEFAULT_MAX_TOKENS_PER_WINDOW, DEFAULT_QUOTA_WINDOW_MS, QUOTA_LEDGER_SCHEMA_VERSION,
 };
 pub use routine::{
     occurrence_dedupe_key, ActivationCause, ActivationDisposition, ActivationRecord,
@@ -67,10 +79,11 @@ pub use types::{
     safe_id_filename, AgentAuthorityPolicy, AgentLaneAssociation, AgentMemoryPolicy,
     AgentModelSpec, AgentRecord, AgentResumePlan, AgentRuntimeState, AgentSpec, AgentState,
     AuditEntry, ChangeRecord, ContinuationCheckpoint, ContinuationReason, IdempotencyReceipt,
-    OrchError, OrchErrorCode, PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution,
-    RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, TestObservation,
-    AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
-    DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
+    OrchError, OrchErrorCode, PromotionState, ProviderRouteSnapshot, RunAggregates, RunApproval,
+    RunBounds, RunExecution, RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState,
+    RunStopCause, TestObservation, AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS,
+    DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS,
+    MAX_AGENT_CONTEXT_BYTES, PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,

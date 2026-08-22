@@ -15,10 +15,12 @@ use uuid::Uuid;
 use super::managed::{
     ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome,
     ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
-    MANAGED_FINALIZATION_SCHEMA_VERSION,
+    AGENT_CEILING_EXHAUSTED, MANAGED_FINALIZATION_SCHEMA_VERSION, PROVIDER_CEILING_EXHAUSTED,
 };
 use super::manager::{ManagerDecisionRecord, ManagerPlan};
 use super::message::{MessagePage, WorkMessage, MAX_RETAINED_MESSAGES};
+use super::provider_attempt::{ProviderAttemptRecord, ProviderAttemptState, ProviderSendCertainty};
+use super::quota::{QuotaPoolUsage, QuotaReservation, QuotaReservationState};
 use super::routine::{
     advance_next_fire, decide_lifecycle_skip, due_occurrences, in_flight_count,
     occurrence_dedupe_key, validate_activation_payload, ActivationCause, ActivationDisposition,
@@ -63,6 +65,17 @@ struct AgentActivationIntent {
     /// creation intents have no prior record.
     #[serde(default)]
     prior_run: Option<RunRecord>,
+    /// Present only when the Run is being admitted with a new provider-quota
+    /// reservation. Legacy activation intents omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_reservation: Option<QuotaReservation>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaAdmissionIntent {
+    run: RunRecord,
+    reservation: QuotaReservation,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -91,6 +104,19 @@ struct RoutineFireIntent {
 struct ManagerCreationIntent {
     plan: ManagerPlan,
     root_work: WorkItem,
+}
+
+fn validate_run_provider_route_for_spec(run: &RunRecord, spec: &AgentSpec) -> anyhow::Result<()> {
+    if let Some(route) = &run.provider_route {
+        route
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            route.selection_key == spec.model.selection_key,
+            "Run provider route does not match its captured Agent specification"
+        );
+    }
+    Ok(())
 }
 
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
@@ -168,6 +194,9 @@ impl OrchStore {
         fs::create_dir_all(root.join("continuation-inputs"))?;
         fs::create_dir_all(root.join("continuation-contexts"))?;
         fs::create_dir_all(root.join("agent-activation"))?;
+        fs::create_dir_all(root.join("quota-reservations"))?;
+        fs::create_dir_all(root.join("quota-admission-intents"))?;
+        fs::create_dir_all(root.join("provider-attempts"))?;
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
@@ -230,12 +259,15 @@ impl OrchStore {
                 },
             }),
         };
+        store.recover_quota_admission_intents()?;
         store.recover_agent_activation_intents()?;
         store.recover_finalization_intents()?;
         store.recover_routine_intents()?;
         store.recover_managed_finalization_intents()?;
         store.recover_manager_creation_intents()?;
+        store.reconcile_provider_attempt_ledger()?;
         store.mark_unfinished_interrupted()?;
+        store.reconcile_quota_ledger()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
         // Cleanup is best-effort at the record level, but directory access
@@ -325,6 +357,33 @@ impl OrchStore {
             .inner
             .root
             .join("agent-activation")
+            .join(format!("{safe}.json")))
+    }
+
+    fn quota_reservation_path(&self, reservation_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(reservation_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("quota-reservations")
+            .join(format!("{safe}.json")))
+    }
+
+    fn quota_admission_intent_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("quota-admission-intents")
+            .join(format!("{safe}.json")))
+    }
+
+    fn provider_attempt_path(&self, attempt_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(attempt_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("provider-attempts")
             .join(format!("{safe}.json")))
     }
 
@@ -419,12 +478,516 @@ impl OrchStore {
             .join(format!("{}.json", safe_id_filename(plan_id)?)))
     }
 
+    fn load_quota_reservation_unlocked(
+        &self,
+        reservation_id: &str,
+    ) -> anyhow::Result<Option<QuotaReservation>> {
+        let path = match self.quota_reservation_path(reservation_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let reservation: QuotaReservation = serde_json::from_str(&fs::read_to_string(path)?)?;
+        reservation
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(Some(reservation))
+    }
+
+    pub fn load_quota_reservation(
+        &self,
+        reservation_id: &str,
+    ) -> anyhow::Result<Option<QuotaReservation>> {
+        let _guard = self.inner.lock.lock();
+        self.load_quota_reservation_unlocked(reservation_id)
+    }
+
+    fn list_quota_reservations_unlocked(&self) -> anyhow::Result<Vec<QuotaReservation>> {
+        let mut reservations = Vec::new();
+        for entry in fs::read_dir(self.inner.root.join("quota-reservations"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let reservation: QuotaReservation = serde_json::from_str(&fs::read_to_string(path)?)?;
+            reservation
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error))?;
+            reservations.push(reservation);
+        }
+        Ok(reservations)
+    }
+
+    pub fn list_quota_reservations(&self) -> anyhow::Result<Vec<QuotaReservation>> {
+        let _guard = self.inner.lock.lock();
+        self.list_quota_reservations_unlocked()
+    }
+
+    fn load_provider_attempt_unlocked(
+        &self,
+        attempt_id: &str,
+    ) -> anyhow::Result<Option<ProviderAttemptRecord>> {
+        let path = match self.provider_attempt_path(attempt_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let attempt: ProviderAttemptRecord = serde_json::from_str(&fs::read_to_string(path)?)?;
+        attempt.validate().map_err(|error| anyhow::anyhow!(error))?;
+        Ok(Some(attempt))
+    }
+
+    pub fn load_provider_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> anyhow::Result<Option<ProviderAttemptRecord>> {
+        let _guard = self.inner.lock.lock();
+        self.load_provider_attempt_unlocked(attempt_id)
+    }
+
+    fn list_provider_attempts_unlocked(&self) -> anyhow::Result<Vec<ProviderAttemptRecord>> {
+        let mut attempts = Vec::new();
+        for entry in fs::read_dir(self.inner.root.join("provider-attempts"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let attempt: ProviderAttemptRecord = serde_json::from_str(&fs::read_to_string(path)?)?;
+            attempt.validate().map_err(|error| anyhow::anyhow!(error))?;
+            attempts.push(attempt);
+        }
+        attempts.sort_by(|left, right| {
+            left.run_id
+                .cmp(&right.run_id)
+                .then(left.ordinal.cmp(&right.ordinal))
+                .then(left.attempt_id.cmp(&right.attempt_id))
+        });
+        Ok(attempts)
+    }
+
+    pub fn list_provider_attempts(&self) -> anyhow::Result<Vec<ProviderAttemptRecord>> {
+        let _guard = self.inner.lock.lock();
+        self.list_provider_attempts_unlocked()
+    }
+
+    fn save_provider_attempt_unlocked(
+        &self,
+        attempt: &ProviderAttemptRecord,
+    ) -> anyhow::Result<()> {
+        attempt.validate().map_err(|error| anyhow::anyhow!(error))?;
+        let path = self
+            .provider_attempt_path(&attempt.attempt_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        atomic_write_json(&path, attempt)
+    }
+
+    fn validate_provider_attempt_binding(
+        run: &RunRecord,
+        attempt: &ProviderAttemptRecord,
+    ) -> anyhow::Result<()> {
+        attempt.validate().map_err(|error| anyhow::anyhow!(error))?;
+        let route = run
+            .provider_route
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("provider attempt Run has no route snapshot"))?;
+        anyhow::ensure!(
+            run.run_id == attempt.run_id
+                && route.quota_reservation_id.as_deref() == Some(attempt.reservation_id.as_str())
+                && route.snapshot_hash == attempt.route_snapshot_hash,
+            "Run and provider attempt immutable identities do not match"
+        );
+        Ok(())
+    }
+
+    /// Install one durable provider attempt before transport dispatch. The
+    /// attempt row is the recovery anchor; if the subsequent Run write fails,
+    /// callers do not send and restart conservatively closes the row.
+    pub fn begin_provider_attempt(&self, run_id: &str) -> anyhow::Result<ProviderAttemptRecord> {
+        let _guard = self.inner.lock.lock();
+        let mut run = self
+            .load_run_unlocked(run_id)?
+            .ok_or_else(|| anyhow::anyhow!("provider attempt Run is missing"))?;
+        anyhow::ensure!(
+            run.state == RunState::Running,
+            "provider attempt Run is not active"
+        );
+        let reservation_id = run
+            .provider_route
+            .as_ref()
+            .and_then(|route| route.quota_reservation_id.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("provider attempt Run has no quota reservation"))?;
+        let reservation = self
+            .load_quota_reservation_unlocked(reservation_id)?
+            .ok_or_else(|| anyhow::anyhow!("provider attempt quota reservation is missing"))?;
+        Self::validate_quota_binding(&run, &reservation)?;
+        anyhow::ensure!(
+            reservation.state == QuotaReservationState::Reserved,
+            "provider attempt quota reservation is not active"
+        );
+
+        let attempts = self.list_provider_attempts_unlocked()?;
+        anyhow::ensure!(
+            !attempts.iter().any(|attempt| {
+                attempt.run_id == run_id && attempt.state == ProviderAttemptState::Admitted
+            }),
+            "provider attempt already admitted for this Run"
+        );
+        let ordinal = attempts
+            .iter()
+            .filter(|attempt| attempt.run_id == run_id)
+            .map(|attempt| attempt.ordinal)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("provider attempt ordinal overflowed"))?;
+        let now = Utc::now();
+        let attempt = ProviderAttemptRecord::admitted(
+            &run,
+            format!("provider-attempt-{}", Uuid::new_v4()),
+            ordinal,
+            now,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        self.save_provider_attempt_unlocked(&attempt)?;
+
+        run.aggregates.usage_pending_requests = run
+            .aggregates
+            .usage_pending_requests
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("provider attempt counter overflowed"))?;
+        run.updated_at = now;
+        let run_path = self
+            .run_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if let Err(error) = atomic_write_json(&run_path, &run) {
+            let mut not_sent = attempt.clone();
+            not_sent
+                .finish(ProviderSendCertainty::KnownNotSent, None, None, Utc::now())
+                .map_err(|finish_error| anyhow::anyhow!(finish_error))?;
+            self.save_provider_attempt_unlocked(&not_sent)?;
+            return Err(error.context("persist provider attempt on Run; transport was not entered"));
+        }
+        Ok(attempt)
+    }
+
+    fn apply_provider_attempt_to_run(
+        &self,
+        run: &mut RunRecord,
+        attempt: &ProviderAttemptRecord,
+    ) -> anyhow::Result<bool> {
+        if attempt.state != ProviderAttemptState::Finished
+            || run
+                .aggregates
+                .accounted_provider_attempt_ids
+                .iter()
+                .any(|attempt_id| attempt_id == &attempt.attempt_id)
+        {
+            return Ok(false);
+        }
+        Self::validate_provider_attempt_binding(run, attempt)?;
+        run.aggregates.usage_pending_requests = u32::try_from(
+            self.list_provider_attempts_unlocked()?
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.run_id == run.run_id
+                        && candidate.state == ProviderAttemptState::Admitted
+                })
+                .count(),
+        )
+        .map_err(|_| anyhow::anyhow!("provider attempt counter overflowed"))?;
+        match attempt.send_certainty {
+            Some(ProviderSendCertainty::KnownAccepted) => {
+                if let Some(usage) = &attempt.usage {
+                    run.aggregates.usage.prompt_tokens = run
+                        .aggregates
+                        .usage
+                        .prompt_tokens
+                        .checked_add(usage.prompt_tokens)
+                        .ok_or_else(|| anyhow::anyhow!("provider token accounting overflowed"))?;
+                    run.aggregates.usage.completion_tokens = run
+                        .aggregates
+                        .usage
+                        .completion_tokens
+                        .checked_add(usage.completion_tokens)
+                        .ok_or_else(|| anyhow::anyhow!("provider token accounting overflowed"))?;
+                    run.aggregates.usage.total_tokens = run
+                        .aggregates
+                        .usage
+                        .total_tokens
+                        .checked_add(usage.total_tokens)
+                        .ok_or_else(|| anyhow::anyhow!("provider token accounting overflowed"))?;
+                    run.aggregates.usage.requests = run
+                        .aggregates
+                        .usage
+                        .requests
+                        .checked_add(usage.requests)
+                        .ok_or_else(|| anyhow::anyhow!("provider request accounting overflowed"))?;
+                } else if attempt.http_status.is_none_or(|status| status < 400) {
+                    run.aggregates.usage_complete = false;
+                }
+            }
+            Some(ProviderSendCertainty::UncertainAccept) => {
+                run.aggregates.usage_complete = false;
+            }
+            Some(ProviderSendCertainty::KnownNotSent) => {}
+            None => anyhow::bail!("finished provider attempt has no send certainty"),
+        }
+        run.aggregates
+            .accounted_provider_attempt_ids
+            .push(attempt.attempt_id.clone());
+        if let Some(verification) = run.aggregates.verification.as_mut() {
+            verification.usage = run.aggregates.usage.clone();
+        }
+        if !run.aggregates.usage_complete && run.bounds.max_total_tokens.is_some() {
+            let code = "max_total_tokens_usage_unavailable";
+            run.error_code = Some(code.into());
+            run.stop_cause = Some(RunStopCause::TokenAccountingUnavailable);
+        } else if let Some(ceiling) = run.bounds.max_total_tokens {
+            if run.aggregates.usage.total_tokens >= ceiling {
+                run.error_code = Some("max_total_tokens_reached".into());
+                run.stop_cause = Some(RunStopCause::TokenCeiling);
+            }
+        }
+        run.updated_at = run.updated_at.max(attempt.updated_at);
+        Ok(true)
+    }
+
+    /// Finish an attempt and fold its usage into the Run exactly once. The
+    /// attempt is written first, so restart can complete the fold after a
+    /// crash between the two durable records.
+    pub fn finish_provider_attempt(
+        &self,
+        attempt_id: &str,
+        certainty: ProviderSendCertainty,
+        http_status: Option<u16>,
+        usage: Option<crate::completion::CompletionUsage>,
+    ) -> anyhow::Result<RunRecord> {
+        let _guard = self.inner.lock.lock();
+        let mut attempt = self
+            .load_provider_attempt_unlocked(attempt_id)?
+            .ok_or_else(|| anyhow::anyhow!("provider attempt is missing"))?;
+        attempt
+            .finish(certainty, http_status, usage, Utc::now())
+            .map_err(|error| anyhow::anyhow!(error))?;
+        self.save_provider_attempt_unlocked(&attempt)?;
+
+        let mut run = self
+            .load_run_unlocked(&attempt.run_id)?
+            .ok_or_else(|| anyhow::anyhow!("provider attempt Run is missing"))?;
+        if self.apply_provider_attempt_to_run(&mut run, &attempt)? {
+            self.preflight_quota_for_run_unlocked(&run)?;
+            let path = self
+                .run_path(&run.run_id)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            atomic_write_json(&path, &run)?;
+        }
+        // Keep settlement retryable even if an earlier call durably applied
+        // the attempt to the Run and then failed before writing the quota row.
+        self.sync_quota_for_run_unlocked(&run)?;
+        Ok(run)
+    }
+
+    fn validate_quota_binding(
+        run: &RunRecord,
+        reservation: &QuotaReservation,
+    ) -> anyhow::Result<()> {
+        reservation
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let route = run
+            .provider_route
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("quota reservation Run has no provider route"))?;
+        route.validate().map_err(|error| anyhow::anyhow!(error))?;
+        anyhow::ensure!(
+            route.quota_reservation_id.as_deref() == Some(reservation.reservation_id.as_str())
+                && route.quota_class == Some(reservation.pool.class)
+                && route.snapshot_hash == reservation.route_snapshot_hash
+                && route.provider_id == reservation.pool.provider_id
+                && route.credential_fingerprint == reservation.pool.credential_fingerprint
+                && run.run_id == reservation.run_id
+                && workspaces_match(&run.workspace, &reservation.pool.workspace),
+            "Run and quota reservation immutable identities do not match"
+        );
+        Ok(())
+    }
+
+    fn ensure_quota_capacity_unlocked(&self, candidate: &QuotaReservation) -> anyhow::Result<()> {
+        let mut usage = QuotaPoolUsage::default();
+        for reservation in self.list_quota_reservations_unlocked()? {
+            if reservation.reservation_id == candidate.reservation_id
+                || reservation.run_id == candidate.run_id
+            {
+                anyhow::bail!(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "quota reservation or Run identity already exists",
+                ));
+            }
+            usage
+                .include(&reservation, &candidate.pool, candidate.window_started_at)
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        usage
+            .ensure_can_reserve(candidate)
+            .map_err(|error| anyhow::anyhow!(error))
+    }
+
+    fn save_quota_reservation_unlocked(
+        &self,
+        reservation: &QuotaReservation,
+    ) -> anyhow::Result<()> {
+        reservation
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let path = self
+            .quota_reservation_path(&reservation.reservation_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        atomic_write_json(&path, reservation)
+    }
+
+    fn sync_quota_for_run_unlocked(&self, run: &RunRecord) -> anyhow::Result<()> {
+        let Some(reservation_id) = run
+            .provider_route
+            .as_ref()
+            .and_then(|route| route.quota_reservation_id.as_deref())
+        else {
+            return Ok(());
+        };
+        let mut reservation = self
+            .load_quota_reservation_unlocked(reservation_id)?
+            .ok_or_else(|| anyhow::anyhow!("Run quota reservation is missing"))?;
+        Self::validate_quota_binding(run, &reservation)?;
+        if run.state.is_terminal()
+            && run.aggregates.usage_complete
+            && run.aggregates.usage_pending_requests == 0
+        {
+            reservation
+                .settle(
+                    run.aggregates.usage.total_tokens,
+                    run.aggregates.usage.requests,
+                    run.updated_at,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            self.save_quota_reservation_unlocked(&reservation)?;
+        }
+        Ok(())
+    }
+
+    fn preflight_quota_for_run_unlocked(&self, run: &RunRecord) -> anyhow::Result<()> {
+        let Some(reservation_id) = run
+            .provider_route
+            .as_ref()
+            .and_then(|route| route.quota_reservation_id.as_deref())
+        else {
+            return Ok(());
+        };
+        let reservation = self
+            .load_quota_reservation_unlocked(reservation_id)?
+            .ok_or_else(|| anyhow::anyhow!("Run quota reservation is missing"))?;
+        Self::validate_quota_binding(run, &reservation)?;
+        if run.state.is_terminal()
+            && run.aggregates.usage_complete
+            && run.aggregates.usage_pending_requests == 0
+        {
+            let mut candidate = reservation;
+            candidate
+                .settle(
+                    run.aggregates.usage.total_tokens,
+                    run.aggregates.usage.requests,
+                    run.updated_at,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        Ok(())
+    }
+
+    /// Atomically install a queued Run and its provider-quota reservation.
+    /// The intent is the recovery anchor for every crash cut point.
+    pub fn save_run_with_quota(
+        &self,
+        run: &RunRecord,
+        reservation: &QuotaReservation,
+    ) -> anyhow::Result<()> {
+        let _guard = self.inner.lock.lock();
+        Self::validate_quota_binding(run, reservation)?;
+        self.ensure_quota_capacity_unlocked(reservation)?;
+        let run_path = self
+            .run_path(&run.run_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        anyhow::ensure!(!run_path.is_file(), "Run ID already exists");
+        let reservation_path = self
+            .quota_reservation_path(&reservation.reservation_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        anyhow::ensure!(
+            !reservation_path.is_file(),
+            "quota reservation ID already exists"
+        );
+        let intent_path = self
+            .quota_admission_intent_path(&run.run_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let intent = QuotaAdmissionIntent {
+            run: run.clone(),
+            reservation: reservation.clone(),
+        };
+        atomic_write_json(&intent_path, &intent)?;
+        if let Err(error) = atomic_write_json(&reservation_path, reservation) {
+            if remove_file_durable(&intent_path).is_err() {
+                return Err(error.context(
+                    "persist quota reservation; durable recovery intent requires restart",
+                ));
+            }
+            return Err(error.context("persist quota reservation"));
+        }
+        if let Err(error) = atomic_write_json(&run_path, run) {
+            if remove_file_durable(&reservation_path).is_err()
+                || remove_file_durable(&intent_path).is_err()
+            {
+                return Err(error.context(
+                    "persist quota-backed Run; durable recovery intent requires restart",
+                ));
+            }
+            return Err(error.context("persist quota-backed Run"));
+        }
+        if let Err(error) = remove_file_durable(&intent_path) {
+            *self.inner.last_run_error.lock() = Some(error.to_string());
+        }
+        Ok(())
+    }
+
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
         let _g = self.inner.lock.lock();
+        if let Some(route) = &run.provider_route {
+            route
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        if let Some(existing) = self.load_run_unlocked(&run.run_id)? {
+            anyhow::ensure!(
+                existing.provider_route == run.provider_route,
+                "Run provider route snapshot is immutable"
+            );
+        } else if run
+            .provider_route
+            .as_ref()
+            .is_some_and(|route| route.quota_reservation_id.is_some())
+        {
+            anyhow::bail!("quota-backed Run must be created atomically with its reservation");
+        }
+        self.preflight_quota_for_run_unlocked(run)?;
         let result = self
             .run_path(&run.run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))
             .and_then(|path| atomic_write_json(&path, run));
+        if result.is_ok() {
+            if let Err(error) = self.sync_quota_for_run_unlocked(run) {
+                *self.inner.last_run_error.lock() = Some(error.to_string());
+                return Err(error);
+            }
+        }
         *self.inner.last_run_error.lock() = result.as_ref().err().map(ToString::to_string);
         result
     }
@@ -436,11 +999,45 @@ impl OrchStore {
         run: &RunRecord,
         agent_id: &str,
     ) -> anyhow::Result<()> {
+        self.save_run_and_activate_agent_inner(run, agent_id, None)
+    }
+
+    /// Atomically reserve provider quota, create the Run, and activate its
+    /// persistent Agent before provider execution may begin.
+    pub fn save_run_and_activate_agent_with_quota(
+        &self,
+        run: &RunRecord,
+        agent_id: &str,
+        reservation: &QuotaReservation,
+    ) -> anyhow::Result<()> {
+        self.save_run_and_activate_agent_inner(run, agent_id, Some(reservation))
+    }
+
+    fn save_run_and_activate_agent_inner(
+        &self,
+        run: &RunRecord,
+        agent_id: &str,
+        quota_reservation: Option<&QuotaReservation>,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             run.agent_id.as_deref() == Some(agent_id),
             "Run Agent identity does not match activation target"
         );
         let _g = self.inner.lock.lock();
+        match quota_reservation {
+            Some(reservation) => {
+                Self::validate_quota_binding(run, reservation)?;
+                self.ensure_quota_capacity_unlocked(reservation)?;
+            }
+            None if run
+                .provider_route
+                .as_ref()
+                .is_some_and(|route| route.quota_reservation_id.is_some()) =>
+            {
+                anyhow::bail!("quota-backed Run must be activated atomically with its reservation");
+            }
+            None => {}
+        }
         let activation_dir = self.inner.root.join("agent-activation");
         if fs::read_dir(&activation_dir)?.any(|entry| {
             entry.ok().is_some_and(|entry| {
@@ -465,10 +1062,12 @@ impl OrchStore {
             agent.known_lane_ids().contains(&run.session_id),
             "Run Lane is not currently associated with the persistent Agent"
         );
+        let current_spec = agent.current_spec()?;
         anyhow::ensure!(
-            run.agent_spec_revision == Some(agent.current_spec()?.revision),
+            run.agent_spec_revision == Some(current_spec.revision),
             "Run Agent specification revision is stale"
         );
+        validate_run_provider_route_for_spec(run, current_spec)?;
         let run_path = self
             .run_path(&run.run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -487,8 +1086,23 @@ impl OrchStore {
             run: run.clone(),
             activated_agent: agent.clone(),
             prior_run: None,
+            quota_reservation: quota_reservation.cloned(),
         };
         atomic_write_json(&intent_path, &intent)?;
+        let quota_path = quota_reservation
+            .map(|reservation| self.quota_reservation_path(&reservation.reservation_id))
+            .transpose()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if let (Some(reservation), Some(quota_path)) = (quota_reservation, quota_path.as_ref()) {
+            if let Err(error) = atomic_write_json(quota_path, reservation) {
+                if remove_file_durable(&intent_path).is_err() {
+                    return Err(error.context(
+                        "persist activation quota; durable recovery intent requires restart",
+                    ));
+                }
+                return Err(error.context("persist activation quota"));
+            }
+        }
         if let Err(error) = atomic_write_json(&run_path, run) {
             let run_rollback = match fs::symlink_metadata(&run_path) {
                 Ok(_) => remove_file_durable(&run_path),
@@ -497,7 +1111,13 @@ impl OrchStore {
                 }
                 Err(metadata_error) => Err(metadata_error.into()),
             };
-            if run_rollback.is_err() || remove_file_durable(&intent_path).is_err() {
+            let quota_rollback = quota_path
+                .as_ref()
+                .map_or(Ok(()), |path| remove_file_durable(path));
+            if run_rollback.is_err()
+                || quota_rollback.is_err()
+                || remove_file_durable(&intent_path).is_err()
+            {
                 return Err(error.context(
                     "persist Agent activation Run; durable recovery intent requires restart",
                 ));
@@ -505,7 +1125,10 @@ impl OrchStore {
             return Err(error.context("persist Agent activation Run"));
         }
         if let Err(error) = atomic_write_json(&agent_path, &agent) {
-            if remove_file_durable(&run_path).is_err() {
+            let quota_rollback = quota_path
+                .as_ref()
+                .map_or(Ok(()), |path| remove_file_durable(path));
+            if remove_file_durable(&run_path).is_err() || quota_rollback.is_err() {
                 return Err(error.context(
                     "persist Agent activation; durable recovery intent requires restart",
                 ));
@@ -572,10 +1195,22 @@ impl OrchStore {
             agent.known_lane_ids().contains(&prior_run.session_id),
             "Run Lane is not currently associated with the persistent Agent"
         );
+        let current_spec = agent.current_spec()?;
         anyhow::ensure!(
-            prior_run.agent_spec_revision == Some(agent.current_spec()?.revision),
+            prior_run.agent_spec_revision == Some(current_spec.revision),
             "Run Agent specification revision is stale"
         );
+        validate_run_provider_route_for_spec(&prior_run, current_spec)?;
+        if let Some(reservation_id) = prior_run
+            .provider_route
+            .as_ref()
+            .and_then(|route| route.quota_reservation_id.as_deref())
+        {
+            let reservation = self
+                .load_quota_reservation_unlocked(reservation_id)?
+                .ok_or_else(|| anyhow::anyhow!("queued Run quota reservation is missing"))?;
+            Self::validate_quota_binding(&prior_run, &reservation)?;
+        }
 
         let mut run = prior_run.clone();
         run.state = RunState::Running;
@@ -600,6 +1235,7 @@ impl OrchStore {
             run: run.clone(),
             activated_agent: agent.clone(),
             prior_run: Some(prior_run.clone()),
+            quota_reservation: None,
         };
         atomic_write_json(&intent_path, &intent)?;
         if let Err(error) = atomic_write_json(&run_path, &run) {
@@ -679,11 +1315,26 @@ impl OrchStore {
         let Some(mut run) = self.load_run_unlocked(run_id)? else {
             return Ok(None);
         };
+        let provider_route = run.provider_route.clone();
         update(&mut run)?;
+        anyhow::ensure!(
+            run.provider_route == provider_route,
+            "Run provider route snapshot is immutable"
+        );
+        if let Some(route) = &run.provider_route {
+            route
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        self.preflight_quota_for_run_unlocked(&run)?;
         let path = self
             .run_path(run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         if let Err(error) = atomic_write_json(&path, &run) {
+            *self.inner.last_run_error.lock() = Some(error.to_string());
+            return Err(error);
+        }
+        if let Err(error) = self.sync_quota_for_run_unlocked(&run) {
             *self.inner.last_run_error.lock() = Some(error.to_string());
             return Err(error);
         }
@@ -2878,6 +3529,83 @@ impl OrchStore {
         Ok(intent.clone())
     }
 
+    /// Reserve one live native admission while enforcing both durable
+    /// capacity ceilings under the same store lock as the intent write.
+    ///
+    /// Callers may perform an earlier eligibility check for diagnostics, but
+    /// this operation is the authority: concurrent executor drives cannot
+    /// both observe the last provider or Agent slot and consume it.
+    pub fn reserve_managed_intent(
+        &self,
+        intent: &ManagedExecutionIntent,
+        max_concurrent_runs_for_agent: usize,
+        max_concurrent_runs_for_provider: usize,
+    ) -> Result<ManagedExecutionIntent, OrchError> {
+        intent.validate()?;
+        if !intent.state.is_live() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "managed execution reservation must start in a live state",
+            ));
+        }
+        let provider_id = intent
+            .provider_route
+            .as_ref()
+            .map(|route| route.provider_id.as_str())
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "managed execution reservation requires an exact provider route",
+                )
+            })?;
+        let _guard = self.inner.lock.lock();
+        let existing = self.list_managed_intents_unlocked()?;
+        if existing
+            .iter()
+            .any(|current| current.state.is_live() && current.work_id == intent.work_id)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work already has a live managed execution intent",
+            ));
+        }
+        let live_for_agent = existing
+            .iter()
+            .filter(|current| current.state.is_live() && current.agent_id == intent.agent_id)
+            .count();
+        if live_for_agent >= max_concurrent_runs_for_agent {
+            return Err(OrchError::new(
+                OrchErrorCode::CapacityExhausted,
+                AGENT_CEILING_EXHAUSTED,
+            ));
+        }
+        let live_for_provider = existing
+            .iter()
+            .filter(|current| {
+                current.state.is_live()
+                    && current
+                        .effective_provider_id()
+                        .as_deref()
+                        .is_none_or(|current_provider| current_provider == provider_id)
+            })
+            .count();
+        if live_for_provider >= max_concurrent_runs_for_provider {
+            return Err(OrchError::new(
+                OrchErrorCode::CapacityExhausted,
+                PROVIDER_CEILING_EXHAUSTED,
+            ));
+        }
+        let path = self.managed_intent_path(&intent.intent_id)?;
+        if path.is_file() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "managed execution intent ID already exists",
+            ));
+        }
+        self.save_managed_intent_unlocked(intent)?;
+        Ok(intent.clone())
+    }
+
     fn save_managed_intent_unlocked(
         &self,
         intent: &ManagedExecutionIntent,
@@ -2947,6 +3675,24 @@ impl OrchStore {
             .list_managed_intents()?
             .into_iter()
             .filter(|intent| intent.agent_id == agent_id && intent.state.is_live())
+            .count())
+    }
+
+    /// Live native admissions that already route to `provider_id`.
+    ///
+    /// Counted from durable intents so duplicate supervisor ticks and process
+    /// restarts re-derive the same provider capacity answer.
+    pub fn live_managed_intents_for_provider(&self, provider_id: &str) -> Result<usize, OrchError> {
+        Ok(self
+            .list_managed_intents()?
+            .into_iter()
+            .filter(|intent| {
+                intent.state.is_live()
+                    && intent
+                        .effective_provider_id()
+                        .as_deref()
+                        .is_none_or(|current_provider| current_provider == provider_id)
+            })
             .count())
     }
 
@@ -4616,6 +5362,7 @@ impl OrchStore {
             .iter()
             .filter_map(|(_, run)| run.retry_of.as_deref())
             .collect();
+        let provider_attempts = self.list_provider_attempts_unlocked()?;
 
         let mut eligible_runs: Vec<(&Path, &RunRecord)> = Vec::new();
         for (path, run) in &runs {
@@ -4637,7 +5384,22 @@ impl OrchStore {
                 continue;
             }
             match fs::remove_file(path) {
-                Ok(()) => report.run_files_removed += 1,
+                Ok(()) => {
+                    report.run_files_removed += 1;
+                    for attempt in provider_attempts
+                        .iter()
+                        .filter(|attempt| attempt.run_id == run.run_id)
+                    {
+                        let attempt_path = self
+                            .provider_attempt_path(&attempt.attempt_id)
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        match fs::remove_file(attempt_path) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(_) => report.skipped_files += 1,
+                        }
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => report.skipped_files += 1,
             }
@@ -4728,6 +5490,11 @@ impl OrchStore {
         if !candidate.state.is_terminal() {
             anyhow::bail!("finalization candidate must be terminal");
         }
+        if let Some(route) = &candidate.provider_route {
+            route
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
         let _guard = self.inner.lock.lock();
         let activation_path = self
             .agent_activation_path(&candidate.run_id)
@@ -4749,6 +5516,10 @@ impl OrchStore {
                 .and_then(|text| serde_json::from_str::<RunRecord>(&text).map_err(Into::into))
             {
                 Ok(current) => {
+                    anyhow::ensure!(
+                        current.provider_route == candidate.provider_route,
+                        "Run provider route snapshot is immutable"
+                    );
                     merge_run_observations(&mut final_run, &current);
                     if current.state.is_terminal() {
                         final_run.state = current.state;
@@ -4775,6 +5546,7 @@ impl OrchStore {
         let intent_path = self
             .finalization_path(&candidate.run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.preflight_quota_for_run_unlocked(&final_run)?;
         let result = (|| -> anyhow::Result<()> {
             atomic_write_json(&intent_path, &final_run)?;
             if let Some(corrupt) = &corrupt_target {
@@ -4784,6 +5556,12 @@ impl OrchStore {
             fs::remove_file(&intent_path)?;
             Ok(())
         })();
+        if result.is_ok() {
+            if let Err(error) = self.sync_quota_for_run_unlocked(&final_run) {
+                *self.inner.last_run_error.lock() = Some(error.to_string());
+                return Err(error);
+            }
+        }
         *self.inner.last_run_error.lock() = result.as_ref().err().map(ToString::to_string);
         result.map(|_| final_run)
     }
@@ -5045,6 +5823,140 @@ impl OrchStore {
         Ok(n)
     }
 
+    fn recover_quota_admission_intents(&self) -> anyhow::Result<usize> {
+        let _guard = self.inner.lock.lock();
+        let dir = self.inner.root.join("quota-admission-intents");
+        let mut recovered = 0;
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let intent: QuotaAdmissionIntent = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            Self::validate_quota_binding(&intent.run, &intent.reservation)?;
+            let run_path = self
+                .run_path(&intent.run.run_id)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            if run_path.is_file() {
+                let existing: RunRecord = serde_json::from_str(&fs::read_to_string(&run_path)?)?;
+                anyhow::ensure!(
+                    serde_json::to_value(existing)? == serde_json::to_value(&intent.run)?,
+                    "quota admission recovery Run conflicts with durable state"
+                );
+            }
+            let reservation_path = self
+                .quota_reservation_path(&intent.reservation.reservation_id)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            if reservation_path.is_file() {
+                let existing: QuotaReservation =
+                    serde_json::from_str(&fs::read_to_string(&reservation_path)?)?;
+                anyhow::ensure!(
+                    existing == intent.reservation,
+                    "quota admission recovery reservation conflicts with durable state"
+                );
+            } else {
+                self.ensure_quota_capacity_unlocked(&intent.reservation)?;
+            }
+            atomic_write_json(&reservation_path, &intent.reservation)?;
+            atomic_write_json(&run_path, &intent.run)?;
+            remove_file_durable(&path)?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    fn reconcile_provider_attempt_ledger(&self) -> anyhow::Result<usize> {
+        let _guard = self.inner.lock.lock();
+        let mut reconciled = 0;
+        for mut attempt in self.list_provider_attempts_unlocked()? {
+            if attempt.state == ProviderAttemptState::Admitted {
+                // The row was durable before transport entry. After process
+                // death there is no proof that request bytes were not
+                // accepted, so recovery must never classify it retry-safe.
+                attempt
+                    .finish(
+                        ProviderSendCertainty::UncertainAccept,
+                        None,
+                        None,
+                        Utc::now(),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                self.save_provider_attempt_unlocked(&attempt)?;
+                reconciled += 1;
+            }
+            let Some(mut run) = self.load_run_unlocked(&attempt.run_id)? else {
+                let reservation = self
+                    .load_quota_reservation_unlocked(&attempt.reservation_id)?
+                    .ok_or_else(|| anyhow::anyhow!("provider attempt reservation is missing"))?;
+                anyhow::ensure!(
+                    attempt.state == ProviderAttemptState::Finished
+                        && reservation.state != QuotaReservationState::Reserved,
+                    "live or uncertain provider attempt Run is missing"
+                );
+                let path = self
+                    .provider_attempt_path(&attempt.attempt_id)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                remove_file_durable(&path)?;
+                reconciled += 1;
+                continue;
+            };
+            if self.apply_provider_attempt_to_run(&mut run, &attempt)? {
+                self.preflight_quota_for_run_unlocked(&run)?;
+                let path = self
+                    .run_path(&run.run_id)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                atomic_write_json(&path, &run)?;
+                self.sync_quota_for_run_unlocked(&run)?;
+                reconciled += 1;
+            }
+        }
+        Ok(reconciled)
+    }
+
+    fn reconcile_quota_ledger(&self) -> anyhow::Result<usize> {
+        let _guard = self.inner.lock.lock();
+        for entry in fs::read_dir(self.inner.root.join("runs"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let run: RunRecord = serde_json::from_str(&fs::read_to_string(path)?)?;
+            if let Some(route) = &run.provider_route {
+                route.validate().map_err(|error| anyhow::anyhow!(error))?;
+                if route.quota_reservation_id.is_some() {
+                    self.sync_quota_for_run_unlocked(&run)?;
+                }
+            }
+        }
+
+        let mut expired = 0;
+        for mut reservation in self.list_quota_reservations_unlocked()? {
+            if reservation.state != QuotaReservationState::Reserved {
+                continue;
+            }
+            let run_path = self
+                .run_path(&reservation.run_id)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let quota_intent_path = self
+                .quota_admission_intent_path(&reservation.run_id)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let activation_intent_path = self
+                .agent_activation_path(&reservation.run_id)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            if run_path.is_file() || quota_intent_path.is_file() || activation_intent_path.is_file()
+            {
+                continue;
+            }
+            reservation.state = QuotaReservationState::Expired;
+            reservation.tokens_consumed = 0;
+            reservation.requests_consumed = 0;
+            reservation.updated_at = Utc::now();
+            self.save_quota_reservation_unlocked(&reservation)?;
+            expired += 1;
+        }
+        Ok(expired)
+    }
+
     fn recover_agent_activation_intents(&self) -> anyhow::Result<usize> {
         let _guard = self.inner.lock.lock();
         let dir = self.inner.root.join("agent-activation");
@@ -5061,6 +5973,73 @@ impl OrchStore {
                         == Some(intent.run.run_id.as_str()),
                 "Agent activation recovery intent is inconsistent"
             );
+            let spec = intent.activated_agent.current_spec()?;
+            // A route-less activation journal from before AgentSpec fencing
+            // must still be installed so startup can mark it Interrupted. It
+            // is never resumed. Any newer record that names either fence must
+            // match the exact captured specification before recovery writes.
+            if intent.run.provider_route.is_some() || intent.run.agent_spec_revision.is_some() {
+                anyhow::ensure!(
+                    intent.run.agent_spec_revision == Some(spec.revision),
+                    "Agent activation recovery Run specification is stale"
+                );
+            }
+            validate_run_provider_route_for_spec(&intent.run, spec)?;
+            match (
+                intent
+                    .run
+                    .provider_route
+                    .as_ref()
+                    .and_then(|route| route.quota_reservation_id.as_deref()),
+                intent.quota_reservation.as_ref(),
+            ) {
+                (Some(reservation_id), Some(reservation)) => {
+                    anyhow::ensure!(
+                        reservation_id == reservation.reservation_id,
+                        "Agent activation recovery quota identity is inconsistent"
+                    );
+                    Self::validate_quota_binding(&intent.run, reservation)?;
+                    let reservation_path = self
+                        .quota_reservation_path(reservation_id)
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                    if reservation_path.is_file() {
+                        let existing: QuotaReservation =
+                            serde_json::from_str(&fs::read_to_string(&reservation_path)?)?;
+                        anyhow::ensure!(
+                            existing == *reservation,
+                            "Agent activation recovery quota conflicts with durable state"
+                        );
+                    } else {
+                        self.ensure_quota_capacity_unlocked(reservation)?;
+                        atomic_write_json(&reservation_path, reservation)?;
+                    }
+                }
+                (Some(reservation_id), None) => {
+                    let reservation = self
+                        .load_quota_reservation_unlocked(reservation_id)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Agent activation recovery quota reservation is missing"
+                            )
+                        })?;
+                    Self::validate_quota_binding(&intent.run, &reservation)?;
+                }
+                (None, Some(_)) => {
+                    anyhow::bail!("Agent activation recovery has an unlinked quota reservation");
+                }
+                (None, None) => {}
+            }
+            if let Some(prior) = &intent.prior_run {
+                anyhow::ensure!(
+                    prior.provider_route == intent.run.provider_route,
+                    "Agent activation recovery cannot replace the Run provider route"
+                );
+                if let Some(route) = &prior.provider_route {
+                    route
+                        .validate()
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+            }
             let run_path = self
                 .run_path(&intent.run.run_id)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -5197,6 +6176,18 @@ fn merge_run_observations(target: &mut RunRecord, current: &RunRecord) {
         .usage
         .requests
         .max(current.aggregates.usage.requests);
+    for attempt_id in &current.aggregates.accounted_provider_attempt_ids {
+        if !target
+            .aggregates
+            .accounted_provider_attempt_ids
+            .contains(attempt_id)
+        {
+            target
+                .aggregates
+                .accounted_provider_attempt_ids
+                .push(attempt_id.clone());
+        }
+    }
     target.aggregates.usage_complete &= current.aggregates.usage_complete;
     // A terminal candidate may have deliberately closed an unresolved marker
     // as accounting-unavailable. Do not resurrect the stale durable pending
@@ -5338,8 +6329,62 @@ mod tests {
     use crate::orchestration::types::{
         AgentRecord, ContinuationCheckpoint, ContinuationReason, RunBounds,
     };
+    use chrono::TimeZone;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    fn provider_route_snapshot(model_id: &str) -> super::super::types::ProviderRouteSnapshot {
+        super::super::types::ProviderRouteSnapshot {
+            schema_version: super::super::types::PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+            provider_id: "xai".into(),
+            model_id: model_id.into(),
+            wire_model_id: model_id.into(),
+            selection_key: model_id.into(),
+            kind: crate::gateway_config::ProviderKind::Xai,
+            dialect: crate::gateway_config::ProviderDialect::XaiChatCompletions,
+            base_url: "https://api.x.ai/v1".into(),
+            endpoint_fingerprint: "endpoint-fingerprint".into(),
+            credential_ref: "managed:xai:api-key".into(),
+            credential_fingerprint: "credential-fingerprint".into(),
+            capabilities: crate::gateway_config::ModelCapabilities::default(),
+            deadline_class: crate::gateway_config::ProviderDeadlineClass::Standard,
+            effort: crate::types::EffortLevel::Medium,
+            qualification_record_id: None,
+            quota_class: None,
+            quota_reservation_id: None,
+            snapshot_hash: String::new(),
+        }
+        .seal()
+        .unwrap()
+    }
+
+    fn quota_backed_run(
+        run_id: &str,
+        state: RunState,
+        now: chrono::DateTime<Utc>,
+        limits: super::super::quota::QuotaLimits,
+    ) -> (RunRecord, super::super::quota::QuotaReservation) {
+        let mut run = terminal_run(run_id);
+        run.state = state;
+        run.created_at = now;
+        run.updated_at = now;
+        run.terminal_result = state.is_terminal().then(|| "terminal".into());
+        run.final_response = None;
+        run.end_seq = None;
+        run.bounds.max_rounds = 8;
+        run.bounds.max_total_tokens = Some(1_000);
+        run.provider_route = Some(
+            provider_route_snapshot("grok-code-1")
+                .bind_quota(
+                    super::super::quota::QuotaClass::CodingExecution,
+                    format!("quota-{run_id}"),
+                )
+                .unwrap(),
+        );
+        let reservation =
+            super::super::quota::QuotaReservation::for_run(&run, "owner-1", limits, now).unwrap();
+        (run, reservation)
+    }
 
     fn terminal_run(run_id: &str) -> RunRecord {
         RunRecord {
@@ -5350,6 +6395,7 @@ mod tests {
             client_id: None,
             state: RunState::Completed,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -5408,6 +6454,7 @@ mod tests {
             client_id: None,
             state: RunState::Running,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -5437,6 +6484,45 @@ mod tests {
         let store2 = OrchStore::open(d.path()).unwrap();
         let loaded = store2.load_run("r1").unwrap().unwrap();
         assert_eq!(loaded.state, RunState::Interrupted);
+    }
+
+    #[test]
+    fn persisted_run_provider_route_is_immutable() {
+        let directory = tempdir().unwrap();
+        let store = OrchStore::open(directory.path()).unwrap();
+        let mut run = terminal_run("immutable-route");
+        run.provider_route = Some(provider_route_snapshot("grok-4"));
+        store.save_run(&run).unwrap();
+
+        let error = store
+            .update_run(&run.run_id, |current| {
+                current.provider_route = None;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider route snapshot is immutable"));
+        assert_eq!(
+            store.load_run(&run.run_id).unwrap().unwrap().provider_route,
+            run.provider_route
+        );
+
+        let mut replacement = run.clone();
+        replacement.provider_route = Some(provider_route_snapshot("grok-4-fast"));
+        let error = store.save_run(&replacement).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider route snapshot is immutable"));
+
+        let error = store.persist_finalization(&replacement).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider route snapshot is immutable"));
+        assert_eq!(
+            store.load_run(&run.run_id).unwrap().unwrap().provider_route,
+            run.provider_route
+        );
     }
 
     #[test]
@@ -5774,6 +6860,7 @@ mod tests {
             client_id: None,
             state: RunState::Running,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -6009,6 +7096,7 @@ mod tests {
             client_id: None,
             state: RunState::Running,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -6252,6 +7340,17 @@ mod tests {
         first.terminal_result = None;
         first.final_response = None;
         first.end_seq = None;
+        first.provider_route = Some(provider_route_snapshot("wrong-model"));
+        let error = store
+            .save_run_and_activate_agent(&first, "agent-activation-race")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not match its captured Agent specification"),
+            "unexpected error: {error}"
+        );
+        assert!(store.load_run(&first.run_id).unwrap().is_none());
+        first.provider_route = Some(provider_route_snapshot("grok"));
         let mut second = first.clone();
         second.run_id = "activation-second".into();
         second.request_id = "req-activation-second".into();
@@ -6354,6 +7453,7 @@ mod tests {
                 run: run.clone(),
                 activated_agent: activated,
                 prior_run: Some(prior_run.clone()),
+                quota_reservation: None,
             };
             atomic_write_json(&store.agent_activation_path(run_id).unwrap(), &intent).unwrap();
             atomic_write_json(&store.run_path(run_id).unwrap(), &prior_run).unwrap();
@@ -6373,5 +7473,429 @@ mod tests {
         assert_eq!(agent.current_run_id, None);
         assert_eq!(agent.last_run_id.as_deref(), Some(run_id));
         assert!(!reopened.agent_activation_path(run_id).unwrap().exists());
+    }
+
+    #[test]
+    fn quota_admission_is_atomic_with_run() {
+        let root = tempdir().unwrap();
+        let store = OrchStore::open(root.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let limits = super::super::quota::QuotaLimits {
+            max_in_flight_reservations: 1,
+            max_tokens_per_window: 2_000,
+            max_requests_per_window: 16,
+            ..Default::default()
+        };
+        let (first_run, first_reservation) =
+            quota_backed_run("quota-run-1", RunState::Queued, now, limits);
+        store
+            .save_run_with_quota(&first_run, &first_reservation)
+            .unwrap();
+        assert_eq!(
+            store.load_run(&first_run.run_id).unwrap().unwrap().run_id,
+            first_run.run_id
+        );
+        assert_eq!(
+            store
+                .load_quota_reservation(&first_reservation.reservation_id)
+                .unwrap()
+                .unwrap(),
+            first_reservation
+        );
+
+        let (second_run, second_reservation) =
+            quota_backed_run("quota-run-2", RunState::Queued, now, limits);
+        let error = store
+            .save_run_with_quota(&second_run, &second_reservation)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<OrchError>().map(|error| &error.code),
+            Some(&OrchErrorCode::CapacityExhausted)
+        );
+        assert!(store.load_run(&second_run.run_id).unwrap().is_none());
+        assert!(store
+            .load_quota_reservation(&second_reservation.reservation_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn concurrent_last_quota_slot_has_one_winner() {
+        let root = tempdir().unwrap();
+        let store = OrchStore::open(root.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let limits = super::super::quota::QuotaLimits {
+            max_in_flight_reservations: 1,
+            max_tokens_per_window: 2_000,
+            max_requests_per_window: 16,
+            ..Default::default()
+        };
+        let first = quota_backed_run("quota-race-1", RunState::Queued, now, limits);
+        let second = quota_backed_run("quota-race-2", RunState::Queued, now, limits);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles = [first, second].map(|(run, reservation)| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.save_run_with_quota(&run, &reservation)
+            })
+        });
+        barrier.wait();
+        let results = handles.map(|handle| handle.join().unwrap());
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .filter(|error| {
+                    error
+                        .downcast_ref::<OrchError>()
+                        .is_some_and(|error| error.code == OrchErrorCode::CapacityExhausted)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(store.list_runs().unwrap().len(), 1);
+        assert_eq!(store.list_quota_reservations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn quota_intent_recovers_without_orphan_reservation() {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (run, reservation) = quota_backed_run(
+            "quota-crash-run",
+            RunState::Queued,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        {
+            let store = OrchStore::open(root.path()).unwrap();
+            let intent = QuotaAdmissionIntent {
+                run: run.clone(),
+                reservation: reservation.clone(),
+            };
+            atomic_write_json(
+                &store.quota_admission_intent_path(&run.run_id).unwrap(),
+                &intent,
+            )
+            .unwrap();
+            atomic_write_json(
+                &store
+                    .quota_reservation_path(&reservation.reservation_id)
+                    .unwrap(),
+                &reservation,
+            )
+            .unwrap();
+            // Crash after the reservation but before the Run write.
+        }
+
+        let reopened = OrchStore::open(root.path()).unwrap();
+        let recovered_run = reopened.load_run(&run.run_id).unwrap().unwrap();
+        let recovered_reservation = reopened
+            .load_quota_reservation(&reservation.reservation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_run.state, RunState::Interrupted);
+        assert_eq!(
+            recovered_reservation.state,
+            super::super::quota::QuotaReservationState::Refunded
+        );
+        assert!(!reopened
+            .quota_admission_intent_path(&run.run_id)
+            .unwrap()
+            .exists());
+        assert_eq!(reopened.list_runs().unwrap().len(), 1);
+        assert_eq!(reopened.list_quota_reservations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn terminal_usage_settles_quota_idempotently_and_uncertain_usage_stays_reserved() {
+        let root = tempdir().unwrap();
+        let store = OrchStore::open(root.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let limits = super::super::quota::QuotaLimits::default();
+        let (run, reservation) = quota_backed_run("quota-consume", RunState::Queued, now, limits);
+        store.save_run_with_quota(&run, &reservation).unwrap();
+        for _ in 0..2 {
+            store
+                .update_run(&run.run_id, |current| {
+                    current.state = RunState::Completed;
+                    current.aggregates.usage.total_tokens = 400;
+                    current.aggregates.usage.requests = 3;
+                    current.aggregates.usage_complete = true;
+                    current.aggregates.usage_pending_requests = 0;
+                    current.updated_at = now;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let consumed = store
+            .load_quota_reservation(&reservation.reservation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            consumed.state,
+            super::super::quota::QuotaReservationState::Consumed
+        );
+        assert_eq!(consumed.tokens_consumed, 400);
+        assert_eq!(consumed.requests_consumed, 3);
+        assert!(store
+            .update_run(&run.run_id, |current| {
+                current.aggregates.usage.requests = reservation.requests_reserved + 1;
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(
+            store
+                .load_run(&run.run_id)
+                .unwrap()
+                .unwrap()
+                .aggregates
+                .usage
+                .requests,
+            3
+        );
+
+        let (uncertain_run, uncertain_reservation) =
+            quota_backed_run("quota-uncertain", RunState::Queued, now, limits);
+        store
+            .save_run_with_quota(&uncertain_run, &uncertain_reservation)
+            .unwrap();
+        store
+            .update_run(&uncertain_run.run_id, |current| {
+                current.state = RunState::Interrupted;
+                current.aggregates.usage_complete = false;
+                current.aggregates.usage_pending_requests = 0;
+                current.updated_at = now;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .load_quota_reservation(&uncertain_reservation.reservation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            super::super::quota::QuotaReservationState::Reserved
+        );
+    }
+
+    #[test]
+    fn restart_expires_reservation_without_run_or_recovery_intent() {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (_run, reservation) = quota_backed_run(
+            "quota-orphan",
+            RunState::Queued,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        {
+            let store = OrchStore::open(root.path()).unwrap();
+            atomic_write_json(
+                &store
+                    .quota_reservation_path(&reservation.reservation_id)
+                    .unwrap(),
+                &reservation,
+            )
+            .unwrap();
+        }
+        let reopened = OrchStore::open(root.path()).unwrap();
+        assert_eq!(
+            reopened
+                .load_quota_reservation(&reservation.reservation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            super::super::quota::QuotaReservationState::Expired
+        );
+    }
+
+    #[test]
+    fn restart_settles_terminal_run_written_before_quota_update() {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (mut run, reservation) = quota_backed_run(
+            "quota-terminal-crash",
+            RunState::Queued,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        {
+            let store = OrchStore::open(root.path()).unwrap();
+            store.save_run_with_quota(&run, &reservation).unwrap();
+            run.state = RunState::Completed;
+            run.aggregates.usage.total_tokens = 333;
+            run.aggregates.usage.requests = 2;
+            run.aggregates.usage_complete = true;
+            run.aggregates.usage_pending_requests = 0;
+            atomic_write_json(&store.run_path(&run.run_id).unwrap(), &run).unwrap();
+            // Crash after the terminal Run write but before quota settlement.
+        }
+        let reopened = OrchStore::open(root.path()).unwrap();
+        let settled = reopened
+            .load_quota_reservation(&reservation.reservation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settled.state,
+            super::super::quota::QuotaReservationState::Consumed
+        );
+        assert_eq!(settled.tokens_consumed, 333);
+        assert_eq!(settled.requests_consumed, 2);
+    }
+
+    #[test]
+    fn known_not_sent_is_retryable_and_completion_is_idempotent() {
+        let root = tempdir().unwrap();
+        let store = OrchStore::open(root.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (run, reservation) = quota_backed_run(
+            "attempt-not-sent",
+            RunState::Running,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        store.save_run_with_quota(&run, &reservation).unwrap();
+
+        let first = store.begin_provider_attempt(&run.run_id).unwrap();
+        assert_eq!(first.ordinal, 1);
+        assert_eq!(
+            store
+                .load_run(&run.run_id)
+                .unwrap()
+                .unwrap()
+                .aggregates
+                .usage_pending_requests,
+            1
+        );
+        for _ in 0..2 {
+            store
+                .finish_provider_attempt(
+                    &first.attempt_id,
+                    ProviderSendCertainty::KnownNotSent,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let finished = store
+            .load_provider_attempt(&first.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            finished.retry_class,
+            Some(super::super::provider_attempt::ProviderRetryClass::SameRunSafe)
+        );
+        let after = store.load_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(after.aggregates.usage_pending_requests, 0);
+        assert!(after.aggregates.usage_complete);
+        assert_eq!(after.aggregates.accounted_provider_attempt_ids.len(), 1);
+
+        let replacement = store.begin_provider_attempt(&run.run_id).unwrap();
+        assert_eq!(replacement.ordinal, 2);
+    }
+
+    #[test]
+    fn restart_marks_unresolved_attempt_uncertain_and_never_refunds_it() {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (run, reservation) = quota_backed_run(
+            "attempt-uncertain",
+            RunState::Running,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        let attempt_id = {
+            let store = OrchStore::open(root.path()).unwrap();
+            store.save_run_with_quota(&run, &reservation).unwrap();
+            store
+                .begin_provider_attempt(&run.run_id)
+                .unwrap()
+                .attempt_id
+            // Crash after the durable row and possible transport entry.
+        };
+
+        let reopened = OrchStore::open(root.path()).unwrap();
+        let attempt = reopened
+            .load_provider_attempt(&attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attempt.send_certainty,
+            Some(ProviderSendCertainty::UncertainAccept)
+        );
+        assert_eq!(
+            attempt.retry_class,
+            Some(super::super::provider_attempt::ProviderRetryClass::ExplicitNewRunOnly)
+        );
+        let recovered_run = reopened.load_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(recovered_run.state, RunState::Interrupted);
+        assert!(!recovered_run.aggregates.usage_complete);
+        assert_eq!(recovered_run.aggregates.usage_pending_requests, 0);
+        assert!(reopened.begin_provider_attempt(&run.run_id).is_err());
+        assert_eq!(
+            reopened
+                .load_quota_reservation(&reservation.reservation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            QuotaReservationState::Reserved
+        );
+    }
+
+    #[test]
+    fn restart_applies_a_completed_attempt_exactly_once() {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (run, reservation) = quota_backed_run(
+            "attempt-complete-crash",
+            RunState::Running,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        let attempt_id = {
+            let store = OrchStore::open(root.path()).unwrap();
+            store.save_run_with_quota(&run, &reservation).unwrap();
+            let mut attempt = store.begin_provider_attempt(&run.run_id).unwrap();
+            attempt
+                .finish(
+                    ProviderSendCertainty::KnownAccepted,
+                    Some(200),
+                    Some(crate::completion::CompletionUsage {
+                        prompt_tokens: 7,
+                        completion_tokens: 5,
+                        total_tokens: 12,
+                        requests: 1,
+                    }),
+                    Utc::now(),
+                )
+                .unwrap();
+            store.save_provider_attempt_unlocked(&attempt).unwrap();
+            attempt.attempt_id
+            // Crash after the response row but before applying it to Run.
+        };
+
+        for _ in 0..2 {
+            let reopened = OrchStore::open(root.path()).unwrap();
+            let recovered = reopened.load_run(&run.run_id).unwrap().unwrap();
+            assert_eq!(recovered.aggregates.usage.total_tokens, 12);
+            assert_eq!(recovered.aggregates.usage.requests, 1);
+            assert_eq!(
+                recovered.aggregates.accounted_provider_attempt_ids,
+                vec![attempt_id.clone()]
+            );
+            assert_eq!(
+                reopened
+                    .load_quota_reservation(&reservation.reservation_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                QuotaReservationState::Consumed
+            );
+            drop(reopened);
+        }
     }
 }

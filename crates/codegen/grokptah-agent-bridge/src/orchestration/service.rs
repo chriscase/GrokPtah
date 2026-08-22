@@ -21,15 +21,18 @@ use super::authz::{
 };
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
-    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedIntentState,
-    ManagedRetryCause, NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
-    MANAGED_EXECUTION_SCHEMA_VERSION, MAX_MANAGED_MESSAGES,
+    ManagedAdmissionCapacity, ManagedExecutionIntent, ManagedExecutionPolicy,
+    ManagedFinalizationOutcome, ManagedIntentState, ManagedRetryCause, NativeExecutorStatus,
+    ProviderRoute, AGENT_CEILING_EXHAUSTED, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
+    MANAGED_EXECUTION_SCHEMA_VERSION, MAX_CONCURRENT_PROVIDER_RUNS, MAX_MANAGED_MESSAGES,
+    PROVIDER_CEILING_EXHAUSTED,
 };
 use super::manager::{
     parse_manager_directive, ManagerCoordinationMode, ManagerDecisionRecord, ManagerDecisionState,
     ManagerDirective, ManagerPlan, ManagerPlanState, ManagerStepSpec, MANAGER_SCHEMA_VERSION,
 };
 use super::message::{message_activation_unsupported, MessageKind, WorkMessage};
+use super::quota::{QuotaClass, QuotaLimits, QuotaReservation};
 use super::routine::{
     manual_dedupe_key, ActivationCause, ActivationRequest, MissedRunPolicy,
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
@@ -53,6 +56,52 @@ use super::workload::{
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
 
+fn validate_provider_route_capabilities(
+    route: &super::types::ProviderRouteSnapshot,
+    purpose: RunPurpose,
+    stale_measured_qualification: bool,
+) -> Result<(), OrchError> {
+    route.validate()?;
+    crate::native_coding_readiness::admit_purpose(
+        purpose,
+        route.capabilities.source,
+        route.capabilities.chat,
+        route.capabilities.tools,
+        stale_measured_qualification,
+    )
+    .orch_error()
+    .map_or(Ok(()), Err)
+}
+
+fn validate_provider_route_for_purpose(
+    route: &super::types::ProviderRouteSnapshot,
+    purpose: RunPurpose,
+) -> Result<(), OrchError> {
+    let stale_measured_qualification =
+        crate::gateway_config::has_measured_xai_qualification(&route.provider_id, &route.model_id)
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "provider qualification ledger is unavailable",
+                )
+            })?;
+    validate_provider_route_capabilities(route, purpose, stale_measured_qualification)
+}
+
+fn provider_projection_error(_error: anyhow::Error) -> OrchError {
+    OrchError::new(
+        OrchErrorCode::Internal,
+        "provider execution ledger is unavailable",
+    )
+}
+
+fn provider_projection_overflow() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::Internal,
+        "provider execution ledger totals overflowed",
+    )
+}
+
 #[derive(Default)]
 struct AdmissionQueueState {
     pending: VecDeque<PendingRun>,
@@ -63,6 +112,27 @@ struct PendingRun {
     session_id: Uuid,
     prompt: String,
     execution_mode: RunExecutionMode,
+}
+
+/// Re-derive the exact provider route for one captured AgentSpec revision.
+///
+/// The spec stores the opaque selection key alongside its parsed identity.
+/// Native admission re-parses the key and requires an exact match, so a
+/// record written by a different schema, hand-edited, or corrupted is never
+/// routed to a provider. Returning `None` fails the admission closed; it does
+/// not fall back to a default provider.
+fn resolve_agent_provider_route(spec: &super::types::AgentSpec) -> Option<ProviderRoute> {
+    let parsed =
+        super::types::AgentModelSpec::from_selection_key(&spec.model.selection_key).ok()?;
+    if parsed.provider_id != spec.model.provider_id || parsed.model_id != spec.model.model_id {
+        return None;
+    }
+    let route = ProviderRoute {
+        provider_id: parsed.provider_id,
+        model_id: parsed.model_id,
+    };
+    route.validate().ok()?;
+    Some(route)
 }
 
 #[derive(Clone)]
@@ -1222,24 +1292,47 @@ impl OrchestrationService {
                 self.native_executor.lock().skipped_ineligible += 1;
                 continue;
             }
+            // Fail closed: an admission never routes a provider identity the
+            // host cannot re-derive from the captured AgentSpec revision.
+            let Some(route) = resolve_agent_provider_route(&spec) else {
+                self.native_executor.lock().skipped_unroutable += 1;
+                continue;
+            };
             let decisions = self.store.list_work_decisions(&work.work_id)?;
-            let live = self.store.live_managed_intents_for_agent(&agent_id)?;
+            let capacity = ManagedAdmissionCapacity {
+                live_intents_for_agent: self.store.live_managed_intents_for_agent(&agent_id)?,
+                live_intents_for_provider: self
+                    .store
+                    .live_managed_intents_for_provider(&route.provider_id)?,
+                max_concurrent_provider_runs: MAX_CONCURRENT_PROVIDER_RUNS,
+            };
             let bounds = match managed_execution_eligible(
-                &work, &agent, &spec, &decisions, live, &ceiling,
+                &work, &agent, &spec, &decisions, capacity, &ceiling,
             ) {
                 Ok(bounds) => bounds,
-                Err(_) => {
-                    self.native_executor.lock().skipped_ineligible += 1;
+                Err(error) => {
+                    let mut status = self.native_executor.lock();
+                    if error.message == PROVIDER_CEILING_EXHAUSTED {
+                        status.skipped_provider_capacity += 1;
+                    } else {
+                        status.skipped_ineligible += 1;
+                    }
                     continue;
                 }
             };
             if let Err(error) = self
-                .admit_one_managed_work(&work, &agent, &spec, bounds, &owner, &secret)
+                .admit_one_managed_work(&work, &agent, &spec, route, bounds, &owner, &secret)
                 .await
             {
                 let mut status = self.native_executor.lock();
-                status.last_error = Some(error.to_string());
-                status.skipped_ineligible += 1;
+                if error.message == PROVIDER_CEILING_EXHAUSTED {
+                    status.skipped_provider_capacity += 1;
+                } else if error.message == AGENT_CEILING_EXHAUSTED {
+                    status.skipped_ineligible += 1;
+                } else {
+                    status.last_error = Some(error.to_string());
+                    status.skipped_ineligible += 1;
+                }
                 continue;
             }
             self.native_executor.lock().admitted += 1;
@@ -1247,11 +1340,13 @@ impl OrchestrationService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn admit_one_managed_work(
         &self,
         work: &WorkItem,
         agent: &super::types::AgentRecord,
         spec: &super::types::AgentSpec,
+        route: ProviderRoute,
         bounds: super::types::RunBounds,
         owner_id: &str,
         secret: &str,
@@ -1302,6 +1397,7 @@ impl OrchestrationService {
             source_routine_id: work.source_routine_id.clone(),
             source_activation_id: work.source_activation_id.clone(),
             model_selection_key: spec.model.selection_key.clone(),
+            provider_route: Some(route),
             bounds: bounds.clone(),
             input_hash,
             state: ManagedIntentState::Claiming,
@@ -1309,7 +1405,11 @@ impl OrchestrationService {
             created_at: now,
             updated_at: now,
         };
-        self.store.save_managed_intent(&intent)?;
+        self.store.reserve_managed_intent(
+            &intent,
+            spec.managed_execution.max_concurrent_runs as usize,
+            MAX_CONCURRENT_PROVIDER_RUNS,
+        )?;
         let claim = match self.store.claim_work_with_lease_secret(
             &work.work_id,
             &agent.agent_id,
@@ -4854,7 +4954,27 @@ impl OrchestrationService {
                     && super::workspaces_match(&intent.workspace, &claimed.display().to_string())
             })
             .collect::<Vec<_>>();
-        Ok(json!({ "intents": intents, "executor": self.native_executor_status() }))
+        // The ceiling is home-wide, but the breakdown is deliberately limited
+        // to the intents this caller is already authorized to read. A Lane
+        // must not learn another Lane's provider identities or counts.
+        let mut live_in_scope: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for intent in &intents {
+            if !intent.state.is_live() {
+                continue;
+            }
+            if let Some(provider_id) = intent.effective_provider_id() {
+                *live_in_scope.entry(provider_id).or_default() += 1;
+            }
+        }
+        Ok(json!({
+            "intents": intents,
+            "executor": self.native_executor_status(),
+            "providerAdmission": {
+                "maxConcurrentRunsPerProvider": MAX_CONCURRENT_PROVIDER_RUNS,
+                "liveInScopeByProvider": live_in_scope,
+            },
+        }))
     }
 
     pub fn resolve_work_input(
@@ -4930,7 +5050,7 @@ impl OrchestrationService {
         }))
     }
 
-    pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+    pub fn get_capacity(&self, auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
         let max = self.host.orchestration_capacity_limit();
         let active = self.host.orchestration_active_count();
         let queued = self.host.orchestration_pending_count();
@@ -4973,12 +5093,14 @@ impl OrchestrationService {
             .last_error
             .as_deref()
             .map(|error| self.bus.redact_text(error, 500));
+        let provider_quota = self.provider_quota_capacity_projection(auth)?;
         Ok(json!({
             "maxConcurrentRuns": max,
             "activeRuns": active,
             "available": max.saturating_sub(active),
             "queuedRuns": queued,
             "queueLimit": MAX_PENDING_ADMISSIONS,
+            "providerQuota": provider_quota,
             "health": {
                 "laggedLiveEvents": self.bus.lagged_event_count(),
                 "eventJournalPersistenceError": event_error,
@@ -4994,6 +5116,43 @@ impl OrchestrationService {
                 "nativeExecutor": self.native_executor.lock().clone(),
             },
         }))
+    }
+
+    pub fn get_native_coding_readiness(
+        &self,
+        auth: &AuthContext,
+        provider_id: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (provider_id, model_id) = match (
+            provider_id.map(str::trim).filter(|value| !value.is_empty()),
+            model_id.map(str::trim).filter(|value| !value.is_empty()),
+        ) {
+            (None, None) => self
+                .host
+                .current_provider_model_selection()
+                .unwrap_or_default(),
+            (Some(provider_id), Some(model_id)) => (provider_id.to_string(), model_id.to_string()),
+            _ => {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "providerId and modelId must both be supplied or both omitted",
+                ))
+            }
+        };
+        let projection = crate::native_coding_readiness::project_for_owner(
+            &auth.owner_id,
+            &provider_id,
+            &model_id,
+        );
+        let value = crate::native_coding_readiness::projection_value(&projection);
+        if crate::native_coding_readiness::projection_contains_forbidden_fields(&value) {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "native coding readiness projection refused to serialize",
+            ));
+        }
+        Ok(value)
     }
 
     pub fn get_run(
@@ -5016,8 +5175,11 @@ impl OrchestrationService {
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
-        serde_json::to_value(run)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
+        let provider_execution = self.provider_execution_projection(&run)?;
+        let mut value = serde_json::to_value(run)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        value["providerExecution"] = provider_execution;
+        Ok(value)
     }
 
     pub fn get_progress(
@@ -5041,6 +5203,7 @@ impl OrchestrationService {
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
+        let provider_execution = self.provider_execution_projection(&run)?;
         Ok(json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
@@ -5057,6 +5220,168 @@ impl OrchestrationService {
             "stopCause": run.stop_cause,
             "bounds": run.bounds,
             "errorCode": run.error_code,
+            "providerExecution": provider_execution,
+        }))
+    }
+
+    fn provider_execution_projection(
+        &self,
+        run: &RunRecord,
+    ) -> Result<serde_json::Value, OrchError> {
+        let Some(route) = run.provider_route.as_ref() else {
+            return Ok(serde_json::Value::Null);
+        };
+        route.validate()?;
+        let quota = match route.quota_reservation_id.as_deref() {
+            Some(reservation_id) => {
+                let reservation = self
+                    .store
+                    .load_quota_reservation(reservation_id)
+                    .map_err(provider_projection_error)?
+                    .ok_or_else(|| {
+                        OrchError::new(
+                            OrchErrorCode::Internal,
+                            "provider quota reservation is missing",
+                        )
+                    })?;
+                if reservation.run_id != run.run_id
+                    || reservation.route_snapshot_hash != route.snapshot_hash
+                    || reservation.pool.provider_id != route.provider_id
+                {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Internal,
+                        "provider quota reservation does not match the Run",
+                    ));
+                }
+                json!({
+                    "reservationId": reservation.reservation_id,
+                    "poolId": reservation.pool_id,
+                    "class": reservation.pool.class,
+                    "state": reservation.state,
+                    "tokensReserved": reservation.tokens_reserved,
+                    "tokensConsumed": reservation.tokens_consumed,
+                    "requestsReserved": reservation.requests_reserved,
+                    "requestsConsumed": reservation.requests_consumed,
+                    "windowStartedAt": reservation.window_started_at,
+                    "limits": reservation.limits,
+                    "updatedAt": reservation.updated_at,
+                })
+            }
+            None => serde_json::Value::Null,
+        };
+        let mut attempts = self
+            .store
+            .list_provider_attempts()
+            .map_err(provider_projection_error)?
+            .into_iter()
+            .filter(|attempt| attempt.run_id == run.run_id)
+            .collect::<Vec<_>>();
+        attempts.sort_by(|left, right| {
+            left.ordinal
+                .cmp(&right.ordinal)
+                .then(left.attempt_id.cmp(&right.attempt_id))
+        });
+        let attempt_count = attempts.len();
+        const MAX_PROJECTED_PROVIDER_ATTEMPTS: usize = 128;
+        let truncated = attempt_count > MAX_PROJECTED_PROVIDER_ATTEMPTS;
+        attempts.truncate(MAX_PROJECTED_PROVIDER_ATTEMPTS);
+        let attempts = attempts
+            .into_iter()
+            .map(|attempt| {
+                json!({
+                    "attemptId": attempt.attempt_id,
+                    "ordinal": attempt.ordinal,
+                    "state": attempt.state,
+                    "sendCertainty": attempt.send_certainty,
+                    "retryClass": attempt.retry_class,
+                    "httpStatus": attempt.http_status,
+                    "usage": attempt.usage,
+                    "createdAt": attempt.created_at,
+                    "updatedAt": attempt.updated_at,
+                    "finishedAt": attempt.finished_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "route": {
+                "providerId": route.provider_id,
+                "kind": route.kind,
+                "dialect": route.dialect,
+                "modelId": route.model_id,
+                "wireModelId": route.wire_model_id,
+                "capabilitySource": route.capabilities.source,
+                "qualificationSchema": route.capabilities.qualification_schema,
+                "deadlineClass": route.deadline_class,
+                "effort": route.effort,
+                "snapshotHash": route.snapshot_hash,
+            },
+            "quota": quota,
+            "attempts": attempts,
+            "attemptCount": attempt_count,
+            "attemptsTruncated": truncated,
+            "usageComplete": run.aggregates.usage_complete,
+            "pendingRequests": run.aggregates.usage_pending_requests,
+        }))
+    }
+
+    fn provider_quota_capacity_projection(
+        &self,
+        auth: &AuthContext,
+    ) -> Result<serde_json::Value, OrchError> {
+        let reservations = self
+            .store
+            .list_quota_reservations()
+            .map_err(provider_projection_error)?;
+        let mut active = 0u64;
+        let mut consumed = 0u64;
+        let mut released = 0u64;
+        let mut tokens_reserved = 0u64;
+        let mut tokens_consumed = 0u64;
+        let mut requests_reserved = 0u64;
+        let mut requests_consumed = 0u64;
+        let mut providers = std::collections::BTreeSet::new();
+        for reservation in reservations
+            .into_iter()
+            .filter(|reservation| reservation.pool.owner_id == auth.owner_id)
+        {
+            providers.insert(reservation.pool.provider_id.clone());
+            match reservation.state {
+                super::quota::QuotaReservationState::Reserved => {
+                    active += 1;
+                    tokens_reserved = tokens_reserved
+                        .checked_add(reservation.tokens_reserved)
+                        .ok_or_else(provider_projection_overflow)?;
+                    requests_reserved = requests_reserved
+                        .checked_add(reservation.requests_reserved)
+                        .ok_or_else(provider_projection_overflow)?;
+                }
+                super::quota::QuotaReservationState::Consumed => {
+                    consumed += 1;
+                    tokens_consumed = tokens_consumed
+                        .checked_add(reservation.tokens_consumed)
+                        .ok_or_else(provider_projection_overflow)?;
+                    requests_consumed = requests_consumed
+                        .checked_add(reservation.requests_consumed)
+                        .ok_or_else(provider_projection_overflow)?;
+                }
+                super::quota::QuotaReservationState::Refunded
+                | super::quota::QuotaReservationState::Expired => released += 1,
+            }
+        }
+        const MAX_PROJECTED_PROVIDERS: usize = 64;
+        let provider_count = providers.len();
+        let providers_truncated = provider_count > MAX_PROJECTED_PROVIDERS;
+        Ok(json!({
+            "activeReservations": active,
+            "consumedReservations": consumed,
+            "releasedReservations": released,
+            "tokensReserved": tokens_reserved,
+            "tokensConsumed": tokens_consumed,
+            "requestsReserved": requests_reserved,
+            "requestsConsumed": requests_consumed,
+            "providers": providers.into_iter().take(MAX_PROJECTED_PROVIDERS).collect::<Vec<_>>(),
+            "providerCount": provider_count,
+            "providersTruncated": providers_truncated,
         }))
     }
 
@@ -6752,12 +7077,13 @@ impl OrchestrationService {
                 ));
             }
         };
-        let agent_bounds = match agent.current_spec() {
-            Ok(spec) => &spec.default_run_bounds,
+        let agent_spec = match agent.current_spec() {
+            Ok(spec) => spec.clone(),
             Err(error) => {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
             }
         };
+        let agent_bounds = &agent_spec.default_run_bounds;
         bounds.max_prompt_bytes = bounds.max_prompt_bytes.min(agent_bounds.max_prompt_bytes);
         bounds.max_rounds = bounds.max_rounds.min(agent_bounds.max_rounds);
         bounds.max_duration_ms = bounds.max_duration_ms.min(agent_bounds.max_duration_ms);
@@ -6777,9 +7103,54 @@ impl OrchestrationService {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
 
+        let agent_spec_revision = agent_spec.revision;
+        let run_purpose = if proposal_only {
+            RunPurpose::ManagerProposal
+        } else {
+            RunPurpose::Execution
+        };
+        let mut provider_route = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
+            None
+        } else {
+            Some(
+                self.host
+                    .capture_provider_route(
+                        &agent_spec.model.selection_key,
+                        self.host.current_effort(),
+                    )
+                    .map_err(|error| {
+                        self.fail_claim(
+                            &mut lease,
+                            None,
+                            session_id,
+                            &claimed,
+                            OrchError::new(OrchErrorCode::Conflict, error.to_string()),
+                        )
+                    })?,
+            )
+        };
+        if let Some(route) = provider_route.as_ref() {
+            validate_provider_route_for_purpose(route, run_purpose)
+                .map_err(|error| self.fail_claim(&mut lease, None, session_id, &claimed, error))?;
+        }
+
         // Give older queued work first claim on any newly available capacity.
         self.pump_pending();
         let run_id = Uuid::new_v4().to_string();
+        if let Some(route) = provider_route.take() {
+            let quota_class = if run_purpose == RunPurpose::ManagerProposal {
+                QuotaClass::ManagerProposal
+            } else {
+                QuotaClass::CodingExecution
+            };
+            provider_route = Some(
+                route
+                    .bind_quota(quota_class, format!("quota-{run_id}"))
+                    .map_err(|error| {
+                        self.fail_claim(&mut lease, None, session_id, &claimed, error)
+                    })?,
+            );
+        }
         let queue_ahead = self.host.orchestration_pending_count() > 0;
         let mut queued = false;
         if allow_queue && queue_ahead {
@@ -6797,10 +7168,7 @@ impl OrchestrationService {
             }
         }
         let start_seq = (!queued).then(|| self.bus.next_seq());
-        let agent_spec_revision = agent
-            .current_spec()
-            .map_err(|error| self.fail_claim(&mut lease, None, session_id, &claimed, error))?
-            .revision;
+        let now = Utc::now();
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -6822,11 +7190,8 @@ impl OrchestrationService {
             } else {
                 RunState::Running
             },
-            purpose: if proposal_only {
-                RunPurpose::ManagerProposal
-            } else {
-                RunPurpose::Execution
-            },
+            purpose: run_purpose,
+            provider_route,
             agent_id: Some(agent.agent_id),
             retry_of: retry_of.map(str::to_string),
             parent_run_id: None,
@@ -6840,8 +7205,8 @@ impl OrchestrationService {
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),
             start_seq,
             end_seq: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
             terminal_result: None,
             final_response: None,
             error_code: None,
@@ -6851,18 +7216,51 @@ impl OrchestrationService {
             execution: None,
             approval: None,
         };
-        let persisted = if queued {
-            self.store.save_run(&run)
-        } else {
-            self.store
-                .save_run_and_activate_agent(&run, run.agent_id.as_deref().expect("Run Agent"))
+        let quota_reservation = match run.provider_route.as_ref() {
+            Some(_) => match QuotaReservation::for_run(
+                &run,
+                auth.owner_id.clone(),
+                QuotaLimits::default(),
+                now,
+            ) {
+                Ok(reservation) => Some(reservation),
+                Err(error) => {
+                    if !queued {
+                        self.host.release_turn_reservation(session_id, &run_id);
+                        self.release_capacity(&run_id);
+                    }
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        Some(run_id.clone()),
+                        session_id,
+                        &claimed,
+                        error,
+                    ));
+                }
+            },
+            None => None,
+        };
+        let persisted = match (queued, quota_reservation.as_ref()) {
+            (true, Some(reservation)) => self.store.save_run_with_quota(&run, reservation),
+            (false, Some(reservation)) => self.store.save_run_and_activate_agent_with_quota(
+                &run,
+                run.agent_id.as_deref().expect("Run Agent"),
+                reservation,
+            ),
+            (true, None) => self.store.save_run(&run),
+            (false, None) => self
+                .store
+                .save_run_and_activate_agent(&run, run.agent_id.as_deref().expect("Run Agent")),
         };
         if let Err(e) = persisted {
             if !queued {
                 self.host.release_turn_reservation(session_id, &run_id);
                 self.release_capacity(&run_id);
             }
-            let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
+            let e = e
+                .downcast_ref::<OrchError>()
+                .cloned()
+                .unwrap_or_else(|| OrchError::new(OrchErrorCode::Internal, e.to_string()));
             return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
         }
 
@@ -7906,5 +8304,87 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | SteeringInjected { session_id, .. }
         | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
+    }
+}
+
+#[cfg(test)]
+mod provider_route_policy_tests {
+    use super::*;
+    use crate::gateway_config::{
+        CapabilitySource, ModelCapabilities, ProviderDeadlineClass, ProviderDialect, ProviderKind,
+        CAPABILITY_QUALIFICATION_SCHEMA,
+    };
+    use crate::types::EffortLevel;
+
+    fn route(
+        source: CapabilitySource,
+        chat: bool,
+        tools: bool,
+    ) -> super::super::types::ProviderRouteSnapshot {
+        super::super::types::ProviderRouteSnapshot {
+            schema_version: super::super::types::PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+            provider_id: "env-grokptah".into(),
+            model_id: "policy-model".into(),
+            wire_model_id: "policy-model".into(),
+            selection_key: crate::gateway_config::model_selection_key(
+                "env-grokptah",
+                "policy-model",
+            ),
+            kind: ProviderKind::OpenAiCompatible,
+            dialect: ProviderDialect::OpenAiChatCompletions,
+            base_url: "http://127.0.0.1:41111/v1".into(),
+            endpoint_fingerprint: String::new(),
+            credential_ref: "env:GROKPTAH_API_KEY".into(),
+            credential_fingerprint: "v1-sha256:policy-credential".into(),
+            capabilities: ModelCapabilities {
+                chat,
+                tools,
+                source,
+                qualification_schema: (source == CapabilitySource::Measured)
+                    .then(|| CAPABILITY_QUALIFICATION_SCHEMA.into()),
+                ..ModelCapabilities::default()
+            },
+            deadline_class: ProviderDeadlineClass::Standard,
+            effort: EffortLevel::Medium,
+            qualification_record_id: None,
+            quota_class: None,
+            quota_reservation_id: None,
+            snapshot_hash: String::new(),
+        }
+        .seal()
+        .unwrap()
+    }
+
+    #[test]
+    fn unknown_capabilities_never_enter_autonomous_runs() {
+        let route = route(CapabilitySource::Unknown, true, true);
+        for purpose in [RunPurpose::Execution, RunPurpose::ManagerProposal] {
+            let error = validate_provider_route_capabilities(&route, purpose, false).unwrap_err();
+            assert_eq!(error.code, OrchErrorCode::Conflict);
+            assert!(error.message.contains("qualified or explicitly declared"));
+        }
+    }
+
+    #[test]
+    fn stale_measured_history_blocks_declared_execution_but_not_chat_only_proposals() {
+        let route = route(CapabilitySource::Declared, true, true);
+        validate_provider_route_capabilities(&route, RunPurpose::Execution, false).unwrap();
+        let error =
+            validate_provider_route_capabilities(&route, RunPurpose::Execution, true).unwrap_err();
+        assert!(error.message.contains("requalify"));
+        validate_provider_route_capabilities(&route, RunPurpose::ManagerProposal, true).unwrap();
+    }
+
+    #[test]
+    fn execution_requires_measured_or_declared_coding_tools_while_proposals_need_chat_only() {
+        let chat_only = route(CapabilitySource::Measured, true, false);
+        validate_provider_route_capabilities(&chat_only, RunPurpose::ManagerProposal, false)
+            .unwrap();
+        let error = validate_provider_route_capabilities(&chat_only, RunPurpose::Execution, false)
+            .unwrap_err();
+        assert!(error.message.contains("native coding tools"));
+
+        let coding = route(CapabilitySource::Measured, true, true);
+        validate_provider_route_capabilities(&coding, RunPurpose::Execution, false).unwrap();
     }
 }

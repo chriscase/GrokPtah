@@ -7,9 +7,11 @@ import type {
   ComputerPlatformStatus,
   ComputerTargetCandidate,
   ModelInfo,
+  NativeCodingReadinessProjection,
   ProviderProfileSummary,
-  QualificationCheck,
+  ProviderQualificationReport,
 } from "../lib/protocol";
+import { ProviderReadinessCenter } from "./ProviderReadinessCenter";
 import { StyledSelect } from "./StyledSelect";
 import { effortForModel, effortOptionsForModel } from "../lib/modelOptions";
 import {
@@ -82,6 +84,17 @@ export function SettingsPanel({
   const [gatewayKey, setGatewayKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [liveQualification, setLiveQualification] =
+    useState<ProviderQualificationReport | null>(null);
+  const [qualificationError, setQualificationError] = useState<string | null>(
+    null,
+  );
+  const [hostAdmission, setHostAdmission] =
+    useState<NativeCodingReadinessProjection | null>(null);
+  const gatewayKeyRef = useRef<HTMLInputElement>(null);
+  const qualifyInFlight = useRef(false);
+  const readinessSelection = useRef(0);
+  const readinessReportSelection = useRef(-1);
   const [computerStatus, setComputerStatus] =
     useState<ComputerPlatformStatus | null>(null);
   const [computerTargets, setComputerTargets] = useState<
@@ -133,6 +146,13 @@ export function SettingsPanel({
     setNotice(null);
   }, [open, refresh]);
 
+  useEffect(() => {
+    if (!open) return;
+    setLiveQualification(null);
+    setQualificationError(null);
+    readinessSelection.current += 1;
+  }, [open]);
+
   const refreshComputerUse = useCallback(async () => {
     setComputerStatus(await api.computerUseStatus());
   }, []);
@@ -157,6 +177,22 @@ export function SettingsPanel({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
+
+  useEffect(() => {
+    if (!open || section !== "auth") return;
+    let cancelled = false;
+    void api
+      .nativeCodingReadiness(gatewayProvider, gatewayModel)
+      .then((projection) => {
+        if (!cancelled) setHostAdmission(projection);
+      })
+      .catch(() => {
+        if (!cancelled) setHostAdmission(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, section, gatewayProvider, gatewayModel, snap]);
 
   if (!open) return null;
 
@@ -209,8 +245,33 @@ export function SettingsPanel({
   const selectedGateway = gatewayProfiles.find(
     (profile) => profile.id === gatewayProvider,
   );
+  const activeQualification =
+    readinessReportSelection.current === readinessSelection.current
+      ? liveQualification
+      : null;
+  const providerWriteDisabled =
+    busy ||
+    Boolean(selectedGateway?.managedByEnv) ||
+    !gatewayProvider.trim() ||
+    !gatewayBase.trim() ||
+    !gatewayModel.trim();
+
+  function discardLiveReadiness() {
+    readinessSelection.current += 1;
+    setLiveQualification(null);
+    setQualificationError(null);
+    setHostAdmission(null);
+  }
+
+  function applyGatewayModel(value: string) {
+    if (value !== gatewayModel) discardLiveReadiness();
+    setGatewayModel(value);
+    const model = selectedGateway?.models.find((item) => item.id === value);
+    setGatewayEffort(model?.effortOptions.join(", ") ?? "");
+  }
 
   function selectGatewayProfile(providerId: string) {
+    discardLiveReadiness();
     if (providerId === "__new__") {
       setGatewayProvider("");
       setGatewayLabel("");
@@ -255,10 +316,14 @@ export function SettingsPanel({
   }
 
   async function qualifyGatewayModel() {
+    if (qualifyInFlight.current) return;
     const providerId = gatewayProvider.trim();
     const modelId = gatewayModel;
+    const selectionAtStart = readinessSelection.current;
+    qualifyInFlight.current = true;
     setBusy(true);
     setNotice(null);
+    setQualificationError(null);
     try {
       await api.upsertProviderProfile(
         providerId,
@@ -274,32 +339,19 @@ export function SettingsPanel({
       );
       setGatewayKey("");
       const report = await api.qualifyProviderModel(providerId, modelId);
+      if (readinessSelection.current !== selectionAtStart) return;
+      setLiveQualification(report);
+      readinessReportSelection.current = selectionAtStart;
+      const projection = await api.nativeCodingReadiness(providerId, modelId);
+      if (readinessSelection.current !== selectionAtStart) return;
+      setHostAdmission(projection);
       await refresh();
       onChromeChange();
-      if (report.codingReady) {
-        setNotice(
-          report.computerUseTier === "semantic_act"
-            ? "Qualified for coding tools and semantic Computer Use"
-            : report.computerUseTier === "observe"
-              ? `Qualified for coding tools and Computer observation only. ${report.staleObservationRecovery.detail}`
-              : `Qualified for coding tools. Computer Use unavailable: ${report.semanticObservation.detail}`,
-        );
-      } else {
-        const checks: Array<[string, QualificationCheck]> = [
-          ["chat", report.basicGeneration],
-          ["native tools", report.nativeToolCall],
-          ["tool continuation", report.toolResultContinuation],
-          ["streaming", report.streaming],
-        ];
-        const failures = checks
-          .filter(([, check]) => check.status !== "pass")
-          .map(([label, check]) => `${label}: ${check.detail}`)
-          .join("; ");
-        setNotice(`Discussion only. ${failures}`);
-      }
     } catch (error) {
-      setNotice(String(error));
+      if (readinessSelection.current !== selectionAtStart) return;
+      setQualificationError(String(error));
     } finally {
+      qualifyInFlight.current = false;
       setBusy(false);
     }
   }
@@ -909,14 +961,7 @@ export function SettingsPanel({
                       placeholder="model-id-from-your-gateway"
                       value={gatewayModel}
                       disabled={busy || selectedGateway?.managedByEnv}
-                      onChange={(e) => {
-                        const value = e.target.value;
-                        setGatewayModel(value);
-                        const model = selectedGateway?.models.find(
-                          (item) => item.id === value,
-                        );
-                        setGatewayEffort(model?.effortOptions.join(", ") ?? "");
-                      }}
+                      onChange={(e) => applyGatewayModel(e.target.value)}
                     />
                     <span className="settings-hint">
                       Enter an exact ID, or save one ID and use Discover models.
@@ -966,6 +1011,7 @@ export function SettingsPanel({
                       {selectedGateway?.credentialSet ? " (saved)" : ""}
                     </span>
                     <input
+                      ref={gatewayKeyRef}
                       data-testid="gateway-api-key"
                       type="password"
                       placeholder={
@@ -987,49 +1033,73 @@ export function SettingsPanel({
                           key={model.id}
                           type="button"
                           className={gatewayModel === model.id ? "active" : ""}
-                          onClick={() => {
-                            setGatewayModel(model.id);
-                            setGatewayEffort(model.effortOptions.join(", "));
-                          }}
+                          onClick={() => applyGatewayModel(model.id)}
                           disabled={busy}
                         >
                           <span>{model.displayName}</span>
                           <small>
                             {model.capabilitySource === "unknown"
                               ? "Not qualified"
-                              : [
-                                  model.supportsTools ? "Tools" : "Chat",
-                                  model.supportsStream ? "Streaming" : null,
-                                  model.supportsImageInput ? "Images" : null,
-                                  model.computerUseTier === "semantic_act"
-                                    ? "Computer: semantic"
-                                    : model.computerUseTier === "observe"
-                                      ? "Computer: observe"
+                              : model.capabilitySource === "declared"
+                                ? "Declared — not measured"
+                                : [
+                                    model.supportsTools ? "Tools" : "Chat",
+                                    model.supportsStream ? "Streaming" : null,
+                                    model.supportsImageInput ? "Images" : null,
+                                    model.computerCapabilitySource ===
+                                    "measured"
+                                      ? model.computerUseTier ===
+                                        "semantic_act"
+                                        ? "Computer: semantic"
+                                        : model.computerUseTier === "observe"
+                                          ? "Computer: observe"
+                                          : model.computerUseTier ===
+                                              "visual_fallback_act"
+                                            ? "Computer: visual fallback"
+                                            : null
+                                      : model.computerCapabilitySource ===
+                                          "declared"
+                                        ? "Computer declared"
+                                        : null,
+                                    model.effortOptions.length > 0
+                                      ? `Effort: ${model.effortOptions.join(", ")}`
                                       : null,
-                                  model.effortOptions.length > 0
-                                    ? `Effort: ${model.effortOptions.join(", ")}`
-                                    : null,
-                                ]
-                                  .filter(Boolean)
-                                  .join(" · ")}
+                                  ]
+                                    .filter(Boolean)
+                                    .join(" · ")}
                           </small>
                         </button>
                       ))}
                     </div>
                   )}
 
+                  <ProviderReadinessCenter
+                    providerId={gatewayProvider}
+                    providerLabel={gatewayLabel}
+                    baseUrl={gatewayBase}
+                    modelId={gatewayModel}
+                    profile={selectedGateway ?? null}
+                    report={activeQualification}
+                    admission={hostAdmission}
+                    busy={busy}
+                    error={qualificationError}
+                    saveDisabled={providerWriteDisabled}
+                    discoverDisabled={providerWriteDisabled}
+                    qualifyDisabled={providerWriteDisabled}
+                    onSaveProvider={() => void saveGatewayProfile(false)}
+                    onDiscoverModels={() => void saveGatewayProfile(true)}
+                    onQualifyModel={() => void qualifyGatewayModel()}
+                    onResolveCredentials={() => {
+                      gatewayKeyRef.current?.focus();
+                    }}
+                  />
+
                   <div className="modal-actions settings-provider-actions">
                     <button
                       type="button"
                       className="primary"
                       data-testid="gateway-save"
-                      disabled={
-                        busy ||
-                        selectedGateway?.managedByEnv ||
-                        !gatewayProvider.trim() ||
-                        !gatewayBase.trim() ||
-                        !gatewayModel.trim()
-                      }
+                      disabled={providerWriteDisabled}
                       onClick={() => void saveGatewayProfile(false)}
                     >
                       Save provider
@@ -1037,13 +1107,7 @@ export function SettingsPanel({
                     <button
                       type="button"
                       data-testid="gateway-discover"
-                      disabled={
-                        busy ||
-                        selectedGateway?.managedByEnv ||
-                        !gatewayProvider.trim() ||
-                        !gatewayBase.trim() ||
-                        !gatewayModel.trim()
-                      }
+                      disabled={providerWriteDisabled}
                       onClick={() => void saveGatewayProfile(true)}
                     >
                       Discover models
@@ -1051,13 +1115,7 @@ export function SettingsPanel({
                     <button
                       type="button"
                       data-testid="gateway-qualify"
-                      disabled={
-                        busy ||
-                        selectedGateway?.managedByEnv ||
-                        !gatewayProvider.trim() ||
-                        !gatewayBase.trim() ||
-                        !gatewayModel.trim()
-                      }
+                      disabled={providerWriteDisabled}
                       onClick={() => void qualifyGatewayModel()}
                     >
                       Qualify model
@@ -1068,12 +1126,13 @@ export function SettingsPanel({
                         className="danger"
                         data-testid="gateway-delete"
                         disabled={busy}
-                        onClick={() =>
+                        onClick={() => {
+                          discardLiveReadiness();
                           void apply(
                             () => api.deleteProviderProfile(selectedGateway.id),
                             "Provider removed",
-                          )
-                        }
+                          );
+                        }}
                       >
                         Remove
                       </button>

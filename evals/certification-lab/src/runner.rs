@@ -1439,6 +1439,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manager_plan_probe_drives_the_offline_public_plan_lifecycle() {
+        if !crate::local_service::loopback_test_available() {
+            return;
+        }
+        let repository =
+            dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let manifest = CampaignManifest::bundled().unwrap();
+        let options = default_options(&repository);
+        let (transport, recorder) = start_transport(&options, &manifest, None).await.unwrap();
+        let workspace = transport.workspace().unwrap().to_owned();
+        let mut client = transport.client();
+        client.initialize().await.unwrap();
+        let definition = manifest.probe("manager-plan-lifecycle-v1").unwrap();
+        let execution =
+            execute_minimal_probe(definition, &mut client, &workspace, None, recorder.as_ref())
+                .await;
+        assert_eq!(
+            execution.result.status,
+            ProbeStatus::Passed,
+            "diagnostics: {:?}",
+            execution.result.diagnostics
+        );
+        assert!(
+            execution
+                .result
+                .opaque_ids
+                .iter()
+                .any(|value| { value.kind == crate::report::DurableIdKind::ManagerPlan }),
+            "probe must retain the durable plan identity"
+        );
+        // The plan must be observed reaching terminal success after an
+        // explicit replan, not merely reaching needs_replan.
+        assert!(
+            execution.result.transitions.iter().any(|transition| {
+                transition.entity == crate::report::EntityKind::ManagerPlan
+                    && transition.from == crate::report::DurableStateCode::NeedsReplan
+                    && transition.to == crate::report::DurableStateCode::Succeeded
+            }),
+            "transitions: {:?}",
+            execution.result.transitions
+        );
+        assert!(
+            execution.result.transitions.iter().any(|transition| {
+                transition.entity == crate::report::EntityKind::ManagerStep
+                    && transition.to == crate::report::DurableStateCode::Superseded
+            }),
+            "the failed step must be superseded by the replan"
+        );
+        client.close_session().await.unwrap();
+        drop(recorder);
+        transport.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_duplicate_probe_exercises_offline_public_executor_shape() {
         if !crate::local_service::loopback_test_available() {
             return;

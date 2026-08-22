@@ -778,6 +778,15 @@ struct ToolsCallParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeCodingReadinessArgs {
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyArgs {}
 
@@ -1839,6 +1848,14 @@ fn tool_input_schema(name: &str) -> Value {
             "properties": {},
             "additionalProperties": false
         }),
+        "ptah_get_native_coding_readiness" => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "providerId": {"type": "string", "maxLength": 256},
+                "modelId": {"type": "string", "maxLength": 512}
+            }
+        }),
         "ptah_create_session" => json!({
             "type": "object",
             "required": ["workspace"],
@@ -2711,6 +2728,14 @@ async fn dispatch_tool(
         "ptah_get_capacity" => {
             let _: EmptyArgs = parse_value(args)?;
             orch.get_capacity(auth)
+        }
+        "ptah_get_native_coding_readiness" => {
+            let args: NativeCodingReadinessArgs = parse_value(args)?;
+            orch.get_native_coding_readiness(
+                auth,
+                args.provider_id.as_deref(),
+                args.model_id.as_deref(),
+            )
         }
         "ptah_get_run" => {
             let args: RunArgs = parse_value(args)?;

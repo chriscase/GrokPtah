@@ -596,7 +596,7 @@ pub async fn remote_service_run_get(
     session_id: String,
     workspace: String,
     run_id: String,
-) -> Result<grokptah_agent_bridge::RunRecord, String> {
+) -> Result<serde_json::Value, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .remote_service
@@ -2114,6 +2114,15 @@ pub fn schedule_background_task(state: State<'_, AppState>, title: String) -> Ba
 #[tauri::command]
 pub fn settings_snapshot(state: State<'_, AppState>) -> serde_json::Value {
     state.host.settings_snapshot()
+}
+
+#[tauri::command]
+pub fn native_coding_readiness(
+    state: State<'_, AppState>,
+    provider_id: String,
+    model_id: String,
+) -> grokptah_agent_bridge::NativeCodingReadinessProjection {
+    state.host.native_coding_readiness(&provider_id, &model_id)
 }
 
 #[tauri::command]

@@ -492,6 +492,55 @@ export interface DurableRunEventPage {
   cursorExpired: boolean;
 }
 
+export interface ProviderExecutionProjection {
+  route: {
+    providerId: string;
+    kind: "xai" | "open_ai_compatible";
+    dialect: "xai_chat_completions" | "open_ai_chat_completions";
+    modelId: string;
+    wireModelId: string;
+    capabilitySource: "declared" | "measured" | "unknown";
+    qualificationSchema?: string | null;
+    deadlineClass: "interactive" | "standard" | "extended";
+    effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+    snapshotHash: string;
+  };
+  quota?: {
+    reservationId: string;
+    poolId: string;
+    class: "coding_execution" | "manager_proposal" | "qualification" | "computer_session";
+    state: "reserved" | "consumed" | "refunded" | "expired";
+    tokensReserved: number;
+    tokensConsumed: number;
+    requestsReserved: number;
+    requestsConsumed: number;
+    windowStartedAt: string;
+    limits: {
+      windowMs: number;
+      maxInFlightReservations: number;
+      maxTokensPerWindow: number;
+      maxRequestsPerWindow: number;
+    };
+    updatedAt: string;
+  } | null;
+  attempts: Array<{
+    attemptId: string;
+    ordinal: number;
+    state: "admitted" | "finished";
+    sendCertainty?: "known_not_sent" | "known_accepted" | "uncertain_accept" | null;
+    retryClass?: "same_run_safe" | "explicit_new_run_only" | null;
+    httpStatus?: number | null;
+    usage?: CompletionEvidence["usage"] | null;
+    createdAt: string;
+    updatedAt: string;
+    finishedAt?: string | null;
+  }>;
+  attemptCount: number;
+  attemptsTruncated: boolean;
+  usageComplete: boolean;
+  pendingRequests: number;
+}
+
 export interface DurableRun {
   runId: string;
   sessionId: string;
@@ -556,6 +605,8 @@ export interface DurableRun {
   } | null;
   execution?: RunExecution | null;
   approval?: RunApproval | null;
+  /** Secret-free operator projection derived from the route/quota/attempt ledgers. */
+  providerExecution?: ProviderExecutionProjection | null;
 }
 
 export type SessionUpdate =
@@ -851,6 +902,54 @@ export interface ProviderQualificationReport {
   semanticObservation: QualificationCheck;
   staleObservationRecovery: QualificationCheck;
   computerUseTier: ComputerUseTier;
+}
+
+export type QualificationEvidence = "measured" | "declared" | "stale" | "unknown";
+
+export type AdmissionEligibility =
+  | "measured_eligible"
+  | "declared_unmeasured"
+  | "requalify_required"
+  | "discussion_only"
+  | "credential_missing"
+  | "unknown"
+  | "configuration_incomplete";
+
+export type AdmissionReasonCode =
+  | "measured_eligible"
+  | "declared_first_use"
+  | "requalify_required"
+  | "tools_not_permitted"
+  | "chat_eligible"
+  | "unknown_capabilities"
+  | "chat_not_permitted"
+  | "credential_missing"
+  | "configuration_incomplete";
+
+export interface PurposeAdmission {
+  eligibility: AdmissionEligibility;
+  permitted: boolean;
+  reasonCode: AdmissionReasonCode;
+}
+
+export interface ComputerUseAdmission {
+  tier: ComputerUseTier;
+  source: "declared" | "measured" | "unknown";
+  enabled: boolean;
+}
+
+export interface NativeCodingReadinessProjection {
+  schema: "grokptah.native-coding-readiness.v1" | string;
+  ownerId: string;
+  providerId: string;
+  modelId: string;
+  qualificationEvidence: QualificationEvidence;
+  execution: PurposeAdmission;
+  managerProposal: PurposeAdmission;
+  computerUse: ComputerUseAdmission;
+  credentialPresent: boolean;
+  configurationComplete: boolean;
+  managedByEnv: boolean;
 }
 
 export type ComputerUseTier =
