@@ -11,17 +11,17 @@ mod always_on_support;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use grokptah_agent_bridge::McpControlClient;
 use grokptah_agent_bridge::orchestration::hash_payload;
-use serde_json::{Value, json};
+use grokptah_agent_bridge::McpControlClient;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use always_on_support::{
-    FIXTURE_SCHEMA, FakeProvider, Fixture, ProviderDisposition, ProviderScript, ResourceSample,
-    ServiceProcess, assert_no_duplicate_step, assert_no_quota_ledger, call, call_expect_error,
-    clear_assertions, intents_array, mcp, pending_usage, poll_json, record_assertion,
-    recorded_assertions, repository_commit, rid, runs_array, scan_service_artifacts, scan_text,
-    serial_lock, snapshot_step, try_mcp, work_for_step, work_items, work_kind_count,
+    assert_no_duplicate_step, assert_no_quota_ledger, call, call_expect_error, clear_assertions,
+    intents_array, mcp, pending_usage, poll_json, record_assertion, recorded_assertions,
+    repository_commit, rid, runs_array, scan_service_artifacts, scan_text, serial_lock,
+    snapshot_step, try_mcp, work_for_step, work_items, work_kind_count, FakeProvider, Fixture,
+    ProviderDisposition, ProviderScript, ResourceSample, ServiceProcess, FIXTURE_SCHEMA,
 };
 
 fn managed_policy() -> Value {
