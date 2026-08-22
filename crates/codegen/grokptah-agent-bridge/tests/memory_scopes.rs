@@ -241,11 +241,11 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
     let mut texts: Vec<_> = restarted_facts.into_iter().map(|fact| fact.text).collect();
     texts.sort();
     assert_eq!(
-        texts,
-        vec![
-            "desktop project fact".into(),
-            "fact retained through promotion".into(),
-            "isolated service fact".into(),
+        texts.as_slice(),
+        [
+            "desktop project fact",
+            "fact retained through promotion",
+            "isolated service fact",
         ]
     );
 }
