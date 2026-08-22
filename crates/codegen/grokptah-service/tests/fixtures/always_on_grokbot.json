@@ -1,0 +1,10 @@
+{
+  "schema": "grokptah.always_on_grokbot_fixture.v1",
+  "seed": "always-on-grokbot-v1",
+  "sentinels": {
+    "success": "GROKBOT_SUCCESS",
+    "fail": "GROKBOT_FORCE_FAIL",
+    "ok": "GROKBOT_OK"
+  },
+  "quotaLedger": "absent-at-67e29bd"
+}
