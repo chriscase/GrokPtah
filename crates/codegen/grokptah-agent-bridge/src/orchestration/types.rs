@@ -13,6 +13,8 @@ use crate::gateway_config::{
 };
 use crate::types::EffortLevel;
 
+use super::quota::QuotaClass;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
@@ -78,6 +80,13 @@ pub struct ProviderRouteSnapshot {
     pub effort: EffortLevel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qualification_record_id: Option<String>,
+    /// Host-authored quota pool class for this finite Run. Legacy route
+    /// snapshots omit both quota fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_class: Option<QuotaClass>,
+    /// Durable reservation identity installed atomically with the Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_reservation_id: Option<String>,
     pub snapshot_hash: String,
 }
 
@@ -104,7 +113,7 @@ impl ProviderRouteSnapshot {
     }
 
     fn hash_material(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut material = serde_json::json!({
             "schemaVersion": self.schema_version,
             "providerId": self.provider_id,
             "modelId": self.model_id,
@@ -120,7 +129,16 @@ impl ProviderRouteSnapshot {
             "deadlineClass": self.deadline_class,
             "effort": self.effort,
             "qualificationRecordId": self.qualification_record_id,
-        })
+        });
+        // Preserve the hash of route snapshots written by schema v1 before
+        // quota linkage existed. New linked snapshots bind both fields.
+        if let Some(quota_class) = self.quota_class {
+            material["quotaClass"] = serde_json::json!(quota_class);
+        }
+        if let Some(reservation_id) = &self.quota_reservation_id {
+            material["quotaReservationId"] = serde_json::json!(reservation_id);
+        }
+        material
     }
 
     pub(crate) fn seal(mut self) -> Result<Self, OrchError> {
@@ -129,6 +147,16 @@ impl ProviderRouteSnapshot {
         self.snapshot_hash = hash_payload(&self.hash_material());
         self.validate()?;
         Ok(self)
+    }
+
+    pub(crate) fn bind_quota(
+        mut self,
+        quota_class: QuotaClass,
+        reservation_id: impl Into<String>,
+    ) -> Result<Self, OrchError> {
+        self.quota_class = Some(quota_class);
+        self.quota_reservation_id = Some(reservation_id.into());
+        self.seal()
     }
 
     pub fn validate(&self) -> Result<(), OrchError> {
@@ -193,6 +221,19 @@ impl ProviderRouteSnapshot {
                 "provider route qualification identity does not match its immutable fields",
             ));
         }
+        match (&self.quota_class, &self.quota_reservation_id) {
+            (Some(_), Some(reservation_id))
+                if !reservation_id.is_empty()
+                    && reservation_id.len() <= MAX_PROVIDER_ROUTE_VALUE_BYTES
+                    && !reservation_id.contains('\0') => {}
+            (None, None) => {}
+            _ => {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "provider route quota identity is incomplete or invalid",
+                ));
+            }
+        }
         if self.snapshot_hash != hash_payload(&self.hash_material()) {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -212,6 +253,7 @@ pub enum RunStopCause {
     RoundLimit,
     DurationLimit,
     TokenCeiling,
+    ProviderQuota,
     TokenAccountingUnavailable,
     TokenAccountingOverflow,
     Stationarity,

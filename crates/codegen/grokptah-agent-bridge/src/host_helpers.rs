@@ -1548,6 +1548,8 @@ fn resolve_live_model_route(
         deadline_class: profile.deadline_class,
         effort,
         qualification_record_id,
+        quota_class: None,
+        quota_reservation_id: None,
         snapshot_hash: String::new(),
     }
     .seal()

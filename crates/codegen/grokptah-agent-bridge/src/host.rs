@@ -48,10 +48,10 @@ use crate::orchestration::{
     AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
     ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, ProviderRouteSnapshot,
-    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
-    RoutineTrigger, RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose,
-    RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy,
-    WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
+    QuotaReservation, RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord,
+    RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger, RunAggregates, RunBounds, RunExecution,
+    RunExecutionMode, RunPurpose, RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem,
+    WorkItemSnapshot, WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -382,6 +382,7 @@ pub(crate) struct SessionUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunTokenStop {
     Reached { consumed: u64, ceiling: u64 },
+    RequestCeiling { consumed: u64, ceiling: u64 },
     UsageUnavailable { ceiling: u64 },
     AccountingOverflow { ceiling: u64 },
 }
@@ -390,6 +391,7 @@ impl RunTokenStop {
     fn code(self) -> &'static str {
         match self {
             Self::Reached { .. } => "max_total_tokens_reached",
+            Self::RequestCeiling { .. } => "provider_request_quota_reached",
             Self::UsageUnavailable { .. } => "max_total_tokens_usage_unavailable",
             Self::AccountingOverflow { .. } => "max_total_tokens_accounting_overflow",
         }
@@ -398,6 +400,7 @@ impl RunTokenStop {
     fn cause(self) -> RunStopCause {
         match self {
             Self::Reached { .. } => RunStopCause::TokenCeiling,
+            Self::RequestCeiling { .. } => RunStopCause::ProviderQuota,
             Self::UsageUnavailable { .. } => RunStopCause::TokenAccountingUnavailable,
             Self::AccountingOverflow { .. } => RunStopCause::TokenAccountingOverflow,
         }
@@ -407,6 +410,9 @@ impl RunTokenStop {
         match self {
             Self::Reached { consumed, ceiling } => format!(
                 "Stopped at the run token boundary: consumed {consumed} total tokens, meeting or exceeding the max_total_tokens ceiling of {ceiling}."
+            ),
+            Self::RequestCeiling { consumed, ceiling } => format!(
+                "Stopped at the provider request boundary: consumed {consumed} requests, meeting the reserved request ceiling of {ceiling}."
             ),
             Self::UsageUnavailable { ceiling } => format!(
                 "Stopped at the run token boundary because the provider did not return usable token metadata for a run bounded by max_total_tokens={ceiling}."
@@ -430,6 +436,7 @@ struct RunUsageTracker {
     run_id: String,
     store: OrchStore,
     max_total_tokens: Option<u64>,
+    max_provider_requests: Option<u64>,
     state: Mutex<RunUsageState>,
     bounded_admission: Arc<tokio::sync::Mutex<()>>,
 }
@@ -451,6 +458,11 @@ impl RunUsageTracker {
             run_id: run.run_id.clone(),
             store,
             max_total_tokens: run.bounds.max_total_tokens,
+            max_provider_requests: run
+                .provider_route
+                .as_ref()
+                .is_some_and(|route| route.quota_reservation_id.is_some())
+                .then(|| QuotaReservation::request_ceiling_for_run(run)),
             state: Mutex::new(RunUsageState {
                 usage: run.aggregates.usage.clone(),
                 complete: run.aggregates.usage_complete,
@@ -510,6 +522,23 @@ impl RunUsageTracker {
         }
         let pending_requests = {
             let mut state = self.state.lock();
+            let admitted_requests = state
+                .usage
+                .requests
+                .checked_add(u64::from(state.pending_requests))
+                .ok_or_else(|| anyhow!("provider request accounting overflowed"))?;
+            if let Some(ceiling) = self.max_provider_requests {
+                if admitted_requests >= ceiling {
+                    let stop = RunTokenStop::RequestCeiling {
+                        consumed: admitted_requests,
+                        ceiling,
+                    };
+                    state.stop = Some(stop);
+                    drop(state);
+                    self.mark_host_stop(stop.cause(), stop.code())?;
+                    bail!(stop.message());
+                }
+            }
             state.pending_requests = state
                 .pending_requests
                 .checked_add(1)
@@ -575,6 +604,16 @@ impl RunUsageTracker {
                                     consumed: state.usage.total_tokens,
                                     ceiling,
                                 });
+                            }
+                        }
+                        if state.stop.is_none() {
+                            if let Some(ceiling) = self.max_provider_requests {
+                                if state.usage.requests >= ceiling {
+                                    state.stop = Some(RunTokenStop::RequestCeiling {
+                                        consumed: state.usage.requests,
+                                        ceiling,
+                                    });
+                                }
                             }
                         }
                     } else if let Some(ceiling) = self.max_total_tokens {
@@ -11619,6 +11658,44 @@ mod tests {
                 .total_tokens,
             10
         );
+    }
+
+    #[tokio::test]
+    async fn provider_request_reservation_is_a_hard_run_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = OrchStore::open(temp.path().join("orch")).unwrap();
+        let run = usage_test_run("request-ceiling", Some(10_000));
+        store.save_run(&run).unwrap();
+        let mut tracker = RunUsageTracker::from_run(store.clone(), &run);
+        Arc::get_mut(&mut tracker).unwrap().max_provider_requests = Some(2);
+
+        assert!(tracker
+            .record(Some(&CompletionUsage {
+                total_tokens: 1,
+                requests: 1,
+                ..Default::default()
+            }))
+            .unwrap()
+            .is_none());
+        let stop = tracker
+            .record(Some(&CompletionUsage {
+                total_tokens: 1,
+                requests: 1,
+                ..Default::default()
+            }))
+            .unwrap()
+            .unwrap();
+        assert!(stop.contains("reserved request ceiling of 2"));
+        assert!(tracker.begin_attempt().await.is_err());
+
+        let persisted = store.load_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            persisted.error_code.as_deref(),
+            Some("provider_request_quota_reached")
+        );
+        assert_eq!(persisted.stop_cause, Some(RunStopCause::ProviderQuota));
+        assert_eq!(persisted.aggregates.usage.requests, 2);
+        assert_eq!(persisted.aggregates.usage_pending_requests, 0);
     }
 
     #[test]
