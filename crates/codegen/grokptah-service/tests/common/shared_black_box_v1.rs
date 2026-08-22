@@ -3392,4 +3392,15 @@ fn expected_main_golden_is_immutable_for_audited_revision() {
         loaded["sourceRevision"],
         json!("67e29bd34dc64049432c715c93c2cef2185c63ea")
     );
+    assert!(loaded.get("calibration").is_none());
+    assert!(
+        loaded.get("overlay").is_none(),
+        "main golden is a complete overlay run, not a handwritten blocker"
+    );
+    assert_eq!(
+        loaded["features"]["nativeCodingReadiness"]["support"],
+        json!("absent")
+    );
+    assert!(loaded.get("observations").is_some());
+    assert!(loaded.get("assertions").is_some());
 }
