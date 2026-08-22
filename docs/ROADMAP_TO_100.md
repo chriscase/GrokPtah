@@ -169,7 +169,9 @@ exits**, and all of the following are true:
     evidence). Explicitly unsupported may cover **documented non-goals only**,
     not the Codex-class core interface. A **recurring expert UI/UX review
     cadence** (stage 10) supplements that one-time acceptance: it is not a
-    single pre-release polish pass and cannot remain Unverified at 100%.
+    single pre-release polish pass; it is mechanically gated by the
+    operator-visible change counter and append-only ledger; and it cannot
+    remain Unverified at 100%.
 11. Operations and release drills have a dated runbook execution covering
     backup/restore, restart, cursor expiry, credential rotation, Computer Use
     Stop / Take over on a packaged identity, upgrade/rollback,
@@ -181,8 +183,11 @@ exits**, and all of the following are true:
     restricted to a company-approved OpenAI-compatible gateway, including a
     weaker non-frontier model, still obtains powerful long-running code
     review from bounded orchestration — not from secretly routing to a
-    stronger external model. That outcome cannot be waived as Explicitly
-    unsupported if we claim the full product vision.
+    stronger external model — and beats a **controlled same-model**
+    single-pass baseline on **pre-registered** thresholds. **Any GrokPtah
+    100% claim requires Stage 12.** It cannot be descoped, status-relabeled,
+    or marked Explicitly unsupported. Documented non-goal features may
+    remain unsupported; this core outcome may not.
 
 Until every item holds, **do not claim 100%.**
 
@@ -215,16 +220,23 @@ Explicitly unsupported / “not observed” status-relabeling.
 Unverified at 100%:**
 
 4. **Recurring expert UI/UX review cadence** (stage 10 supplement, not a
-   substitute for #308). Reviews the exact assembled integration head on a
-   recorded cadence; unresolved P0/P1 UX/accessibility findings block the
-   next integration/release gate. Phase 2 mockups and a one-time polish pass
+   substitute for #308). Mechanically auditable: expert review is required
+   **before merging the third** operator-visible GUI change since the last
+   expert review, **and** after every named operator-surface integration
+   milestone, whichever comes first; plus packaged-desktop review before
+   release. Evidence is the dated append-only ledger with explicit
+   PASS/BLOCK. Unresolved P0/P1 UX/accessibility findings block the next
+   integration/release gate. Phase 2 mockups and a one-time polish pass
    do not close this.
-5. **Enterprise gateway long-running code-review lane** (stage 12). A frozen
-   company-approved OpenAI-compatible route, including a modest non-frontier
-   model, must deliver powerful multi-hour review from orchestration — not
-   from secretly routing to a stronger external model. Closed [#169](https://github.com/chriscase/GrokPtah/issues/169)
-   profiles are not this certification. Cannot be waived as Explicitly
-   unsupported if we claim the full product vision.
+5. **Enterprise gateway long-running code-review lane** (stage 12). **Any
+   GrokPtah 100% claim requires this stage.** A frozen company-approved
+   OpenAI-compatible route, including a modest non-frontier model, must
+   deliver powerful multi-hour review from orchestration — not from
+   secretly routing to a stronger external model — and must beat a
+   controlled same-model single-pass baseline on pre-registered thresholds.
+   Closed [#169](https://github.com/chriscase/GrokPtah/issues/169)
+   profiles are not this certification. Cannot be descoped, status-relabeled,
+   or marked Explicitly unsupported.
 
 **Already forbidden by earlier corrections (preserved):** isolated visual
 Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288)); named
@@ -627,13 +639,25 @@ proof still required.
   one pre-release polish pass). GrokPtah must be periodically reviewed by a
   skilled UI/UX expert so it remains sleek, aesthetically coherent,
   accessible, approachable, and exceptionally effective for power users.
-  - During active development: an expert review after each material
-    operator-surface integration wave **or** every 2–3 significant GUI
-    changes, whichever comes first, **plus** a full packaged-desktop review
-    before release.
+  - **Operator-visible GUI change:** a change that alters operator-facing
+    desktop UI (layout, chrome, navigation, settings, cockpit, lane/run
+    inspector, notifications, keyboard map, or equivalent packaged
+    surface). Docs-only, tests-only, and non-UI backend changes do **not**
+    increment the counter.
+  - **Counter:** the integer of operator-visible GUI changes **since the
+    last expert-review ledger entry**. The counter lives in the ledger.
+  - **Cadence:** expert review is required **before merging the third**
+    operator-visible GUI change since the last expert review, **and** after
+    every named operator-surface integration milestone, whichever comes
+    first; **plus** a full packaged-desktop review before release.
   - Review the **exact assembled integration head**, not mockups alone.
-    Record SHA, reviewer/model/tool, surfaces/workflows, visual evidence,
-    severity-ranked findings, accepted tradeoffs, and issue/PR follow-ups.
+  - **Ledger (absent today; not a certification):** dated append-only
+    evidence at `docs/ux-audit/expert-cadence-ledger.md`. Existing files
+    under [`docs/ux-audit/`](ux-audit/) are Phase 1/2 design inputs, not
+    this ledger. Every entry must name exact reviewed SHAs/change IDs,
+    reviewer/model/tool, surfaces/workflows, visual/a11y matrix,
+    severity-ranked findings, accepted tradeoffs, linked issues/PRs, and
+    explicit PASS/BLOCK disposition.
   - Cover progressive disclosure, information density, navigation/search,
     command/keyboard efficiency, bulk/multi-lane workflows, status/evidence
     clarity, error/reconnect/quota/authority/permission states, and
@@ -645,14 +669,15 @@ proof still required.
     empty/loading/success/error/denied/exhausted/reconnecting, hostile/long
     text and overflow, real packaged windows.
   - Unresolved P0/P1 UX/accessibility findings **block** the next
-    integration/release gate. Lower findings require explicit disposition
-    and regression coverage.
-  No dated cadence review of an assembled head is recorded. Phase 2
+    integration/release gate (BLOCK disposition). Lower findings require
+    explicit disposition and regression coverage.
+  No dated cadence ledger of an assembled head is recorded. Phase 2
   prototypes do not close this.
 
 **Must not claim:** packaged UX certified from `tauri:dev`, terminal-owned
 TCC grants, or prototype screenshots alone. **Must not claim** the expert
-cadence from a single audit or from mockups of an unintegrated head.
+cadence from a single audit, from mockups of an unintegrated head, or from
+a ledger that omits PASS/BLOCK or the operator-visible change counter.
 
 ## Stage 11 — Operations and release drills
 
@@ -749,33 +774,66 @@ row is **not** certified.
   **No fallback** to another provider (including Grok Build / xAI).
   Capability, credential, or route changes **fail closed** and require
   requalification.
-- **Read-only by default:** isolated checkout, explicit file/repo scope,
-  no builds, network, writes, or PR comments unless separately authorized.
-  Publishing comments or fixes is a **distinct** least-privilege capability
-  and approval (stage 3).
+- **Read-only review is permanently separated from publishing.** Review
+  workers have **no ambient network** except the frozen company gateway
+  and **no** write, shell, MCP mutation, Computer Use, or publish
+  authority. They cannot request, issue, or exercise publication
+  authority. Isolated checkout, explicit file/repo scope, no builds, no
+  writes, no PR comments.
+- A **distinct publisher principal/workflow** may consume an **immutable
+  reviewed draft** only under a scoped, short-lived human grant pinned to
+  repo, PR, head SHA, and draft hash. Publication is outside the review
+  worker, separately audited, and idempotent. Stage 3 least privilege
+  applies to the publisher; it is not ambient review-worker authority.
 - Output cites exact code locations/evidence, distinguishes confirmed
   findings from hypotheses, shows confidence and model limitations,
   deduplicates across passes, and retains a **secret-free** audit trail.
 - **Certification (live, named, unmet):** a deliberately modest compatible
-  model completes a seeded multi-hour review corpus with measured
-  recall/precision, bounded cost/time/retries, restart continuity, **zero**
-  code/secret egress, **no** mutation, and useful findings materially
-  better than a single-pass baseline. Also certify **denial** on route
-  drift, missing capability, quota exhaustion, and unauthorized publish.
+  model completes a seeded multi-hour review corpus with bounded
+  cost/time/retries, restart continuity, **zero** code/secret egress, and
+  **no** mutation.
+- **Controlled same-model baseline (required).** Both arms freeze the
+  **same** approved company-gateway route, opaque modest
+  model/version/deployment, credential binding, effort/decoding profile,
+  corpus, prompt/input scope, and comparable response cap. Pre-register
+  quantitative thresholds **before** execution:
+  - precision `>= 0.75`
+  - weighted recall `>= 0.75`
+  - high/critical recall `>= 0.85`
+  - usefulness `>= 0.70`
+  - Brier `<= 0.20`
+  - ECE `<= 0.15`
+  - paired weighted-utility lift `>= 0.15` with project-cluster-bootstrap
+    95% lower bound `> 0.08`
+  - recall lift `>= 0.15` with lower bound `> 0.05`
+  - wins `>= 6` of 8 pre-registered finding families and no family `> 0.10`
+    worse
+  Missing or mixed binding or usage is **Indeterminate**, never PASS. A
+  free-form “better than a single-pass baseline” claim, unmatched
+  models/routes, or a frontier-model arm **fails** this exit.
+- Also certify **denial** on route drift, missing capability, quota
+  exhaustion, and unauthorized publish (including any attempt by a review
+  worker to request or exercise publication).
 - Integrate with provider-neutral execution, long-running workers
   ([#305](https://github.com/chriscase/GrokPtah/issues/305)), least
   privilege, memory, desktop/hosted parity, and the Stage 10 operator
   workflow. Company-gateway quota is **that provider’s** quota; it is not
   the Stage 2 Grok Build provider-quota receipt and not a Grok Build
   account balance.
-- Marking this core product outcome Explicitly unsupported **fails** a
-  full-product 100% claim. Documented non-goals may stay unsupported
-  (proprietary non-OpenAI-compatible APIs remain out of scope until ADR-002
-  §6 evidence).
+- Named evidence (absent today; not a certification): protocol, frozen
+  bindings, pre-registered thresholds, corpus, and dated paired report
+  under `evals/enterprise-gateway-review-lane/v1/`. Existing
+  [`evals/certification-lab/`](../evals/certification-lab/) hermetic replay
+  is **not** this campaign.
+- **Any GrokPtah 100% claim requires this stage.** It cannot be descoped,
+  status-relabeled, or marked Explicitly unsupported. Documented non-goal
+  features may stay unsupported (proprietary non-OpenAI-compatible APIs
+  remain out of scope until ADR-002 §6 evidence); this core outcome may
+  not.
 
 **Must not claim:** enterprise review-lane certification from closed #169
-profiles, from Grok Build routing, from hermetic replay, or from a
-single-pass chat on a frontier model.
+profiles, from Grok Build routing, from hermetic replay, from a
+single-pass chat on a frontier model, or from an Indeterminate binding.
 
 ## Dependency graph (summary)
 
@@ -822,8 +880,9 @@ visual (stage 9) has no Explicitly unsupported waiver. Independent
 long-running workers (stage 6 / #305) have no descope waiver. Packaged
 core UX (stage 10 / #308) has no Explicitly unsupported waiver for the
 Codex-class interface. Recurring expert UX cadence (stage 10) has no
-one-polish-pass waiver. The enterprise gateway review lane (stage 12)
-has no Explicitly unsupported waiver if we claim the full product vision.
+one-polish-pass waiver and no vague 2–3-change waiver. The enterprise
+gateway review lane (stage 12) cannot be descoped, status-relabeled, or
+marked Explicitly unsupported. **Any GrokPtah 100% claim requires Stage 12.**
 
 ## Unverified (explicit)
 
@@ -860,11 +919,13 @@ still carries them here is invalid.
   **Must not remain Unverified at 100%.** Cannot be closed by marking the
   Codex-class core interface Explicitly unsupported.
 - Recurring expert UI/UX review cadence (stage 10 supplement).
-  **Must not remain Unverified at 100%.** Cannot be closed by mockups or a
-  single pre-release polish pass.
+  **Must not remain Unverified at 100%.** Cannot be closed by mockups, a
+  single pre-release polish pass, or a cadence without the operator-visible
+  change counter and PASS/BLOCK ledger.
 - Enterprise gateway long-running code-review lane (stage 12).
   **Must not remain Unverified at 100%.** Closed [#169](https://github.com/chriscase/GrokPtah/issues/169)
-  profiles and Grok Build routing do not close this. Cannot be waived as
-  Explicitly unsupported if we claim the full product vision.
+  profiles and Grok Build routing do not close this. Cannot be descoped,
+  status-relabeled, or marked Explicitly unsupported. **Any 100% claim
+  requires Stage 12.**
 
 See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) for per-row evidence.
