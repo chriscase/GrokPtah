@@ -28,6 +28,9 @@ complete or that the product has reached 100%.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.
+- The review-benchmark contract keeps its fail-closed live behavior; the
+  fake-loopback quality path is also host-only in this sandbox because its
+  provider must bind `127.0.0.1`.
 
 ## Still required before a 100% claim
 
@@ -39,4 +42,3 @@ complete or that the product has reached 100%.
    certification, isolated visual Computer Use hardware proof, packaged UI
    acceptance plus recurring expert reviews, a 72-hour operational soak, and
    the enterprise-gateway long-running review lane.
-
