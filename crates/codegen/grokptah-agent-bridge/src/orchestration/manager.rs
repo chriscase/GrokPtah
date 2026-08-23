@@ -247,6 +247,16 @@ pub struct ManagerDecisionRecord {
 }
 
 impl ManagerDecisionRecord {
+    pub fn matches_directive_fences(&self, envelope: &ManagerDirectiveEnvelope) -> bool {
+        envelope.occurrence_id == self.decision_id
+            && envelope.plan_id == self.plan_id
+            && envelope.expected_plan_revision == self.expected_plan_revision
+            && envelope.manager_agent_id == self.manager_agent_id
+            && envelope.expected_agent_spec_revision == self.agent_spec_revision
+            && envelope.input_snapshot_hash == self.input_snapshot_hash
+            && envelope.memory_attribution_digest == self.memory_attribution.attribution_digest
+    }
+
     pub fn validate(&self) -> Result<(), OrchError> {
         if self.schema_version != MANAGER_SCHEMA_VERSION
             || self.expected_plan_revision == 0
@@ -297,6 +307,11 @@ impl ManagerDecisionRecord {
                 &serde_json::to_string(directive)
                     .map_err(|error| invalid(format!("invalid stored directive: {error}")))?,
             )?;
+            if !self.matches_directive_fences(directive) {
+                return Err(invalid(
+                    "stored manager directive does not match its occurrence fences",
+                ));
+            }
         }
         Ok(())
     }
@@ -1503,6 +1518,49 @@ mod tests {
             "context must not cross a disabled scope",
         )
         .is_err());
+
+        let now = Utc::now();
+        let decision = ManagerDecisionRecord {
+            schema_version: MANAGER_SCHEMA_VERSION,
+            decision_id: "decision".into(),
+            plan_id: "plan".into(),
+            expected_plan_revision: 2,
+            manager_agent_id: "manager".into(),
+            agent_spec_revision: attribution.agent_spec_revision,
+            memory_attribution: attribution.clone(),
+            triggering_work_ids: Vec::new(),
+            triggering_message_ids: Vec::new(),
+            input_snapshot_hash: "snapshot".into(),
+            decision_work_id: "decision-work".into(),
+            decision_work_objective_digest: "b".repeat(64),
+            run_id: None,
+            state: ManagerDecisionState::AwaitingResult,
+            proposed_directive: None,
+            outcome: None,
+            applied_mutation_ids: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let envelope = ManagerDirectiveEnvelope {
+            schema_version: MANAGER_SCHEMA_VERSION,
+            occurrence_id: decision.decision_id.clone(),
+            plan_id: decision.plan_id.clone(),
+            expected_plan_revision: decision.expected_plan_revision,
+            manager_agent_id: decision.manager_agent_id.clone(),
+            expected_agent_spec_revision: decision.agent_spec_revision,
+            input_snapshot_hash: decision.input_snapshot_hash.clone(),
+            memory_attribution_digest: attribution.attribution_digest.clone(),
+            directive: ManagerDirective::NoSafeAction {
+                reason: "bounded fixture".into(),
+            },
+        };
+        assert!(decision.matches_directive_fences(&envelope));
+        let mut wrong_memory = envelope.clone();
+        wrong_memory.memory_attribution_digest = "c".repeat(64);
+        assert!(!decision.matches_directive_fences(&wrong_memory));
+        let mut stored = decision;
+        stored.proposed_directive = Some(wrong_memory);
+        assert!(stored.validate().is_err());
     }
 
     #[test]

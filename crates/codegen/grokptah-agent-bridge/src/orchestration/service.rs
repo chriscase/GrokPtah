@@ -876,14 +876,7 @@ impl OrchestrationService {
         decision: &ManagerDecisionRecord,
         envelope: &super::manager::ManagerDirectiveEnvelope,
     ) -> Result<(), OrchError> {
-        if envelope.occurrence_id != decision.decision_id
-            || envelope.plan_id != decision.plan_id
-            || envelope.expected_plan_revision != decision.expected_plan_revision
-            || envelope.manager_agent_id != decision.manager_agent_id
-            || envelope.expected_agent_spec_revision != decision.agent_spec_revision
-            || envelope.input_snapshot_hash != decision.input_snapshot_hash
-            || envelope.memory_attribution_digest != decision.memory_attribution.attribution_digest
-        {
+        if !decision.matches_directive_fences(envelope) {
             return Err(OrchError::new(
                 OrchErrorCode::StaleVersion,
                 "manager directive does not match its durable occurrence fences",

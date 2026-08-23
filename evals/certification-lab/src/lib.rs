@@ -8,6 +8,7 @@ pub mod capture;
 pub mod cli;
 pub mod local_service;
 pub mod manifest;
+pub mod memory_stage5;
 pub mod normalize;
 pub mod probes;
 pub mod process_service;
@@ -29,6 +30,7 @@ pub const REVIEW_FAKE_PROVIDER_SCHEMA: &str = "grokptah.code-review-benchmark-fa
 pub const REVIEW_REPORT_SCHEMA: &str = "grokptah.code-review-benchmark.v1";
 pub const REVIEW_FINGERPRINT_SCHEMA: &str = "grokptah.code-review-benchmark-fingerprint.v1";
 pub const REVIEW_IMPLEMENTATION_SCHEMA: &str = "grokptah.code-review-benchmark-implementation.v1";
+pub const MEMORY_STAGE5_REPORT_SCHEMA: &str = memory_stage5::MEMORY_STAGE5_REPORT_SCHEMA;
 pub const ALWAYS_ON_GROKBOT_FIXTURE: &[u8] = crate::process_service::FIXTURE_BYTES;
 pub const ALWAYS_ON_GROKBOT_FIXTURE_SCHEMA: &str = crate::process_service::FIXTURE_SCHEMA;
 

@@ -17,6 +17,10 @@ use uuid::Uuid;
 
 use crate::artifact::{verify_completed_campaign, SafeOutputRoot, DEFAULT_OUTPUT_RELATIVE_PATH};
 use crate::manifest::CampaignManifest;
+use crate::memory_stage5::{
+    inspect as inspect_memory_stage5, run as run_memory_stage5, MemoryStage5Options,
+    MEMORY_STAGE5_OUTPUT_RELATIVE_PATH, MEMORY_STAGE5_REPORT_SCHEMA,
+};
 use crate::normalize::{normalize_capture, replay_fixture, ReplayFixture, MAX_FIXTURE_BYTES};
 use crate::report::{
     CampaignReport, DiagnosticCode, FailureClass, ProbeStatus, ReportSummary, RuntimeMode,
@@ -67,6 +71,8 @@ pub enum Command {
     ValidateManifest(RepositoryArgs),
     /// Run the sealed code-review benchmark contract (fake) or fail closed (live).
     Review(ReviewArgs),
+    /// Run the exact-head Stage 5 durable-memory certification campaign.
+    Memory(MemoryArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -126,6 +132,24 @@ pub struct CampaignArgs {
     pub acknowledge_disposable_target: bool,
 
     /// Total bytes available to one campaign, including interrupted temps.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_ARTIFACT_BUDGET_BYTES,
+        value_parser = clap::value_parser!(u64).range(1..=2_147_483_648)
+    )]
+    pub artifact_budget_bytes: u64,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct MemoryArgs {
+    #[command(flatten)]
+    pub repository: RepositoryArgs,
+
+    /// Absolute artifact root; defaults to the ignored Stage 5 run root.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    /// Total bytes available to the sealed Stage 5 campaign.
     #[arg(
         long,
         default_value_t = DEFAULT_ARTIFACT_BUDGET_BYTES,
@@ -378,6 +402,15 @@ async fn dispatch(command: Command) -> Result<(ExitClass, serde_json::Value)> {
                 };
                 return Ok((exit, serde_json::to_value(summary)?));
             }
+            if schema.as_deref() == Some(MEMORY_STAGE5_REPORT_SCHEMA) {
+                let summary = inspect_memory_stage5(&args.campaign)?;
+                let exit = if summary.certification_ready {
+                    ExitClass::Passed
+                } else {
+                    ExitClass::OracleFailure
+                };
+                return Ok((exit, serde_json::to_value(summary)?));
+            }
             if sealed.bytes > MAX_REPORT_BYTES as u64 {
                 bail!("campaign seal does not reference a bounded report");
             }
@@ -424,7 +457,30 @@ async fn dispatch(command: Command) -> Result<(ExitClass, serde_json::Value)> {
             Ok((ExitClass::Passed, serde_json::to_value(summary)?))
         }
         Command::Review(args) => review(args).await,
+        Command::Memory(args) => memory(args),
     }
+}
+
+fn memory(args: MemoryArgs) -> Result<(ExitClass, serde_json::Value)> {
+    let repository = canonical_repository(&args.repository.repository)?;
+    let output_root = match args.output {
+        Some(path) => {
+            require_absolute(&path, "output_path_must_be_absolute")?;
+            path
+        }
+        None => repository.join(MEMORY_STAGE5_OUTPUT_RELATIVE_PATH),
+    };
+    let completion = run_memory_stage5(&MemoryStage5Options {
+        repository_root: repository,
+        output_root,
+        artifact_budget_bytes: args.artifact_budget_bytes,
+    })?;
+    let exit = if completion.certification_ready {
+        ExitClass::Passed
+    } else {
+        ExitClass::OracleFailure
+    };
+    Ok((exit, serde_json::to_value(completion)?))
 }
 
 async fn review(args: ReviewArgs) -> Result<(ExitClass, serde_json::Value)> {
