@@ -2,7 +2,31 @@
 
 use std::path::{Path, PathBuf};
 
+use uuid::Uuid;
+
 use super::types::{OrchError, OrchErrorCode};
+
+/// Immutable Computer-read capability bound to one credential.
+///
+/// The grant is the only Computer-read scope a bearer may exercise. Callers
+/// cannot widen it through MCP/UI session or workspace arguments. Legacy
+/// credentials constructed with [`AuthCredential::new`] carry no grant and
+/// receive no Computer-read authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerReadGrant {
+    session_id: Uuid,
+    workspace: String,
+}
+
+impl ComputerReadGrant {
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthContext {
@@ -13,6 +37,21 @@ pub struct AuthContext {
     /// device credentials. A later multi-tenant service can map credentials to
     /// different owner identities without changing the protocol shape.
     pub owner_id: String,
+    computer_read: Option<ComputerReadGrant>,
+}
+
+impl AuthContext {
+    pub fn new(token_id: impl Into<String>, owner_id: impl Into<String>) -> Self {
+        Self {
+            token_id: token_id.into(),
+            owner_id: owner_id.into(),
+            computer_read: None,
+        }
+    }
+
+    pub fn computer_read_grant(&self) -> Option<&ComputerReadGrant> {
+        self.computer_read.as_ref()
+    }
 }
 
 /// One named bearer credential accepted by a service instance.
@@ -24,6 +63,7 @@ pub struct AuthContext {
 pub struct AuthCredential {
     pub id: String,
     token: String,
+    computer_read: Option<ComputerReadGrant>,
 }
 
 impl std::fmt::Debug for AuthCredential {
@@ -31,6 +71,7 @@ impl std::fmt::Debug for AuthCredential {
         f.debug_struct("AuthCredential")
             .field("id", &self.id)
             .field("token", &"[redacted]")
+            .field("computer_read", &self.computer_read)
             .finish()
     }
 }
@@ -56,11 +97,43 @@ impl AuthCredential {
                 "auth credential token must not be empty",
             ));
         }
-        Ok(Self { id, token })
+        Ok(Self {
+            id,
+            token,
+            computer_read: None,
+        })
+    }
+
+    /// Issue a credential that may read Computer Runs for exactly one
+    /// owner session and canonical workspace. Unscoped [`Self::new`]
+    /// credentials never gain this authority.
+    pub fn with_computer_read_grant(
+        id: impl Into<String>,
+        token: impl Into<String>,
+        session_id: Uuid,
+        workspace: impl AsRef<Path>,
+    ) -> Result<Self, OrchError> {
+        if session_id.is_nil() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "computer-read grant session is missing",
+            ));
+        }
+        let workspace = canonical_workspace(workspace.as_ref())?;
+        let mut credential = Self::new(id, token)?;
+        credential.computer_read = Some(ComputerReadGrant {
+            session_id,
+            workspace: workspace.display().to_string(),
+        });
+        Ok(credential)
     }
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    pub fn computer_read_grant(&self) -> Option<&ComputerReadGrant> {
+        self.computer_read.as_ref()
     }
 }
 
@@ -162,6 +235,7 @@ pub fn authenticate_bearer(
     Ok(AuthContext {
         token_id: credential.id.clone(),
         owner_id: owner_id.trim().to_string(),
+        computer_read: credential.computer_read.clone(),
     })
 }
 
@@ -227,6 +301,37 @@ mod tests {
         assert_eq!(auth.token_id, "laptop");
         assert_eq!(auth.owner_id, "account-1");
         assert!(authenticate_bearer(Some("Bearer unknown"), &credentials, "account-1").is_err());
+        assert!(auth.computer_read_grant().is_none());
+    }
+
+    #[test]
+    fn legacy_unscoped_credentials_have_no_computer_read_authority() {
+        let credential = AuthCredential::new("primary", "tok").unwrap();
+        assert!(credential.computer_read_grant().is_none());
+        let auth = authenticate_bearer(Some("Bearer tok"), &[credential], "primary").unwrap();
+        assert!(auth.computer_read_grant().is_none());
+    }
+
+    #[test]
+    fn computer_read_grant_is_copied_immutably_onto_the_auth_context() {
+        let dir = tempdir().unwrap();
+        let session = Uuid::new_v4();
+        let credential =
+            AuthCredential::with_computer_read_grant("laptop", "scoped-tok", session, dir.path())
+                .unwrap();
+        let granted = credential.computer_read_grant().unwrap().clone();
+        let auth =
+            authenticate_bearer(Some("Bearer scoped-tok"), &[credential], "account-1").unwrap();
+        let bound = auth.computer_read_grant().unwrap();
+        assert_eq!(bound.session_id(), session);
+        assert_eq!(bound.workspace(), granted.workspace());
+        assert_eq!(
+            bound.workspace(),
+            canonical_workspace(dir.path())
+                .unwrap()
+                .display()
+                .to_string()
+        );
     }
 
     #[test]

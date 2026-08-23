@@ -3,7 +3,7 @@ import { api } from "../lib/api";
 import type {
   ComputerAction,
   ComputerCockpitSnapshot,
-  ComputerRun,
+  ComputerLocalApproval,
 } from "../lib/protocol";
 import { ComputerCockpit } from "./ComputerCockpit";
 
@@ -27,24 +27,23 @@ function observedRun(
   sequence: number,
   name = "",
   submitted = false,
-): ComputerRun {
+): ComputerLocalApproval {
   const observationId = `story-observation-${sequence}`;
   return {
     runId: "story-run",
-    ownerSessionId: "story-session",
-    target,
     state: "ready",
     version: sequence * 2 + 1,
-    createdAt: new Date(Date.now() - 22_000).toISOString(),
-    updatedAt: new Date().toISOString(),
-    startedAt: new Date(Date.now() - 20_000).toISOString(),
-    limits: { maxActions: 8, maxDurationSecs: 600 },
     actionCount: Math.max(0, sequence - 1),
-    currentObservation: {
+    limits: { maxActions: 8 },
+    controlDisposition: "agent_owned",
+    target: {
+      appId: target.appId,
+      displayName: target.displayName,
+    },
+    observation: {
       observationId,
       sequence,
       capturedAt: new Date().toISOString(),
-      target,
       elements: [
         {
           elementId: `${observationId}-name`,
@@ -52,8 +51,6 @@ function observedRun(
           label: "Name",
           value: name || null,
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: ["set_value"],
         },
         {
@@ -61,8 +58,6 @@ function observedRun(
           role: "button",
           label: "Submit",
           enabled: Boolean(name),
-          focused: false,
-          sensitivity: "none",
           actions: ["invoke"],
         },
         {
@@ -70,17 +65,12 @@ function observedRun(
           role: "status",
           label: submitted ? `Submitted for ${name}` : "Not submitted",
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: [],
         },
       ],
-      elementsTruncated: false,
     },
     grant: {
-      grantId: `story-grant-${sequence}`,
       expiresAt: new Date(Date.now() + 120_000).toISOString(),
-      usesRemaining: 1,
       revokedAt: null,
       actionClasses: ["semantic", "text_entry"],
     },
@@ -105,19 +95,22 @@ function observedRun(
         observationId,
       },
     ],
+    lastError: null,
   };
 }
 
-function nativeObservedRun(sequence: number, name = "public-demo-value", submittedValue = false): ComputerRun {
+function nativeObservedRun(sequence: number, name = "public-demo-value", submittedValue = false): ComputerLocalApproval {
   const observationId = `native-observation-${sequence}`;
   return {
     ...observedRun(sequence, name, submittedValue),
-    target: nativeTarget,
-    currentObservation: {
+    target: {
+      appId: nativeTarget.appId,
+      displayName: nativeTarget.displayName,
+    },
+    observation: {
       observationId,
       sequence,
       capturedAt: new Date().toISOString(),
-      target: nativeTarget,
       elements: [
         {
           elementId: `${observationId}-element-3`,
@@ -125,8 +118,6 @@ function nativeObservedRun(sequence: number, name = "public-demo-value", submitt
           label: "Project label",
           value: name,
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: ["set_value"],
         },
         {
@@ -135,8 +126,6 @@ function nativeObservedRun(sequence: number, name = "public-demo-value", submitt
           label: "Priority",
           value: "Normal",
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: ["select"],
         },
         {
@@ -144,8 +133,6 @@ function nativeObservedRun(sequence: number, name = "public-demo-value", submitt
           role: "AXButton",
           label: "Submit fixture",
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: ["invoke"],
         },
         {
@@ -153,8 +140,6 @@ function nativeObservedRun(sequence: number, name = "public-demo-value", submitt
           role: "AXStaticText",
           label: submittedValue ? `Submitted ${name} at Normal` : "Not submitted",
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: [],
         },
         {
@@ -162,12 +147,9 @@ function nativeObservedRun(sequence: number, name = "public-demo-value", submitt
           role: "AXScrollArea",
           label: "Accessible demo rows",
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: ["scroll"],
         },
       ],
-      elementsTruncated: false,
     },
   };
 }
@@ -179,6 +161,7 @@ const backend = {
   textEntry: true,
   keyChords: false,
   pointerFallback: false,
+  foregroundConflictCapacity: 1,
 };
 
 const nativeBackend = {
@@ -189,42 +172,29 @@ const nativeBackend = {
 let current: ComputerCockpitSnapshot = {
   backend,
   origin: "desktop",
-  run: null,
+  local: null,
   pendingApproval: null,
 };
 let currentName = "";
 let submitted = false;
 let agentQualified = false;
 
-function setRun(run: ComputerRun | null): ComputerCockpitSnapshot {
-  current = { ...current, run, pendingApproval: null };
+function setRun(run: ComputerLocalApproval | null): ComputerCockpitSnapshot {
+  current = { ...current, local: run, pendingApproval: null };
   return structuredClone(current);
 }
 
-function pausedAfter(action: ComputerAction): ComputerRun {
-  const run = structuredClone(current.run!);
+function pausedAfter(action: ComputerAction): ComputerLocalApproval {
+  const run = structuredClone(current.local!);
   if (action.type === "set_value") currentName = action.text;
   if (action.type === "invoke") submitted = true;
   run.state = "paused";
   run.version += 1;
   run.actionCount += 1;
-  run.currentObservation = null;
+  run.observation = null;
   run.grant = run.grant
-    ? { ...run.grant, usesRemaining: 0, revokedAt: new Date().toISOString() }
+    ? { ...run.grant, revokedAt: new Date().toISOString() }
     : null;
-  run.lastOutcome = {
-    summary:
-      action.type === "set_value"
-        ? "set visible demo text"
-        : action.type === "activate_target"
-          ? "activated the authorized application"
-          : action.type === "invoke"
-            ? "invoked the selected element"
-            : action.type === "select"
-              ? "selected the chosen value"
-              : "scrolled the selected element into view",
-    expectedPostconditionMet: true,
-  };
   run.audit = [
     ...run.audit,
     {
@@ -289,7 +259,7 @@ api.computerUseCockpitStageAction = async (
 ) => {
   const actionElementLabel =
     "element_id" in action
-      ? current.run?.currentObservation?.elements.find(
+      ? current.local?.observation?.elements.find(
           (element) => element.elementId === action.element_id,
         )?.label
       : null;
@@ -301,7 +271,7 @@ api.computerUseCockpitStageAction = async (
       runId,
       runVersion: expectedVersion,
       observationId,
-      targetLabel: current.run?.target.displayName ?? target.displayName,
+      targetLabel: current.local?.target.displayName ?? target.displayName,
       action,
       actionSummary:
         action.type === "set_value"
@@ -326,7 +296,7 @@ api.computerUseCockpitProposeAgentAction = async (
   expectedVersion,
   observationId,
 ) => {
-  const elementId = current.run?.currentObservation?.elements.find(
+  const elementId = current.local?.observation?.elements.find(
     (element) => element.actions.includes("set_value"),
   )?.elementId;
   if (!elementId) throw new Error("No visible text field is available");
@@ -351,25 +321,24 @@ api.computerUseCockpitDiscardApproval = async () => {
 };
 api.computerUseCockpitRefresh = async () =>
   setRun(
-    current.run?.target.appId === nativeTarget.appId
-      ? nativeObservedRun((current.run?.actionCount ?? 0) + 1, currentName || "public-demo-value", submitted)
-      : observedRun((current.run?.actionCount ?? 0) + 1, currentName, submitted),
+    current.local?.target.appId === nativeTarget.appId
+      ? nativeObservedRun((current.local?.actionCount ?? 0) + 1, currentName || "public-demo-value", submitted)
+      : observedRun((current.local?.actionCount ?? 0) + 1, currentName, submitted),
   );
 api.computerUseCockpitPause = async () => {
-  const run = structuredClone(current.run!);
+  const run = structuredClone(current.local!);
   run.state = "paused";
   run.version += 1;
-  run.currentObservation = null;
+  run.observation = null;
   if (run.grant) run.grant.revokedAt = new Date().toISOString();
   return setRun(run);
 };
 api.computerUseCockpitTakeOver = api.computerUseCockpitPause;
 api.computerUseCockpitStop = async () => {
-  const run = structuredClone(current.run!);
+  const run = structuredClone(current.local!);
   run.state = "cancelled";
   run.version += 1;
-  run.currentObservation = null;
-  run.endedAt = new Date().toISOString();
+  run.observation = null;
   return setRun(run);
 };
 

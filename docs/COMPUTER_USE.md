@@ -15,13 +15,79 @@ Computer Use treats observation and action as separate privileged operations:
 3. A local-user grant binds that run, target generation, allowed action classes, expiry, and
    optional remaining-use count.
 4. An observation receives a monotonic ID. Every action must reference the current observation.
-5. Policy is checked again immediately before the backend action.
+5. Policy is checked again immediately before the backend action. Takeover is durable
+   bookkeeping-safe (revokes grants, bumps epochs, cancels later work). It is not physically
+   preemptive once an action is already inside the native action gate.
 6. Successful actions invalidate the observation, forcing the caller to observe again.
 
 Authorization is fail-closed. Grants do not survive restart, pause, cancellation, completion,
 failure, target changes, or exhausted limits. Secure and system-restricted surfaces are denied
-even when a grant exists. Pointer fallback and key chords require separate action classes; a
-semantic-action grant cannot silently expand into raw input control.
+even when a grant exists. Pointer fallback and key chords require a typed independently isolated
+visual input-domain proof; capability booleans, a blanket grant class, and a simulator fixture
+cannot make a native backend isolated. A semantic-action grant cannot silently expand into raw
+input control.
+
+## Isolation contract (stage 1)
+
+Surface isolation, surface incarnation, initiating principal, authority epoch, frame/observation
+generation, and isolation proof are intrinsic to the Computer Use contract. Backends advertise a
+closed `ComputerCapabilityTier`:
+
+- `foreground_semantic` — may require activating the real target. Current macOS native Computer
+  Use is this tier and must not be advertised as isolated. It is one host-global-foreground
+  conflict domain (capacity 1). Per-window IDs are target identity, not isolation.
+- `measured_background_safe_semantic` — host-measured semantic actions that must not activate or
+  move the pointer. `ActivateTarget` is forbidden and cannot silently fall back to foreground.
+- `independently_isolated_visual_input_domain` — pointer, key, and visual actions. Stage 1 only
+  the deterministic simulator may fixture this origin; a simulator fixture cannot stamp a native
+  backend isolated. Host-native isolated helpers are a later stage and fail closed.
+- `unproven` — missing, unknown, legacy, or contradictory capability. Fail closed.
+
+`ComputerCapabilityProof` is the security boundary. Public booleans on `ComputerCapabilities`
+are a derived projection. Legacy boolean-only records hydrate to foreground-semantic when they
+claim only observe/semantic/text entry, or stay unproven when they claim pointer or key
+authority. Unknown, malformed, host-native isolated, or contradictory tier/proof/boolean
+combinations cannot deserialize into background or isolated authority.
+
+Every run, grant, observation, and policy check is bound to a host-interned opaque surface ID and
+incarnation for an attested physical input domain, plus target generation, a host-minted
+frame epoch, and control/authority epoch. Native macOS interns one host-global-foreground domain;
+two windows share that domain's freshness clocks. Backends do not mint surface authority; syntactic
+prefixes are not proof of issuance. A serialized wall-clock timestamp is not dispatch proof.
+Monotonic freshness ticks are exact-current for the live surface incarnation: an older tick is
+stale. Restart invalidates the live clocks.
+
+Local-operator caller identity is a host-resolved `ComputerAuthorityToken`. Public principal,
+proof, surface, and grant constructors do not mint authority. Agent principal creation is
+fail-closed in this allowlist: resolving a durable Agent ID and the exact current spec revision
+requires `AgentHost` / orchestration `AgentRecord` integration owned by the active PR #352
+security repair. Stage 1 does not accept `agent-*` strings as host-issued identity.
+
+Unproven capability fails closed for observe, evidence, grant, and act. Missing initiating
+principal is not treated as the local operator. Idempotency receipts are bound to the immutable
+caller principal and run authority/control epochs; replay reauthorizes before returning typed
+data. Legacy unstamped receipts fail closed.
+
+`ActivateTarget` is valid only for explicitly authorized foreground-semantic execution. It is
+never non-disruptive. Restart/reopen rotates the surface incarnation, zeros the freshness tick,
+bumps the authority epoch, clears grants and observations, and coerces isolated or background
+proofs to unproven. A second reopen of an already-interrupted run is idempotent.
+
+Public projections expose `capabilityTier`, opaque `surfaceId` / `surfaceIncarnation`,
+`authorityEpoch`, and `initiatingPrincipalKind` only. They never include native process or
+window handles, raw attestation material, agent IDs, spec revisions, input-domain IDs, or
+measurement IDs.
+
+This stage does **not** implement an isolated helper process, visual compositor, agent cursor
+UI, background Accessibility execution, a durable dispatch-intent journal, pointer/keyboard
+injection, or out-of-band preemptive takeover. Those remain later stages; this contract makes
+them structurally representable without lying that macOS is isolated today. Stage 1 is not
+stable or release-ready. MCP Computer reads now require an immutable credential grant; Agent
+principal minting and packaged hardware/TCC/takeover remain fail-closed or unverified. A later
+coordinator can bind host-sealed capability documents, WorkAttempt surface leases, and
+principal-bound receipts to these types without exposing raw `ComputerRun`. Stage 1 does not
+implement that coordinator, does not simulate N isolated surfaces, and does not widen MCP
+mutations.
 
 ## Foundation (#268)
 
@@ -180,20 +246,22 @@ deterministic simulator. Its report is redacted and explicitly records that no a
 ## macOS observation and semantic action slices (#269, #270)
 
 The native adapter uses a runtime-loaded ScreenCaptureKit shim plus Accessibility semantic
-snapshots behind the same platform-neutral backend. The Computer Run cockpit exposes
-non-prompting status, explicit per-permission requests, bounded window discovery, exact scope
-review, one-use approvals, evidence and audit visibility, pause, Stop, Take over, and
-non-cancelling steering. Native actions are limited to activation, Accessibility invoke, visible
-value entry, selection, and semantic scrolling. Every mutation requires a fresh observation and
-local one-use grant. It does not register a model action or MCP tool. See
-[Computer Use on macOS](COMPUTER_USE_MACOS.md) for the privacy boundary, dispatch attestation,
-packaging requirements, and disposable smoke fixture.
+snapshots behind the same platform-neutral backend. It advertises **foreground-semantic**
+capability only (`pointer_fallback=false`, `key_chords=false`). Bringing the real target to
+the foreground is an authorized, disruptive `ActivateTarget`, not an isolated or background-safe
+action. The Computer Run cockpit exposes non-prompting status, explicit per-permission requests,
+bounded window discovery, exact scope review, one-use approvals, evidence and audit visibility,
+pause, Stop, Take over, and non-cancelling steering. Native actions are limited to activation,
+Accessibility invoke, visible value entry, selection, and semantic scrolling. Every mutation
+requires a fresh observation and local one-use grant. It does not register a model action or
+MCP tool. See [Computer Use on macOS](COMPUTER_USE_MACOS.md) for the privacy boundary, dispatch
+attestation, packaging requirements, and disposable smoke fixture.
 
 ## Deliberate non-goals of the current desktop slice
 
 - no Windows UI Automation or Linux portal adapter;
 - no unattended or continuously autonomous model invocation;
-- no MCP Computer Run surface;
+- no MCP mutation/evidence surface;
 - no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell endpoint;
 - no background or unattended grant;
 - no cross-application target switching inside a run.
@@ -203,10 +271,16 @@ packaging requirements, and disposable smoke fixture.
 | Stage | Issues | Outcome |
 |---|---|---|
 | Safety kernel | #268, #274 | Typed contract, simulator, durable authority, adversarial gates |
+| Isolation contract | stage 1 | Host-enforced tier, sealed token, interned surface, exact freshness, typed proof. Native macOS is a singleton host-global-foreground conflict domain (capacity 1). Not isolated or preemptive. |
 | macOS observe | #269 | Consented target selection, capture, redaction, semantic snapshots |
 | Operator UX and model proof | #273, #272 | Visible runs/approvals and capability-based provider conformance |
-| macOS act | #270 | Bounded semantic actions with immediate local takeover |
+| macOS act | #270 | Bounded semantic actions with durable bookkeeping-safe local takeover (not physically preemptive inside the native action gate) |
 | Coordinator interoperability | #271 | Scoped Computer Run MCP tools and event visibility |
+| Durable dispatch journal | later | Authenticated in-flight intent so takeover can preempt a native gate |
+| Isolated helper / input domain | later | Host-native independently isolated visual input, not a simulator fixture |
+| Out-of-band preemptive takeover | later | Cancel work that has already entered the native action gate |
+| Semantic-first isolated visual fallback | later | Isolated visual input after semantic miss, never boolean-upgraded native AX |
+| Cockpit agent cursor / always-available Stop | later | Agent-owned cursor UI on an isolated surface |
 | Other platforms | #275, #276 | Windows and Linux adapters behind the same contract |
 
 Provider support is capability-based, not model-name based. OpenAI-compatible corporate gateways
@@ -222,3 +296,24 @@ from a stale-frame tool error against a replacement observation. Compatible-prov
 persists the same measured tier for its exact route. Image input and `visual_fallback_act` remain
 unqualified. A qualified tier permits proposals only; it never replaces the cockpit's exact target
 review, one-use local grant, reobservation, or native dispatch checks.
+
+## Acceptance commands
+
+Stage 1 is not isolated Computer Use, not physically preemptive, and not release-ready. Packaged
+hardware focus, TCC, and takeover evidence remain explicitly unverified.
+
+```sh
+cargo fmt --check --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --lib computer_use -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --lib computer_agent -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --lib mcp_control::tests::computer -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --test computer_use_release_gate -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --test mcp_streamable_transport live_computer -- --test-threads=1
+cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml \
+  --lib computer_use -- --test-threads=1
+```

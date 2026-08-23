@@ -11,12 +11,13 @@ untrusted app/window content, screenshots, accessibility labels, model output, M
                               |
                               v
        bridge-owned typed run + policy + exact target/observation/grant checks
+       + capability proof, principal, surface incarnation, freshness fence
                               |
              +----------------+----------------+
              |                                 |
        local operator UI                  platform adapter
        approval / Stop / Take over        ScreenCaptureKit + AX
-             |                                 |
+             |                                 |  foreground-semantic only
              +---------------+-----------------+
                              v
                  bounded semantic action only
@@ -35,9 +36,14 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 | Target/window generation drift during observation | Proven fail-closed; the run becomes `failed` and authority is revoked | `computer_use_release_gate::observation_target_drift_fails_inflight_run_and_revokes_authority` |
 | Stale semantic element or geometry/action mismatch | Proven by exact observation, target, element, enabled-state, advertised-action, and bounds checks | policy tests; service stale-observation tests; native action tests |
 | Permission revoked during action | Proven fail-closed; in-flight action fails and authority is cleared | `computer_use_release_gate::permission_revocation_fails_action_and_clears_authority`; native permission-revocation tests |
-| Unsupported host pointer/coordinate fallback | Explicitly unsupported in the first slice; service rejects it before backend dispatch | `computer_use_release_gate::unsupported_pointer_fallback_never_reaches_backend`; proposal schema excludes pointer/key actions |
-| Duplicate mutation or conflicting request ID | Proven idempotent replay and conflict rejection | `ComputerUseService` idempotency tests; durable store receipt tests |
-| Stop/Take over versus in-flight action completion | Proven that cancellation wins and late completion becomes `uncertain` without incrementing action count | `ComputerUseService::cancellation_wins_over_an_inflight_action_completion`; desktop cockpit takeover tests |
+| Unsupported host pointer/coordinate fallback | Explicitly unsupported; pointer/key require an independently isolated input-domain proof even if legacy booleans or blanket grant classes are true | `computer_use_release_gate::unsupported_pointer_fallback_never_reaches_backend`; policy `pointer_and_key_require_isolated_proof_even_with_grant_class`; typed `ComputerCapabilityProof` |
+| Legacy/missing isolation fields | Deserialize to unproven or foreground-only; cannot authorize background, isolated, pointer, or key actions | `types` hydrate/from_wire tests; store restart coerces isolated/background proof to unproven |
+| Principal mismatch (session) | Denied before grant, observation, action, evidence read, and takeover. Agent principal minting is fail-closed until the PR #352 host Agent registry lands | policy and `ComputerUseService` principal-mismatch tests; `AGENT_PRINCIPAL_INTEGRATION_BLOCKER` |
+| Surface/incarnation/epoch/frame/freshness mismatch | Denied before backend dispatch; wall-clock alone is not proof | policy surface/epoch/freshness tests |
+| Simulator isolated fixture used as native isolation | Simulator-only origin; native macOS backends cannot carry isolated proof | simulator fixture tests; `ComputerRun::new_with_isolation` native stamp tests |
+| Per-window IDs treated as isolated input domains | Native macOS interns one host-global-foreground conflict domain (capacity 1); distinct windows share freshness clocks | `macos_observation::native_macos_windows_share_one_host_global_foreground_conflict_domain` |
+| Duplicate mutation or conflicting request ID | Proven idempotent replay bound to caller principal and authority/control epochs; cross-principal replay and legacy unstamped receipts fail closed | `ComputerUseService` idempotency tests; durable store receipt tests |
+| Stop/Take over versus in-flight action completion | Proven that cancellation wins and late completion becomes `uncertain` without incrementing action count. Takeover is durable bookkeeping-safe, not physically preemptive inside the native action gate | `ComputerUseService::cancellation_wins_over_an_inflight_action_completion`; desktop cockpit takeover tests |
 | Restart during a run or mutation | Proven: active runs become `interrupted`, grants/observations clear, and claimed receipts become `uncertain` | durable store restart tests |
 | Evidence size, retention, integrity, and path leakage | Proven bounded evidence, hash/length verification, atomic records, retention, and opaque asset IDs | service evidence tests; store retention/integrity tests; `docs/COMPUTER_USE.md` |
 | Model/provider change during Computer inference | Proven at the model boundary; ephemeral qualification is cleared and late proposals are rejected | `computer_agent` and desktop proposal revalidation tests |
@@ -51,15 +57,34 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 
 - Run the three-action disposable macOS fixture proof through the packaged GrokPtah identity with
   Screen Recording and Accessibility grants. Terminal-owned grants do not prove packaged identity.
+  Packaged hardware focus, TCC, and takeover evidence remain explicitly unverified.
 - Complete the named hardware matrix for focus/geometry/display changes and permission revocation.
 - Keep #271 Computer MCP mutations disabled until the shared event/approval contract and its threat
   review are complete.
+- MCP Computer **read** methods currently ignore authenticated bearer identity in
+  `orchestration/service.rs`. That least-privilege repair is owned by the active PR #352 security
+  work and is unresolved here. Stage 1 is not stable or release-ready until that authority slice
+  lands.
 - Keep #288 isolated visual execution disabled until a backend provides a genuinely separate input
-  surface; hidden windows, separate Spaces, and global `CGEvent` injection do not qualify.
+  surface; hidden windows, separate Spaces, and global `CGEvent` injection do not qualify. Stage 1
+  only makes isolation a typed, host-enforced contract. Remaining stages: durable dispatch journal;
+  authenticated isolated helper/input domain; out-of-band preemptive takeover; semantic-first
+  isolated visual fallback; cockpit agent cursor and always-available Stop.
 
 ## Verification command
 
 ```sh
+cargo fmt --check --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --lib computer_use -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --lib computer_agent -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --lib mcp_control::tests::computer -- --test-threads=1
 cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
   --test computer_use_release_gate -- --test-threads=1
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --test mcp_streamable_transport live_computer -- --test-threads=1
+cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml \
+  --lib computer_use -- --test-threads=1
 ```

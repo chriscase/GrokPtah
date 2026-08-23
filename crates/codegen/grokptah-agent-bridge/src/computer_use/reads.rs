@@ -30,7 +30,9 @@ use super::types::{validate_id, ComputerResult, ComputerRun};
 /// The workspace is the exact durable binding string after the control-plane
 /// allowlist and session-cwd gate. Session-only [`super::service::ComputerUseService`]
 /// methods do not accept this type, so a coordinator surface cannot be wired
-/// to those methods without a type error.
+/// to those methods without a type error. Public construction is only from a
+/// host-issued [`crate::orchestration::ComputerReadGrant`]; MCP/UI arguments
+/// cannot mint a binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComputerReadBinding<'a> {
     owner_session_id: Uuid,
@@ -38,7 +40,20 @@ pub struct ComputerReadBinding<'a> {
 }
 
 impl<'a> ComputerReadBinding<'a> {
-    pub fn new(owner_session_id: Uuid, workspace: &'a str) -> Self {
+    /// Bind reads to an immutable credential grant. The grant is the only
+    /// Computer-read scope; caller-supplied session/workspace arguments must
+    /// already have been checked equal to this grant.
+    pub fn from_grant(grant: &'a crate::orchestration::ComputerReadGrant) -> Self {
+        Self {
+            owner_session_id: grant.session_id(),
+            workspace: grant.workspace(),
+        }
+    }
+
+    /// In-crate test constructor for synthetic workspace strings that need
+    /// not exist on disk. Production callers use [`Self::from_grant`].
+    #[cfg(test)]
+    pub(crate) fn new(owner_session_id: Uuid, workspace: &'a str) -> Self {
         Self {
             owner_session_id,
             workspace,
@@ -151,7 +166,8 @@ mod tests {
     use crate::computer_use::project_run_at;
     use crate::computer_use::types::{
         ActionClass, ActionGrant, ActionOutcome, ComputerObservation, ComputerRunState,
-        ComputerTarget, ComputerUseLimits, GrantIssuer, ObservationGeometry,
+        ComputerTarget, ComputerUseLimits, ObservationAuthority, ObservationGeometry,
+        SurfaceFreshnessFence,
     };
     use crate::computer_use::Sensitivity;
 
@@ -298,9 +314,21 @@ mod tests {
         let store = ComputerStore::open(dir.path()).unwrap();
         let owner = Uuid::new_v4();
         let now = Utc::now();
-        let mut run = saved_run(&store, owner, Some("/workspace/a"));
+        let mut run = ComputerRun::attested_foreground_for_test(
+            owner,
+            Some("/workspace/a".into()),
+            target(),
+            ComputerUseLimits::default(),
+        )
+        .unwrap();
         run.transition(ComputerRunState::Ready).unwrap();
         run.started_at = Some(now - Duration::seconds(10));
+        let freshness = SurfaceFreshnessFence {
+            surface_id: run.surface.surface_id.clone(),
+            incarnation: run.surface.incarnation.clone(),
+            tick: 1,
+            wall_clock: Some(now),
+        };
         run.current_observation = Some(ComputerObservation {
             observation_id: "obs-clock".into(),
             sequence: 1,
@@ -317,18 +345,15 @@ mod tests {
             elements: Vec::new(),
             elements_truncated: false,
             sensitivity: Sensitivity::None,
+            authority: ObservationAuthority::bind(&run, 1, freshness).unwrap(),
         });
-        run.grant = Some(ActionGrant {
-            grant_id: "grant-clock".into(),
-            run_id: run.run_id.clone(),
-            target: run.target.clone(),
-            action_classes: BTreeSet::from([ActionClass::Semantic]),
-            issued_by: GrantIssuer::LocalUser,
-            issued_at: now - Duration::minutes(1),
-            expires_at: now + Duration::minutes(1),
-            uses_remaining: Some(2),
-            revoked_at: None,
-        });
+        run.grant = Some(ActionGrant::for_run(
+            &run,
+            BTreeSet::from([ActionClass::Semantic]),
+            now - Duration::minutes(1),
+            now + Duration::minutes(1),
+            Some(2),
+        ));
         run.last_outcome = Some(ActionOutcome::bounded("set demo name", Some(true)));
         store.save_run(&run).unwrap();
 

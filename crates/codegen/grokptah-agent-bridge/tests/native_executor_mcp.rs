@@ -369,10 +369,7 @@ fn retry_policy(retry_eligible: bool) -> ManagedExecutionPolicy {
 }
 
 fn auth() -> AuthContext {
-    AuthContext {
-        token_id: "native-token-308".into(),
-        owner_id: "primary".into(),
-    }
+    AuthContext::new("native-token-308", "primary")
 }
 
 fn run_record(

@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use base64::Engine;
 use chrono::{Duration, Utc};
+#[cfg(target_os = "macos")]
+use grokptah_agent_bridge::MacOsObservationPlatform;
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
-    ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
-    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    ComputerAgentProposal, ComputerAuthorityToken, ComputerBackendPublicView, ComputerCapabilities,
+    ComputerError, ComputerLocalApproval, ComputerObservation, ComputerObservationPlatform,
+    ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun,
+    ComputerRunProjection, ComputerRunState, ComputerTargetCandidate, ComputerUseLimits,
+    ComputerUseService, SemanticAction, SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -42,16 +44,15 @@ pub struct PendingComputerApproval {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComputerCockpitSnapshot {
-    pub backend: ComputerCapabilities,
+    pub backend: ComputerBackendPublicView,
     pub origin: String,
     /// Authoritative run view. This is the identical serialized projection a
     /// coordinator surface receives, so the cockpit and an external observer
     /// cannot disagree about state, control disposition, epoch, or progress.
     pub projection: Option<ComputerRunProjection>,
-    /// Local-only detail. It carries observed element labels and values needed
-    /// to render an approval and must never cross the MCP boundary; the
-    /// projection above is what does.
-    pub run: Option<ComputerRun>,
+    /// Allowlisted local approval/observation DTO. Capability handles, workspace
+    /// bindings, proofs, evidence tokens, and backend text stay internal.
+    pub local: Option<ComputerLocalApproval>,
     pub pending_approval: Option<PendingComputerApproval>,
 }
 
@@ -107,6 +108,12 @@ impl DesktopComputerUse {
             simulator_operation: Mutex::new(()),
             pending_approval: std::sync::Mutex::new(None),
         }
+    }
+
+    fn operator_token(&self, owner_session_id: Uuid) -> Result<ComputerAuthorityToken, String> {
+        self.host
+            .computer_operator_token(owner_session_id)
+            .map_err(|error| error.to_string())
     }
 
     /// Durable workspace binding for a new run: the owning session's canonical
@@ -207,42 +214,49 @@ impl DesktopComputerUse {
         let run = service
             .create_run(
                 &Uuid::new_v4().to_string(),
-                owner_session_id,
+                &self.operator_token(owner_session_id)?,
                 self.session_workspace(owner_session_id),
                 target,
                 limits,
             )
             .map_err(|error| error.to_string())?;
         let now = Utc::now();
-        let grant = ActionGrant {
-            grant_id: Uuid::new_v4().to_string(),
-            run_id: run.run_id.clone(),
-            target: run.target.clone(),
-            action_classes: BTreeSet::from([ActionClass::Semantic]),
-            issued_by: GrantIssuer::LocalUser,
-            issued_at: now,
-            expires_at: now + Duration::minutes(5),
-            uses_remaining: Some(1),
-            revoked_at: None,
+        let grant = ActionGrant::for_run(
+            &run,
+            BTreeSet::from([ActionClass::Semantic]),
+            now,
+            now + Duration::minutes(5),
+            Some(1),
+        );
+        let caller = self.operator_token(owner_session_id)?;
+        let run = match service.authorize(
+            &Uuid::new_v4().to_string(),
+            &caller,
+            &run.run_id,
+            run.version,
+            grant,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                let _ = service
+                    .cancel(&Uuid::new_v4().to_string(), &caller, &run.run_id)
+                    .await;
+                return Err(error.to_string());
+            }
         };
-        let run =
-            match service.authorize(&Uuid::new_v4().to_string(), &run.run_id, run.version, grant) {
-                Ok(run) => run,
-                Err(error) => {
-                    let _ = service
-                        .cancel(&Uuid::new_v4().to_string(), &run.run_id)
-                        .await;
-                    return Err(error.to_string());
-                }
-            };
         let observed = service
-            .observe(&Uuid::new_v4().to_string(), &run.run_id, run.version)
+            .observe(
+                &Uuid::new_v4().to_string(),
+                &caller,
+                &run.run_id,
+                run.version,
+            )
             .await;
         let preview = match observed {
             Ok(observation) => {
                 let image_data_url = match observation.screenshot.as_ref() {
                     Some(evidence) => service
-                        .read_current_evidence(&run.run_id, &evidence.asset_id)
+                        .read_current_evidence(&caller, &run.run_id, &evidence.asset_id)
                         .await
                         .map(|bytes| {
                             Some(format!(
@@ -261,7 +275,7 @@ impl DesktopComputerUse {
             Err(error) => Err(error.to_string()),
         };
         let cleanup = service
-            .cancel(&Uuid::new_v4().to_string(), &run.run_id)
+            .cancel(&Uuid::new_v4().to_string(), &caller, &run.run_id)
             .await
             .map_err(|error| error.to_string());
         match (preview, cleanup) {
@@ -304,12 +318,12 @@ impl DesktopComputerUse {
             None => index.capabilities(),
         };
         Ok(ComputerCockpitSnapshot {
-            backend,
+            backend: ComputerBackendPublicView::from_capabilities(&backend),
             origin: "desktop".into(),
             projection: run
                 .as_ref()
                 .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now())),
-            run,
+            local: run.as_ref().map(ComputerLocalApproval::from_run),
             pending_approval,
         })
     }
@@ -339,15 +353,22 @@ impl DesktopComputerUse {
         let run = service
             .create_run(
                 &Uuid::new_v4().to_string(),
-                owner_session_id,
+                &self.operator_token(owner_session_id)?,
                 self.session_workspace(owner_session_id),
                 target,
                 limits,
             )
             .map_err(|error| error.to_string())?;
-        if let Err(error) = authorize_and_observe_once(&service, &run).await {
+        if let Err(error) =
+            authorize_and_observe_once(&service, &run, &self.operator_token(owner_session_id)?)
+                .await
+        {
             let _ = service
-                .cancel(&Uuid::new_v4().to_string(), &run.run_id)
+                .cancel(
+                    &Uuid::new_v4().to_string(),
+                    &self.operator_token(owner_session_id)?,
+                    &run.run_id,
+                )
                 .await;
             return Err(error.to_string());
         }
@@ -398,7 +419,7 @@ impl DesktopComputerUse {
         let run = service
             .create_run(
                 &Uuid::new_v4().to_string(),
-                owner_session_id,
+                &self.operator_token(owner_session_id)?,
                 self.session_workspace(owner_session_id),
                 target,
                 limits,
@@ -409,9 +430,16 @@ impl DesktopComputerUse {
             .map_err(|_| "Computer Use native run state is unavailable".to_string())?
             .insert(run.run_id.clone(), service.clone());
         self.clear_pending_for_owner(owner_session_id)?;
-        if let Err(error) = authorize_and_observe_once(&service, &run).await {
+        if let Err(error) =
+            authorize_and_observe_once(&service, &run, &self.operator_token(owner_session_id)?)
+                .await
+        {
             let _ = service
-                .cancel(&Uuid::new_v4().to_string(), &run.run_id)
+                .cancel(
+                    &Uuid::new_v4().to_string(),
+                    &self.operator_token(owner_session_id)?,
+                    &run.run_id,
+                )
                 .await;
             self.native_services
                 .lock()
@@ -440,7 +468,7 @@ impl DesktopComputerUse {
             return Err("Only a paused Computer Run can be reauthorized".into());
         }
         self.clear_pending_for_owner(owner_session_id)?;
-        authorize_and_observe_once(&service, &run)
+        authorize_and_observe_once(&service, &run, &self.operator_token(owner_session_id)?)
             .await
             .map_err(|error| error.to_string())?;
         self.cockpit_snapshot(owner_session_id)
@@ -581,7 +609,12 @@ impl DesktopComputerUse {
                     return Err("The Computer Run changed while the model was responding".into());
                 }
                 service
-                    .complete(&Uuid::new_v4().to_string(), run_id, expected_version)
+                    .complete(
+                        &Uuid::new_v4().to_string(),
+                        &self.operator_token(owner_session_id)?,
+                        run_id,
+                        expected_version,
+                    )
                     .map_err(|error| error.to_string())?;
                 Ok(ComputerAgentProposalResult {
                     snapshot: self.cockpit_snapshot(owner_session_id)?,
@@ -622,6 +655,7 @@ impl DesktopComputerUse {
         let result = service
             .act(
                 request_id,
+                &self.operator_token(owner_session_id)?,
                 &pending.run_id,
                 pending.run_version,
                 &pending.observation_id,
@@ -650,7 +684,12 @@ impl DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
         service
-            .pause(&Uuid::new_v4().to_string(), run_id, expected_version)
+            .pause(
+                &Uuid::new_v4().to_string(),
+                &self.operator_token(owner_session_id)?,
+                run_id,
+                expected_version,
+            )
             .await
             .map_err(|error| error.to_string())?;
         self.cockpit_snapshot(owner_session_id)
@@ -665,7 +704,12 @@ impl DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
         service
-            .take_over(&Uuid::new_v4().to_string(), run_id, expected_version)
+            .take_over(
+                &Uuid::new_v4().to_string(),
+                &self.operator_token(owner_session_id)?,
+                run_id,
+                expected_version,
+            )
             .await
             .map_err(|error| error.to_string())?;
         self.cockpit_snapshot(owner_session_id)
@@ -679,7 +723,11 @@ impl DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
         service
-            .cancel(&Uuid::new_v4().to_string(), run_id)
+            .cancel(
+                &Uuid::new_v4().to_string(),
+                &self.operator_token(owner_session_id)?,
+                run_id,
+            )
             .await
             .map_err(|error| error.to_string())?;
         self.cockpit_snapshot(owner_session_id)
@@ -802,14 +850,7 @@ fn owned_run(
 }
 
 fn unavailable_native_capabilities() -> ComputerCapabilities {
-    ComputerCapabilities {
-        backend_id: "macos_interrupted".into(),
-        observe: false,
-        semantic_actions: false,
-        text_entry: false,
-        key_chords: false,
-        pointer_fallback: false,
-    }
+    ComputerCapabilities::unproven(grokptah_agent_bridge::MACOS_INTERRUPTED_BACKEND_ID)
 }
 
 fn approval_copy(
@@ -850,22 +891,30 @@ fn approval_copy(
 async fn authorize_and_observe_once(
     service: &ComputerUseService,
     run: &ComputerRun,
+    caller: &ComputerAuthorityToken,
 ) -> Result<ComputerObservation, ComputerError> {
     let now = Utc::now();
-    let grant = ActionGrant {
-        grant_id: Uuid::new_v4().to_string(),
-        run_id: run.run_id.clone(),
-        target: run.target.clone(),
-        action_classes: BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
-        issued_by: GrantIssuer::LocalUser,
-        issued_at: now,
-        expires_at: now + Duration::minutes(2),
-        uses_remaining: Some(1),
-        revoked_at: None,
-    };
-    let run = service.authorize(&Uuid::new_v4().to_string(), &run.run_id, run.version, grant)?;
+    let grant = ActionGrant::for_run(
+        run,
+        BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        now,
+        now + Duration::minutes(2),
+        Some(1),
+    );
+    let run = service.authorize(
+        &Uuid::new_v4().to_string(),
+        caller,
+        &run.run_id,
+        run.version,
+        grant,
+    )?;
     service
-        .observe(&Uuid::new_v4().to_string(), &run.run_id, run.version)
+        .observe(
+            &Uuid::new_v4().to_string(),
+            caller,
+            &run.run_id,
+            run.version,
+        )
         .await
 }
 
@@ -902,7 +951,10 @@ mod tests {
 
     use async_trait::async_trait;
     use grokptah_agent_bridge::computer_use::{ObservationGeometry, SemanticElement, Sensitivity};
-    use grokptah_agent_bridge::{ActionOutcome, ComputerBackend, ComputerStore, ComputerTarget};
+    use grokptah_agent_bridge::{
+        ActionOutcome, ComputerBackend, ComputerCapabilityProof, ComputerStore, ComputerTarget,
+        PhysicalInputDomain,
+    };
 
     use super::*;
 
@@ -912,19 +964,23 @@ mod tests {
     struct NativeTestBackend {
         target: ComputerTarget,
         actions: Arc<AtomicUsize>,
+        domain: PhysicalInputDomain,
     }
 
     #[async_trait]
     impl ComputerBackend for NativeTestBackend {
         fn capabilities(&self) -> ComputerCapabilities {
-            ComputerCapabilities {
+            ComputerCapabilities::from_proof(ComputerCapabilityProof::ForegroundSemantic {
                 backend_id: "native_test_backend".into(),
                 observe: true,
                 semantic_actions: true,
                 text_entry: true,
-                key_chords: false,
-                pointer_fallback: false,
-            }
+            })
+            .expect("native test backend is foreground-semantic")
+        }
+
+        fn physical_input_domain(&self) -> PhysicalInputDomain {
+            self.domain.clone()
         }
 
         async fn observe(
@@ -966,6 +1022,7 @@ mod tests {
                 }],
                 elements_truncated: false,
                 sensitivity: Sensitivity::None,
+                authority: Default::default(),
             };
             observation.validate(limits)?;
             Ok(observation)
@@ -990,6 +1047,15 @@ mod tests {
             }
             self.actions.fetch_add(1, Ordering::SeqCst);
             Ok(ActionOutcome::bounded("native test action", Some(true)))
+        }
+
+        async fn act_if_current(
+            &self,
+            run_id: &str,
+            observation: &ComputerObservation,
+            action: &ComputerAction,
+        ) -> Result<ActionOutcome, ComputerError> {
+            self.act(run_id, observation, action).await
         }
 
         async fn cancel(&self, _run_id: &str) -> Result<(), ComputerError> {
@@ -1044,6 +1110,8 @@ mod tests {
             Ok(Arc::new(NativeTestBackend {
                 target: self.candidate.target.clone(),
                 actions: self.actions.clone(),
+                domain: PhysicalInputDomain::attested("desktop-native-test", NATIVE_TEST_APP_ID)
+                    .expect("native test domain is attested"),
             }))
         }
     }
@@ -1051,25 +1119,23 @@ mod tests {
     /// Host fixture with its persist directories bound under the disposable
     /// fixture directory. The process-global home override is serialized and
     /// restored so parallel tests never touch the real user home.
-    fn test_host(dir: &std::path::Path) -> AgentHostHandle {
-        let _guard = grokptah_agent_bridge::home_override_serial();
+    fn test_host(dir: &std::path::Path) -> grokptah_agent_bridge::AgentHostHandle {
         grokptah_agent_bridge::set_grokptah_home_override(Some(dir.join(".grokptah")));
-        let host = grokptah_agent_bridge::AgentHost::create(Default::default());
-        grokptah_agent_bridge::set_grokptah_home_override(None);
-        host
+        grokptah_agent_bridge::AgentHost::create(Default::default())
     }
 
-    fn test_desktop() -> (tempfile::TempDir, DesktopComputerUse) {
+    fn test_desktop() -> (tempfile::TempDir, DesktopComputerUse, Uuid) {
         let dir = tempfile::tempdir().unwrap();
-        // Tests deliberately open an isolated store in the fixture directory;
-        // production `new()` must borrow the host's shared handle instead.
+        let _guard = grokptah_agent_bridge::home_override_serial();
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
         let simulator = Arc::new(ComputerUseService::new(
             Arc::new(SimulatorBackend::new()),
             store.clone(),
         ));
-        // Build the host before `dir` moves into the returned tuple.
         let host = test_host(dir.path());
+        host.start().unwrap();
+        let session = host.session_new().unwrap();
+        grokptah_agent_bridge::set_grokptah_home_override(None);
         (
             dir,
             DesktopComputerUse {
@@ -1084,11 +1150,17 @@ mod tests {
                 simulator_operation: Mutex::new(()),
                 pending_approval: std::sync::Mutex::new(None),
             },
+            session.id,
         )
     }
 
-    fn native_test_desktop() -> (tempfile::TempDir, DesktopComputerUse, Arc<AtomicUsize>) {
-        let (dir, mut desktop) = test_desktop();
+    fn native_test_desktop() -> (
+        tempfile::TempDir,
+        DesktopComputerUse,
+        Arc<AtomicUsize>,
+        Uuid,
+    ) {
+        let (dir, mut desktop, owner) = test_desktop();
         let actions = Arc::new(AtomicUsize::new(0));
         let target = ComputerTarget {
             app_id: NATIVE_TEST_APP_ID.into(),
@@ -1115,20 +1187,36 @@ mod tests {
             actions: actions.clone(),
             available: std::sync::Mutex::new(true),
         }));
-        (dir, desktop, actions)
+        (dir, desktop, actions, owner)
     }
 
     #[tokio::test]
     async fn approval_is_exact_one_use_and_requires_reobservation() {
-        let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let (_dir, desktop, owner) = test_desktop();
         let target = SimulatorBackend::demo_target();
         let started = desktop
             .start_simulator(owner, &target.app_id)
             .await
             .unwrap();
-        let run = started.run.unwrap();
-        let observation = run.current_observation.as_ref().unwrap();
+        let snapshot_json = serde_json::to_value(&started).unwrap();
+        assert!(snapshot_json.get("run").is_none());
+        assert!(snapshot_json.get("local").is_some());
+        let local_wire = snapshot_json["local"].to_string();
+        for forbidden in [
+            "\"workspace\"",
+            "initiatingPrincipal",
+            "capabilityProof",
+            "assetId",
+            "lastOutcome",
+            "grantId",
+        ] {
+            assert!(
+                !local_wire.contains(forbidden),
+                "{forbidden} must not appear in the local cockpit snapshot"
+            );
+        }
+        let run = started.local.unwrap();
+        let observation = run.observation.as_ref().unwrap();
         let staged = desktop
             .stage_simulator_action(
                 owner,
@@ -1147,10 +1235,10 @@ mod tests {
             .approve_simulator_action(owner, &approval.approval_id, "approve-once")
             .await
             .unwrap();
-        let acted_run = acted.run.unwrap();
+        let acted_run = acted.local.unwrap();
         assert_eq!(acted_run.action_count, 1);
         assert_eq!(acted_run.state, ComputerRunState::Paused);
-        assert!(acted_run.current_observation.is_none());
+        assert!(acted_run.observation.is_none());
         assert!(desktop
             .approve_simulator_action(owner, &approval.approval_id, "approve-once")
             .await
@@ -1159,7 +1247,7 @@ mod tests {
             desktop
                 .cockpit_snapshot(owner)
                 .unwrap()
-                .run
+                .local
                 .unwrap()
                 .action_count,
             1
@@ -1169,20 +1257,19 @@ mod tests {
             .refresh_simulator(owner, &acted_run.run_id, acted_run.version)
             .await
             .unwrap();
-        assert!(refreshed.run.unwrap().current_observation.is_some());
+        assert!(refreshed.local.unwrap().observation.is_some());
     }
 
     #[tokio::test]
     async fn model_proposal_is_revalidated_and_staged_without_dispatch() {
-        let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let (_dir, desktop, owner) = test_desktop();
         let target = SimulatorBackend::demo_target();
         let started = desktop
             .start_simulator(owner, &target.app_id)
             .await
             .unwrap();
-        let run = started.run.unwrap();
-        let observation = run.current_observation.as_ref().unwrap();
+        let run = started.local.unwrap();
+        let observation = run.observation.as_ref().unwrap();
         let result = desktop
             .apply_model_proposal(
                 owner,
@@ -1202,7 +1289,7 @@ mod tests {
             .unwrap();
         assert!(!result.completed);
         assert!(result.snapshot.pending_approval.is_some());
-        assert_eq!(result.snapshot.run.unwrap().action_count, 0);
+        assert_eq!(result.snapshot.local.unwrap().action_count, 0);
 
         let stale = desktop
             .apply_model_proposal(
@@ -1222,15 +1309,14 @@ mod tests {
 
     #[tokio::test]
     async fn model_completion_only_revokes_authority_on_exact_current_frame() {
-        let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let (_dir, desktop, owner) = test_desktop();
         let target = SimulatorBackend::demo_target();
         let started = desktop
             .start_simulator(owner, &target.app_id)
             .await
             .unwrap();
-        let run = started.run.unwrap();
-        let observation = run.current_observation.as_ref().unwrap();
+        let run = started.local.unwrap();
+        let observation = run.observation.as_ref().unwrap();
         let result = desktop
             .apply_model_proposal(
                 owner,
@@ -1245,7 +1331,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.completed);
-        let completed = result.snapshot.run.unwrap();
+        let completed = result.snapshot.local.unwrap();
         assert_eq!(completed.state, ComputerRunState::Completed);
         assert!(completed
             .grant
@@ -1256,16 +1342,15 @@ mod tests {
 
     #[tokio::test]
     async fn approval_cannot_cross_sessions_or_survive_takeover() {
-        let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let (_dir, desktop, owner) = test_desktop();
         let other = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
         let started = desktop
             .start_simulator(owner, &target.app_id)
             .await
             .unwrap();
-        let run = started.run.unwrap();
-        let observation = run.current_observation.as_ref().unwrap();
+        let run = started.local.unwrap();
+        let observation = run.observation.as_ref().unwrap();
         let staged = desktop
             .stage_simulator_action(
                 owner,
@@ -1306,7 +1391,7 @@ mod tests {
             .take_over_simulator(owner, &run.run_id, run.version)
             .await
             .unwrap();
-        assert_eq!(taken_over.run.unwrap().state, ComputerRunState::Paused);
+        assert_eq!(taken_over.local.unwrap().state, ComputerRunState::Paused);
         assert!(desktop
             .approve_simulator_action(owner, &approval.approval_id, "after-takeover")
             .await
@@ -1315,16 +1400,15 @@ mod tests {
 
     #[tokio::test]
     async fn native_run_uses_the_same_exact_one_use_approval_path() {
-        let (_dir, desktop, actions) = native_test_desktop();
-        let owner = Uuid::new_v4();
+        let (_dir, desktop, actions, owner) = native_test_desktop();
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let started = desktop
             .start_native(owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
             .await
             .unwrap();
         assert_eq!(started.backend.backend_id, "native_test_backend");
-        let run = started.run.unwrap();
-        let observation = run.current_observation.as_ref().unwrap();
+        let run = started.local.unwrap();
+        let observation = run.observation.as_ref().unwrap();
         let staged = desktop
             .stage_simulator_action(
                 owner,
@@ -1348,7 +1432,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(actions.load(Ordering::SeqCst), 1);
-        assert_eq!(acted.run.unwrap().state, ComputerRunState::Paused);
+        assert_eq!(acted.local.unwrap().state, ComputerRunState::Paused);
         assert!(desktop
             .approve_simulator_action(owner, &approval.approval_id, "native-approve-once")
             .await
@@ -1358,28 +1442,23 @@ mod tests {
 
     #[tokio::test]
     async fn starting_a_native_run_prunes_terminal_native_backends() {
-        let (_dir, desktop, _actions) = native_test_desktop();
-        let first_owner = Uuid::new_v4();
+        let (_dir, desktop, _actions, owner) = native_test_desktop();
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let first = desktop
-            .start_native(first_owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
+            .start_native(owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
             .await
             .unwrap()
-            .run
+            .local
             .unwrap();
-        desktop
-            .stop_simulator(first_owner, &first.run_id)
-            .await
-            .unwrap();
+        desktop.stop_simulator(owner, &first.run_id).await.unwrap();
         assert_eq!(desktop.native_services.lock().unwrap().len(), 1);
 
-        let second_owner = Uuid::new_v4();
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let second = desktop
-            .start_native(second_owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
+            .start_native(owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
             .await
             .unwrap()
-            .run
+            .local
             .unwrap();
         let services = desktop.native_services.lock().unwrap();
         assert_eq!(services.len(), 1);

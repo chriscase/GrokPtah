@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComputerCockpit } from "./ComputerCockpit";
 import type {
   ComputerCockpitSnapshot,
-  ComputerRun,
+  ComputerLocalApproval,
   ComputerRunProjection,
 } from "../lib/protocol";
 
@@ -56,48 +56,36 @@ const backend = {
   textEntry: true,
   keyChords: false,
   pointerFallback: false,
+  foregroundConflictCapacity: 1,
 };
 
-function run(state = "ready"): ComputerRun {
+function localView(
+  state = "ready",
+  extras: Partial<ComputerLocalApproval> = {},
+): ComputerLocalApproval {
   return {
     runId: "run-1",
-    ownerSessionId: "session-1",
+    state,
+    version: state === "paused" ? 5 : 3,
+    actionCount: state === "paused" ? 1 : 0,
+    limits: { maxActions: 8 },
+    controlDisposition: extras.controlDisposition ?? (state === "paused" ? "paused" : "agent_owned"),
     target: {
       appId: "com.grokptah.computer-use-simulator",
-      windowId: "demo-form",
-      generation: 1,
       displayName: "Computer Use Simulator",
-      sensitivity: "none",
     },
-    state,
-    controlDisposition: state === "paused" ? "paused" : "agent_owned",
-    controlEpoch: state === "paused" ? 1 : 0,
-    version: state === "paused" ? 5 : 3,
-    createdAt: "2026-08-13T10:00:00Z",
-    updatedAt: "2026-08-13T10:00:01Z",
-    limits: { maxActions: 8, maxDurationSecs: 600 },
-    actionCount: state === "paused" ? 1 : 0,
-    currentObservation:
+    observation:
       state === "ready"
         ? {
             observationId: "observation-1",
             sequence: 1,
             capturedAt: "2026-08-13T10:00:01Z",
-            target: {
-              appId: "com.grokptah.computer-use-simulator",
-              windowId: "demo-form",
-              generation: 1,
-              displayName: "Computer Use Simulator",
-              sensitivity: "none",
-            },
             elements: [
               {
                 elementId: "observation-1-name",
                 role: "text_field",
                 label: "Name",
                 enabled: true,
-                focused: false,
-                sensitivity: "none",
                 actions: ["set_value"],
               },
               {
@@ -105,8 +93,6 @@ function run(state = "ready"): ComputerRun {
                 role: "button",
                 label: "Submit",
                 enabled: false,
-                focused: false,
-                sensitivity: "none",
                 actions: ["invoke"],
               },
               {
@@ -114,18 +100,13 @@ function run(state = "ready"): ComputerRun {
                 role: "status",
                 label: "Not submitted",
                 enabled: true,
-                focused: false,
-                sensitivity: "none",
                 actions: [],
               },
             ],
-            elementsTruncated: false,
           }
         : null,
     grant: {
-      grantId: "grant-1",
       expiresAt: "2026-08-13T10:02:00Z",
-      usesRemaining: state === "paused" ? 0 : 1,
       revokedAt: state === "paused" ? "2026-08-13T10:00:02Z" : null,
       actionClasses: ["semantic", "text_entry"],
     },
@@ -137,6 +118,8 @@ function run(state = "ready"): ComputerRun {
         disposition: "accepted",
       },
     ],
+    lastError: null,
+    ...extras,
   };
 }
 
@@ -147,76 +130,85 @@ const TERMINAL_STATES = ["completed", "failed", "cancelled", "interrupted", "lim
  * authoritative shape the host actually sends, rather than a snapshot missing
  * the projection the cockpit renders its status from.
  */
-function projectionFor(runValue: ComputerRun): ComputerRunProjection {
+function projectionFor(local: ComputerLocalApproval): ComputerRunProjection {
   return {
-    runId: runValue.runId,
-    ownerSessionId: runValue.ownerSessionId,
+    runId: local.runId,
+    ownerSessionId: "session-1",
     parentRunId: null,
     campaignId: null,
-    target: runValue.target,
-    state: runValue.state,
-    controlDisposition: runValue.controlDisposition ?? "agent_owned",
-    controlEpoch: runValue.controlEpoch ?? 0,
-    version: runValue.version,
-    agentActive: ["observing", "acting"].includes(runValue.state),
-    terminal: TERMINAL_STATES.includes(runValue.state),
-    createdAt: runValue.createdAt,
-    updatedAt: runValue.updatedAt,
-    startedAt: runValue.startedAt ?? null,
-    endedAt: runValue.endedAt ?? null,
+    target: {
+      appId: local.target.appId,
+      windowId: "demo-form",
+      generation: 1,
+      displayName: local.target.displayName,
+      sensitivity: "none",
+    },
+    state: local.state,
+    controlDisposition: local.controlDisposition ?? "agent_owned",
+    controlEpoch:
+      local.controlDisposition === "operator_takeover"
+        ? 2
+        : local.controlDisposition === "paused"
+          ? 1
+          : 0,
+    version: local.version,
+    agentActive: ["observing", "acting"].includes(local.state),
+    terminal: TERMINAL_STATES.includes(local.state),
+    createdAt: "2026-08-13T10:00:00Z",
+    updatedAt: "2026-08-13T10:00:01Z",
+    startedAt: "2026-08-13T10:00:01Z",
+    endedAt: null,
     progress: {
-      actionCount: runValue.actionCount,
-      maxActions: runValue.limits.maxActions,
+      actionCount: local.actionCount,
+      maxActions: local.limits.maxActions,
       evidenceBytes: 0,
       maxEvidenceBytes: 8 * 1024 * 1024,
       elapsedMillis: 1000,
-      maxDurationSecs: runValue.limits.maxDurationSecs,
+      maxDurationSecs: 600,
       durationExceeded: false,
     },
-    grant: runValue.grant
+    grant: local.grant
       ? {
-          grantId: runValue.grant.grantId,
-          actionClasses: runValue.grant.actionClasses,
+          grantId: "grant-1",
+          actionClasses: local.grant.actionClasses,
           issuedBy: "local_user",
-          issuedAt: runValue.createdAt,
-          expiresAt: runValue.grant.expiresAt,
-          usesRemaining: runValue.grant.usesRemaining ?? null,
-          revoked: Boolean(runValue.grant.revokedAt),
+          issuedAt: "2026-08-13T10:00:00Z",
+          expiresAt: local.grant.expiresAt,
+          usesRemaining: local.grant.revokedAt ? 0 : 1,
+          revoked: Boolean(local.grant.revokedAt),
           expired: false,
         }
       : null,
-    observation: runValue.currentObservation
+    observation: local.observation
       ? {
-          observationId: runValue.currentObservation.observationId,
-          sequence: runValue.currentObservation.sequence,
-          capturedAt: runValue.currentObservation.capturedAt,
-          elementCount: runValue.currentObservation.elements.length,
-          elementsTruncated: runValue.currentObservation.elementsTruncated,
+          observationId: local.observation.observationId,
+          sequence: local.observation.sequence,
+          capturedAt: local.observation.capturedAt,
+          elementCount: local.observation.elements.length,
+          elementsTruncated: false,
           sensitivity: "none",
           hasScreenshot: false,
           screenshotRedacted: null,
           stale: false,
         }
       : null,
-    lastOutcome: runValue.lastOutcome
-      ? { expectedPostconditionMet: runValue.lastOutcome.expectedPostconditionMet ?? null }
-      : null,
-    lastError: runValue.lastError ? { code: runValue.lastError.code } : null,
-    eventRange: runValue.audit.length
+    lastOutcome: null,
+    lastError: local.lastError ? { code: local.lastError.code } : null,
+    eventRange: local.audit.length
       ? {
-          startSeq: runValue.audit[0].sequence,
-          endSeq: runValue.audit[runValue.audit.length - 1].sequence,
+          startSeq: local.audit[0].sequence,
+          endSeq: local.audit[local.audit.length - 1].sequence,
         }
       : null,
   };
 }
 
-function snapshot(runValue: ComputerRun | null = null): ComputerCockpitSnapshot {
+function snapshot(local: ComputerLocalApproval | null = null): ComputerCockpitSnapshot {
   return {
     backend,
     origin: "desktop",
-    projection: runValue ? projectionFor(runValue) : null,
-    run: runValue,
+    projection: local ? projectionFor(local) : null,
+    local,
     pendingApproval: null,
   };
 }
@@ -278,7 +270,7 @@ describe("ComputerCockpit", () => {
   });
 
   it("requires exact scope review before a run starts", async () => {
-    mocks.start.mockResolvedValue(snapshot(run()));
+    mocks.start.mockResolvedValue(snapshot(localView()));
     render(<ComputerCockpit {...props} />);
 
     const start = await screen.findByRole("button", { name: "Start Computer Run" });
@@ -317,7 +309,7 @@ describe("ComputerCockpit", () => {
         minimized: false,
       },
     ]);
-    mocks.startNative.mockResolvedValue(snapshot(run()));
+    mocks.startNative.mockResolvedValue(snapshot(localView()));
     render(<ComputerCockpit {...props} />);
 
     fireEvent.click(await screen.findByRole("button", { name: "macOS app" }));
@@ -381,7 +373,7 @@ describe("ComputerCockpit", () => {
   });
 
   it("shows an exact one-use approval and requires reauthorization after action", async () => {
-    const ready = snapshot(run());
+    const ready = snapshot(localView());
     const pending = {
       ...ready,
       pendingApproval: {
@@ -403,7 +395,7 @@ describe("ComputerCockpit", () => {
     };
     mocks.snapshot.mockResolvedValue(ready);
     mocks.stage.mockResolvedValue(pending);
-    mocks.approve.mockResolvedValue(snapshot(run("paused")));
+    mocks.approve.mockResolvedValue(snapshot(localView("paused")));
     render(<ComputerCockpit {...props} />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Stage text entry" }));
@@ -418,7 +410,7 @@ describe("ComputerCockpit", () => {
   });
 
   it("shows measured model eligibility without expanding local approval", async () => {
-    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
     render(
       <ComputerCockpit
         {...props}
@@ -434,9 +426,8 @@ describe("ComputerCockpit", () => {
   it("does not offer reauthorization after operator takeover", async () => {
     mocks.snapshot.mockResolvedValue(
       snapshot({
-        ...run("paused"),
+        ...localView("paused"),
         controlDisposition: "operator_takeover",
-        controlEpoch: 2,
       }),
     );
     render(<ComputerCockpit {...props} />);
@@ -447,7 +438,7 @@ describe("ComputerCockpit", () => {
   });
 
   it("qualifies an unknown model before offering agent proposals", async () => {
-    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
     mocks.qualifyAgent.mockResolvedValue({
       model: "grok-4.5",
       tier: "semantic_act",
@@ -465,7 +456,7 @@ describe("ComputerCockpit", () => {
   });
 
   it("stages one model proposal for the existing local approval", async () => {
-    const active = snapshot(run());
+    const active = snapshot(localView());
     mocks.snapshot.mockResolvedValue(active);
     mocks.proposeAgent.mockResolvedValue({
       snapshot: {
@@ -508,9 +499,9 @@ describe("ComputerCockpit", () => {
   });
 
   it("keeps Stop available while model inference is pending", async () => {
-    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
     mocks.proposeAgent.mockReturnValue(new Promise(() => {}));
-    mocks.stop.mockResolvedValue(snapshot(run("cancelled")));
+    mocks.stop.mockResolvedValue(snapshot(localView("cancelled")));
     render(<ComputerCockpit {...props} computerUseTier="semantic_act" computerCapabilitySource="measured" />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Propose next action" }));
@@ -536,7 +527,7 @@ describe("ComputerCockpit", () => {
       <ComputerCockpit {...props} sessionId="session-2" sessionTitle="Other build" />,
     );
     await screen.findByText("Scope review");
-    resolveOld(snapshot(run()));
+    resolveOld(snapshot(localView()));
 
     await waitFor(() => {
       expect(screen.queryByText("Frame 1")).toBeNull();
@@ -545,7 +536,7 @@ describe("ComputerCockpit", () => {
   });
 
   it("does not carry a model objective into another session", async () => {
-    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
     const view = render(
       <ComputerCockpit
         {...props}
@@ -574,7 +565,7 @@ describe("ComputerCockpit", () => {
   });
 
   it("keeps steering non-cancelling and session-bound", async () => {
-    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
     render(<ComputerCockpit {...props} sessionBusy />);
     fireEvent.change(await screen.findByPlaceholderText("Guide the agent at its next safe step"), {
       target: { value: "Verify the postcondition before continuing" },
@@ -596,7 +587,7 @@ describe("ComputerCockpit", () => {
           resolveSteer = resolve;
         }),
     );
-    mocks.snapshot.mockResolvedValueOnce(snapshot(run())).mockResolvedValueOnce(snapshot());
+    mocks.snapshot.mockResolvedValueOnce(snapshot(localView())).mockResolvedValueOnce(snapshot());
     const view = render(<ComputerCockpit {...props} sessionBusy />);
 
     fireEvent.change(await screen.findByPlaceholderText("Guide the agent at its next safe step"), {

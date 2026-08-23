@@ -1,20 +1,25 @@
+use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::types::{
     validate_id, validate_workspace, ComputerControlDisposition, ComputerError, ComputerErrorCode,
-    ComputerResult, ComputerRun, ComputerRunState,
+    ComputerPrincipal, ComputerResult, ComputerRun, ComputerRunState, ComputerSurfaceBinding,
+    PhysicalInputDomain, SurfaceFreshnessFence, COMPUTER_RECEIPT_SCHEMA_VERSION,
+    COMPUTER_RUN_SCHEMA_VERSION,
 };
 
-const MAX_RECEIPTS: usize = 2_048;
+pub(crate) const MAX_RECEIPTS: usize = 2_048;
 const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const TERMINAL_RUN_AGE: Duration = Duration::days(30);
 const TERMINAL_RECEIPT_AGE: Duration = Duration::days(7);
@@ -28,6 +33,38 @@ struct ComputerStoreInner {
     root: PathBuf,
     _store_lock: fs::File,
     lock: Mutex<()>,
+    surfaces: Mutex<SurfaceRegistry>,
+}
+
+#[derive(Default)]
+struct SurfaceRegistry {
+    by_domain: HashMap<String, Arc<LiveSurfaceState>>,
+    by_surface_id: HashMap<String, Arc<LiveSurfaceState>>,
+}
+
+struct LiveSurfaceState {
+    binding: ComputerSurfaceBinding,
+    input_domain_id: String,
+    measurement_id: String,
+    tick: AtomicU64,
+    frame_epoch: AtomicU64,
+}
+
+/// Host-interned surface for one attested physical input domain.
+#[derive(Debug, Clone)]
+pub(crate) struct InternedSurface {
+    pub binding: ComputerSurfaceBinding,
+    pub input_domain_id: String,
+    pub measurement_id: String,
+}
+
+impl InternedSurface {
+    pub(crate) fn stamp_proof(
+        &self,
+        proof: crate::computer_use::ComputerCapabilityProof,
+    ) -> ComputerResult<crate::computer_use::ComputerCapabilityProof> {
+        proof.bind_to_interned_surface(&self.binding, &self.input_domain_id, &self.measurement_id)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +87,89 @@ struct MutationReceipt {
     updated_at: DateTime<Utc>,
     result: Option<serde_json::Value>,
     error: Option<ComputerError>,
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    caller_kind: Option<String>,
+    #[serde(default)]
+    caller_owner_session_id: Option<Uuid>,
+    #[serde(default)]
+    caller_agent_id: Option<String>,
+    #[serde(default)]
+    caller_agent_spec_revision: Option<u64>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    surface_id: Option<String>,
+    #[serde(default)]
+    incarnation: Option<String>,
+    #[serde(default)]
+    grant_id: Option<String>,
+    #[serde(default)]
+    frame_epoch: Option<u64>,
+    #[serde(default, alias = "authorityEpoch")]
+    pre_authority_epoch: Option<u64>,
+    #[serde(default, alias = "controlEpoch")]
+    pre_control_epoch: Option<u64>,
+    #[serde(default)]
+    post_authority_epoch: Option<u64>,
+    #[serde(default)]
+    post_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MutationStamp {
+    pub principal: ComputerPrincipal,
+    pub run_id: Option<String>,
+    pub surface_id: Option<String>,
+    pub incarnation: Option<String>,
+    pub grant_id: Option<String>,
+    pub frame_epoch: Option<u64>,
+    pub pre_authority_epoch: u64,
+    pub pre_control_epoch: u64,
+}
+
+impl MutationStamp {
+    pub(crate) fn from_caller(principal: ComputerPrincipal, run: Option<&ComputerRun>) -> Self {
+        Self {
+            principal,
+            run_id: run.map(|run| run.run_id.clone()),
+            surface_id: run.and_then(|run| {
+                run.surface
+                    .is_issued()
+                    .then(|| run.surface.surface_id.clone())
+            }),
+            incarnation: run.and_then(|run| {
+                run.surface
+                    .is_issued()
+                    .then(|| run.surface.incarnation.clone())
+            }),
+            grant_id: run.and_then(|run| run.grant.as_ref().map(|grant| grant.grant_id.clone())),
+            frame_epoch: run.and_then(|run| {
+                run.current_observation
+                    .as_ref()
+                    .map(|observation| observation.authority.frame_epoch)
+            }),
+            pre_authority_epoch: run.map(|run| run.authority_epoch).unwrap_or(0),
+            pre_control_epoch: run.map(|run| run.control_epoch).unwrap_or(0),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        self.principal.public_kind()
+    }
+
+    fn owner_session_id(&self) -> Option<Uuid> {
+        self.principal.session_id()
+    }
+
+    fn agent_id(&self) -> Option<String> {
+        self.principal.agent_id().map(str::to_string)
+    }
+
+    fn agent_spec_revision(&self) -> Option<u64> {
+        self.principal.agent_spec_revision()
+    }
 }
 
 #[derive(Debug)]
@@ -88,6 +208,7 @@ impl ComputerStore {
                 root,
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
+                surfaces: Mutex::new(SurfaceRegistry::default()),
             }),
         };
         store.recover_interrupted()?;
@@ -103,6 +224,7 @@ impl ComputerStore {
 
     pub(crate) fn save_run(&self, run: &ComputerRun) -> ComputerResult<()> {
         let _guard = self.inner.lock.lock();
+        validate_run_record(run)?;
         let path = self.run_path(&run.run_id)?;
         atomic_write_json(&path, run).map_err(internal_error)
     }
@@ -125,6 +247,7 @@ impl ComputerStore {
             return Ok(None);
         };
         update(&mut run)?;
+        validate_run_record(&run)?;
         atomic_write_json(&self.run_path(run_id)?, &run).map_err(internal_error)?;
         Ok(Some(run))
     }
@@ -145,40 +268,159 @@ impl ComputerStore {
         Ok(())
     }
 
+    pub(crate) fn intern_physical_domain(
+        &self,
+        domain: &PhysicalInputDomain,
+    ) -> ComputerResult<InternedSurface> {
+        let mut registry = self.inner.surfaces.lock();
+        if let Some(existing) = registry.by_domain.get(domain.as_key()) {
+            return Ok(InternedSurface {
+                binding: existing.binding.clone(),
+                input_domain_id: existing.input_domain_id.clone(),
+                measurement_id: existing.measurement_id.clone(),
+            });
+        }
+        let binding = ComputerSurfaceBinding::issue();
+        let state = Arc::new(LiveSurfaceState {
+            binding: binding.clone(),
+            input_domain_id: Uuid::new_v4().to_string(),
+            measurement_id: Uuid::new_v4().to_string(),
+            tick: AtomicU64::new(0),
+            frame_epoch: AtomicU64::new(0),
+        });
+        registry
+            .by_domain
+            .insert(domain.as_key().to_string(), state.clone());
+        registry
+            .by_surface_id
+            .insert(binding.surface_id.clone(), state.clone());
+        Ok(InternedSurface {
+            binding,
+            input_domain_id: state.input_domain_id.clone(),
+            measurement_id: state.measurement_id.clone(),
+        })
+    }
+
+    pub(crate) fn live_freshness(
+        &self,
+        binding: &ComputerSurfaceBinding,
+    ) -> ComputerResult<SurfaceFreshnessFence> {
+        binding.validate()?;
+        let registry = self.inner.surfaces.lock();
+        let live = registry
+            .by_surface_id
+            .get(&binding.surface_id)
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::StaleObservation,
+                    "surface was not interned by the host registry",
+                )
+            })?;
+        if live.binding.incarnation != binding.incarnation {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "surface incarnation was invalidated by restart",
+            ));
+        }
+        Ok(SurfaceFreshnessFence {
+            surface_id: binding.surface_id.clone(),
+            incarnation: binding.incarnation.clone(),
+            tick: live.tick.load(Ordering::SeqCst),
+            wall_clock: Some(Utc::now()),
+        })
+    }
+
+    pub(crate) fn mint_observation_clock(
+        &self,
+        binding: &ComputerSurfaceBinding,
+    ) -> ComputerResult<(SurfaceFreshnessFence, u64)> {
+        binding.validate()?;
+        let registry = self.inner.surfaces.lock();
+        let live = registry
+            .by_surface_id
+            .get(&binding.surface_id)
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::StaleObservation,
+                    "surface was not interned by the host registry",
+                )
+            })?;
+        if live.binding.incarnation != binding.incarnation {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "surface incarnation was invalidated by restart",
+            ));
+        }
+        let previous_tick = live.tick.load(Ordering::SeqCst);
+        let previous_frame = live.frame_epoch.load(Ordering::SeqCst);
+        let tick = live.tick.fetch_add(1, Ordering::SeqCst) + 1;
+        let frame_epoch = live.frame_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        if tick <= previous_tick || frame_epoch <= previous_frame {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Internal,
+                "host surface registry clocks are not monotonic",
+            ));
+        }
+        Ok((
+            SurfaceFreshnessFence {
+                surface_id: binding.surface_id.clone(),
+                incarnation: binding.incarnation.clone(),
+                tick,
+                wall_clock: Some(Utc::now()),
+            },
+            frame_epoch,
+        ))
+    }
+
+    pub(crate) fn replay_mutation(
+        &self,
+        request_id: &str,
+        operation: &str,
+        payload_hash: &str,
+        stamp: &MutationStamp,
+    ) -> ComputerResult<Option<ComputerResult<serde_json::Value>>> {
+        let _guard = self.inner.lock.lock();
+        let path = self.receipt_path(request_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(self.interpret_existing_receipt(
+            &self.read_receipt_path(&path)?,
+            request_id,
+            operation,
+            payload_hash,
+            stamp,
+        )?))
+    }
+
     pub(crate) fn claim_mutation(
         &self,
         request_id: &str,
         operation: &str,
         payload_hash: &str,
+        stamp: &MutationStamp,
     ) -> ComputerResult<MutationClaim> {
         let _guard = self.inner.lock.lock();
         let path = self.receipt_path(request_id)?;
         if path.is_file() {
-            let receipt = self.read_receipt_path(&path)?;
-            if receipt.request_id != request_id
-                || receipt.operation != operation
-                || receipt.payload_hash != payload_hash
-            {
-                return Err(ComputerError::new(
-                    ComputerErrorCode::Conflict,
-                    "request id was reused with a different computer-use mutation",
-                ));
-            }
-            return Ok(match receipt.state {
-                ReceiptState::Claimed => MutationClaim::Pending,
-                ReceiptState::Uncertain => MutationClaim::Uncertain,
-                ReceiptState::Succeeded => {
-                    MutationClaim::Replay(Ok(receipt.result.unwrap_or(serde_json::Value::Null)))
-                }
-                ReceiptState::Failed => {
-                    MutationClaim::Replay(Err(receipt.error.unwrap_or_else(|| {
-                        ComputerError::new(
-                            ComputerErrorCode::Internal,
-                            "stored mutation failed without an error",
-                        )
-                    })))
-                }
-            });
+            return Ok(
+                match self.interpret_existing_receipt(
+                    &self.read_receipt_path(&path)?,
+                    request_id,
+                    operation,
+                    payload_hash,
+                    stamp,
+                )? {
+                    Ok(value) => MutationClaim::Replay(Ok(value)),
+                    Err(error) if error.code == ComputerErrorCode::Pending => {
+                        MutationClaim::Pending
+                    }
+                    Err(error) if error.code == ComputerErrorCode::UncertainOutcome => {
+                        MutationClaim::Uncertain
+                    }
+                    Err(error) => MutationClaim::Replay(Err(error)),
+                },
+            );
         }
         if count_json_files(&self.inner.root.join("receipts")).map_err(internal_error)?
             >= MAX_RECEIPTS
@@ -198,9 +440,71 @@ impl ComputerStore {
             updated_at: now,
             result: None,
             error: None,
+            schema_version: COMPUTER_RECEIPT_SCHEMA_VERSION,
+            caller_kind: Some(stamp.kind().to_string()),
+            caller_owner_session_id: stamp.owner_session_id(),
+            caller_agent_id: stamp.agent_id(),
+            caller_agent_spec_revision: stamp.agent_spec_revision(),
+            run_id: stamp.run_id.clone(),
+            surface_id: stamp.surface_id.clone(),
+            incarnation: stamp.incarnation.clone(),
+            grant_id: stamp.grant_id.clone(),
+            frame_epoch: stamp.frame_epoch,
+            pre_authority_epoch: Some(stamp.pre_authority_epoch),
+            pre_control_epoch: Some(stamp.pre_control_epoch),
+            post_authority_epoch: None,
+            post_control_epoch: None,
         };
         write_json_exclusive(&path, &receipt).map_err(internal_error)?;
         Ok(MutationClaim::Perform)
+    }
+
+    fn interpret_existing_receipt(
+        &self,
+        receipt: &MutationReceipt,
+        request_id: &str,
+        operation: &str,
+        payload_hash: &str,
+        stamp: &MutationStamp,
+    ) -> ComputerResult<ComputerResult<serde_json::Value>> {
+        if !receipt_is_stamped(receipt) {
+            return Ok(Err(ComputerError::new(
+                ComputerErrorCode::UncertainOutcome,
+                "the earlier computer-use mutation has an uncertain outcome and will not be retried",
+            )));
+        }
+        if receipt.request_id != request_id
+            || receipt.operation != operation
+            || receipt.payload_hash != payload_hash
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "request id was reused with a different computer-use mutation",
+            ));
+        }
+        if !receipt_matches_stamp(receipt, stamp) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "idempotency receipt is not bound to this caller and run authority",
+            ));
+        }
+        Ok(match receipt.state {
+            ReceiptState::Claimed => Err(ComputerError::new(
+                ComputerErrorCode::Pending,
+                "an identical computer-use mutation is in progress",
+            )),
+            ReceiptState::Uncertain => Err(ComputerError::new(
+                ComputerErrorCode::UncertainOutcome,
+                "the earlier computer-use mutation has an uncertain outcome and will not be retried",
+            )),
+            ReceiptState::Succeeded => Ok(receipt.result.clone().unwrap_or(serde_json::Value::Null)),
+            ReceiptState::Failed => Err(receipt.error.clone().unwrap_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Internal,
+                    "stored mutation failed without an error",
+                )
+            })),
+        })
     }
 
     pub(crate) fn complete_mutation(
@@ -222,10 +526,34 @@ impl ComputerStore {
             Ok(value) => {
                 receipt.state = ReceiptState::Succeeded;
                 receipt.result = Some(value.clone());
+                if let Ok(run) = serde_json::from_value::<ComputerRun>(value.clone()) {
+                    receipt.run_id.get_or_insert(run.run_id.clone());
+                    if run.surface.is_issued() {
+                        receipt
+                            .surface_id
+                            .get_or_insert(run.surface.surface_id.clone());
+                        receipt
+                            .incarnation
+                            .get_or_insert(run.surface.incarnation.clone());
+                    }
+                    receipt.post_authority_epoch = Some(run.authority_epoch);
+                    receipt.post_control_epoch = Some(run.control_epoch);
+                } else if let Some(run_id) = receipt.run_id.clone() {
+                    if let Ok(Some(run)) = self.load_run_unlocked(&run_id) {
+                        receipt.post_authority_epoch = Some(run.authority_epoch);
+                        receipt.post_control_epoch = Some(run.control_epoch);
+                    }
+                }
             }
             Err(error) => {
                 receipt.state = ReceiptState::Failed;
                 receipt.error = Some(error.clone());
+                if let Some(run_id) = receipt.run_id.clone() {
+                    if let Ok(Some(run)) = self.load_run_unlocked(&run_id) {
+                        receipt.post_authority_epoch = Some(run.authority_epoch);
+                        receipt.post_control_epoch = Some(run.control_epoch);
+                    }
+                }
             }
         }
         atomic_write_json(&path, &receipt).map_err(internal_error)
@@ -236,7 +564,7 @@ impl ComputerStore {
         Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
     }
 
-    fn receipt_path(&self, request_id: &str) -> ComputerResult<PathBuf> {
+    pub(crate) fn receipt_path(&self, request_id: &str) -> ComputerResult<PathBuf> {
         let safe = safe_file_id(request_id)?;
         Ok(self
             .inner
@@ -276,6 +604,20 @@ impl ComputerStore {
             run.ended_at = Some(run.updated_at);
             run.grant = None;
             run.current_observation = None;
+            if run.surface.is_issued() {
+                if let Ok(rotated) = run.surface.rotate_incarnation() {
+                    run.surface = rotated;
+                }
+            }
+            run.freshness_tick = 0;
+            run.bump_authority_epoch();
+            run.capability_proof = match &run.capability_proof {
+                crate::computer_use::ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain { .. }
+                | crate::computer_use::ComputerCapabilityProof::MeasuredBackgroundSafeSemantic { .. } => {
+                    crate::computer_use::ComputerCapabilityProof::Unproven
+                }
+                other => other.clone(),
+            };
             // A prior action summary can carry backend-chosen text. Clearing it
             // is the same fail-closed move as dropping the observation: restart
             // must not keep a leaky last_outcome on the durable record.
@@ -294,6 +636,7 @@ impl ComputerStore {
                 None,
                 Some(ComputerErrorCode::Interrupted),
             );
+            validate_run_record(&run)?;
             atomic_write_json(&path, &run).map_err(internal_error)?;
         }
         Ok(())
@@ -353,7 +696,10 @@ impl ComputerStore {
     }
 
     fn read_run_path(&self, path: &Path) -> ComputerResult<ComputerRun> {
-        let run: ComputerRun = read_json(path).map_err(internal_error)?;
+        let mut run: ComputerRun = read_json(path).map_err(internal_error)?;
+        if migrate_run_record(&mut run)? {
+            atomic_write_json(path, &run).map_err(internal_error)?;
+        }
         validate_run_record(&run)?;
         if self.run_path(&run.run_id)? != path {
             return Err(ComputerError::new(
@@ -377,6 +723,124 @@ impl ComputerStore {
     }
 }
 
+fn migrate_run_record(run: &mut ComputerRun) -> ComputerResult<bool> {
+    if run.schema_version != 0 && run.schema_version != COMPUTER_RUN_SCHEMA_VERSION {
+        return Err(invalid_record());
+    }
+    let mut changed = false;
+    let mut untrusted = run.schema_version == 0;
+
+    if run
+        .initiating_principal
+        .as_ref()
+        .is_some_and(|principal| principal.validate().is_err())
+    {
+        run.initiating_principal = None;
+        untrusted = true;
+        changed = true;
+    }
+    if run.initiating_principal.as_ref().is_some_and(|principal| {
+        principal
+            .session_id()
+            .is_some_and(|session_id| session_id != run.owner_session_id)
+    }) {
+        run.initiating_principal = None;
+        untrusted = true;
+        changed = true;
+    }
+
+    let isolated_mismatch = run
+        .capability_proof
+        .isolated_surface()
+        .is_some_and(|surface| !run.surface.is_issued() || surface != run.surface);
+    let proof_invalid = run.capability_proof.validate().is_err()
+        || matches!(
+            run.capability_proof,
+            crate::computer_use::ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+                origin: crate::computer_use::IsolationProofOrigin::HostNative,
+                ..
+            }
+        )
+        || isolated_mismatch;
+    if proof_invalid
+        || matches!(
+            run.capability_proof.tier(),
+            crate::computer_use::ComputerCapabilityTier::IndependentlyIsolatedVisualInputDomain
+                | crate::computer_use::ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
+        ) && run.schema_version == 0
+    {
+        if !matches!(
+            run.capability_proof,
+            crate::computer_use::ComputerCapabilityProof::Unproven
+        ) {
+            run.capability_proof = crate::computer_use::ComputerCapabilityProof::Unproven;
+            changed = true;
+        }
+        untrusted = true;
+    }
+
+    if let Some(grant) = &run.grant {
+        let grant_untrusted = if grant.revoked_at.is_some() {
+            grant.run_id != run.run_id
+        } else {
+            grant.validate().is_err()
+                || grant.run_id != run.run_id
+                || grant.target != run.target
+                || grant.surface != run.surface
+                || grant.authority_epoch != run.authority_epoch
+                || grant.principal.as_ref() != run.initiating_principal.as_ref()
+                || grant.capability_tier != run.capability_proof.tier()
+                || matches!(
+                    grant.capability_tier,
+                    crate::computer_use::ComputerCapabilityTier::Unproven
+                )
+        };
+        if grant_untrusted {
+            run.grant = None;
+            untrusted = true;
+            changed = true;
+        }
+    }
+
+    if let Some(observation) = &run.current_observation {
+        let observation_untrusted = observation.validate(&run.limits).is_err()
+            || observation.target != run.target
+            || !observation.authority.surface.is_issued()
+            || observation.authority.surface != run.surface
+            || observation.authority.frame_epoch == 0
+            || observation.authority.freshness.tick == 0
+            || observation.authority.freshness.surface_id != run.surface.surface_id
+            || observation.authority.freshness.incarnation != run.surface.incarnation
+            || observation.authority.authority_epoch != run.authority_epoch
+            || observation.authority.control_epoch != run.control_epoch
+            || observation.authority.target_generation != run.target.generation;
+        if observation_untrusted {
+            run.current_observation = None;
+            untrusted = true;
+            changed = true;
+        }
+    }
+
+    if untrusted {
+        if run.grant.is_some() {
+            run.grant = None;
+            changed = true;
+        }
+        if run.current_observation.is_some() {
+            run.current_observation = None;
+            changed = true;
+        }
+        if run.schema_version != COMPUTER_RUN_SCHEMA_VERSION {
+            run.schema_version = COMPUTER_RUN_SCHEMA_VERSION;
+            changed = true;
+        }
+    } else if run.schema_version != COMPUTER_RUN_SCHEMA_VERSION {
+        run.schema_version = COMPUTER_RUN_SCHEMA_VERSION;
+        changed = true;
+    }
+    Ok(changed)
+}
+
 fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
     validate_id("run_id", &run.run_id)?;
     validate_workspace(run.workspace.as_deref())?;
@@ -388,6 +852,41 @@ fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
     }
     run.target.validate()?;
     run.limits.validate()?;
+    if run.schema_version != COMPUTER_RUN_SCHEMA_VERSION {
+        return Err(invalid_record());
+    }
+    if run.surface.is_issued() {
+        run.surface.validate()?;
+    } else if !matches!(
+        run.capability_proof,
+        crate::computer_use::ComputerCapabilityProof::Unproven
+    ) {
+        return Err(invalid_record());
+    }
+    run.capability_proof.validate()?;
+    if matches!(
+        run.capability_proof,
+        crate::computer_use::ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+            origin: crate::computer_use::IsolationProofOrigin::HostNative,
+            ..
+        }
+    ) {
+        return Err(invalid_record());
+    }
+    if let Some(isolated) = run.capability_proof.isolated_surface() {
+        if isolated != run.surface {
+            return Err(invalid_record());
+        }
+    }
+    if let Some(principal) = &run.initiating_principal {
+        principal.validate()?;
+        if principal
+            .session_id()
+            .is_some_and(|session_id| session_id != run.owner_session_id)
+        {
+            return Err(invalid_record());
+        }
+    }
     if run.version == 0
         || run.action_count > run.limits.max_actions
         || run.evidence_bytes > run.limits.max_evidence_bytes
@@ -417,23 +916,41 @@ fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
     }
     if let Some(observation) = &run.current_observation {
         observation.validate(&run.limits)?;
-        if observation.target != run.target || run.state.is_terminal() {
+        if observation.target != run.target
+            || run.state.is_terminal()
+            || observation.authority.surface != run.surface
+            || observation.authority.frame_epoch == 0
+            || observation.authority.freshness.tick == 0
+            || observation.authority.freshness.surface_id != run.surface.surface_id
+            || observation.authority.freshness.incarnation != run.surface.incarnation
+            || observation.authority.authority_epoch != run.authority_epoch
+            || observation.authority.control_epoch != run.control_epoch
+            || observation.authority.target_generation != run.target.generation
+        {
             return Err(invalid_record());
         }
     }
     if let Some(grant) = &run.grant {
-        validate_id("grant_id", &grant.grant_id)?;
-        validate_id("grant_run_id", &grant.run_id)?;
-        grant.target.validate()?;
-        if grant.run_id != run.run_id
-            || grant.target != run.target
-            || grant.action_classes.is_empty()
-            || grant.expires_at <= grant.issued_at
-            || grant
-                .uses_remaining
-                .is_some_and(|remaining| remaining > run.limits.max_actions)
-        {
+        if grant.run_id != run.run_id {
             return Err(invalid_record());
+        }
+        if grant.revoked_at.is_some() {
+            // Revoked grants are retained as bookkeeping. Revocation bumps the
+            // run authority epoch, so they must not be required to match live
+            // epochs or remaining uses.
+        } else {
+            grant.validate()?;
+            if grant.target != run.target
+                || grant.surface != run.surface
+                || grant.authority_epoch != run.authority_epoch
+                || grant.principal.as_ref() != run.initiating_principal.as_ref()
+                || grant.capability_tier != run.capability_proof.tier()
+                || grant
+                    .uses_remaining
+                    .is_some_and(|remaining| remaining > run.limits.max_actions)
+            {
+                return Err(invalid_record());
+            }
         }
     }
     let authority_must_be_revoked =
@@ -469,8 +986,29 @@ fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
     Ok(())
 }
 
+fn receipt_is_stamped(receipt: &MutationReceipt) -> bool {
+    receipt.schema_version == COMPUTER_RECEIPT_SCHEMA_VERSION
+        && receipt.caller_kind.is_some()
+        && receipt.pre_authority_epoch.is_some()
+        && receipt.pre_control_epoch.is_some()
+}
+
+fn receipt_matches_stamp(receipt: &MutationReceipt, stamp: &MutationStamp) -> bool {
+    receipt.caller_kind.as_deref() == Some(stamp.kind())
+        && receipt.caller_owner_session_id == stamp.owner_session_id()
+        && receipt.caller_agent_id == stamp.agent_id()
+        && receipt.caller_agent_spec_revision == stamp.agent_spec_revision()
+        && receipt.run_id == stamp.run_id
+        && receipt.surface_id == stamp.surface_id
+        && receipt.incarnation == stamp.incarnation
+        && receipt.grant_id == stamp.grant_id
+}
+
 fn validate_receipt(receipt: &MutationReceipt) -> ComputerResult<()> {
     validate_id("request_id", &receipt.request_id)?;
+    if receipt.schema_version != 0 && receipt.schema_version != COMPUTER_RECEIPT_SCHEMA_VERSION {
+        return Err(invalid_record());
+    }
     if receipt.operation.is_empty()
         || receipt.operation.len() > 64
         || receipt.payload_hash.len() != 64
@@ -495,6 +1033,34 @@ fn validate_receipt(receipt: &MutationReceipt) -> ComputerResult<()> {
             .is_some_and(|error| error.message.len() > 512)
     {
         return Err(invalid_record());
+    }
+    if receipt.schema_version == COMPUTER_RECEIPT_SCHEMA_VERSION {
+        if receipt.caller_kind.is_none()
+            || receipt.pre_authority_epoch.is_none()
+            || receipt.pre_control_epoch.is_none()
+        {
+            return Err(invalid_record());
+        }
+        if receipt.run_id.is_some()
+            && (receipt
+                .run_id
+                .as_deref()
+                .is_some_and(|run_id| validate_id("run_id", run_id).is_err())
+                || receipt
+                    .surface_id
+                    .as_deref()
+                    .is_some_and(|surface_id| validate_id("surface_id", surface_id).is_err())
+                || receipt
+                    .incarnation
+                    .as_deref()
+                    .is_some_and(|incarnation| validate_id("incarnation", incarnation).is_err())
+                || receipt
+                    .grant_id
+                    .as_deref()
+                    .is_some_and(|grant_id| validate_id("grant_id", grant_id).is_err()))
+        {
+            return Err(invalid_record());
+        }
     }
     Ok(())
 }
@@ -590,22 +1156,22 @@ mod tests {
         let run_id;
         {
             let store = ComputerStore::open(dir.path()).unwrap();
-            let mut run =
-                ComputerRun::new(Uuid::new_v4(), None, target(), ComputerUseLimits::default())
-                    .unwrap();
+            let mut run = ComputerRun::attested_foreground_for_test(
+                Uuid::new_v4(),
+                None,
+                target(),
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
             run_id = run.run_id.clone();
             let now = Utc::now();
-            run.grant = Some(ActionGrant {
-                grant_id: "grant".into(),
-                run_id: run.run_id.clone(),
-                target: run.target.clone(),
-                action_classes: BTreeSet::from([ActionClass::Semantic]),
-                issued_by: crate::computer_use::GrantIssuer::LocalUser,
-                issued_at: now,
-                expires_at: now + Duration::minutes(5),
-                uses_remaining: None,
-                revoked_at: None,
-            });
+            run.grant = Some(ActionGrant::for_run(
+                &run,
+                BTreeSet::from([ActionClass::Semantic]),
+                now,
+                now + Duration::minutes(5),
+                None,
+            ));
             run.transition(ComputerRunState::Ready).unwrap();
             run.last_outcome = Some(ActionOutcome::bounded(
                 "PRIVATE_DOCUMENT_TITLE leaked from AX",
@@ -638,14 +1204,103 @@ mod tests {
     }
 
     #[test]
+    fn restart_rotates_incarnation_coerces_isolated_proof_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let run_id;
+        let original_incarnation;
+        let original_surface_id;
+        {
+            let store = ComputerStore::open(dir.path()).unwrap();
+            let surface = crate::computer_use::ComputerSurfaceBinding::issue();
+            original_incarnation = surface.incarnation.clone();
+            original_surface_id = surface.surface_id.clone();
+            let owner = Uuid::new_v4();
+            let mut run = ComputerRun::new_with_isolation(
+                owner,
+                None,
+                target(),
+                ComputerUseLimits::default(),
+                crate::computer_use::ComputerPrincipal::local_operator(owner),
+                surface.clone(),
+                crate::computer_use::ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+                    backend_id: crate::computer_use::SIMULATOR_ISOLATED_BACKEND_ID.into(),
+                    surface_id: surface.surface_id.clone(),
+                    incarnation: surface.incarnation.clone(),
+                    input_domain_id: uuid::Uuid::new_v4().to_string(),
+                    origin: crate::computer_use::IsolationProofOrigin::SimulatorFixture,
+                    observe: true,
+                    semantic_actions: true,
+                    text_entry: true,
+                    key_chords: true,
+                    pointer_fallback: true,
+                },
+            )
+            .unwrap();
+            run_id = run.run_id.clone();
+            let now = Utc::now();
+            run.grant = Some(ActionGrant::for_run(
+                &run,
+                BTreeSet::from([ActionClass::Semantic]),
+                now,
+                now + Duration::minutes(5),
+                None,
+            ));
+            run.transition(ComputerRunState::Ready).unwrap();
+            store.save_run(&run).unwrap();
+        }
+
+        let first = ComputerStore::open(dir.path())
+            .unwrap()
+            .load_run(&run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.state, ComputerRunState::Interrupted);
+        assert!(first.grant.is_none());
+        assert_eq!(first.surface.surface_id, original_surface_id);
+        assert_ne!(first.surface.incarnation, original_incarnation);
+        assert_eq!(
+            first.capability_proof,
+            crate::computer_use::ComputerCapabilityProof::Unproven
+        );
+        assert_eq!(first.freshness_tick, 0);
+        assert!(first.authority_epoch > 0);
+        let first_incarnation = first.surface.incarnation.clone();
+        let first_epoch = first.authority_epoch;
+        let first_version = first.version;
+
+        let second = ComputerStore::open(dir.path())
+            .unwrap()
+            .load_run(&run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.state, ComputerRunState::Interrupted);
+        assert!(second.grant.is_none());
+        assert_eq!(second.surface.incarnation, first_incarnation);
+        assert_eq!(second.authority_epoch, first_epoch);
+        assert_eq!(second.version, first_version);
+        assert_eq!(
+            second.capability_proof,
+            crate::computer_use::ComputerCapabilityProof::Unproven
+        );
+    }
+
+    fn test_stamp() -> MutationStamp {
+        MutationStamp::from_caller(
+            crate::computer_use::ComputerPrincipal::local_operator(Uuid::new_v4()),
+            None,
+        )
+    }
+
+    #[test]
     fn interrupted_claim_becomes_uncertain_not_replayable() {
         let dir = tempdir().unwrap();
         let payload_hash = "a".repeat(64);
+        let stamp = test_stamp();
         {
             let store = ComputerStore::open(dir.path()).unwrap();
             assert!(matches!(
                 store
-                    .claim_mutation("request-1", "act", &payload_hash)
+                    .claim_mutation("request-1", "act", &payload_hash, &stamp)
                     .unwrap(),
                 MutationClaim::Perform
             ));
@@ -653,21 +1308,63 @@ mod tests {
         let store = ComputerStore::open(dir.path()).unwrap();
         assert!(matches!(
             store
-                .claim_mutation("request-1", "act", &payload_hash)
+                .claim_mutation("request-1", "act", &payload_hash, &stamp)
                 .unwrap(),
             MutationClaim::Uncertain
         ));
         assert_eq!(
             store
-                .claim_mutation("request-1", "act", "other")
+                .claim_mutation("request-1", "act", "other", &stamp)
                 .unwrap_err()
                 .code,
             ComputerErrorCode::Conflict
         );
+        let other = MutationStamp::from_caller(
+            crate::computer_use::ComputerPrincipal::local_operator(Uuid::new_v4()),
+            None,
+        );
+        assert_eq!(
+            store
+                .claim_mutation("request-1", "act", &payload_hash, &other)
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
     }
 
     #[test]
-    fn corrupt_record_fails_store_open_closed() {
+    fn unstamped_legacy_receipt_fails_closed() {
+        let dir = tempdir().unwrap();
+        let payload_hash = "b".repeat(64);
+        {
+            let store = ComputerStore::open(dir.path()).unwrap();
+            let path = store.receipt_path("legacy").unwrap();
+            fs::write(
+                path,
+                serde_json::to_vec(&serde_json::json!({
+                    "requestId": "legacy",
+                    "operation": "observe",
+                    "payloadHash": payload_hash,
+                    "state": "succeeded",
+                    "createdAt": Utc::now(),
+                    "updatedAt": Utc::now(),
+                    "result": {"ok": true}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let store = ComputerStore::open(dir.path()).unwrap();
+        assert!(matches!(
+            store
+                .claim_mutation("legacy", "observe", &payload_hash, &test_stamp())
+                .unwrap(),
+            MutationClaim::Uncertain
+        ));
+    }
+
+    #[test]
+    fn corrupt_json_fails_store_open_closed() {
         let dir = tempdir().unwrap();
         {
             let store = ComputerStore::open(dir.path()).unwrap();
@@ -675,6 +1372,234 @@ mod tests {
             fs::write(path, b"{").unwrap();
         }
         assert!(ComputerStore::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn contradictory_legacy_records_reopen_as_interrupted_unproven() {
+        let owner = Uuid::new_v4();
+        let surface_a = crate::computer_use::ComputerSurfaceBinding::issue();
+        let surface_b = crate::computer_use::ComputerSurfaceBinding::issue();
+        let now = Utc::now();
+        let cases: &[(&str, serde_json::Value)] = &[
+            (
+                "cross-surface-isolated",
+                serde_json::json!({
+                    "runId": "cross-surface-isolated",
+                    "ownerSessionId": owner,
+                    "target": {
+                        "appId": "com.grokptah.demo",
+                        "windowId": "main",
+                        "generation": 1,
+                        "displayName": "Demo",
+                        "sensitivity": "none"
+                    },
+                    "state": "ready",
+                    "version": 1,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "limits": ComputerUseLimits::default(),
+                    "actionCount": 0,
+                    "evidenceBytes": 0,
+                    "audit": [],
+                    "surface": surface_a,
+                    "initiatingPrincipal": {
+                        "kind": "local_operator_session",
+                        "sessionId": owner
+                    },
+                    "capabilityProof": {
+                        "kind": "independently_isolated_visual_input_domain",
+                        "backendId": crate::computer_use::SIMULATOR_ISOLATED_BACKEND_ID,
+                        "surfaceId": surface_b.surface_id,
+                        "incarnation": surface_b.incarnation,
+                        "inputDomainId": Uuid::new_v4().to_string(),
+                        "origin": "simulator_fixture",
+                        "observe": true,
+                        "semanticActions": true,
+                        "textEntry": true,
+                        "keyChords": true,
+                        "pointerFallback": true
+                    }
+                }),
+            ),
+            (
+                "agent-principal",
+                serde_json::json!({
+                    "runId": "agent-principal",
+                    "ownerSessionId": owner,
+                    "target": {
+                        "appId": "com.grokptah.demo",
+                        "windowId": "main",
+                        "generation": 1,
+                        "displayName": "Demo",
+                        "sensitivity": "none"
+                    },
+                    "state": "ready",
+                    "version": 1,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "limits": ComputerUseLimits::default(),
+                    "actionCount": 0,
+                    "evidenceBytes": 0,
+                    "audit": [],
+                    "initiatingPrincipal": {
+                        "kind": "agent",
+                        "agentId": format!("agent-{}", Uuid::new_v4()),
+                        "specRevision": 1
+                    },
+                    "capabilityProof": { "kind": "unproven" }
+                }),
+            ),
+            (
+                "missing-schema",
+                serde_json::json!({
+                    "runId": "missing-schema",
+                    "ownerSessionId": owner,
+                    "target": {
+                        "appId": "com.grokptah.demo",
+                        "windowId": "main",
+                        "generation": 1,
+                        "displayName": "Demo",
+                        "sensitivity": "none"
+                    },
+                    "state": "ready",
+                    "version": 1,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "limits": ComputerUseLimits::default(),
+                    "actionCount": 0,
+                    "evidenceBytes": 0,
+                    "audit": []
+                }),
+            ),
+            (
+                "owner-mismatch-principal",
+                serde_json::json!({
+                    "runId": "owner-mismatch-principal",
+                    "ownerSessionId": owner,
+                    "target": {
+                        "appId": "com.grokptah.demo",
+                        "windowId": "main",
+                        "generation": 1,
+                        "displayName": "Demo",
+                        "sensitivity": "none"
+                    },
+                    "state": "ready",
+                    "version": 1,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "limits": ComputerUseLimits::default(),
+                    "actionCount": 0,
+                    "evidenceBytes": 0,
+                    "audit": [],
+                    "schemaVersion": 1,
+                    "initiatingPrincipal": {
+                        "kind": "local_operator_session",
+                        "sessionId": Uuid::new_v4()
+                    },
+                    "capabilityProof": { "kind": "unproven" }
+                }),
+            ),
+            (
+                "zero-frame-observation",
+                serde_json::json!({
+                    "runId": "zero-frame-observation",
+                    "ownerSessionId": owner,
+                    "target": {
+                        "appId": "com.grokptah.demo",
+                        "windowId": "main",
+                        "generation": 1,
+                        "displayName": "Demo",
+                        "sensitivity": "none"
+                    },
+                    "state": "ready",
+                    "version": 1,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "limits": ComputerUseLimits::default(),
+                    "actionCount": 0,
+                    "evidenceBytes": 0,
+                    "audit": [],
+                    "schemaVersion": 1,
+                    "surface": surface_a,
+                    "initiatingPrincipal": {
+                        "kind": "local_operator_session",
+                        "sessionId": owner
+                    },
+                    "capabilityProof": {
+                        "kind": "foreground_semantic",
+                        "backendId": "test_foreground",
+                        "observe": true,
+                        "semanticActions": true,
+                        "textEntry": true
+                    },
+                    "currentObservation": {
+                        "observationId": "obs-1",
+                        "sequence": 1,
+                        "target": {
+                            "appId": "com.grokptah.demo",
+                            "windowId": "main",
+                            "generation": 1,
+                            "displayName": "Demo",
+                            "sensitivity": "none"
+                        },
+                        "capturedAt": now,
+                        "geometry": {
+                            "x": 0.0,
+                            "y": 0.0,
+                            "width": 800.0,
+                            "height": 600.0,
+                            "scaleFactor": 1.0
+                        },
+                        "elements": [],
+                        "elementsTruncated": false,
+                        "sensitivity": "none",
+                        "authority": {
+                            "surface": surface_a,
+                            "frameEpoch": 0,
+                            "targetGeneration": 1,
+                            "authorityEpoch": 0,
+                            "controlEpoch": 0,
+                            "freshness": {
+                                "surfaceId": surface_a.surface_id,
+                                "incarnation": surface_a.incarnation,
+                                "tick": 1
+                            }
+                        }
+                    }
+                }),
+            ),
+        ];
+
+        for (name, record) in cases {
+            let dir = tempdir().unwrap();
+            {
+                let store = ComputerStore::open(dir.path()).unwrap();
+                let path = store.run_path(name).unwrap();
+                fs::write(path, serde_json::to_vec_pretty(record).unwrap()).unwrap();
+            }
+            let store = ComputerStore::open(dir.path()).unwrap();
+            let recovered = store.load_run(name).unwrap().unwrap();
+            assert_eq!(
+                recovered.state,
+                ComputerRunState::Interrupted,
+                "{name} must reopen interrupted"
+            );
+            assert!(recovered.grant.is_none(), "{name} must drop grant");
+            assert!(
+                recovered.current_observation.is_none(),
+                "{name} must drop observation"
+            );
+            if *name != "zero-frame-observation" {
+                assert_eq!(
+                    recovered.capability_proof,
+                    crate::computer_use::ComputerCapabilityProof::Unproven,
+                    "{name} must be unproven"
+                );
+            }
+            if *name == "agent-principal" || *name == "owner-mismatch-principal" {
+                assert!(recovered.initiating_principal.is_none());
+            }
+        }
     }
 
     #[test]
@@ -703,6 +1628,83 @@ mod tests {
             let path = store.root().join("runs").join("oversized.json");
             let file = fs::File::create(path).unwrap();
             file.set_len(MAX_RECORD_BYTES + 1).unwrap();
+        }
+        assert!(ComputerStore::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn unknown_future_run_schema_fails_store_open_and_is_not_rewritten() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let persisted_path = {
+            let store = ComputerStore::open(dir.path()).unwrap();
+            let path = store.run_path("future-run").unwrap();
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "runId": "future-run",
+                    "ownerSessionId": Uuid::new_v4(),
+                    "target": {
+                        "appId": "com.grokptah.demo",
+                        "windowId": "main",
+                        "generation": 1,
+                        "displayName": "Demo",
+                        "sensitivity": "none"
+                    },
+                    "state": "ready",
+                    "version": 1,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "limits": ComputerUseLimits::default(),
+                    "actionCount": 0,
+                    "evidenceBytes": 0,
+                    "audit": [],
+                    "schemaVersion": 99,
+                    "capabilityProof": {
+                        "kind": "foreground_semantic",
+                        "backendId": "future_backend",
+                        "observe": true,
+                        "semanticActions": true,
+                        "textEntry": true
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            path
+        };
+        assert!(ComputerStore::open(dir.path()).is_err());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&persisted_path).unwrap()).unwrap();
+        assert_eq!(persisted["schemaVersion"], 99);
+        assert_eq!(persisted["capabilityProof"]["kind"], "foreground_semantic");
+    }
+
+    #[test]
+    fn unknown_future_receipt_schema_fails_store_open() {
+        let dir = tempdir().unwrap();
+        let payload_hash = "c".repeat(64);
+        {
+            let store = ComputerStore::open(dir.path()).unwrap();
+            let path = store.receipt_path("future-receipt").unwrap();
+            fs::write(
+                path,
+                serde_json::to_vec(&serde_json::json!({
+                    "requestId": "future-receipt",
+                    "operation": "act",
+                    "payloadHash": payload_hash,
+                    "state": "succeeded",
+                    "createdAt": Utc::now(),
+                    "updatedAt": Utc::now(),
+                    "result": {"ok": true},
+                    "schemaVersion": 99,
+                    "callerKind": "local_operator_session",
+                    "preAuthorityEpoch": 0,
+                    "preControlEpoch": 0
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         }
         assert!(ComputerStore::open(dir.path()).is_err());
     }
