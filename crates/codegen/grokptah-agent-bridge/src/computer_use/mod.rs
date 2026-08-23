@@ -13,6 +13,7 @@
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
 mod coordination;
+mod isolated_visual;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -23,6 +24,13 @@ mod simulator;
 mod store;
 mod types;
 
+pub use isolated_visual::{
+    IsolatedVisualCleanupEvidence, IsolatedVisualLaunchContract, IsolatedVisualLifecycle,
+    IsolatedVisualLifecycleState, IsolatedVisualManifest, IsolatedVisualResourceLimits,
+    IsolatedVisualSecurityProfile, IsolatedVisualTerminalDisposition,
+    ISOLATED_VISUAL_GUEST_PROTOCOL_VERSION, ISOLATED_VISUAL_MANIFEST_SCHEMA_VERSION,
+    MACOS_ISOLATED_VISUAL_CANDIDATE_BACKEND_ID,
+};
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
     computer_isolated_visual_status, ComputerBackgroundSafetyReceipt,

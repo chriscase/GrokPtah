@@ -669,7 +669,10 @@ hidden windows, Spaces, live coordinate injection, the simulator, and a WebView
 alone as sufficient proof. The Stage 9 candidate also has an additive guest-only pointer
 move/button/text contract and a read-only macOS probe for the minimum OS, required Virtualization
 classes, and exact entitlement. The probe explicitly reports the packaged helper/image as pending
-and never launches a VM or grants authority. See
+and never launches a VM or grants authority. A further candidate contract freezes the initial
+network/clipboard/share/credential/input-device-free profile, resource ceilings, exact packaged
+digests, restart interruption, and cleanup-before-terminal lifecycle without serializing host paths
+or channel secrets. It is a contract, not packaged evidence. See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
 source slices satisfy no #288 acceptance checkbox.

@@ -169,7 +169,10 @@ available.
    virtualization entitlement, then reports the first blocker in Settings. It hard-codes the
    helper/image as unready and records `launchAttempted: false`; it cannot mint a capability proof.
 3. Package and measure a minimal helper and immutable guest fixture; run the no-input lifecycle and
-   cleanup campaign.
+   cleanup campaign. The candidate now defines the closed manifest/security/resource contract and
+   a deterministic no-input lifecycle that refuses terminal completion until exact process,
+   open-handle, overlay, and frame-cache cleanup evidence matches the bound surface. It contains no
+   host paths or channel secrets. Actual helper/image packaging and the destructive campaign remain.
 4. Add authenticated virtio-socket frame/health transport and render read-only frames.
 5. Add guest pointer state and one-action local approval; then key/text/scroll/drag independently.
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
@@ -182,8 +185,9 @@ available.
 ## Status and nonclaims
 
 The existing simulator remains the only dispatchable isolated proof. The Stage 8 measured
-background candidate is not a substitute. The typed input-contract and read-only host-probe
-candidates do not enable `HostNative`, expose isolated actions to a model or cockpit approval flow,
-qualify a provider for visual fallback, package a VM image/helper, or satisfy any #288 acceptance
-checkbox. The probe dynamically checks availability only; a present framework or entitlement is
-not a VM, guest, isolation, dispatch, or packaged-release proof.
+background candidate is not a substitute. The typed input, read-only host-probe, and no-input
+lifecycle-contract candidates do not enable `HostNative`, expose isolated actions to a model or
+cockpit approval flow, qualify a provider for visual fallback, package a VM image/helper, or
+satisfy any #288 acceptance checkbox. The manifest accepts only the locked-down profile and bounded
+resources, but synthetic digests are not packaged identity. A present framework, valid contract,
+or entitlement is not a VM, guest, isolation, dispatch, cleanup campaign, or release proof.
