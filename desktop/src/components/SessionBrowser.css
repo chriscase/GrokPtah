@@ -83,6 +83,16 @@
   border-color: var(--accent);
 }
 
+/* Light --accent (#b8860b) only reaches ~3:1 as text; --accent-dim holds
+ * 4.5:1+ on light surfaces. Dark keeps its measured 9:1 --accent. */
+[data-theme="light"] .session-browser .sb-chip {
+  color: var(--accent-dim);
+}
+
+[data-theme="light"] .session-browser .sb-progress {
+  color: var(--accent-dim);
+}
+
 .session-browser .sb-reset {
   font-size: 11px;
   padding: 0.15rem 0.5rem;
@@ -182,9 +192,12 @@
   min-width: 0;
 }
 
-/* Token-based archive pill (shared rule hardcodes a dark-only border). */
+/* Token-based archive pill (shared rule hardcodes a dark-only border, and
+ * colors the text with --accent, which fails 4.5:1 on light surfaces —
+ * --state-attention is identical in dark and passes in light). */
 .session-browser .sb-pill.archive {
   border-color: var(--accent-dim);
+  color: var(--state-attention);
 }
 
 .session-browser .sb-select {

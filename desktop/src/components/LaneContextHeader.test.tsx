@@ -1,3 +1,6 @@
+import { readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LaneSummary, RuntimeConnectionState, RuntimeTarget } from "../lib/protocol";
@@ -281,6 +284,30 @@ describe("operational state priority", () => {
     expect(mark).not.toBeNull();
     expect(mark).toHaveAttribute("aria-hidden");
   });
+
+  it("announces the pill as work status, not Lane status", () => {
+    // With a remote Run Lane the pill reflects the effective work
+    // connection while the Runtime fact stays the selected Lane's own —
+    // "Lane status" would attribute the remote state to the Lane.
+    render(
+      <LaneContextHeader
+        lane={lane()}
+        fallbackTitle="Fallback"
+        runLane={lane({
+          id: "lane-hosted",
+          session_id: "lane-hosted",
+          runtime_target: "hosted_service",
+          runtime_connection: "reconnecting",
+        })}
+        runLabel="Working"
+        runLive
+      />,
+    );
+    const pill = screen.getByRole("status");
+    expect(pill).toHaveTextContent("Reconnecting");
+    expect(pill.textContent).toContain("Work status:");
+    expect(pill.textContent).not.toContain("Lane status:");
+  });
 });
 
 describe("selected Lane vs remote Run Lane", () => {
@@ -324,6 +351,16 @@ describe("selected Lane vs remote Run Lane", () => {
     expect(group).toHaveAttribute("data-run-lane-connection", "connected");
     expect(within(group as HTMLElement).getByText("Remote")).toBeInTheDocument();
     expect(fact("Run Lane").dt.textContent).toContain("Run Lane");
+  });
+
+  it("explains the remote ownership boundary in text, not only in a tooltip", () => {
+    renderRemote();
+    // The title tooltip is mouse-only; keyboard and screen-reader users get
+    // the same boundary as visually-hidden text inside the term.
+    const sentence = within(fact("Run Lane").dt).getByText(
+      "Remote execution target; selected Lane ownership is unchanged.",
+    );
+    expect(sentence.classList.contains("lane-context-sr-only")).toBe(true);
   });
 
   it("carries full Run Lane evidence in the title even when text is shortened", () => {
@@ -487,5 +524,20 @@ describe("structural invariants for layout safety", () => {
       expect(dt.tagName).toBe("DT");
       expect(dd.tagName).toBe("DD");
     }
+  });
+
+  it("keeps the CSS contrast and legibility contract (PR #360 audit)", () => {
+    const root = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(join(root, "LaneContextHeader.css"), "utf8");
+    // The Remote flag must stay readable — 8px was the audited failure.
+    expect(css).toMatch(
+      /\.lane-context-remote-flag\s*{[^}]*font-size:\s*10px/s,
+    );
+    expect(css).not.toMatch(/font-size:\s*[0-8]px/);
+    // Light --ok only reaches ~3.6:1 as pill text; the light theme must
+    // darken the running pill via a text mix while dark keeps --ok.
+    expect(css).toMatch(
+      /\[data-theme="light"\][^{]*is-running\s*{[^}]*color-mix\(in srgb, var\(--ok\)/s,
+    );
   });
 });

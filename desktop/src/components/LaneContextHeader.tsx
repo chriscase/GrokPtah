@@ -130,7 +130,10 @@ export function LaneContextHeader({
           <span className="lane-context-state-mark" aria-hidden>
             {state.mark}
           </span>
-          <span className="lane-context-sr-only">Lane status: </span>
+          {/* "Work status", not "Lane status": with a remote Run Lane the pill
+              reflects the effective work connection, while the Runtime fact
+              below stays the selected Lane's own. */}
+          <span className="lane-context-sr-only">Work status: </span>
           {state.label}
         </span>
       </div>
@@ -182,6 +185,11 @@ export function LaneContextHeader({
                 title="Remote execution target — selected Lane ownership is unchanged"
               >
                 Remote
+              </span>
+              {/* The title tooltip is mouse-only; keyboard and screen-reader
+                  users need the ownership boundary in text. */}
+              <span className="lane-context-sr-only">
+                Remote execution target; selected Lane ownership is unchanged.
               </span>
             </dt>
             <dd title={runLaneEvidence}>

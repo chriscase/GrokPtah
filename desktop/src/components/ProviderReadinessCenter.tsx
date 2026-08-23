@@ -528,7 +528,7 @@ export function deriveProviderReadiness(
         .map((item) => `${item.label}: ${item.summary}`);
       summary =
         reasons.length > 0
-          ? `This exact model can be used for discussion, not the native coding loop. ${reasons.join(" ")}`
+          ? `This exact model can be used for discussion, not the native coding loop. ${reasons.join("; ")}`
           : "This exact model can be used for discussion, not the native coding loop.";
       break;
     }
