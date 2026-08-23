@@ -102,6 +102,38 @@ pub struct EnterpriseReviewPass {
     pub duration_budget_ms: u64,
 }
 
+impl EnterpriseReviewPass {
+    /// Project one specialist into the provider-neutral durable worker
+    /// contract. The objective contains only opaque digests; the worker must
+    /// obtain source through its separately authorized, read-only workspace
+    /// scope rather than receiving a route, URL, or raw prompt here.
+    pub fn work_template(&self) -> crate::orchestration::WorkTemplate {
+        crate::orchestration::WorkTemplate {
+            kind: format!("enterprise_review:{}", self.kind.id()),
+            objective: format!(
+                "Run bounded {} review pass; objective={}, source and route are resolved by the admitted worker scope.",
+                self.kind.id(), self.objective_digest
+            ),
+            priority: 0,
+            policy: crate::orchestration::WorkPolicy {
+                bounds: crate::orchestration::RunBounds {
+                    max_prompt_bytes: 32 * 1024,
+                    max_rounds: self.request_budget,
+                    max_duration_ms: self.duration_budget_ms,
+                    max_total_tokens: Some(self.token_budget),
+                },
+                retry: crate::orchestration::WorkRetryPolicy {
+                    max_attempts: MAX_ENTERPRISE_REVIEW_PASS_ATTEMPTS,
+                    retry_failed: true,
+                    retry_expired: true,
+                    backoff_ms: 0,
+                },
+                ..crate::orchestration::WorkPolicy::default()
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EnterpriseReviewPlan {
@@ -649,6 +681,12 @@ mod tests {
             .passes
             .iter()
             .all(|pass| valid_fingerprint(&pass.objective_digest)));
+        for pass in &first.passes {
+            let template = pass.work_template();
+            template.validate().unwrap();
+            assert!(template.objective.contains(&pass.objective_digest));
+            assert!(!template.objective.contains("https://"));
+        }
     }
 
     #[test]

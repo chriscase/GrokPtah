@@ -42,6 +42,9 @@ complete or that the product has reached 100%.
   secret-free finding references, deduplicates cross-pass findings, and resumes
   only from a plan-bound checkpoint with full interrupted-attempt history. Its outcome remains explicitly
   `quality_claim_eligible=false` until the live paired campaign is run.
+- Each specialist also projects into the provider-neutral durable `WorkTemplate`
+  contract with bounded rounds/tokens/time and retry policy; the template carries
+  only opaque objective evidence, never a route or raw source prompt.
 - Shared desktop/hosted black-box parity is present as a fail-closed fixture.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
