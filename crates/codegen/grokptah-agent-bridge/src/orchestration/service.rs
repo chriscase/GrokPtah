@@ -5344,7 +5344,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsRead, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsRead, workspace)
+            .map_err(|_| Self::run_scope_denied())?;
         self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5369,7 +5370,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsRead, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsRead, workspace)
+            .map_err(|_| Self::run_scope_denied())?;
         self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5480,7 +5482,8 @@ impl OrchestrationService {
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsEvents, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsEvents, workspace)
+            .map_err(|_| Self::run_scope_denied())?;
         self.events_for_run(
             self.authorize_run_request(session_id, workspace, run_id)?,
             after_seq,
@@ -5499,7 +5502,8 @@ impl OrchestrationService {
         after_seq: u64,
         limit: usize,
     ) -> Result<(LiveRunScope, JournalPage), OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsEvents, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsEvents, workspace)
+            .map_err(|_| Self::run_scope_denied())?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
         let Some(start_seq) = run.start_seq else {
             return Err(OrchError::new(
@@ -5736,7 +5740,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsRead, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsRead, workspace)
+            .map_err(|_| Self::run_scope_denied())?;
         self.changes_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5780,7 +5785,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsRead, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsRead, workspace)
+            .map_err(|_| Self::run_scope_denied())?;
         self.test_results_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5881,7 +5887,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsRead, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsRead, workspace)
+            .map_err(|_| Self::run_scope_denied())?;
         self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5954,27 +5961,37 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<(RunRecord, PathBuf), OrchError> {
-        let session = self.require_build_session(session_id)?;
-        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
-        let allowlist = self.config.lock().allowlist.clone();
-        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
         if safe_id_filename(run_id).is_err() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
                 "malformed run_id",
             ));
         }
+        let session = self.require_build_session(session_id).ok();
+        let allowlist = self.config.lock().allowlist.clone();
+        let cwd = session
+            .as_ref()
+            .filter(|session| !session.cwd.is_empty())
+            .map(|session| PathBuf::from(&session.cwd));
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace).ok();
         let run = self
             .store
             .load_run(run_id)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
             .ok_or_else(Self::run_scope_denied)?;
-        if run.session_id != session_id
-            || !super::workspaces_match(&run.workspace, &claimed.display().to_string())
-        {
+        let authorized = session.is_some()
+            && claimed.as_ref().is_some_and(|claimed| {
+                run.session_id == session_id
+                    && allowlist.contains(Path::new(&run.workspace))
+                    && super::workspaces_match(&run.workspace, &claimed.display().to_string())
+            });
+        if !authorized {
             return Err(Self::run_scope_denied());
         }
-        Ok((run, claimed))
+        Ok((
+            run,
+            claimed.expect("authorized run has a canonical workspace"),
+        ))
     }
 
     fn authorize_persistent_agent_request(
@@ -6687,7 +6704,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsReview, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsReview, workspace)
+            .map_err(|_| Self::run_scope_denied())?;
         let (run, mut review) = self.isolated_review(session_id, workspace, run_id)?;
         let projected = super::project_public_run(&self.store, &run)?;
         let redacted = super::scrub_route_secret_needles(&mut review, run.provider_route.as_ref())?;
@@ -8105,7 +8123,8 @@ impl OrchestrationService {
         run_id: Option<&str>,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_cancel";
-        auth.require_workspace(AuthorityOperation::RunsCancel, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsCancel, workspace)
+            .map_err(|_| Self::run_scope_denied())?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),

@@ -96,6 +96,15 @@ session IDs fail closed before tool dispatch or session deletion. There is no
 legacy bearer-only path after initialization; clients must reinitialize after
 an authority change or reconnect.
 
+Run-scoped reads, progress, events/live streams, change and test projections,
+handoffs, isolated review, and cancellation deliberately do not reveal whether
+a well-formed Run ID exists outside the caller's authority. Unknown Runs,
+foreign sessions, foreign workspaces, invalid session/workspace claims, and
+credentials without the required workspace grant return the same typed
+`forbidden_scope` code and message. A refused cancellation reaches this check
+before idempotency is claimed, so it cannot leave a replayable receipt. Only a
+syntactically malformed Run ID remains a distinct `invalid_request`.
+
 Embedders may construct a credential with a narrower set of canonical
 workspace roots. Authentication rejects any credential grant that exceeds the
 service allowlist. The CLI currently applies the service-wide allowlist to its

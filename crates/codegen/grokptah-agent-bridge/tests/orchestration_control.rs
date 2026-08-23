@@ -1067,12 +1067,19 @@ async fn unknown_and_foreign_runs_are_indistinguishable_before_idempotency_claim
             bounds: RunBounds::default(),
         },
     );
-    orch.set_auth_credentials(vec![AuthCredential::new("primary", "primary-secret")
-        .unwrap()
-        .with_workspace_roots([allowed.path().to_path_buf()])
-        .unwrap()])
-        .unwrap();
+    orch.set_auth_credentials(vec![
+        AuthCredential::new("primary", "primary-secret")
+            .unwrap()
+            .with_workspace_roots([allowed.path().to_path_buf()])
+            .unwrap(),
+        AuthCredential::new("narrow", "narrow-secret")
+            .unwrap()
+            .with_workspace_roots([foreign.path().to_path_buf()])
+            .unwrap(),
+    ])
+    .unwrap();
     let auth = orch.auth_header(Some("Bearer primary-secret")).unwrap();
+    let narrow_auth = orch.auth_header(Some("Bearer narrow-secret")).unwrap();
 
     let now = Utc::now();
     let foreign_run = RunRecord {
@@ -1109,6 +1116,24 @@ async fn unknown_and_foreign_runs_are_indistinguishable_before_idempotency_claim
         approval: None,
     };
     store.save_run(&foreign_run).unwrap();
+    let allowed_run = RunRecord {
+        run_id: "allowed-run-existence-oracle".into(),
+        session_id: allowed_session.id,
+        workspace: allowed.path().display().to_string(),
+        request_id: "allowed-run-request".into(),
+        client_id: Some("allowed-client".into()),
+        ..foreign_run.clone()
+    };
+    store.save_run(&allowed_run).unwrap();
+    let mismatched_workspace_run = RunRecord {
+        run_id: "mismatched-workspace-run-existence-oracle".into(),
+        session_id: allowed_session.id,
+        workspace: foreign.path().display().to_string(),
+        request_id: "mismatched-workspace-run-request".into(),
+        client_id: Some("mismatched-workspace-client".into()),
+        ..foreign_run.clone()
+    };
+    store.save_run(&mismatched_workspace_run).unwrap();
 
     let unknown = orch.get_run(&auth, "unknown-run-oracle").unwrap_err();
     let out_of_grant = orch.get_run(&auth, &foreign_run.run_id).unwrap_err();
@@ -1132,9 +1157,90 @@ async fn unknown_and_foreign_runs_are_indistinguishable_before_idempotency_claim
             &foreign_run.run_id,
         )
         .unwrap_err();
+    let scoped_workspace_mismatch = orch
+        .get_run_scoped(
+            &auth,
+            allowed_session.id,
+            allowed.path(),
+            &mismatched_workspace_run.run_id,
+        )
+        .unwrap_err();
+    let scoped_credential_out_of_scope = orch
+        .get_run_scoped(
+            &narrow_auth,
+            allowed_session.id,
+            allowed.path(),
+            &allowed_run.run_id,
+        )
+        .unwrap_err();
+    let scoped_unknown_session = orch
+        .get_run_scoped(&auth, Uuid::new_v4(), allowed.path(), &allowed_run.run_id)
+        .unwrap_err();
     assert_eq!(scoped_unknown.code, OrchErrorCode::ForbiddenScope);
-    assert_eq!(scoped_foreign.code, scoped_unknown.code);
-    assert_eq!(scoped_foreign.message, scoped_unknown.message);
+    for error in [
+        &scoped_foreign,
+        &scoped_workspace_mismatch,
+        &scoped_credential_out_of_scope,
+        &scoped_unknown_session,
+    ] {
+        assert_eq!(error.code, scoped_unknown.code);
+        assert_eq!(error.message, scoped_unknown.message);
+    }
+
+    let malformed = orch
+        .get_run_scoped(&auth, allowed_session.id, allowed.path(), "../run")
+        .unwrap_err();
+    assert_eq!(malformed.code, OrchErrorCode::InvalidRequest);
+
+    for error in [
+        orch.get_progress_scoped(
+            &narrow_auth,
+            allowed_session.id,
+            allowed.path(),
+            &allowed_run.run_id,
+        )
+        .unwrap_err(),
+        orch.get_events_scoped(
+            &narrow_auth,
+            allowed_session.id,
+            allowed.path(),
+            &allowed_run.run_id,
+            0,
+            10,
+        )
+        .unwrap_err(),
+        orch.get_changes_scoped(
+            &narrow_auth,
+            allowed_session.id,
+            allowed.path(),
+            &allowed_run.run_id,
+        )
+        .unwrap_err(),
+        orch.get_test_results_scoped(
+            &narrow_auth,
+            allowed_session.id,
+            allowed.path(),
+            &allowed_run.run_id,
+        )
+        .unwrap_err(),
+        orch.get_handoff_scoped(
+            &narrow_auth,
+            allowed_session.id,
+            allowed.path(),
+            &allowed_run.run_id,
+        )
+        .unwrap_err(),
+        orch.review_run(
+            &narrow_auth,
+            allowed_session.id,
+            allowed.path(),
+            &allowed_run.run_id,
+        )
+        .unwrap_err(),
+    ] {
+        assert_eq!(error.code, scoped_unknown.code);
+        assert_eq!(error.message, scoped_unknown.message);
+    }
 
     let cancel_unknown = orch
         .cancel(
@@ -1156,9 +1262,21 @@ async fn unknown_and_foreign_runs_are_indistinguishable_before_idempotency_claim
         )
         .await
         .unwrap_err();
+    let cancel_out_of_scope = orch
+        .cancel(
+            &narrow_auth,
+            "cancel-out-of-scope-run",
+            allowed_session.id,
+            allowed.path(),
+            Some(&allowed_run.run_id),
+        )
+        .await
+        .unwrap_err();
     assert_eq!(cancel_unknown.code, OrchErrorCode::ForbiddenScope);
-    assert_eq!(cancel_foreign.code, cancel_unknown.code);
-    assert_eq!(cancel_foreign.message, cancel_unknown.message);
+    for error in [&cancel_foreign, &cancel_out_of_scope] {
+        assert_eq!(error.code, cancel_unknown.code);
+        assert_eq!(error.message, cancel_unknown.message);
+    }
     assert!(
         store
             .load_idempotency("cancel-unknown-run")
@@ -1172,6 +1290,13 @@ async fn unknown_and_foreign_runs_are_indistinguishable_before_idempotency_claim
             .unwrap()
             .is_none(),
         "foreign run refusal must precede the idempotency claim"
+    );
+    assert!(
+        store
+            .load_idempotency("cancel-out-of-scope-run")
+            .unwrap()
+            .is_none(),
+        "credential-scope refusal must precede the idempotency claim"
     );
     set_grokptah_home_override(None);
 }
