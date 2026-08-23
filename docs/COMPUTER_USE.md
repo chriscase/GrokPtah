@@ -58,10 +58,11 @@ Monotonic freshness ticks are exact-current for the live surface incarnation: an
 stale. Restart invalidates the live clocks.
 
 Local-operator caller identity is a host-resolved `ComputerAuthorityToken`. Public principal,
-proof, surface, and grant constructors do not mint authority. Agent principal creation is
-fail-closed in this allowlist: resolving a durable Agent ID and the exact current spec revision
-requires `AgentHost` / orchestration `AgentRecord` integration owned by the active PR #352
-security repair. Stage 1 does not accept `agent-*` strings as host-issued identity.
+proof, surface, and grant constructors do not mint authority. Agent authority is issued only by
+`AgentHost` after it resolves an active durable `AgentRecord`, its exact current `AgentSpec`
+revision with `computer_use_allowed=true`, an assigned Work Item, and the exact live WorkAttempt
+claimant. The public `ComputerPrincipal::agent` constructor remains fail-closed, and an Agent-shaped serialized
+principal is not an authority token.
 
 Unproven capability fails closed for observe, evidence, grant, and act. Missing initiating
 principal is not treated as the local operator. Idempotency receipts are bound to the immutable
@@ -79,15 +80,59 @@ window handles, raw attestation material, agent IDs, spec revisions, input-domai
 measurement IDs.
 
 This stage does **not** implement an isolated helper process, visual compositor, agent cursor
-UI, background Accessibility execution, a durable dispatch-intent journal, pointer/keyboard
-injection, or out-of-band preemptive takeover. Those remain later stages; this contract makes
-them structurally representable without lying that macOS is isolated today. Stage 1 is not
-stable or release-ready. MCP Computer reads now require an immutable credential grant; Agent
-principal minting and packaged hardware/TCC/takeover remain fail-closed or unverified. A later
-coordinator can bind host-sealed capability documents, WorkAttempt surface leases, and
-principal-bound receipts to these types without exposing raw `ComputerRun`. Stage 1 does not
-implement that coordinator, does not simulate N isolated surfaces, and does not widen MCP
-mutations.
+UI, background Accessibility execution, pointer/keyboard injection on the real desktop, or
+out-of-band preemptive takeover. Those remain later stages; this contract makes them
+structurally representable without lying that macOS is isolated today. Stage 1 is not stable or
+release-ready. MCP Computer reads still require the separate least-privilege repair, and
+packaged hardware/TCC/takeover remain fail-closed or unverified. The host now does implement the
+durable WorkAttempt surface-lease and physical-dispatch coordinator described below, without
+exposing raw leases or widening MCP mutations.
+
+## Inter-Agent surface coordination
+
+An Agent-owned Computer Run is admitted only through `AgentHost::create_agent_computer_run`.
+The public request contains a Work ID and WorkAttempt ID, but cannot supply a session, workspace,
+Agent ID, spec revision, surface, conflict domain, queue sequence, or authority epoch. The host
+resolves and freezes all of those values from the durable orchestration ledger.
+
+Before Agent authorization, observation queueing, dispatch preparation, and the irreversible
+input boundary, the service revalidates the exact Work, active unexpired WorkAttempt, claimant,
+assigned Agent, current AgentSpec revision, the AgentSpec's explicit Computer Use policy, owning
+Lane, and workspace. The final check and
+durable dispatch transition are linearized while the Work ledger is locked. Work cancellation,
+lease expiry, reassignment, or Agent-spec revision therefore revokes the old Computer authority;
+it cannot silently continue under a stale token.
+
+One host-attested physical input conflict domain owns at most one granted or dispatching lease.
+Agents sharing the native macOS foreground domain queue in deterministic FIFO order. A normal
+waiter ages so future priority classes cannot starve it. Operator Take over, pause, and cancel
+use the same store linearization fence as Agent injection. Independently attested simulator
+domains may proceed concurrently; separate window IDs on the native desktop do not create
+separate domains.
+
+Every physical action has a stable durable dispatch ID and a closed transition:
+
+```text
+queued -> granted -> prepared -> injected -> acknowledged
+                    |            |
+                    |            +-> uncertain (never replay automatically)
+                    +-> known_not_injected (safe terminal result)
+```
+
+Restart invalidates queued/granted leases, converts prepared dispatches to
+`known_not_injected`, and converts injected dispatches to `uncertain`. Reopening the same store a
+second time is a no-op. Expiry uses the same distinction. Corrupt or future-shaped lease records
+fail store open before recovery can rewrite Runs. The coordinator remains internal: the current
+product has no MCP Computer mutation surface and no polished queue/cursor UI yet.
+
+The coordination ledger is bounded to 512 lease records. `released`, `revoked`, `cancelled`, and
+`quarantined` records age out after seven days and are retired oldest-first when a new admission
+needs space; during its declared retention horizon, the separately persisted mutation receipt
+remains the exact-request replay fence.
+`uncertain` physical dispatches are never deleted to regain capacity. If unresolved uncertainty
+fills the ledger, new Computer Use fails closed with `limit_reached` until an operator-facing
+reconciliation workflow exists. This prevents ordinary long-running use from exhausting the
+coordinator without converting a storage bound into permission to replay an ambiguous action.
 
 ## Foundation (#268)
 
@@ -276,9 +321,9 @@ attestation, packaging requirements, and disposable smoke fixture.
 | Operator UX and model proof | #273, #272 | Visible runs/approvals and capability-based provider conformance |
 | macOS act | #270 | Bounded semantic actions with durable bookkeeping-safe local takeover (not physically preemptive inside the native action gate) |
 | Coordinator interoperability | #271 | Scoped Computer Run MCP tools and event visibility |
-| Durable dispatch journal | later | Authenticated in-flight intent so takeover can preempt a native gate |
+| WorkAttempt surface coordination | current stacked draft | Host-resolved Agent/Work/spec authority, deterministic per-domain queue, exact-current frame fence, durable dispatch identity, restart/expiry outcomes |
+| Out-of-band native cancellation channel | later | Physically preempt work that has already entered the native action gate |
 | Isolated helper / input domain | later | Host-native independently isolated visual input, not a simulator fixture |
-| Out-of-band preemptive takeover | later | Cancel work that has already entered the native action gate |
 | Semantic-first isolated visual fallback | later | Isolated visual input after semantic miss, never boolean-upgraded native AX |
 | Cockpit agent cursor / always-available Stop | later | Agent-owned cursor UI on an isolated surface |
 | Other platforms | #275, #276 | Windows and Linux adapters behind the same contract |

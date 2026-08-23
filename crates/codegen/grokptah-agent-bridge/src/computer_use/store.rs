@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -10,8 +10,15 @@ use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use uuid::Uuid;
 
+use super::coordination::{
+    conflict_domain_id, invalid_lease_record, validate_payload_digest, ComputerDispatchClaim,
+    ComputerDispatchRecord, ComputerDispatchState, ComputerSurfaceLease, ComputerSurfaceLeaseState,
+    HostSurfaceLeaseRequest, COMPUTER_DISPATCH_SCHEMA_VERSION,
+    COMPUTER_SURFACE_LEASE_SCHEMA_VERSION, MAX_SURFACE_LEASES,
+};
 use super::types::{
     validate_id, validate_workspace, ComputerControlDisposition, ComputerError, ComputerErrorCode,
     ComputerPrincipal, ComputerResult, ComputerRun, ComputerRunState, ComputerSurfaceBinding,
@@ -23,6 +30,7 @@ pub(crate) const MAX_RECEIPTS: usize = 2_048;
 const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const TERMINAL_RUN_AGE: Duration = Duration::days(30);
 const TERMINAL_RECEIPT_AGE: Duration = Duration::days(7);
+const TERMINAL_SURFACE_LEASE_AGE: Duration = Duration::days(7);
 
 #[derive(Clone)]
 pub struct ComputerStore {
@@ -45,6 +53,7 @@ struct SurfaceRegistry {
 struct LiveSurfaceState {
     binding: ComputerSurfaceBinding,
     input_domain_id: String,
+    conflict_domain_id: String,
     measurement_id: String,
     tick: AtomicU64,
     frame_epoch: AtomicU64,
@@ -189,6 +198,7 @@ impl ComputerStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
         fs::create_dir_all(root.join("receipts"))?;
+        fs::create_dir_all(root.join("surface-leases"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -211,10 +221,17 @@ impl ComputerStore {
                 surfaces: Mutex::new(SurfaceRegistry::default()),
             }),
         };
+        store.validate_surface_lease_records()?;
         store.recover_interrupted()?;
+        store.recover_surface_leases()?;
         store.recover_receipts()?;
         store.prune_retention()?;
         Ok(store)
+    }
+
+    fn validate_surface_lease_records(&self) -> ComputerResult<()> {
+        let _guard = self.inner.lock.lock();
+        self.list_surface_leases_unlocked().map(|_| ())
     }
 
     #[cfg(test)]
@@ -252,6 +269,72 @@ impl ComputerStore {
         Ok(Some(run))
     }
 
+    /// Apply an out-of-band control transition and revoke the Run's active
+    /// surface leases while holding the same host linearization lock used by
+    /// dispatch preparation/injection. If injection won the lock first, its
+    /// lease becomes Uncertain; otherwise it becomes KnownNotInjected.
+    pub(crate) fn update_run_and_revoke_surface_leases<F>(
+        &self,
+        run_id: &str,
+        disposition: &str,
+        now: DateTime<Utc>,
+        update: F,
+    ) -> ComputerResult<Option<ComputerRun>>
+    where
+        F: FnOnce(&mut ComputerRun) -> ComputerResult<()>,
+    {
+        validate_id("run_id", run_id)?;
+        validate_id("disposition", disposition)?;
+        let _guard = self.inner.lock.lock();
+        let Some(mut run) = self.load_run_unlocked(run_id)? else {
+            return Ok(None);
+        };
+        update(&mut run)?;
+        validate_run_record(&run)?;
+        atomic_write_json(&self.run_path(run_id)?, &run).map_err(internal_error)?;
+
+        for mut lease in self
+            .list_surface_leases_unlocked()?
+            .into_iter()
+            .filter(|lease| lease.run_id == run_id && !lease.state.is_terminal())
+        {
+            match lease.state {
+                ComputerSurfaceLeaseState::Queued | ComputerSurfaceLeaseState::Granted => {
+                    lease.transition(ComputerSurfaceLeaseState::Revoked, now, Some(disposition))?;
+                }
+                ComputerSurfaceLeaseState::Dispatching => {
+                    let dispatch = lease.dispatch.as_mut().ok_or_else(invalid_lease_record)?;
+                    match dispatch.state {
+                        ComputerDispatchState::Prepared => {
+                            dispatch.state = ComputerDispatchState::KnownNotInjected;
+                            dispatch.completed_at = Some(now);
+                            dispatch.error_code = Some(ComputerErrorCode::PermissionRevoked);
+                            lease.transition(
+                                ComputerSurfaceLeaseState::Revoked,
+                                now,
+                                Some(disposition),
+                            )?;
+                        }
+                        ComputerDispatchState::Injected => {
+                            dispatch.state = ComputerDispatchState::Uncertain;
+                            dispatch.completed_at = Some(now);
+                            dispatch.error_code = Some(ComputerErrorCode::UncertainOutcome);
+                            lease.transition(
+                                ComputerSurfaceLeaseState::Uncertain,
+                                now,
+                                Some(disposition),
+                            )?;
+                        }
+                        _ => return Err(invalid_lease_record()),
+                    }
+                }
+                _ => return Err(invalid_lease_record()),
+            }
+            self.write_surface_lease_unlocked(&lease)?;
+        }
+        Ok(Some(run))
+    }
+
     pub(crate) fn list_runs(&self) -> ComputerResult<Vec<ComputerRun>> {
         let _guard = self.inner.lock.lock();
         self.list_runs_unlocked()
@@ -281,9 +364,11 @@ impl ComputerStore {
             });
         }
         let binding = ComputerSurfaceBinding::issue();
+        let conflict_domain_id = conflict_domain_id(domain.as_key());
         let state = Arc::new(LiveSurfaceState {
             binding: binding.clone(),
             input_domain_id: Uuid::new_v4().to_string(),
+            conflict_domain_id,
             measurement_id: Uuid::new_v4().to_string(),
             tick: AtomicU64::new(0),
             frame_epoch: AtomicU64::new(0),
@@ -370,6 +455,682 @@ impl ComputerStore {
             },
             frame_epoch,
         ))
+    }
+
+    /// Queue one WorkAttempt on the conflict domain derived from the Run's
+    /// host-interned surface. Caller/backend data never supplies the domain,
+    /// queue sequence, surface, principal, or epoch fences.
+    pub(crate) fn queue_surface_lease(
+        &self,
+        request: HostSurfaceLeaseRequest,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ComputerSurfaceLease> {
+        request.validate(now)?;
+        let _guard = self.inner.lock.lock();
+        let run = self
+            .load_run_unlocked(&request.run_id)?
+            .ok_or_else(|| ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown run"))?;
+        let principal = run.required_principal()?;
+        let work_attempt = run.work_attempt.as_ref().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "surface lease requires a host-frozen WorkAttempt binding",
+            )
+        })?;
+        work_attempt.validate()?;
+        if work_attempt.work_id != request.work_id
+            || work_attempt.work_attempt_id != request.work_attempt_id
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "surface lease request does not match the Run WorkAttempt binding",
+            ));
+        }
+        let agent_id = principal.agent_id().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "surface leases require a host-issued durable Agent principal",
+            )
+        })?;
+        let agent_spec_revision = principal.agent_spec_revision().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "surface leases require an exact Agent spec revision",
+            )
+        })?;
+        if work_attempt.agent_id != agent_id
+            || work_attempt.agent_spec_revision != agent_spec_revision
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "surface lease WorkAttempt does not match the Run Agent principal",
+            ));
+        }
+        if run.state != ComputerRunState::Ready {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidState,
+                "surface lease requires a ready Computer Run",
+            ));
+        }
+        let (input_domain_id, conflict_domain_id) = {
+            let registry = self.inner.surfaces.lock();
+            let live = registry
+                .by_surface_id
+                .get(run.surface.surface_id())
+                .ok_or_else(|| {
+                    ComputerError::new(
+                        ComputerErrorCode::Unauthorized,
+                        "run surface is not owned by the live host registry",
+                    )
+                })?;
+            if live.binding != run.surface {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "run surface incarnation is no longer live",
+                ));
+            }
+            (
+                live.input_domain_id.clone(),
+                live.conflict_domain_id.clone(),
+            )
+        };
+        // Surface leases are a bounded coordination ledger, not an
+        // append-only archive. Retire ordinary terminal records before
+        // admission while preserving every active or uncertain dispatch.
+        // Mutation receipts remain the independent exact-request replay
+        // fence after an acknowledged/known-not-injected lease is retired.
+        let leases = self.prune_surface_leases_unlocked(now, 1)?;
+        if leases.len() >= MAX_SURFACE_LEASES {
+            return Err(ComputerError::new(
+                ComputerErrorCode::LimitReached,
+                "computer-use surface lease limit reached by active or uncertain dispatches",
+            ));
+        }
+        if leases.iter().any(|lease| {
+            lease.work_attempt_id == request.work_attempt_id && !lease.state.is_terminal()
+        }) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "WorkAttempt already owns an active Computer Use surface lease",
+            ));
+        }
+        let queue_sequence = leases
+            .iter()
+            .map(|lease| lease.queue_sequence)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::LimitReached,
+                    "computer-use surface lease queue sequence exhausted",
+                )
+            })?;
+        let lease = ComputerSurfaceLease {
+            schema_version: COMPUTER_SURFACE_LEASE_SCHEMA_VERSION,
+            lease_id: Uuid::new_v4().to_string(),
+            work_id: request.work_id,
+            work_attempt_id: request.work_attempt_id,
+            agent_id: agent_id.to_string(),
+            agent_spec_revision,
+            run_id: run.run_id,
+            surface: run.surface,
+            authority_epoch: run.authority_epoch,
+            control_epoch: run.control_epoch,
+            frame_epoch: None,
+            input_domain_id,
+            conflict_domain_id,
+            revision: 1,
+            expires_at: request.expires_at,
+            queue_sequence,
+            priority: request.priority,
+            state: ComputerSurfaceLeaseState::Queued,
+            dispatch: None,
+            disposition: None,
+            created_at: now,
+            updated_at: now,
+        };
+        lease.validate()?;
+        write_json_exclusive(&self.surface_lease_path(&lease.lease_id)?, &lease)
+            .map_err(internal_error)?;
+        Ok(lease)
+    }
+
+    /// Grant the deterministic next waiter for one exact host surface. A
+    /// conflict domain owns at most one Granted/Dispatching lease.
+    pub(crate) fn grant_next_surface_lease(
+        &self,
+        surface: &ComputerSurfaceBinding,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<Option<ComputerSurfaceLease>> {
+        surface.validate()?;
+        let _guard = self.inner.lock.lock();
+        let conflict_domain_id = {
+            let registry = self.inner.surfaces.lock();
+            let live = registry
+                .by_surface_id
+                .get(surface.surface_id())
+                .ok_or_else(|| {
+                    ComputerError::new(
+                        ComputerErrorCode::Unauthorized,
+                        "surface is not owned by the live host registry",
+                    )
+                })?;
+            if live.binding != *surface {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "surface incarnation is no longer live",
+                ));
+            }
+            live.conflict_domain_id.clone()
+        };
+        let mut leases = self.list_surface_leases_unlocked()?;
+        self.expire_surface_leases_unlocked(&mut leases, now)?;
+        if leases.iter().any(|lease| {
+            lease.conflict_domain_id == conflict_domain_id && lease.state.owns_domain_capacity()
+        }) {
+            return Ok(None);
+        }
+        let newest_sequence = leases
+            .iter()
+            .map(|lease| lease.queue_sequence)
+            .max()
+            .unwrap_or(0);
+        let mut candidates = leases
+            .into_iter()
+            .filter(|lease| {
+                lease.conflict_domain_id == conflict_domain_id
+                    && lease.state == ComputerSurfaceLeaseState::Queued
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .effective_priority(newest_sequence)
+                .cmp(&left.effective_priority(newest_sequence))
+                .then_with(|| left.queue_sequence.cmp(&right.queue_sequence))
+                .then_with(|| left.lease_id.cmp(&right.lease_id))
+        });
+        for mut candidate in candidates {
+            let run = self.load_run_unlocked(&candidate.run_id)?;
+            let valid = run
+                .as_ref()
+                .is_some_and(|run| candidate.assert_run_fence(run).is_ok());
+            if !valid {
+                candidate.transition(
+                    ComputerSurfaceLeaseState::Quarantined,
+                    now,
+                    Some("run_fence_changed_before_grant"),
+                )?;
+                self.write_surface_lease_unlocked(&candidate)?;
+                continue;
+            }
+            candidate.transition(ComputerSurfaceLeaseState::Granted, now, None)?;
+            self.write_surface_lease_unlocked(&candidate)?;
+            return Ok(Some(candidate));
+        }
+        Ok(None)
+    }
+
+    /// Atomically claims one stable physical dispatch id and freezes the full
+    /// lease/run fence before any input can be injected.
+    pub(crate) fn prepare_surface_dispatch(
+        &self,
+        lease_id: &str,
+        expected_revision: u64,
+        dispatch_id: &str,
+        payload_sha256: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ComputerDispatchClaim> {
+        validate_id("lease_id", lease_id)?;
+        validate_id("dispatch_id", dispatch_id)?;
+        validate_payload_digest(payload_sha256)?;
+        let _guard = self.inner.lock.lock();
+        let leases = self.list_surface_leases_unlocked()?;
+        if let Some(existing) = leases.iter().find(|lease| {
+            lease
+                .dispatch
+                .as_ref()
+                .is_some_and(|d| d.dispatch_id == dispatch_id)
+        }) {
+            let dispatch = existing.dispatch.as_ref().expect("matched dispatch exists");
+            if existing.lease_id != lease_id || dispatch.payload_sha256 != payload_sha256 {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Conflict,
+                    "dispatch id was reused for another lease or payload",
+                ));
+            }
+            return Ok(match dispatch.state {
+                ComputerDispatchState::Acknowledged
+                | ComputerDispatchState::KnownNotInjected
+                | ComputerDispatchState::Failed => ComputerDispatchClaim::Replay(existing.clone()),
+                ComputerDispatchState::Prepared => ComputerDispatchClaim::Pending,
+                ComputerDispatchState::Injected | ComputerDispatchState::Uncertain => {
+                    ComputerDispatchClaim::Uncertain
+                }
+            });
+        }
+        let mut lease = self.load_surface_lease_unlocked(lease_id)?.ok_or_else(|| {
+            ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown lease")
+        })?;
+        if lease.revision != expected_revision {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "surface lease revision changed",
+            ));
+        }
+        if lease.state != ComputerSurfaceLeaseState::Granted {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidState,
+                "surface lease is not granted",
+            ));
+        }
+        if lease.frame_epoch.is_none() {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "surface dispatch requires a lease-bound host observation",
+            ));
+        }
+        if lease.expires_at <= now {
+            lease.transition(
+                ComputerSurfaceLeaseState::Revoked,
+                now,
+                Some("lease_expired_before_dispatch"),
+            )?;
+            self.write_surface_lease_unlocked(&lease)?;
+            return Err(ComputerError::new(
+                ComputerErrorCode::PermissionRevoked,
+                "surface lease expired before dispatch",
+            ));
+        }
+        let run = self
+            .load_run_unlocked(&lease.run_id)?
+            .ok_or_else(|| ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown run"))?;
+        lease.assert_run_fence(&run)?;
+        self.assert_live_lease_surface(&lease)?;
+        if leases.iter().any(|other| {
+            other.lease_id != lease.lease_id
+                && other.conflict_domain_id == lease.conflict_domain_id
+                && other.state == ComputerSurfaceLeaseState::Dispatching
+        }) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Pending,
+                "another lease is dispatching on this conflict domain",
+            ));
+        }
+        lease.transition(ComputerSurfaceLeaseState::Dispatching, now, None)?;
+        lease.dispatch = Some(ComputerDispatchRecord {
+            schema_version: COMPUTER_DISPATCH_SCHEMA_VERSION,
+            dispatch_id: dispatch_id.to_string(),
+            payload_sha256: payload_sha256.to_string(),
+            state: ComputerDispatchState::Prepared,
+            prepared_at: now,
+            injected_at: None,
+            completed_at: None,
+            outcome_sha256: None,
+            error_code: None,
+        });
+        self.write_surface_lease_unlocked(&lease)?;
+        Ok(ComputerDispatchClaim::Perform(lease))
+    }
+
+    /// Commit the irreversible send boundary before calling the backend. A
+    /// restart after this write is Uncertain and is never replayed.
+    pub(crate) fn mark_surface_dispatch_injected(
+        &self,
+        lease_id: &str,
+        expected_revision: u64,
+        dispatch_id: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ComputerSurfaceLease> {
+        let _guard = self.inner.lock.lock();
+        let mut lease = self.load_surface_lease_unlocked(lease_id)?.ok_or_else(|| {
+            ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown lease")
+        })?;
+        if lease.revision != expected_revision
+            || lease.state != ComputerSurfaceLeaseState::Dispatching
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "surface dispatch lease changed before injection",
+            ));
+        }
+        let run = self
+            .load_run_unlocked(&lease.run_id)?
+            .ok_or_else(|| ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown run"))?;
+        lease.assert_run_fence(&run)?;
+        self.assert_live_lease_surface(&lease)?;
+        let dispatch = lease.dispatch.as_mut().ok_or_else(invalid_lease_record)?;
+        if dispatch.dispatch_id != dispatch_id || dispatch.state != ComputerDispatchState::Prepared
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "surface dispatch id or state changed before injection",
+            ));
+        }
+        dispatch.state = ComputerDispatchState::Injected;
+        dispatch.injected_at = Some(now);
+        lease.revision = lease.revision.saturating_add(1);
+        lease.updated_at = now;
+        self.write_surface_lease_unlocked(&lease)?;
+        Ok(lease)
+    }
+
+    pub(crate) fn acknowledge_surface_dispatch(
+        &self,
+        lease_id: &str,
+        expected_revision: u64,
+        dispatch_id: &str,
+        outcome_sha256: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ComputerSurfaceLease> {
+        validate_payload_digest(outcome_sha256)?;
+        let _guard = self.inner.lock.lock();
+        let mut lease = self.load_surface_lease_unlocked(lease_id)?.ok_or_else(|| {
+            ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown lease")
+        })?;
+        if lease.revision != expected_revision
+            || lease.state != ComputerSurfaceLeaseState::Dispatching
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "surface dispatch lease changed before acknowledgement",
+            ));
+        }
+        let dispatch = lease.dispatch.as_mut().ok_or_else(invalid_lease_record)?;
+        if dispatch.dispatch_id != dispatch_id || dispatch.state != ComputerDispatchState::Injected
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "surface dispatch id or state changed before acknowledgement",
+            ));
+        }
+        dispatch.state = ComputerDispatchState::Acknowledged;
+        dispatch.completed_at = Some(now);
+        dispatch.outcome_sha256 = Some(outcome_sha256.to_string());
+        lease.transition(ComputerSurfaceLeaseState::Released, now, None)?;
+        self.write_surface_lease_unlocked(&lease)?;
+        Ok(lease)
+    }
+
+    /// Fail closed at the physical boundary. Prepared is definitely not sent;
+    /// Injected is ambiguous and permanently Uncertain.
+    pub(crate) fn fail_surface_dispatch(
+        &self,
+        lease_id: &str,
+        dispatch_id: &str,
+        error_code: ComputerErrorCode,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ComputerSurfaceLease> {
+        let _guard = self.inner.lock.lock();
+        let mut lease = self.load_surface_lease_unlocked(lease_id)?.ok_or_else(|| {
+            ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown lease")
+        })?;
+        let dispatch = lease.dispatch.as_mut().ok_or_else(invalid_lease_record)?;
+        if dispatch.dispatch_id != dispatch_id {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "surface dispatch id changed",
+            ));
+        }
+        let (dispatch_state, lease_state, disposition) = match dispatch.state {
+            ComputerDispatchState::Prepared => (
+                ComputerDispatchState::KnownNotInjected,
+                ComputerSurfaceLeaseState::Revoked,
+                "dispatch_failed_before_injection",
+            ),
+            ComputerDispatchState::Injected => (
+                ComputerDispatchState::Uncertain,
+                ComputerSurfaceLeaseState::Uncertain,
+                "dispatch_outcome_uncertain_after_injection",
+            ),
+            _ => {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::InvalidState,
+                    "surface dispatch is already terminal",
+                ))
+            }
+        };
+        dispatch.state = dispatch_state;
+        dispatch.completed_at = Some(now);
+        dispatch.error_code = Some(error_code);
+        lease.transition(lease_state, now, Some(disposition))?;
+        self.write_surface_lease_unlocked(&lease)?;
+        Ok(lease)
+    }
+
+    pub(crate) fn list_surface_leases(&self) -> ComputerResult<Vec<ComputerSurfaceLease>> {
+        let _guard = self.inner.lock.lock();
+        self.list_surface_leases_unlocked()
+    }
+
+    /// Acquire the conflict-domain lease before an Agent is allowed to
+    /// observe. This prevents multiple Agents from racing on mutually stale
+    /// frames of one physical foreground surface.
+    pub(crate) fn acquire_agent_surface_observation(
+        &self,
+        run_id: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<Option<ComputerSurfaceLease>> {
+        validate_id("run_id", run_id)?;
+        let run = self
+            .load_run(run_id)?
+            .ok_or_else(|| ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown run"))?;
+        let binding = run.work_attempt.clone().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "Agent Computer Run is missing its host-frozen WorkAttempt binding",
+            )
+        })?;
+        let mut active = self
+            .list_surface_leases()?
+            .into_iter()
+            .filter(|lease| lease.run_id == run_id && !lease.state.is_terminal())
+            .collect::<Vec<_>>();
+        if active.len() > 1 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Internal,
+                "Agent Computer Run owns multiple active surface leases",
+            ));
+        }
+        let lease = if let Some(lease) = active.pop() {
+            lease
+        } else {
+            let run_deadline = run.started_at.unwrap_or(run.created_at)
+                + Duration::seconds(run.limits.max_duration_secs as i64);
+            if run_deadline <= now {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::LimitReached,
+                    "computer run expired before a surface lease could be issued",
+                ));
+            }
+            self.queue_surface_lease(
+                HostSurfaceLeaseRequest {
+                    work_id: binding.work_id,
+                    work_attempt_id: binding.work_attempt_id,
+                    run_id: run_id.to_string(),
+                    priority: super::coordination::HostLeasePriority::Normal,
+                    expires_at: (now + Duration::minutes(1)).min(run_deadline),
+                },
+                now,
+            )?
+        };
+        match lease.state {
+            ComputerSurfaceLeaseState::Queued => {
+                let Some(granted) = self.grant_next_surface_lease(&run.surface, now)? else {
+                    return Ok(None);
+                };
+                if granted.lease_id == lease.lease_id {
+                    Ok(Some(granted))
+                } else {
+                    Ok(None)
+                }
+            }
+            ComputerSurfaceLeaseState::Granted => Ok(Some(lease)),
+            ComputerSurfaceLeaseState::Dispatching => Err(ComputerError::new(
+                ComputerErrorCode::InvalidState,
+                "Agent surface lease is already dispatching",
+            )),
+            _ => Err(invalid_lease_record()),
+        }
+    }
+
+    /// Freeze the exact host-stamped observation into the granted lease.
+    pub(crate) fn bind_surface_lease_observation(
+        &self,
+        lease_id: &str,
+        expected_revision: u64,
+        run_id: &str,
+        frame_epoch: u64,
+        freshness_tick: u64,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ComputerSurfaceLease> {
+        let _guard = self.inner.lock.lock();
+        let mut lease = self.load_surface_lease_unlocked(lease_id)?.ok_or_else(|| {
+            ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown lease")
+        })?;
+        if lease.revision != expected_revision
+            || lease.run_id != run_id
+            || lease.state != ComputerSurfaceLeaseState::Granted
+            || frame_epoch == 0
+            || freshness_tick == 0
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "surface lease changed before observation binding",
+            ));
+        }
+        let run = self
+            .load_run_unlocked(run_id)?
+            .ok_or_else(|| ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown run"))?;
+        let observation = run.current_observation.as_ref().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "Computer Run has no committed observation to bind",
+            )
+        })?;
+        if observation.authority.frame_epoch != frame_epoch
+            || observation.authority.freshness.tick != freshness_tick
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "Computer Run observation does not match the lease frame",
+            ));
+        }
+        lease.frame_epoch = Some(frame_epoch);
+        lease.revision = lease.revision.saturating_add(1);
+        lease.updated_at = now;
+        lease.assert_run_fence(&run)?;
+        self.assert_live_lease_surface(&lease)?;
+        self.write_surface_lease_unlocked(&lease)?;
+        Ok(lease)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_surface_lease(
+        &self,
+        lease_id: &str,
+    ) -> ComputerResult<Option<ComputerSurfaceLease>> {
+        let _guard = self.inner.lock.lock();
+        self.load_surface_lease_unlocked(lease_id)
+    }
+
+    /// Acquire and prepare the one physical dispatch for an Agent Run. This is
+    /// the production coordination seam used by `ComputerUseService::act`;
+    /// local-operator Runs continue through the existing singleton path.
+    pub(crate) fn acquire_agent_surface_dispatch(
+        &self,
+        run_id: &str,
+        request_id: &str,
+        payload_sha256: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ComputerDispatchClaim> {
+        validate_id("run_id", run_id)?;
+        validate_id("request_id", request_id)?;
+        validate_payload_digest(payload_sha256)?;
+        let run = self
+            .load_run(run_id)?
+            .ok_or_else(|| ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown run"))?;
+        run.work_attempt.as_ref().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "Agent Computer Run is missing its host-frozen WorkAttempt binding",
+            )
+        })?;
+        let mut active = self
+            .list_surface_leases()?
+            .into_iter()
+            .filter(|lease| lease.run_id == run_id && !lease.state.is_terminal())
+            .collect::<Vec<_>>();
+        if active.len() > 1 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Internal,
+                "Agent Computer Run owns multiple active surface leases",
+            ));
+        }
+        let lease = active.pop().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "Agent action requires a previously granted observation lease",
+            )
+        })?;
+        if lease.state == ComputerSurfaceLeaseState::Queued {
+            return Ok(ComputerDispatchClaim::Pending);
+        }
+        if lease.state == ComputerSurfaceLeaseState::Dispatching {
+            return Ok(
+                match lease.dispatch.as_ref().map(|dispatch| dispatch.state) {
+                    Some(ComputerDispatchState::Prepared) => ComputerDispatchClaim::Pending,
+                    Some(ComputerDispatchState::Injected | ComputerDispatchState::Uncertain) => {
+                        ComputerDispatchClaim::Uncertain
+                    }
+                    Some(_) => ComputerDispatchClaim::Replay(lease),
+                    None => return Err(invalid_lease_record()),
+                },
+            );
+        }
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"grokptah-computer-dispatch-v1\0");
+        hasher.update(run_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(request_id.as_bytes());
+        let dispatch_id = format!("{:x}", hasher.finalize());
+        self.prepare_surface_dispatch(
+            &lease.lease_id,
+            lease.revision,
+            &dispatch_id,
+            payload_sha256,
+            now,
+        )
+    }
+
+    pub(crate) fn revoke_surface_lease_before_dispatch(
+        &self,
+        lease_id: &str,
+        expected_revision: u64,
+        disposition: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ComputerSurfaceLease> {
+        validate_id("lease_id", lease_id)?;
+        validate_id("disposition", disposition)?;
+        let _guard = self.inner.lock.lock();
+        let mut lease = self.load_surface_lease_unlocked(lease_id)?.ok_or_else(|| {
+            ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown lease")
+        })?;
+        if lease.revision != expected_revision
+            || !matches!(
+                lease.state,
+                ComputerSurfaceLeaseState::Queued | ComputerSurfaceLeaseState::Granted
+            )
+            || lease.dispatch.is_some()
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "surface lease changed before revocation",
+            ));
+        }
+        lease.transition(ComputerSurfaceLeaseState::Revoked, now, Some(disposition))?;
+        self.write_surface_lease_unlocked(&lease)?;
+        Ok(lease)
     }
 
     pub(crate) fn replay_mutation(
@@ -564,6 +1325,15 @@ impl ComputerStore {
         Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
     }
 
+    fn surface_lease_path(&self, lease_id: &str) -> ComputerResult<PathBuf> {
+        let safe = safe_file_id(lease_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("surface-leases")
+            .join(format!("{safe}.json")))
+    }
+
     pub(crate) fn receipt_path(&self, request_id: &str) -> ComputerResult<PathBuf> {
         let safe = safe_file_id(request_id)?;
         Ok(self
@@ -588,6 +1358,174 @@ impl ComputerStore {
         }
         runs.sort_by(|a: &ComputerRun, b: &ComputerRun| b.created_at.cmp(&a.created_at));
         Ok(runs)
+    }
+
+    fn load_surface_lease_unlocked(
+        &self,
+        lease_id: &str,
+    ) -> ComputerResult<Option<ComputerSurfaceLease>> {
+        let path = self.surface_lease_path(lease_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        self.read_surface_lease_path(&path).map(Some)
+    }
+
+    fn list_surface_leases_unlocked(&self) -> ComputerResult<Vec<ComputerSurfaceLease>> {
+        let mut leases = Vec::new();
+        for path in json_paths(&self.inner.root.join("surface-leases")).map_err(internal_error)? {
+            leases.push(self.read_surface_lease_path(&path)?);
+        }
+        leases.sort_by(|left, right| {
+            left.queue_sequence
+                .cmp(&right.queue_sequence)
+                .then_with(|| left.lease_id.cmp(&right.lease_id))
+        });
+        Ok(leases)
+    }
+
+    /// Keep the durable lease ledger bounded without weakening a physical
+    /// dispatch fence. Active and uncertain records are never removed. Older
+    /// ordinary terminal records are retired by age first, then oldest-first
+    /// only as needed to reserve admission capacity.
+    fn prune_surface_leases_unlocked(
+        &self,
+        now: DateTime<Utc>,
+        reserve_slots: usize,
+    ) -> ComputerResult<Vec<ComputerSurfaceLease>> {
+        if reserve_slots > MAX_SURFACE_LEASES {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Internal,
+                "surface lease retention requested impossible capacity",
+            ));
+        }
+        let mut leases = self.list_surface_leases_unlocked()?;
+        let mut candidates: Vec<&ComputerSurfaceLease> = leases
+            .iter()
+            .filter(|lease| lease.state.is_retention_prunable())
+            .collect();
+        candidates.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.queue_sequence.cmp(&right.queue_sequence))
+                .then_with(|| left.lease_id.cmp(&right.lease_id))
+        });
+
+        let mut remove = HashSet::new();
+        for lease in &candidates {
+            if now.signed_duration_since(lease.updated_at) > TERMINAL_SURFACE_LEASE_AGE {
+                remove.insert(lease.lease_id.clone());
+            }
+        }
+        let retained_after_age = leases.len().saturating_sub(remove.len());
+        let capacity_prune = retained_after_age
+            .saturating_add(reserve_slots)
+            .saturating_sub(MAX_SURFACE_LEASES);
+        let capacity_retirements = candidates
+            .into_iter()
+            .filter(|lease| !remove.contains(&lease.lease_id))
+            .take(capacity_prune)
+            .map(|lease| lease.lease_id.clone())
+            .collect::<Vec<_>>();
+        remove.extend(capacity_retirements);
+
+        if !remove.is_empty() {
+            for lease_id in &remove {
+                fs::remove_file(self.surface_lease_path(lease_id)?).map_err(internal_error)?;
+            }
+            leases.retain(|lease| !remove.contains(&lease.lease_id));
+        }
+        Ok(leases)
+    }
+
+    fn write_surface_lease_unlocked(&self, lease: &ComputerSurfaceLease) -> ComputerResult<()> {
+        lease.validate()?;
+        atomic_write_json(&self.surface_lease_path(&lease.lease_id)?, lease).map_err(internal_error)
+    }
+
+    fn read_surface_lease_path(&self, path: &Path) -> ComputerResult<ComputerSurfaceLease> {
+        let lease: ComputerSurfaceLease = read_json(path).map_err(internal_error)?;
+        lease.validate()?;
+        if self.surface_lease_path(&lease.lease_id)? != path {
+            return Err(invalid_lease_record());
+        }
+        Ok(lease)
+    }
+
+    fn assert_live_lease_surface(&self, lease: &ComputerSurfaceLease) -> ComputerResult<()> {
+        let registry = self.inner.surfaces.lock();
+        let live = registry
+            .by_surface_id
+            .get(lease.surface.surface_id())
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "lease surface is not owned by the live host registry",
+                )
+            })?;
+        if live.binding != lease.surface
+            || live.input_domain_id != lease.input_domain_id
+            || live.conflict_domain_id != lease.conflict_domain_id
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "lease surface or conflict domain is stale or forged",
+            ));
+        }
+        if let Some(frame_epoch) = lease.frame_epoch {
+            if live.frame_epoch.load(Ordering::SeqCst) != frame_epoch {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::StaleObservation,
+                    "lease frame is no longer the exact current host surface frame",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn expire_surface_leases_unlocked(
+        &self,
+        leases: &mut [ComputerSurfaceLease],
+        now: DateTime<Utc>,
+    ) -> ComputerResult<()> {
+        for lease in leases {
+            if !lease.state.is_terminal() && lease.expires_at <= now {
+                if lease.state == ComputerSurfaceLeaseState::Dispatching {
+                    let dispatch = lease.dispatch.as_mut().ok_or_else(invalid_lease_record)?;
+                    match dispatch.state {
+                        ComputerDispatchState::Prepared => {
+                            dispatch.state = ComputerDispatchState::KnownNotInjected;
+                            dispatch.completed_at = Some(now);
+                            dispatch.error_code = Some(ComputerErrorCode::PermissionRevoked);
+                            lease.transition(
+                                ComputerSurfaceLeaseState::Revoked,
+                                now,
+                                Some("lease_expired_before_injection"),
+                            )?;
+                        }
+                        ComputerDispatchState::Injected => {
+                            dispatch.state = ComputerDispatchState::Uncertain;
+                            dispatch.completed_at = Some(now);
+                            dispatch.error_code = Some(ComputerErrorCode::UncertainOutcome);
+                            lease.transition(
+                                ComputerSurfaceLeaseState::Uncertain,
+                                now,
+                                Some("lease_expired_after_injection"),
+                            )?;
+                        }
+                        _ => return Err(invalid_lease_record()),
+                    }
+                } else {
+                    lease.transition(
+                        ComputerSurfaceLeaseState::Revoked,
+                        now,
+                        Some("lease_expired"),
+                    )?;
+                }
+                self.write_surface_lease_unlocked(lease)?;
+            }
+        }
+        Ok(())
     }
 
     fn recover_interrupted(&self) -> ComputerResult<()> {
@@ -642,6 +1580,55 @@ impl ComputerStore {
         Ok(())
     }
 
+    fn recover_surface_leases(&self) -> ComputerResult<()> {
+        let _guard = self.inner.lock.lock();
+        let now = Utc::now();
+        for path in json_paths(&self.inner.root.join("surface-leases")).map_err(internal_error)? {
+            let mut lease = self.read_surface_lease_path(&path)?;
+            if lease.state.is_terminal() {
+                continue;
+            }
+            match lease.state {
+                ComputerSurfaceLeaseState::Queued | ComputerSurfaceLeaseState::Granted => {
+                    lease.transition(
+                        ComputerSurfaceLeaseState::Revoked,
+                        now,
+                        Some("restart_invalidated_surface_incarnation"),
+                    )?;
+                }
+                ComputerSurfaceLeaseState::Dispatching => {
+                    let dispatch = lease.dispatch.as_mut().ok_or_else(invalid_lease_record)?;
+                    match dispatch.state {
+                        ComputerDispatchState::Prepared => {
+                            dispatch.state = ComputerDispatchState::KnownNotInjected;
+                            dispatch.completed_at = Some(now);
+                            dispatch.error_code = Some(ComputerErrorCode::Interrupted);
+                            lease.transition(
+                                ComputerSurfaceLeaseState::Revoked,
+                                now,
+                                Some("restart_before_physical_injection"),
+                            )?;
+                        }
+                        ComputerDispatchState::Injected => {
+                            dispatch.state = ComputerDispatchState::Uncertain;
+                            dispatch.completed_at = Some(now);
+                            dispatch.error_code = Some(ComputerErrorCode::UncertainOutcome);
+                            lease.transition(
+                                ComputerSurfaceLeaseState::Uncertain,
+                                now,
+                                Some("restart_after_physical_injection"),
+                            )?;
+                        }
+                        _ => return Err(invalid_lease_record()),
+                    }
+                }
+                _ => return Err(invalid_lease_record()),
+            }
+            self.write_surface_lease_unlocked(&lease)?;
+        }
+        Ok(())
+    }
+
     fn recover_receipts(&self) -> ComputerResult<()> {
         let _guard = self.inner.lock.lock();
         for path in json_paths(&self.inner.root.join("receipts")).map_err(internal_error)? {
@@ -692,6 +1679,7 @@ impl ComputerStore {
                 fs::remove_file(path).map_err(internal_error)?;
             }
         }
+        self.prune_surface_leases_unlocked(now, 0)?;
         Ok(())
     }
 
@@ -744,6 +1732,19 @@ fn migrate_run_record(run: &mut ComputerRun) -> ComputerResult<bool> {
             .session_id()
             .is_some_and(|session_id| session_id != run.owner_session_id)
     }) {
+        run.initiating_principal = None;
+        untrusted = true;
+        changed = true;
+    }
+    if run
+        .initiating_principal
+        .as_ref()
+        .is_some_and(|principal| principal.agent_id().is_some())
+        && run.work_attempt.is_none()
+    {
+        // Pre-coordination Agent-shaped principals were never backed by an
+        // exact host-resolved WorkAttempt and cannot be grandfathered into
+        // authority merely because their string shape is valid.
         run.initiating_principal = None;
         untrusted = true;
         changed = true;
@@ -883,6 +1884,17 @@ fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
         if principal
             .session_id()
             .is_some_and(|session_id| session_id != run.owner_session_id)
+        {
+            return Err(invalid_record());
+        }
+    }
+    if let Some(binding) = &run.work_attempt {
+        binding.validate()?;
+        let Some(principal) = &run.initiating_principal else {
+            return Err(invalid_record());
+        };
+        if principal.agent_id() != Some(binding.agent_id.as_str())
+            || principal.agent_spec_revision() != Some(binding.agent_spec_revision)
         {
             return Err(invalid_record());
         }
@@ -1148,6 +2160,177 @@ mod tests {
             display_name: "Demo".into(),
             sensitivity: crate::computer_use::Sensitivity::None,
         }
+    }
+
+    fn terminal_surface_lease(
+        sequence: u64,
+        state: ComputerSurfaceLeaseState,
+        now: DateTime<Utc>,
+    ) -> ComputerSurfaceLease {
+        let dispatch = match state {
+            ComputerSurfaceLeaseState::Released => Some(ComputerDispatchRecord {
+                schema_version: COMPUTER_DISPATCH_SCHEMA_VERSION,
+                dispatch_id: format!("dispatch-{sequence}"),
+                payload_sha256: "a".repeat(64),
+                state: ComputerDispatchState::Acknowledged,
+                prepared_at: now - Duration::seconds(2),
+                injected_at: Some(now - Duration::seconds(1)),
+                completed_at: Some(now),
+                outcome_sha256: Some("b".repeat(64)),
+                error_code: None,
+            }),
+            ComputerSurfaceLeaseState::Uncertain => Some(ComputerDispatchRecord {
+                schema_version: COMPUTER_DISPATCH_SCHEMA_VERSION,
+                dispatch_id: format!("dispatch-{sequence}"),
+                payload_sha256: "a".repeat(64),
+                state: ComputerDispatchState::Uncertain,
+                prepared_at: now - Duration::seconds(2),
+                injected_at: Some(now - Duration::seconds(1)),
+                completed_at: Some(now),
+                outcome_sha256: None,
+                error_code: Some(ComputerErrorCode::UncertainOutcome),
+            }),
+            _ => None,
+        };
+        let lease = ComputerSurfaceLease {
+            schema_version: COMPUTER_SURFACE_LEASE_SCHEMA_VERSION,
+            lease_id: format!("lease-{sequence}"),
+            work_id: format!("work-{sequence}"),
+            work_attempt_id: format!("attempt-{sequence}"),
+            agent_id: format!("agent-{sequence}"),
+            agent_spec_revision: 1,
+            run_id: format!("run-{sequence}"),
+            surface: ComputerSurfaceBinding::issue(),
+            authority_epoch: 1,
+            control_epoch: 1,
+            frame_epoch: dispatch.as_ref().map(|_| 1),
+            input_domain_id: format!("input-{sequence}"),
+            conflict_domain_id: format!("conflict-{sequence}"),
+            revision: 1,
+            expires_at: now + Duration::minutes(1),
+            queue_sequence: sequence,
+            priority: super::super::coordination::HostLeasePriority::Normal,
+            state,
+            dispatch,
+            disposition: Some("retention_fixture".into()),
+            created_at: now - Duration::minutes(1),
+            updated_at: now,
+        };
+        lease.validate().unwrap();
+        lease
+    }
+
+    fn ready_agent_run_for_surface_lease(
+        store: &ComputerStore,
+        suffix: &str,
+        now: DateTime<Utc>,
+    ) -> (ComputerRun, HostSurfaceLeaseRequest) {
+        let domain = PhysicalInputDomain::attested("test", &format!("retention-{suffix}")).unwrap();
+        let surface = store.intern_physical_domain(&domain).unwrap();
+        let agent_id = format!("agent-retention-{suffix}");
+        let work_id = format!("work-retention-{suffix}");
+        let attempt_id = format!("attempt-retention-{suffix}");
+        let proof = surface
+            .stamp_proof(
+                crate::computer_use::ComputerCapabilityProof::ForegroundSemantic {
+                    backend_id: "test_foreground".into(),
+                    observe: true,
+                    semantic_actions: true,
+                    text_entry: true,
+                },
+            )
+            .unwrap();
+        let mut run = ComputerRun::new_with_isolation(
+            Uuid::new_v4(),
+            Some(format!("/tmp/workspace-retention-{suffix}")),
+            target(),
+            ComputerUseLimits::default(),
+            ComputerPrincipal::from_host_agent_record(&agent_id, 1).unwrap(),
+            surface.binding,
+            proof,
+        )
+        .unwrap();
+        run.work_attempt = Some(crate::computer_use::ComputerWorkAttemptBinding {
+            work_id: work_id.clone(),
+            work_attempt_id: attempt_id.clone(),
+            agent_id,
+            agent_spec_revision: 1,
+        });
+        run.transition(ComputerRunState::Ready).unwrap();
+        store.save_run(&run).unwrap();
+        let request = HostSurfaceLeaseRequest {
+            work_id,
+            work_attempt_id: attempt_id,
+            run_id: run.run_id.clone(),
+            priority: super::super::coordination::HostLeasePriority::Normal,
+            expires_at: now + Duration::minutes(1),
+        };
+        (run, request)
+    }
+
+    #[test]
+    fn ordinary_terminal_surface_leases_make_room_for_new_work() {
+        let dir = tempdir().unwrap();
+        let store = ComputerStore::open(dir.path()).unwrap();
+        let now = Utc::now();
+        for sequence in 1..=MAX_SURFACE_LEASES as u64 {
+            let lease = terminal_surface_lease(sequence, ComputerSurfaceLeaseState::Released, now);
+            store.write_surface_lease_unlocked(&lease).unwrap();
+        }
+        assert_eq!(
+            store.list_surface_leases().unwrap().len(),
+            MAX_SURFACE_LEASES
+        );
+
+        let (_, request) = ready_agent_run_for_surface_lease(&store, "new-work", now);
+        let queued = store.queue_surface_lease(request, now).unwrap();
+        assert_eq!(queued.state, ComputerSurfaceLeaseState::Queued);
+        assert_eq!(queued.queue_sequence, MAX_SURFACE_LEASES as u64 + 1);
+        let retained = store.list_surface_leases().unwrap();
+        assert_eq!(retained.len(), MAX_SURFACE_LEASES);
+        assert!(retained
+            .iter()
+            .any(|lease| lease.lease_id == queued.lease_id));
+        assert!(retained.iter().all(|lease| lease.lease_id != "lease-1"));
+    }
+
+    #[test]
+    fn uncertain_surface_leases_are_never_pruned_for_capacity() {
+        let dir = tempdir().unwrap();
+        let store = ComputerStore::open(dir.path()).unwrap();
+        let now = Utc::now();
+        for sequence in 1..=MAX_SURFACE_LEASES as u64 {
+            let lease = terminal_surface_lease(sequence, ComputerSurfaceLeaseState::Uncertain, now);
+            store.write_surface_lease_unlocked(&lease).unwrap();
+        }
+        let (_, request) = ready_agent_run_for_surface_lease(&store, "uncertain-full", now);
+        let error = store.queue_surface_lease(request, now).unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::LimitReached);
+        let retained = store.list_surface_leases().unwrap();
+        assert_eq!(retained.len(), MAX_SURFACE_LEASES);
+        assert!(retained
+            .iter()
+            .all(|lease| lease.state == ComputerSurfaceLeaseState::Uncertain));
+    }
+
+    #[test]
+    fn reopen_ages_out_only_replay_safe_terminal_surface_leases() {
+        let dir = tempdir().unwrap();
+        let old = Utc::now() - TERMINAL_SURFACE_LEASE_AGE - Duration::minutes(1);
+        {
+            let store = ComputerStore::open(dir.path()).unwrap();
+            let released = terminal_surface_lease(1, ComputerSurfaceLeaseState::Released, old);
+            let uncertain = terminal_surface_lease(2, ComputerSurfaceLeaseState::Uncertain, old);
+            store.write_surface_lease_unlocked(&released).unwrap();
+            store.write_surface_lease_unlocked(&uncertain).unwrap();
+        }
+
+        let store = ComputerStore::open(dir.path()).unwrap();
+        assert!(store.load_surface_lease("lease-1").unwrap().is_none());
+        assert_eq!(
+            store.load_surface_lease("lease-2").unwrap().unwrap().state,
+            ComputerSurfaceLeaseState::Uncertain
+        );
     }
 
     #[test]

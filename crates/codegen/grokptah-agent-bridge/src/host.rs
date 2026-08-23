@@ -3126,6 +3126,87 @@ impl AgentHostHandle {
             .map_err(|error| anyhow!(error))
     }
 
+    /// Host-owned Computer Use Agent issuance. Resolves the durable Agent and
+    /// exact current immutable spec revision on every call. Public callers
+    /// cannot turn an Agent-shaped string into Computer Use authority.
+    pub(crate) fn computer_agent_token(
+        &self,
+        agent_id: &str,
+    ) -> Result<crate::computer_use::ComputerAuthorityToken> {
+        let store = self.ensure_orchestration_store()?;
+        let agent = store
+            .load_agent(agent_id)?
+            .ok_or_else(|| anyhow!("unknown Agent cannot issue Computer Use authority"))?;
+        if !agent.state.is_active_identity() {
+            bail!("inactive Agent cannot issue Computer Use authority");
+        }
+        let spec = agent.current_spec()?;
+        if !spec.authority.computer_use_allowed {
+            bail!("Agent specification does not allow Computer Use");
+        }
+        let revision = spec.revision;
+        crate::computer_use::ComputerAuthorityToken::agent_from_host_record(
+            &agent.agent_id,
+            revision,
+        )
+        .map_err(|error| anyhow!(error))
+    }
+
+    /// Admit an Agent-owned Computer Run only after resolving the exact
+    /// durable Work, active WorkAttempt, assigned Agent, and current AgentSpec.
+    /// The request cannot supply its own session, workspace, Agent, or spec.
+    pub fn create_agent_computer_run(
+        &self,
+        service: &crate::computer_use::ComputerUseService,
+        request: crate::computer_use::AgentComputerRunRequest,
+    ) -> Result<crate::computer_use::ComputerRun> {
+        request.validate().map_err(|error| anyhow!(error))?;
+        let store = self.ensure_orchestration_store()?;
+        service
+            .bind_agent_work_store(store.clone())
+            .map_err(|error| anyhow!(error))?;
+        let work = store
+            .load_work_item(&request.work_id)?
+            .ok_or_else(|| anyhow!("unknown Work cannot acquire Computer Use"))?;
+        let attempt = store
+            .load_work_attempt(&request.work_attempt_id)?
+            .ok_or_else(|| anyhow!("unknown WorkAttempt cannot acquire Computer Use"))?;
+        if attempt.work_id != work.work_id || !attempt.state.is_active() {
+            bail!("Computer Use requires the exact active WorkAttempt");
+        }
+        let agent_id = work
+            .assigned_agent_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("Computer Use Work is not assigned to a durable Agent"))?
+            .to_string();
+        if attempt.claimant_id != agent_id {
+            bail!("Computer Use WorkAttempt claimant does not match its assigned Agent");
+        }
+        let token = self.computer_agent_token(&agent_id)?;
+        let spec_revision = token
+            .principal()
+            .agent_spec_revision()
+            .ok_or_else(|| anyhow!("host-issued Agent authority is missing its spec revision"))?;
+        service
+            .create_agent_run(
+                &token,
+                crate::computer_use::ResolvedAgentComputerRunAdmission {
+                    request_id: request.request_id,
+                    owner_session_id: work.session_id,
+                    binding: crate::computer_use::ComputerWorkAttemptBinding {
+                        work_id: work.work_id,
+                        work_attempt_id: attempt.attempt_id,
+                        agent_id,
+                        agent_spec_revision: spec_revision,
+                    },
+                    workspace: work.workspace,
+                    target: request.target,
+                    limits: request.limits,
+                },
+            )
+            .map_err(|error| anyhow!(error))
+    }
+
     /// Full transcript for hydrating a session tab (loads JSONL on demand).
     pub fn session_transcript(&self, id: Uuid) -> Result<Vec<TranscriptEntry>> {
         self.ensure_transcript_loaded(id)?;
@@ -11255,6 +11336,230 @@ mod computer_agent_host_tests {
             "archiving the live Lane must fail closed: {archived_live}"
         );
 
+        drop(host);
+        crate::set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn agent_computer_run_admission_resolves_exact_durable_work_identity() {
+        let _serial = crate::home_override_serial();
+        let home = tempfile::tempdir().unwrap();
+        let computer_root = home.path().join("computer-use-test");
+        crate::set_grokptah_home_override(Some(home.path().to_path_buf()));
+
+        let host = AgentHost::create(HostConfig::default());
+        host.start().unwrap();
+        let lane = host.session_new().unwrap();
+        let agent = host.ensure_session_agent(lane.id).unwrap();
+        let default_denial = host.computer_agent_token(&agent.agent_id).unwrap_err();
+        assert!(default_denial
+            .to_string()
+            .contains("does not allow Computer Use"));
+        let store = host.ensure_orchestration_store().unwrap();
+        let agent = store
+            .revise_agent_spec(&agent.agent_id, "test", |spec| {
+                spec.authority.computer_use_allowed = true;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        let work = host
+            .create_work_item(
+                lane.id,
+                "computer_review".into(),
+                "inspect one isolated surface".into(),
+                0,
+                false,
+            )
+            .unwrap();
+        let work = host
+            .assign_work_item(
+                lane.id,
+                &work.work_id,
+                Some(agent.agent_id.clone()),
+                Some(work.revision),
+            )
+            .unwrap();
+        let claim = store
+            .claim_work(&work.work_id, &agent.agent_id, None)
+            .unwrap();
+        let backend = Arc::new(crate::computer_use::SimulatorBackend::independently_isolated());
+        let service = crate::computer_use::ComputerUseService::new_simulator(
+            backend.clone(),
+            crate::computer_use::ComputerStore::open(&computer_root).unwrap(),
+        );
+        let target = crate::computer_use::SimulatorBackend::demo_target();
+        let request = |request_id: &str, work_id: &str, attempt_id: &str| {
+            crate::computer_use::AgentComputerRunRequest {
+                request_id: request_id.into(),
+                work_id: work_id.into(),
+                work_attempt_id: attempt_id.into(),
+                target: target.clone(),
+                limits: crate::computer_use::ComputerUseLimits::default(),
+            }
+        };
+
+        let run = host
+            .create_agent_computer_run(
+                &service,
+                request(
+                    "host-agent-computer-create",
+                    &work.work_id,
+                    &claim.attempt.attempt_id,
+                ),
+            )
+            .unwrap();
+        let token = host.computer_agent_token(&agent.agent_id).unwrap();
+        let now = Utc::now();
+        let run = service
+            .authorize(
+                "host-agent-computer-authorize",
+                &token,
+                &run.run_id,
+                run.version,
+                crate::computer_use::ActionGrant::for_run(
+                    &run,
+                    std::collections::BTreeSet::from([crate::computer_use::ActionClass::Semantic]),
+                    now,
+                    now + chrono::Duration::minutes(1),
+                    Some(1),
+                ),
+            )
+            .unwrap();
+        let binding = run.work_attempt.as_ref().unwrap();
+        assert_eq!(binding.work_id, work.work_id);
+        assert_eq!(binding.work_attempt_id, claim.attempt.attempt_id);
+        assert_eq!(binding.agent_id, agent.agent_id);
+        assert_eq!(
+            binding.agent_spec_revision,
+            agent.current_spec().unwrap().revision
+        );
+        assert_eq!(run.owner_session_id, lane.id);
+        assert_eq!(run.workspace.as_deref(), Some(work.workspace.as_str()));
+
+        let _observed = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(service.observe(
+                "host-agent-computer-observe-before-cancel",
+                &token,
+                &run.run_id,
+                run.version,
+            ))
+            .unwrap();
+
+        let other = host
+            .create_work_item(
+                lane.id,
+                "computer_review".into(),
+                "must not borrow another WorkAttempt".into(),
+                0,
+                false,
+            )
+            .unwrap();
+        let other = host
+            .assign_work_item(
+                lane.id,
+                &other.work_id,
+                Some(agent.agent_id.clone()),
+                Some(other.revision),
+            )
+            .unwrap();
+        let cross_work = host
+            .create_agent_computer_run(
+                &service,
+                request(
+                    "host-agent-computer-cross-work",
+                    &other.work_id,
+                    &claim.attempt.attempt_id,
+                ),
+            )
+            .unwrap_err();
+        assert!(cross_work.to_string().contains("exact active WorkAttempt"));
+
+        let other_claim = store
+            .claim_work(&other.work_id, &agent.agent_id, None)
+            .unwrap();
+        let stale_spec_run = host
+            .create_agent_computer_run(
+                &service,
+                request(
+                    "host-agent-computer-stale-spec-create",
+                    &other.work_id,
+                    &other_claim.attempt.attempt_id,
+                ),
+            )
+            .unwrap();
+        store
+            .revise_agent_spec(&agent.agent_id, "test", |_spec| Ok(()))
+            .unwrap();
+        let stale_spec_error = service
+            .authorize(
+                "host-agent-computer-stale-spec-authorize",
+                &token,
+                &stale_spec_run.run_id,
+                stale_spec_run.version,
+                crate::computer_use::ActionGrant::for_run(
+                    &stale_spec_run,
+                    std::collections::BTreeSet::from([crate::computer_use::ActionClass::Semantic]),
+                    now,
+                    now + chrono::Duration::minutes(1),
+                    Some(1),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            stale_spec_error.code,
+            crate::computer_use::ComputerErrorCode::PermissionRevoked
+        );
+
+        store
+            .cancel_work(&work.work_id, "test terminalization")
+            .unwrap();
+        let denied_replay = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(service.observe(
+                "host-agent-computer-observe-before-cancel",
+                &token,
+                &run.run_id,
+                run.version,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            denied_replay.code,
+            crate::computer_use::ComputerErrorCode::PermissionRevoked
+        );
+        let inactive = host
+            .create_agent_computer_run(
+                &service,
+                request(
+                    "host-agent-computer-inactive",
+                    &work.work_id,
+                    &claim.attempt.attempt_id,
+                ),
+            )
+            .unwrap_err();
+        assert!(inactive.to_string().contains("exact active WorkAttempt"));
+        let denied_observation = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(service.observe(
+                "host-agent-computer-observe-after-cancel",
+                &token,
+                &run.run_id,
+                run.version,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            denied_observation.code,
+            crate::computer_use::ComputerErrorCode::PermissionRevoked
+        );
+        assert_eq!(service.list_runs().unwrap().len(), 2);
+        assert_eq!(
+            service.get_run(&run.run_id).unwrap().unwrap().state,
+            crate::computer_use::ComputerRunState::Ready
+        );
+        assert_eq!(backend.action_attempt_count(), 0);
+
+        host.stop().unwrap();
         drop(host);
         crate::set_grokptah_home_override(None);
     }
