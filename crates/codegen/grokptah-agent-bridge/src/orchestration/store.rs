@@ -1668,13 +1668,13 @@ impl OrchStore {
     /// Compensate an unstarted admission. Writes a durable abort journal first,
     /// then terminalizes the Run, settles quota, and clears Agent activation.
     /// The Run identity is retained. Cleanup failure is never ignored.
-    pub fn abort_unstarted_run_admission(&self, run_id: &str) -> anyhow::Result<()> {
+    /// Callers must match [`DurableAdmission`]; Uncertain is not a zero-effect `Err`.
+    pub fn abort_unstarted_run_admission(&self, run_id: &str) -> DurableAdmission {
         self.terminalize_unstarted_admission(
             run_id,
             "admission_aborted",
             "unstarted admission was compensated before provider start",
         )
-        .into_result()
     }
 
     pub fn terminalize_unstarted_admission(

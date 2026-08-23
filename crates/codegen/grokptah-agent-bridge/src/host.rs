@@ -2979,7 +2979,7 @@ impl AgentHostHandle {
             crate::orchestration::DurableAdmission::Committed => Ok(()),
             crate::orchestration::DurableAdmission::DefinitelyNotCommitted(error) => Err(error),
             crate::orchestration::DurableAdmission::Uncertain(error) => {
-                Err(anyhow!("durable admission is uncertain: {error}"))
+                Err(crate::orchestration::UncertainAdmission(error).into())
             }
         }
     }
@@ -3179,9 +3179,9 @@ impl AgentHostHandle {
                 return Err(Self::map_desktop_admission_error(error));
             }
             crate::orchestration::DurableAdmission::Uncertain(error) => {
-                return Err(Self::map_desktop_admission_error(anyhow!(
-                    "durable admission is uncertain: {error}"
-                )));
+                return Err(Self::map_desktop_admission_error(
+                    crate::orchestration::UncertainAdmission(error).into(),
+                ));
             }
         }
         #[cfg(test)]

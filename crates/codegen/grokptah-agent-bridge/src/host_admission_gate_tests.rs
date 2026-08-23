@@ -11,8 +11,8 @@ use crate::gateway_config::{
 };
 use crate::native_coding_readiness::DESKTOP_OWNER_ID;
 use crate::orchestration::{
-    AuthContext, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService, RunBounds,
-    WorkspaceAllowlist,
+    AdmissionPersistCut, AuthContext, OrchError, OrchErrorCode, OrchestrationConfig,
+    OrchestrationService, RunBounds, UncertainAdmission, WorkspaceAllowlist,
 };
 use crate::orchestration::{
     QuotaClass, QuotaLimits, QuotaReservation, DEFAULT_MAX_IN_FLIGHT_RESERVATIONS,
@@ -300,6 +300,14 @@ fn session_prompt_inner_must_admit_before_session_mutation() {
     assert!(
         host_src.contains("require_durable_admission"),
         "compensation must match DurableAdmission instead of collapsing Uncertain"
+    );
+    assert!(
+        host_src.contains("UncertainAdmission"),
+        "Uncertain desktop admission must remain a typed UncertainAdmission error"
+    );
+    assert!(
+        !host_src.contains("durable admission is uncertain: {error}"),
+        "Uncertain must not be rewritten as an ordinary anyhow string error"
     );
 }
 
@@ -857,6 +865,38 @@ async fn already_service_admitted_frozen_route_does_not_double_reserve() {
             .reservation_id,
         "quota-frozen-external"
     );
+    host.stop().unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn uncertain_persist_cut_is_typed_and_does_not_start_provider() {
+    let (base_url, requests, server) = spawn_xai_sse().await;
+    let mut home = IsolatedHome::enter();
+    home.remove("GROKPTAH_AGENT_OFFLINE");
+    home.set("XAI_API_BASE", &base_url);
+    home.set("XAI_API_KEY", "synthetic-p2-uncertain-key");
+    save_measured_history(&base_url, "grok-route");
+    let (host, lane_id, _workspace) = xai_host("grok-route");
+    let store = host.ensure_orchestration_store().unwrap();
+    store.set_persist_cut(Some(AdmissionPersistCut::AfterQuota));
+    let before_title = host.session_inspect(lane_id).unwrap().title;
+    let before_transcript = host.session_transcript(lane_id).unwrap();
+    let mut events = host.subscribe_events();
+    let error = host
+        .session_prompt_with_max_rounds(lane_id, "must not dispatch".into(), Some(1))
+        .await
+        .unwrap_err();
+    assert!(
+        UncertainAdmission::is(&error),
+        "desktop Uncertain must stay typed, not an ordinary zero-effect error: {error}"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert!(store.list_provider_attempts().unwrap().is_empty());
+    assert!(!store.list_quota_reservations().unwrap().is_empty());
+    assert_session_unmutated(&host, lane_id, &before_title, &before_transcript, None);
+    drain_turn_started(&mut events);
     host.stop().unwrap();
     server.abort();
 }
