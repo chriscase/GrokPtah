@@ -5,13 +5,17 @@
 //! remain on `MemoryAccess` inside the crate. There are no live provider
 //! calls, sleeps, or Tokio-time claims.
 
-use grokptah_agent_bridge::MemoryScope;
+use grokptah_agent_bridge::{MemoryLongHorizonEvidence, MemoryScope};
 use serde::Deserialize;
 use serde_json::Value;
 
 const FIXTURE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../evals/certification-lab/replay-fixtures/memory-long-horizon.v1.json"
+));
+const EVIDENCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../docs/evidence/memory-long-horizon-campaign-v1.json"
 ));
 
 /// Runtime-only canary. Must never appear in errors, debug codes, or the fixture.
@@ -165,4 +169,18 @@ fn long_horizon_fixture_is_typed_deny_unknown_and_secret_free() {
         team_id: fixture.scopes.team_id.clone(),
     }
     .label();
+}
+
+#[test]
+fn retained_logical_years_evidence_is_digest_bound_but_not_overclaimed() {
+    let evidence: MemoryLongHorizonEvidence =
+        serde_json::from_str(EVIDENCE).expect("retained memory evidence JSON");
+    evidence
+        .validate()
+        .expect("retained memory evidence validates");
+    assert!(!evidence.certification_ready());
+    assert_eq!(evidence.logical_years, 10);
+    assert_eq!(evidence.scopes.len(), 3);
+    assert!(!EVIDENCE.to_ascii_lowercase().contains("api_key"));
+    assert!(!EVIDENCE.contains("bearer"));
 }

@@ -415,7 +415,9 @@ and host parity before treating hosted memory as production-shaped).
 bounds ([`MEMORY_SCOPES.md`](MEMORY_SCOPES.md), `memory.rs`,
 `tests/memory_scopes.rs`). Team scope is denied unless host policy approves
 an ID. The candidate now includes a digest-bound `MemoryLongHorizonEvidence`
-schema for the eventual retained campaign report, but there is **no**
+schema and one retained deterministic campaign artifact
+([`docs/evidence/memory-long-horizon-campaign-v1.json`](evidence/memory-long-horizon-campaign-v1.json));
+it remains ineligible for the full exit because there is **no** complete
 accelerated logical-years retention proof, no
 revision/supersession/expiry/conflict protocol beyond exact-text
 deduplication, no compaction/retrieval-quality eval, and no Manager frozen

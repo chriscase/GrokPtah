@@ -209,7 +209,10 @@ unrelated signal.
 - A typed, digest-bound `MemoryLongHorizonEvidence` contract now exists for
   the deterministic logical-years campaign. It requires the three memory
   scopes, ten logical years, exact quality oracles, storage/reopen bounds, and
-  a secret-free evidence digest; no retained campaign artifact is claimed yet.
+  a secret-free evidence digest. The retained deterministic artifact is
+  [`docs/evidence/memory-long-horizon-campaign-v1.json`](evidence/memory-long-horizon-campaign-v1.json)
+  at candidate `47d7f71`; it deliberately has `claim_eligible: false` until
+  Manager attribution and the remaining crash/retention gates are proven.
 - The candidate's 10-minute Always-On soak was attempted and stopped before
   execution because the sandbox denied the fake provider's loopback bind
   (`Operation not permitted`); no soak evidence is claimed.
