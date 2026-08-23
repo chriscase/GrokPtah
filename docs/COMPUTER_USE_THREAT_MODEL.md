@@ -51,6 +51,7 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 | Uncertain physical outcome followed by another Agent | The exact physical conflict domain remains poisoned until explicit reconciliation; another Agent cannot observe or dispatch there, while an independently attested isolated domain remains usable | `uncertain_dispatch_poison_is_exact_to_its_physical_input_domain` |
 | Stop/Take over versus in-flight action completion | Proven that cancellation wins and late completion becomes `uncertain` without incrementing action count. Takeover is durable bookkeeping-safe, not physically preemptive inside the native action gate | `ComputerUseService::cancellation_wins_over_an_inflight_action_completion`; desktop cockpit takeover tests |
 | Cockpit closed, Lane switched/archived, preview captured, or another approval read | App shell retains an exact Run binding and emergency controls; unique discovery fails closed on ambiguity; previews are excluded; approvals are per Run. Non-foreground owners receive only an opaque revoking-control token | `cockpit_discovery_fails_closed_when_multiple_runs_need_exact_binding`; `one_shot_preview_cannot_become_the_app_owned_control_surface`; `background_owner_retains_only_out_of_band_emergency_control`; `PersistentComputerRuns` tests |
+| App reload, session switch, bounded-journal eviction, or cursor expiry | The stacked app shell replays typed, redaction-safe events against the exact app-owned session/Run identity. Its cursor persists across reloads; an expired or initially truncated window becomes a sticky visible gap while the retained tail resumes. A gap never disables Stop or becomes “complete” later | `app_owned_event_replay_is_typed_cursor_addressed_and_owner_scoped`; `legacy_audit_rows_gain_typed_surface_events_only_at_projection`; `computerRunReplay` and `PersistentComputerRuns` tests |
 | Restart during a run or mutation | Proven: active runs become `interrupted`, grants/observations clear, and claimed receipts become `uncertain` | durable store restart tests |
 | Evidence size, retention, integrity, and path leakage | Proven bounded evidence, hash/length verification, atomic records, retention, and opaque asset IDs | service evidence tests; store retention/integrity tests; `docs/COMPUTER_USE.md` |
 | Model/provider change during Computer inference | Proven at the model boundary; ephemeral qualification is cleared and late proposals are rejected | `computer_agent` and desktop proposal revalidation tests |
@@ -75,7 +76,8 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
   surface; hidden windows, separate Spaces, and global `CGEvent` injection do not qualify. Stage 1
   only makes isolation a typed, host-enforced contract. Remaining stages: authenticated isolated
   helper/input domain; out-of-band preemptive takeover after native entry; semantic-first isolated
-  visual fallback; cockpit agent cursor and always-available Stop.
+  visual fallback; cockpit agent attention position/cursor. Persistent Stop is present in the
+  stacked app-owned surface candidate, but remains part of the packaged acceptance gate.
 
 ## Verification command
 

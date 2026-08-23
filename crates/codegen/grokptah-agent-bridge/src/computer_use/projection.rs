@@ -26,8 +26,8 @@ use uuid::Uuid;
 
 use super::types::{
     ActionClass, ComputerCapabilities, ComputerControlDisposition, ComputerError,
-    ComputerErrorCode, ComputerRun, ComputerRunState, ComputerUseLimits, GrantIssuer,
-    SemanticAction, Sensitivity,
+    ComputerErrorCode, ComputerRun, ComputerRunState, ComputerSurfaceEvent, ComputerUseLimits,
+    GrantIssuer, SemanticAction, Sensitivity,
 };
 
 /// Hard ceiling on one event page regardless of the requested limit.
@@ -331,6 +331,7 @@ pub struct ComputerLocalGrant {
 pub struct ComputerLocalAuditEntry {
     pub sequence: u64,
     pub at: DateTime<Utc>,
+    pub surface_event: ComputerSurfaceEvent,
     pub operation: String,
     pub disposition: String,
     pub action_class: Option<ActionClass>,
@@ -420,6 +421,7 @@ impl ComputerLocalApproval {
                 .map(|entry| ComputerLocalAuditEntry {
                     sequence: entry.sequence,
                     at: entry.at,
+                    surface_event: entry.projected_surface_event(),
                     operation: entry.operation.clone(),
                     disposition: entry.disposition.clone(),
                     action_class: entry.action_class,
@@ -612,6 +614,7 @@ pub(super) fn project_events(
         .filter(|entry| after_seq.is_none_or(|after| entry.sequence > after))
         .cloned()
         .map(|mut entry| {
+            entry.surface_event = entry.projected_surface_event();
             entry.observation_id = entry
                 .observation_id
                 .as_deref()
@@ -923,12 +926,38 @@ mod tests {
             BTreeSet::from([
                 "sequence",
                 "at",
+                "surfaceEvent",
                 "operation",
                 "disposition",
                 "actionClass",
                 "observationId",
                 "errorCode",
             ])
+        );
+        assert_eq!(
+            page.entries[0].surface_event,
+            ComputerSurfaceEvent::RunCreated
+        );
+    }
+
+    #[test]
+    fn legacy_audit_rows_gain_typed_surface_events_only_at_projection() {
+        let mut run = run();
+        run.record_audit("observe", "completed", None, Some("frame-1".into()), None);
+        run.audit[0].surface_event = ComputerSurfaceEvent::Unknown;
+
+        assert_eq!(
+            project_events(&run, None, 10).entries[0].surface_event,
+            ComputerSurfaceEvent::ObservationReady
+        );
+        assert_eq!(
+            ComputerLocalApproval::from_run(&run).audit[0].surface_event,
+            ComputerSurfaceEvent::ObservationReady
+        );
+        assert_eq!(
+            run.audit[0].surface_event,
+            ComputerSurfaceEvent::Unknown,
+            "read projections must not rewrite durable legacy evidence"
         );
     }
 
@@ -1132,6 +1161,7 @@ mod tests {
                 "audit".into(),
                 "audit[].sequence".into(),
                 "audit[].at".into(),
+                "audit[].surfaceEvent".into(),
                 "audit[].operation".into(),
                 "audit[].disposition".into(),
                 "audit[].actionClass".into(),

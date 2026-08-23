@@ -111,6 +111,7 @@ pub fn run() {
             commands::computer_use_list_targets,
             commands::computer_use_observe_once,
             commands::computer_use_cockpit_snapshot,
+            commands::computer_use_cockpit_events,
             commands::computer_use_cockpit_agent_eligibility,
             commands::computer_use_cockpit_qualify_agent,
             commands::computer_use_cockpit_propose_agent_action,

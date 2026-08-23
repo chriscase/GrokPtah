@@ -868,6 +868,22 @@ pub fn computer_use_cockpit_snapshot(
 }
 
 #[tauri::command]
+pub fn computer_use_cockpit_events(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    after_seq: Option<u64>,
+    limit: Option<usize>,
+) -> Result<grokptah_agent_bridge::ComputerRunEventPage, String> {
+    state.computer_use.cockpit_events(
+        computer_owner(&state, &session_id)?,
+        &run_id,
+        after_seq,
+        limit.unwrap_or(100),
+    )
+}
+
+#[tauri::command]
 pub fn computer_use_cockpit_agent_eligibility(
     state: State<'_, AppState>,
     session_id: String,

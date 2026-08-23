@@ -10,9 +10,10 @@ use grokptah_agent_bridge::{
     ComputerAgentProposal, ComputerAuthorityToken, ComputerBackendPublicView, ComputerCapabilities,
     ComputerEmergencyControlToken, ComputerError, ComputerLocalApproval, ComputerObservation,
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
-    ComputerSurfaceCoordination, ComputerTargetCandidate, ComputerUncertainSurfaceLease,
-    ComputerUseLimits, ComputerUseService, SemanticAction, SimulatorBackend,
+    ComputerPlatformStatus, ComputerRun, ComputerRunEventPage, ComputerRunProjection,
+    ComputerRunState, ComputerSurfaceCoordination, ComputerTargetCandidate,
+    ComputerUncertainSurfaceLease, ComputerUseLimits, ComputerUseService, SemanticAction,
+    SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -380,6 +381,30 @@ impl DesktopComputerUse {
             coordination,
             reconciliation,
         })
+    }
+
+    /// Cursor-addressed replay for an exact app-owned Run. The positive
+    /// app-owned allowlist prevents one-shot previews from becoming a replay
+    /// oracle, while `session_run_events` collapses unknown and cross-session
+    /// identities to the same authorization failure.
+    pub fn cockpit_events(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        after_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<ComputerRunEventPage, String> {
+        if !self
+            .app_owned_run_ids
+            .lock()
+            .map_err(|_| "Computer Use app-owned Run state is unavailable".to_string())?
+            .contains(run_id)
+        {
+            return Err("This is not an app-owned controllable Computer Run".into());
+        }
+        self.simulator()?
+            .session_run_events(owner_session_id, run_id, after_seq, limit)
+            .map_err(|error| error.to_string())
     }
 
     pub async fn start_simulator(
@@ -1503,6 +1528,10 @@ mod tests {
             .cockpit_snapshot(owner, Some(&preview.run_id))
             .unwrap_err()
             .contains("not an app-owned controllable Computer Run"));
+        assert!(desktop
+            .cockpit_events(owner, &preview.run_id, None, 100)
+            .unwrap_err()
+            .contains("not an app-owned controllable Computer Run"));
     }
 
     #[tokio::test]
@@ -1540,6 +1569,40 @@ mod tests {
             .local
             .unwrap();
         assert_eq!(stopped.state, ComputerRunState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn app_owned_event_replay_is_typed_cursor_addressed_and_owner_scoped() {
+        let (_dir, desktop, owner) = test_desktop();
+        let target = SimulatorBackend::demo_target();
+        let run = desktop
+            .start_simulator(owner, &target.app_id)
+            .await
+            .unwrap()
+            .local
+            .unwrap();
+
+        let first = desktop.cockpit_events(owner, &run.run_id, None, 2).unwrap();
+        assert_eq!(first.entries.len(), 2);
+        assert_eq!(
+            first.entries[0].surface_event,
+            grokptah_agent_bridge::ComputerSurfaceEvent::RunCreated
+        );
+        let cursor = first.next_cursor.expect("the initial page is bounded");
+        let tail = desktop
+            .cockpit_events(owner, &run.run_id, Some(cursor), 100)
+            .unwrap();
+        assert!(!tail.cursor_expired);
+        assert!(tail.entries.iter().all(|entry| entry.sequence > cursor));
+        assert!(tail.entries.iter().any(|entry| {
+            entry.surface_event == grokptah_agent_bridge::ComputerSurfaceEvent::ObservationReady
+        }));
+
+        let intruder = desktop.host.session_new().unwrap().id;
+        assert!(desktop
+            .cockpit_events(intruder, &run.run_id, None, 100)
+            .unwrap_err()
+            .contains("not available to this session"));
     }
 
     #[tokio::test]

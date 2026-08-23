@@ -12,6 +12,7 @@ import type {
   ComputerLocalElement,
   ComputerPermissionStatus,
   ComputerPlatformStatus,
+  ComputerRunReplayStatus,
   ComputerSurfaceCoordination,
   ComputerTargetCandidate,
 } from "../lib/protocol";
@@ -31,6 +32,7 @@ type ComputerCockpitProps = {
   computerUseTier?: string;
   computerCapabilitySource?: string;
   sessionBusy: boolean;
+  eventReplay?: ComputerRunReplayStatus;
   onClose: () => void;
   onSteer: (text: string) => Promise<string>;
   onRunState?: (state: string | null) => void;
@@ -133,6 +135,7 @@ export function ComputerCockpit({
   computerUseTier = "none",
   computerCapabilitySource = "unknown",
   sessionBusy,
+  eventReplay,
   onClose,
   onSteer,
   onRunState,
@@ -760,6 +763,16 @@ export function ComputerCockpit({
             </div>
           </div>
 
+          {eventReplay?.runId === run.runId && eventReplay.gapDetected && (
+            <div className="computer-replay-gap" role="alert">
+              <strong>Event history is incomplete</strong>
+              <span>
+                Some earlier durable events are no longer retained. This Run is
+                still exactly bound; Pause, Take over, and Stop remain available.
+              </span>
+            </div>
+          )}
+
           {coordination && coordinationStatus && (
             <section
               className={`computer-coordination tone-${coordinationStatus.tone}`}
@@ -1153,12 +1166,25 @@ export function ComputerCockpit({
               </button>
             </div>
             <div className="computer-timeline">
-              <span className="computer-section-label">Audit timeline</span>
+              <div className="computer-timeline-heading">
+                <span className="computer-section-label">Audit timeline</span>
+                {eventReplay?.runId === run.runId && (
+                  <span>
+                    {eventReplay.lastEvent
+                      ? titleCase(eventReplay.lastEvent)
+                      : "Replay connected"}
+                    {eventReplay.cursor !== null ? ` · through #${eventReplay.cursor}` : ""}
+                  </span>
+                )}
+              </div>
               <ol>
                 {timeline.map((entry) => (
                   <li key={entry.sequence}>
                     <span>{entry.sequence}</span>
-                    <div><strong>{titleCase(entry.operation)}</strong><small>{titleCase(entry.disposition)}</small></div>
+                    <div>
+                      <strong>{titleCase(entry.surfaceEvent)}</strong>
+                      <small>{titleCase(entry.operation)} · {titleCase(entry.disposition)}</small>
+                    </div>
                   </li>
                 ))}
               </ol>

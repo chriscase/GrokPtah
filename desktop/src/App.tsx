@@ -24,6 +24,7 @@ import {
   type RunOrigin,
   type WorkspaceStatus,
   type ComputerCockpitSnapshot,
+  type ComputerRunReplayStatus,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
 import {
@@ -97,6 +98,12 @@ import { entriesToTranscriptItems, hasInterruptedTurn } from "./lib/transcript";
 import { appendThoughtChunk } from "./lib/thoughtText";
 import { createLatestRequestGuard } from "./lib/latestRequest";
 import { preserveProjectCwd } from "./lib/projectCwd";
+import {
+  advanceComputerRunReplay,
+  computerRunReplayKey,
+  loadComputerRunReplay,
+  saveComputerRunCursor,
+} from "./lib/computerRunReplay";
 import {
   doneActivity,
   errorActivity,
@@ -425,8 +432,16 @@ export default function App() {
   const [computerRunSnapshots, setComputerRunSnapshots] = useState<
     Record<string, ComputerCockpitSnapshot>
   >({});
+  const [computerRunReplay, setComputerRunReplay] = useState<
+    Record<string, ComputerRunReplayStatus>
+  >({});
   const computerSnapshotPolls = useRef(new Set<string>());
   const computerDiscoveryPolls = useRef(new Set<string>());
+  const computerEventPolls = useRef(new Set<string>());
+  const computerTerminalEventPulls = useRef(new Set<string>());
+  const computerEventReplay = useRef(
+    new Map<string, ComputerRunReplayStatus>(),
+  );
   const recordComputerSnapshot = useCallback(
     (sessionId: string, snapshot: ComputerCockpitSnapshot) => {
       setComputerRunSnapshots((current) => {
@@ -515,6 +530,94 @@ export default function App() {
     const timer = window.setInterval(poll, 2_000);
     return () => window.clearInterval(timer);
   }, [computerRunSnapshots, recordComputerSnapshot]);
+
+  // Replay the durable typed journal independently from cockpit visibility.
+  // The cursor is bound to the exact session/Run pair and persisted across app
+  // reloads. A retention gap stays sticky even after the retained tail catches
+  // up, because later events cannot prove what was lost.
+  useEffect(() => {
+    const poll = () => {
+      for (const [sessionId, snapshot] of Object.entries(computerRunSnapshots)) {
+        const run = snapshot.local;
+        if (!run) continue;
+        const key = computerRunReplayKey(sessionId, run.runId);
+        const terminal = [
+          "completed",
+          "failed",
+          "cancelled",
+          "interrupted",
+          "limit_reached",
+        ].includes(run.state);
+        if (
+          computerEventPolls.current.has(key) ||
+          (terminal && computerTerminalEventPulls.current.has(key))
+        ) {
+          continue;
+        }
+
+        let previous = computerEventReplay.current.get(key);
+        if (!previous) {
+          const stored = loadComputerRunReplay(sessionId, run.runId);
+          previous = {
+            runId: run.runId,
+            cursor: stored?.cursor ?? null,
+            gapDetected: stored?.gapDetected ?? false,
+            replayedEntries: 0,
+            lastEvent: null,
+          };
+          computerEventReplay.current.set(key, previous);
+        }
+        const requestedCursor = previous.cursor;
+        computerEventPolls.current.add(key);
+        void api
+          .computerUseCockpitEvents(
+            sessionId,
+            run.runId,
+            requestedCursor,
+            100,
+          )
+          .then((page) => {
+            const current = computerEventReplay.current.get(key) ?? previous;
+            const next = advanceComputerRunReplay(
+              run.runId,
+              requestedCursor,
+              current,
+              page,
+            );
+            computerEventReplay.current.set(key, next);
+            if (next.cursor !== null) {
+              saveComputerRunCursor(
+                sessionId,
+                run.runId,
+                next.cursor,
+                next.gapDetected,
+              );
+            }
+            if (terminal) computerTerminalEventPulls.current.add(key);
+            setComputerRunReplay((existing) => {
+              const prior = existing[sessionId];
+              if (
+                prior?.runId === next.runId &&
+                prior.cursor === next.cursor &&
+                prior.gapDetected === next.gapDetected &&
+                prior.replayedEntries === next.replayedEntries &&
+                prior.lastEvent === next.lastEvent
+              ) {
+                return existing;
+              }
+              return { ...existing, [sessionId]: next };
+            });
+          })
+          .catch((error) => {
+            console.warn("Computer Run event replay failed closed", error);
+          })
+          .finally(() => computerEventPolls.current.delete(key));
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 1_500);
+    return () => window.clearInterval(timer);
+  }, [computerRunSnapshots]);
 
   const syncOpenQueues = useCallback(
     async (sessionIds: string[]) => {
@@ -872,8 +975,12 @@ export default function App() {
           tabs.find((tab) => tab.id === sessionId)?.title ??
           sessions.find((session) => session.id === sessionId)?.title,
         snapshot,
+        replay:
+          computerRunReplay[sessionId]?.runId === snapshot.local?.runId
+            ? computerRunReplay[sessionId]
+            : undefined,
       })),
-    [computerRunSnapshots, sessions, tabs],
+    [computerRunReplay, computerRunSnapshots, sessions, tabs],
   );
 
   // Focusing a tab clears its unseen badge.
@@ -3481,6 +3588,12 @@ export default function App() {
               currentModelInfo?.computer_capability_source ?? "unknown"
             }
             sessionBusy={busy}
+            eventReplay={
+              activeSessionId &&
+              computerRunReplay[activeSessionId]?.runId === boundComputerRunId
+                ? computerRunReplay[activeSessionId]
+                : undefined
+            }
             onClose={() => setComputerOpen(false)}
             onSnapshot={recordComputerSnapshot}
             emergencyKeysManaged

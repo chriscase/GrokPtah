@@ -125,6 +125,53 @@ describe("PersistentComputerRuns", () => {
     await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("session-a", "run-a"));
   });
 
+  it("shows the latest typed durable surface event", () => {
+    const current = binding("session-a", "run-a");
+    current.replay = {
+      runId: "run-a",
+      cursor: 7,
+      gapDetected: false,
+      replayedEntries: 7,
+      lastEvent: "observation_ready",
+    };
+    render(
+      <PersistentComputerRuns
+        runs={[current]}
+        preferredSessionId="session-a"
+        onSnapshot={vi.fn()}
+        onOpen={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByRole("status", { name: /latest event Observation Ready/ }),
+    ).toHaveTextContent("Observation Ready");
+  });
+
+  it("keeps Stop available when replay reports an audit-history gap", async () => {
+    const current = binding("session-a", "run-a");
+    current.replay = {
+      runId: "run-a",
+      cursor: 8,
+      gapDetected: true,
+      replayedEntries: 0,
+      lastEvent: null,
+    };
+    render(
+      <PersistentComputerRuns
+        runs={[current]}
+        preferredSessionId="session-a"
+        onSnapshot={vi.fn()}
+        onOpen={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("status", { name: /event history has a gap/ }),
+    ).toHaveTextContent("History gap");
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("session-a", "run-a"));
+  });
+
   it("does not render terminal Runs as active controls", () => {
     const ended = binding("session-a", "run-a");
     ended.snapshot = snapshot("run-a", "cancelled");

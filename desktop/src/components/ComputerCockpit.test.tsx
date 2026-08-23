@@ -116,6 +116,7 @@ function localView(
       {
         sequence: 1,
         at: "2026-08-13T10:00:00Z",
+        surfaceEvent: "run_created",
         operation: "create_run",
         disposition: "accepted",
       },
@@ -264,6 +265,33 @@ describe("ComputerCockpit", () => {
       "session-1",
       expect.objectContaining({ local: expect.objectContaining({ runId: "run-1" }) }),
     );
+  });
+
+  it("renders typed replay events and keeps emergency controls usable across a history gap", async () => {
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
+    mocks.stop.mockResolvedValue(snapshot(localView("cancelled")));
+    render(
+      <ComputerCockpit
+        {...props}
+        eventReplay={{
+          runId: "run-1",
+          cursor: 9,
+          gapDetected: true,
+          replayedEntries: 2,
+          lastEvent: "permission_revoked",
+        }}
+      />,
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Event history is incomplete",
+    );
+    expect(screen.getByText("Run Created")).toBeTruthy();
+    expect(screen.getByText(/Permission Revoked · through #9/)).toBeTruthy();
+    const stop = screen.getByRole("button", { name: "Stop" });
+    expect(stop).toBeEnabled();
+    fireEvent.click(stop);
+    await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("session-1", "run-1"));
   });
 
   it("keeps Computer Run ownership visible beyond the focused tab", async () => {

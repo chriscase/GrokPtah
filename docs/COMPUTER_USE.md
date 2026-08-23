@@ -167,6 +167,18 @@ receive an opaque host-issued emergency-control token that can enter only those 
 observation, grant, proposal, approval, and action authority still requires the foreground Lane.
 This is persistent control-plane reachability, not proof of native physical preemption.
 
+The stacked typed-replay successor gives every durable audit row a closed,
+redaction-safe `ComputerSurfaceEvent` value and exposes cursor replay only for
+the exact app-owned session/Run binding. The application shell owns that replay
+rather than the cockpit panel, persists the exact cursor across reloads, and
+keeps a detected retention gap sticky for the lifetime of the Run. After an
+expired cursor it resumes immediately before the retained window so current
+events can remain visible, but it never relabels the retained tail as a complete
+history. Both the persistent emergency strip and the cockpit show the gap while
+leaving Pause, Take over, and Stop usable. This successor still does **not** add
+an agent attention position/cursor, native physical preemption, a background-safe
+backend, or isolated visual execution.
+
 ## Foundation (#268)
 
 `grokptah-agent-bridge::computer_use` provides:
@@ -182,10 +194,13 @@ This is persistent control-plane reachability, not proof of native physical pree
 - bounded retention and an exclusive store lock;
 - a deterministic simulator used to test observation/action behavior without OS access.
 
-Audit entries retain operation metadata, dispositions, action classes, observation IDs, and
-error codes. They do not retain action payloads, typed text, screenshots, application values,
-window titles, credentials, or arbitrary model content. Evidence references are opaque IDs and
-hashes rather than filesystem paths.
+Audit entries retain a closed surface-event type plus bounded legacy operation
+metadata, dispositions, action classes, observation IDs, and error codes. Legacy
+records without the typed field are classified only in their read projection;
+the durable evidence is not rewritten. Audit rows do not retain action payloads,
+typed text, screenshots, application values, window titles, credentials, or
+arbitrary model content. Evidence references are opaque IDs and hashes rather
+than filesystem paths.
 
 The durable run projection also exposes `controlDisposition` and `controlEpoch`. A paused run
 can be explicitly reauthorized, but `operator_takeover` is an absorbing local-control fence:
@@ -261,6 +276,14 @@ never presented as a complete stream. `afterSeq == startSeq - 1` is exact contin
 Restart keeps events readable. Recovery marks the run `interrupted`, clears authority,
 clears `last_outcome`, and increments `controlEpoch`; the durable journal remains
 replayable from its retained start.
+
+The stacked desktop successor calls that cursor contract only for positive
+app-owned Run IDs. Its persisted key contains both owning session and exact Run
+ID. `cursorExpired` moves the next request to `range.startSeq - 1`; the UI then
+continues through the retained tail with a persistent **History gap** warning.
+Storage failures cannot block emergency controls. Typed replay tests cover exact
+binding, cross-owner denial, legacy projection, cursor expiry, reload persistence,
+and Stop reachability while the warning is present.
 
 ### Visible activity states
 

@@ -4923,6 +4923,25 @@ button:disabled {
   font-size: 10px;
 }
 
+.persistent-computer-replay {
+  flex: 0 0 auto;
+  max-width: 9.5rem;
+  overflow: hidden;
+  padding: 0.16rem 0.38rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border-soft));
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.persistent-computer-replay.has-gap {
+  border-color: color-mix(in srgb, var(--warning, #e0ad4f) 55%, var(--border-soft));
+  color: var(--warning, #e0ad4f);
+  background: rgba(224, 173, 79, 0.07);
+}
+
 .persistent-computer-actions {
   gap: 0.25rem;
   flex: 0 0 auto;
@@ -5187,6 +5206,22 @@ button:disabled {
   color: var(--danger);
   border-color: #5c2a2e;
   background: rgba(145, 45, 55, 0.08);
+}
+
+.computer-replay-gap {
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0.55rem 1rem;
+  border-bottom: 1px solid rgba(224, 173, 79, 0.35);
+  color: var(--warning, #e0ad4f);
+  background: rgba(224, 173, 79, 0.055);
+  font-size: 11px;
+}
+
+.computer-replay-gap span {
+  color: var(--muted);
 }
 
 .computer-scope {
@@ -5765,6 +5800,19 @@ button:disabled {
   list-style: none;
   margin: 0.55rem 0 0;
   padding: 0;
+}
+
+.computer-timeline-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.computer-timeline-heading > span:last-child:not(:first-child) {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
 }
 
 .computer-timeline li {

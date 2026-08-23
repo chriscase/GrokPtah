@@ -79,18 +79,21 @@ function observedRun(
       {
         sequence: 1,
         at: new Date(Date.now() - 22_000).toISOString(),
+        surfaceEvent: "run_created",
         operation: "create_run",
         disposition: "accepted",
       },
       {
         sequence: 2,
         at: new Date(Date.now() - 21_000).toISOString(),
+        surfaceEvent: "authorization_granted",
         operation: "authorize",
         disposition: "granted",
       },
       {
         sequence: 3,
         at: new Date(Date.now() - 20_000).toISOString(),
+        surfaceEvent: "observation_ready",
         operation: "observe",
         disposition: "completed",
         observationId,
@@ -201,6 +204,7 @@ function pausedAfter(action: ComputerAction): ComputerLocalApproval {
     {
       sequence: run.audit.length + 1,
       at: new Date().toISOString(),
+      surfaceEvent: "postcondition_recorded",
       operation: "act",
       disposition: "completed",
       actionClass: action.type === "set_value" ? "text_entry" : "semantic",

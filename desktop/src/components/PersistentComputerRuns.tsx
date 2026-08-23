@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
-import type { ComputerCockpitSnapshot, ComputerLocalApproval } from "../lib/protocol";
+import type {
+  ComputerCockpitSnapshot,
+  ComputerLocalApproval,
+  ComputerRunReplayStatus,
+} from "../lib/protocol";
 
 export type AppOwnedComputerRun = {
   sessionId: string;
   sessionTitle?: string;
   snapshot: ComputerCockpitSnapshot;
+  replay?: ComputerRunReplayStatus;
 };
 
 type PersistentComputerRunsProps = {
@@ -133,6 +138,28 @@ export function PersistentComputerRuns({
                 <strong>{run.target.displayName}</strong>
                 <span>{binding.sessionTitle ?? binding.sessionId} · {titleCase(run.state)}</span>
               </button>
+              {binding.replay && (
+                <span
+                  className={`persistent-computer-replay ${binding.replay.gapDetected ? "has-gap" : ""}`}
+                  role="status"
+                  aria-label={
+                    binding.replay.gapDetected
+                      ? `${run.target.displayName} event history has a gap`
+                      : `${run.target.displayName} latest event ${binding.replay.lastEvent ? titleCase(binding.replay.lastEvent) : "replay connected"}`
+                  }
+                  title={
+                    binding.replay.gapDetected
+                      ? "Earlier durable events are no longer retained; emergency controls remain available"
+                      : "Durable event replay is current"
+                  }
+                >
+                  {binding.replay.gapDetected
+                    ? "History gap"
+                    : binding.replay.lastEvent
+                      ? titleCase(binding.replay.lastEvent)
+                      : "Replay connected"}
+                </span>
+              )}
               <div className="persistent-computer-actions">
                 <button
                   type="button"

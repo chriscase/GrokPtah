@@ -1050,6 +1050,62 @@ export type ComputerAction =
       delta_y: number;
     };
 
+export type ComputerSurfaceEvent =
+  | "unknown"
+  | "run_created"
+  | "authorization_granted"
+  | "observation_started"
+  | "observation_ready"
+  | "action_proposed"
+  | "approval_required"
+  | "approval_rejected"
+  | "attention_moved"
+  | "dispatch_started"
+  | "postcondition_recorded"
+  | "paused"
+  | "stopped"
+  | "takeover"
+  | "steering"
+  | "target_drift"
+  | "permission_revoked"
+  | "disconnected"
+  | "restart_interrupted"
+  | "terminal"
+  | "denied";
+
+export interface ComputerSurfaceEventEntry {
+  sequence: number;
+  at: string;
+  surfaceEvent: ComputerSurfaceEvent;
+  operation: string;
+  disposition: string;
+  actionClass?: string | null;
+  observationId?: string | null;
+  errorCode?: string | null;
+}
+
+export interface ComputerRunEventPage {
+  runId: string;
+  entries: ComputerSurfaceEventEntry[];
+  nextCursor?: number | null;
+  cursorExpired: boolean;
+  range?: { startSeq: number; endSeq: number } | null;
+}
+
+/**
+ * App-shell recovery evidence for one exact session/Run binding. A history gap
+ * is sticky for the lifetime of that Run, including across app reloads: later
+ * retained events can restore live awareness, but cannot prove that missing
+ * events never happened.
+ */
+export interface ComputerRunReplayStatus {
+  runId: string;
+  cursor: number | null;
+  gapDetected: boolean;
+  replayedEntries: number;
+  lastEvent?: ComputerSurfaceEvent | null;
+}
+
 export interface ComputerSemanticElement {
   elementId: string;
   role: string;
@@ -1105,15 +1161,7 @@ export interface ComputerRun {
     expectedPostconditionMet?: boolean | null;
   } | null;
   lastError?: { code: string; message: string } | null;
-  audit: Array<{
-    sequence: number;
-    at: string;
-    operation: string;
-    disposition: string;
-    actionClass?: string | null;
-    observationId?: string | null;
-    errorCode?: string | null;
-  }>;
+  audit: ComputerSurfaceEventEntry[];
 }
 
 export interface PendingComputerApproval {
@@ -1249,15 +1297,7 @@ export interface ComputerLocalApproval {
     revokedAt?: string | null;
     actionClasses: string[];
   } | null;
-  audit: Array<{
-    sequence: number;
-    at: string;
-    operation: string;
-    disposition: string;
-    actionClass?: string | null;
-    observationId?: string | null;
-    errorCode?: string | null;
-  }>;
+  audit: ComputerSurfaceEventEntry[];
   lastError?: { code: string } | null;
 }
 

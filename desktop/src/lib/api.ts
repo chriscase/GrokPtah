@@ -7,6 +7,7 @@ import type {
   ComputerAgentProposalResult,
   ComputerAction,
   ComputerCockpitSnapshot,
+  ComputerRunEventPage,
   ComputerPermissionStatus,
   ComputerPlatformStatus,
   ComputerTargetCandidate,
@@ -349,6 +350,18 @@ export const api = {
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_snapshot", {
       sessionId,
       runId: runId ?? null,
+    }),
+  computerUseCockpitEvents: (
+    sessionId: string,
+    runId: string,
+    afterSeq?: number | null,
+    limit = 100,
+  ) =>
+    invoke<ComputerRunEventPage>("computer_use_cockpit_events", {
+      sessionId,
+      runId,
+      afterSeq: afterSeq ?? null,
+      limit,
     }),
   computerUseCockpitAgentEligibility: (sessionId: string) =>
     invoke<ComputerAgentEligibility>("computer_use_cockpit_agent_eligibility", {

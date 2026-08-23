@@ -599,7 +599,12 @@ coordination candidate adds a local-only, secret-free queue/owner explanation
 for the durable WorkAttempt surface ledger. Its stacked emergency-control
 successor keeps Pause / Stop / Take over outside the ordinary UI busy gate,
 uses current host state rather than a client-held version, and provides stable
-keyboard paths. It still does not add an agent-owned cursor or a physically
+keyboard paths. The app-owned successor binds those controls to the exact Run
+outside cockpit visibility. Its typed-replay successor adds a closed
+redaction-safe event vocabulary, exact session/Run cursor persistence, and a
+sticky visible history-gap state that does not block emergency controls. These
+are candidate objects pending external Rust qualification and integration. They
+still do not add an agent-owned attention position/cursor or a physically
 preemptive native cancellation channel.
 [#286](https://github.com/chriscase/GrokPtah/issues/286) **open**.
 

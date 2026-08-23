@@ -1402,11 +1402,104 @@ pub struct ActionOutcome {
 pub struct ComputerAuditEntry {
     pub sequence: u64,
     pub at: DateTime<Utc>,
+    /// Closed, redaction-safe surface event used by replaying UI and
+    /// coordinator clients. Legacy records deserialize as `Unknown` and are
+    /// classified from their bounded operation/disposition pair at projection
+    /// time; new records persist the typed value directly.
+    #[serde(default)]
+    pub surface_event: ComputerSurfaceEvent,
     pub operation: String,
     pub disposition: String,
     pub action_class: Option<ActionClass>,
     pub observation_id: Option<String>,
     pub error_code: Option<ComputerErrorCode>,
+}
+
+/// Provider-neutral event vocabulary for the agent-owned Computer surface.
+///
+/// This deliberately contains no window title, semantic label/value, entered
+/// text, evidence locator, element identifier, or backend message. The exact
+/// Run and optional run-scoped observation surrogate are carried by the event
+/// page envelope and [`ComputerAuditEntry`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerSurfaceEvent {
+    #[default]
+    Unknown,
+    RunCreated,
+    AuthorizationGranted,
+    ObservationStarted,
+    ObservationReady,
+    ActionProposed,
+    ApprovalRequired,
+    ApprovalRejected,
+    AttentionMoved,
+    DispatchStarted,
+    PostconditionRecorded,
+    Paused,
+    Stopped,
+    Takeover,
+    Steering,
+    TargetDrift,
+    PermissionRevoked,
+    Disconnected,
+    RestartInterrupted,
+    Terminal,
+    Denied,
+}
+
+impl ComputerSurfaceEvent {
+    pub fn classify(
+        operation: &str,
+        disposition: &str,
+        error_code: Option<ComputerErrorCode>,
+    ) -> Self {
+        if error_code == Some(ComputerErrorCode::TargetChanged) {
+            return Self::TargetDrift;
+        }
+        if error_code == Some(ComputerErrorCode::PermissionRevoked) {
+            return Self::PermissionRevoked;
+        }
+        if matches!(
+            error_code,
+            Some(ComputerErrorCode::BackendUnavailable) | Some(ComputerErrorCode::TargetClosed)
+        ) {
+            return Self::Disconnected;
+        }
+        if disposition == "denied" {
+            return Self::Denied;
+        }
+        match (operation, disposition) {
+            ("create_run" | "create_agent_run", "accepted") => Self::RunCreated,
+            ("authorize", "granted") => Self::AuthorizationGranted,
+            ("observe", "started") => Self::ObservationStarted,
+            ("observe", "completed") => Self::ObservationReady,
+            ("action_proposed", _) => Self::ActionProposed,
+            ("approval", "required") => Self::ApprovalRequired,
+            ("approval", "rejected") => Self::ApprovalRejected,
+            ("attention", "moved") => Self::AttentionMoved,
+            ("act", "started") => Self::DispatchStarted,
+            ("act", "completed" | "uncertain_outcome") => Self::PostconditionRecorded,
+            ("pause", "paused") => Self::Paused,
+            ("cancel", "cancelled") => Self::Stopped,
+            ("take_over", "operator_control") => Self::Takeover,
+            ("steer", _) => Self::Steering,
+            ("recover", "interrupted") => Self::RestartInterrupted,
+            ("complete", "completed") => Self::Terminal,
+            (_, "failed" | "limit_reached" | "interrupted") => Self::Terminal,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl ComputerAuditEntry {
+    pub fn projected_surface_event(&self) -> ComputerSurfaceEvent {
+        if self.surface_event == ComputerSurfaceEvent::Unknown {
+            ComputerSurfaceEvent::classify(&self.operation, &self.disposition, self.error_code)
+        } else {
+            self.surface_event
+        }
+    }
 }
 
 impl ActionOutcome {
@@ -2047,6 +2140,7 @@ impl ComputerRun {
         self.audit.push(ComputerAuditEntry {
             sequence: self.audit.last().map_or(1, |entry| entry.sequence + 1),
             at: Utc::now(),
+            surface_event: ComputerSurfaceEvent::classify(operation, disposition, error_code),
             operation: crate::textutil::truncate_at_char_boundary(operation, 64).to_string(),
             disposition: crate::textutil::truncate_at_char_boundary(disposition, 64).to_string(),
             action_class,
@@ -2235,6 +2329,50 @@ mod tests {
             display_name: "Demo".into(),
             sensitivity: Sensitivity::None,
         }
+    }
+
+    #[test]
+    fn surface_event_vocabulary_is_closed_and_legacy_rows_remain_readable() {
+        assert_eq!(
+            ComputerSurfaceEvent::classify("create_run", "accepted", None),
+            ComputerSurfaceEvent::RunCreated
+        );
+        assert_eq!(
+            ComputerSurfaceEvent::classify(
+                "observe",
+                "failed",
+                Some(ComputerErrorCode::TargetChanged),
+            ),
+            ComputerSurfaceEvent::TargetDrift
+        );
+        assert_eq!(
+            ComputerSurfaceEvent::classify(
+                "act",
+                "failed",
+                Some(ComputerErrorCode::PermissionRevoked),
+            ),
+            ComputerSurfaceEvent::PermissionRevoked
+        );
+        assert_eq!(
+            ComputerSurfaceEvent::classify("recover", "interrupted", None),
+            ComputerSurfaceEvent::RestartInterrupted
+        );
+
+        let legacy: ComputerAuditEntry = serde_json::from_value(serde_json::json!({
+            "sequence": 1,
+            "at": "2026-08-23T00:00:00Z",
+            "operation": "take_over",
+            "disposition": "operator_control",
+            "actionClass": null,
+            "observationId": null,
+            "errorCode": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.surface_event, ComputerSurfaceEvent::Unknown);
+        assert_eq!(
+            legacy.projected_surface_event(),
+            ComputerSurfaceEvent::Takeover
+        );
     }
 
     #[test]
