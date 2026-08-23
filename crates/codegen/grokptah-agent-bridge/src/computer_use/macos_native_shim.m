@@ -7,11 +7,16 @@
 
 #include <stdbool.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 typedef struct {
     int32_t status;
@@ -28,6 +33,17 @@ typedef struct {
     bool framework_available;
 } GPTMacVirtualizationProbe;
 
+typedef struct {
+    int32_t status;
+    int32_t helper_fd;
+    int32_t guest_image_fd;
+    int32_t configuration_fd;
+    uint8_t *requirement_data;
+    size_t requirement_data_len;
+    uint8_t *error;
+    size_t error_len;
+} GPTMacIsolatedArtifactsResult;
+
 enum {
     GPT_MAC_OK = 0,
     GPT_MAC_UNSUPPORTED = 1,
@@ -41,6 +57,8 @@ enum {
     GPT_MAC_FORBIDDEN_ACTION = 9,
     GPT_MAC_INTERRUPTED = 10,
     GPT_MAC_UNCERTAIN_OUTCOME = 11,
+    GPT_MAC_BACKEND_UNAVAILABLE = 12,
+    GPT_MAC_UNAUTHORIZED = 13,
 };
 
 typedef struct {
@@ -233,6 +251,389 @@ GPTMacVirtualizationProbe gpt_macos_virtualization_probe(void) {
     result.framework_available = framework_available;
 
     return result;
+}
+
+static const size_t GPT_MAX_REQUIREMENT_DATA_BYTES = 64 * 1024;
+static NSString *const GPT_APP_BUNDLE_IDENTIFIER = @"com.chriscase.grokptah";
+static NSString *const GPT_HELPER_SIGNING_IDENTIFIER =
+    @"com.chriscase.grokptah.isolated-visual-helper";
+
+static GPTMacIsolatedArtifactsResult GPTEmptyIsolatedArtifactsResult(int32_t status) {
+    GPTMacIsolatedArtifactsResult result = {0};
+    result.status = status;
+    result.helper_fd = -1;
+    result.guest_image_fd = -1;
+    result.configuration_fd = -1;
+    return result;
+}
+
+static GPTMacIsolatedArtifactsResult GPTIsolatedArtifactsError(
+    int32_t status,
+    NSString *message) {
+    GPTMacIsolatedArtifactsResult result = GPTEmptyIsolatedArtifactsResult(status);
+    NSString *bounded = message.length > 512 ? [message substringToIndex:512] : message;
+    NSData *data = [bounded dataUsingEncoding:NSUTF8StringEncoding];
+    result.error = GPTCopyBytes(data, &result.error_len);
+    return result;
+}
+
+static void GPTCloseArtifactDescriptors(
+    int helperFD,
+    int guestImageFD,
+    int configurationFD) {
+    if (helperFD >= 0) {
+        close(helperFD);
+    }
+    if (guestImageFD >= 0) {
+        close(guestImageFD);
+    }
+    if (configurationFD >= 0) {
+        close(configurationFD);
+    }
+}
+
+static BOOL GPTAppendBundlePath(
+    const char *bundleRoot,
+    const char *relativePath,
+    char output[PATH_MAX]) {
+    int written = snprintf(output, PATH_MAX, "%s/%s", bundleRoot, relativePath);
+    return written > 0 && written < PATH_MAX;
+}
+
+static int GPTOpenPackagedArtifact(const char *path) {
+    return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW_ANY);
+}
+
+static BOOL GPTSameArtifactIdentity(const struct stat *left, const struct stat *right) {
+    return left->st_dev == right->st_dev && left->st_ino == right->st_ino &&
+           left->st_mode == right->st_mode && left->st_size == right->st_size &&
+           left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
+           left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+}
+
+static BOOL GPTPathStillNamesArtifact(const char *path, const struct stat *expected) {
+    int descriptor = GPTOpenPackagedArtifact(path);
+    if (descriptor < 0) {
+        return NO;
+    }
+    struct stat observed = {0};
+    BOOL matches = fstat(descriptor, &observed) == 0 &&
+                   GPTSameArtifactIdentity(expected, &observed);
+    close(descriptor);
+    return matches;
+}
+
+static BOOL GPTEntitlementIsTrue(NSDictionary *entitlements, NSString *key) {
+    id value = entitlements[key];
+    return [value isKindOfClass:[NSNumber class]] && [value boolValue];
+}
+
+static BOOL GPTEntitlementIsAbsentOrFalse(NSDictionary *entitlements, NSString *key) {
+    id value = entitlements[key];
+    return value == nil || ([value isKindOfClass:[NSNumber class]] && ![value boolValue]);
+}
+
+static NSString *GPTValidatePackagedCode(
+    NSURL *url,
+    NSString *expectedIdentifier,
+    NSString *expectedTeamIdentifier,
+    BOOL checkNestedCode,
+    BOOL requireVirtualization,
+    BOOL forbidVirtualization,
+    NSString *__autoreleasing *teamIdentifier,
+    NSData *__autoreleasing *designatedRequirementData) {
+    SecStaticCodeRef code = NULL;
+    OSStatus status = SecStaticCodeCreateWithPath(
+        (__bridge CFURLRef)url,
+        kSecCSDefaultFlags,
+        &code);
+    if (status != errSecSuccess || code == NULL) {
+        return @"Packaged isolated code could not be opened for signature validation";
+    }
+
+    SecCSFlags validationFlags = kSecCSCheckAllArchitectures | kSecCSStrictValidate |
+                                 kSecCSRestrictSymlinks | kSecCSRestrictSidebandData;
+    if (checkNestedCode) {
+        validationFlags |= kSecCSCheckNestedCode;
+    }
+    CFErrorRef validationError = NULL;
+    status = SecStaticCodeCheckValidityWithErrors(
+        code,
+        validationFlags,
+        NULL,
+        &validationError);
+    if (validationError != NULL) {
+        CFRelease(validationError);
+    }
+    if (status != errSecSuccess) {
+        CFRelease(code);
+        return @"Packaged isolated code failed strict offline signature validation";
+    }
+
+    CFDictionaryRef rawInformation = NULL;
+    status = SecCodeCopySigningInformation(
+        code,
+        kSecCSSigningInformation,
+        &rawInformation);
+    if (status != errSecSuccess || rawInformation == NULL) {
+        CFRelease(code);
+        return @"Packaged isolated code has no usable signing information";
+    }
+    NSDictionary *information = (__bridge NSDictionary *)rawInformation;
+    NSString *identifier = information[(__bridge NSString *)kSecCodeInfoIdentifier];
+    NSString *observedTeam = information[(__bridge NSString *)kSecCodeInfoTeamIdentifier];
+    NSNumber *signatureFlags = information[(__bridge NSString *)kSecCodeInfoFlags];
+    NSDictionary *entitlements =
+        information[(__bridge NSString *)kSecCodeInfoEntitlementsDict];
+    if (![identifier isKindOfClass:[NSString class]] ||
+        ![identifier isEqualToString:expectedIdentifier] ||
+        ![observedTeam isKindOfClass:[NSString class]] || observedTeam.length == 0 ||
+        (expectedTeamIdentifier != nil &&
+         ![observedTeam isEqualToString:expectedTeamIdentifier]) ||
+        ![signatureFlags isKindOfClass:[NSNumber class]]) {
+        CFRelease(rawInformation);
+        CFRelease(code);
+        return @"Packaged isolated code has the wrong signing identity";
+    }
+    uint32_t flags = signatureFlags.unsignedIntValue;
+    if ((flags & kSecCodeSignatureRuntime) == 0 ||
+        (flags & kSecCodeSignatureLibraryValidation) == 0 ||
+        (flags & kSecCodeSignatureAdhoc) != 0) {
+        CFRelease(rawInformation);
+        CFRelease(code);
+        return @"Packaged isolated code is not a hardened non-ad-hoc signature";
+    }
+    if (entitlements != nil && ![entitlements isKindOfClass:[NSDictionary class]]) {
+        CFRelease(rawInformation);
+        CFRelease(code);
+        return @"Packaged isolated code has malformed entitlements";
+    }
+    NSDictionary *checkedEntitlements = entitlements ?: @{};
+    BOOL virtualization = GPTEntitlementIsTrue(
+        checkedEntitlements,
+        @"com.apple.security.virtualization");
+    BOOL networkingAbsent = GPTEntitlementIsAbsentOrFalse(
+        checkedEntitlements,
+        @"com.apple.vm.networking");
+    BOOL debugAttachmentAbsent = GPTEntitlementIsAbsentOrFalse(
+        checkedEntitlements,
+        @"com.apple.security.get-task-allow");
+    if ((requireVirtualization && !virtualization) ||
+        (forbidVirtualization && virtualization) || !networkingAbsent ||
+        !debugAttachmentAbsent) {
+        CFRelease(rawInformation);
+        CFRelease(code);
+        return @"Packaged isolated code violates the virtualization entitlement boundary";
+    }
+    if (requireVirtualization) {
+        if (!GPTEntitlementIsTrue(
+                checkedEntitlements,
+                @"com.apple.security.app-sandbox")) {
+            CFRelease(rawInformation);
+            CFRelease(code);
+            return @"Packaged isolated helper is not sandboxed";
+        }
+        NSSet<NSString *> *allowedHelperEntitlements = [NSSet setWithArray:@[
+            @"com.apple.application-identifier",
+            @"com.apple.developer.team-identifier",
+            @"com.apple.security.app-sandbox",
+            @"com.apple.security.virtualization",
+        ]];
+        for (id key in checkedEntitlements) {
+            if (![key isKindOfClass:[NSString class]] ||
+                ![allowedHelperEntitlements containsObject:key]) {
+                CFRelease(rawInformation);
+                CFRelease(code);
+                return @"Packaged isolated helper requests an unreviewed entitlement";
+            }
+        }
+        NSString *applicationIdentifier =
+            checkedEntitlements[@"com.apple.application-identifier"];
+        NSString *entitlementTeam =
+            checkedEntitlements[@"com.apple.developer.team-identifier"];
+        NSString *expectedApplicationIdentifier = [NSString
+            stringWithFormat:@"%@.%@", observedTeam, expectedIdentifier];
+        if (![applicationIdentifier isKindOfClass:[NSString class]] ||
+            ![applicationIdentifier isEqualToString:expectedApplicationIdentifier] ||
+            ![entitlementTeam isKindOfClass:[NSString class]] ||
+            ![entitlementTeam isEqualToString:observedTeam]) {
+            CFRelease(rawInformation);
+            CFRelease(code);
+            return @"Packaged isolated helper has inconsistent sandbox identity entitlements";
+        }
+    }
+    if (teamIdentifier != NULL) {
+        *teamIdentifier = [observedTeam copy];
+    }
+
+    if (designatedRequirementData != NULL) {
+        SecRequirementRef requirement = NULL;
+        CFDataRef rawRequirementData = NULL;
+        status = SecCodeCopyDesignatedRequirement(
+            code,
+            kSecCSDefaultFlags,
+            &requirement);
+        if (status == errSecSuccess && requirement != NULL) {
+            status = SecRequirementCopyData(
+                requirement,
+                kSecCSDefaultFlags,
+                &rawRequirementData);
+        }
+        if (requirement != NULL) {
+            CFRelease(requirement);
+        }
+        if (status != errSecSuccess || rawRequirementData == NULL ||
+            CFDataGetLength(rawRequirementData) <= 0 ||
+            (size_t)CFDataGetLength(rawRequirementData) > GPT_MAX_REQUIREMENT_DATA_BYTES) {
+            if (rawRequirementData != NULL) {
+                CFRelease(rawRequirementData);
+            }
+            CFRelease(rawInformation);
+            CFRelease(code);
+            return @"Packaged helper has no bounded designated requirement";
+        }
+        *designatedRequirementData = [(__bridge NSData *)rawRequirementData copy];
+        CFRelease(rawRequirementData);
+    }
+    CFRelease(rawInformation);
+    CFRelease(code);
+    return nil;
+}
+
+GPTMacIsolatedArtifactsResult gpt_macos_isolated_artifacts_open(void) {
+    @autoreleasepool {
+        NSBundle *bundle = NSBundle.mainBundle;
+        if (![bundle.bundleIdentifier isEqualToString:GPT_APP_BUNDLE_IDENTIFIER]) {
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_BACKEND_UNAVAILABLE,
+                @"The isolated environment is not running from the GrokPtah application bundle");
+        }
+        const char *bundlePath = bundle.bundleURL.path.fileSystemRepresentation;
+        char bundleRoot[PATH_MAX] = {0};
+        if (bundlePath == NULL || realpath(bundlePath, bundleRoot) == NULL) {
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_BACKEND_UNAVAILABLE,
+                @"The GrokPtah application bundle could not be resolved");
+        }
+
+        char helperPath[PATH_MAX] = {0};
+        char guestImagePath[PATH_MAX] = {0};
+        char configurationPath[PATH_MAX] = {0};
+        if (!GPTAppendBundlePath(
+                bundleRoot,
+                "Contents/MacOS/grokptah-isolated-visual-helper",
+                helperPath) ||
+            !GPTAppendBundlePath(
+                bundleRoot,
+                "Contents/Resources/isolated-visual/grokptah-isolated-guest-v1.img",
+                guestImagePath) ||
+            !GPTAppendBundlePath(
+                bundleRoot,
+                "Contents/Resources/isolated-visual/grokptah-isolated-config-v1.json",
+                configurationPath)) {
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_BACKEND_UNAVAILABLE,
+                @"The isolated environment bundle layout is invalid");
+        }
+
+        int helperFD = GPTOpenPackagedArtifact(helperPath);
+        int guestImageFD = GPTOpenPackagedArtifact(guestImagePath);
+        int configurationFD = GPTOpenPackagedArtifact(configurationPath);
+        if (helperFD < 0 || guestImageFD < 0 || configurationFD < 0) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_BACKEND_UNAVAILABLE,
+                @"The signed helper and measured guest artifacts are not packaged");
+        }
+        struct stat helperIdentity = {0};
+        struct stat guestImageIdentity = {0};
+        struct stat configurationIdentity = {0};
+        if (fstat(helperFD, &helperIdentity) != 0 ||
+            fstat(guestImageFD, &guestImageIdentity) != 0 ||
+            fstat(configurationFD, &configurationIdentity) != 0 ||
+            !S_ISREG(helperIdentity.st_mode) || !S_ISREG(guestImageIdentity.st_mode) ||
+            !S_ISREG(configurationIdentity.st_mode)) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_FORBIDDEN_ACTION,
+                @"The isolated environment contains an invalid artifact type");
+        }
+
+        NSURL *bundleURL = [NSURL fileURLWithFileSystemRepresentation:bundleRoot
+                                                          isDirectory:YES
+                                                        relativeToURL:nil];
+        NSString *teamIdentifier = nil;
+        NSString *validationFailure = GPTValidatePackagedCode(
+            bundleURL,
+            GPT_APP_BUNDLE_IDENTIFIER,
+            nil,
+            YES,
+            NO,
+            YES,
+            &teamIdentifier,
+            NULL);
+        if (validationFailure != nil) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            return GPTIsolatedArtifactsError(GPT_MAC_UNAUTHORIZED, validationFailure);
+        }
+
+        NSURL *helperURL = [NSURL fileURLWithFileSystemRepresentation:helperPath
+                                                           isDirectory:NO
+                                                         relativeToURL:nil];
+        NSData *requirementData = nil;
+        validationFailure = GPTValidatePackagedCode(
+            helperURL,
+            GPT_HELPER_SIGNING_IDENTIFIER,
+            teamIdentifier,
+            NO,
+            YES,
+            NO,
+            NULL,
+            &requirementData);
+        if (validationFailure != nil) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            return GPTIsolatedArtifactsError(GPT_MAC_UNAUTHORIZED, validationFailure);
+        }
+        if (!GPTPathStillNamesArtifact(helperPath, &helperIdentity) ||
+            !GPTPathStillNamesArtifact(guestImagePath, &guestImageIdentity) ||
+            !GPTPathStillNamesArtifact(configurationPath, &configurationIdentity)) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_TARGET_CHANGED,
+                @"An isolated environment artifact changed during package verification");
+        }
+
+        GPTMacIsolatedArtifactsResult result =
+            GPTEmptyIsolatedArtifactsResult(GPT_MAC_OK);
+        result.helper_fd = helperFD;
+        result.guest_image_fd = guestImageFD;
+        result.configuration_fd = configurationFD;
+        result.requirement_data = GPTCopyBytes(
+            requirementData,
+            &result.requirement_data_len);
+        if (result.requirement_data == NULL || result.requirement_data_len == 0) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            free(result.requirement_data);
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_BACKEND_FAILURE,
+                @"The packaged helper requirement could not be retained");
+        }
+        return result;
+    }
+}
+
+void gpt_macos_isolated_artifacts_result_free(GPTMacIsolatedArtifactsResult *result) {
+    if (result == NULL) {
+        return;
+    }
+    free(result->requirement_data);
+    free(result->error);
+    result->requirement_data = NULL;
+    result->requirement_data_len = 0;
+    result->error = NULL;
+    result->error_len = 0;
 }
 
 bool gpt_macos_screen_recording_granted(void) {

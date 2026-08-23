@@ -177,10 +177,18 @@ available.
    host paths or channel secrets. A subsequent measurement candidate hashes independently opened,
    read-only regular-file handles under helper/image/configuration size and mode ceilings, preserves
    their offsets, detects identity changes during streaming, emits no paths/descriptors, and can
-   compare those three content digests with the launch manifest. It does **not** discover bundle
-   resources, reject a symlink at open time, establish the helper's code-signing requirement,
-   package an artifact, launch a VM, or run cleanup. Actual helper/image packaging, signing proof,
-   and the destructive campaign remain.
+   compare those three content digests with the launch manifest. The latest source candidate adds a
+   fixed package verifier for the exact app, helper, guest-image, and configuration paths. It opens
+   each artifact read-only with no-follow semantics, retains the handles, strictly validates the
+   entire app including nested code, separately validates the helper, requires matching non-ad-hoc
+   hardened signing identities, and hashes the helper's canonical designated requirement. The main
+   app must have no virtualization authority; the helper must be sandboxed and may carry only its
+   exact application/team identity, App Sandbox, and virtualization entitlements. VM networking,
+   debug attachment, mismatched teams, unreviewed helper entitlements, path replacement, and
+   content/manifest drift fail closed. This is verifier **source**, not evidence that the helper,
+   guest, configuration, signing pipeline, or entitlement profile is actually packaged. No VM is
+   launched and no cleanup is run. Actual artifact production plus signed-package and destructive
+   campaign evidence remain.
 4. Add authenticated virtio-socket frame/health transport and render read-only frames. The candidate
    now defines the transport-independent, read-only protocol core: a non-serializable/redacted
    32-byte channel key authenticates the exact protocol version, Run, surface incarnation, message
@@ -201,11 +209,14 @@ available.
 
 The existing simulator remains the only dispatchable isolated proof. The Stage 8 measured
 background candidate is not a substitute. The typed input, read-only host-probe, no-input lifecycle,
-open-handle content-measurement, and authenticated read-protocol candidates do not enable
+open-handle content-measurement, fixed-path packaged-identity verifier, and authenticated
+read-protocol candidates do not enable
 `HostNative`, expose isolated actions to a model or cockpit approval flow, qualify a provider for
-visual fallback, package a VM image/helper, establish code-signing identity, carry or render frame
-bytes, or satisfy any #288 acceptance checkbox. The manifest accepts only the locked-down profile
-and bounded resources, but synthetic or caller-opened content digests are not packaged identity. A
-present framework, valid contract, content hash, authenticated metadata envelope, or entitlement is
-not a VM, signed helper, guest, carrier, rendered frame, isolation, dispatch, cleanup campaign, or
-release proof.
+visual fallback, package a VM image/helper, carry or render frame bytes, or satisfy any #288
+acceptance checkbox. The verifier can establish signed package identity only when invoked by a real
+correctly signed package containing the exact artifacts; source tests and Objective-C syntax checks
+are not that runtime evidence. The manifest accepts only the locked-down profile and bounded
+resources, but synthetic or caller-opened content digests are not packaged identity. A present
+framework, valid contract, verifier implementation, content hash, authenticated metadata envelope,
+or entitlement declaration is not a packaged helper, booted guest, carrier, rendered frame,
+isolation campaign, dispatch, cleanup campaign, or release proof.

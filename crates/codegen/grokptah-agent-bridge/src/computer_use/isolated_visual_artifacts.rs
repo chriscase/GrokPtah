@@ -10,6 +10,9 @@ use super::types::{ComputerError, ComputerErrorCode, ComputerResult};
 pub const ISOLATED_VISUAL_MAX_HELPER_BYTES: u64 = 64_u64 * 1024 * 1024;
 pub const ISOLATED_VISUAL_MAX_GUEST_IMAGE_BYTES: u64 = 32_u64 * 1024 * 1024 * 1024;
 pub const ISOLATED_VISUAL_MAX_CONFIGURATION_BYTES: u64 = 1024_u64 * 1024;
+pub const ISOLATED_VISUAL_APP_BUNDLE_IDENTIFIER: &str = "com.chriscase.grokptah";
+pub const ISOLATED_VISUAL_HELPER_SIGNING_IDENTIFIER: &str =
+    "com.chriscase.grokptah.isolated-visual-helper";
 
 const MEASUREMENT_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -106,6 +109,97 @@ impl IsolatedVisualArtifactMeasurements {
             return Err(ComputerError::new(
                 ComputerErrorCode::Unauthorized,
                 "isolated artifact content does not match the launch manifest",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Secret- and path-free receipt emitted only after fixed-bundle discovery,
+/// strict app/helper signature validation, helper entitlement validation, and
+/// stable-handle content measurement all succeed in one operation. It is not
+/// deserializable into authority and does not imply that a VM was launched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IsolatedVisualPackagedArtifactReceipt {
+    bundle_identifier: String,
+    helper_signing_identifier: String,
+    helper_signing_requirement_sha256: String,
+    helper_signature_valid: bool,
+    helper_hardened_runtime: bool,
+    helper_sandboxed: bool,
+    helper_virtualization_entitlement_verified: bool,
+    helper_unreviewed_entitlements_absent: bool,
+    main_process_virtualization_entitlement_absent: bool,
+    vm_networking_entitlement_absent: bool,
+    measurements: IsolatedVisualArtifactMeasurements,
+}
+
+impl IsolatedVisualPackagedArtifactReceipt {
+    pub(crate) fn verified(
+        helper_signing_requirement_sha256: String,
+        measurements: IsolatedVisualArtifactMeasurements,
+    ) -> ComputerResult<Self> {
+        let receipt = Self {
+            bundle_identifier: ISOLATED_VISUAL_APP_BUNDLE_IDENTIFIER.into(),
+            helper_signing_identifier: ISOLATED_VISUAL_HELPER_SIGNING_IDENTIFIER.into(),
+            helper_signing_requirement_sha256,
+            helper_signature_valid: true,
+            helper_hardened_runtime: true,
+            helper_sandboxed: true,
+            helper_virtualization_entitlement_verified: true,
+            helper_unreviewed_entitlements_absent: true,
+            main_process_virtualization_entitlement_absent: true,
+            vm_networking_entitlement_absent: true,
+            measurements,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn measurements(&self) -> &IsolatedVisualArtifactMeasurements {
+        &self.measurements
+    }
+
+    pub fn helper_signing_requirement_sha256(&self) -> &str {
+        &self.helper_signing_requirement_sha256
+    }
+
+    pub fn validate(&self) -> ComputerResult<()> {
+        self.measurements.validate()?;
+        validate_digest(
+            "isolated helper signing requirement",
+            &self.helper_signing_requirement_sha256,
+        )?;
+        if self.bundle_identifier != ISOLATED_VISUAL_APP_BUNDLE_IDENTIFIER
+            || self.helper_signing_identifier != ISOLATED_VISUAL_HELPER_SIGNING_IDENTIFIER
+            || !self.helper_signature_valid
+            || !self.helper_hardened_runtime
+            || !self.helper_sandboxed
+            || !self.helper_virtualization_entitlement_verified
+            || !self.helper_unreviewed_entitlements_absent
+            || !self.main_process_virtualization_entitlement_absent
+            || !self.vm_networking_entitlement_absent
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "isolated packaged artifact receipt violates the signed-helper boundary",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_manifest(
+        &self,
+        manifest: &IsolatedVisualManifest,
+    ) -> ComputerResult<()> {
+        self.validate()?;
+        self.measurements
+            .validate_content_against_manifest(manifest)?;
+        if self.helper_signing_requirement_sha256 != manifest.helper_signing_requirement_sha256 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "isolated helper signing requirement does not match the launch manifest",
             ));
         }
         Ok(())
@@ -354,6 +448,27 @@ pub fn measure_open_isolated_visual_artifacts(
     Ok(measurements)
 }
 
+/// Discover and verify the exact packaged artifact layout selected for Stage
+/// 9. On macOS this performs fixed-path, no-symlink, strict offline signing and
+/// entitlement checks before measuring retained read-only descriptors. Other
+/// platforms fail closed. This never launches or configures a VM.
+pub fn measure_packaged_isolated_visual_artifacts(
+    manifest: &IsolatedVisualManifest,
+) -> ComputerResult<IsolatedVisualPackagedArtifactReceipt> {
+    #[cfg(target_os = "macos")]
+    {
+        super::macos_isolated_artifacts::measure_packaged_artifacts(manifest)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = manifest;
+        Err(ComputerError::new(
+            ComputerErrorCode::UnsupportedPlatform,
+            "packaged isolated artifacts currently require macOS",
+        ))
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs::OpenOptions;
@@ -501,10 +616,28 @@ mod tests {
         measurements
             .validate_content_against_manifest(&manifest)
             .unwrap();
+        let receipt =
+            IsolatedVisualPackagedArtifactReceipt::verified("a".repeat(64), measurements.clone())
+                .unwrap();
+        receipt.validate_against_manifest(&manifest).unwrap();
+        let serialized = serde_json::to_string(&receipt).unwrap();
+        assert!(serialized.contains(ISOLATED_VISUAL_HELPER_SIGNING_IDENTIFIER));
+        assert!(!serialized.contains("descriptor"));
+        assert!(!serialized.contains("path"));
+
         manifest.guest_image_sha256 = "b".repeat(64);
         assert_eq!(
             measurements
                 .validate_content_against_manifest(&manifest)
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+        manifest.guest_image_sha256 = measurements.guest_image.content_sha256.clone();
+        manifest.helper_signing_requirement_sha256 = "b".repeat(64);
+        assert_eq!(
+            receipt
+                .validate_against_manifest(&manifest)
                 .unwrap_err()
                 .code,
             ComputerErrorCode::Unauthorized

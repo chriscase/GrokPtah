@@ -16,6 +16,8 @@ mod coordination;
 mod isolated_visual;
 mod isolated_visual_artifacts;
 mod isolated_visual_protocol;
+#[cfg(target_os = "macos")]
+mod macos_isolated_artifacts;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -35,8 +37,10 @@ pub use isolated_visual::{
 };
 pub use isolated_visual_artifacts::{
     measure_open_isolated_visual_artifact, measure_open_isolated_visual_artifacts,
-    IsolatedVisualArtifactMeasurement, IsolatedVisualArtifactMeasurements,
-    IsolatedVisualArtifactRole, ISOLATED_VISUAL_MAX_CONFIGURATION_BYTES,
+    measure_packaged_isolated_visual_artifacts, IsolatedVisualArtifactMeasurement,
+    IsolatedVisualArtifactMeasurements, IsolatedVisualArtifactRole,
+    IsolatedVisualPackagedArtifactReceipt, ISOLATED_VISUAL_APP_BUNDLE_IDENTIFIER,
+    ISOLATED_VISUAL_HELPER_SIGNING_IDENTIFIER, ISOLATED_VISUAL_MAX_CONFIGURATION_BYTES,
     ISOLATED_VISUAL_MAX_GUEST_IMAGE_BYTES, ISOLATED_VISUAL_MAX_HELPER_BYTES,
 };
 pub use isolated_visual_protocol::{

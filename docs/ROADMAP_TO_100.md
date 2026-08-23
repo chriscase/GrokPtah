@@ -678,10 +678,14 @@ incarnation, payload length, one outstanding request nonce, monotonic message/fr
 zero input sequence for a closed observe/frame-metadata/health/failure/stop/shutdown-ack vocabulary.
 An open-handle measurement candidate separately streams helper/image/configuration content through
 bounded SHA-256 measurements, rejects writable descriptors and unsafe modes, detects file identity
-changes, and emits no paths or descriptors. It does not discover the application bundle, prove the
-helper's signing requirement, or package any artifact. The protocol does not implement a carrier,
-transfer frame bytes, render a frame, or launch a guest. These are contracts and measurement
-primitives, not packaged evidence. See
+changes, and emits no paths or descriptors. A later source candidate adds fixed exact bundle paths,
+no-follow retained handles, strict whole-app/nested-code and helper signature validation, matching
+team/identifier checks, a canonical designated-requirement digest, and the helper-only App Sandbox +
+virtualization entitlement boundary. It rejects VM networking, debug attachment, unreviewed helper
+entitlements, path replacement, and content/manifest drift. No helper, guest, configuration, signing
+pipeline, or entitlement file is actually added by that verifier slice; it has no packaged runtime
+evidence. The protocol does not implement a carrier, transfer frame bytes, render a frame, or launch
+a guest. These are contracts and verifier/measurement primitives, not packaged evidence. See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
 source slices satisfy no #288 acceptance checkbox.
