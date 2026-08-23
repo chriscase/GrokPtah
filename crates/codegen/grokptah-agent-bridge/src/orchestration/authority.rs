@@ -209,6 +209,18 @@ impl EffectiveAuthority {
         )
     }
 
+    /// Narrow a remote authority document to one durable Agent identity.
+    /// Recompute the document hash so the published stamp and its audit
+    /// evidence cannot describe a broader scope than enforcement uses.
+    pub(crate) fn with_agent_scope(mut self, agent_id: &str) -> Result<Self, OrchError> {
+        validate_id(agent_id, "agent scope")?;
+        self.agent_ids.insert(agent_id.to_string());
+        self.capability_document.scopes.agent_ids = self.agent_ids.iter().cloned().collect();
+        self.capability_document.document_hash = hash_document(&self.capability_document)?;
+        self.stamp.capability_document_hash = self.capability_document.document_hash.clone();
+        Ok(self)
+    }
+
     fn new(
         credential_id: &str,
         owner_principal_id: &str,

@@ -91,6 +91,10 @@ impl AuthContext {
             role,
             computer_read.is_some(),
         )?;
+        let authority = match bound_agent_id.as_deref() {
+            Some(agent_id) => authority.with_agent_scope(agent_id)?,
+            None => authority,
+        };
         Ok(Self {
             token_id,
             owner_id,
@@ -585,6 +589,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(auth.bound_agent_id(), Some("worker-a"));
+        assert_eq!(
+            auth.capability_document().scopes.agent_ids,
+            vec!["worker-a".to_string()]
+        );
+        assert_eq!(
+            auth.authority_stamp().capability_document_hash,
+            auth.capability_document().document_hash
+        );
         assert_eq!(
             auth.resolve_agent_binding(None).unwrap().as_deref(),
             Some("worker-a")

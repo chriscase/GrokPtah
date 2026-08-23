@@ -26,8 +26,9 @@ complete or that the product has reached 100%.
 - Per-principal worker credential binding is now implemented: a bearer can be
   narrowed to one durable Agent, omitted worker identity resolves to that
   Agent, and cross-agent heartbeat/assignment/message/persistent-agent
-  requests fail closed. Production issuance/rotation and independent
-  long-running evidence are still open.
+  requests fail closed. The published authority capability document carries
+  the same Agent scope and a recomputed evidence hash. Production
+  issuance/rotation and independent long-running evidence are still open.
 - Computer Use observation now re-checks the durable conflict-domain poison
   fence even for an already-granted Agent, so an uncertain sibling dispatch
   cannot be bypassed by a stale grant.
