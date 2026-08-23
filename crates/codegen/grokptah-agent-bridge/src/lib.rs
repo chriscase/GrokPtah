@@ -144,8 +144,9 @@ pub use ui_review_evidence::{
     REQUIRED_UI_REVIEW_STATES, UI_REVIEW_EVIDENCE_SCHEMA,
 };
 pub use worker_certification_evidence::{
-    LongRunningWorkerEvidence, WorkerCertificationEvidenceError, WorkerCheckEvidence,
-    WorkerCredentialLifecycleEvidence, REQUIRED_SOAK_SECONDS, REQUIRED_WORKER_CHECKS,
+    expected_worker_evidence_digest, LongRunningWorkerEvidence, WorkerCertificationEvidenceError,
+    WorkerCheckEvidence, WorkerCredentialLifecycleEvidence, REQUIRED_RESTARTS,
+    REQUIRED_SOAK_SECONDS, REQUIRED_WORKERS, REQUIRED_WORKER_CHECKS,
     WORKER_CERTIFICATION_EVIDENCE_SCHEMA,
 };
 
