@@ -809,6 +809,14 @@ async fn focal_work_detail(
     )
 }
 
+fn allowed_after_sends(before: u64) -> std::ops::RangeInclusive<u64> {
+    if before == 0 {
+        0..=1
+    } else {
+        before..=before
+    }
+}
+
 fn assert_focal_after_restart(
     cut: &str,
     before_decision_ids: &std::collections::BTreeSet<String>,
@@ -848,27 +856,19 @@ fn assert_focal_after_restart(
             1,
             "cut work must keep exactly one linkedRunId at {cut}: {after_links:?}"
         );
-        assert_eq!(
-            after_sends, before_sends,
-            "restart resumed provider sends for the cut attempt at {cut}: {before_sends} -> {after_sends}"
-        );
     } else {
         assert!(
             after_links.len() <= 1,
             "restart linked more than one Run for the cut work at {cut}: {after_links:?}"
-        );
-        assert!(
-            after_sends <= before_sends.saturating_add(1),
-            "restart created extra provider sends for the cut attempt at {cut}: {before_sends} -> {after_sends}"
         );
     }
     assert_eq!(
         after_links, again_links,
         "duplicate tick created linkedRunIds at {cut}: {after_links:?} vs {again_links:?}"
     );
-    assert_eq!(
-        after_sends, again_sends,
-        "duplicate tick created provider sends for the cut attempt at {cut}: {after_sends} vs {again_sends}"
+    assert!(
+        allowed_after_sends(before_sends).contains(&after_sends) && after_sends == again_sends,
+        "restart provider sends for the cut attempt at {cut}: before={before_sends} after={after_sends} again={again_sends}"
     );
     if let Some(detail) = after_detail {
         let attempts = detail["attempts"].as_array().cloned().unwrap_or_default();
@@ -884,6 +884,24 @@ fn assert_focal_after_restart(
                 "cut work attempt must have at most one linkedRunId at {cut}: {detail}"
             );
         }
+    }
+}
+
+#[test]
+fn allowed_after_sends_known_not_sent_may_send_once() {
+    let cases: &[(u64, u64, bool)] = &[
+        (0, 0, true),
+        (0, 1, true),
+        (1, 1, true),
+        (1, 2, false),
+        (2, 3, false),
+    ];
+    for (before, after, ok) in cases {
+        assert_eq!(
+            allowed_after_sends(*before).contains(after),
+            *ok,
+            "allowed_after_sends({before}).contains({after}) should be {ok}"
+        );
     }
 }
 
