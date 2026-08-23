@@ -51,3 +51,12 @@ Provider observations have an optional opaque credential binding. The runtime
 adds it only when `LiveCredentialAttestation::certification_ready()` is true.
 Missing or mismatched binding, incomplete authoritative usage, or observation
 recorder drops must remain indeterminate in the certification lab.
+
+The candidate also exposes `LiveProviderCampaignEvidence`, a secret-free
+positive projection that can be assembled only from a ready attestation and a
+validated provider-quota receipt set. It binds the named campaign, opaque
+credential fingerprint, canonical route/model digest, consumption receipt, and
+HTTP-429 exhaustion receipt, then records an evidence digest for transport
+tamper detection. Constructing this object does not itself constitute a live
+campaign; the operator must still run the named catalog and attach the
+resulting artifact.

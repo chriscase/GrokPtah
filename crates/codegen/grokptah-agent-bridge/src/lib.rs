@@ -25,6 +25,7 @@ mod instance_lock;
 mod isolation;
 mod lane;
 pub mod live_attestation;
+pub mod live_provider_certification;
 mod local_tools;
 pub mod mcp_control;
 pub mod mcp_control_client;
@@ -102,6 +103,10 @@ pub use live_attestation::{
     LiveEndpointClass, LiveIssuerClass, LiveSafetyError, OverrideState, RedirectPolicyClass,
     RefreshEndpointPolicyState, GROK_BUILD_ENDPOINT, MAX_AUTH_JSON_BYTES, XAI_OIDC_ISSUER,
     XAI_OIDC_TOKEN_ENDPOINT,
+};
+pub use live_provider_certification::{
+    expected_evidence_digest, LiveProviderCampaignEvidence, LiveProviderCampaignEvidenceError,
+    LIVE_PROVIDER_CAMPAIGN_EVIDENCE_SCHEMA,
 };
 pub use operations_drill::{
     BuildTargetCleanupEvidence, OperationsDrillCheck, OperationsDrillEnvironment,

@@ -76,6 +76,10 @@ complete or that the product has reached 100%.
   exhaustion observations. Digests, ordering, schema, and secret-free output
   fail closed; this remains a contract for future live evidence, not a live
   quota receipt.
+- `LiveProviderCampaignEvidence` now binds a ready Grok Build attestation to
+  the complete quota receipt pair with canonical credential/route digests and
+  its own transport-tamper digest. It is an evidence artifact shape, not a
+  claim that a live campaign has run.
 - Enterprise durable work-plan deserialization now denies unknown nested
   `WorkTemplate` fields, with a regression covering a tampered policy member;
   the broker cannot silently discard an unrecognized field before validation.
