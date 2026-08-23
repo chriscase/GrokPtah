@@ -4,6 +4,9 @@ This note describes the isolated integration candidate on
 `codex/overnight-dream-certification-v1`. It is not a claim that `origin/main` is
 complete or that the product has reached 100%.
 
+Current candidate snapshot: `4960b1c7683e81ee4eb2ee056b38f8ead207b686`.
+Transport bundle: `/private/tmp/grokptah-dream-overnight-certification-v11.bundle`.
+
 ## Newly certified in this candidate
 
 - Long-horizon durable memory v2 is present with source-workspace addressing,
