@@ -333,7 +333,7 @@ impl ComputerPolicy {
         if action.requires_isolated_input() && !grant.effective_tier().allows_isolated_input() {
             return Err(ComputerError::new(
                 ComputerErrorCode::ForbiddenAction,
-                "pointer and key actions require an independently isolated input-domain proof",
+                "guest pointer, key, and text input require an independently isolated input-domain proof",
             ));
         }
         if observation.target != run.target {
@@ -403,7 +403,10 @@ impl ComputerPolicy {
             }
         }
 
-        if let ComputerAction::PointerClick { x, y, .. } = action {
+        if let ComputerAction::PointerClick { x, y, .. }
+        | ComputerAction::PointerMove { x, y }
+        | ComputerAction::PointerButton { x, y, .. } = action
+        {
             if *x < 0.0
                 || *y < 0.0
                 || *x >= observation.geometry.width
@@ -470,12 +473,15 @@ impl ComputerPolicy {
             if !run.capability_proof.isolated_input_is_dispatchable() {
                 return Err(ComputerError::new(
                     ComputerErrorCode::ForbiddenAction,
-                    "pointer and key actions require an independently isolated input-domain proof",
+                    "guest pointer, key, and text input require an independently isolated input-domain proof",
                 ));
             }
             let allowed = match action {
                 ComputerAction::KeyChord { .. } => run.capability_proof.key_chords(),
-                ComputerAction::PointerClick { .. } => run.capability_proof.pointer_fallback(),
+                ComputerAction::PointerClick { .. }
+                | ComputerAction::PointerMove { .. }
+                | ComputerAction::PointerButton { .. } => run.capability_proof.pointer_fallback(),
+                ComputerAction::TextInput { .. } => run.capability_proof.text_entry(),
                 _ => false,
             };
             if !allowed {
@@ -605,6 +611,36 @@ mod tests {
         run
     }
 
+    fn ready_isolated_run() -> ComputerRun {
+        let mut run = ready_run();
+        run.capability_proof = ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+            backend_id: crate::computer_use::SIMULATOR_ISOLATED_BACKEND_ID.into(),
+            surface_id: run.surface.surface_id.clone(),
+            incarnation: run.surface.incarnation.clone(),
+            input_domain_id: format!("input-domain-{}", Uuid::new_v4()),
+            origin: crate::computer_use::IsolationProofOrigin::SimulatorFixture,
+            observe: true,
+            semantic_actions: true,
+            text_entry: true,
+            key_chords: true,
+            pointer_fallback: true,
+        };
+        let now = Utc::now();
+        run.grant = Some(ActionGrant::for_run(
+            &run,
+            BTreeSet::from([
+                ActionClass::Semantic,
+                ActionClass::TextEntry,
+                ActionClass::KeyChord,
+                ActionClass::PointerFallback,
+            ]),
+            now - Duration::seconds(1),
+            now + Duration::minutes(5),
+            None,
+        ));
+        run
+    }
+
     fn live_fence(run: &ComputerRun) -> SurfaceFreshnessFence {
         SurfaceFreshnessFence {
             surface_id: run.surface.surface_id.clone(),
@@ -699,17 +735,59 @@ mod tests {
     fn pointer_fallback_needs_isolated_input_proof() {
         let run = ready_run();
         let observation = run.current_observation.clone().unwrap();
-        let err = authorize(
-            &run,
-            &observation,
+        let actions = [
             ComputerAction::PointerClick {
                 x: 10.0,
                 y: 10.0,
                 button: crate::computer_use::PointerButton::Primary,
             },
+            ComputerAction::PointerMove { x: 10.0, y: 10.0 },
+            ComputerAction::PointerButton {
+                x: 10.0,
+                y: 10.0,
+                button: crate::computer_use::PointerButton::Primary,
+                state: crate::computer_use::PointerButtonState::Down,
+            },
+            ComputerAction::TextInput { text: "Ada".into() },
+        ];
+        for action in actions {
+            assert_eq!(
+                authorize(&run, &observation, action).unwrap_err().code,
+                ComputerErrorCode::ForbiddenAction
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_input_is_bound_to_guest_surface_geometry() {
+        let run = ready_isolated_run();
+        let observation = run.current_observation.clone().unwrap();
+        authorize(
+            &run,
+            &observation,
+            ComputerAction::PointerMove { x: 10.0, y: 10.0 },
         )
-        .unwrap_err();
-        assert_eq!(err.code, ComputerErrorCode::ForbiddenAction);
+        .unwrap();
+        authorize(
+            &run,
+            &observation,
+            ComputerAction::TextInput { text: "Ada".into() },
+        )
+        .unwrap();
+        for action in [
+            ComputerAction::PointerMove { x: 800.0, y: 1.0 },
+            ComputerAction::PointerButton {
+                x: 1.0,
+                y: 600.0,
+                button: crate::computer_use::PointerButton::Primary,
+                state: crate::computer_use::PointerButtonState::Up,
+            },
+        ] {
+            assert_eq!(
+                authorize(&run, &observation, action).unwrap_err().code,
+                ComputerErrorCode::ForbiddenAction
+            );
+        }
     }
 
     #[test]

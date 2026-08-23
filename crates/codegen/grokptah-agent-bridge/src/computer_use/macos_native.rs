@@ -535,6 +535,9 @@ fn encode_action_request(
         ),
         ComputerAction::KeyChord { .. }
         | ComputerAction::PointerClick { .. }
+        | ComputerAction::PointerMove { .. }
+        | ComputerAction::PointerButton { .. }
+        | ComputerAction::TextInput { .. }
         | ComputerAction::Wait { .. } => {
             return Err(ComputerError::new(
                 ComputerErrorCode::ForbiddenAction,

@@ -1055,7 +1055,46 @@ export type ComputerAction =
       element_id: string;
       delta_x: number;
       delta_y: number;
-    };
+    }
+  | {
+      type: "key_chord";
+      keys: Array<
+        | "enter"
+        | "escape"
+        | "tab"
+        | "arrow_up"
+        | "arrow_down"
+        | "arrow_left"
+        | "arrow_right"
+        | "space"
+        | "backspace"
+        | "delete"
+        | "home"
+        | "end"
+        | "page_up"
+        | "page_down"
+        | "shift"
+        | "control"
+        | "alt"
+        | "meta"
+      >;
+    }
+  | {
+      type: "pointer_click";
+      x: number;
+      y: number;
+      button: "primary" | "secondary";
+    }
+  | { type: "pointer_move"; x: number; y: number }
+  | {
+      type: "pointer_button";
+      x: number;
+      y: number;
+      button: "primary" | "secondary";
+      state: "down" | "up";
+    }
+  | { type: "text_input"; text: string }
+  | { type: "wait"; millis: number };
 
 export type ComputerSurfaceEvent =
   | "unknown"

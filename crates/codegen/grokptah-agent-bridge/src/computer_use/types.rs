@@ -1113,7 +1113,9 @@ impl ComputerAttentionPoint {
                 y_basis_points: Self::MAX_BASIS_POINTS / 2,
                 target: ComputerAttentionTarget::Surface,
             }),
-            ComputerAction::PointerClick { x, y, .. } => Self::from_logical_point(
+            ComputerAction::PointerClick { x, y, .. }
+            | ComputerAction::PointerMove { x, y }
+            | ComputerAction::PointerButton { x, y, .. } => Self::from_logical_point(
                 *x,
                 *y,
                 &observation.geometry,
@@ -1370,6 +1372,16 @@ pub enum PointerButton {
     Secondary,
 }
 
+/// Explicit pointer button edge for an independently isolated visual input
+/// domain. Keeping down/up separate makes drag and hold behavior auditable and
+/// prevents a guest bridge from inventing an implicit release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerButtonState {
+    Down,
+    Up,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputerKey {
@@ -1421,6 +1433,23 @@ pub enum ComputerAction {
         y: f64,
         button: PointerButton,
     },
+    PointerMove {
+        /// Guest-surface-relative logical coordinates, never host screen coordinates.
+        x: f64,
+        y: f64,
+    },
+    PointerButton {
+        /// Guest-surface-relative logical coordinates, never host screen coordinates.
+        x: f64,
+        y: f64,
+        button: PointerButton,
+        state: PointerButtonState,
+    },
+    /// Text sent to the focused control inside an independently isolated guest.
+    /// This is intentionally distinct from semantic `SetValue`.
+    TextInput {
+        text: String,
+    },
     Wait {
         millis: u64,
     },
@@ -1433,9 +1462,11 @@ impl ComputerAction {
             | Self::Invoke { .. }
             | Self::Select { .. }
             | Self::Scroll { .. } => ActionClass::Semantic,
-            Self::SetValue { .. } => ActionClass::TextEntry,
+            Self::SetValue { .. } | Self::TextInput { .. } => ActionClass::TextEntry,
             Self::KeyChord { .. } => ActionClass::KeyChord,
-            Self::PointerClick { .. } => ActionClass::PointerFallback,
+            Self::PointerClick { .. } | Self::PointerMove { .. } | Self::PointerButton { .. } => {
+                ActionClass::PointerFallback
+            }
             Self::Wait { .. } => ActionClass::Semantic,
         }
     }
@@ -1445,7 +1476,11 @@ impl ComputerAction {
     pub fn required_tier(&self) -> ComputerCapabilityTier {
         match self {
             Self::ActivateTarget => ComputerCapabilityTier::ForegroundSemantic,
-            Self::KeyChord { .. } | Self::PointerClick { .. } => {
+            Self::KeyChord { .. }
+            | Self::PointerClick { .. }
+            | Self::PointerMove { .. }
+            | Self::PointerButton { .. }
+            | Self::TextInput { .. } => {
                 ComputerCapabilityTier::IndependentlyIsolatedVisualInputDomain
             }
             Self::Invoke { .. }
@@ -1457,7 +1492,14 @@ impl ComputerAction {
     }
 
     pub fn requires_isolated_input(&self) -> bool {
-        matches!(self, Self::KeyChord { .. } | Self::PointerClick { .. })
+        matches!(
+            self,
+            Self::KeyChord { .. }
+                | Self::PointerClick { .. }
+                | Self::PointerMove { .. }
+                | Self::PointerButton { .. }
+                | Self::TextInput { .. }
+        )
     }
 
     pub fn is_activate_target(&self) -> bool {
@@ -1479,16 +1521,20 @@ impl ComputerAction {
             validate_id("element_id", element_id)?;
         }
         match self {
-            Self::SetValue { text, .. } if text.len() > limits.max_text_entry_bytes as usize => {
+            Self::SetValue { text, .. } | Self::TextInput { text }
+                if text.len() > limits.max_text_entry_bytes as usize =>
+            {
                 Err(ComputerError::new(
                     ComputerErrorCode::LimitReached,
                     "text entry limit exceeded",
                 ))
             }
-            Self::SetValue { text, .. } if text.contains('\0') => Err(ComputerError::new(
-                ComputerErrorCode::InvalidRequest,
-                "text entry contains a null byte",
-            )),
+            Self::SetValue { text, .. } | Self::TextInput { text } if text.contains('\0') => {
+                Err(ComputerError::new(
+                    ComputerErrorCode::InvalidRequest,
+                    "text entry contains a null byte",
+                ))
+            }
             Self::Scroll {
                 delta_x, delta_y, ..
             } if delta_x.unsigned_abs() > 10_000 || delta_y.unsigned_abs() > 10_000 => {
@@ -1500,9 +1546,16 @@ impl ComputerAction {
             Self::KeyChord { keys } if keys.is_empty() || keys.len() > 4 => Err(
                 ComputerError::new(ComputerErrorCode::InvalidRequest, "invalid key chord"),
             ),
-            Self::PointerClick { x, y, .. } if !x.is_finite() || !y.is_finite() => Err(
-                ComputerError::new(ComputerErrorCode::InvalidRequest, "invalid pointer point"),
-            ),
+            Self::PointerClick { x, y, .. }
+            | Self::PointerMove { x, y }
+            | Self::PointerButton { x, y, .. }
+                if !x.is_finite() || !y.is_finite() =>
+            {
+                Err(ComputerError::new(
+                    ComputerErrorCode::InvalidRequest,
+                    "invalid pointer point",
+                ))
+            }
             Self::Wait { millis } if *millis > limits.max_wait_millis => Err(ComputerError::new(
                 ComputerErrorCode::LimitReached,
                 "wait limit exceeded",
@@ -1769,7 +1822,10 @@ impl ComputerCapabilities {
             return self.proof.isolated_input_is_dispatchable()
                 && match action {
                     ComputerAction::KeyChord { .. } => self.proof.key_chords(),
-                    ComputerAction::PointerClick { .. } => self.proof.pointer_fallback(),
+                    ComputerAction::PointerClick { .. }
+                    | ComputerAction::PointerMove { .. }
+                    | ComputerAction::PointerButton { .. } => self.proof.pointer_fallback(),
+                    ComputerAction::TextInput { .. } => self.proof.text_entry(),
                     _ => false,
                 };
         }
@@ -2538,6 +2594,15 @@ mod tests {
             })
         );
 
+        let guest_pointer = ComputerAttentionPoint::for_action(
+            &observation,
+            &ComputerAction::PointerMove { x: 400.0, y: 300.0 },
+        )
+        .unwrap();
+        assert_eq!(guest_pointer.x_basis_points, 5_000);
+        assert_eq!(guest_pointer.y_basis_points, 5_000);
+        assert_eq!(guest_pointer.target, ComputerAttentionTarget::Surface);
+
         let mut outside = observation;
         outside.elements[0].bounds.as_mut().unwrap().x = 760.0;
         assert!(ComputerAttentionPoint::for_action(&outside, &action).is_none());
@@ -2655,6 +2720,79 @@ mod tests {
             .unwrap_err()
             .code,
             ComputerErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            ComputerAction::PointerMove {
+                x: f64::NAN,
+                y: 1.0,
+            }
+            .validate(&limits)
+            .unwrap_err()
+            .code,
+            ComputerErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            ComputerAction::TextInput {
+                text: "not\0valid".into(),
+            }
+            .validate(&limits)
+            .unwrap_err()
+            .code,
+            ComputerErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn isolated_input_contract_is_explicit_and_proof_gated() {
+        let surface = ComputerSurfaceBinding::issue();
+        let isolated = ComputerCapabilities::from_proof(
+            ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+                backend_id: SIMULATOR_ISOLATED_BACKEND_ID.into(),
+                surface_id: surface.surface_id,
+                incarnation: surface.incarnation,
+                input_domain_id: format!("input-domain-{}", Uuid::new_v4()),
+                origin: IsolationProofOrigin::SimulatorFixture,
+                observe: true,
+                semantic_actions: true,
+                text_entry: true,
+                key_chords: true,
+                pointer_fallback: true,
+            },
+        )
+        .unwrap();
+        let actions = [
+            ComputerAction::PointerMove { x: 1.0, y: 2.0 },
+            ComputerAction::PointerButton {
+                x: 1.0,
+                y: 2.0,
+                button: PointerButton::Primary,
+                state: PointerButtonState::Down,
+            },
+            ComputerAction::TextInput { text: "Ada".into() },
+        ];
+        for action in &actions {
+            assert!(action.requires_isolated_input());
+            assert_eq!(
+                action.required_tier(),
+                ComputerCapabilityTier::IndependentlyIsolatedVisualInputDomain
+            );
+            assert!(isolated.allows_action(action));
+        }
+
+        let foreground = ComputerCapabilities::from_proof(macos_native_capability_proof()).unwrap();
+        for action in &actions {
+            assert!(!foreground.allows_action(action));
+        }
+
+        assert_eq!(
+            serde_json::to_value(&actions[1]).unwrap(),
+            serde_json::json!({
+                "type": "pointer_button",
+                "x": 1.0,
+                "y": 2.0,
+                "button": "primary",
+                "state": "down"
+            })
         );
     }
 

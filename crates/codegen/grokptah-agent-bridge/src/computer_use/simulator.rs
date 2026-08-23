@@ -417,7 +417,11 @@ fn simulator_dispatch(
             ComputerAction::Wait { .. } => {
                 ActionOutcome::bounded("simulator action completed", Some(true))
             }
-            ComputerAction::PointerClick { .. } | ComputerAction::KeyChord { .. }
+            ComputerAction::PointerClick { .. }
+            | ComputerAction::PointerMove { .. }
+            | ComputerAction::PointerButton { .. }
+            | ComputerAction::KeyChord { .. }
+            | ComputerAction::TextInput { .. }
                 if proof.is_simulator_only_isolation() =>
             {
                 ActionOutcome::bounded("simulator isolated fixture input", Some(true))
@@ -576,6 +580,35 @@ mod tests {
                     y: 10.0,
                     button: crate::computer_use::PointerButton::Primary,
                 },
+            )
+            .await
+            .unwrap();
+        isolated
+            .act(
+                "iso",
+                &isolated_obs,
+                &ComputerAction::PointerMove { x: 20.0, y: 30.0 },
+            )
+            .await
+            .unwrap();
+        isolated
+            .act(
+                "iso",
+                &isolated_obs,
+                &ComputerAction::PointerButton {
+                    x: 20.0,
+                    y: 30.0,
+                    button: crate::computer_use::PointerButton::Primary,
+                    state: crate::computer_use::PointerButtonState::Down,
+                },
+            )
+            .await
+            .unwrap();
+        isolated
+            .act(
+                "iso",
+                &isolated_obs,
+                &ComputerAction::TextInput { text: "Ada".into() },
             )
             .await
             .unwrap();

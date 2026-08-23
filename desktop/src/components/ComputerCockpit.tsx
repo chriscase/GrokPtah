@@ -81,6 +81,18 @@ function actionText(action: ComputerAction) {
       return "Select the chosen element";
     case "scroll":
       return "Scroll the chosen element into view";
+    case "key_chord":
+      return "Send a key chord inside the isolated guest";
+    case "pointer_click":
+      return "Click inside the isolated guest";
+    case "pointer_move":
+      return "Move the agent cursor inside the isolated guest";
+    case "pointer_button":
+      return `${action.state === "down" ? "Press" : "Release"} the pointer button inside the isolated guest`;
+    case "text_input":
+      return action.text;
+    case "wait":
+      return "Wait for the isolated guest";
   }
 }
 

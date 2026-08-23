@@ -1159,6 +1159,12 @@ fn approval_copy(
             "Application focus".into(),
         ));
     }
+    if action.requires_isolated_input() {
+        return Err(
+            "The cockpit cannot stage guest input until a measured isolated visual surface is packaged"
+                .into(),
+        );
+    }
     let element_id = action
         .referenced_element()
         .ok_or_else(|| "The proposed action does not identify an element".to_string())?;

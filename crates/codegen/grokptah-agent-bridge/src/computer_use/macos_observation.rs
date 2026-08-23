@@ -1168,6 +1168,9 @@ fn action_element(
         }
         ComputerAction::KeyChord { .. }
         | ComputerAction::PointerClick { .. }
+        | ComputerAction::PointerMove { .. }
+        | ComputerAction::PointerButton { .. }
+        | ComputerAction::TextInput { .. }
         | ComputerAction::Wait { .. } => {
             return Err(ComputerError::new(
                 ComputerErrorCode::ForbiddenAction,
