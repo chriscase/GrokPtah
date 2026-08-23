@@ -119,6 +119,8 @@ unrelated signal.
 - Operations drill suite: 4 passed, covering combined-environment readiness,
   failed/partial drill denial, duplicate/missing checks, cleanup safety, and
   unknown or malformed evidence.
+- Worker lease claimant fencing: bound-credential ownership check passed;
+  independent worker leases remained distinct and durable across store reopen.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.

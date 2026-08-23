@@ -18,6 +18,10 @@ from:
 A live heartbeat is not a lease. Lease ownership is only an active
 `WorkAttempt` whose claimant is that Agent.
 
+Lease-scoped renew, link, progress, release, completion, and failure calls
+also re-check the durable attempt claimant for a bound credential; possession
+of a lease token alone cannot turn one worker bearer into another worker.
+
 ### Authenticated principal versus Agent resource
 
 Named control-plane credentials (`AuthCredential`) share one service account

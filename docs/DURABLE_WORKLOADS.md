@@ -135,6 +135,8 @@ The bridge integration tests cover:
 - dependency blocking and unblocking;
 - approval-aware completion;
 - duplicate claims, wrong tokens, and durable attempt history;
+- bound-worker claimant fencing and distinct independent leases surviving a
+  store reopen;
 - create and claim idempotency, including conflicting replay rejection;
 - omission of `leaseTokenHash` from protocol responses;
 - progress and completion through the live loopback MCP server;
