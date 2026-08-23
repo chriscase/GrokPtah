@@ -98,9 +98,14 @@ pub use host_helpers::{
     is_edit_or_shell_tool, is_post_cargo_explore_only_burn, should_skip_tool_after_cargo_failure,
 };
 #[doc(hidden)]
-pub use host_helpers::{replay_xai_provider_contract_on_loopback, ProviderContractReplay};
+pub use host_helpers::{
+    replay_xai_provider_contract_on_loopback, MemoryInjectionProbe, ProviderContractReplay,
+};
 
-pub use memory::{MemoryFact, MemoryScope};
+pub use memory::{
+    MemoryCommitStatus, MemoryConflict, MemoryError, MemoryFact, MemoryRetrieval, MemoryScope,
+    MemoryWriteAck,
+};
 
 pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
@@ -144,11 +149,11 @@ pub use orchestration::{
     AgentLaneAssociation, AgentMemoryPolicy, AgentModelSpec, AgentRecord, AgentResumePlan,
     AgentRuntimeState, AgentSpec, AgentState, AuthContext, AuthCredential,
     ContinuationAssemblyFailure, ContinuationCheckpoint, ContinuationContext, ContinuationFidelity,
-    ContinuationInputSnapshot, ContinuationMemoryFact, ContinuationMemoryInput,
-    ContinuationMemoryScope, ContinuationOmission, ContinuationReason, ContinuationReasonCode,
-    ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef, FakeClock,
-    ManagedExecutionPolicy, MissedRunPolicy, NativeExecutorStatus, OrchStore, OrchestrationConfig,
-    OrchestrationService, PromotionState, RetentionPolicy, RetentionReport,
+    ContinuationInputSnapshot, ContinuationMemoryConflict, ContinuationMemoryFact,
+    ContinuationMemoryInput, ContinuationMemoryScope, ContinuationOmission, ContinuationReason,
+    ContinuationReasonCode, ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef,
+    FakeClock, ManagedExecutionPolicy, MissedRunPolicy, NativeExecutorStatus, OrchStore,
+    OrchestrationConfig, OrchestrationService, PromotionState, RetentionPolicy, RetentionReport,
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
     RoutineTrigger, RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
     RunStopCause, WorkAttemptView, WorkDecision, WorkItem, WorkItemSnapshot, WorkMessage,
