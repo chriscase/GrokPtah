@@ -277,7 +277,7 @@ async fn bootstrap(
     // orchestration controls. Make that authority explicit instead of relying
     // on the product's safe coordinator default for ordinary bearer tokens.
     orchestration
-        .set_auth_credentials(vec![AuthCredential::operator("certification-lab", token)?])
+        .set_auth_credentials(vec![AuthCredential::operator("primary", token)?])
         .context("install isolated certification operator credential")?;
     let limits = ControlServerLimits {
         max_concurrent: config.max_concurrent,
