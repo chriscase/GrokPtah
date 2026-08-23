@@ -30,10 +30,10 @@ use always_on_support::{
     call, call_expect_error, causal_join, certify, clear_assertions, fingerprint_tree,
     intents_array, mcp, mcp_with_token, parse_fixture, pending_usage, plans_len, poll_json,
     recorded_assertions, repository_commit, require_causal_join, require_unique_step_work, rid,
-    runs_array, scan_service_artifacts, scan_text, serial_lock, sessions_len, try_mcp,
-    work_for_step, work_items, work_kind_count, CausalJoin, EntityCardinalities, FakeProvider,
-    Fixture, ProviderDisposition, ProviderScript, ResourceSample, ServiceProcess, FIXTURE_BYTES,
-    FIXTURE_SCHEMA, TOKEN,
+    runs_array, scan_service_artifacts, scan_service_artifacts_with_sentinels, scan_text,
+    serial_lock, sessions_len, try_mcp, work_for_step, work_items, work_kind_count, CausalJoin,
+    EntityCardinalities, FakeProvider, Fixture, ProviderDisposition, ProviderScript,
+    ResourceSample, ServiceProcess, FIXTURE_BYTES, FIXTURE_SCHEMA, TOKEN,
 };
 
 const STAGE6_WORKER_LABELS: [&str; REQUIRED_WORKERS] = ["worker-a", "worker-b"];
@@ -713,6 +713,16 @@ struct Stage6WorkerPool {
 }
 
 impl Stage6WorkerPool {
+    fn scan_credentials(campaign: &Campaign) {
+        let sentinels = STAGE6_INITIAL_TOKENS
+            .iter()
+            .chain(STAGE6_ROTATED_TOKENS.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        scan_service_artifacts_with_sentinels(&campaign.service, &sentinels);
+        campaign.provider.assert_route_and_auth();
+    }
+
     async fn bootstrap(campaign: &mut Campaign) -> Self {
         let mut lanes = Vec::with_capacity(REQUIRED_WORKERS);
         for index in 0..REQUIRED_WORKERS {
@@ -744,6 +754,7 @@ impl Stage6WorkerPool {
         campaign.service.replace_client_specs(pool.client_specs());
         campaign.reopen().await;
         pool.connect_and_capture_authority(campaign).await;
+        Self::scan_credentials(campaign);
         pool
     }
 
@@ -1182,6 +1193,7 @@ impl Stage6WorkerPool {
                     evidence_digest,
                 });
         }
+        Self::scan_credentials(campaign);
     }
 
     async fn retained_audit_entries(&mut self, campaign: &mut Campaign) -> u64 {
@@ -2744,7 +2756,7 @@ async fn stage6_multi_worker_restart_rotation_smoke() {
         "worker attempt/decision/message evidence missing"
     );
     assert_eq!(workers.credential_lifecycle.len(), REQUIRED_WORKERS);
-    campaign.scan();
+    Stage6WorkerPool::scan_credentials(&campaign);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2799,7 +2811,7 @@ async fn certify_stage6_multi_worker_72h() {
         cycles = cycles.saturating_add(1);
         max.max_with(&campaign.service.sample_tree());
         max_cycle_latency_ms = max_cycle_latency_ms.max(cycle_started.elapsed().as_millis() as u64);
-        campaign.scan();
+        Stage6WorkerPool::scan_credentials(&campaign);
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2911,7 +2923,7 @@ async fn certify_stage6_multi_worker_72h() {
     };
     evidence.evidence_digest = expected_worker_evidence_digest(&evidence);
     persist_stage6_worker_report(&evidence);
-    campaign.scan();
+    Stage6WorkerPool::scan_credentials(&campaign);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

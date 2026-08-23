@@ -1830,7 +1830,7 @@ pub fn scan_mcp(tool: &str, structured: &Value, raw: &Value) {
 }
 
 pub fn scan_home(home: &Path, limits: &ArtifactScan) {
-    scan_tree(home, limits).unwrap_or_else(|error| panic!("home scan failed: {error}"));
+    scan_tree(home, limits, &[]).unwrap_or_else(|error| panic!("home scan failed: {error}"));
 }
 
 pub fn scan_service_artifacts(service: &ServiceProcess) {
@@ -1839,15 +1839,34 @@ pub fn scan_service_artifacts(service: &ServiceProcess) {
     scan_home(&service.home, &service.artifact_scan);
 }
 
-fn scan_tree(root: &Path, limits: &ArtifactScan) -> Result<(), String> {
+pub fn scan_service_artifacts_with_sentinels(service: &ServiceProcess, sentinels: &[&str]) {
+    assert!(
+        sentinels.iter().all(|sentinel| !sentinel.is_empty()),
+        "artifact sentinels must be non-empty"
+    );
+    for (label, text) in [
+        ("stderr-head", service.stderr_head()),
+        ("stderr-tail", service.stderr_tail()),
+    ] {
+        scan_text(label, &text);
+        for sentinel in sentinels {
+            assert!(!text.contains(sentinel), "{label} leaked campaign sentinel");
+        }
+    }
+    scan_tree(&service.home, &service.artifact_scan, sentinels)
+        .unwrap_or_else(|error| panic!("campaign home scan failed: {error}"));
+}
+
+fn scan_tree(root: &Path, limits: &ArtifactScan, sentinels: &[&str]) -> Result<(), String> {
     let mut files = 0u64;
-    scan_tree_inner(root, 0, limits, &mut files)
+    scan_tree_inner(root, 0, limits, sentinels, &mut files)
 }
 
 fn scan_tree_inner(
     path: &Path,
     depth: u64,
     limits: &ArtifactScan,
+    sentinels: &[&str],
     files: &mut u64,
 ) -> Result<(), String> {
     if depth > limits.max_depth {
@@ -1864,7 +1883,7 @@ fn scan_tree_inner(
         let meta = std::fs::symlink_metadata(&child)
             .map_err(|error| format!("metadata {}: {error}", child.display()))?;
         if meta.file_type().is_dir() {
-            scan_tree_inner(&child, depth + 1, limits, files)?;
+            scan_tree_inner(&child, depth + 1, limits, sentinels, files)?;
             continue;
         }
         *files = files.saturating_add(1);
@@ -1892,6 +1911,11 @@ fn scan_tree_inner(
             )
         })?;
         scan_text_result(&format!("home {}", child.display()), text)?;
+        for sentinel in sentinels {
+            if text.contains(sentinel) {
+                return Err(format!("home {} leaked campaign sentinel", child.display()));
+            }
+        }
     }
     Ok(())
 }
@@ -2506,5 +2530,30 @@ mod redaction_scan_tests {
             "detail": TOKEN
         });
         scan_mcp("ptah_get_run", &structured, &structured);
+    }
+}
+
+#[cfg(test)]
+mod campaign_artifact_scan_tests {
+    use super::{scan_tree, ArtifactScan};
+
+    fn limits() -> ArtifactScan {
+        ArtifactScan {
+            max_depth: 4,
+            max_files: 16,
+            max_file_bytes: 4096,
+            stderr_head_bytes: 4096,
+            stderr_tail_bytes: 4096,
+        }
+    }
+
+    #[test]
+    fn campaign_specific_secret_is_rejected_from_retained_home() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("audit.json"), "worker-campaign-secret").unwrap();
+        assert!(scan_tree(home.path(), &limits(), &["unrelated-secret"]).is_ok());
+        let error = scan_tree(home.path(), &limits(), &["worker-campaign-secret"])
+            .expect_err("campaign credential must fail the retained-home scan");
+        assert!(error.contains("campaign sentinel"), "{error}");
     }
 }

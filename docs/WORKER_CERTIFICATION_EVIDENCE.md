@@ -39,7 +39,9 @@ service-owned durable home, bootstraps two distinct durable worker Agents,
 installs separate Agent-bound credentials, holds both leases across the real
 manager SIGKILL fence, completes them with the recovered lease secrets,
 rotates both credentials across another restart, rejects the old bearers,
-and continues bounded parent/child worker cycles for the measured window. The
+and scans retained service files plus bounded stderr for every initial and
+rotated worker bearer. It continues bounded parent/child worker cycles for the
+measured window. The
 runner creates the unique
 `<platform-temp>/always-on-grokbot-workers-<sha>-<campaign-id>.json` artifact
 only after
