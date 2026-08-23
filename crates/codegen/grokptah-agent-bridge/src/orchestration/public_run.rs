@@ -1284,131 +1284,75 @@ mod tests {
     }
 
     #[test]
-    fn reintroducing_raw_run_record_serialization_fails() {
-        let service = include_str!("service.rs");
-        let list_runs = service
-            .split("pub fn list_runs_scoped_page")
-            .nth(1)
-            .expect("list_runs_scoped_page")
-            .split("// ── durable workloads")
-            .next()
+    fn public_list_get_progress_omit_internal_fields_and_stay_session_bounded() {
+        let temp = tempdir().unwrap();
+        let store = OrchStore::open(temp.path()).unwrap();
+        let own = leaky_run(leaky_route());
+        let reservation =
+            QuotaReservation::for_run(&own, "owner-a", QuotaLimits::default(), Utc::now()).unwrap();
+        store
+            .admit_run_with_quota(&own, &reservation)
+            .into_result()
             .unwrap();
-        let run_value = service
-            .split("fn run_value(")
-            .nth(1)
-            .expect("run_value")
-            .split("\n    pub fn ")
-            .next()
-            .unwrap();
-        let progress_value = service
-            .split("fn progress_value(")
-            .nth(1)
-            .expect("progress_value")
-            .split("\n    fn ")
-            .next()
-            .unwrap();
-        assert!(
-            !run_value.contains("serde_json::to_value(run)"),
-            "get_run must project PublicRun instead of serializing RunRecord"
-        );
-        assert!(
-            run_value.contains("project_public_run"),
-            "get_run must call project_public_run"
-        );
-        assert!(
-            list_runs.contains("list_runs_for_session_page"),
-            "list_runs must use the session-bounded store query"
-        );
-        assert!(
-            !list_runs.contains(".list_runs()"),
-            "list_runs must not scan the global Run directory"
-        );
-        assert!(
-            list_runs.contains("project_public_run"),
-            "list_runs must call project_public_run"
-        );
-        assert!(
-            list_runs.contains("public_run_to_value"),
-            "list_runs must encode PublicRun values"
-        );
-        assert!(
-            !list_runs.contains("serde_json::to_value(run)"),
-            "list_runs must not serialize raw RunRecord values"
-        );
-        assert!(
-            progress_value.contains("project_public_run_progress"),
-            "progress must use the shared public progress projection"
-        );
-        assert!(
-            !progress_value.contains("serde_json::to_value(run)"),
-            "progress must not serialize RunRecord"
-        );
-        let promote = service
-            .split("pub async fn promote_run(")
-            .nth(1)
-            .expect("promote_run")
-            .split("\n    pub async fn ")
-            .next()
-            .unwrap();
-        let discard = service
-            .split("pub async fn discard_run(")
-            .nth(1)
-            .expect("discard_run")
-            .split("\n    // ── mutations")
-            .next()
-            .unwrap();
-        assert!(
-            promote.contains("project_public_run") && promote.contains("public_run_from_receipt"),
-            "promote must project PublicRun and sanitize replay receipts"
-        );
-        assert!(
-            !promote.contains("serde_json::to_value(promoted)"),
-            "promote must not serialize raw RunRecord"
-        );
-        assert!(
-            discard.contains("project_public_run") && discard.contains("public_run_from_receipt"),
-            "discard must project PublicRun and sanitize replay receipts"
-        );
-        assert!(
-            !discard.contains("serde_json::to_value(discarded)"),
-            "discard must not serialize raw RunRecord"
-        );
+        let mut foreign = leaky_run(leaky_route());
+        foreign.run_id = "foreign-run-leak".into();
+        foreign.request_id = "foreign-req".into();
+        foreign.session_id = Uuid::new_v4();
+        foreign.provider_route = None;
+        store.admit_run(&foreign).into_result().unwrap();
 
-        let host = include_str!("../host.rs");
-        let public_list = host
-            .split("pub fn list_public_session_runs_page")
-            .nth(1)
-            .expect("list_public_session_runs_page")
-            .split("\n    pub fn ")
-            .next()
+        let loaded = store.load_run(&own.run_id).unwrap().unwrap();
+        let raw = serde_json::to_value(&loaded).unwrap();
+        assert!(
+            raw.get("providerRoute").is_some(),
+            "durable RunRecord retains providerRoute"
+        );
+        assert!(raw["aggregates"]
+            .get("accountedProviderAttemptIds")
+            .is_some());
+
+        let page = store
+            .list_runs_for_session_page(own.session_id, None, None, None)
             .unwrap();
-        let public_get = host
-            .split("pub fn get_public_session_run")
-            .nth(1)
-            .expect("get_public_session_run")
-            .split("\n    pub fn ")
-            .next()
-            .unwrap();
-        assert!(
-            public_list.contains("list_runs_for_session_page"),
-            "desktop list must use the session-bounded store query"
+        assert_eq!(
+            page.total_count, 1,
+            "session list must not include foreign Runs"
         );
-        assert!(
-            public_list.contains("project_public_session_run"),
-            "desktop list must project PublicRun"
-        );
-        assert!(
-            public_get.contains("project_public_session_run"),
-            "desktop get must project PublicRun"
-        );
-        assert!(
-            !public_list.contains("serde_json::to_value"),
-            "desktop list must not serialize RunRecord"
-        );
-        assert!(
-            !public_get.contains("serde_json::to_value"),
-            "desktop get must not serialize RunRecord"
-        );
+        assert_eq!(page.runs.len(), 1);
+        assert_eq!(page.runs[0].run_id, own.run_id);
+        assert!(!page.truncated);
+
+        let projected = project_public_run(&store, &page.runs[0]).unwrap();
+        let get = public_run_to_value(&projected).unwrap();
+        let progress = public_run_progress_to_value(
+            &project_public_run_progress(&store, &loaded, false).unwrap(),
+        )
+        .unwrap();
+        let handoff = public_run_handoff_value(&projected).unwrap();
+        for (name, payload) in [
+            ("get", &get),
+            ("progress", &progress),
+            ("handoff", &handoff),
+        ] {
+            assert!(
+                payload.get("providerRoute").is_none(),
+                "{name} serialized internal providerRoute"
+            );
+            assert!(
+                payload
+                    .pointer("/aggregates/accountedProviderAttemptIds")
+                    .is_none(),
+                "{name} serialized internal accountedProviderAttemptIds"
+            );
+            let encoded = payload.to_string();
+            assert!(
+                !encoded.contains("providerRoute")
+                    && !encoded.contains("accountedProviderAttemptIds"),
+                "{name} MCP text leaked internal RunRecord keys: {encoded}"
+            );
+        }
+        assert!(get.get("providerExecution").is_some());
+        assert_payload_hides_route(&get, own.provider_route.as_ref().unwrap());
     }
 
     #[test]
