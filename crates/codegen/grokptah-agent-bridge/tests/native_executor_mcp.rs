@@ -2457,9 +2457,7 @@ async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_a
             bounds: RunBounds::default(),
         },
     );
-    let workspace_text = workspace
-        .path()
-        .canonicalize()
+    let workspace_text = dunce::canonicalize(workspace.path())
         .unwrap()
         .display()
         .to_string();
