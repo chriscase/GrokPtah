@@ -64,11 +64,26 @@ after dispatch and verifies values where Accessibility exposes a deterministic p
 Permission revocation, app restart, focus theft, window movement, stale element identity, tree
 truncation, secure controls, or failed postconditions fail closed and consume the frame.
 
-This slice has no `CGEvent` keyboard or pointer path, coordinate fallback, cursor movement,
-clipboard access, AppleScript, secret substitution, automatic approval, unattended mode, model
-Computer tool, or Computer mutation over MCP. Pause, Stop, and Take over revoke authority without
-depending on the model or network; an action that loses the durable completion race cannot commit
-as successful.
+This native adapter has no `CGEvent` keyboard or pointer path, coordinate fallback, cursor
+movement, clipboard access, AppleScript, secret substitution, automatic approval, unattended
+mode, or MCP/model **dispatch** tool. The desktop cockpit may ask a qualified model for one
+typed proposal (`computer_agent.rs`); that proposal never executes until the same local
+one-use approval used for manual actions. Computer Use MCP **mutations** remain unsupported
+([#271](https://github.com/chriscase/GrokPtah/issues/271)). Pause, Stop, and Take over revoke
+authority without depending on the model or network; an action that loses the durable
+completion race cannot commit as successful.
+
+Current semantic Computer Use **deliberately avoids raw global mouse injection**. Foreground
+`activate target` (this shim rechecks the frontmost application and focused AX window) is
+**not equivalent to non-disruptive isolated Computer Use**. Background-safe semantic
+([#287](https://github.com/chriscase/GrokPtah/issues/287)) is Planned.
+**Isolated visual Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288))
+is a mandatory product exit**: a genuinely isolated agent-owned app
+surface/cursor; global pointer, keyboard, focus, clipboard, and unrelated apps
+remain unaffected; takeover is out-of-band and preemptive. This foreground
+slice does **not** satisfy that contract. Raw global injection may remain
+Explicitly unsupported. Status:
+[`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md).
 
 ## Packaging and signing
 

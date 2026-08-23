@@ -6,6 +6,24 @@ control plane used by the desktop app. Policy, persistent orchestration, and
 restart recovery stay in `grokptah-agent-bridge`; the service crate owns only
 configuration and process lifecycle.
 
+Desktop and `grokptah-service` share a runtime; they are **not** assumed to
+have identical host capabilities, and a declared capability document is not
+on `origin/main`. Hosted-service CI (`.github/workflows/hosted-service.yml`)
+exists only on draft [PR #352](https://github.com/chriscase/GrokPtah/pull/352)
+and is **Pending — not shipped**. Stage 1 cannot pass while that PR remains
+draft. **Every configured remote bearer can approve and promote within
+service scope** (`ptah_approve_run`, `ptah_promote_run`). That is not
+least-privilege `LocalOperator` / `RemoteCoordinator` / `Observer`
+separation; those tiers must ship before any production-shaped 72-hour soak.
+Shipped ManagerSupervisor is not hosted Grokbot certification.
+See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) and
+[`ROADMAP_TO_100.md`](ROADMAP_TO_100.md). Always-on “Grokbot” language in
+ADR-002 / [#301](https://github.com/chriscase/GrokPtah/issues/301) is not a
+shipped binary name. Independent long-running workers
+([#305](https://github.com/chriscase/GrokPtah/issues/305)) are a **mandatory
+unmet** 100% exit and cannot be descoped; the first workload supervisor on
+this service is not that exit.
+
 ## Run locally
 
 Use a disposable workspace while testing:
@@ -63,8 +81,9 @@ has `coordinator` authority. Add named credentials with repeated
 optional and defaults to `coordinator`. Every credential maps to the configured
 `GROKPTAH_SERVICE_AGENT_OWNER` account (default `primary`), so devices can
 share durable Agent identities while Runs and audit entries retain the
-credential ID that initiated them. Credentials are held in process memory and
-are never written into `GROKPTAH_HOME`.
+credential ID that initiated them. **Every one of those configured bearers
+can currently approve and promote within this service's scope.** Credentials
+are held in process memory and are never written into `GROKPTAH_HOME`.
 
 ### Authority tiers and capability discovery
 
@@ -155,6 +174,16 @@ multi-node coordinator is a later storage boundary, not an implicit property of
 the current service. Durable Agents now carry the service owner account, while
 frequently archived Lanes remain separate presentation/workspace projections.
 
+**Every configured remote bearer can approve and promote within service
+scope.** `--token` and each `--client ID=TOKEN` credential currently receive
+the full `CONTROL_TOOLS` surface, including `ptah_approve_run` and
+`ptah_promote_run`. Bearer authentication is not an Observer role. Planned
+least-privilege tiers (`LocalOperator`, `RemoteCoordinator`, `Observer`) must
+ship **before** any production-shaped 72-hour autonomous soak
+([`ROADMAP_TO_100.md`](ROADMAP_TO_100.md) stage 3). A remote client still
+cannot inherit **desktop** Computer Use, keychain, PTY, or local TCC grants
+from the service host.
+
 ## Supervised VM deployment
 
 Linux VM operators can use the checked-in [systemd deployment](../deploy/README.md).
@@ -182,7 +211,10 @@ durable home. Restore the complete home with its ownership and permissions,
 then start exactly one service against it. Never copy a live home, use a
 multi-writer network filesystem, or synchronize it between active instances.
 After restore, verify `/ready`, review interrupted runs, and resume a
-persistent Agent only through an explicit operator action.
+persistent Agent only through an explicit operator action. Dated
+upgrade/rollback, disk-full/corrupt/torn-state, sole-writer contention,
+monitoring/alerts, backup-confidentiality, and RTO/RPO drills are roadmap
+stage 11; they are **not** certified by this section.
 
 ## Desktop remote operations
 

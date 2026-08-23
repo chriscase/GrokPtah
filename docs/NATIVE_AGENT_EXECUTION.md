@@ -72,203 +72,6 @@ and control one home. They do not become extra dispatch owners. The exclusive
 orchestration store lock (`ADR-002`) prevents two processes from opening the
 same home.
 
-## Provider route and admission accounting
-
-Every native admission records the exact provider identity it routes to
-**before** the provider task is spawned. `ManagedExecutionIntent.providerRoute`
-carries `{providerId, modelId}` alongside the opaque `modelSelectionKey`, so
-the durable record names the route rather than an encoded string.
-
-The route is re-derived from the captured AgentSpec revision and must match
-the identity that spec already recorded. A spec whose selection key cannot be
-re-parsed, or whose parsed identity disagrees with its stored
-`provider_id`/`model_id`, is **not admitted**: the tick counts
-`skippedUnroutable` and leaves Work `queued`. There is no default-provider
-fallback.
-
-`MAX_CONCURRENT_PROVIDER_RUNS` (4) is a finite host ceiling on live intents
-that share one provider identity. It is provider-neutral — the same number
-applies to every provider — and it is independent of the per-Agent
-`maxConcurrentRuns` (1-4). Because several Agents may share one provider, the
-per-Agent ceiling alone leaves a provider unbounded across the home; this
-ceiling bounds it. Both ceilings are counted from durable intents in
-`claiming`, `admitted`, `parked`, and `resolving`, so duplicate supervisor
-ticks and process restarts re-derive the same admission answer. A declined
-admission counts `skippedProviderCapacity`, distinct from
-`skippedIneligible`, and never mutates the Work item.
-
-Legacy intents written before this record deserialize with no
-`providerRoute`. Their provider identity is re-derived from the captured
-selection key for accounting, so an upgrade cannot silently under-count live
-capacity.
-
-`ptah_list_execution_intents` reports the ceiling and a per-provider live
-count under `providerAdmission`. The ceiling is home-wide, but
-`liveInScopeByProvider` counts only the intents that caller is already
-authorized to read: a Lane never learns another Lane's provider identities or
-counts. Home-wide pressure is visible without that disclosure through
-`ptah_get_capacity`'s `health.nativeExecutor`, which reports
-`skippedProviderCapacity`, `skippedUnroutable`, and
-`maxConcurrentProviderRuns`.
-
-The ceiling is a host constant in this slice. Making it operator-configurable
-per deployment is deliberate follow-up work, not part of this contract.
-
-### Capability and purpose gate
-
-Online autonomous admission validates the frozen route before it reserves
-quota or creates a Run. Interactive desktop Build uses the same host-owned
-validator after exact route capture and before Run persistence, provider
-attempts, quota reservation, usage tracking, or network dispatch. Unknown
-capability records are refused. Execution Runs require chat generation and
-native coding-tool capability; ManagerProposal Runs require chat generation
-but do not require tool capability because the host denies every tool for
-that purpose.
-
-Declared capability records remain usable before a model's first measured
-qualification, preserving the existing compatible-provider first-run path.
-For host-managed xAI, however, any prior measured record is a downgrade fence:
-if an endpoint or credential change causes the same model to fall back to
-declared tools, new Execution admission fails and requires requalification.
-The old measurement is never borrowed by the new route or credential.
-
-The proposal boundary is enforced from the durable Run purpose during the
-real native admission lifecycle. Ambient bypass settings and a permissive
-Agent policy cannot turn a ManagerProposal tool request into a mutation or an
-approval prompt; the model receives a host-authored denial as tool output.
-
-### Native coding readiness projection
-
-Desktop, loopback MCP, and standalone `grokptah-service` expose one
-host-authored admission record for an exact provider/model:
-
-- schema `grokptah.native-coding-readiness.v1`
-- MCP tool `ptah_get_native_coding_readiness`
-- desktop command `native_coding_readiness`
-
-The record separates **admission eligibility** (what the host will currently
-permit for Execution and ManagerProposal) from **qualification evidence**
-(measured, declared, stale, or unknown). TypeScript may label that record; it
-must not recreate the capability gate. Computer Use is projected independently
-and never becomes enabled merely because coding tools are ready.
-
-The projection is owner-scoped and secret-free. It omits API keys, bearer
-values, credential references and fingerprints, base URLs, raw provider
-bodies, unrelated provider identities, and cross-owner quota.
-
-Declared chat+tools routes remain eligible for first-use Execution before any
-measured history exists. After a measured xAI record exists, falling back to
-declared capabilities blocks Execution and reports requalification. Chat-only
-measured capability admits ManagerProposal and refuses Execution.
-
-### Durable provider quota
-
-Online native Runs also reserve a durable, provider-neutral quota row before
-provider execution can begin. The pool key is
-`{owner, workspace, provider, credentialFingerprint, class}`; it contains no
-bearer material. The closed classes distinguish coding execution, manager
-proposals, qualification, and Computer sessions so one authority class never
-borrows another class's accounting identity.
-
-The initial host limits are a one-hour fixed window, four in-flight
-reservations, 10,000,000 reserved tokens, and 4,096 reserved provider
-requests per pool. A Run reserves its finite `maxTotalTokens` and a hard
-provider-request ceiling of `maxRounds + 1` (the extra slot is the bounded
-recovery-grace step). Compaction, planning, and child-model calls share that
-same ceiling. Reaching it records the host-authored
-`provider_request_quota_reached` stop; it is not a prompt convention.
-
-Reservation and Run creation occur under the same store lock. Queued
-admission uses a `quota-admission-intents` recovery journal; immediate Agent
-activation embeds the reservation in the existing activation journal. Store
-open completes either side of a partial write, rejects mismatched immutable
-identities, settles a terminal Run written before its quota update, and
-expires a reservation that has neither a Run nor a recovery intent. A stable
-reservation without a Run, or a quota-linked Run without its reservation,
-cannot be treated as healthy state.
-
-Authoritative terminal usage consumes `min(reservedTokens, measuredTokens)`
-and the measured request count; unused capacity is released. A terminal Run
-with complete zero usage is refunded. Missing usage or an uncertain provider
-request remains reserved deliberately: refunding it could turn an
-accepted-but-unknown request into free capacity.
-
-### Durable provider attempts
-
-Before a quota-linked Run enters the HTTP transport, the store writes one
-`ProviderAttemptRecord` bound to the exact Run, reservation, and route-snapshot
-hash. The Run carries a bounded list of applied attempt IDs, so a response row
-written immediately before a crash is folded into usage exactly once on
-restart.
-
-The host decides one of three send certainties:
-
-- `known_not_sent`: the host can prove request bytes did not reach the
-  provider. This is the only same-Run retry-safe outcome.
-- `known_accepted`: the provider responded definitively, including an HTTP
-  refusal. A retry is a new explicit Run unless the provider supplies separate
-  idempotency evidence.
-- `uncertain_accept`: request acceptance cannot be disproved, including a
-  crash with an admitted row, an in-flight cancellation, timeout, or partial
-  stream. It is never automatically retried or refunded as unsent.
-
-Store open changes every unfinished admitted row to `uncertain_accept`, marks
-usage incomplete, and preserves its quota reservation. A completed row whose
-usage was not yet applied is replayed through the Run-side attempt-ID fence.
-For quota-linked Runs, definitive 400/401/429/5xx responses and compatibility
-rejections are never hidden behind an internal resend. Non-durable interactive
-calls retain their legacy compatibility behavior outside this native lane.
-
-### Provider transport boundary
-
-The host selects a `ProviderTransport` from the already validated frozen
-dialect, then passes a `ProviderAgentStepRequest` containing only the resolved
-route, exact wire model, short-lived credential handle, request payload,
-deadline/cancellation inputs, and optional structural-observation handle. The
-first concrete adapters are `XaiChatCompletionsTransport` and the existing
-OpenAI-compatible chat-completions dialect; both share the bounded encoder,
-redirect refusal, SSE decoder, and strict usage parser.
-
-The adapter receives no orchestration store, session/workspace controls,
-authority policy, approval path, quota mutation API, catalog resolver, or
-credential resolver. OIDC refresh remains a host operation outside the adapter,
-and a durable Run never refreshes and resends after a definitive 401. A
-source-boundary regression test rejects those capabilities if they enter the
-adapter implementation.
-
-### Operator projection
-
-`ptah_get_run` and `ptah_get_progress` expose a bounded
-`providerExecution` projection for Runs with a frozen provider route. It joins
-the route, its quota reservation, and durable provider attempts, and refuses
-missing or mismatched ledger links instead of showing a partial healthy view.
-Attempts are ordered by ordinal and stable ID and capped at 128 with explicit
-count and truncation fields.
-
-The projection includes provider/model identity, route snapshot hash, quota
-state and limits, attempt state and retry classification, and authoritative
-usage completeness. It deliberately omits the provider base URL, credential
-reference and fingerprint, bearer material, request/response bodies, and any
-provider error body. The persisted Run remains backward compatible; the
-projection is the safe operator-facing summary rather than a replacement for
-the frozen route contract.
-
-Every public list/get/progress surface serializes one allowlisted `PublicRun`
-(or `PublicRunProgress`) instead of the persistence record. MCP
-`ptah_list_runs` / `ptah_get_run` / `ptah_get_progress`, hosted-service MCP,
-local Tauri `run_list` / `run_get`, and remote-desktop decoding share that
-type. TypeScript omitting `providerRoute` does not remove it from a raw
-`RunRecord` payload, so adapters never serialize `RunRecord` and subtract
-fields afterward. The full frozen `ProviderRouteSnapshot` stays in trusted
-durable storage and internal host logic.
-
-`ptah_get_capacity` adds an owner-scoped `providerQuota` summary. It reports
-reservation counts, token/request totals, and a bounded sorted set of provider
-IDs only for the authenticated owner. It does not disclose another owner's
-workspace, provider identity, credential identity, or quota use. The desktop
-remote client preserves this projection as JSON and the desktop protocol gives
-it an explicit typed contract.
-
 ## Work-attempt / Run relationship
 
 A `ManagedExecutionIntent` binds, under the store lock:
@@ -454,8 +257,10 @@ send.
   session is `session_busy` rather than a second concurrent turn.
 - Permission oneshots are process memory. They are not restart-durable.
   Resolution after restart, cancel, or a dead receiver fails closed.
-- Named control-plane credentials remain **operator-equivalent**. They share
-  one service `owner_id` and are not bound to a single Agent.
+- Named control-plane credentials remain **operator-equivalent**: **every
+  configured remote bearer can approve and promote within service scope**.
+  They share one service `owner_id` and are not bound to a single Agent.
+  `LocalOperator` / `RemoteCoordinator` / `Observer` separation is Planned.
 - `maxConcurrentRuns` is bounded to **1–4** (default 1). Live intents in
   `claiming`, `admitted`, `parked`, and `resolving` consume that ceiling.
 
@@ -478,10 +283,40 @@ explicit enable/disable; it does not own dispatch.
 
 ## Follow-up
 
-- Operator-configurable per-provider admission ceiling
-- Operator-configurable quota pools, spend conversion, and operator projections
-- Provider-side idempotency evidence if xAI exposes a verifiable contract
-- Manager-agent planning and decomposition
-- Message-triggered routine activation
-- Per-principal worker credentials bound to one Agent
-- Computer Use for unattended Agents (not in this slice)
+Shipped since this slice (do not treat as remaining work):
+
+- Manager-agent planning and decomposition — [`MANAGER_PLANS.md`](MANAGER_PLANS.md) (autonomous supervisor is Experimental; not a Grokbot binary; not unattended Computer Use)
+- Manual and scheduled routines — [`DURABLE_ROUTINES.md`](DURABLE_ROUTINES.md) ([#306](https://github.com/chriscase/GrokPtah/issues/306) closed)
+
+Still remaining:
+
+- Message-triggered routine activation (`RoutineTrigger::External` adapters remain `unsupported` on create/fire)
+- Per-principal worker credentials bound to one Agent (**every configured
+  remote bearer can currently approve/promote within service scope**;
+  `LocalOperator` / `RemoteCoordinator` / `Observer` are Planned and must
+  precede any production-shaped 72-hour soak)
+- Computer Use for unattended Agents (not in this slice; [#287](https://github.com/chriscase/GrokPtah/issues/287)
+  Planned; isolated visual [#288](https://github.com/chriscase/GrokPtah/issues/288)
+  is a **mandatory unmet** 100% exit, not an unsupported alternative)
+- Native Coding Readiness Center / local host quota ledger — **Pending — not shipped** on [PR #352](https://github.com/chriscase/GrokPtah/pull/352);
+  stage 1 cannot pass while that PR remains draft; merge requires independently
+  certified repair of the five confirmed P1s
+- Independent long-running workers / multi-worker ([#305](https://github.com/chriscase/GrokPtah/issues/305)) —
+  **mandatory unmet** 100% exit (durable ownership, bounded delegated
+  workloads, crash/restart recovery, no duplicate execution,
+  capability/authority isolation, retained evidence). Cannot be descoped.
+  First-slice coordinator/workload tests and closed [#307](https://github.com/chriscase/GrokPtah/issues/307)
+  do not close it.
+- Selected packaged-desktop UX ([#308](https://github.com/chriscase/GrokPtah/issues/308)) —
+  **mandatory unmet** 100% exit; Explicitly unsupported covers documented
+  non-goals only
+
+Status: [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md). Road to 100%:
+[`ROADMAP_TO_100.md`](ROADMAP_TO_100.md). Grok Build session/gateway routing is
+already Supported (credential order: `XAI_API_KEY`, keychain,
+`GROKPTAH_TOKEN_COMMAND`, then `~/.grok/auth.json`); compatible gateway
+requests consume provider quota; GrokPtah does not sync a Grok Build account
+balance; a named secret-free provider-quota receipt is a mandatory unmet 100%
+exit (“not observed” fails); account-balance sync is not implemented and not
+required; the PR #352 local host quota ledger is a separate pending feature
+until merged. Live certification is a separate question.
