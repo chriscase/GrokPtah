@@ -1011,6 +1011,58 @@ fn scrub_opt_string(value: &mut Option<String>, needles: &[String]) -> bool {
     }
 }
 
+/// Redact route-secret needles from an MCP JSON object. Leftover needles fail closed.
+pub(crate) fn scrub_public_json(
+    value: &mut Value,
+    route: Option<&ProviderRouteSnapshot>,
+) -> Result<bool, OrchError> {
+    let needles = route_secret_needles(route);
+    let redacted = if needles.is_empty() {
+        false
+    } else {
+        scrub_value_strings(value, &needles)
+    };
+    let needle_refs: Vec<&str> = needles.iter().map(String::as_str).collect();
+    if contains_forbidden_key(value) || contains_forbidden_value(value, &needle_refs) {
+        return Err(OrchError::new(
+            OrchErrorCode::Internal,
+            "public run projection refused to serialize privileged diagnostics",
+        ));
+    }
+    Ok(redacted)
+}
+
+fn scrub_value_strings(value: &mut Value, needles: &[String]) -> bool {
+    match value {
+        Value::Object(map) => {
+            let mut redacted = false;
+            for child in map.values_mut() {
+                redacted |= scrub_value_strings(child, needles);
+            }
+            redacted
+        }
+        Value::Array(values) => {
+            let mut redacted = false;
+            for child in values.iter_mut() {
+                redacted |= scrub_value_strings(child, needles);
+            }
+            redacted
+        }
+        Value::String(text) => {
+            if needles
+                .iter()
+                .any(|needle| !needle.is_empty() && text.contains(needle))
+            {
+                text.clear();
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 fn provider_projection_error(_error: anyhow::Error) -> OrchError {
     OrchError::new(
         OrchErrorCode::Internal,
@@ -1551,6 +1603,34 @@ mod tests {
         assert!(handoff["terminalResult"].is_null());
         assert!(projected.final_response.is_none());
         assert!(projected.terminal_result.is_none());
+    }
+
+    #[test]
+    fn scrub_public_json_redacts_changes_and_test_command_needles() {
+        let route = leaky_route();
+        let mut changes = json!({
+            "runId": "public-run-leak",
+            "changes": [{
+                "path": format!("called {BASE_URL_SENTINEL}"),
+                "summary": format!("ref {CREDENTIAL_REF_SENTINEL}")
+            }]
+        });
+        assert!(scrub_public_json(&mut changes, Some(&route)).unwrap());
+        assert_eq!(changes["changes"][0]["path"], "");
+        assert_eq!(changes["changes"][0]["summary"], "");
+        assert!(!changes.to_string().contains(BASE_URL_SENTINEL));
+        let mut tests = json!({
+            "runId": "public-run-leak",
+            "status": "observed",
+            "results": [{
+                "callId": "t1",
+                "command": format!("curl {BASE_URL_SENTINEL}"),
+                "status": "ended"
+            }]
+        });
+        assert!(scrub_public_json(&mut tests, Some(&route)).unwrap());
+        assert_eq!(tests["results"][0]["command"], "");
+        assert!(!tests.to_string().contains(BASE_URL_SENTINEL));
     }
 
     #[test]

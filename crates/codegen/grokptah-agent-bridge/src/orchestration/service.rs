@@ -5543,12 +5543,12 @@ impl OrchestrationService {
     }
 
     fn changes_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
-        // Prefer durable aggregates (survive journal rollover).
-        let mut paths: Vec<serde_json::Value> = run
+        let projected = super::project_public_run(&self.store, &run)?;
+        let mut paths: Vec<serde_json::Value> = projected
             .aggregates
             .changes
             .iter()
-            .map(|c| json!({ "path": c.path, "summary": c.summary }))
+            .map(|change| json!({ "path": change.path, "summary": change.summary }))
             .collect();
         if let Ok(entries) = self.scoped_events_complete(&run) {
             for e in entries {
@@ -5559,7 +5559,11 @@ impl OrchestrationService {
                 }
             }
         }
-        Ok(json!({ "runId": run.run_id, "changes": paths }))
+        self.scrub_run_tool_payload(
+            &run,
+            projected.error_code.as_deref(),
+            json!({ "runId": projected.run_id, "changes": paths }),
+        )
     }
 
     pub fn get_test_results(
@@ -5581,18 +5585,18 @@ impl OrchestrationService {
     }
 
     fn test_results_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
+        let projected = super::project_public_run(&self.store, &run)?;
         let mut by_id: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
-        // Seed from durable aggregates.
-        for t in &run.aggregates.tests {
+        for test in &projected.aggregates.tests {
             by_id.insert(
-                t.call_id.clone(),
+                test.call_id.clone(),
                 json!({
-                    "callId": t.call_id,
-                    "command": t.command,
-                    "status": t.status,
-                    "exitCode": t.exit_code,
-                    "cancelled": t.cancelled,
+                    "callId": test.call_id,
+                    "command": test.command,
+                    "status": test.status,
+                    "exitCode": test.exit_code,
+                    "cancelled": test.cancelled,
                 }),
             );
         }
@@ -5631,19 +5635,34 @@ impl OrchestrationService {
             }
         }
         let observed: Vec<_> = by_id.into_values().collect();
-        if observed.is_empty() {
-            Ok(json!({
-                "runId": run.run_id,
+        let payload = if observed.is_empty() {
+            json!({
+                "runId": projected.run_id,
                 "status": "not_observed",
                 "results": [],
-            }))
+            })
         } else {
-            Ok(json!({
-                "runId": run.run_id,
+            json!({
+                "runId": projected.run_id,
                 "status": "observed",
                 "results": observed,
-            }))
+            })
+        };
+        self.scrub_run_tool_payload(&run, projected.error_code.as_deref(), payload)
+    }
+
+    fn scrub_run_tool_payload(
+        &self,
+        run: &RunRecord,
+        error_code: Option<&str>,
+        mut payload: serde_json::Value,
+    ) -> Result<serde_json::Value, OrchError> {
+        let redacted =
+            super::public_run::scrub_public_json(&mut payload, run.provider_route.as_ref())?;
+        if redacted || error_code == Some(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS) {
+            payload["errorCode"] = json!(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS);
         }
+        Ok(payload)
     }
 
     pub fn get_handoff(
