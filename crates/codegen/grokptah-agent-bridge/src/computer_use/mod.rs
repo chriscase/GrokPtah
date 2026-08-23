@@ -14,6 +14,7 @@
 
 mod coordination;
 mod isolated_visual;
+mod isolated_visual_protocol;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -30,6 +31,12 @@ pub use isolated_visual::{
     IsolatedVisualSecurityProfile, IsolatedVisualTerminalDisposition,
     ISOLATED_VISUAL_GUEST_PROTOCOL_VERSION, ISOLATED_VISUAL_MANIFEST_SCHEMA_VERSION,
     MACOS_ISOLATED_VISUAL_CANDIDATE_BACKEND_ID,
+};
+pub use isolated_visual_protocol::{
+    IsolatedVisualGuestFailure, IsolatedVisualGuestHealth, IsolatedVisualGuestMessage,
+    IsolatedVisualHostMessage, IsolatedVisualProtocolEnvelope, IsolatedVisualProtocolPayload,
+    IsolatedVisualProtocolSession, IsolatedVisualProtocolSurfaceBinding,
+    ISOLATED_VISUAL_CHANNEL_SECRET_BYTES, ISOLATED_VISUAL_MAX_SIGNED_ENVELOPE_BYTES,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{

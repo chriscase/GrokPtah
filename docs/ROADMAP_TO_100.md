@@ -672,7 +672,11 @@ classes, and exact entitlement. The probe explicitly reports the packaged helper
 and never launches a VM or grants authority. A further candidate contract freezes the initial
 network/clipboard/share/credential/input-device-free profile, resource ceilings, exact packaged
 digests, restart interruption, and cleanup-before-terminal lifecycle without serializing host paths
-or channel secrets. It is a contract, not packaged evidence. See
+or channel secrets. A subsequent read-only protocol candidate HMAC-binds the exact Run/surface
+incarnation, payload length, one outstanding request nonce, monotonic message/frame sequences, and
+zero input sequence for a closed observe/frame-metadata/health/failure/stop/shutdown-ack vocabulary.
+It does not implement a carrier, transfer frame bytes, render a frame, or launch a guest. These are
+contracts, not packaged evidence. See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
 source slices satisfy no #288 acceptance checkbox.

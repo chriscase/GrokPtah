@@ -173,7 +173,14 @@ available.
    a deterministic no-input lifecycle that refuses terminal completion until exact process,
    open-handle, overlay, and frame-cache cleanup evidence matches the bound surface. It contains no
    host paths or channel secrets. Actual helper/image packaging and the destructive campaign remain.
-4. Add authenticated virtio-socket frame/health transport and render read-only frames.
+4. Add authenticated virtio-socket frame/health transport and render read-only frames. The candidate
+   now defines the transport-independent, read-only protocol core: a non-serializable/redacted
+   32-byte channel key authenticates the exact protocol version, Run, surface incarnation, message
+   and frame sequences, zero input sequence, one outstanding request nonce, encoded payload length,
+   and closed observe/frame-metadata/health/failure/stop/shutdown-ack payload. Tamper, replay,
+   wrong-secret, wrong-nonce, input, oversized-frame, and unknown-field paths fail closed. No carrier,
+   frame-byte transfer, guest agent, or renderer exists yet, so this is not transport or isolation
+   proof.
 5. Add guest pointer state and one-action local approval; then key/text/scroll/drag independently.
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.
@@ -185,9 +192,10 @@ available.
 ## Status and nonclaims
 
 The existing simulator remains the only dispatchable isolated proof. The Stage 8 measured
-background candidate is not a substitute. The typed input, read-only host-probe, and no-input
-lifecycle-contract candidates do not enable `HostNative`, expose isolated actions to a model or
-cockpit approval flow, qualify a provider for visual fallback, package a VM image/helper, or
-satisfy any #288 acceptance checkbox. The manifest accepts only the locked-down profile and bounded
-resources, but synthetic digests are not packaged identity. A present framework, valid contract,
-or entitlement is not a VM, guest, isolation, dispatch, cleanup campaign, or release proof.
+background candidate is not a substitute. The typed input, read-only host-probe, no-input lifecycle,
+and authenticated read-protocol candidates do not enable `HostNative`, expose isolated actions to a
+model or cockpit approval flow, qualify a provider for visual fallback, package a VM image/helper,
+carry or render frame bytes, or satisfy any #288 acceptance checkbox. The manifest accepts only the
+locked-down profile and bounded resources, but synthetic digests are not packaged identity. A
+present framework, valid contract, authenticated metadata envelope, or entitlement is not a VM,
+guest, carrier, rendered frame, isolation, dispatch, cleanup campaign, or release proof.
