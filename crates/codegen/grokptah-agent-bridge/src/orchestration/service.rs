@@ -1524,8 +1524,11 @@ impl OrchestrationService {
             watcher.abort();
         }
         let joins = std::mem::take(&mut *self.join_handles.lock());
-        for join in joins {
-            if !join.is_finished() {
+        for mut join in joins {
+            if tokio::time::timeout(Duration::from_secs(6), &mut join)
+                .await
+                .is_err()
+            {
                 join.abort();
             }
             let _ = join.await;

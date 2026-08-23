@@ -204,6 +204,11 @@ impl LocalService {
     }
 
     async fn shutdown_parts(&mut self) {
+        if let Some(host) = self.host.as_ref() {
+            // Signal host-owned turns before awaiting the control-plane
+            // shutdown so finalizers can release the runtime-home lock.
+            let _ = host.stop();
+        }
         if let Some(server) = self.server.take() {
             server.stop_and_wait().await;
         }
