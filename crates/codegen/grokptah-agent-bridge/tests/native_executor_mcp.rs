@@ -3094,6 +3094,11 @@ async fn failing_provider_live_isolated_promote_and_discard_are_scrubbed() {
         .await
         .unwrap();
     assert!(!review.is_error, "{:?}", review.raw);
+    let review_text = format!("{}{}", review.structured, mcp_text_value(&review.raw));
+    assert!(
+        !review_text.contains(FAILING_BASE_URL) && !review_text.contains(FAILING_CREDENTIAL_REF),
+        "ptah_review_run leaked route secrets: {review_text}"
+    );
     let approval = client
         .call_tool(
             "ptah_approve_run",

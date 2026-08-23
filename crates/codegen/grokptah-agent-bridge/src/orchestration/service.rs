@@ -6466,8 +6466,10 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let (run, review) = self.isolated_review(session_id, workspace, run_id)?;
-        Ok(json!({
+        let (run, mut review) = self.isolated_review(session_id, workspace, run_id)?;
+        let projected = super::project_public_run(&self.store, &run)?;
+        let redacted = super::scrub_route_secret_needles(&mut review, run.provider_route.as_ref())?;
+        let mut payload = json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
             "sourceFingerprint": run.execution.as_ref().map(|e| e.source_fingerprint.clone()),
@@ -6476,7 +6478,13 @@ impl OrchestrationService {
             "diff": review.diff,
             "diffTruncated": review.diff_truncated,
             "promotionState": run.execution.as_ref().map(|e| e.promotion_state),
-        }))
+        });
+        if redacted
+            || projected.error_code.as_deref() == Some(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)
+        {
+            payload["errorCode"] = json!(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS);
+        }
+        Ok(payload)
     }
 
     #[allow(clippy::too_many_arguments)] // Keeps the approval scope explicit at the control boundary.

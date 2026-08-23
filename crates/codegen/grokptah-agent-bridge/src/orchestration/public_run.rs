@@ -1676,6 +1676,31 @@ mod tests {
     }
 
     #[test]
+    fn scrub_route_secret_needles_redacts_review_diff() {
+        use crate::orchestration::ChangeRecord;
+        use crate::run_promotion::RunReview;
+
+        let route = leaky_route();
+        let mut review = RunReview {
+            changed_files: vec![ChangeRecord {
+                path: format!("called {BASE_URL_SENTINEL}"),
+                summary: format!("ref {CREDENTIAL_REF_SENTINEL}"),
+            }],
+            diff: format!("--- a/file\n+++ b/file\n+curl {BASE_URL_SENTINEL}\n"),
+            diff_truncated: false,
+            fingerprint: "abc123".into(),
+        };
+        assert!(scrub_route_secret_needles(&mut review, Some(&route)).unwrap());
+        assert_eq!(review.diff, "");
+        assert_eq!(review.changed_files[0].path, "");
+        assert_eq!(review.changed_files[0].summary, "");
+        assert_eq!(review.fingerprint, "abc123");
+        assert!(!serde_json::to_string(&review)
+            .unwrap()
+            .contains(BASE_URL_SENTINEL));
+    }
+
+    #[test]
     fn public_run_list_caps_at_128_with_exact_truncation_count() {
         let now = Utc::now();
         let runs = (0..200)

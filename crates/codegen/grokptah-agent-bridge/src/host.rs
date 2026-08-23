@@ -2534,7 +2534,16 @@ impl AgentHostHandle {
 
     /// Read the bounded Git diff for an isolated terminal run.
     pub fn review_run(&self, session_id: Uuid, run_id: &str) -> Result<RunReview> {
-        self.review_run_internal(session_id, run_id, true)
+        let mut review = self.review_run_internal(session_id, run_id, true)?;
+        let store = self.ensure_orchestration_store()?;
+        if let Some(run) = store.load_run(run_id)? {
+            crate::orchestration::scrub_route_secret_needles(
+                &mut review,
+                run.provider_route.as_ref(),
+            )
+            .map_err(|error| anyhow!(error.message))?;
+        }
+        Ok(review)
     }
 
     /// Inspect an isolated run without granting the desktop-only in-memory

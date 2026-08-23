@@ -32,7 +32,7 @@ pub(crate) struct WorktreeSnapshot {
     pub changed_files: Vec<ChangeRecord>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunReview {
     pub changed_files: Vec<ChangeRecord>,
