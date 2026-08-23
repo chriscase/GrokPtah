@@ -7,11 +7,12 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::coordination::{ComputerDispatchClaim, ComputerSurfaceLease};
+use super::coordination::{ComputerDispatchClaim, ComputerSurfaceLease, ComputerSurfaceLeaseState};
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
-    ComputerRunProjection, ComputerUncertainSurfaceLease,
+    ComputerRunProjection, ComputerSurfaceCoordination, ComputerSurfaceCoordinationState,
+    ComputerSurfaceOccupant, ComputerUncertainSurfaceLease,
 };
 use super::store::{ComputerStore, MutationClaim, MutationStamp};
 use super::types::{
@@ -187,6 +188,123 @@ impl ComputerUseService {
                 surface_id: lease.surface.surface_id,
                 incarnation: lease.surface.incarnation,
             }))
+    }
+
+    /// Explain one session-owned Agent Run's current position on its physical
+    /// input conflict domain without exposing any lease or authority handle.
+    ///
+    /// This is intentionally a local-operator projection. Serving it through
+    /// a workspace-scoped coordinator would reveal host-wide queue depth and
+    /// another workspace's active Agent identity.
+    pub fn local_surface_coordination(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<Option<ComputerSurfaceCoordination>> {
+        let _run = self.load_owned_run(owner_session_id, run_id)?;
+        let leases = self.store.list_surface_leases()?;
+        let mut current = leases
+            .iter()
+            .filter(|lease| {
+                lease.run_id == run_id
+                    && (lease.state == ComputerSurfaceLeaseState::Uncertain
+                        || (!lease.state.is_terminal() && lease.expires_at > now))
+            })
+            .collect::<Vec<_>>();
+        if current.len() > 1 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Internal,
+                "Agent Computer Run owns multiple live surface coordination records",
+            ));
+        }
+        let Some(lease) = current.pop() else {
+            return Ok(None);
+        };
+        let domain = leases
+            .iter()
+            .filter(|candidate| {
+                candidate.conflict_domain_id == lease.conflict_domain_id
+                    && (candidate.state == ComputerSurfaceLeaseState::Uncertain
+                        || (!candidate.state.is_terminal() && candidate.expires_at > now))
+            })
+            .collect::<Vec<_>>();
+        let owners = domain
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.state.owns_domain_capacity())
+            .collect::<Vec<_>>();
+        if owners.len() > 1 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Internal,
+                "Computer surface conflict domain has multiple capacity owners",
+            ));
+        }
+        let newest_sequence = domain
+            .iter()
+            .map(|candidate| candidate.queue_sequence)
+            .max()
+            .unwrap_or(0);
+        let mut waiters = domain
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.state == ComputerSurfaceLeaseState::Queued)
+            .collect::<Vec<_>>();
+        waiters.sort_by(|left, right| {
+            right
+                .effective_priority(newest_sequence)
+                .cmp(&left.effective_priority(newest_sequence))
+                .then_with(|| left.queue_sequence.cmp(&right.queue_sequence))
+                .then_with(|| left.lease_id.cmp(&right.lease_id))
+        });
+        let queue_depth = u32::try_from(waiters.len()).map_err(|_| {
+            ComputerError::new(
+                ComputerErrorCode::Internal,
+                "Computer surface queue depth exceeds its public projection bound",
+            )
+        })?;
+        let queue_position = waiters
+            .iter()
+            .position(|candidate| candidate.lease_id == lease.lease_id)
+            .map(|position| u32::try_from(position + 1))
+            .transpose()
+            .map_err(|_| {
+                ComputerError::new(
+                    ComputerErrorCode::Internal,
+                    "Computer surface queue position exceeds its public projection bound",
+                )
+            })?;
+        let state = match lease.state {
+            ComputerSurfaceLeaseState::Queued => ComputerSurfaceCoordinationState::Queued,
+            ComputerSurfaceLeaseState::Granted => ComputerSurfaceCoordinationState::Granted,
+            ComputerSurfaceLeaseState::Dispatching => ComputerSurfaceCoordinationState::Dispatching,
+            ComputerSurfaceLeaseState::Uncertain => ComputerSurfaceCoordinationState::Uncertain,
+            _ => {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Internal,
+                    "Computer surface coordination record has an invalid projected state",
+                ))
+            }
+        };
+        let active = owners.first().map(|owner| ComputerSurfaceOccupant {
+            agent_id: owner.agent_id.clone(),
+            work_id: owner.work_id.clone(),
+            run_id: owner.run_id.clone(),
+        });
+        Ok(Some(ComputerSurfaceCoordination {
+            state,
+            queue_position,
+            queue_depth,
+            owns_surface: owners
+                .first()
+                .is_some_and(|owner| owner.lease_id == lease.lease_id),
+            blocked_by_uncertain_outcome: domain
+                .iter()
+                .any(|candidate| candidate.state == ComputerSurfaceLeaseState::Uncertain),
+            active,
+            expires_at: lease.expires_at,
+            updated_at: lease.updated_at,
+        }))
     }
 
     /// Local-operator projection of every run owned by one session, newest
@@ -2130,6 +2248,55 @@ mod tests {
         assert_eq!(queued[1].run_id, run_c.run_id);
         assert!(queued[0].queue_sequence < queued[1].queue_sequence);
         assert_eq!(backend.action_calls.load(Ordering::SeqCst), 1);
+
+        let coordination_a = service
+            .local_surface_coordination(run_a.owner_session_id, &run_a.run_id, Utc::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coordination_a.state,
+            ComputerSurfaceCoordinationState::Dispatching
+        );
+        assert!(coordination_a.owns_surface);
+        assert_eq!(coordination_a.queue_position, None);
+        assert_eq!(coordination_a.queue_depth, 2);
+        assert_eq!(
+            coordination_a
+                .active
+                .as_ref()
+                .map(|active| active.agent_id.as_str()),
+            Some("agent-serial-a")
+        );
+
+        let coordination_b = service
+            .local_surface_coordination(run_b.owner_session_id, &run_b.run_id, Utc::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coordination_b.state,
+            ComputerSurfaceCoordinationState::Queued
+        );
+        assert!(!coordination_b.owns_surface);
+        assert_eq!(coordination_b.queue_position, Some(1));
+        assert_eq!(coordination_b.queue_depth, 2);
+        assert_eq!(
+            coordination_b.active.as_ref().map(|active| &active.run_id),
+            Some(&run_a.run_id)
+        );
+        let projected_json = serde_json::to_string(&coordination_b).unwrap();
+        assert!(!projected_json.contains(&queued[0].lease_id));
+        assert!(!projected_json.contains(&queued[0].work_attempt_id));
+        assert!(!projected_json.contains(&queued[0].conflict_domain_id));
+
+        let coordination_c = service
+            .local_surface_coordination(run_c.owner_session_id, &run_c.run_id, Utc::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(coordination_c.queue_position, Some(2));
+        let error = service
+            .local_surface_coordination(run_a.owner_session_id, &run_b.run_id, Utc::now())
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
 
         backend.release_action.notify_one();
         action.await.unwrap().unwrap();

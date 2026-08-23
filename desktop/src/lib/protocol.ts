@@ -1269,7 +1269,24 @@ export interface ComputerCockpitSnapshot {
   /** Allowlisted local approval/observation DTO. */
   local?: ComputerLocalApproval | null;
   pendingApproval?: PendingComputerApproval | null;
+  /** Local-only, secret-free explanation of shared physical-surface ownership. */
+  coordination?: ComputerSurfaceCoordination | null;
   reconciliation?: ComputerUncertainSurfaceLease | null;
+}
+
+export interface ComputerSurfaceCoordination {
+  state: "queued" | "granted" | "dispatching" | "uncertain";
+  queuePosition?: number | null;
+  queueDepth: number;
+  ownsSurface: boolean;
+  blockedByUncertainOutcome: boolean;
+  active?: {
+    agentId: string;
+    workId: string;
+    runId: string;
+  } | null;
+  expiresAt: string;
+  updatedAt: string;
 }
 
 /** Exact opaque handles shown only to the owning local operator. */

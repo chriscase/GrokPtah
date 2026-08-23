@@ -271,6 +271,36 @@ describe("ComputerCockpit", () => {
     expect(scope).toHaveTextContent("Run No active Run");
   });
 
+  it("explains durable inter-agent surface queueing without exposing lease handles", async () => {
+    const next = snapshot(localView());
+    next.coordination = {
+      state: "queued",
+      queuePosition: 2,
+      queueDepth: 3,
+      ownsSurface: false,
+      blockedByUncertainOutcome: false,
+      active: {
+        agentId: "agent-reviewer",
+        workId: "work-review",
+        runId: "run-review",
+      },
+      expiresAt: "2026-08-13T10:01:00Z",
+      updatedAt: "2026-08-13T10:00:05Z",
+    };
+    mocks.snapshot.mockResolvedValue(next);
+
+    render(<ComputerCockpit {...props} />);
+
+    const status = await screen.findByRole("region", {
+      name: "Waiting for the shared surface",
+    });
+    expect(status).toHaveTextContent("Agent agent-reviewer is using it");
+    expect(status).toHaveTextContent("2 of 3");
+    expect(status).toHaveTextContent("agent-reviewer");
+    expect(status).not.toHaveTextContent("lease-");
+    expect(status).not.toHaveTextContent("attempt-");
+  });
+
   it("requires exact scope review before a run starts", async () => {
     mocks.start.mockResolvedValue(snapshot(localView()));
     render(<ComputerCockpit {...props} />);

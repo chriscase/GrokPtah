@@ -12,6 +12,7 @@ import type {
   ComputerLocalElement,
   ComputerPermissionStatus,
   ComputerPlatformStatus,
+  ComputerSurfaceCoordination,
   ComputerTargetCandidate,
 } from "../lib/protocol";
 import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
@@ -70,6 +71,48 @@ function actionText(action: ComputerAction) {
       return "Select the chosen element";
     case "scroll":
       return "Scroll the chosen element into view";
+  }
+}
+
+function coordinationCopy(coordination: ComputerSurfaceCoordination) {
+  if (coordination.blockedByUncertainOutcome) {
+    return {
+      label: "Waiting for local safety confirmation",
+      detail:
+        "A physical result is uncertain. GrokPtah will not grant this surface or replay the action until a local operator clears the fence.",
+      tone: "attention",
+    };
+  }
+  switch (coordination.state) {
+    case "queued":
+      return {
+        label: "Waiting for the shared surface",
+        detail: coordination.active
+          ? `Agent ${coordination.active.agentId} is using it. This run will continue automatically when the host can grant a fresh frame.`
+          : "This run is queued and will continue automatically when the host grants a fresh frame.",
+        tone: "waiting",
+      };
+    case "granted":
+      return {
+        label: "Surface reserved for this agent",
+        detail:
+          "The host granted exclusive observation authority. Other agents sharing this physical surface remain queued.",
+        tone: "reserved",
+      };
+    case "dispatching":
+      return {
+        label: "Agent is using the shared surface",
+        detail:
+          "One physical action is inside the durable dispatch fence. Stop and Take over remain visible above.",
+        tone: "active",
+      };
+    case "uncertain":
+      return {
+        label: "Shared surface is safety-fenced",
+        detail:
+          "The physical outcome is uncertain. No queued agent will be granted until local reconciliation.",
+        tone: "attention",
+      };
   }
 }
 
@@ -182,6 +225,8 @@ export function ComputerCockpit({
     ["status", "AXStaticText"].includes(element.role),
   );
   const approval = snapshot?.pendingApproval ?? null;
+  const coordination = snapshot?.coordination ?? null;
+  const coordinationStatus = coordination ? coordinationCopy(coordination) : null;
   const reconciliation = snapshot?.reconciliation ?? null;
   const grantActive = Boolean(run?.grant && !run.grant.revokedAt);
   const timeline = useMemo(() => run?.audit.slice(-12).reverse() ?? [], [run]);
@@ -617,6 +662,43 @@ export function ComputerCockpit({
               </button>
             </div>
           </div>
+
+          {coordination && coordinationStatus && (
+            <section
+              className={`computer-coordination tone-${coordinationStatus.tone}`}
+              aria-labelledby="computer-coordination-title"
+              aria-live="polite"
+            >
+              <span className="computer-coordination-marker" aria-hidden />
+              <div className="computer-coordination-copy">
+                <span className="computer-section-label">Shared Computer Use surface</span>
+                <h2 id="computer-coordination-title">{coordinationStatus.label}</h2>
+                <p>{coordinationStatus.detail}</p>
+              </div>
+              <dl>
+                <div>
+                  <dt>Queue</dt>
+                  <dd>
+                    {coordination.queuePosition
+                      ? `${coordination.queuePosition} of ${coordination.queueDepth}`
+                      : coordination.queueDepth
+                        ? `${coordination.queueDepth} waiting`
+                        : "Clear"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Surface owner</dt>
+                  <dd>
+                    {coordination.active
+                      ? coordination.active.runId === run.runId
+                        ? "This agent"
+                        : coordination.active.agentId
+                      : "None"}
+                  </dd>
+                </div>
+              </dl>
+            </section>
+          )}
 
           <div className="computer-cockpit-grid">
             <div className="computer-observation-column">

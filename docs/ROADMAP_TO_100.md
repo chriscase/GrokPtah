@@ -594,7 +594,10 @@ outcome from the first workload/coordinator slice or by descoping #305.
 for a local-only slice, but **release** of the surface as 100% does.
 
 **Exists today:** Experimental foreground semantic CU + cockpit projection
-([`computerActivity.ts`](../desktop/src/lib/computerActivity.ts)).
+([`computerActivity.ts`](../desktop/src/lib/computerActivity.ts)). The stacked
+coordination candidate adds a local-only, secret-free queue/owner explanation
+for the durable WorkAttempt surface ledger; it does not add an agent-owned
+cursor or physical preemption channel.
 [#286](https://github.com/chriscase/GrokPtah/issues/286) **open**.
 
 **Exit:** every [#286](https://github.com/chriscase/GrokPtah/issues/286)

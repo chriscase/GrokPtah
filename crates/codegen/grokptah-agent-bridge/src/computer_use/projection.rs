@@ -175,6 +175,50 @@ pub struct ComputerUncertainSurfaceLease {
     pub incarnation: String,
 }
 
+/// Local-operator view of one Agent Run's position in the host-owned physical
+/// input queue. This deliberately omits lease IDs, revisions, dispatch IDs,
+/// conflict-domain IDs, frame epochs, and WorkAttempt IDs: none of those
+/// capability/fence handles are required to explain ownership to a person.
+///
+/// The desktop may show this after its session-ownership gate. Coordinator
+/// reads do not receive it because queue depth and another Agent's identity
+/// would otherwise become a cross-workspace activity oracle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerSurfaceCoordination {
+    pub state: ComputerSurfaceCoordinationState,
+    /// One-based position among currently live queued waiters. Absent after a
+    /// grant, during dispatch, and for an uncertain physical outcome.
+    pub queue_position: Option<u32>,
+    pub queue_depth: u32,
+    pub owns_surface: bool,
+    pub blocked_by_uncertain_outcome: bool,
+    /// Current capacity owner, if the domain has a granted/dispatching lease.
+    pub active: Option<ComputerSurfaceOccupant>,
+    pub expires_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerSurfaceCoordinationState {
+    Queued,
+    Granted,
+    Dispatching,
+    Uncertain,
+}
+
+/// Non-secret local-operator identity for the Agent currently holding a
+/// physical input conflict domain. WorkAttempt and authority handles remain
+/// absent; the stable Agent, Work, and Run IDs are sufficient for diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerSurfaceOccupant {
+    pub agent_id: String,
+    pub work_id: String,
+    pub run_id: String,
+}
+
 /// One bounded, cursor-addressed page of a run's durable event journal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

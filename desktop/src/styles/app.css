@@ -5300,6 +5300,80 @@ button:disabled {
   color: var(--accent);
 }
 
+.computer-coordination {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 0.65rem;
+  align-items: center;
+  padding: 0.7rem 1rem;
+  border-bottom: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--surface-deep) 88%, var(--accent) 12%);
+}
+
+.computer-coordination-marker {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.computer-coordination-copy {
+  min-width: 0;
+}
+
+.computer-coordination-copy p {
+  margin: 0.18rem 0 0;
+  max-width: 78ch;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.computer-coordination dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(90px, auto));
+  gap: 0.35rem 0.8rem;
+  margin: 0;
+}
+
+.computer-coordination dl div {
+  min-width: 0;
+}
+
+.computer-coordination dt {
+  color: var(--muted);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.computer-coordination dd {
+  margin: 0.08rem 0 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.computer-coordination.tone-waiting,
+.computer-coordination.tone-reserved {
+  background: color-mix(in srgb, var(--surface-deep) 90%, var(--warning, #e0ad4f) 10%);
+}
+
+.computer-coordination.tone-waiting .computer-coordination-marker,
+.computer-coordination.tone-reserved .computer-coordination-marker {
+  background: var(--warning, #e0ad4f);
+  box-shadow: 0 0 0 4px rgba(224, 173, 79, 0.14);
+}
+
+.computer-coordination.tone-attention {
+  background: color-mix(in srgb, var(--surface-deep) 90%, var(--danger, #e0625f) 10%);
+}
+
+.computer-coordination.tone-attention .computer-coordination-marker {
+  background: var(--danger, #e0625f);
+  box-shadow: 0 0 0 4px rgba(224, 98, 95, 0.15);
+}
+
 .computer-cockpit-grid {
   display: grid;
   grid-template-columns: minmax(360px, 1.6fr) minmax(220px, 0.8fr);
@@ -5666,6 +5740,17 @@ button:disabled {
   .computer-control-actions button,
   .computer-paused button {
     flex: 1 1 auto;
+  }
+
+  .computer-coordination {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .computer-coordination dl {
+    grid-column: 2;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
   }
 
   .computer-scope-grid {

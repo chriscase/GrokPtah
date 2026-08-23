@@ -10,7 +10,7 @@ use grokptah_agent_bridge::{
     ComputerAgentProposal, ComputerAuthorityToken, ComputerBackendPublicView, ComputerCapabilities,
     ComputerError, ComputerLocalApproval, ComputerObservation, ComputerObservationPlatform,
     ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun,
-    ComputerRunProjection, ComputerRunState, ComputerTargetCandidate,
+    ComputerRunProjection, ComputerRunState, ComputerSurfaceCoordination, ComputerTargetCandidate,
     ComputerUncertainSurfaceLease, ComputerUseLimits, ComputerUseService, SemanticAction,
     SimulatorBackend,
 };
@@ -55,6 +55,9 @@ pub struct ComputerCockpitSnapshot {
     /// bindings, proofs, evidence tokens, and backend text stay internal.
     pub local: Option<ComputerLocalApproval>,
     pub pending_approval: Option<PendingComputerApproval>,
+    /// Secret-free local-operator explanation of an Agent Run's place in the
+    /// host-owned physical input queue. Absent for ordinary local Runs.
+    pub coordination: Option<ComputerSurfaceCoordination>,
     /// Exact opaque handles for an owning operator's uncertain-dispatch
     /// reconciliation workflow. Absent for ordinary runs.
     pub reconciliation: Option<ComputerUncertainSurfaceLease>,
@@ -338,6 +341,16 @@ impl DesktopComputerUse {
         } else {
             None
         };
+        let coordination = if let Some(run) = run.as_ref() {
+            // Queue coordination is store-derived and backend-independent.
+            // The shared index therefore remains available even if a native
+            // backend service is no longer resident after interruption.
+            index
+                .local_surface_coordination(owner_session_id, &run.run_id, Utc::now())
+                .map_err(|error| error.to_string())?
+        } else {
+            None
+        };
         Ok(ComputerCockpitSnapshot {
             backend: ComputerBackendPublicView::from_capabilities(&backend),
             origin: "desktop".into(),
@@ -346,6 +359,7 @@ impl DesktopComputerUse {
                 .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now())),
             local: run.as_ref().map(ComputerLocalApproval::from_run),
             pending_approval,
+            coordination,
             reconciliation,
         })
     }

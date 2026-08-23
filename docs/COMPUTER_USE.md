@@ -123,7 +123,8 @@ Restart invalidates queued/granted leases, converts prepared dispatches to
 `known_not_injected`, and converts injected dispatches to `uncertain`. Reopening the same store a
 second time is a no-op. Expiry uses the same distinction. Corrupt or future-shaped lease records
 fail store open before recovery can rewrite Runs. The coordinator remains internal: the current
-product has no MCP Computer mutation surface and no polished queue/cursor UI yet.
+product has no MCP Computer mutation surface or agent-owned cursor UI. The stacked local queue
+explanation below remains unqualified until its Rust, desktop, and packaged-UI gates pass.
 
 The coordination ledger is bounded to 512 lease records. `released`, `revoked`, `cancelled`, and
 `quarantined` records age out after seven days and are retired oldest-first when a new admission
@@ -131,11 +132,20 @@ needs space; during its declared retention horizon, the separately persisted mut
 remains the exact-request replay fence.
 `uncertain` physical dispatches are never deleted to regain capacity. If unresolved uncertainty
 fills the ledger, new Computer Use fails closed with `limit_reached` until an operator-facing
-reconciliation workflow exists. This prevents ordinary long-running use from exhausting the
-coordinator without converting a storage bound into permission to replay an ambiguous action.
+reconciliation clears exact uncertain records. This prevents ordinary long-running use from
+exhausting the coordinator without converting a storage bound into permission to replay an ambiguous action.
 An unresolved `uncertain` dispatch also poisons its exact physical input conflict domain: no other
 Agent may observe or act through that domain until reconciliation. Independently attested isolated
 domains remain available, so one ambiguous isolated surface does not stop unrelated isolated work.
+
+The stacked cockpit candidate derives a separate, local-operator-only projection from that ledger.
+It shows the selected Run's queued/granted/dispatching/uncertain state, its deterministic queue
+position, total live waiters, and the stable Agent/Work/Run identity currently holding capacity.
+Lease IDs, revisions, dispatch IDs, WorkAttempt IDs, conflict-domain IDs, frame epochs, and
+authority handles never enter the DTO. Workspace-scoped coordinator reads do not receive host-wide
+queue depth or another workspace's Agent identity. This makes contention understandable without
+turning the read surface into a cross-workspace activity oracle. It is not an agent-owned cursor,
+an out-of-band preemption channel, a background-safe backend, or isolated visual execution.
 
 ## Foundation (#268)
 
@@ -324,7 +334,7 @@ attestation, packaging requirements, and disposable smoke fixture.
 | Operator UX and model proof | #273, #272 | Visible runs/approvals and capability-based provider conformance |
 | macOS act | #270 | Bounded semantic actions with durable bookkeeping-safe local takeover (not physically preemptive inside the native action gate) |
 | Coordinator interoperability | #271 | Scoped Computer Run MCP tools and event visibility |
-| WorkAttempt surface coordination | current stacked draft | Host-resolved Agent/Work/spec authority, deterministic per-domain queue, exact-current frame fence, durable dispatch identity, restart/expiry outcomes |
+| WorkAttempt surface coordination | current stacked draft | Host-resolved Agent/Work/spec authority, deterministic per-domain queue, exact-current frame fence, durable dispatch identity, restart/expiry outcomes, secret-free local queue/owner projection |
 | Out-of-band native cancellation channel | later | Physically preempt work that has already entered the native action gate |
 | Isolated helper / input domain | later | Host-native independently isolated visual input, not a simulator fixture |
 | Semantic-first isolated visual fallback | later | Isolated visual input after semantic miss, never boolean-upgraded native AX |
