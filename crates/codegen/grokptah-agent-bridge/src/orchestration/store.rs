@@ -3928,35 +3928,29 @@ impl OrchStore {
         )
     }
 
-    /// An Interrupted managed Run whose provider send is UncertainAccept or
-    /// ExplicitNewRunOnly must not auto-retry. Retry would create a second
-    /// intent/Run/HTTP request against a reservation that stays Reserved.
+    /// An in-flight or UncertainAccept provider send must not auto-retry.
+    ///
+    /// Graceful host stop can persist the Run as `LimitReached` /
+    /// `token_accounting_unavailable` while the attempt row is still
+    /// `Admitted`. Crash recovery later finishes that row as
+    /// `UncertainAccept` / `ExplicitNewRunOnly`. Either way, retry would
+    /// create a second intent/Run/HTTP request against a reservation that
+    /// stays Reserved.
     fn requires_explicit_new_logical_run_unlocked(
         &self,
         intent: &ManagedExecutionIntent,
-        cause: ManagedRetryCause,
+        _cause: ManagedRetryCause,
     ) -> Result<bool, OrchError> {
-        if cause != ManagedRetryCause::Interrupted {
-            return Ok(false);
-        }
         let Some(run_id) = intent.run_id.as_deref() else {
             return Ok(false);
         };
-        let Some(run) = self
-            .load_run_unlocked(run_id)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-        else {
-            return Ok(false);
-        };
-        if run.state != RunState::Interrupted {
-            return Ok(false);
-        }
         let attempts = self
             .list_provider_attempts_unlocked()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Ok(attempts.iter().any(|attempt| {
             attempt.run_id == run_id
-                && (attempt.send_certainty == Some(ProviderSendCertainty::UncertainAccept)
+                && (attempt.state == ProviderAttemptState::Admitted
+                    || attempt.send_certainty == Some(ProviderSendCertainty::UncertainAccept)
                     || attempt.retry_class == Some(ProviderRetryClass::ExplicitNewRunOnly))
         }))
     }
@@ -3998,9 +3992,10 @@ impl OrchStore {
             ..ManagedExecutionPolicy::default()
         };
         let explicit_new_run = self.requires_explicit_new_logical_run_unlocked(&intent, cause)?;
-        // UncertainAccept / ExplicitNewRunOnly on an Interrupted managed Run
-        // overrides retryEligible / retryExpired / retryFailed. Auto-retry
-        // would duplicate an in-flight provider send.
+        // Admitted / UncertainAccept / ExplicitNewRunOnly overrides
+        // retryEligible / retryExpired / retryFailed, including when graceful
+        // stop classified the Run as LimitReached. Auto-retry would duplicate
+        // an in-flight provider send.
         let retry = !explicit_new_run
             && policy.allows_auto_retry(&item, attempt_number.saturating_add(1), cause);
         let attempt_state = match cause {
@@ -8134,6 +8129,134 @@ mod tests {
             );
             drop(again);
         }
+    }
+
+    #[test]
+    fn admitted_in_flight_attempt_parks_on_graceful_interrupted_close() {
+        let (_root, store, work_id, _attempt_id, run_id, _provider_attempt_id, reservation_id) =
+            in_flight_managed_run("run-admitted-park");
+        let closed = store
+            .close_managed_attempt(
+                "intent-uncertain-park",
+                true,
+                ManagedRetryCause::Interrupted,
+                "managed run interrupted; native executor does not resume the invocation",
+                Utc::now(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.state, ManagedIntentState::Finalized);
+        assert_parked_without_retry(&store, &work_id, &run_id, &reservation_id);
+    }
+
+    #[test]
+    fn uncertain_limit_reached_run_parks_on_failed_close_instead_of_retrying() {
+        let (_root, store, work_id, _attempt_id, run_id, _provider_attempt_id, reservation_id) =
+            in_flight_managed_run("run-limit-reached-park");
+        let mut run = store.load_run(&run_id).unwrap().unwrap();
+        run.state = RunState::LimitReached;
+        run.error_code = Some("max_total_tokens_usage_unavailable".into());
+        run.terminal_result = Some("max_total_tokens_usage_unavailable".into());
+        run.stop_cause = Some(RunStopCause::TokenAccountingUnavailable);
+        store.save_run(&run).unwrap();
+        let closed = store
+            .close_managed_attempt(
+                "intent-uncertain-park",
+                true,
+                ManagedRetryCause::Failed,
+                "max_total_tokens_usage_unavailable",
+                Utc::now(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.state, ManagedIntentState::Finalized);
+        assert_parked_without_retry(&store, &work_id, &run_id, &reservation_id);
+    }
+
+    fn in_flight_managed_run(
+        run_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        OrchStore,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (mut run, reservation) = quota_backed_run(
+            run_id,
+            RunState::Running,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        let session = Uuid::new_v4();
+        run.session_id = session;
+        run.agent_id = Some("worker-a".into());
+        let store = OrchStore::open(root.path()).unwrap();
+        store
+            .save_agent(&worker_agent(session, &run.workspace))
+            .unwrap();
+        let item = retry_allowed_work(session, &run.workspace);
+        let work_id = item.work_id.clone();
+        store.save_work_item(&item).unwrap();
+        let claim = store
+            .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+            .unwrap();
+        let attempt_id = claim.attempt.attempt_id.clone();
+        store.save_run_with_quota(&run, &reservation).unwrap();
+        let provider_attempt_id = store
+            .begin_provider_attempt(&run.run_id)
+            .unwrap()
+            .attempt_id;
+        store
+            .link_work_run(&item.work_id, &attempt_id, &claim.lease_token, &run.run_id)
+            .unwrap();
+        store
+            .save_managed_intent(&admitted_intent(
+                &item,
+                attempt_id.clone(),
+                run.run_id.clone(),
+                session,
+            ))
+            .unwrap();
+        (
+            root,
+            store,
+            work_id,
+            attempt_id,
+            run.run_id,
+            provider_attempt_id,
+            reservation.reservation_id,
+        )
+    }
+
+    fn assert_parked_without_retry(
+        store: &OrchStore,
+        work_id: &str,
+        run_id: &str,
+        reservation_id: &str,
+    ) {
+        let work = store.load_work_item(work_id).unwrap().unwrap();
+        assert_eq!(work.state, WorkState::Blocked);
+        assert!(work.blocked_reason.is_some());
+        assert_ne!(work.state, WorkState::Queued);
+        assert_eq!(store.list_work_attempts(Some(work_id)).unwrap().len(), 1);
+        assert_eq!(store.list_managed_intents().unwrap().len(), 1);
+        assert!(store
+            .live_managed_intent_for_work(work_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.list_runs().unwrap().len(), 1);
+        assert_eq!(store.list_provider_attempts().unwrap().len(), 1);
+        let reservation = store
+            .load_quota_reservation(reservation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reservation.run_id, run_id);
+        assert_eq!(reservation.state, QuotaReservationState::Reserved);
     }
 
     #[test]
