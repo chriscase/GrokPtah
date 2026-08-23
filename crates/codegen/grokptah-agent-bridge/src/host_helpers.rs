@@ -2364,40 +2364,6 @@ where
     F: FnMut(&str) + Send,
     G: FnMut(&str) + Send,
 {
-    call_xai_agent_step_observed_inner(
-        creds,
-        model,
-        effort,
-        None,
-        messages,
-        tools,
-        allow_transient_retries,
-        cancel,
-        observation,
-        on_delta,
-        on_thought,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn call_xai_agent_step_observed_inner<F, G>(
-    creds: &crate::auth_store::WireCredentials,
-    model: &str,
-    effort: EffortLevel,
-    snapshot: Option<&crate::orchestration::ProviderRouteSnapshot>,
-    messages: &[serde_json::Value],
-    tools: &serde_json::Value,
-    allow_transient_retries: bool,
-    cancel: &CancellationToken,
-    observation: Option<&ProviderObservationContext>,
-    on_delta: F,
-    on_thought: G,
-) -> Result<AgentStep>
-where
-    F: FnMut(&str),
-    G: FnMut(&str),
-{
     let creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
     let target = match snapshot {
         Some(snapshot) => resolve_model_target_from_snapshot(&creds, snapshot)?,
