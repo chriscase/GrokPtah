@@ -41,6 +41,9 @@ pub struct AuthContext {
     pub owner_id: String,
     authority: EffectiveAuthority,
     computer_read: Option<ComputerReadGrant>,
+    /// Optional worker identity binding for least-privilege bearer tokens.
+    /// When present, worker-scoped requests may address only this identity.
+    bound_agent_id: Option<String>,
 }
 
 impl std::fmt::Debug for AuthContext {
@@ -67,6 +70,7 @@ impl AuthContext {
             allowlist,
             AuthorityRole::RemoteCoordinator,
             None,
+            None,
         )
     }
 
@@ -76,16 +80,23 @@ impl AuthContext {
         allowlist: &WorkspaceAllowlist,
         role: AuthorityRole,
         computer_read: Option<ComputerReadGrant>,
+        bound_agent_id: Option<String>,
     ) -> Result<Self, OrchError> {
         let token_id = token_id.into();
         let owner_id = owner_id.into();
-        let authority =
-            EffectiveAuthority::remote_default(&token_id, &owner_id, allowlist.roots(), role)?;
+        let authority = EffectiveAuthority::remote_default(
+            &token_id,
+            &owner_id,
+            allowlist.roots(),
+            role,
+            computer_read.is_some(),
+        )?;
         Ok(Self {
             token_id,
             owner_id,
             authority,
             computer_read,
+            bound_agent_id,
         })
     }
 
@@ -103,6 +114,7 @@ impl AuthContext {
             owner_id,
             authority,
             computer_read: None,
+            bound_agent_id: None,
         })
     }
 
@@ -117,6 +129,7 @@ impl AuthContext {
             owner_id,
             authority,
             computer_read: None,
+            bound_agent_id: None,
         })
     }
 
@@ -147,6 +160,40 @@ impl AuthContext {
     pub fn computer_read_grant(&self) -> Option<&ComputerReadGrant> {
         self.computer_read.as_ref()
     }
+
+    pub fn bound_agent_id(&self) -> Option<&str> {
+        self.bound_agent_id.as_deref()
+    }
+
+    /// Enforce an optional per-worker credential binding. Unbound coordinator
+    /// credentials retain their existing multi-worker authority.
+    pub fn require_agent_binding(&self, agent_id: &str) -> Result<(), OrchError> {
+        if self
+            .bound_agent_id
+            .as_deref()
+            .is_some_and(|bound| bound != agent_id)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "credential is bound to a different worker identity",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve an optional request identity without allowing a bound bearer
+    /// to impersonate another worker. A bound worker defaults to its own id.
+    pub fn resolve_agent_binding(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<Option<String>, OrchError> {
+        if let Some(bound) = self.bound_agent_id() {
+            let resolved = requested.unwrap_or(bound);
+            self.require_agent_binding(resolved)?;
+            return Ok(Some(resolved.to_string()));
+        }
+        Ok(requested.map(str::to_string))
+    }
 }
 
 /// One named bearer credential accepted by a service instance.
@@ -161,6 +208,7 @@ pub struct AuthCredential {
     role: AuthorityRole,
     workspace_roots: Option<Vec<PathBuf>>,
     computer_read: Option<ComputerReadGrant>,
+    bound_agent_id: Option<String>,
 }
 
 impl std::fmt::Debug for AuthCredential {
@@ -174,6 +222,7 @@ impl std::fmt::Debug for AuthCredential {
                 &self.workspace_roots.as_ref().map(Vec::len),
             )
             .field("computer_read", &self.computer_read)
+            .field("bound_agent_id", &self.bound_agent_id)
             .finish()
     }
 }
@@ -205,6 +254,7 @@ impl AuthCredential {
             role: AuthorityRole::RemoteCoordinator,
             workspace_roots: None,
             computer_read: None,
+            bound_agent_id: None,
         })
     }
 
@@ -233,6 +283,30 @@ impl AuthCredential {
 
     pub fn computer_read_grant(&self) -> Option<&ComputerReadGrant> {
         self.computer_read.as_ref()
+    }
+
+    /// Narrow this bearer to one durable worker identity. The secret remains
+    /// private; only the stable identity is carried into authorization/audit.
+    pub fn with_agent_binding(mut self, agent_id: impl Into<String>) -> Result<Self, OrchError> {
+        let agent_id = agent_id.into().trim().to_string();
+        if agent_id.is_empty()
+            || agent_id.len() > 256
+            || agent_id.contains("..")
+            || agent_id.contains('/')
+            || agent_id.contains('\\')
+            || agent_id.contains('\0')
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "worker identity binding is empty or invalid",
+            ));
+        }
+        self.bound_agent_id = Some(agent_id);
+        Ok(self)
+    }
+
+    pub fn bound_agent_id(&self) -> Option<&str> {
+        self.bound_agent_id.as_deref()
     }
 
     /// Issue a credential bound to exactly one host-owned Computer-read
@@ -409,6 +483,7 @@ pub(crate) fn authenticate_bearer(
         &credential_allowlist,
         credential.role,
         credential.computer_read.clone(),
+        credential.bound_agent_id.clone(),
     )
 }
 
@@ -494,6 +569,51 @@ mod tests {
             &WorkspaceAllowlist::default(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn worker_binding_is_narrow_and_defaults_missing_identity() {
+        let credential = AuthCredential::new("worker", "worker-token")
+            .unwrap()
+            .with_agent_binding("worker-a")
+            .unwrap();
+        let auth = authenticate_bearer(
+            Some("Bearer worker-token"),
+            &[credential],
+            "account-1",
+            &WorkspaceAllowlist::default(),
+        )
+        .unwrap();
+        assert_eq!(auth.bound_agent_id(), Some("worker-a"));
+        assert_eq!(
+            auth.resolve_agent_binding(None).unwrap().as_deref(),
+            Some("worker-a")
+        );
+        assert_eq!(
+            auth.resolve_agent_binding(Some("worker-a"))
+                .unwrap()
+                .as_deref(),
+            Some("worker-a")
+        );
+        let error = auth.require_agent_binding("worker-b").unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::ForbiddenScope);
+        assert!(
+            auth.resolve_agent_binding(Some("worker-b")).is_err(),
+            "a bound worker bearer must not impersonate another agent"
+        );
+    }
+
+    #[test]
+    fn worker_binding_rejects_path_like_identity() {
+        for invalid in ["", "../worker", "worker/child", "worker\\child"] {
+            assert!(
+                AuthCredential::new("worker", "token")
+                    .unwrap()
+                    .with_agent_binding(invalid)
+                    .is_err(),
+                "invalid worker identity should fail closed: {invalid:?}"
+            );
+        }
     }
 
     #[test]

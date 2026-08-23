@@ -456,9 +456,10 @@ coordinator/worker slices
 Those first slices are **not** the independent long-running multi-worker 100%
 exit. Grokbot is not a binary. Unattended Computer Use is Explicitly
 unsupported. Certification-lab smoke checks that managed execution is
-**disabled by default**. No 72-hour soak report exists. Per-principal worker
-credentials are still deferred; current configured remote bearers remain
-operator-equivalent.
+**disabled by default**. No 72-hour soak report exists. The runtime now has
+an opt-in per-principal worker-credential binding, but production issuance,
+rotation, and retained multi-worker evidence are not yet certified; unbound
+remote bearers remain coordinator-scoped.
 
 **Exit (all required):**
 
@@ -491,8 +492,8 @@ operator-equivalent.
     request-id idempotency; expired leases do not complete on a stale token);
   - **capability/authority isolation** (a worker cannot widen bounds or
     Computer Use the manager does not possess; caller-supplied Agent IDs are
-    not authentication; least-privilege / per-principal worker credentials
-    from stage 3 apply);
+    not authentication; the runtime's bound-worker credential contract and
+    its production issuance/rotation from stage 3 apply);
   - **retained evidence** (attempt history, artifacts, ordered events
     suitable for cursor replay and audit).
   Documented #305 **non-goals** may remain Explicitly unsupported: scheduler

@@ -45,6 +45,11 @@ existing exclusive store lock and atomic writes. It supports crash/reopen
 recovery and serializes competing claims. It intentionally accepts only one
 concurrent attempt per WorkItem in this first slice; a multi-node scheduler,
 database backend, and approval-decision operation remain follow-on work.
+Named bearers can be narrowed to one durable Agent identity with
+`AuthCredential::with_agent_binding`; the service rejects cross-agent worker,
+heartbeat, assignment, and message mutations for such a bearer. Credential
+issuance/rotation and an independent long-running multi-worker proof are still
+required for the Stage 6 release gate.
 
 ## Service reconciliation
 
@@ -95,9 +100,12 @@ Mutation tools:
 
 Mutating calls use the existing durable request-id/idempotency mechanism. A
 replayed request returns the original response; the same request ID with a
-different payload is rejected. The authenticated service currently exposes a
-single operator-equivalent bearer token, so claimant identity is the current
-auth token ID. Per-principal authorization is a separate security milestone.
+different payload is rejected. Unbound coordinator credentials may act on
+behalf of in-scope Agent resources and remain attributable by auth token.
+Bound worker credentials resolve omitted claimant identity to their bound
+Agent and fail closed on cross-agent requests. Per-principal issuance,
+rotation, and the independent multi-worker outcome remain separate release
+milestones.
 
 The desktop's remote-service adapter advertises and decodes the two read tools
 into typed `DurableWorkItem`, `DurableWorkAttempt`, and `RemoteWorkSnapshot`

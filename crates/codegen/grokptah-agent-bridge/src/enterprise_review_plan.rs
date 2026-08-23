@@ -632,8 +632,8 @@ mod tests {
             &EnterpriseReviewPolicy::default(),
             now,
             "review-plan",
-            &"b".repeat(64),
-            &"c".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
         )
         .unwrap()
     }

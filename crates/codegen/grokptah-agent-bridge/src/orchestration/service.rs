@@ -3149,7 +3149,13 @@ impl OrchestrationService {
             }
         };
         let lease_secret = self.config.lock().bearer_token.clone();
-        if let Some(agent_id) = agent_id.as_deref() {
+        let bound_agent_id = match auth.resolve_agent_binding(agent_id.as_deref()) {
+            Ok(agent_id) => agent_id,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
+        };
+        if let Some(agent_id) = bound_agent_id.as_deref() {
             if let Err(error) = self.store.require_agent_in_scope(
                 agent_id,
                 session_id,
@@ -3158,7 +3164,7 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
             }
         }
-        let claimant = agent_id.unwrap_or_else(|| auth.token_id.clone());
+        let claimant = bound_agent_id.unwrap_or_else(|| auth.token_id.clone());
         let claim = match self.store.claim_work_with_lease_secret(
             work_id,
             &claimant,
@@ -3247,6 +3253,15 @@ impl OrchestrationService {
         };
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        if let Some(agent_id) = auth.bound_agent_id() {
+            if let Err(error) = self.store.require_work_attempt_claimant(
+                work_id,
+                details["attemptId"].as_str().unwrap_or_default(),
+                agent_id,
+            ) {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
         }
         let attempt = match operation(&self.store) {
             Ok(attempt) => attempt,
@@ -3346,6 +3361,14 @@ impl OrchestrationService {
         };
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        if let Some(agent_id) = auth.bound_agent_id() {
+            if let Err(error) = self
+                .store
+                .require_work_attempt_claimant(work_id, attempt_id, agent_id)
+            {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
         }
         let (item, attempt) =
             match self
@@ -3479,6 +3502,15 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        if let Some(agent_id) = auth.bound_agent_id() {
+            if let Err(error) = self.store.require_work_attempt_claimant(
+                work_id,
+                details["attemptId"].as_str().unwrap_or_default(),
+                agent_id,
+            ) {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
+        }
         let (item, attempt) = match operation(&self.store) {
             Ok(value) => value,
             Err(error) => {
@@ -3569,6 +3601,9 @@ impl OrchestrationService {
         assigned_agent_id: Option<String>,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        if let Some(agent_id) = assigned_agent_id.as_deref() {
+            auth.require_agent_binding(agent_id)?;
+        }
         self.work_item_mutation(
             auth,
             "ptah_assign_work",
@@ -3642,6 +3677,7 @@ impl OrchestrationService {
         workspace: &Path,
         agent_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        auth.require_agent_binding(agent_id)?;
         auth.require_workspace(AuthorityOperation::WorkersRead, workspace)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let worker = self
@@ -3666,6 +3702,7 @@ impl OrchestrationService {
         agent_id: &str,
         host_kind: WorkerHostKind,
     ) -> Result<serde_json::Value, OrchError> {
+        auth.require_agent_binding(agent_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3727,6 +3764,10 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
         manager_agent_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
+        auth.require_agent_binding(agent_id)?;
+        if let Some(manager_agent_id) = manager_agent_id.as_deref() {
+            auth.require_agent_binding(manager_agent_id)?;
+        }
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3868,6 +3909,10 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
         manager_agent_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
+        auth.require_agent_binding(agent_id)?;
+        if let Some(manager_agent_id) = manager_agent_id.as_deref() {
+            auth.require_agent_binding(manager_agent_id)?;
+        }
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -4072,6 +4117,7 @@ impl OrchestrationService {
         attempt_id: Option<String>,
         run_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
+        let from_agent_id = auth.resolve_agent_binding(from_agent_id.as_deref())?;
         let idempotency = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -4100,6 +4146,16 @@ impl OrchestrationService {
         if let Some(work_id) = &work_id {
             if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, true) {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
+            if let (Some(agent_id), Some(attempt_id)) =
+                (auth.bound_agent_id(), attempt_id.as_deref())
+            {
+                if let Err(error) = self
+                    .store
+                    .require_work_attempt_claimant(work_id, attempt_id, agent_id)
+                {
+                    return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+                }
             }
         }
         let mut message = match WorkMessage::new(
@@ -4220,6 +4276,7 @@ impl OrchestrationService {
         agent_id: &str,
         after_seq: u64,
     ) -> Result<serde_json::Value, OrchError> {
+        auth.require_agent_binding(agent_id)?;
         auth.require_workspace(AuthorityOperation::WorkMessages, workspace)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let page = self.store.list_messages(
@@ -4241,6 +4298,7 @@ impl OrchestrationService {
         actor_id: &str,
         after_seq: u64,
     ) -> Result<serde_json::Value, OrchError> {
+        auth.require_agent_binding(actor_id)?;
         auth.require_workspace(AuthorityOperation::WorkMessages, workspace)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let page = self.store.list_messages(
@@ -4776,6 +4834,7 @@ impl OrchestrationService {
             chrono::DateTime<Utc>,
         ) -> Result<(WorkItem, WorkDecision), OrchError>,
     {
+        auth.require_agent_binding(agent_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -6015,6 +6074,7 @@ impl OrchestrationService {
         agent_id: &str,
         claim_owner: bool,
     ) -> Result<(AgentRecord, PathBuf), OrchError> {
+        auth.require_agent_binding(agent_id)?;
         let session = self.require_build_session(session_id)?;
         let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
         let allowlist = self.config.lock().allowlist.clone();

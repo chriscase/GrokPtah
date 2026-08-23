@@ -172,6 +172,7 @@ impl EffectiveAuthority {
         owner_principal_id: &str,
         roots: &[PathBuf],
         role: AuthorityRole,
+        computer_read: bool,
     ) -> Result<Self, OrchError> {
         if role == AuthorityRole::LocalOperator {
             return Err(OrchError::new(
@@ -180,12 +181,16 @@ impl EffectiveAuthority {
             ));
         }
         let workspaces = workspace_grants(roots)?;
+        let mut operations = role_ceiling(role);
+        if computer_read {
+            operations.insert(AuthorityOperation::ComputerRead);
+        }
         Self::new(
             credential_id,
             owner_principal_id,
             role,
             workspaces,
-            role_ceiling(role),
+            operations,
             "standalone_service",
         )
     }
@@ -602,6 +607,7 @@ mod tests {
             "owner",
             &[root.path().to_path_buf()],
             AuthorityRole::RemoteCoordinator,
+            false,
         )
         .unwrap();
         for denied in [
@@ -635,6 +641,7 @@ mod tests {
             "owner",
             &[root.path().to_path_buf()],
             AuthorityRole::Observer,
+            false,
         )
         .unwrap();
         assert!(authority
@@ -667,6 +674,7 @@ mod tests {
             "owner",
             &[root.path().to_path_buf()],
             AuthorityRole::RemoteOperator,
+            false,
         )
         .unwrap();
         for allowed in ["ptah_approve_work", "ptah_approve_run", "ptah_promote_run"] {
@@ -692,5 +700,34 @@ mod tests {
             authority.capability_document.hard_denials,
             vec!["computer_use"]
         );
+    }
+
+    #[test]
+    fn scoped_computer_read_grant_adds_only_read_capability() {
+        let root = tempdir().unwrap();
+        let authority = EffectiveAuthority::remote_default(
+            "scoped",
+            "owner",
+            &[root.path().to_path_buf()],
+            AuthorityRole::RemoteCoordinator,
+            true,
+        )
+        .unwrap();
+        assert!(authority
+            .capability_document
+            .tools
+            .iter()
+            .any(|tool| tool == "ptah_list_computer_runs"));
+        for denied in [
+            "ptah_approve_work",
+            "ptah_promote_run",
+            "ptah_authorize_work_execution",
+        ] {
+            assert!(!authority
+                .capability_document
+                .tools
+                .iter()
+                .any(|tool| tool == denied));
+        }
     }
 }

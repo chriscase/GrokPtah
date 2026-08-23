@@ -1,7 +1,7 @@
 # Dream Candidate Status
 
 This note describes the isolated integration candidate on
-`codex/dream-always-on-reconcile`. It is not a claim that `origin/main` is
+`codex/overnight-dream-certification-v1`. It is not a claim that `origin/main` is
 complete or that the product has reached 100%.
 
 ## Newly certified in this candidate
@@ -23,6 +23,11 @@ complete or that the product has reached 100%.
   assignment, manager attribution, message acknowledgement, liveness, and
   restart-safe workload fencing. The workload MCP approval fixture already
   uses a durable Agent identity and rejects omitted or foreign claimants.
+- Per-principal worker credential binding is now implemented: a bearer can be
+  narrowed to one durable Agent, omitted worker identity resolves to that
+  Agent, and cross-agent heartbeat/assignment/message/persistent-agent
+  requests fail closed. Production issuance/rotation and independent
+  long-running evidence are still open.
 - Computer Use observation now re-checks the durable conflict-domain poison
   fence even for an already-granted Agent, so an uncertain sibling dispatch
   cannot be bypassed by a stale grant.
@@ -129,8 +134,9 @@ unrelated signal.
 1. Capture the candidate's immutable desktop/hosted parity golden on a host
    where the service gateway can bind, then run the full authenticated fixture.
 2. Complete the independent long-running worker outcome: multi-worker crash/
-   restart recovery, no duplicate execution, least-privilege production-shaped
-   credentials, retained evidence, and the operational soak.
+   restart recovery, no duplicate execution, production-shaped issuance and
+   rotation of least-privilege credentials, retained evidence, and the
+   operational soak.
 3. Complete visual acceptance of the packaged reconciliation workflow, then
    complete live Grok Build quota/exhaustion evidence, isolated visual
    Computer Use hardware proof, recurring expert UI reviews, a 72-hour

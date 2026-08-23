@@ -5448,6 +5448,35 @@ impl OrchStore {
         self.claim_work_inner(work_id, claimant_id, lease_ms, Some(lease_secret))
     }
 
+    /// Verify that a lease attempt belongs to a bound worker credential before
+    /// accepting any lease-scoped mutation. The attempt token remains the
+    /// second factor; this check prevents a worker bearer from reusing a
+    /// different worker's token if it is ever exposed to that process.
+    pub fn require_work_attempt_claimant(
+        &self,
+        work_id: &str,
+        attempt_id: &str,
+        claimant_id: &str,
+    ) -> Result<(), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let attempt = self
+            .load_work_attempt_unlocked(attempt_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "work attempt is not owned by this credential",
+                )
+            })?;
+        if attempt.work_id != work_id || attempt.claimant_id != claimant_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "work attempt is not owned by this credential",
+            ));
+        }
+        Ok(())
+    }
+
     fn claim_work_inner(
         &self,
         work_id: &str,

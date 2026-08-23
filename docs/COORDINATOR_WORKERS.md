@@ -21,8 +21,13 @@ A live heartbeat is not a lease. Lease ownership is only an active
 ### Authenticated principal versus Agent resource
 
 Named control-plane credentials (`AuthCredential`) share one service account
-(`owner_id`) and are **operator-equivalent** in this slice. They are not bound
-to a specific Agent. Per-principal worker credentials are deferred.
+(`owner_id`). A credential may remain coordinator-scoped, or may be bound to
+exactly one durable Agent with `with_agent_binding`. Bound credentials cannot
+name another Agent, and omitted worker identities resolve to their bound
+identity. This narrows impersonation without treating a bearer as proof that
+the Agent resource exists; the normal session/workspace/active-identity checks
+still apply. Production-shaped credential issuance and the long-running
+multi-worker evidence remain open.
 
 That does not let a caller invent or impersonate an Agent identity:
 
@@ -31,10 +36,10 @@ That does not let a caller invent or impersonate an Agent identity:
 | `from_actor` / `actor_id` / `credential_id` | authenticated `token_id` | The bearer that performed the mutation |
 | `from_agent_id` / `to_agent_id` / `actor_agent_id` / `agent_id` | request, then store | Durable Agent **resource** the principal named |
 
-The service never copies a caller-supplied Agent id into `from_actor`. A
-worker credential that names `from_agent_id` of another in-scope Agent is
-recorded as that credential **acting on behalf of** the Agent, not as the
-Agent itself.
+The service never copies a caller-supplied Agent id into `from_actor`. An
+unbound coordinator credential that names `from_agent_id` is recorded as that
+credential **acting on behalf of** the Agent, not as the Agent itself. A bound
+worker credential cannot make that cross-identity request.
 
 Every referenced Agent is loaded under the store lock and must:
 
@@ -135,11 +140,11 @@ returns the original Work or message and creates no duplicate.
 
 ## Follow-up
 
-- **Per-principal worker credentials.** Bind a credential to one Agent so a
-  worker bearer cannot name another Agent as `from_agent_id` / `agent_id`.
-  Until that exists, operator-equivalent bearers may act on behalf of any
-  in-scope Agent, and the durable record always stores the authenticated
-  principal separately.
+- **Production-shaped worker credential issuance.** The runtime now supports
+  binding a credential to one Agent and rejects cross-identity worker and
+  message operations. A deployment still needs a real issuance/rotation
+  workflow plus independent multi-worker evidence before this is a release
+  claim.
 - **Coordinator-only versus worker-only tools.** Keep the current
   operator-equivalent bearer model until that binding exists; do not split
   the control-plane credential set in this slice.
