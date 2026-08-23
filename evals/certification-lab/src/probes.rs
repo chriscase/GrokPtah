@@ -5,6 +5,7 @@
 
 use std::time::Instant;
 
+use grokptah_agent_bridge::orchestration::hash_payload;
 use grokptah_agent_bridge::provider_observation::InMemoryObservationRecorder;
 use grokptah_agent_bridge::{McpControlClient, McpRemoteError};
 use serde_json::{json, Value};
@@ -14,9 +15,9 @@ use crate::local_service::LocalService;
 use crate::manifest::ProbeDefinition;
 use crate::report::{
     diagnostic_failure_class, opaque_durable_id, ArgumentFieldCode, DiagnosticCode, DurableIdKind,
-    DurableStateCode, EntityKind, EvidenceCounters, OpaqueDurableId, PhaseCode, PhaseResult,
-    ProbeResult, ProbeStatus, ReconnectEvidence, RestartEvidence, StructuralTrace,
-    TraceOperationCode, TraceRecord, TransitionEvidence,
+    DurableStateCode, EntityKind, EvidenceCounters, LoopbackProviderObservation, OpaqueDurableId,
+    PhaseCode, PhaseResult, ProbeResult, ProbeStatus, ReconnectEvidence, RestartEvidence,
+    StructuralTrace, TraceOperationCode, TraceRecord, TransitionEvidence,
 };
 use crate::LAB_TRACE_SCHEMA;
 
@@ -71,6 +72,7 @@ struct ProbeBuilder<'a> {
     capture_provider_run: Option<ProviderRunEvidence>,
     provider_attempt_start: Option<u32>,
     capture_attempt_start: Option<u32>,
+    provider_observation: Option<LoopbackProviderObservation>,
 }
 
 impl<'a> ProbeBuilder<'a> {
@@ -88,6 +90,7 @@ impl<'a> ProbeBuilder<'a> {
             capture_provider_run: None,
             provider_attempt_start: None,
             capture_attempt_start: None,
+            provider_observation: None,
         }
     }
 
@@ -130,6 +133,10 @@ impl<'a> ProbeBuilder<'a> {
                     ) {
                         return Err(DiagnosticCode::McpResultMalformed);
                     }
+                }
+                if let Some(last) = self.records.last_mut() {
+                    last.result_digest = Some(hash_payload(&result.structured));
+                    last.opaque_entity_id = opaque_from_value(&result.structured);
                 }
                 Ok(result.structured)
             }
@@ -180,6 +187,8 @@ impl<'a> ProbeBuilder<'a> {
             argument_fields,
             diagnostic,
             sequence: None,
+            result_digest: None,
+            opaque_entity_id: None,
         });
         Ok(())
     }
@@ -251,6 +260,7 @@ impl<'a> ProbeBuilder<'a> {
                 trace: None,
                 capture_refs: Vec::new(),
                 elapsed_millis,
+                provider_observation: self.provider_observation,
             },
             trace: StructuralTrace {
                 schema: LAB_TRACE_SCHEMA.into(),
@@ -265,6 +275,19 @@ impl<'a> ProbeBuilder<'a> {
             capture_attempt_start: self.capture_attempt_start,
         }
     }
+}
+
+fn opaque_from_value(value: &Value) -> Option<String> {
+    value
+        .pointer("/plan/planId")
+        .or_else(|| value.pointer("/run/runId"))
+        .or_else(|| value.pointer("/runId"))
+        .or_else(|| value.pointer("/work/workId"))
+        .or_else(|| value.pointer("/workId"))
+        .or_else(|| value.pointer("/sessionId"))
+        .or_else(|| value.pointer("/agentId"))
+        .and_then(Value::as_str)
+        .map(opaque_durable_id)
 }
 
 impl ProbeExecution {
@@ -1834,6 +1857,7 @@ async fn native_interruption_retry_policy(
     workspace: &str,
     provider_recorder: Option<&InMemoryObservationRecorder>,
 ) -> Result<(), DiagnosticCode> {
+    // This path is the implementation for OracleCode::InterruptedRunNotReadmittedWithinWindow.
     let mut client = service.client();
     client
         .initialize()

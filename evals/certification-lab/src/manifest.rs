@@ -269,6 +269,7 @@ pub enum ProbeAction {
     AdvanceManagerPlan,
     TickManagerPlan,
     ReplanManagerPlan,
+    CreateAutonomousManagerPlan,
 }
 
 impl ProbeAction {
@@ -380,6 +381,15 @@ impl ProbeAction {
             ],
             Self::ObserveNativeTicks => &["ptah_get_capacity"],
             Self::ClaimRetriedWork => &["ptah_claim_work"],
+            Self::CreateAutonomousManagerPlan => &[
+                "ptah_create_session",
+                "ptah_submit_task",
+                "ptah_cancel",
+                "ptah_get_run",
+                "ptah_list_persistent_agents",
+                FUTURE_SET_MANAGED_EXECUTION_TOOL,
+                "ptah_create_manager_plan",
+            ],
         }
     }
 
@@ -540,6 +550,9 @@ pub enum OracleCode {
     ManagerNotificationFencedByWorkRevision,
     ManagerStalePlanRevisionRejected,
     ManagerReplanSupersedesAndSucceeds,
+    AlwaysOnPlanSucceeded,
+    UncertainAttemptNotResumed,
+    InterruptedRunNotReadmittedWithinWindow,
 }
 
 #[derive(Debug, Deserialize)]

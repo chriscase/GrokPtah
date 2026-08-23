@@ -316,6 +316,27 @@ pub struct ProbeResult {
     pub trace: Option<ArtifactReference>,
     pub capture_refs: Vec<CaptureReference>,
     pub elapsed_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_observation: Option<LoopbackProviderObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LoopbackProviderObservation {
+    pub accepted_posts: u64,
+    pub rejected_auth: u64,
+    pub records: Vec<LoopbackProviderRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LoopbackProviderRecord {
+    pub method: String,
+    pub path: String,
+    pub semantic_id: String,
+    pub body_digest: String,
+    pub auth_accepted: bool,
+    pub route_ok: bool,
 }
 
 impl ProbeResult {
@@ -347,6 +368,7 @@ impl ProbeResult {
             trace: None,
             capture_refs: Vec::new(),
             elapsed_millis: 0,
+            provider_observation: None,
         }
     }
 
@@ -935,6 +957,10 @@ pub struct TraceRecord {
     pub diagnostic: Option<DiagnosticCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque_entity_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1855,6 +1881,8 @@ mod tests {
                 argument_fields: vec![],
                 diagnostic: Some(DiagnosticCode::Ok),
                 sequence: None,
+                result_digest: None,
+                opaque_entity_id: None,
             }],
             truncated: false,
             dropped_records: 0,
@@ -1916,6 +1944,7 @@ mod tests {
             }),
             capture_refs: Vec::new(),
             elapsed_millis: 1,
+            provider_observation: None,
         }];
         value.recompute_summary().unwrap();
         value.certified = true;
@@ -1982,6 +2011,8 @@ mod tests {
                 argument_fields: vec![],
                 diagnostic: Some(DiagnosticCode::Ok),
                 sequence: None,
+                result_digest: None,
+                opaque_entity_id: None,
             }],
             truncated: false,
             dropped_records: 0,
