@@ -401,8 +401,17 @@ receives `CONTROL_TOOLS` in full. **Must not start** a production-shaped
 **Depends on:** stage 3 (capability advertisement is unsafe while every
 bearer is operator-equivalent).
 
-**Exists today:** Shared runtime/protocol; Experimental parity; no declared
-host capability document; hosted-service.yml **Pending — not shipped**.
+**Exists on `origin/main`:** Shared runtime/protocol; Experimental parity; no
+declared host capability document; hosted-service.yml **Pending — not
+shipped**.
+
+**Dream candidate:** Desktop and service entry paths now bind distinct stable
+host assertions and capability sets into the versioned initialize document
+without widening bearer authority. The existing public-MCP fixture verifies
+attempt-time capture, restart stability, and typed denial of an undeclared
+Computer mutation in addition to its readiness/quota/Manager/restart/redaction
+oracle. Its current-head immutable golden and hosted qualification remain open,
+so Stage 4 is **not** claimed complete.
 
 **Exit (all required):**
 

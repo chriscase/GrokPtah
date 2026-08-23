@@ -107,6 +107,17 @@ hard denials—never bearer values or canonical filesystem paths. An MCP session
 is bound to the credential ID and capability-document hash used at initialize;
 credential swaps or authority changes require a new session.
 
+On the current dream candidate, that same versioned document also binds an
+attempt-time host assertion. The production desktop adapter declares
+`desktop_local`; `grokptah-service` declares `standalone_service`; both use an
+opaque runtime-home-derived instance ID and bridge version. Common durable
+capabilities are explicit, while desktop-only keychain, PTY, local approval,
+and foreground semantic Computer Use are declared only by the desktop host.
+Those host facts do **not** expand the connected bearer role: coordinator and
+observer denials remain enforced even when the desktop host possesses a local
+capability. This candidate slice is not a Stage 4 certification until its
+exact-head immutable parity golden and hosted qualification pass.
+
 `initialize` is the only stateless MCP method and the only way to create that
 binding. Every later POST method—including `ping`, `tools/list`, `tools/call`,
 notifications, and typed error paths—plus `GET /mcp` and `DELETE /mcp` requires

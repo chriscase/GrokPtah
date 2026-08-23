@@ -12,6 +12,86 @@ use super::types::{OrchError, OrchErrorCode, CONTROL_TOOLS};
 pub const AUTHORITY_SCHEMA_VERSION: u32 = 1;
 pub const AUTHORITY_CAPABILITY_SCHEMA: &str = "grokptah.authority-capabilities.v1";
 
+const COMMON_HOST_CAPABILITIES: &[&str] = &[
+    "durable_sessions",
+    "durable_runs",
+    "event_replay",
+    "persistent_agents",
+    "durable_work",
+    "routines",
+    "native_execution",
+];
+
+const DESKTOP_LOCAL_HOST_CAPABILITIES: &[&str] = &[
+    "desktop_keychain",
+    "desktop_pty",
+    "desktop_local_approval",
+    "semantic_computer_use_foreground",
+];
+
+/// Host shape captured when an authenticated control-plane attempt begins.
+///
+/// This is deliberately separate from the caller's authority role. A remote
+/// bearer connected to a desktop host can learn that the *host* supports a
+/// local feature without inheriting permission to invoke that feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeHostKind {
+    DesktopLocal,
+    StandaloneService,
+    Unknown,
+}
+
+impl RuntimeHostKind {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::DesktopLocal => "desktop_local",
+            Self::StandaloneService => "standalone_service",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Immutable host facts bound into every per-credential capability document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostCapabilityProfile {
+    asserted_by: CapabilityAssertion,
+    capabilities: Vec<String>,
+}
+
+impl HostCapabilityProfile {
+    pub(crate) fn for_runtime(kind: RuntimeHostKind, runtime_home: &Path) -> Self {
+        let mut identity = Vec::new();
+        identity.extend_from_slice(b"grokptah.host-instance.v1\0");
+        identity.extend_from_slice(kind.wire().as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(runtime_home.as_os_str().as_encoded_bytes());
+
+        let mut capabilities = COMMON_HOST_CAPABILITIES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        if kind == RuntimeHostKind::DesktopLocal {
+            capabilities.extend(
+                DESKTOP_LOCAL_HOST_CAPABILITIES
+                    .iter()
+                    .map(|value| (*value).to_string()),
+            );
+        }
+        capabilities.sort();
+        capabilities.dedup();
+
+        Self {
+            asserted_by: CapabilityAssertion {
+                host_instance_id: opaque_id(&identity),
+                host_kind: kind.wire().to_string(),
+                host_version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            capabilities,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthorityRole {
@@ -221,6 +301,20 @@ impl EffectiveAuthority {
         Ok(self)
     }
 
+    /// Bind the attempt-time host profile without widening caller authority.
+    /// Re-hashing makes the transport session fail closed if the host shape
+    /// changes across a reconnect or credential rotation.
+    pub(crate) fn with_host_profile(
+        mut self,
+        profile: &HostCapabilityProfile,
+    ) -> Result<Self, OrchError> {
+        self.capability_document.asserted_by = profile.asserted_by.clone();
+        self.capability_document.host_capabilities = profile.capabilities.clone();
+        self.capability_document.document_hash = hash_document(&self.capability_document)?;
+        self.stamp.capability_document_hash = self.capability_document.document_hash.clone();
+        Ok(self)
+    }
+
     fn new(
         credential_id: &str,
         owner_principal_id: &str,
@@ -260,15 +354,10 @@ impl EffectiveAuthority {
             workspace_ids,
             agent_ids: Vec::new(),
         };
-        let host_capabilities = vec![
-            "durable_sessions".to_string(),
-            "durable_runs".to_string(),
-            "event_replay".to_string(),
-            "persistent_agents".to_string(),
-            "durable_work".to_string(),
-            "routines".to_string(),
-            "native_execution".to_string(),
-        ];
+        let host_capabilities = COMMON_HOST_CAPABILITIES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
         let hard_denials = match role {
             AuthorityRole::LocalOperator => Vec::new(),
             AuthorityRole::RemoteOperator => vec!["computer_use".to_string()],
@@ -703,6 +792,64 @@ mod tests {
                 .unwrap();
         assert_eq!(trusted.stamp.role, AuthorityRole::LocalOperator);
         assert_eq!(trusted.stamp.credential_id, "trusted-local-adapter");
+    }
+
+    #[test]
+    fn host_profile_is_stable_role_separate_and_hash_bound() {
+        let root = tempdir().unwrap();
+        let authority = EffectiveAuthority::remote_default(
+            "coordinator",
+            "owner",
+            &[root.path().to_path_buf()],
+            AuthorityRole::RemoteCoordinator,
+            false,
+        )
+        .unwrap();
+        let operations = authority.operations.clone();
+        let desktop_profile =
+            HostCapabilityProfile::for_runtime(RuntimeHostKind::DesktopLocal, root.path());
+        let desktop_again =
+            HostCapabilityProfile::for_runtime(RuntimeHostKind::DesktopLocal, root.path());
+        let service_profile =
+            HostCapabilityProfile::for_runtime(RuntimeHostKind::StandaloneService, root.path());
+
+        assert_eq!(desktop_profile, desktop_again);
+        assert_ne!(
+            desktop_profile.asserted_by.host_instance_id,
+            service_profile.asserted_by.host_instance_id
+        );
+
+        let desktop = authority
+            .clone()
+            .with_host_profile(&desktop_profile)
+            .unwrap();
+        let service = authority.with_host_profile(&service_profile).unwrap();
+        assert_eq!(desktop.operations, operations);
+        assert_eq!(service.operations, operations);
+        assert_eq!(
+            desktop.capability_document.asserted_by.host_kind,
+            "desktop_local"
+        );
+        assert_eq!(
+            service.capability_document.asserted_by.host_kind,
+            "standalone_service"
+        );
+        assert!(desktop
+            .capability_document
+            .host_capabilities
+            .iter()
+            .any(|value| value == "semantic_computer_use_foreground"));
+        assert!(!service
+            .capability_document
+            .host_capabilities
+            .iter()
+            .any(|value| value == "semantic_computer_use_foreground"));
+        assert_ne!(
+            desktop.capability_document.document_hash,
+            service.capability_document.document_hash
+        );
+        let encoded = serde_json::to_string(&desktop.capability_document).unwrap();
+        assert!(!encoded.contains(root.path().to_string_lossy().as_ref()));
     }
 
     #[test]

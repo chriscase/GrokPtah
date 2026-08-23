@@ -18,7 +18,9 @@ use crate::host::AgentHostHandle;
 use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
-use super::authority::{required_operation, AuthorityOperation};
+use super::authority::{
+    required_operation, AuthorityOperation, HostCapabilityProfile, RuntimeHostKind,
+};
 use super::authz::{
     authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
     WorkspaceAllowlist,
@@ -211,6 +213,7 @@ impl Default for OrchestrationConfig {
 
 pub struct OrchestrationService {
     host: AgentHostHandle,
+    host_capability_profile: HostCapabilityProfile,
     bus: EventBus,
     store: OrchStore,
     config: Mutex<OrchestrationConfig>,
@@ -387,8 +390,26 @@ impl OrchestrationService {
         host: AgentHostHandle,
         bus: EventBus,
         store: OrchStore,
-        mut config: OrchestrationConfig,
+        config: OrchestrationConfig,
     ) -> Arc<Self> {
+        Self::new_for_host(host, bus, store, config, RuntimeHostKind::Unknown)
+    }
+
+    /// Construct the shared runtime with an explicit host shape.
+    ///
+    /// Production desktop and standalone-service entry points must use this
+    /// constructor so initialize captures the real host profile. The legacy
+    /// constructor remains conservative (`unknown`) for embedders that have
+    /// not declared their host boundary.
+    pub fn new_for_host(
+        host: AgentHostHandle,
+        bus: EventBus,
+        store: OrchStore,
+        mut config: OrchestrationConfig,
+        host_kind: RuntimeHostKind,
+    ) -> Arc<Self> {
+        let host_capability_profile =
+            HostCapabilityProfile::for_runtime(host_kind, host.runtime_home().path());
         host.install_orchestration_store(store.clone());
         // The host owns the process-wide ledger. If desktop bootstrap opened
         // it first, use that same handle instead of creating a split history.
@@ -412,6 +433,7 @@ impl OrchestrationService {
             RoutineSupervisor::start(store.clone(), DEFAULT_ROUTINE_TICK_INTERVAL);
         let service = Arc::new_cyclic(|self_ref| Self {
             host,
+            host_capability_profile,
             bus,
             store,
             config: Mutex::new(config),
@@ -1860,7 +1882,8 @@ impl OrchestrationService {
         let credentials = self.auth_credentials.lock().clone();
         let owner_id = self.agent_owner_id();
         let allowlist = self.config.lock().allowlist.clone();
-        let res = authenticate_bearer(header, &credentials, &owner_id, &allowlist);
+        let res = authenticate_bearer(header, &credentials, &owner_id, &allowlist)
+            .and_then(|auth| auth.with_host_profile(&self.host_capability_profile));
         if let Err(ref e) = res {
             self.audit(
                 "auth",
@@ -1890,6 +1913,7 @@ impl OrchestrationService {
         let owner_id = self.agent_owner_id();
         let allowlist = self.config.lock().allowlist.clone();
         authenticate_bearer(Some(&header), &credentials, &owner_id, &allowlist)
+            .and_then(|auth| auth.with_host_profile(&self.host_capability_profile))
             .ok()
             .is_some_and(|current| {
                 current.authority_stamp() == auth.authority_stamp()
@@ -1900,6 +1924,7 @@ impl OrchestrationService {
     pub(crate) fn trusted_local_auth(&self, owner_id: &str) -> Result<AuthContext, OrchError> {
         let allowlist = self.config.lock().allowlist.clone();
         AuthContext::trusted_local_operator(owner_id.to_string(), &allowlist)
+            .and_then(|auth| auth.with_host_profile(&self.host_capability_profile))
     }
 
     #[allow(clippy::too_many_arguments)]

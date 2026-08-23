@@ -126,6 +126,13 @@ complete or that the product has reached 100%.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
   gateway, so the candidate parity campaign still needs a host run.
+- Desktop and service control-plane entry paths now bind distinct
+  `desktop_local` / `standalone_service` host assertions, opaque stable host
+  instance identity, bridge version, and exact capability sets into the
+  initialize document without expanding the bearer role. The fixture checks
+  initial and post-restart stability and typed denial for an undeclared
+  Computer mutation. No current-head immutable golden or Stage 4 certificate
+  is claimed yet.
 - Certification-lab shutdown now awaits each Tokio worker exactly once; the
   prior timeout-then-second-await path could panic with `JoinHandle polled
   after completion`. The offline lab suite is now a clean 92/92, but this is

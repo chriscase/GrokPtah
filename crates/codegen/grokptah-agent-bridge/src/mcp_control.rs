@@ -40,9 +40,9 @@ use crate::orchestration::{
     required_operation, scrub_route_secret_needles, AuthContext, ChangeRecord, ManagerStepSpec,
     MessageKind, MissedRunPolicy, OrchError, OrchErrorCode, OrchestrationConfig,
     OrchestrationService, ProviderRouteSnapshot, RoutineConcurrencyPolicy, RoutineLifecycle,
-    RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef, WorkDependency,
-    WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS,
-    FORBIDDEN_TOOLS, PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
+    RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, RuntimeHostKind, WorkArtifactRef,
+    WorkDependency, WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist,
+    CONTROL_TOOLS, FORBIDDEN_TOOLS, PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -384,7 +384,7 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
     // important: opening a second store would split desktop and MCP history or
     // contend on the process-wide lock.
     let store = host.ensure_orchestration_store().ok()?;
-    let orch = OrchestrationService::new(
+    let orch = OrchestrationService::new_for_host(
         host.clone(),
         host.event_bus(),
         store,
@@ -394,6 +394,7 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
             max_concurrent_runs: 4,
             bounds: Default::default(),
         },
+        RuntimeHostKind::DesktopLocal,
     );
     let mut limits = ControlServerLimits::default();
     if let Ok(n) = std::env::var("GROKPTAH_CONTROL_MAX_CONCURRENT") {

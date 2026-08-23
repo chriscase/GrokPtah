@@ -21,8 +21,8 @@ mod workload;
 
 pub use authority::{
     required_operation, role_ceiling, validate_tool_registry, AuthorityCapabilityDocument,
-    AuthorityOperation, AuthorityRole, AuthorityStamp, AUTHORITY_CAPABILITY_SCHEMA,
-    AUTHORITY_SCHEMA_VERSION,
+    AuthorityOperation, AuthorityRole, AuthorityStamp, RuntimeHostKind,
+    AUTHORITY_CAPABILITY_SCHEMA, AUTHORITY_SCHEMA_VERSION,
 };
 pub use authz::{
     canonical_workspace, constant_time_eq, AuthContext, AuthCredential, ComputerReadGrant,

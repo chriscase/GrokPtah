@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::authority::{
     AuthorityCapabilityDocument, AuthorityOperation, AuthorityRole, AuthorityStamp,
-    EffectiveAuthority,
+    EffectiveAuthority, HostCapabilityProfile,
 };
 use super::types::{OrchError, OrchErrorCode};
 
@@ -177,6 +177,14 @@ impl AuthContext {
 
     pub fn capability_document(&self) -> &AuthorityCapabilityDocument {
         &self.authority.capability_document
+    }
+
+    pub(crate) fn with_host_profile(
+        mut self,
+        profile: &HostCapabilityProfile,
+    ) -> Result<Self, OrchError> {
+        self.authority = self.authority.with_host_profile(profile)?;
+        Ok(self)
     }
 
     pub fn role(&self) -> AuthorityRole {

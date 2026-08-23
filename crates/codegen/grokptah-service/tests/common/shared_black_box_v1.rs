@@ -29,7 +29,7 @@ use std::time::Duration;
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_server, AgentHost,
     AgentHostHandle, ControlServerHandle, HostConfig, McpControlClient, McpRemoteError,
-    OrchestrationConfig, OrchestrationService, RuntimeHome, WorkspaceAllowlist,
+    OrchestrationConfig, OrchestrationService, RuntimeHome, RuntimeHostKind, WorkspaceAllowlist,
 };
 use grokptah_service::{start_service, ServiceConfig, ServiceHandle};
 use grokptah_test_gateway::{MockGateway, RecordedRequest, Response, Step};
@@ -38,6 +38,21 @@ use tempfile::TempDir;
 
 const FIXTURE_SCHEMA: &str = "grokptah.shared-black-box-fixture.v1";
 const RESULT_SCHEMA: &str = "grokptah.shared-black-box-result.v1";
+const EXPECTED_COMMON_HOST_CAPABILITIES: &[&str] = &[
+    "durable_runs",
+    "durable_sessions",
+    "durable_work",
+    "event_replay",
+    "native_execution",
+    "persistent_agents",
+    "routines",
+];
+const EXPECTED_DESKTOP_LOCAL_HOST_CAPABILITIES: &[&str] = &[
+    "desktop_keychain",
+    "desktop_local_approval",
+    "desktop_pty",
+    "semantic_computer_use_foreground",
+];
 const SCENARIO_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/shared-black-box/v1/scenario.json"
@@ -161,6 +176,7 @@ struct Launched {
     mcp: McpControlClient,
     inner: EndpointInner,
     addr: String,
+    initialization: Option<Value>,
 }
 
 struct Scenario {
@@ -605,7 +621,7 @@ async fn start_endpoint(
             let store = host
                 .ensure_orchestration_store()
                 .expect("desktop orchestration store");
-            let orch = OrchestrationService::new(
+            let orch = OrchestrationService::new_for_host(
                 host.clone(),
                 host.event_bus(),
                 store,
@@ -615,6 +631,7 @@ async fn start_endpoint(
                     max_concurrent_runs: 4,
                     bounds: Default::default(),
                 },
+                RuntimeHostKind::DesktopLocal,
             );
             let server = start_control_server(orch, 0)
                 .await
@@ -625,6 +642,7 @@ async fn start_endpoint(
                 mcp,
                 inner: EndpointInner::Desktop { server, host },
                 addr,
+                initialization: None,
             }
         }
         EndpointKind::Hosted => {
@@ -646,6 +664,7 @@ async fn start_endpoint(
                 mcp,
                 inner: EndpointInner::Hosted { handle },
                 addr,
+                initialization: None,
             }
         }
     }
@@ -680,11 +699,138 @@ async fn restart_endpoint(
 
 async fn initialize_mcp(launched: &mut Launched) {
     yield_budget(16).await;
-    launched
+    let initialization = launched
         .mcp
         .initialize()
         .await
         .unwrap_or_else(|error| panic!("initialize {}: {error}", launched.addr));
+    launched.initialization = Some(initialization);
+}
+
+fn authority_capability_document(initialization: &Value) -> Value {
+    initialization["_meta"]["grokptah/authorityCapabilities"].clone()
+}
+
+fn host_capability_contract(
+    kind: EndpointKind,
+    document: &Value,
+    defects: &mut Vec<String>,
+) -> Value {
+    let expected_kind = match kind {
+        EndpointKind::Desktop => "desktop_local",
+        EndpointKind::Hosted => "standalone_service",
+    };
+    let mut expected_capabilities = EXPECTED_COMMON_HOST_CAPABILITIES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    if matches!(kind, EndpointKind::Desktop) {
+        expected_capabilities.extend(
+            EXPECTED_DESKTOP_LOCAL_HOST_CAPABILITIES
+                .iter()
+                .map(|value| (*value).to_string()),
+        );
+    }
+    expected_capabilities.sort();
+
+    let actual_capabilities = document["hostCapabilities"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let expected_hard_denials = vec![
+        "approval".to_string(),
+        "promotion".to_string(),
+        "computer_use".to_string(),
+    ];
+    let actual_hard_denials = document["hardDenials"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for (label, actual, expected) in [
+        (
+            "schema",
+            document["schema"].clone(),
+            json!("grokptah.authority-capabilities.v1"),
+        ),
+        ("schemaVersion", document["schemaVersion"].clone(), json!(1)),
+        (
+            "assertedBy.hostKind",
+            document["assertedBy"]["hostKind"].clone(),
+            json!(expected_kind),
+        ),
+        (
+            "principal.role",
+            document["principal"]["role"].clone(),
+            json!("remote_coordinator"),
+        ),
+        (
+            "hostCapabilities",
+            json!(actual_capabilities),
+            json!(expected_capabilities),
+        ),
+        (
+            "hardDenials",
+            json!(actual_hard_denials),
+            json!(expected_hard_denials),
+        ),
+    ] {
+        if actual != expected {
+            defects.push(format!(
+                "{}.hostCapability.{label}: actual={actual} expected={expected}",
+                kind.as_str()
+            ));
+        }
+    }
+
+    for (label, value) in [
+        ("documentHash", document["documentHash"].as_str()),
+        (
+            "assertedBy.hostInstanceId",
+            document["assertedBy"]["hostInstanceId"].as_str(),
+        ),
+    ] {
+        if !value.is_some_and(|value| {
+            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            defects.push(format!(
+                "{}.hostCapability.{label}: expected an opaque 64-hex identifier",
+                kind.as_str()
+            ));
+        }
+    }
+    if document["assertedBy"]["hostVersion"]
+        .as_str()
+        .is_none_or(str::is_empty)
+    {
+        defects.push(format!(
+            "{}.hostCapability.assertedBy.hostVersion: missing",
+            kind.as_str()
+        ));
+    }
+
+    json!({
+        "schema": "grokptah.authority-capabilities.v1",
+        "schemaVersion": 1,
+        "attemptTimeCapture": true,
+        "authorityRole": "remote_coordinator",
+        "hostKinds": ["desktop_local", "standalone_service"],
+        "commonCapabilities": EXPECTED_COMMON_HOST_CAPABILITIES,
+        "desktopLocalCapabilities": EXPECTED_DESKTOP_LOCAL_HOST_CAPABILITIES,
+        "remoteHardDenials": ["approval", "promotion", "computer_use"]
+    })
 }
 
 type ScanFn<'a> = dyn FnMut(&Value, &str) + 'a;
@@ -701,6 +847,15 @@ async fn drive_six_phases(
     scan: &mut ScanFn<'_>,
 ) -> (Value, Launched, Vec<String>) {
     let workspace_text = workspace.display().to_string();
+    let mut defects: Vec<String> = Vec::new();
+    let initial_capability = authority_capability_document(
+        launched
+            .initialization
+            .as_ref()
+            .expect("initial MCP capability document"),
+    );
+    scan(&initial_capability, "initialize.authorityCapabilities");
+    let mut host_contract = host_capability_contract(kind, &initial_capability, &mut defects);
 
     // Phase 1: discovery / readiness through tools/list and optional readiness.
     let tools = launched.mcp.list_tools().await.expect("tools/list");
@@ -717,6 +872,39 @@ async fn drive_six_phases(
         .map(|name| json!(name))
         .collect::<Vec<_>>());
     scan(&tools_value, "tools/list");
+    let mut capability_tools = initial_capability["tools"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    capability_tools.sort();
+    if capability_tools != advertised {
+        defects.push(format!(
+            "{}.hostCapability.tools: initialize document does not match tools/list",
+            kind.as_str()
+        ));
+    }
+    let missing_capability_denial = call_scanned(
+        &mut launched.mcp,
+        "ptah_start_computer_run",
+        json!({}),
+        scan,
+    )
+    .await
+    .expect_err("undeclared Computer mutation must fail closed");
+    if missing_capability_denial != "forbidden_scope" {
+        defects.push(format!(
+            "{}.hostCapability.missingCapabilityDenial: actual={} expected=forbidden_scope",
+            kind.as_str(),
+            missing_capability_denial
+        ));
+    }
+    host_contract["missingCapabilityDenial"] = json!(missing_capability_denial);
 
     let capacity0 = call_ok(&mut launched.mcp, "ptah_get_capacity", json!({}), scan).await;
     let readiness_supported = advertised
@@ -1140,6 +1328,22 @@ async fn drive_six_phases(
     let stall_held_after_accept = restart_http_before == 1;
 
     launched = restart_endpoint(kind, launched, home, workspace, token).await;
+    let restarted_capability = authority_capability_document(
+        launched
+            .initialization
+            .as_ref()
+            .expect("restarted MCP capability document"),
+    );
+    scan(
+        &restarted_capability,
+        "restart.initialize.authorityCapabilities",
+    );
+    if restarted_capability != initial_capability {
+        defects.push(format!(
+            "{}.hostCapability: attempt-time document changed across owned restart",
+            kind.as_str()
+        ));
+    }
     for _ in 0..8 {
         tokio::time::advance(Duration::from_millis(scenario.native_ms())).await;
         yield_budget(scenario.yields() as usize).await;
@@ -1184,7 +1388,6 @@ async fn drive_six_phases(
         &gateway_base,
         &gateway_authority,
     );
-    let mut defects: Vec<String> = Vec::new();
     if serde_json::to_string(&post1_norm).unwrap() != serde_json::to_string(&post2_norm).unwrap() {
         defects.push(format!(
             "{} post-restart observations did not converge after stripping declared transport-volatile fields",
@@ -1415,6 +1618,7 @@ async fn drive_six_phases(
         "version": "v1",
         "advertisedTools": advertised,
         "features": {
+            "hostCapabilityContract": host_contract,
             "nativeCodingReadiness": if readiness_supported {
                 json!({ "support": "present" })
             } else {
@@ -3081,6 +3285,41 @@ fn committed_preload_is_armed() {
         PRELOAD_IMMUTABLE_GOLDEN,
         "committed fixture must fail closed on missing/pending goldens before launch"
     );
+}
+
+#[test]
+fn host_capability_oracle_rejects_kind_and_capability_drift() {
+    let mut desktop_capabilities = EXPECTED_COMMON_HOST_CAPABILITIES
+        .iter()
+        .chain(EXPECTED_DESKTOP_LOCAL_HOST_CAPABILITIES.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    desktop_capabilities.sort();
+    let document = json!({
+        "schema": "grokptah.authority-capabilities.v1",
+        "schemaVersion": 1,
+        "documentHash": "a".repeat(64),
+        "assertedBy": {
+            "hostInstanceId": "b".repeat(64),
+            "hostKind": "desktop_local",
+            "hostVersion": "0.1.0"
+        },
+        "principal": { "role": "remote_coordinator" },
+        "hostCapabilities": desktop_capabilities,
+        "hardDenials": ["approval", "promotion", "computer_use"]
+    });
+    let mut defects = Vec::new();
+    host_capability_contract(EndpointKind::Desktop, &document, &mut defects);
+    assert!(defects.is_empty(), "{defects:?}");
+
+    let mut drifted = document;
+    drifted["assertedBy"]["hostKind"] = json!("standalone_service");
+    drifted["hostCapabilities"] = json!(EXPECTED_COMMON_HOST_CAPABILITIES);
+    let mut defects = Vec::new();
+    host_capability_contract(EndpointKind::Desktop, &drifted, &mut defects);
+    let joined = defects.join("\n");
+    assert!(joined.contains("assertedBy.hostKind"), "{joined}");
+    assert!(joined.contains("hostCapabilities"), "{joined}");
 }
 
 #[test]

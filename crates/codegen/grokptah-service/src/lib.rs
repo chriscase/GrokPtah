@@ -16,7 +16,7 @@ use grokptah_agent_bridge::orchestration::AuthorityRole;
 use grokptah_agent_bridge::{
     start_control_server_with_bind, AgentHost, AgentHostHandle, AuthCredential,
     ControlServerHandle, ControlServerLimits, HostConfig, OrchStore, OrchestrationConfig,
-    OrchestrationService, RuntimeHome, WorkspaceAllowlist,
+    OrchestrationService, RuntimeHome, RuntimeHostKind, WorkspaceAllowlist,
 };
 
 pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -384,7 +384,7 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
     let store: OrchStore = host
         .ensure_orchestration_store()
         .context("open durable orchestration store")?;
-    let orch = OrchestrationService::new(
+    let orch = OrchestrationService::new_for_host(
         host.clone(),
         host.event_bus(),
         store,
@@ -394,6 +394,7 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
             max_concurrent_runs: config.max_concurrent,
             bounds: Default::default(),
         },
+        RuntimeHostKind::StandaloneService,
     );
     orch.set_auth_credentials(config.client_credentials.clone())
         .map_err(|error| anyhow::anyhow!(error.message))?;
