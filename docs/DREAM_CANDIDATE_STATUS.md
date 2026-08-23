@@ -26,6 +26,11 @@ complete or that the product has reached 100%.
 - Computer Use observation now re-checks the durable conflict-domain poison
   fence even for an already-granted Agent, so an uncertain sibling dispatch
   cannot be bypassed by a stale grant.
+- A local operator can now reconcile an uncertain physical dispatch only when
+  the exact lease, surface, and incarnation match. The durable dispatch stays
+  `Uncertain`, the lease is quarantined rather than falsely marked successful,
+  the mutation is replay-safe, and the conflict domain is released only after
+  that explicit operator confirmation.
 - Shared desktop/hosted black-box parity is present as a fail-closed fixture.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
@@ -35,8 +40,11 @@ complete or that the product has reached 100%.
 
 - Coordinator store suite: 12 passed, 0 failed.
 - Orchestration library suite: 121 selected tests passed, 0 failed.
-- Computer Use uncertain-domain regression: passed; bridge Clippy with `-D
-  warnings`: passed after the observation-fence change.
+- Computer Use library suite: 130 passed, 0 failed, including the uncertain
+  dispatch/operator-reconciliation regression; bridge Clippy with `-D
+  warnings`: passed after the observation-fence and reconciliation changes.
+- Desktop Tauri `cargo check --locked` passed with the cockpit reconciliation
+  command/API wired through the host-authorized path.
 - `memory::tests`: 34 passed, 0 failed.
 - Host memory-scope suite: 6 passed, including versioned replay and payload
   conflict rejection.
@@ -49,6 +57,9 @@ complete or that the product has reached 100%.
 - The review-benchmark contract keeps its fail-closed live behavior; the
   fake-loopback quality path is also host-only in this sandbox because its
   provider must bind `127.0.0.1`.
+- The candidate's 10-minute Always-On soak was attempted and stopped before
+  execution because the sandbox denied the fake provider's loopback bind
+  (`Operation not permitted`); no soak evidence is claimed.
 
 ## Still required before a 100% claim
 
@@ -57,7 +68,8 @@ complete or that the product has reached 100%.
 2. Complete the independent long-running worker outcome: multi-worker crash/
    restart recovery, no duplicate execution, least-privilege production-shaped
    credentials, retained evidence, and the operational soak.
-3. Complete live Grok Build quota/exhaustion evidence, isolated visual
-   Computer Use hardware proof, packaged UI acceptance plus recurring expert
+3. Surface the reconciliation workflow in the packaged cockpit with accessible
+   operator affordances, then complete live Grok Build quota/exhaustion
+   evidence, isolated visual Computer Use hardware proof, recurring expert UI
    reviews, a 72-hour operational soak, and the enterprise-gateway
    long-running review lane.

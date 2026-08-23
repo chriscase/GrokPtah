@@ -1054,6 +1054,29 @@ pub async fn computer_use_cockpit_take_over(
 }
 
 #[tauri::command]
+pub fn computer_use_cockpit_reconcile_uncertain_surface(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    lease_id: String,
+    expected_revision: u64,
+    surface_id: String,
+    incarnation: String,
+    note: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    let owner = computer_owner(&state, &session_id)?;
+    state.computer_use.reconcile_uncertain_surface_lease(
+        owner,
+        &run_id,
+        &lease_id,
+        expected_revision,
+        &surface_id,
+        &incarnation,
+        &note,
+    )
+}
+
+#[tauri::command]
 pub async fn computer_use_cockpit_stop(
     state: State<'_, AppState>,
     session_id: String,

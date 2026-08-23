@@ -285,7 +285,10 @@ impl ComputerSurfaceLease {
                 | ComputerSurfaceLeaseState::Cancelled
                 | ComputerSurfaceLeaseState::Quarantined,
                 Some(ComputerDispatchRecord {
-                    state: ComputerDispatchState::KnownNotInjected | ComputerDispatchState::Failed,
+                    state:
+                        ComputerDispatchState::KnownNotInjected
+                        | ComputerDispatchState::Failed
+                        | ComputerDispatchState::Uncertain,
                     ..
                 }),
             ) if self.frame_epoch.is_some() => {}
@@ -406,6 +409,9 @@ impl ComputerSurfaceLease {
             ) | (
                 ComputerSurfaceLeaseState::Dispatching,
                 ComputerSurfaceLeaseState::Uncertain
+            ) | (
+                ComputerSurfaceLeaseState::Uncertain,
+                ComputerSurfaceLeaseState::Quarantined
             )
         );
         if !legal {

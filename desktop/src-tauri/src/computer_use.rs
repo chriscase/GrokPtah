@@ -715,6 +715,32 @@ impl DesktopComputerUse {
         self.cockpit_snapshot(owner_session_id)
     }
 
+    pub fn reconcile_uncertain_surface_lease(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        lease_id: &str,
+        expected_revision: u64,
+        surface_id: &str,
+        incarnation: &str,
+        note: &str,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        self.clear_pending_for_owner(owner_session_id)?;
+        let (service, _) = self.owned_service(owner_session_id, run_id)?;
+        service
+            .reconcile_uncertain_surface_lease(
+                &Uuid::new_v4().to_string(),
+                &self.operator_token(owner_session_id)?,
+                lease_id,
+                expected_revision,
+                surface_id,
+                incarnation,
+                note,
+            )
+            .map_err(|error| error.to_string())?;
+        self.cockpit_snapshot(owner_session_id)
+    }
+
     pub async fn stop_simulator(
         &self,
         owner_session_id: Uuid,

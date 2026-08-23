@@ -1206,6 +1206,74 @@ impl ComputerUseService {
         result
     }
 
+    /// Explicitly quarantine an uncertain physical dispatch after the local
+    /// operator has verified the exact surface incarnation is clear. The
+    /// durable dispatch remains uncertain and is never replayed; this only
+    /// releases the conflict-domain poison fence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconcile_uncertain_surface_lease(
+        &self,
+        request_id: &str,
+        caller: &ComputerAuthorityToken,
+        lease_id: &str,
+        expected_revision: u64,
+        surface_id: &str,
+        incarnation: &str,
+        note: &str,
+    ) -> ComputerResult<serde_json::Value> {
+        validate_id("lease_id", lease_id)?;
+        validate_id("surface_id", surface_id)?;
+        validate_id("incarnation", incarnation)?;
+        let lease = self.store.load_surface_lease(lease_id)?.ok_or_else(|| {
+            ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown lease")
+        })?;
+        let run = self
+            .store
+            .load_run(&lease.run_id)?
+            .ok_or_else(unknown_run)?;
+        let payload = json!({
+            "leaseId": lease_id,
+            "expectedRevision": expected_revision,
+            "surfaceId": surface_id,
+            "incarnation": incarnation,
+            "note": note,
+        });
+        if let Some(replayed) = self.begin_mutation(
+            request_id,
+            "reconcile_uncertain_surface_lease",
+            &payload,
+            caller,
+            Some(&run),
+        )? {
+            return replayed;
+        }
+        let result = self
+            .store
+            .reconcile_uncertain_surface_lease(
+                lease_id,
+                expected_revision,
+                surface_id,
+                incarnation,
+                note,
+                Utc::now(),
+            )
+            .and_then(|lease| {
+                serde_json::to_value(lease).map_err(|error| {
+                    ComputerError::new(ComputerErrorCode::Internal, error.to_string())
+                })
+            });
+        if let Err(error) = &result {
+            self.record_denial(
+                &lease.run_id,
+                "reconcile_uncertain_surface_lease",
+                None,
+                error,
+            );
+        }
+        self.finish_mutation(request_id, &result)?;
+        result
+    }
+
     pub async fn cancel(
         &self,
         request_id: &str,
@@ -1558,6 +1626,18 @@ impl ComputerUseService {
                         "create_agent_run requires a host-issued durable Agent principal",
                     )
                 }),
+            "reconcile_uncertain_surface_lease" => {
+                let run = run.ok_or_else(unknown_run)?;
+                if caller.principal().public_kind() != "local_operator_session"
+                    || caller.principal().session_id() != Some(run.owner_session_id)
+                {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::Unauthorized,
+                        "surface reconciliation requires the owning local operator",
+                    ));
+                }
+                Ok(())
+            }
             "take_over" => {
                 let run = run.ok_or_else(unknown_run)?;
                 if caller.principal().session_id() != Some(run.owner_session_id) {
@@ -2530,6 +2610,93 @@ mod tests {
             .unwrap();
         assert!(store.list_surface_leases().unwrap().iter().any(|lease| {
             lease.run_id == run_c.run_id && lease.state == ComputerSurfaceLeaseState::Granted
+        }));
+    }
+
+    #[tokio::test]
+    async fn local_operator_reconciliation_quarantines_without_claiming_outcome() {
+        let dir = tempdir().unwrap();
+        let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
+        let service =
+            ComputerUseService::new_simulator(Arc::new(SimulatorBackend::new()), store.clone());
+        let (run, token) = create_authorized_agent_run(&service, "reconcile");
+        observe_agent_run(&service, &run, &token, "reconcile")
+            .await
+            .unwrap();
+        let payload_sha256 = crate::orchestration::hash_payload(&json!({
+            "action": "reconcile"
+        }));
+        let prepared = match store
+            .acquire_agent_surface_dispatch(
+                &run.run_id,
+                "reconcile-dispatch",
+                &payload_sha256,
+                Utc::now(),
+            )
+            .unwrap()
+        {
+            ComputerDispatchClaim::Perform(lease) => lease,
+            other => panic!("expected Perform, got {other:?}"),
+        };
+        let dispatch_key = dispatch_id(&prepared).unwrap().to_string();
+        let injected = store
+            .mark_surface_dispatch_injected(
+                &prepared.lease_id,
+                prepared.revision,
+                &dispatch_key,
+                Utc::now(),
+            )
+            .unwrap();
+        let uncertain = store
+            .fail_surface_dispatch(
+                &injected.lease_id,
+                &dispatch_key,
+                ComputerErrorCode::Internal,
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(uncertain.state, ComputerSurfaceLeaseState::Uncertain);
+
+        let operator = caller(&run, &service);
+        service
+            .reconcile_uncertain_surface_lease(
+                "reconcile-uncertain-1",
+                &operator,
+                &uncertain.lease_id,
+                uncertain.revision,
+                &uncertain.surface.surface_id,
+                &uncertain.surface.incarnation,
+                "operator verified the exact surface is clear",
+            )
+            .unwrap();
+        let reconciled = store
+            .load_surface_lease(&uncertain.lease_id)
+            .unwrap()
+            .expect("reconciled lease");
+        assert_eq!(reconciled.state, ComputerSurfaceLeaseState::Quarantined);
+        assert_eq!(
+            reconciled.dispatch.as_ref().map(|dispatch| dispatch.state),
+            Some(ComputerDispatchState::Uncertain)
+        );
+
+        service
+            .reconcile_uncertain_surface_lease(
+                "reconcile-uncertain-1",
+                &operator,
+                &uncertain.lease_id,
+                uncertain.revision,
+                &uncertain.surface.surface_id,
+                &uncertain.surface.incarnation,
+                "operator verified the exact surface is clear",
+            )
+            .unwrap();
+
+        let (next_run, next_token) = create_authorized_agent_run(&service, "reconcile-next");
+        observe_agent_run(&service, &next_run, &next_token, "reconcile-next")
+            .await
+            .unwrap();
+        assert!(store.list_surface_leases().unwrap().iter().any(|lease| {
+            lease.run_id == next_run.run_id && lease.state == ComputerSurfaceLeaseState::Granted
         }));
     }
 

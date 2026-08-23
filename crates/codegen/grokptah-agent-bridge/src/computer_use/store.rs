@@ -1045,7 +1045,6 @@ impl ComputerStore {
         Ok(lease)
     }
 
-    #[cfg(test)]
     pub(crate) fn load_surface_lease(
         &self,
         lease_id: &str,
@@ -1149,6 +1148,63 @@ impl ComputerStore {
             ));
         }
         lease.transition(ComputerSurfaceLeaseState::Revoked, now, Some(disposition))?;
+        self.write_surface_lease_unlocked(&lease)?;
+        Ok(lease)
+    }
+
+    /// Quarantine an uncertain physical dispatch after an explicit local
+    /// operator reconciliation. The dispatch remains `Uncertain` in durable
+    /// history; only the lease is released from the conflict-domain poison
+    /// fence. A concurrent active lease keeps the domain blocked.
+    pub(crate) fn reconcile_uncertain_surface_lease(
+        &self,
+        lease_id: &str,
+        expected_revision: u64,
+        surface_id: &str,
+        incarnation: &str,
+        note: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ComputerSurfaceLease> {
+        validate_id("lease_id", lease_id)?;
+        validate_id("surface_id", surface_id)?;
+        validate_id("incarnation", incarnation)?;
+        if note.is_empty() || note.len() > 128 || note.contains('\0') {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "reconciliation note is empty or exceeds its bound",
+            ));
+        }
+        let _guard = self.inner.lock.lock();
+        let mut lease = self.load_surface_lease_unlocked(lease_id)?.ok_or_else(|| {
+            ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown lease")
+        })?;
+        if lease.revision != expected_revision
+            || lease.state != ComputerSurfaceLeaseState::Uncertain
+            || lease.dispatch.as_ref().map(|dispatch| dispatch.state)
+                != Some(ComputerDispatchState::Uncertain)
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "surface lease is not the expected uncertain dispatch",
+            ));
+        }
+        if lease.surface.surface_id != surface_id || lease.surface.incarnation != incarnation {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "surface reconciliation does not match the host-attested surface",
+            ));
+        }
+        if self.list_surface_leases_unlocked()?.iter().any(|other| {
+            other.lease_id != lease_id
+                && other.conflict_domain_id == lease.conflict_domain_id
+                && other.state.owns_domain_capacity()
+        }) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Pending,
+                "surface conflict domain still has an active lease",
+            ));
+        }
+        lease.transition(ComputerSurfaceLeaseState::Quarantined, now, Some(note))?;
         self.write_surface_lease_unlocked(&lease)?;
         Ok(lease)
     }

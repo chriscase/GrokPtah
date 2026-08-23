@@ -123,6 +123,7 @@ pub fn run() {
             commands::computer_use_cockpit_discard_approval,
             commands::computer_use_cockpit_pause,
             commands::computer_use_cockpit_take_over,
+            commands::computer_use_cockpit_reconcile_uncertain_surface,
             commands::computer_use_cockpit_stop,
             commands::set_project_cwd,
             commands::pick_project_folder,

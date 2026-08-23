@@ -449,6 +449,27 @@ export const api = {
       runId,
       expectedVersion,
     }),
+  computerUseCockpitReconcileUncertainSurface: (
+    sessionId: string,
+    runId: string,
+    leaseId: string,
+    expectedRevision: number,
+    surfaceId: string,
+    incarnation: string,
+    note: string,
+  ) =>
+    invoke<ComputerCockpitSnapshot>(
+      "computer_use_cockpit_reconcile_uncertain_surface",
+      {
+        sessionId,
+        runId,
+        leaseId,
+        expectedRevision,
+        surfaceId,
+        incarnation,
+        note,
+      },
+    ),
   computerUseCockpitStop: (sessionId: string, runId: string) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_stop", {
       sessionId,
