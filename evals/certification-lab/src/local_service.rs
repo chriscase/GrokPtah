@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::provider_observation::ProviderObservationSession;
 use grokptah_agent_bridge::{
-    home_override_serial, start_control_server_with, AgentHost, AgentHostHandle,
+    home_override_serial, start_control_server_with, AgentHost, AgentHostHandle, AuthCredential,
     ControlServerHandle, ControlServerLimits, HostConfig, McpControlClient, OrchestrationConfig,
     OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist,
 };
@@ -273,6 +273,12 @@ async fn bootstrap(
             bounds,
         },
     );
+    // The owned certification lane intentionally exercises protected
+    // orchestration controls. Make that authority explicit instead of relying
+    // on the product's safe coordinator default for ordinary bearer tokens.
+    orchestration
+        .set_auth_credentials(vec![AuthCredential::operator("certification-lab", token)?])
+        .context("install isolated certification operator credential")?;
     let limits = ControlServerLimits {
         max_concurrent: config.max_concurrent,
         ..ControlServerLimits::default()
