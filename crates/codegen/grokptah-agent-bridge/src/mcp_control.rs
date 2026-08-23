@@ -32,11 +32,12 @@ use uuid::Uuid;
 
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    AuthContext, ChangeRecord, ManagerStepSpec, MessageKind, MissedRunPolicy, OrchError,
-    OrchErrorCode, OrchestrationConfig, OrchestrationService, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef,
-    WorkDependency, WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist,
-    CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    scrub_route_secret_needles, AuthContext, ChangeRecord, ManagerStepSpec, MessageKind,
+    MissedRunPolicy, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
+    ProviderRouteSnapshot, RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRetryPolicy,
+    RoutineTrigger, RunExecutionMode, WorkArtifactRef, WorkDependency, WorkPolicy, WorkResult,
+    WorkTemplate, WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -128,6 +129,7 @@ struct LiveStreamState {
     run_id: String,
     start_seq: u64,
     end_seq: Option<u64>,
+    provider_route: Option<ProviderRouteSnapshot>,
     receiver: EventReceiver,
     last_seq: u64,
     replay_cursor: Option<u64>,
@@ -151,7 +153,7 @@ impl LiveStreamState {
         }
     }
 
-    fn queue_entry(&mut self, seq: u64, ts: String, update: SessionUpdate) {
+    fn queue_entry(&mut self, seq: u64, ts: String, mut update: SessionUpdate) {
         if seq <= self.last_seq || seq < self.start_seq {
             return;
         }
@@ -159,6 +161,15 @@ impl LiveStreamState {
             if seq > end_seq {
                 self.done = true;
                 return;
+            }
+        }
+        match scrub_route_secret_needles(&mut update, self.provider_route.as_ref()) {
+            Ok(_) => {}
+            Err(_) => {
+                update = SessionUpdate::Error {
+                    session_id: self.session_id,
+                    message: PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS.to_string(),
+                };
             }
         }
         let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
@@ -725,6 +736,7 @@ async fn streamable_get_handler(
         run_id: scope.run_id,
         start_seq: scope.start_seq,
         end_seq: scope.end_seq,
+        provider_route: scope.provider_route,
         receiver,
         last_seq,
         replay_cursor: None,

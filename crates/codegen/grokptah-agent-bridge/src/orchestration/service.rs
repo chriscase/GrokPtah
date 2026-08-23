@@ -158,6 +158,7 @@ pub(crate) struct LiveRunScope {
     pub run_id: String,
     pub start_seq: u64,
     pub end_seq: Option<u64>,
+    pub provider_route: Option<ProviderRouteSnapshot>,
 }
 
 impl Drop for OrchestrationService {
@@ -5331,8 +5332,9 @@ impl OrchestrationService {
             run_id: run.run_id.clone(),
             start_seq,
             end_seq: run.end_seq,
+            provider_route: run.provider_route.clone(),
         };
-        let page = self.events_page_for_run(run, after_seq, limit)?;
+        let (page, _) = self.events_page_for_run(run, after_seq, limit)?;
         Ok((scope, page))
     }
 
@@ -5487,8 +5489,16 @@ impl OrchestrationService {
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
-        serde_json::to_value(self.events_page_for_run(run, after_seq, limit)?)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
+        let projected = super::project_public_run(&self.store, &run)?;
+        let (page, redacted) = self.events_page_for_run(run, after_seq, limit)?;
+        let mut payload = serde_json::to_value(page)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        if redacted
+            || projected.error_code.as_deref() == Some(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)
+        {
+            payload["errorCode"] = json!(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS);
+        }
+        Ok(payload)
     }
 
     fn events_page_for_run(
@@ -5496,7 +5506,7 @@ impl OrchestrationService {
         run: RunRecord,
         after_seq: u64,
         limit: usize,
-    ) -> Result<JournalPage, OrchError> {
+    ) -> Result<(JournalPage, bool), OrchError> {
         // Read the bounded run range before applying the caller's page limit.
         // Applying `limit` to the global journal first can return a page made
         // entirely of other sessions and advance the cursor past this run's
@@ -5517,11 +5527,13 @@ impl OrchestrationService {
         });
         entries.truncate(limit.clamp(1, 500));
         let next_cursor = entries.last().map(|e| e.seq);
-        Ok(JournalPage {
+        let mut page = JournalPage {
             entries,
             next_cursor,
             cursor_expired: false,
-        })
+        };
+        let redacted = super::scrub_route_secret_needles(&mut page, run.provider_route.as_ref())?;
+        Ok((page, redacted))
     }
 
     pub fn get_changes(

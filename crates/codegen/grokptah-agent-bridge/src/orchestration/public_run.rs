@@ -7,6 +7,7 @@
 //! appear on the wire.
 
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -1016,6 +1017,23 @@ pub(crate) fn scrub_public_json(
     value: &mut Value,
     route: Option<&ProviderRouteSnapshot>,
 ) -> Result<bool, OrchError> {
+    let redacted = scrub_public_json_needles(value, route)?;
+    if contains_forbidden_key(value) {
+        return Err(OrchError::new(
+            OrchErrorCode::Internal,
+            "public run projection refused to serialize privileged diagnostics",
+        ));
+    }
+    Ok(redacted)
+}
+
+/// Redact this Run's route-secret needles from journal JSON. Does not treat
+/// unrelated key names (`token`, `secret`, …) as forbidden: `SessionUpdate`
+/// tool input can use those names legitimately. Leftover needle values fail closed.
+pub(crate) fn scrub_public_json_needles(
+    value: &mut Value,
+    route: Option<&ProviderRouteSnapshot>,
+) -> Result<bool, OrchError> {
     let needles = route_secret_needles(route);
     let redacted = if needles.is_empty() {
         false
@@ -1023,12 +1041,28 @@ pub(crate) fn scrub_public_json(
         scrub_value_strings(value, &needles)
     };
     let needle_refs: Vec<&str> = needles.iter().map(String::as_str).collect();
-    if contains_forbidden_key(value) || contains_forbidden_value(value, &needle_refs) {
+    if contains_forbidden_value(value, &needle_refs) {
         return Err(OrchError::new(
             OrchErrorCode::Internal,
             "public run projection refused to serialize privileged diagnostics",
         ));
     }
+    Ok(redacted)
+}
+
+/// Round-trip a public journal payload through needle scrubbing.
+pub(crate) fn scrub_route_secret_needles<T: Serialize + DeserializeOwned>(
+    value: &mut T,
+    route: Option<&ProviderRouteSnapshot>,
+) -> Result<bool, OrchError> {
+    if route_secret_needles(route).is_empty() {
+        return Ok(false);
+    }
+    let mut encoded = serde_json::to_value(&*value)
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+    let redacted = scrub_public_json_needles(&mut encoded, route)?;
+    *value = serde_json::from_value(encoded)
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
     Ok(redacted)
 }
 
@@ -1575,6 +1609,70 @@ mod tests {
         assert!(scrub_public_json(&mut tests, Some(&route)).unwrap());
         assert_eq!(tests["results"][0]["command"], "");
         assert!(!tests.to_string().contains(BASE_URL_SENTINEL));
+    }
+
+    #[test]
+    fn scrub_route_secret_needles_redacts_journal_event_strings() {
+        use crate::event_bus::{JournalEntry, JournalPage};
+        use crate::events::SessionUpdate;
+
+        let route = leaky_route();
+        let mut page = JournalPage {
+            entries: vec![JournalEntry {
+                seq: 7,
+                ts: "t".into(),
+                update: SessionUpdate::FileEdit {
+                    session_id: Uuid::nil(),
+                    path: format!("called {BASE_URL_SENTINEL}"),
+                    summary: format!("ref {CREDENTIAL_REF_SENTINEL}"),
+                    unified_diff: format!("--- {BASE_URL_SENTINEL}\n"),
+                },
+            }],
+            next_cursor: Some(7),
+            cursor_expired: false,
+        };
+        assert!(scrub_route_secret_needles(&mut page, Some(&route)).unwrap());
+        match &page.entries[0].update {
+            SessionUpdate::FileEdit {
+                path,
+                summary,
+                unified_diff,
+                ..
+            } => {
+                assert_eq!(path, "");
+                assert_eq!(summary, "");
+                assert_eq!(unified_diff, "");
+            }
+            other => panic!("expected FileEdit, got {other:?}"),
+        }
+        let encoded = serde_json::to_string(&page).unwrap();
+        assert!(!encoded.contains(BASE_URL_SENTINEL));
+        assert!(!encoded.contains(CREDENTIAL_REF_SENTINEL));
+
+        let mut tool_input = json!({
+            "entries": [{
+                "seq": 1,
+                "ts": "t",
+                "update": {
+                    "type": "tool_call",
+                    "session_id": Uuid::nil(),
+                    "call_id": "c1",
+                    "title": "tokenize",
+                    "kind": "other",
+                    "status": "completed",
+                    "input": { "token": "count", "text": "ok" }
+                }
+            }]
+        });
+        assert!(!scrub_route_secret_needles(&mut tool_input, Some(&route)).unwrap());
+        assert_eq!(
+            tool_input["entries"][0]["update"]["input"]["token"],
+            "count"
+        );
+        assert!(
+            scrub_public_json(&mut tool_input.clone(), Some(&route)).is_err(),
+            "exact PublicRun JSON still fail-closes on forbidden key names"
+        );
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub use provider_attempt::{
     ProviderAttemptRecord, ProviderAttemptState, ProviderRetryClass, ProviderSendCertainty,
     PROVIDER_ATTEMPT_SCHEMA_VERSION,
 };
+pub(crate) use public_run::scrub_route_secret_needles;
 pub use public_run::{
     encode_public_run_receipt, page_public_runs, project_public_run, project_public_run_progress,
     public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,

@@ -2701,6 +2701,161 @@ async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_a
     orch.stop_background_tasks().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn failing_provider_mcp_events_and_desktop_journal_are_scrubbed() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let store = host.ensure_orchestration_store().unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let workspace_text = workspace.path().display().to_string();
+    let route = failing_provider_route(FAILING_QUOTA);
+    let now = chrono::Utc::now();
+    host.event_bus().publish(SessionUpdate::FileEdit {
+        session_id: lane.id,
+        path: format!("called {FAILING_BASE_URL}"),
+        summary: format!("ref {FAILING_CREDENTIAL_REF}"),
+        unified_diff: format!("--- {FAILING_BASE_URL}\n"),
+    });
+    host.event_bus().publish(SessionUpdate::ShellOutput {
+        session_id: lane.id,
+        call_id: "shell-leak".into(),
+        data: format!("curl {FAILING_BASE_URL}"),
+    });
+    let journal = host.event_bus().read_after(0, 500);
+    let leaked_seqs: Vec<u64> = journal
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.update {
+            SessionUpdate::FileEdit { path, .. } if path.contains(FAILING_BASE_URL) => {
+                Some(entry.seq)
+            }
+            SessionUpdate::ShellOutput { data, .. } if data.contains(FAILING_BASE_URL) => {
+                Some(entry.seq)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(leaked_seqs.len(), 2, "durable journal must retain the leak");
+    let durable = serde_json::to_value(&journal).unwrap();
+    assert!(
+        durable.to_string().contains(FAILING_BASE_URL),
+        "internal journal is not the public surface"
+    );
+    let run = RunRecord {
+        run_id: "native-failing-events".into(),
+        session_id: lane.id,
+        workspace: workspace_text.clone(),
+        request_id: "native-failing-events-req".into(),
+        client_id: Some("mcp".into()),
+        state: RunState::Failed,
+        purpose: RunPurpose::Execution,
+        provider_route: Some(route.clone()),
+        agent_id: None,
+        retry_of: None,
+        parent_run_id: None,
+        agent_spec_revision: None,
+        checkpoint_id: None,
+        continuation_context_id: None,
+        continuation_context_hash: None,
+        continuation_fidelity: None,
+        queue_position: None,
+        bounds: RunBounds {
+            max_total_tokens: Some(8_000),
+            ..RunBounds::default()
+        },
+        prompt_preview: format!("retry {}", route.selection_key),
+        start_seq: Some(leaked_seqs[0]),
+        end_seq: Some(*leaked_seqs.last().unwrap()),
+        created_at: now,
+        updated_at: now,
+        terminal_result: Some(format!("credential {} rejected", FAILING_CREDENTIAL_REF)),
+        final_response: Some(format!("failed calling {FAILING_BASE_URL}")),
+        error_code: Some("provider_failed".into()),
+        stop_cause: None,
+        aggregates: RunAggregates::default(),
+        progress: None,
+        execution: None,
+        approval: None,
+    };
+    let reservation =
+        QuotaReservation::for_run(&run, "primary", QuotaLimits::default(), now).unwrap();
+    store
+        .admit_run_with_quota(&run, &reservation)
+        .into_result()
+        .unwrap();
+
+    let control = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let events = client
+        .call_tool(
+            "ptah_get_events",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+                "after_seq": 0,
+                "limit": 100,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!events.is_error, "{:?}", events.raw);
+    let structured = events.structured.to_string();
+    let text = mcp_text_value(&events.raw).to_string();
+    for haystack in [&structured, &text] {
+        assert!(
+            !haystack.contains(FAILING_BASE_URL),
+            "ptah_get_events leaked base_url: {haystack}"
+        );
+        assert!(
+            !haystack.contains(FAILING_CREDENTIAL_REF),
+            "ptah_get_events leaked credential ref: {haystack}"
+        );
+    }
+    assert_eq!(
+        events.structured["errorCode"],
+        json!(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)
+    );
+    assert_eq!(events.structured["entries"].as_array().unwrap().len(), 2);
+
+    let desktop = host
+        .get_session_run_events(lane.id, &run.run_id, 0, 100)
+        .unwrap();
+    let desktop_json = serde_json::to_value(&desktop).unwrap();
+    let desktop_text = desktop_json.to_string();
+    assert!(
+        !desktop_text.contains(FAILING_BASE_URL),
+        "desktop run_events leaked base_url: {desktop_text}"
+    );
+    assert!(!desktop_text.contains(FAILING_CREDENTIAL_REF));
+    assert_eq!(desktop.entries.len(), 2);
+
+    client.close_session().await.unwrap();
+    orch.stop_background_tasks().await;
+}
+
 fn init_git_workspace(workspace: &Path) {
     std::fs::write(workspace.join("README.md"), "baseline\n").unwrap();
     for args in [

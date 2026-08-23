@@ -2527,6 +2527,8 @@ impl AgentHostHandle {
                 && entry.seq >= start_seq
                 && run.end_seq.map(|end| entry.seq <= end).unwrap_or(true)
         });
+        crate::orchestration::scrub_route_secret_needles(&mut page, run.provider_route.as_ref())
+            .map_err(|error| anyhow!(error.message))?;
         Ok(page)
     }
 
