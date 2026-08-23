@@ -2467,6 +2467,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uncertain_dispatch_poison_is_exact_to_its_physical_input_domain() {
+        let dir = tempdir().unwrap();
+        let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
+        let shared =
+            ComputerUseService::new_simulator(Arc::new(SimulatorBackend::new()), store.clone());
+        let (run_a, token_a) = create_authorized_agent_run(&shared, "uncertain-domain-a");
+        let (run_b, token_b) = create_authorized_agent_run(&shared, "uncertain-domain-b");
+        observe_agent_run(&shared, &run_a, &token_a, "uncertain-domain-a")
+            .await
+            .unwrap();
+
+        let payload_sha256 = crate::orchestration::hash_payload(&json!({"action": "uncertain"}));
+        let prepared = match store
+            .acquire_agent_surface_dispatch(
+                &run_a.run_id,
+                "uncertain-domain-dispatch",
+                &payload_sha256,
+                Utc::now(),
+            )
+            .unwrap()
+        {
+            ComputerDispatchClaim::Perform(lease) => lease,
+            other => panic!("expected Perform, got {other:?}"),
+        };
+        let dispatch_key = dispatch_id(&prepared).unwrap().to_string();
+        let injected = store
+            .mark_surface_dispatch_injected(
+                &prepared.lease_id,
+                prepared.revision,
+                &dispatch_key,
+                Utc::now(),
+            )
+            .unwrap();
+        let uncertain = store
+            .fail_surface_dispatch(
+                &injected.lease_id,
+                &dispatch_key,
+                ComputerErrorCode::Internal,
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(uncertain.state, ComputerSurfaceLeaseState::Uncertain);
+
+        let blocked = observe_agent_run(&shared, &run_b, &token_b, "uncertain-domain-b")
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.code, ComputerErrorCode::UncertainOutcome);
+        assert!(store
+            .list_surface_leases()
+            .unwrap()
+            .iter()
+            .all(|lease| lease.run_id != run_b.run_id));
+
+        let isolated = ComputerUseService::new_simulator(
+            Arc::new(SimulatorBackend::independently_isolated()),
+            store.clone(),
+        );
+        let (run_c, token_c) = create_authorized_agent_run(&isolated, "uncertain-domain-c");
+        observe_agent_run(&isolated, &run_c, &token_c, "uncertain-domain-c")
+            .await
+            .unwrap();
+        assert!(store.list_surface_leases().unwrap().iter().any(|lease| {
+            lease.run_id == run_c.run_id && lease.state == ComputerSurfaceLeaseState::Granted
+        }));
+    }
+
+    #[tokio::test]
     async fn lease_expiry_fences_known_not_injected_and_uncertain_dispatches() {
         let root = tempdir().unwrap();
 
@@ -2540,14 +2607,14 @@ mod tests {
             after_injected.dispatch.as_ref().unwrap().state,
             ComputerDispatchState::Injected
         );
-        assert!(after_service
+        let reassignment_error = after_service
             .store
             .grant_next_surface_lease(
                 &after_run.surface,
                 after_injected.expires_at + Duration::milliseconds(1),
             )
-            .unwrap()
-            .is_none());
+            .unwrap_err();
+        assert_eq!(reassignment_error.code, ComputerErrorCode::UncertainOutcome);
         let after_recovered = after_service
             .store
             .load_surface_lease(&after_lease.lease_id)

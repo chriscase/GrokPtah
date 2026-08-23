@@ -133,6 +133,9 @@ remains the exact-request replay fence.
 fills the ledger, new Computer Use fails closed with `limit_reached` until an operator-facing
 reconciliation workflow exists. This prevents ordinary long-running use from exhausting the
 coordinator without converting a storage bound into permission to replay an ambiguous action.
+An unresolved `uncertain` dispatch also poisons its exact physical input conflict domain: no other
+Agent may observe or act through that domain until reconciliation. Independently attested isolated
+domains remain available, so one ambiguous isolated surface does not stop unrelated isolated work.
 
 ## Foundation (#268)
 
