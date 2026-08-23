@@ -1587,11 +1587,11 @@ impl AgentHostHandle {
         if association_changed {
             agent.updated_at = now;
         }
-        if persist_new || !created_new {
+        if persist_new {
             if association_changed || created_new {
                 store.save_agent(&agent)?;
             }
-            if persist_new && existing_id.is_none() {
+            if existing_id.is_none() {
                 self.bind_session_agent_id(session_id, &agent_id)?;
             }
         }
@@ -2419,13 +2419,10 @@ impl AgentHostHandle {
 
     /// Read desktop-visible runs for one session. Session scoping prevents a
     /// local inspector from displaying another workspace's coordinator data.
+    #[allow(dead_code)] // crate-private raw RunRecord helper; product APIs use PublicRun.
     pub(crate) fn list_session_runs(&self, session_id: Uuid) -> Result<Vec<RunRecord>> {
         let store = self.ensure_orchestration_store()?;
-        Ok(store
-            .list_runs()?
-            .into_iter()
-            .filter(|run| run.session_id == session_id)
-            .collect())
+        store.list_runs_for_session(session_id, None)
     }
 
     /// Read one run only when it belongs to the requested session.
@@ -2480,12 +2477,19 @@ impl AgentHostHandle {
         cursor: Option<&str>,
         limit: Option<usize>,
     ) -> Result<crate::orchestration::PublicRunPage> {
-        let runs = self
-            .list_session_runs(session_id)?
+        let store = self.ensure_orchestration_store()?;
+        let page = store.list_runs_for_session_page(session_id, None, cursor, limit)?;
+        let runs = page
+            .runs
             .into_iter()
             .map(|run| self.project_public_session_run(run))
             .collect::<Result<Vec<_>>>()?;
-        Ok(crate::orchestration::page_public_runs(runs, cursor, limit))
+        Ok(crate::orchestration::PublicRunPage {
+            runs,
+            total_count: page.total_count,
+            truncated: page.truncated,
+            next_cursor: page.next_cursor,
+        })
     }
 
     /// One desktop-visible Run, using the shared public projection.
@@ -2970,6 +2974,16 @@ impl AgentHostHandle {
         error
     }
 
+    fn require_durable_admission(outcome: crate::orchestration::DurableAdmission) -> Result<()> {
+        match outcome {
+            crate::orchestration::DurableAdmission::Committed => Ok(()),
+            crate::orchestration::DurableAdmission::DefinitelyNotCommitted(error) => Err(error),
+            crate::orchestration::DurableAdmission::Uncertain(error) => {
+                Err(anyhow!("durable admission is uncertain: {error}"))
+            }
+        }
+    }
+
     #[cfg(test)]
     fn fail_admission_cutpoint(
         &self,
@@ -3180,13 +3194,11 @@ impl AgentHostHandle {
             })
         {
             *self.desktop_admission_cutpoint.lock() = None;
-            store
-                .terminalize_unstarted_admission(
-                    &run_id,
-                    "admission_aborted",
-                    "injected post-persist admission fault",
-                )
-                .into_result()?;
+            Self::require_durable_admission(store.terminalize_unstarted_admission(
+                &run_id,
+                "admission_aborted",
+                "injected post-persist admission fault",
+            ))?;
             bail!("injected post-persist admission fault");
         }
         Ok((run_id, store))
@@ -7850,13 +7862,11 @@ impl AgentHostHandle {
             if let Some(agent) = agent.as_ref() {
                 if let Err(error) = self.bind_session_agent_id(session_id, &agent.agent_id) {
                     if let Some((run_id, store)) = desktop_run.as_ref() {
-                        store
-                            .terminalize_unstarted_admission(
-                                run_id,
-                                "session_bind_failed",
-                                &error.to_string(),
-                            )
-                            .into_result()?;
+                        Self::require_durable_admission(store.terminalize_unstarted_admission(
+                            run_id,
+                            "session_bind_failed",
+                            &error.to_string(),
+                        ))?;
                     }
                     return Err(error);
                 }
@@ -7875,13 +7885,11 @@ impl AgentHostHandle {
             Ok(cancel) => cancel,
             Err(error) => {
                 if let Some((run_id, store)) = desktop_run.as_ref() {
-                    store
-                        .terminalize_unstarted_admission(
-                            run_id,
-                            "session_commit_failed",
-                            &error.to_string(),
-                        )
-                        .into_result()?;
+                    Self::require_durable_admission(store.terminalize_unstarted_admission(
+                        run_id,
+                        "session_commit_failed",
+                        &error.to_string(),
+                    ))?;
                 }
                 return Err(error);
             }
@@ -7907,13 +7915,11 @@ impl AgentHostHandle {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     if let Some((run_id, store)) = desktop_run.as_ref() {
-                        store
-                            .terminalize_unstarted_admission(
-                                run_id,
-                                "worktree_prepare_failed",
-                                &error.to_string(),
-                            )
-                            .into_result()?;
+                        Self::require_durable_admission(store.terminalize_unstarted_admission(
+                            run_id,
+                            "worktree_prepare_failed",
+                            &error.to_string(),
+                        ))?;
                     }
                     return Err(error);
                 }
@@ -8005,9 +8011,11 @@ impl AgentHostHandle {
                         Err(error) => error.to_string(),
                         Ok(Some(_)) => unreachable!(),
                     };
-                    store
-                        .terminalize_unstarted_admission(run_id, "run_reload_failed", &detail)
-                        .into_result()?;
+                    Self::require_durable_admission(store.terminalize_unstarted_admission(
+                        run_id,
+                        "run_reload_failed",
+                        &detail,
+                    ))?;
                     bail!("{detail}");
                 }
             }

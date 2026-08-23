@@ -1139,6 +1139,14 @@ mod tests {
             "get_run must call project_public_run"
         );
         assert!(
+            list_runs.contains("list_runs_for_session_page"),
+            "list_runs must use the session-bounded store query"
+        );
+        assert!(
+            !list_runs.contains(".list_runs()"),
+            "list_runs must not scan the global Run directory"
+        );
+        assert!(
             list_runs.contains("project_public_run"),
             "list_runs must call project_public_run"
         );
@@ -1204,6 +1212,10 @@ mod tests {
             .split("\n    pub fn ")
             .next()
             .unwrap();
+        assert!(
+            public_list.contains("list_runs_for_session_page"),
+            "desktop list must use the session-bounded store query"
+        );
         assert!(
             public_list.contains("project_public_session_run"),
             "desktop list must project PublicRun"

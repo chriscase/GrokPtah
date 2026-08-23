@@ -459,10 +459,11 @@ export default function App() {
     runsRefreshInFlight.current = { sessionId: scopeKey, request };
     setRunsBusy(true);
     try {
-      const nextRuns = remote
+      const nextPage = remote
         ? await api.remoteServiceRunList()
         : await api.runList(sessionId!);
       if (!runsRefreshGuard.isCurrent(request)) return;
+      const nextRuns = Array.isArray(nextPage) ? nextPage : nextPage.runs;
       setRuns(nextRuns);
       setRunsSessionId(scopeKey);
       setRunsError(null);
@@ -661,7 +662,7 @@ export default function App() {
       const results = await Promise.all(
         sessionIds.map(async (sessionId) => {
           try {
-            return [sessionId, activeRunOrigin(await api.runList(sessionId))] as const;
+            return [sessionId, activeRunOrigin((await api.runList(sessionId)).runs)] as const;
           } catch {
             // The bridge can be unavailable during startup or shutdown.
             return null;

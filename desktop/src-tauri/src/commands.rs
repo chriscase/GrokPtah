@@ -5,9 +5,10 @@ use grokptah_agent_bridge::{
     ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
     JournalPage, McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
     PromptQueueRunNextResult, PromptQueueSnapshot, PromptQueueTakeResult, ProviderDeadlineClass,
-    ProviderProfileUpdate, ProviderQualificationReport, PublicRun, RunExecutionMode, RunReview,
-    RunState, SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
-    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    ProviderProfileUpdate, ProviderQualificationReport, PublicRun, PublicRunPage, RunExecutionMode,
+    RunReview, RunState, SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary,
+    SkillInfo, SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION,
+    PRODUCT_NAME,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
@@ -1510,10 +1511,16 @@ pub async fn session_completion_history(
 pub async fn run_list(
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<Vec<PublicRun>, String> {
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> Result<PublicRunPage, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.list_public_session_runs(id).map_err(map_err)).await
+    run_blocking(move || {
+        host.list_public_session_runs_page(id, cursor.as_deref(), limit)
+            .map_err(map_err)
+    })
+    .await
 }
 
 /// Read one durable Build run, scoped to its owning session.

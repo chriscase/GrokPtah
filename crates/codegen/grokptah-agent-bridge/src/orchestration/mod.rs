@@ -80,7 +80,8 @@ pub use service::{OrchestrationConfig, OrchestrationService};
 pub(crate) use store::workspaces_match;
 pub use store::{
     AdmissionPersistCut, DurableAdmission, IdempotencyClaim, OrchStore, ProviderAttemptPage,
-    RetentionPolicy, RetentionReport, MAX_PROVIDER_ATTEMPTS_PER_RUN_PAGE, MAX_PUBLIC_RUN_LIST,
+    RetentionPolicy, RetentionReport, UncertainAdmission, MAX_PROVIDER_ATTEMPTS_PER_RUN_PAGE,
+    MAX_PUBLIC_RUN_LIST,
 };
 pub use supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
