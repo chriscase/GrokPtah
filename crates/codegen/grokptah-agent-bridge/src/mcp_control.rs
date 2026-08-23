@@ -3951,7 +3951,7 @@ mod tests {
 
         let canon_a = canonical_workspace_string(ws_a.path()).unwrap();
         let canon_b = canonical_workspace_string(ws_b.path()).unwrap();
-        let computer = ComputerUseService::new(
+        let computer = ComputerUseService::new_simulator(
             Arc::new(SimulatorBackend::new()),
             host.ensure_computer_store().unwrap(),
         );
@@ -4352,7 +4352,8 @@ mod tests {
 
         let canon = canonical_workspace_string(ws.path()).unwrap();
         let store = host.ensure_computer_store().unwrap();
-        let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store.clone());
+        let computer =
+            ComputerUseService::new_simulator(Arc::new(SimulatorBackend::new()), store.clone());
         let run = computer
             .create_run(
                 "create-ring",
@@ -4459,7 +4460,8 @@ mod tests {
         {
             let store =
                 ComputerStore::open(crate::discover::grokptah_home().join("computer-use")).unwrap();
-            let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store);
+            let computer =
+                ComputerUseService::new_simulator(Arc::new(SimulatorBackend::new()), store);
             let run = computer
                 .create_run(
                     "create-restart",

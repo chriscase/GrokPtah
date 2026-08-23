@@ -15,11 +15,12 @@ use super::platform::{
 };
 use super::types::{
     macos_native_capability_proof, macos_native_physical_input_domain, ActionOutcome,
-    ComputerAction, ComputerBackend, ComputerCapabilities, ComputerError, ComputerErrorCode,
-    ComputerObservation, ComputerResult, ComputerTarget, ComputerUseLimits, EvidenceRef,
-    ObservationGeometry, PhysicalInputDomain, SemanticAction, SemanticElement, Sensitivity,
-    MAX_LABEL_BYTES,
+    ComputerAction, ComputerBackend, ComputerBackendAttestation, ComputerCapabilities,
+    ComputerCapabilityTier, ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult,
+    ComputerTarget, ComputerUseLimits, EvidenceRef, ObservationGeometry, PhysicalInputDomain,
+    SemanticAction, SemanticElement, Sensitivity, MAX_LABEL_BYTES,
 };
+use super::{ComputerStore, ComputerUseService};
 
 const MAX_TARGET_CANDIDATES: usize = 128;
 const SELECTION_LEASE_TTL: StdDuration = StdDuration::from_secs(120);
@@ -185,6 +186,54 @@ impl MacOsObservationPlatform {
             super::macos_native::NativeMacObservationSource::new()?,
         )))
     }
+
+    async fn bind_target_backend(
+        &self,
+        selection_token: &str,
+    ) -> ComputerResult<Arc<dyn ComputerBackend>> {
+        super::types::validate_id("selection_token", selection_token)?;
+        let lease = self.leases.lock().remove(selection_token).ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "unknown or already-consumed computer-use selection",
+            )
+        })?;
+        if lease.issued_at.elapsed() >= SELECTION_LEASE_TTL {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "computer-use selection expired",
+            ));
+        }
+        require_platform_ready(&self.status())?;
+        let current = self
+            .source
+            .revalidate_target(&lease.native.identity)
+            .await?;
+        validate_raw_target(&current)?;
+        if current.identity != lease.native.identity {
+            return Err(ComputerError::new(
+                ComputerErrorCode::TargetChanged,
+                "selected macOS target identity changed",
+            ));
+        }
+        Ok(Arc::new(MacOsObservationBackend {
+            source: self.source.clone(),
+            target: lease.candidate.target,
+            native_identity: lease.native.identity,
+            sequence: Mutex::new(0),
+            observation_gate: tokio::sync::Mutex::new(()),
+            last_capture_started: Mutex::new(None),
+            cancellation_epoch: AtomicU64::new(0),
+            action_gate: tokio::sync::Mutex::new(()),
+            action_snapshot: Mutex::new(None),
+            evidence: EvidenceVault::default(),
+        }))
+    }
+
+    #[cfg(test)]
+    async fn bind_target(&self, selection_token: &str) -> ComputerResult<Arc<dyn ComputerBackend>> {
+        self.bind_target_backend(selection_token).await
+    }
 }
 
 #[async_trait]
@@ -266,44 +315,18 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
         Ok(candidates)
     }
 
-    async fn bind_target(&self, selection_token: &str) -> ComputerResult<Arc<dyn ComputerBackend>> {
-        super::types::validate_id("selection_token", selection_token)?;
-        let lease = self.leases.lock().remove(selection_token).ok_or_else(|| {
-            ComputerError::new(
-                ComputerErrorCode::Unauthorized,
-                "unknown or already-consumed computer-use selection",
-            )
-        })?;
-        if lease.issued_at.elapsed() >= SELECTION_LEASE_TTL {
-            return Err(ComputerError::new(
-                ComputerErrorCode::Unauthorized,
-                "computer-use selection expired",
-            ));
-        }
-        require_platform_ready(&self.status())?;
-        let current = self
-            .source
-            .revalidate_target(&lease.native.identity)
-            .await?;
-        validate_raw_target(&current)?;
-        if current.identity != lease.native.identity {
-            return Err(ComputerError::new(
-                ComputerErrorCode::TargetChanged,
-                "selected macOS target identity changed",
-            ));
-        }
-        Ok(Arc::new(MacOsObservationBackend {
-            source: self.source.clone(),
-            target: lease.candidate.target,
-            native_identity: lease.native.identity,
-            sequence: Mutex::new(0),
-            observation_gate: tokio::sync::Mutex::new(()),
-            last_capture_started: Mutex::new(None),
-            cancellation_epoch: AtomicU64::new(0),
-            action_gate: tokio::sync::Mutex::new(()),
-            action_snapshot: Mutex::new(None),
-            evidence: EvidenceVault::default(),
-        }))
+    async fn bind_target_service(
+        &self,
+        selection_token: &str,
+        store: ComputerStore,
+    ) -> ComputerResult<ComputerUseService> {
+        let backend = self.bind_target_backend(selection_token).await?;
+        let attestation = ComputerBackendAttestation::trusted(
+            super::types::MACOS_NATIVE_BACKEND_ID,
+            ComputerCapabilityTier::ForegroundSemantic,
+            macos_native_physical_input_domain(),
+        )?;
+        Ok(ComputerUseService::new_trusted(backend, store, attestation))
     }
 }
 
@@ -1239,6 +1262,33 @@ mod tests {
             platform.bind_target("forged-token").await.unwrap_err().code,
             ComputerErrorCode::Unauthorized
         );
+    }
+
+    #[tokio::test]
+    async fn host_bound_macos_service_is_foreground_semantic_only() {
+        let source = Arc::new(FixtureSource::granted());
+        let platform = MacOsObservationPlatform::with_source(source);
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let directory = tempfile::tempdir().unwrap();
+        let service = platform
+            .bind_target_service(
+                &candidate.selection_token,
+                ComputerStore::open(directory.path().join("computer-use")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let capabilities = service.capabilities();
+        assert_eq!(
+            capabilities.backend_id,
+            crate::computer_use::MACOS_NATIVE_BACKEND_ID
+        );
+        assert_eq!(
+            capabilities.tier,
+            ComputerCapabilityTier::ForegroundSemantic
+        );
+        assert!(!capabilities.pointer_fallback);
+        assert!(!capabilities.key_chords);
+        assert!(!capabilities.proof.isolated_input_is_dispatchable());
     }
 
     #[tokio::test]
