@@ -157,6 +157,8 @@ pub struct EnterpriseReviewCheckpoint {
     pub review_id: String,
     pub plan_digest: String,
     pub revision: u64,
+    /// All accepted attempts, including interrupted/failed attempts. Keeping
+    /// history makes retry cost auditable after a process restart.
     pub results: Vec<EnterpriseReviewPassResult>,
     pub requests_used: u32,
     pub tokens_used: u64,
@@ -336,6 +338,7 @@ impl EnterpriseReviewPlan {
 pub struct EnterpriseReviewRun {
     plan: EnterpriseReviewPlan,
     results: BTreeMap<String, EnterpriseReviewPassResult>,
+    history: Vec<EnterpriseReviewPassResult>,
     revision: u64,
     requests_used: u32,
     tokens_used: u64,
@@ -348,6 +351,7 @@ impl EnterpriseReviewRun {
         Ok(Self {
             plan,
             results: BTreeMap::new(),
+            history: Vec::new(),
             revision: 1,
             requests_used: 0,
             tokens_used: 0,
@@ -364,8 +368,13 @@ impl EnterpriseReviewRun {
         mut result: EnterpriseReviewPassResult,
     ) -> Result<(), EnterpriseReviewPlanError> {
         let pass = self.plan.pass(&result.pass_id)?;
-        if self.results.contains_key(&result.pass_id) {
-            return Err(EnterpriseReviewPlanError::DuplicatePass);
+        if let Some(previous) = self.results.get(&result.pass_id) {
+            if previous.status == EnterpriseReviewPassStatus::Completed {
+                return Err(EnterpriseReviewPlanError::DuplicatePass);
+            }
+            if result.attempt <= previous.attempt {
+                return Err(EnterpriseReviewPlanError::InvalidPass("attempt order"));
+            }
         }
         if result.schema != ENTERPRISE_REVIEW_PLAN_SCHEMA
             || result.attempt == 0
@@ -397,6 +406,7 @@ impl EnterpriseReviewRun {
         self.requests_used = requests;
         self.tokens_used = tokens;
         self.duration_used_ms = duration;
+        self.history.push(result.clone());
         self.results.insert(result.pass_id.clone(), result);
         self.revision = self.revision.saturating_add(1);
         Ok(())
@@ -408,7 +418,7 @@ impl EnterpriseReviewRun {
             review_id: self.plan.review_id.clone(),
             plan_digest: self.plan.plan_digest.clone(),
             revision: self.revision,
-            results: self.results.values().cloned().collect(),
+            results: self.history.clone(),
             requests_used: self.requests_used,
             tokens_used: self.tokens_used,
             duration_used_ms: self.duration_used_ms,
@@ -687,6 +697,36 @@ mod tests {
         assert!(matches!(
             run.record_pass(interrupted),
             Err(EnterpriseReviewPlanError::InvalidPass("result bounds"))
+        ));
+    }
+
+    #[test]
+    fn interrupted_pass_can_retry_once_with_auditable_attempt_history() {
+        let plan = plan();
+        let mut run = EnterpriseReviewRun::start(plan.clone()).unwrap();
+        run.record_pass(result(
+            &plan.passes[0],
+            1,
+            EnterpriseReviewPassStatus::Interrupted,
+        ))
+        .unwrap();
+        run.record_pass(result(
+            &plan.passes[0],
+            2,
+            EnterpriseReviewPassStatus::Completed,
+        ))
+        .unwrap();
+        let checkpoint = run.checkpoint();
+        assert_eq!(checkpoint.results.len(), 2);
+        assert_eq!(checkpoint.results[0].attempt, 1);
+        assert_eq!(checkpoint.results[1].attempt, 2);
+        assert!(matches!(
+            run.record_pass(result(
+                &plan.passes[0],
+                3,
+                EnterpriseReviewPassStatus::Completed,
+            )),
+            Err(EnterpriseReviewPlanError::DuplicatePass)
         ));
     }
 }
