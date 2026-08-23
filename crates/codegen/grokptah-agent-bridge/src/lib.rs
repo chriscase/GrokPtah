@@ -41,6 +41,7 @@ mod prompt_queue;
 mod provider_discovery;
 pub mod provider_observation;
 mod provider_qualification;
+pub mod provider_quota_receipt;
 pub mod reliability_eval;
 mod run_promotion;
 mod search_engine;
@@ -105,6 +106,11 @@ pub use prompt_queue::{
 pub use provider_discovery::{discover_profile_models, parse_compatible_model_catalog};
 pub use provider_qualification::{
     qualify_provider_model, ProviderQualificationReport, QualificationCheck, QualificationStatus,
+};
+pub use provider_quota_receipt::{
+    expected_receipt_digest, ProviderQuotaReceipt, ProviderQuotaReceiptError,
+    ProviderQuotaReceiptKind, ProviderQuotaReceiptSet, PROVIDER_QUOTA_RECEIPT_SCHEMA,
+    PROVIDER_QUOTA_RECEIPT_SET_SCHEMA,
 };
 pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
 

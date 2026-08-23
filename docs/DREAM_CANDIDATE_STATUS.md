@@ -45,6 +45,11 @@ complete or that the product has reached 100%.
 - Each specialist also projects into the provider-neutral durable `WorkTemplate`
   contract with bounded rounds/tokens/time and retry policy; the template carries
   only opaque objective evidence, never a route or raw source prompt.
+- The provider-quota receipt contract now requires a named campaign, credential
+  and route binding plus distinct provider-side consumption and HTTP-429
+  exhaustion observations. Digests, ordering, schema, and secret-free output
+  fail closed; this remains a contract for future live evidence, not a live
+  quota receipt.
 - Shared desktop/hosted black-box parity is present as a fail-closed fixture.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
@@ -99,6 +104,9 @@ unrelated signal.
 - Enterprise review plan suite: 4 passed, covering deterministic seven-pass
   decomposition, checkpoint resume/deduplication, interrupted-pass retry
   history, unsafe-location rejection, plan drift, and budget bounds.
+- Provider-quota receipt suite: 4 passed, covering bound-pair readiness,
+  route/credential drift, ordering, non-429 exhaustion, tampered digests, and
+  unknown fields.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.
