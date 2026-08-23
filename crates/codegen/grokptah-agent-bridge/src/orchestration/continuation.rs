@@ -99,13 +99,25 @@ pub enum ContinuationMemoryScope {
     Team,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ContinuationMemoryFact {
     pub id: String,
     pub text: String,
     pub tags: Vec<String>,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +126,8 @@ pub struct ContinuationMemoryInput {
     pub scope: ContinuationMemoryScope,
     pub scope_id: Option<String>,
     pub facts: Vec<ContinuationMemoryFact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_claims: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,8 +373,14 @@ impl ContinuationInputSnapshot {
                     .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
                     .then_with(|| left.text.as_bytes().cmp(right.text.as_bytes()))
                     .then_with(|| left.tags.cmp(&right.tags))
+                    .then_with(|| left.revision.cmp(&right.revision))
+                    .then_with(|| left.claim_key.cmp(&right.claim_key))
+                    .then_with(|| left.valid_from.cmp(&right.valid_from))
+                    .then_with(|| left.valid_until.cmp(&right.valid_until))
             });
             scope.facts.dedup();
+            scope.conflict_claims.sort();
+            scope.conflict_claims.dedup();
         }
         self.memory_scopes.sort_by(|left, right| {
             left.scope
@@ -371,6 +391,7 @@ impl ContinuationInputSnapshot {
                         .unwrap_or_default()
                         .cmp(&serde_json::to_vec(&right.facts).unwrap_or_default())
                 })
+                .then_with(|| left.conflict_claims.cmp(&right.conflict_claims))
         });
         self.memory_scopes.dedup();
         self.workload_refs.sort_by(|left, right| {
@@ -1047,7 +1068,9 @@ mod tests {
                     text: "Use Rust".into(),
                     tags: vec!["language".into()],
                     updated_at: "2023-11-14T22:13:20Z".into(),
+                    ..Default::default()
                 }],
+                conflict_claims: Vec::new(),
             }],
             Vec::new(),
             Vec::new(),

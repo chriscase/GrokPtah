@@ -1005,13 +1005,24 @@ pub(crate) fn coding_agent_tools(
             "type": "function",
             "function": {
                 "name": "memory_write",
-                "description": "Store a fact in an explicit durable source-workspace memory scope.",
+                "description": "Store a fact in an explicit durable source-workspace memory scope using the versioned CAS/receipt writer. Optional request_key, claim_key, expected_head_*, supersedes, validity window, salience, and critical flags are honored; critical writes are rejected unless Agent memory policy grants criticalWrites.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "text": { "type": "string", "description": "Fact to remember" },
                         "tags": { "type": "array", "items": { "type": "string" } },
-                        "scope": memory_scope_schema()
+                        "scope": memory_scope_schema(),
+                        "request_key": { "type": "string", "description": "Idempotency key. Omitted values use a per-text compatibility key." },
+                        "idempotency_key": { "type": "string", "description": "Alias for request_key." },
+                        "claim_key": { "type": "string", "description": "Claim chain this write belongs to." },
+                        "expected_head_id": { "type": "string" },
+                        "expected_head_revision": { "type": "integer", "minimum": 1 },
+                        "supersedes": { "type": "string" },
+                        "valid_from": { "type": "string", "description": "RFC3339 instant" },
+                        "valid_until": { "type": "string", "description": "RFC3339 instant" },
+                        "salience": { "type": "string", "enum": ["low", "medium", "high"] },
+                        "critical": { "type": "boolean", "description": "Request a critical write. Denied unless the Agent spec grants memory.criticalWrites." },
+                        "class": { "type": "string", "enum": ["normal", "critical"] }
                     },
                     "required": ["text", "scope"]
                 }
@@ -1021,7 +1032,7 @@ pub(crate) fn coding_agent_tools(
             "type": "function",
             "function": {
                 "name": "memory_read",
-                "description": "Search facts in an explicit durable source-workspace memory scope (empty query lists recent).",
+                "description": "Search authoritative current facts in an explicit durable source-workspace memory scope (empty query lists recent). Dual-head conflicts are reported separately and are not treated as current.",
                 "parameters": {
                     "type": "object",
                     "properties": {

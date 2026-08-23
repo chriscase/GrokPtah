@@ -694,6 +694,10 @@ impl AgentAuthorityPolicy {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMemoryPolicy {
@@ -701,6 +705,10 @@ pub struct AgentMemoryPolicy {
     pub agent_private_scope: bool,
     #[serde(default)]
     pub team_ids: Vec<String>,
+    /// Host-owned grant for critical durable writes. Missing on legacy
+    /// records and treated as denied.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub critical_writes: bool,
 }
 
 impl Default for AgentMemoryPolicy {
@@ -709,6 +717,7 @@ impl Default for AgentMemoryPolicy {
             project_scope: true,
             agent_private_scope: true,
             team_ids: Vec::new(),
+            critical_writes: false,
         }
     }
 }

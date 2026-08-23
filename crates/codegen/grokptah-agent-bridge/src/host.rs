@@ -2011,12 +2011,7 @@ impl AgentHostHandle {
         agent_id: &str,
         capture_reasons: &mut Vec<ContinuationReasonCode>,
     ) -> Result<(Vec<ContinuationMemoryInput>, Vec<String>)> {
-        let access = MemoryAccess::new(&spec.source_workspace, Some(agent_id.to_string()))
-            .with_agent_policy(
-                spec.memory.project_scope,
-                spec.memory.agent_private_scope,
-                spec.memory.team_ids.clone(),
-            )?;
+        let access = Self::memory_access_from_spec(&spec.source_workspace, agent_id, spec)?;
         let mut requested = Vec::new();
         if spec.memory.project_scope {
             requested.push((MemoryScope::Project, ContinuationMemoryScope::Project, None));
@@ -2051,11 +2046,10 @@ impl AgentHostHandle {
                 (ContinuationMemoryScope::Team, Some(id)) => format!("team:{id}"),
                 _ => "invalid".into(),
             };
-            let facts = match access
-                .resolve(scope)
-                .and_then(|address| crate::memory::list_facts(&address))
-            {
-                Ok(facts) => facts,
+            let retrieved = match access.resolve(scope).and_then(|address| {
+                crate::memory::inspect(&address).map_err(|error| anyhow!(error))
+            }) {
+                Ok(retrieved) => retrieved,
                 Err(_) => {
                     capture_reasons.push(ContinuationReasonCode::MemoryScopeUnavailable);
                     unavailable.push(descriptor);
@@ -2064,7 +2058,7 @@ impl AgentHostHandle {
             };
             let mut normalized_facts = Vec::new();
             let mut invalid = false;
-            for fact in facts {
+            for fact in retrieved.current {
                 let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&fact.updated_at) else {
                     invalid = true;
                     break;
@@ -2076,6 +2070,10 @@ impl AgentHostHandle {
                     updated_at: updated_at
                         .with_timezone(&Utc)
                         .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                    revision: fact.revision,
+                    valid_from: fact.valid_from,
+                    valid_until: fact.valid_until,
+                    claim_key: fact.claim_key,
                 });
             }
             if invalid {
@@ -2087,6 +2085,11 @@ impl AgentHostHandle {
                 scope: rendered_scope,
                 scope_id,
                 facts: normalized_facts,
+                conflict_claims: retrieved
+                    .conflicts
+                    .into_iter()
+                    .map(|(claim, _heads)| claim)
+                    .collect(),
             });
         }
         Ok((scopes, unavailable))
@@ -4090,11 +4093,24 @@ impl AgentHostHandle {
         if spec.source_workspace != session.cwd.display().to_string() {
             bail!("persistent Agent memory scope does not match the Lane source workspace");
         }
-        access.with_agent_policy(
-            spec.memory.project_scope,
-            spec.memory.agent_private_scope,
-            spec.memory.team_ids,
-        )
+        Self::memory_access_from_spec(&session.cwd, actor_agent.as_deref().unwrap_or(""), &spec)
+    }
+
+    fn memory_access_from_spec(
+        source_workspace: impl AsRef<Path>,
+        agent_id: &str,
+        spec: &AgentSpec,
+    ) -> Result<MemoryAccess> {
+        let mut access = MemoryAccess::new(source_workspace, Some(agent_id.to_string()))
+            .with_agent_policy(
+                spec.memory.project_scope,
+                spec.memory.agent_private_scope,
+                spec.memory.team_ids.clone(),
+            )?;
+        if spec.memory.critical_writes {
+            access = access.with_critical_writes();
+        }
+        Ok(access)
     }
 
     fn memory_address_for_session(
@@ -9517,21 +9533,35 @@ impl AgentHostHandle {
                     })
                     .unwrap_or_default();
                 let address = self.memory_address_from_args(session_id, &args)?;
+                let args_for_write = args.clone();
                 self.run_tool_for_output(
                     session_id,
                     "memory_write",
                     &args,
                     || async move {
-                        let id = crate::memory::remember(&address, &text, &tags)?;
-                        let out = format!("Remembered fact {id}: {text}");
-                        Ok(local_tools::ToolResult::basic(
-                            "memory_write".into(),
-                            ToolCallKind::Edit,
-                            serde_json::json!({}),
-                            out,
-                            true,
-                            "Allow durable memory mutation?".into(),
-                        ))
+                        match crate::memory::remember_from_host_args(
+                            &address,
+                            &text,
+                            &tags,
+                            &args_for_write,
+                        ) {
+                            Ok(ack) => {
+                                let payload = ack.tool_payload();
+                                let out = format!(
+                                    "Remembered fact {}: {}\n{}",
+                                    ack.id, text, payload
+                                );
+                                Ok(local_tools::ToolResult::basic(
+                                    "memory_write".into(),
+                                    ToolCallKind::Edit,
+                                    payload,
+                                    out,
+                                    true,
+                                    "Allow durable memory mutation?".into(),
+                                ))
+                            }
+                            Err(error) => Err(anyhow!("{} {}", error, error.tool_payload())),
+                        }
                     },
                     cancel,
                     event_tx,
@@ -9617,16 +9647,40 @@ impl AgentHostHandle {
                     .unwrap_or("")
                     .to_string();
                 let address = self.memory_address_from_args(session_id, &args)?;
-                let facts = crate::memory::search(&address, &query)?;
-                let out = if facts.is_empty() {
-                    format!("(no matching {} memory)", address.scope().label())
+                let retrieved = crate::memory::inspect_search(&address, &query)?;
+                let mut lines = Vec::new();
+                if retrieved.current.is_empty() {
+                    lines.push(format!(
+                        "(no matching {} memory)",
+                        address.scope().label()
+                    ));
                 } else {
-                    facts
+                    for fact in &retrieved.current {
+                        lines.push(format!(
+                            "- [{} rev {} claim {}] {}",
+                            fact.id,
+                            fact.revision,
+                            fact.claim_key.as_deref().unwrap_or(""),
+                            fact.text
+                        ));
+                    }
+                }
+                for (claim, heads) in &retrieved.conflicts {
+                    let ids = heads
                         .iter()
-                        .map(|f| format!("- {}", f.text))
+                        .map(|head| head.id.as_str())
                         .collect::<Vec<_>>()
-                        .join("\n")
-                };
+                        .join(",");
+                    lines.push(format!(
+                        "CONFLICT claim {claim} heads {ids} at {}",
+                        retrieved.at.to_rfc3339()
+                    ));
+                }
+                lines.push(format!(
+                    "bounds: {}",
+                    crate::memory::declared_bounds_json()
+                ));
+                let out = lines.join("\n");
                 let call_id = Uuid::new_v4().to_string();
                 let _ = event_tx.send(SessionUpdate::ToolCall {
                     session_id,
