@@ -94,6 +94,7 @@ const FIXTURE_ALLOWLIST: &[&str] = &[
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-main-67e29bd3.json",
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-pr352-4bd2081b.json",
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-57c0f4f70f53a7.json",
+    ".github/workflows/hosted-service.yml",
 ];
 
 const GOLDEN_UPDATE_ENV_VARS: &[&str] = &[
@@ -3184,6 +3185,31 @@ fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+fn commit_parents(sha: &str) -> Result<Vec<String>, String> {
+    let line = git_stdout(&["rev-list", "--parents", "-n", "1", sha])?;
+    let mut parts = line.split_whitespace();
+    let Some(self_sha) = parts.next() else {
+        return Err(format!("git rev-list --parents returned empty for {sha}"));
+    };
+    if self_sha != sha {
+        return Err(format!(
+            "git rev-list --parents started with {self_sha}, expected {sha}"
+        ));
+    }
+    Ok(parts.map(str::to_string).collect())
+}
+
+/// GitHub `pull_request` jobs check out a merge of the PR into the base.
+/// That synthetic commit is not an audited host revision; the second parent
+/// is the PR head we actually authored.
+fn audit_walk_start(head: &str, parents: &[String]) -> String {
+    if parents.len() >= 2 {
+        parents[1].clone()
+    } else {
+        head.to_string()
+    }
+}
+
 fn detect_audited_source_revision() -> String {
     let status = git_stdout(&["status", "--porcelain"]).expect("git status");
     for path in porcelain_paths(&status) {
@@ -3191,7 +3217,9 @@ fn detect_audited_source_revision() -> String {
             panic!("unexpected dirty path outside fixture allowlist: {path}");
         }
     }
-    let mut sha = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let head = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let parents = commit_parents(&head).expect("HEAD parents");
+    let mut sha = audit_walk_start(&head, &parents);
     loop {
         let files = commit_changed_files(&sha).expect("commit files");
         if files.iter().any(|path| !allowlisted(path)) {
@@ -3424,6 +3452,27 @@ fn unknown_source_revision_fails_closed() {
     .expect_err("unknown revision must fail closed");
     let text = panic_text(message);
     assert!(text.contains("unexpected source revision"), "{text}");
+}
+
+#[test]
+fn github_pr_merge_commit_starts_audit_at_the_pr_head() {
+    assert_eq!(
+        audit_walk_start(
+            "ef0a479b57e14d48209a1561e12551405569f0f3",
+            &[
+                "4bd2081b2945e8ce881895f976bb7c8d88b929f2".into(),
+                "e9f7934dbecaba50b840d337b7073c86687242b2".into()
+            ]
+        ),
+        "e9f7934dbecaba50b840d337b7073c86687242b2"
+    );
+    assert_eq!(
+        audit_walk_start(
+            "e9f7934dbecaba50b840d337b7073c86687242b2",
+            &["57c0f4f70f53a726188ff7ec8278c1c5d0be6604".into()]
+        ),
+        "e9f7934dbecaba50b840d337b7073c86687242b2"
+    );
 }
 
 #[test]
