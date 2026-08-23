@@ -45,6 +45,7 @@ xcrun clang \
   -Werror \
   -Wl,-dead_strip \
   -framework Foundation \
+  -framework Security \
   -framework Virtualization \
   "$script_dir/main.m" \
   -o "$temporary"

@@ -191,7 +191,9 @@ available.
    closed configuration, and a credentialed assembler. The helper accepts only inherited immutable
    guest/configuration handles plus private control/event pipes; it clears its environment, refuses
    arguments, builds a bounded one-display/virtio-socket VM with no network/share/audio/storage/host
-   input devices, requires an explicit start byte, and performs bounded graceful-then-forced stop.
+   input devices, requires an explicit start byte, performs a challenge/response ready handshake
+   with the guest bootstrap agent, and requires an authenticated shutdown acknowledgement before
+   bounded graceful-then-forced stop.
    The assembler signs the helper before the outer unprivileged app and derives the content and
    designated-requirement manifest. CI links only the unsigned helper source. The repository now
    also carries a pinned Linux arm64 guest-source lock, closed kernel fragment, freestanding guest
@@ -205,9 +207,9 @@ available.
    32-byte channel key authenticates the exact protocol version, Run, surface incarnation, message
    and frame sequences, zero input sequence, one outstanding request nonce, encoded payload length,
    and closed observe/frame-metadata/health/failure/stop/shutdown-ack payload. Tamper, replay,
-   wrong-secret, wrong-nonce, input, oversized-frame, and unknown-field paths fail closed. No carrier,
-   frame-byte transfer, guest agent, or renderer exists yet, so this is not transport or isolation
-   proof.
+   wrong-secret, wrong-nonce, input, oversized-frame, and unknown-field paths fail closed. The
+   helper/guest bootstrap handshake is now wired, but no carrier, frame-byte transfer, guest
+   application agent, or renderer exists yet, so this is not transport or isolation proof.
 5. Add guest pointer state and one-action local approval; then key/text/scroll/drag independently.
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.

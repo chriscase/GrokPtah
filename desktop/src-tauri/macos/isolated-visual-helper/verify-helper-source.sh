@@ -53,7 +53,11 @@ for required in \
   'machine.audioDevices = @[];' \
   'machine.storageDevices = @[];' \
   'machine.keyboards = @[];' \
-  'machine.pointingDevices = @[];'; do
+  'machine.pointingDevices = @[];' \
+  'setSocketListener:guestSocketListener' \
+  'GPTGuestWaitForReady' \
+  'GPTGuestRequestShutdown' \
+  'GPTIsolatedHelperFailureGuestProtocol'; do
   grep -F "$required" "$helper_source" >/dev/null
 done
 for forbidden in \

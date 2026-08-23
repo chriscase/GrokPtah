@@ -686,10 +686,11 @@ entitlements, path replacement, and content/manifest drift. No helper, guest, co
 pipeline, or entitlement file is actually added by that verifier slice; it has no packaged runtime
 evidence. A following source slice adds the minimal helper, exact entitlement/configuration files,
 and a credentialed nested-signing assembler. The helper's closed inherited-descriptor bootstrap can
-configure a one-display/virtio-socket VM with no network/share/audio/storage/host-input devices and
-   bounded graceful/forced stop, but there is no reviewed guest image, signing identity, assembled app,
+   configure a one-display/virtio-socket VM with no network/share/audio/storage/host-input devices,
+   challenge/response guest bootstrap, authenticated shutdown acknowledgement, and bounded
+   graceful/forced stop, but there is no reviewed guest image, signing identity, assembled app,
    host supervisor, launch, or cleanup run. The protocol does not implement a carrier, transfer frame
-   bytes, render a frame, or launch a guest. The repository now also carries a pinned Linux arm64
+   bytes, render a frame, or launch a guest application. The repository now also carries a pinned Linux arm64
    guest-source lock, closed kernel fragment, freestanding guest PID 1, protocol self-test, and a
    Linux-only deterministic image-builder candidate. A dedicated Linux workflow builds that source
    twice and compares image/manifest bytes; it deliberately does not embed or publish the output.

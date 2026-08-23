@@ -1,5 +1,8 @@
 #import <Foundation/Foundation.h>
+#import <Security/Security.h>
 #import <Virtualization/Virtualization.h>
+
+#include "../isolated-visual-guest/protocol.h"
 
 #include <errno.h>
 #include <crt_externs.h>
@@ -20,6 +23,8 @@ static const int GPT_EVENT_FD = 6;
 static const size_t GPT_MAX_CONFIGURATION_BYTES = 1024 * 1024;
 static const uint8_t GPT_CONTROL_START = 1;
 static const uint8_t GPT_CONTROL_STOP = 2;
+static const int GPT_GUEST_HANDSHAKE_TIMEOUT_MS = 30000;
+static const int GPT_GUEST_SHUTDOWN_TIMEOUT_MS = 5000;
 static const uint32_t GPT_EVENT_MAGIC = 0x47505449;
 static const uint16_t GPT_EVENT_VERSION = 1;
 static NSString *const GPT_KERNEL_COMMAND_LINE =
@@ -44,6 +49,7 @@ typedef NS_ENUM(uint32_t, GPTIsolatedHelperFailure) {
     GPTIsolatedHelperFailureControlLost = 8,
     GPTIsolatedHelperFailureStopFailed = 9,
     GPTIsolatedHelperFailureGuestStopped = 10,
+    GPTIsolatedHelperFailureGuestProtocol = 11,
 };
 
 typedef struct __attribute__((packed)) {
@@ -380,6 +386,34 @@ static VZVirtualMachineConfiguration *GPTVirtualMachineConfiguration(
 }
 @end
 
+@interface GPTGuestSocketDelegate : NSObject <VZVirtioSocketListenerDelegate>
+@property(nonatomic, strong, nullable) VZVirtioSocketConnection *connection;
+@property(nonatomic) dispatch_semaphore_t connected;
+@end
+
+@implementation GPTGuestSocketDelegate
+- (instancetype)init {
+    self = [super init];
+    if (self != nil) {
+        _connected = dispatch_semaphore_create(0);
+    }
+    return self;
+}
+
+- (BOOL)listener:(VZVirtioSocketListener *)listener
+    shouldAcceptNewConnection:(VZVirtioSocketConnection *)connection
+             fromSocketDevice:(VZVirtioSocketDevice *)socketDevice {
+    (void)listener;
+    (void)socketDevice;
+    if (self.connection != nil || connection.fileDescriptor < 0) {
+        return NO;
+    }
+    self.connection = connection;
+    dispatch_semaphore_signal(self.connected);
+    return YES;
+}
+@end
+
 static int GPTReadControlByte(uint8_t *command, int timeoutMilliseconds) {
     struct pollfd descriptor = {
         .fd = GPT_CONTROL_FD,
@@ -398,6 +432,148 @@ static int GPTReadControlByte(uint8_t *command, int timeoutMilliseconds) {
         count = read(GPT_CONTROL_FD, command, 1);
     } while (count < 0 && errno == EINTR && !GPTStopRequested);
     return count == 1 ? 1 : -1;
+}
+
+static uint64_t GPTMonotonicMilliseconds(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return (uint64_t)now.tv_sec * 1000ULL + (uint64_t)now.tv_nsec / 1000000ULL;
+}
+
+static BOOL GPTWriteSocketExact(
+    VZVirtioSocketConnection *connection,
+    const void *bytes,
+    size_t length,
+    int timeoutMilliseconds) {
+    const uint8_t *cursor = bytes;
+    size_t remaining = length;
+    uint64_t deadline = GPTMonotonicMilliseconds() + (uint64_t)timeoutMilliseconds;
+    while (remaining > 0 && connection.fileDescriptor >= 0) {
+        uint64_t now = GPTMonotonicMilliseconds();
+        int waitMilliseconds = now >= deadline ? 0 : (int)(deadline - now);
+        struct pollfd descriptor = {
+            .fd = connection.fileDescriptor,
+            .events = POLLOUT | POLLERR | POLLHUP,
+            .revents = 0,
+        };
+        int polled;
+        do {
+            polled = poll(&descriptor, 1, waitMilliseconds);
+        } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+        if (polled <= 0 || (descriptor.revents & (POLLERR | POLLHUP)) != 0) {
+            return NO;
+        }
+        ssize_t written = write(connection.fileDescriptor, cursor, remaining);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            return NO;
+        }
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+    return remaining == 0;
+}
+
+static BOOL GPTReadSocketExact(
+    VZVirtioSocketConnection *connection,
+    void *bytes,
+    size_t length,
+    int timeoutMilliseconds) {
+    uint8_t *cursor = bytes;
+    size_t remaining = length;
+    uint64_t deadline = GPTMonotonicMilliseconds() + (uint64_t)timeoutMilliseconds;
+    while (remaining > 0 && connection.fileDescriptor >= 0) {
+        uint64_t now = GPTMonotonicMilliseconds();
+        int waitMilliseconds = now >= deadline ? 0 : (int)(deadline - now);
+        struct pollfd descriptor = {
+            .fd = connection.fileDescriptor,
+            .events = POLLIN | POLLERR | POLLHUP,
+            .revents = 0,
+        };
+        int polled;
+        do {
+            polled = poll(&descriptor, 1, waitMilliseconds);
+        } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+        if (polled <= 0 || (descriptor.revents & (POLLERR | POLLHUP)) != 0) {
+            return NO;
+        }
+        ssize_t count = read(connection.fileDescriptor, cursor, remaining);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            return NO;
+        }
+        cursor += count;
+        remaining -= (size_t)count;
+    }
+    return remaining == 0;
+}
+
+static BOOL GPTGuestWaitForReady(
+    GPTGuestSocketDelegate *socketDelegate,
+    gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES]) {
+    if (dispatch_semaphore_wait(
+            socketDelegate.connected,
+            dispatch_time(
+                DISPATCH_TIME_NOW,
+                (int64_t)GPT_GUEST_HANDSHAKE_TIMEOUT_MS * NSEC_PER_MSEC)) != 0) {
+        return NO;
+    }
+    VZVirtioSocketConnection *connection = socketDelegate.connection;
+    if (connection == nil ||
+        SecRandomCopyBytes(
+            kSecRandomDefault,
+            GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
+            challenge) != errSecSuccess ||
+        !GPTWriteSocketExact(
+            connection,
+            challenge,
+            GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
+            GPT_GUEST_HANDSHAKE_TIMEOUT_MS)) {
+        return NO;
+    }
+    gpt_u8 frame[GPT_GUEST_BOOTSTRAP_FRAME_BYTES] = {0};
+    return GPTReadSocketExact(
+               connection,
+               frame,
+               sizeof(frame),
+               GPT_GUEST_HANDSHAKE_TIMEOUT_MS) &&
+           gpt_guest_bootstrap_frame_valid(
+               challenge,
+               GPT_GUEST_BOOTSTRAP_EVENT_READY,
+               frame);
+}
+
+static BOOL GPTGuestRequestShutdown(
+    GPTGuestSocketDelegate *socketDelegate,
+    const gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES]) {
+    VZVirtioSocketConnection *connection = socketDelegate.connection;
+    if (connection == nil) {
+        return NO;
+    }
+    const gpt_u8 stop = GPT_GUEST_BOOTSTRAP_STOP;
+    if (!GPTWriteSocketExact(
+            connection,
+            &stop,
+            sizeof(stop),
+            GPT_GUEST_SHUTDOWN_TIMEOUT_MS)) {
+        return NO;
+    }
+    gpt_u8 frame[GPT_GUEST_BOOTSTRAP_FRAME_BYTES] = {0};
+    return GPTReadSocketExact(
+               connection,
+               frame,
+               sizeof(frame),
+               GPT_GUEST_SHUTDOWN_TIMEOUT_MS) &&
+           gpt_guest_bootstrap_frame_valid(
+               challenge,
+               GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK,
+               frame);
 }
 
 static BOOL GPTStopVirtualMachine(
@@ -508,6 +684,21 @@ int main(int argc, const char *argv[]) {
             VZVirtualMachine *virtualMachine = [[VZVirtualMachine alloc]
                 initWithConfiguration:machineConfiguration
                                   queue:queue];
+            GPTGuestSocketDelegate *guestSocketDelegate =
+                [[GPTGuestSocketDelegate alloc] init];
+            VZVirtioSocketListener *guestSocketListener =
+                [[VZVirtioSocketListener alloc] init];
+            guestSocketListener.delegate = guestSocketDelegate;
+            VZSocketDevice *socketDevice = virtualMachine.socketDevices.firstObject;
+            if (![socketDevice isKindOfClass:[VZVirtioSocketDevice class]]) {
+                GPTWriteEvent(
+                    GPTIsolatedHelperEventFailure,
+                    GPTIsolatedHelperFailureConfigurationRejected);
+                return GPTIsolatedHelperFailureConfigurationRejected;
+            }
+            [(VZVirtioSocketDevice *)socketDevice
+                setSocketListener:guestSocketListener
+                           forPort:GPT_GUEST_BOOTSTRAP_PORT];
             GPTVirtualMachineDelegate *delegate = [[GPTVirtualMachineDelegate alloc] init];
             virtualMachine.delegate = delegate;
             dispatch_semaphore_t started = dispatch_semaphore_create(0);
@@ -527,6 +718,14 @@ int main(int argc, const char *argv[]) {
                     GPTIsolatedHelperFailureStartFailed);
                 return GPTIsolatedHelperFailureStartFailed;
             }
+            gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES] = {0};
+            if (!GPTGuestWaitForReady(guestSocketDelegate, challenge)) {
+                GPTStopVirtualMachine(virtualMachine, delegate, queue);
+                GPTWriteEvent(
+                    GPTIsolatedHelperEventFailure,
+                    GPTIsolatedHelperFailureGuestProtocol);
+                return GPTIsolatedHelperFailureGuestProtocol;
+            }
             if (!GPTWriteEvent(GPTIsolatedHelperEventRunning, 0)) {
                 GPTStopRequested = 1;
             }
@@ -534,6 +733,8 @@ int main(int argc, const char *argv[]) {
             NSUInteger elapsedSeconds = 0;
             BOOL controlLost = NO;
             BOOL guestStopped = NO;
+            BOOL expectedGuestStop = NO;
+            BOOL guestShutdownAcknowledged = NO;
             while (!GPTStopRequested && elapsedSeconds < configuration.durationSeconds) {
                 if (delegate.didStop) {
                     guestStopped = YES;
@@ -550,6 +751,11 @@ int main(int argc, const char *argv[]) {
                 }
                 elapsedSeconds += 1;
             }
+            if (!delegate.didStop) {
+                guestShutdownAcknowledged =
+                    GPTGuestRequestShutdown(guestSocketDelegate, challenge);
+                expectedGuestStop = guestShutdownAcknowledged;
+            }
             BOOL stopped = GPTStopVirtualMachine(virtualMachine, delegate, queue);
             if (!stopped) {
                 GPTWriteEvent(
@@ -557,11 +763,17 @@ int main(int argc, const char *argv[]) {
                     GPTIsolatedHelperFailureStopFailed);
                 return GPTIsolatedHelperFailureStopFailed;
             }
-            if (guestStopped) {
+            if (guestStopped && !expectedGuestStop) {
                 GPTWriteEvent(
                     GPTIsolatedHelperEventFailure,
                     GPTIsolatedHelperFailureGuestStopped);
                 return GPTIsolatedHelperFailureGuestStopped;
+            }
+            if (!guestShutdownAcknowledged) {
+                GPTWriteEvent(
+                    GPTIsolatedHelperEventFailure,
+                    GPTIsolatedHelperFailureGuestProtocol);
+                return GPTIsolatedHelperFailureGuestProtocol;
             }
             if (controlLost) {
                 GPTWriteEvent(

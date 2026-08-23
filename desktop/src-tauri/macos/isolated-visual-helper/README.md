@@ -45,8 +45,11 @@ seconds. The parent must still prove exact process/handle cleanup before deletin
 
 The start path configures one bounded graphics scanout, entropy, and virtio socket. Network, shared
 directories, audio, storage, keyboards, pointing devices, and serial devices are explicitly empty.
-The future guest agent—not the host pointer or clipboard—will own framebuffer capture and guest-local
-input through the authenticated protocol documented in `docs/COMPUTER_USE_ISOLATED_VISUAL.md`.
+The helper performs a bounded challenge/response with the guest bootstrap agent before emitting
+`running`, and requires an authenticated shutdown acknowledgement before terminal success. The
+guest agent—not the host pointer or clipboard—must eventually own framebuffer capture and guest-local
+input through the authenticated protocol documented in `docs/COMPUTER_USE_ISOLATED_VISUAL.md`;
+those carrier and input paths are not implemented here.
 
 ## Build and package boundaries
 

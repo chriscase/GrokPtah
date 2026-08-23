@@ -259,7 +259,7 @@ static int gpt_guest_bootstrap_tag(
     return 1;
 }
 
-static int gpt_guest_bootstrap_frame(
+static GPT_GUEST_UNUSED int gpt_guest_bootstrap_frame(
     const gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES],
     gpt_u16 event,
     gpt_u8 output[GPT_GUEST_BOOTSTRAP_FRAME_BYTES]) {
