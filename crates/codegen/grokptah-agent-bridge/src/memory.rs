@@ -5,6 +5,11 @@
 //! self-serve storage API. `remember` remains the compatibility writer; the
 //! versioned writer is crate-private and host-stamped.
 
+// The durable core is intentionally staged behind host-owned admission wiring;
+// keep its complete fail-closed implementation warning-free until the public
+// orchestration surface consumes these crate-private operations.
+#![allow(dead_code)]
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -125,9 +130,10 @@ fn current_cutpoint() -> CommitCutpoint {
     #[cfg(test)]
     {
         if let Ok(raw) = std::env::var("GROKPTAH_MEMORY_CUTPOINT") {
-            return parse_cutpoint(&raw);
+            parse_cutpoint(&raw)
+        } else {
+            COMMIT_CUTPOINT.with(|cell| cell.get())
         }
-        return COMMIT_CUTPOINT.with(|cell| cell.get());
     }
     #[cfg(not(test))]
     {
@@ -966,7 +972,7 @@ fn parse_store_bytes(raw: &[u8]) -> anyhow::Result<ProjectMemory> {
     v2_from_envelope(env)
 }
 
-fn encode_store(memory: &ProjectMemory) -> Result<Vec<u8>, MemoryError> {
+fn encode_store_unbounded(memory: &ProjectMemory) -> Result<Vec<u8>, MemoryError> {
     let env = V2Envelope {
         schema: SCHEMA_V2.into(),
         project_key: memory.project_key.clone(),
@@ -1011,6 +1017,14 @@ fn encode_store(memory: &ProjectMemory) -> Result<Vec<u8>, MemoryError> {
             .collect(),
     };
     let raw = serde_json::to_vec_pretty(&env).map_err(|_| MemoryError::Durable)?;
+    if raw.len() > MAX_PERSISTED_BYTES {
+        return Err(MemoryError::Capacity);
+    }
+    Ok(raw)
+}
+
+fn encode_store(memory: &ProjectMemory) -> Result<Vec<u8>, MemoryError> {
+    let raw = encode_store_unbounded(memory)?;
     if raw.len() > MAX_PERSISTED_BYTES {
         return Err(MemoryError::Capacity);
     }
@@ -1283,7 +1297,14 @@ fn sort_authoritative(facts: &mut [MemoryFact]) {
 
 fn compaction_protected(fact: &MemoryFact, facts: &[MemoryFact], watermark: DateTime<Utc>) -> bool {
     if !fact.is_critical() {
-        return false;
+        // A non-critical fact with a bounded future expiry is still needed
+        // when the logical clock rolls back. Keep it until the retention
+        // watermark has crossed its expiry; unbounded facts remain compactable.
+        return fact
+            .valid_until
+            .as_deref()
+            .and_then(parse_timestamp)
+            .is_some_and(|until| until > watermark);
     }
     if is_active(fact, watermark) && !successor_active_at(facts, &fact.id, watermark) {
         return true;
@@ -1336,11 +1357,17 @@ fn pick_query_superseded(
         .map(|(index, _)| index)
 }
 
-fn pick_noncritical(facts: &[MemoryFact], watermark: DateTime<Utc>) -> Option<usize> {
+fn pick_noncritical(
+    facts: &[MemoryFact],
+    watermark: DateTime<Utc>,
+    preserve_id: Option<&str>,
+) -> Option<usize> {
     facts
         .iter()
         .enumerate()
-        .filter(|(_, fact)| !compaction_protected(fact, facts, watermark))
+        .filter(|(_, fact)| {
+            preserve_id != Some(fact.id.as_str()) && !compaction_protected(fact, facts, watermark)
+        })
         .min_by(|(_, left), (_, right)| {
             let ls = match left.salience {
                 MemorySalience::Low => 0,
@@ -1368,12 +1395,18 @@ fn mark_tombstones(memory: &mut ProjectMemory) {
     }
 }
 
-fn compact(memory: &mut ProjectMemory, event: DateTime<Utc>) -> Result<(), MemoryError> {
+fn compact(
+    memory: &mut ProjectMemory,
+    event: DateTime<Utc>,
+    preserve_id: &str,
+) -> Result<(), MemoryError> {
     let watermark = memory.retention_watermark;
-    while memory.facts.len() > MAX_FACTS || encode_store(memory)?.len() > MAX_HOT_STORE_BYTES {
+    while memory.facts.len() > MAX_FACTS
+        || encode_store_unbounded(memory)?.len() > MAX_HOT_STORE_BYTES
+    {
         let index = pick_expired(&memory.facts, event, watermark)
             .or_else(|| pick_query_superseded(&memory.facts, event, watermark))
-            .or_else(|| pick_noncritical(&memory.facts, watermark));
+            .or_else(|| pick_noncritical(&memory.facts, watermark, Some(preserve_id)));
         let Some(index) = index else {
             return Err(MemoryError::Capacity);
         };
@@ -1536,7 +1569,7 @@ fn apply_incoming(
 ) -> Result<(), MemoryError> {
     let incoming_id = incoming.id.clone();
     memory.facts.push(incoming);
-    compact(memory, now)?;
+    compact(memory, now, &incoming_id)?;
     if !memory.facts.iter().any(|fact| fact.id == incoming_id) {
         return Err(MemoryError::Capacity);
     }
@@ -3492,7 +3525,9 @@ mod tests {
                 if expected_critical.contains(&fact.text) {
                     critical_hits += 1;
                 }
-                if fact.text.contains("pref v1") || fact.text.contains(" status ") {
+                if fact.text.contains("pref v1")
+                    || (fact.text.contains(" status ") && is_expired(fact, clock.now()))
+                {
                     stale_or_expired += 1;
                 }
             }
@@ -3615,7 +3650,7 @@ mod tests {
             CommitCutpoint::AfterRenameBeforeDirFsync,
             CommitCutpoint::BeforeRename
         );
-        assert!(MAX_FACTS < 81);
+        const { assert!(MAX_FACTS < 81) };
         assert_eq!(SCHEMA_V2, "grokptah.memory.v2");
         let lexical_wrong = "2024-01-01T00:00:00-05:00" < "2024-01-01T04:00:00Z";
         let parsed_right = parse_timestamp("2024-01-01T00:00:00-05:00").unwrap()
