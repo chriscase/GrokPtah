@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   discard: vi.fn(),
   pause: vi.fn(),
   takeOver: vi.fn(),
+  reconcile: vi.fn(),
   stop: vi.fn(),
 }));
 
@@ -45,6 +46,7 @@ vi.mock("../lib/api", () => ({
     computerUseCockpitDiscardApproval: mocks.discard,
     computerUseCockpitPause: mocks.pause,
     computerUseCockpitTakeOver: mocks.takeOver,
+    computerUseCockpitReconcileUncertainSurface: mocks.reconcile,
     computerUseCockpitStop: mocks.stop,
   },
 }));
@@ -435,6 +437,44 @@ describe("ComputerCockpit", () => {
     expect(await screen.findByText("Take over active")).toBeTruthy();
     expect(screen.getByText(/cannot be reauthorized after takeover/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Reauthorize and observe" })).toBeNull();
+  });
+
+  it("requires an explicit bounded note before releasing an uncertain surface fence", async () => {
+    const uncertain = snapshot({
+      ...localView("failed"),
+      controlDisposition: "uncertain_outcome",
+      lastError: { code: "uncertain_outcome" },
+    });
+    uncertain.reconciliation = {
+      leaseId: "lease-uncertain",
+      expectedRevision: 4,
+      surfaceId: "surface-1",
+      incarnation: "incarnation-1",
+    };
+    mocks.snapshot.mockResolvedValue(uncertain);
+    mocks.reconcile.mockResolvedValue(snapshot(localView("failed")));
+    render(<ComputerCockpit {...props} />);
+
+    expect(await screen.findByRole("heading", { name: "Outcome needs local confirmation" })).toBeTruthy();
+    const release = screen.getByRole("button", { name: "Quarantine and release fence" });
+    expect(release).toBeDisabled();
+    fireEvent.change(screen.getByRole("textbox", { name: "Operator confirmation note" }), {
+      target: { value: "I verified this exact surface is clear." },
+    });
+    expect(release).toBeEnabled();
+    fireEvent.click(release);
+
+    await waitFor(() =>
+      expect(mocks.reconcile).toHaveBeenCalledWith(
+        "session-1",
+        "run-1",
+        "lease-uncertain",
+        4,
+        "surface-1",
+        "incarnation-1",
+        "I verified this exact surface is clear.",
+      ),
+    );
   });
 
   it("qualifies an unknown model before offering agent proposals", async () => {

@@ -45,6 +45,10 @@ complete or that the product has reached 100%.
   warnings`: passed after the observation-fence and reconciliation changes.
 - Desktop Tauri `cargo check --locked` passed with the cockpit reconciliation
   command/API wired through the host-authorized path.
+- The packaged cockpit now renders an accessible exact-surface reconciliation
+  panel with bounded operator notes and a fail-closed release action; its
+  TypeScript typecheck, full frontend suite (357 tests), and production Vite
+  build all pass.
 - `memory::tests`: 34 passed, 0 failed.
 - Host memory-scope suite: 6 passed, including versioned replay and payload
   conflict rejection.
@@ -68,8 +72,7 @@ complete or that the product has reached 100%.
 2. Complete the independent long-running worker outcome: multi-worker crash/
    restart recovery, no duplicate execution, least-privilege production-shaped
    credentials, retained evidence, and the operational soak.
-3. Surface the reconciliation workflow in the packaged cockpit with accessible
-   operator affordances, then complete live Grok Build quota/exhaustion
-   evidence, isolated visual Computer Use hardware proof, recurring expert UI
-   reviews, a 72-hour operational soak, and the enterprise-gateway
-   long-running review lane.
+3. Complete visual acceptance of the packaged reconciliation workflow, then
+   complete live Grok Build quota/exhaustion evidence, isolated visual
+   Computer Use hardware proof, recurring expert UI reviews, a 72-hour
+   operational soak, and the enterprise-gateway long-running review lane.

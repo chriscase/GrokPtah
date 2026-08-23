@@ -97,6 +97,7 @@ export function ComputerCockpit({
   const [agentEligibility, setAgentEligibility] = useState<ComputerAgentEligibility | null>(null);
   const [agentBusy, setAgentBusy] = useState(false);
   const [steerText, setSteerText] = useState("");
+  const [reconciliationNote, setReconciliationNote] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -115,6 +116,7 @@ export function ComputerCockpit({
     setBusy(false);
     setAgentBusy(false);
     setAgentEligibility(null);
+    setReconciliationNote("");
     setObjective(DEFAULT_AGENT_OBJECTIVE);
     if (!sessionId) {
       onRunState?.(null);
@@ -148,18 +150,20 @@ export function ComputerCockpit({
   const apply = async (
     mutation: () => Promise<ComputerCockpitSnapshot>,
     success?: string,
-  ) => {
+  ): Promise<boolean> => {
     const epoch = requestEpoch.current;
     setBusy(true);
     setError(null);
     try {
       const next = await mutation();
-      if (requestEpoch.current !== epoch) return;
+      if (requestEpoch.current !== epoch) return false;
       setSnapshot(next);
       setNotice(success ?? null);
       onRunState?.(next.local?.state ?? null);
+      return true;
     } catch (reason) {
       if (requestEpoch.current === epoch) setError(String(reason));
+      return false;
     } finally {
       if (requestEpoch.current === epoch) setBusy(false);
     }
@@ -178,6 +182,7 @@ export function ComputerCockpit({
     ["status", "AXStaticText"].includes(element.role),
   );
   const approval = snapshot?.pendingApproval ?? null;
+  const reconciliation = snapshot?.reconciliation ?? null;
   const grantActive = Boolean(run?.grant && !run.grant.revokedAt);
   const timeline = useMemo(() => run?.audit.slice(-12).reverse() ?? [], [run]);
   const selectedNativeTarget = nativeTargets.find(
@@ -307,6 +312,24 @@ export function ComputerCockpit({
         action,
       ),
     );
+  };
+
+  const reconcileUncertainSurface = async () => {
+    if (!sessionId || !run || !reconciliation || !reconciliationNote.trim()) return;
+    const succeeded = await apply(
+      () =>
+        api.computerUseCockpitReconcileUncertainSurface(
+          sessionId,
+          run.runId,
+          reconciliation.leaseId,
+          reconciliation.expectedRevision,
+          reconciliation.surfaceId,
+          reconciliation.incarnation,
+          reconciliationNote.trim(),
+        ),
+      "The uncertain dispatch was quarantined. No physical outcome was claimed.",
+    );
+    if (succeeded) setReconciliationNote("");
   };
 
   return (
@@ -674,6 +697,44 @@ export function ComputerCockpit({
               )}
             </aside>
           </div>
+
+          {reconciliation && (
+            <section className="computer-reconciliation" aria-labelledby="computer-reconciliation-title">
+              <div>
+                <span className="computer-section-label">Physical dispatch fence</span>
+                <h2 id="computer-reconciliation-title">Outcome needs local confirmation</h2>
+                <p>
+                  The action crossed the injection boundary, but its physical result is unknown.
+                  GrokPtah will not replay it or call it successful. Confirm that this exact
+                  surface is clear before releasing the safety fence.
+                </p>
+              </div>
+              <dl>
+                <div><dt>Surface</dt><dd>{run.target.displayName}</dd></div>
+                <div><dt>Lease revision</dt><dd>{reconciliation.expectedRevision}</dd></div>
+                <div><dt>Surface identity</dt><dd><code>{reconciliation.surfaceId}</code></dd></div>
+                <div><dt>Incarnation</dt><dd><code>{reconciliation.incarnation}</code></dd></div>
+              </dl>
+              <label>
+                Operator confirmation note
+                <textarea
+                  rows={2}
+                  maxLength={128}
+                  value={reconciliationNote}
+                  placeholder="I verified this exact surface is clear."
+                  onChange={(event) => setReconciliationNote(event.target.value)}
+                />
+              </label>
+              <button
+                type="button"
+                className="primary"
+                disabled={busy || !reconciliationNote.trim()}
+                onClick={() => void reconcileUncertainSurface()}
+              >
+                Quarantine and release fence
+              </button>
+            </section>
+          )}
 
           {run.state === "ready" && observation && !approval && (
             <div className="computer-proposal">

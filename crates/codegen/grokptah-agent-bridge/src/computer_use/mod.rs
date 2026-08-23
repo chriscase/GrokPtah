@@ -35,7 +35,7 @@ pub use projection::{
     ComputerLocalError, ComputerLocalGrant, ComputerLocalLimits, ComputerLocalObservation,
     ComputerLocalTarget, ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange,
     ComputerRunProgress, ComputerRunProjection, ComputerScopeCapacity, ComputerTargetSummary,
-    ObservationSummary, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    ComputerUncertainSurfaceLease, ObservationSummary, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
 pub use reads::{ComputerReadBinding, ComputerRunReads};
 

@@ -10,8 +10,9 @@ use grokptah_agent_bridge::{
     ComputerAgentProposal, ComputerAuthorityToken, ComputerBackendPublicView, ComputerCapabilities,
     ComputerError, ComputerLocalApproval, ComputerObservation, ComputerObservationPlatform,
     ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun,
-    ComputerRunProjection, ComputerRunState, ComputerTargetCandidate, ComputerUseLimits,
-    ComputerUseService, SemanticAction, SimulatorBackend,
+    ComputerRunProjection, ComputerRunState, ComputerTargetCandidate,
+    ComputerUncertainSurfaceLease, ComputerUseLimits, ComputerUseService, SemanticAction,
+    SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -54,6 +55,9 @@ pub struct ComputerCockpitSnapshot {
     /// bindings, proofs, evidence tokens, and backend text stay internal.
     pub local: Option<ComputerLocalApproval>,
     pub pending_approval: Option<PendingComputerApproval>,
+    /// Exact opaque handles for an owning operator's uncertain-dispatch
+    /// reconciliation workflow. Absent for ordinary runs.
+    pub reconciliation: Option<ComputerUncertainSurfaceLease>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -316,6 +320,24 @@ impl DesktopComputerUse {
                 .unwrap_or_else(unavailable_native_capabilities),
             None => index.capabilities(),
         };
+        let reconciliation = if let Some(run) = run.as_ref() {
+            let service = if run.target.app_id == SimulatorBackend::demo_target().app_id {
+                Some(index.clone())
+            } else {
+                self.native_services
+                    .lock()
+                    .map_err(|_| "Computer Use native run state is unavailable".to_string())?
+                    .get(&run.run_id)
+                    .cloned()
+            };
+            service
+                .map(|service| service.uncertain_surface_lease(&run.run_id))
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .flatten()
+        } else {
+            None
+        };
         Ok(ComputerCockpitSnapshot {
             backend: ComputerBackendPublicView::from_capabilities(&backend),
             origin: "desktop".into(),
@@ -324,6 +346,7 @@ impl DesktopComputerUse {
                 .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now())),
             local: run.as_ref().map(ComputerLocalApproval::from_run),
             pending_approval,
+            reconciliation,
         })
     }
 

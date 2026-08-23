@@ -5440,6 +5440,54 @@ button:disabled {
   border-bottom: 1px solid var(--border-soft);
 }
 
+.computer-reconciliation {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0.8rem 1rem;
+  padding: 0.85rem;
+  border: 1px solid rgba(224, 98, 95, 0.48);
+  border-left: 3px solid var(--danger, #e0625f);
+  border-radius: 8px;
+  background: rgba(224, 98, 95, 0.07);
+}
+
+.computer-reconciliation p {
+  max-width: 72ch;
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.computer-reconciliation dl {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+}
+
+.computer-reconciliation label {
+  display: grid;
+  gap: 0.25rem;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.computer-reconciliation textarea {
+  width: 100%;
+  min-height: 3rem;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.computer-reconciliation button {
+  justify-self: start;
+}
+
+.computer-reconciliation code {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 10px;
+}
+
 .computer-proposal {
   align-items: flex-end;
   flex-wrap: wrap;
@@ -5586,6 +5634,10 @@ button:disabled {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .computer-reconciliation dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .computer-agent-proposal {
     grid-template-columns: minmax(0, 1fr);
     align-items: stretch;
@@ -5617,6 +5669,10 @@ button:disabled {
   }
 
   .computer-scope-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .computer-reconciliation dl {
     grid-template-columns: minmax(0, 1fr);
   }
 

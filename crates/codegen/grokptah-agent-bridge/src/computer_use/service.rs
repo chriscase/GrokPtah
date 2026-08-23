@@ -11,7 +11,7 @@ use super::coordination::{ComputerDispatchClaim, ComputerSurfaceLease};
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
-    ComputerRunProjection,
+    ComputerRunProjection, ComputerUncertainSurfaceLease,
 };
 use super::store::{ComputerStore, MutationClaim, MutationStamp};
 use super::types::{
@@ -157,6 +157,36 @@ impl ComputerUseService {
 
     pub fn get_run(&self, run_id: &str) -> ComputerResult<Option<ComputerRun>> {
         self.store.load_run(run_id)
+    }
+
+    /// Return the exact opaque handles needed for an owning local operator to
+    /// reconcile this run's uncertain physical dispatch. No outcome, target
+    /// content, evidence token, or backend text is exposed.
+    pub fn uncertain_surface_lease(
+        &self,
+        run_id: &str,
+    ) -> ComputerResult<Option<ComputerUncertainSurfaceLease>> {
+        validate_id("run_id", run_id)?;
+        let _run = self.store.load_run(run_id)?.ok_or_else(|| {
+            ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown computer run")
+        })?;
+        Ok(self
+            .store
+            .list_surface_leases()?
+            .into_iter()
+            .find(|lease| {
+                lease.run_id == run_id
+                    && lease.state == super::coordination::ComputerSurfaceLeaseState::Uncertain
+                    && lease.dispatch.as_ref().is_some_and(|dispatch| {
+                        dispatch.state == super::coordination::ComputerDispatchState::Uncertain
+                    })
+            })
+            .map(|lease| ComputerUncertainSurfaceLease {
+                lease_id: lease.lease_id,
+                expected_revision: lease.revision,
+                surface_id: lease.surface.surface_id,
+                incarnation: lease.surface.incarnation,
+            }))
     }
 
     /// Local-operator projection of every run owned by one session, newest
@@ -2656,6 +2686,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(uncertain.state, ComputerSurfaceLeaseState::Uncertain);
+        let handles = service
+            .uncertain_surface_lease(&run.run_id)
+            .unwrap()
+            .expect("uncertain lease handles");
+        assert_eq!(handles.lease_id, uncertain.lease_id);
+        assert_eq!(handles.expected_revision, uncertain.revision);
+        assert_eq!(handles.surface_id, uncertain.surface.surface_id);
+        assert_eq!(handles.incarnation, uncertain.surface.incarnation);
 
         let operator = caller(&run, &service);
         service

@@ -163,6 +163,18 @@ pub struct ComputerRunProjection {
     pub initiating_principal_kind: String,
 }
 
+/// Exact opaque handles an owning local operator needs to reconcile one
+/// uncertain physical dispatch. This projection is emitted only by the local
+/// cockpit path; it carries no target content, evidence token, or outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerUncertainSurfaceLease {
+    pub lease_id: String,
+    pub expected_revision: u64,
+    pub surface_id: String,
+    pub incarnation: String,
+}
+
 /// One bounded, cursor-addressed page of a run's durable event journal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

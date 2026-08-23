@@ -1269,6 +1269,15 @@ export interface ComputerCockpitSnapshot {
   /** Allowlisted local approval/observation DTO. */
   local?: ComputerLocalApproval | null;
   pendingApproval?: PendingComputerApproval | null;
+  reconciliation?: ComputerUncertainSurfaceLease | null;
+}
+
+/** Exact opaque handles shown only to the owning local operator. */
+export interface ComputerUncertainSurfaceLease {
+  leaseId: string;
+  expectedRevision: number;
+  surfaceId: string;
+  incarnation: string;
 }
 
 export interface ComputerAgentEligibility {
