@@ -71,6 +71,12 @@ complete or that the product has reached 100%.
   ordinary scoped durable-work path, replaying plan-bound request IDs on
   partial retries; provider attach and live quality evidence remain separate
   gates.
+- The loopback MCP control plane now exposes `ptah_create_enterprise_review`.
+  It accepts only the signed lease, separate operator public trust, and
+  secret-free repository/scope fingerprints; it verifies gateway trust before
+  materializing the seven passes and is guarded by the existing `WorkCreate`
+  authority. Unsigned or caller-prebuilt plans cannot enter through this
+  surface.
 - The provider-quota receipt contract now requires a named campaign, credential
   and route binding plus distinct provider-side consumption and HTTP-429
   exhaustion observations. Digests, ordering, schema, and secret-free output
@@ -101,7 +107,7 @@ complete or that the product has reached 100%.
   gateway, so the candidate parity campaign still needs a host run.
 - Certification-lab shutdown now awaits each Tokio worker exactly once; the
   prior timeout-then-second-await path could panic with `JoinHandle polled
-  after completion`. The offline lab suite is now a clean 90/90, but this is
+  after completion`. The offline lab suite is now a clean 92/92, but this is
   harness/restart reliability evidence, not a live or 72-hour soak claim.
 
 ## Verification recorded
@@ -112,7 +118,7 @@ The assembled candidate was rerun in an isolated checkout after the UI and
 enterprise slices were present:
 
 - Enterprise admission: 4 passed, 0 failed.
-- Full `grokptah-agent-bridge` library suite: 674 passed, 0 failed;
+- Full `grokptah-agent-bridge` library suite: 675 passed, 0 failed;
   signed-attestation verification and all existing Computer Use, memory, and
   orchestration regressions are included.
 - Agent bridge Clippy (`-D warnings`, library target): passed.

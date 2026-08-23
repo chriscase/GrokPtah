@@ -22,6 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
+use chrono::Utc;
 use futures::stream;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,10 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use crate::enterprise_review::{
+    EnterpriseGatewayTrust, EnterpriseReviewLease, EnterpriseReviewPolicy,
+};
+use crate::enterprise_review_plan::build_enterprise_review_plan_with_trust;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
     required_operation, scrub_route_secret_needles, AuthContext, ChangeRecord, ManagerStepSpec,
@@ -1049,6 +1054,23 @@ struct CreateWorkArgs {
     policy: WorkPolicy,
 }
 
+/// Operator-authorized entry point for the provider-neutral enterprise review
+/// lane. The lease and public trust record contain no bearer or endpoint URL;
+/// the service verifies the detached gateway signature before materializing
+/// any durable work.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateEnterpriseReviewArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    review_id: String,
+    repository_fingerprint: String,
+    scope_fingerprint: String,
+    lease: EnterpriseReviewLease,
+    trust: EnterpriseGatewayTrust,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateManagerPlanArgs {
@@ -1929,6 +1951,69 @@ fn tool_input_schema(name: &str) -> Value {
             "maxDurationMs": {"type": "integer", "minimum": 1}
         }
     });
+    let enterprise_attestation = json!({
+        "type": "object",
+        "required": [
+            "schema", "route_id", "endpoint_fingerprint", "model_id", "model_tier",
+            "deployment_revision", "issued_at", "expires_at", "no_premium_fallback",
+            "egress_firewall_attested"
+        ],
+        "additionalProperties": false,
+        "properties": {
+            "schema": {"type": "string", "const": "grokptah.enterprise-gateway-attestation.v1"},
+            "route_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "endpoint_fingerprint": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+            "model_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "model_tier": {"type": "string", "const": "modest"},
+            "deployment_revision": {"type": "string", "minLength": 1, "maxLength": 256},
+            "issued_at": {"type": "string", "format": "date-time"},
+            "expires_at": {"type": "string", "format": "date-time"},
+            "no_premium_fallback": {"type": "boolean"},
+            "egress_firewall_attested": {"type": "boolean"},
+            "signing_key_id": {"type": ["string", "null"], "maxLength": 256},
+            "signature": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{128}$"}
+        }
+    });
+    let enterprise_lease = json!({
+        "type": "object",
+        "required": [
+            "schema", "lease_id", "credential_id", "route_id", "endpoint_fingerprint",
+            "model_id", "model_tier", "issued_at", "expires_at", "route_binding_digest",
+            "read_only", "allow_network", "allow_workspace_writes", "allow_publication",
+            "max_requests", "max_tokens", "max_duration_ms", "attestation"
+        ],
+        "additionalProperties": false,
+        "properties": {
+            "schema": {"type": "string", "const": "grokptah.enterprise-review-lease.v1"},
+            "lease_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "credential_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "route_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "endpoint_fingerprint": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+            "model_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "model_tier": {"type": "string", "const": "modest"},
+            "issued_at": {"type": "string", "format": "date-time"},
+            "expires_at": {"type": "string", "format": "date-time"},
+            "route_binding_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+            "read_only": {"type": "boolean"},
+            "allow_network": {"type": "boolean"},
+            "allow_workspace_writes": {"type": "boolean"},
+            "allow_publication": {"type": "boolean"},
+            "max_requests": {"type": "integer", "minimum": 1, "maximum": 400},
+            "max_tokens": {"type": "integer", "minimum": 1, "maximum": 1250000},
+            "max_duration_ms": {"type": "integer", "minimum": 1, "maximum": 28800000},
+            "attestation": enterprise_attestation
+        }
+    });
+    let enterprise_trust = json!({
+        "type": "object",
+        "required": ["schema", "key_id", "public_key_hex"],
+        "additionalProperties": false,
+        "properties": {
+            "schema": {"type": "string", "const": "grokptah.enterprise-review-trust.v1"},
+            "key_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "public_key_hex": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}
+        }
+    });
     match name {
         "ptah_list_sessions" | "ptah_list_persistent_agents" | "ptah_get_capacity" => json!({
             "type": "object",
@@ -2096,6 +2181,24 @@ fn tool_input_schema(name: &str) -> Value {
                 "parent_work_id": run_id,
                 "dependencies": {"type": "array", "maxItems": 128},
                 "policy": {"type": "object"}
+            }
+        }),
+        "ptah_create_enterprise_review" => json!({
+            "type": "object",
+            "required": [
+                "request_id", "session_id", "workspace", "review_id",
+                "repository_fingerprint", "scope_fingerprint", "lease", "trust"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "review_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "repository_fingerprint": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+                "scope_fingerprint": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+                "lease": enterprise_lease,
+                "trust": enterprise_trust
             }
         }),
         "ptah_create_manager_plan" => json!({
@@ -2983,6 +3086,31 @@ async fn dispatch_tool(
                 args.parent_work_id,
                 args.dependencies,
                 args.policy,
+            )
+            .await
+        }
+        "ptah_create_enterprise_review" => {
+            let args: CreateEnterpriseReviewArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            let plan = build_enterprise_review_plan_with_trust(
+                &args.lease,
+                &args.trust,
+                &EnterpriseReviewPolicy::default(),
+                Utc::now(),
+                args.review_id,
+                args.repository_fingerprint,
+                args.scope_fingerprint,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.to_string()))?;
+            let work_plan = plan.work_plan().map_err(|error| {
+                OrchError::new(OrchErrorCode::InvalidRequest, error.to_string())
+            })?;
+            orch.create_enterprise_review_work_plan(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                work_plan,
             )
             .await
         }

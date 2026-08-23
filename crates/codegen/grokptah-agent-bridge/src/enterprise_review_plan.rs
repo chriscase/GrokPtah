@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::enterprise_review::{
-    admit_enterprise_review, EnterpriseReviewAdmissionError, EnterpriseReviewEvidence,
-    EnterpriseReviewLease, EnterpriseReviewPolicy,
+    admit_enterprise_review, admit_enterprise_review_with_trust, EnterpriseGatewayTrust,
+    EnterpriseReviewAdmissionError, EnterpriseReviewEvidence, EnterpriseReviewLease,
+    EnterpriseReviewPolicy,
 };
 
 pub const ENTERPRISE_REVIEW_PLAN_SCHEMA: &str = "grokptah.enterprise-review-plan.v1";
@@ -357,6 +358,31 @@ pub fn build_enterprise_review_plan(
     };
     plan.plan_digest = plan_digest(&plan);
     Ok(plan)
+}
+
+/// Build a review plan only after verifying the gateway attestation against
+/// operator-configured public trust. The ordinary builder remains available
+/// for hermetic contract fixtures; this is the production-facing entry point
+/// used by the control plane so a caller cannot materialize work from
+/// self-asserted route metadata.
+pub fn build_enterprise_review_plan_with_trust(
+    lease: &EnterpriseReviewLease,
+    trust: &EnterpriseGatewayTrust,
+    policy: &EnterpriseReviewPolicy,
+    now: DateTime<Utc>,
+    review_id: impl Into<String>,
+    repository_fingerprint: impl Into<String>,
+    scope_fingerprint: impl Into<String>,
+) -> Result<EnterpriseReviewPlan, EnterpriseReviewPlanError> {
+    admit_enterprise_review_with_trust(lease, policy, now, trust)?;
+    build_enterprise_review_plan(
+        lease,
+        policy,
+        now,
+        review_id,
+        repository_fingerprint,
+        scope_fingerprint,
+    )
 }
 
 impl EnterpriseReviewPlan {
@@ -824,6 +850,32 @@ mod tests {
             assert!(template.objective.contains(&pass.objective_digest));
             assert!(!template.objective.contains("https://"));
         }
+    }
+
+    #[test]
+    fn trusted_plan_builder_rejects_unsigned_gateway_handoff() {
+        let now = Utc::now();
+        let trust = EnterpriseGatewayTrust {
+            schema: super::super::enterprise_review::ENTERPRISE_REVIEW_TRUST_SCHEMA.into(),
+            key_id: "broker-key-1".into(),
+            public_key_hex: "11".repeat(32),
+        };
+        let error = build_enterprise_review_plan_with_trust(
+            &lease(now),
+            &trust,
+            &EnterpriseReviewPolicy::default(),
+            now,
+            "review-trust",
+            "a".repeat(64),
+            "b".repeat(64),
+        )
+        .expect_err("unsigned gateway metadata must not materialize work");
+        assert!(matches!(
+            error,
+            EnterpriseReviewPlanError::Admission(
+                EnterpriseReviewAdmissionError::AttestationSignatureMissing
+            )
+        ));
     }
 
     #[test]

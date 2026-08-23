@@ -55,6 +55,15 @@ otherwise discard.
 The orchestration service now has a host-authorized materialization helper that
 uses the plan-bound keys as per-pass idempotency request IDs, so a partial
 broker retry replays completed WorkItems instead of duplicating them.
+The loopback MCP control plane exposes this as
+`ptah_create_enterprise_review`. That tool accepts only the review identity,
+secret-free repository/scope fingerprints, the signed lease, and the separate
+operator trust record. It requires the ordinary `WorkCreate` authority and
+verifies the detached signature before creating any WorkItem; callers cannot
+submit a pre-built work plan or self-authorize a route. This is the supported
+handoff for a company gateway whose model is weaker than the local orchestrator:
+the gateway owns provider execution, while GrokPtah owns decomposition,
+durability, retry identity, and read-only policy.
 The run accepts only safe location references, deduplicates findings across
 passes, and can resume only from a checkpoint bound to the exact plan digest.
 The resulting outcome is execution evidence, not a quality claim.
@@ -64,8 +73,9 @@ The resulting outcome is execution evidence, not a quality claim.
 The candidate now ships deterministic admission validation and denial tests for
 expiry, route/model drift, premium fallback, missing egress attestation,
 network/write/publication permission, bound overruns, unknown fields, and
-secret-free evidence. It also ships deterministic seven-pass planning and
-checkpoint/resume tests. This does **not** close the live gate: the
+secret-free evidence, plus a host-authorized MCP materialization path that
+rejects unsigned or self-authored gateway leases. It also ships deterministic
+seven-pass planning and checkpoint/resume tests. This does **not** close the live gate: the
 operator-owned broker, approved gateway, gateway-signed deployment attestation,
 external egress-firewall attestation, authoritative usage, durable worker
 execution, and multi-hour paired quality run remain required before Stage 12

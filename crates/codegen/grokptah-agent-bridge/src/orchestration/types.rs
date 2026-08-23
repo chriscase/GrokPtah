@@ -1682,6 +1682,7 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_submit_task",
     "ptah_resume_persistent_agent",
     "ptah_create_work",
+    "ptah_create_enterprise_review",
     "ptah_create_manager_plan",
     "ptah_list_manager_plans",
     "ptah_get_manager_plan",

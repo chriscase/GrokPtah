@@ -746,9 +746,11 @@ and finite Runs exist as separate contracts. The certification lab now has a
 host-only, secret-free lease attachment path for the operator-owned broker;
 the candidate verifies a detached Ed25519 gateway signature against a separate
 operator-selected public trust record before admitting that lease. That path
-still does not execute a provider campaign. **No** frozen-route, read-only,
-multi-hour enterprise review-lane certification exists. This row is **not**
-certified.
+still does not execute a provider campaign. The candidate also exposes
+`ptah_create_enterprise_review`, which verifies that signed handoff and
+materializes the seven bounded passes into durable WorkItems with stable
+idempotency keys. **No** frozen-route, read-only, multi-hour enterprise
+review-lane certification exists. This row is **not** certified.
 
 **Exit (all required):**
 

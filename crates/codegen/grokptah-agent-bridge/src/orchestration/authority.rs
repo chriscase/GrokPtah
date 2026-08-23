@@ -385,7 +385,7 @@ pub fn required_operation(tool: &str) -> Option<AuthorityOperation> {
         | "ptah_get_computer_run_events"
         | "ptah_get_computer_capacity" => ComputerRead,
         "ptah_list_work" | "ptah_get_work" | "ptah_list_work_decisions" => WorkRead,
-        "ptah_create_work" => WorkCreate,
+        "ptah_create_work" | "ptah_create_enterprise_review" => WorkCreate,
         "ptah_assign_work" => WorkAssign,
         "ptah_claim_work" => WorkClaim,
         "ptah_renew_work" | "ptah_release_work" => WorkLease,
