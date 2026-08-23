@@ -35,15 +35,24 @@ Any missing, stale, mismatched, or over-broad field rejects the lane before a
 provider turn. The returned `EnterpriseReviewEvidence` is secret-free and is
 safe to include in a public campaign report.
 
+After admission, `enterprise_review_plan.rs` freezes seven bounded specialist
+passes (correctness, security, concurrency, performance, tests, API, and UX).
+Each pass has a deterministic objective digest and request/token/time budget.
+The run accepts only safe location references, deduplicates findings across
+passes, and can resume only from a checkpoint bound to the exact plan digest.
+The resulting outcome is execution evidence, not a quality claim.
+
 ## Current status
 
 The candidate now ships deterministic admission validation and denial tests for
 expiry, route/model drift, premium fallback, missing egress attestation,
 network/write/publication permission, bound overruns, unknown fields, and
-secret-free evidence. This does **not** close the live gate: the operator-owned
-broker, approved gateway, gateway-signed deployment attestation, external
-egress-firewall attestation, authoritative usage, and multi-hour quality run
-remain required before Stage 12 can pass.
+secret-free evidence. It also ships deterministic seven-pass planning and
+checkpoint/resume tests. This does **not** close the live gate: the
+operator-owned broker, approved gateway, gateway-signed deployment attestation,
+external egress-firewall attestation, authoritative usage, durable worker
+execution, and multi-hour paired quality run remain required before Stage 12
+can pass.
 
 The fake benchmark remains a contract test only and must continue to report
 `qualityClaimEligible=false`.

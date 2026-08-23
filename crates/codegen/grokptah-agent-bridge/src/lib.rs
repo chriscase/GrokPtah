@@ -11,6 +11,7 @@ mod computer_agent;
 pub mod computer_use;
 mod discover;
 pub mod enterprise_review;
+pub mod enterprise_review_plan;
 pub mod eval_oracle;
 pub mod eval_report;
 pub mod event_bus;
@@ -72,6 +73,14 @@ pub use enterprise_review::{
     ENTERPRISE_REVIEW_EVIDENCE_SCHEMA, ENTERPRISE_REVIEW_LEASE_SCHEMA,
     MAX_ENTERPRISE_REVIEW_DURATION_MS, MAX_ENTERPRISE_REVIEW_REQUESTS,
     MAX_ENTERPRISE_REVIEW_TOKENS,
+};
+pub use enterprise_review_plan::{
+    build_enterprise_review_plan, EnterpriseReviewCheckpoint, EnterpriseReviewFindingRef,
+    EnterpriseReviewOutcome, EnterpriseReviewPass, EnterpriseReviewPassKind,
+    EnterpriseReviewPassResult, EnterpriseReviewPassStatus, EnterpriseReviewPlan,
+    EnterpriseReviewPlanError, EnterpriseReviewRun, ENTERPRISE_REVIEW_CHECKPOINT_SCHEMA,
+    ENTERPRISE_REVIEW_OUTCOME_SCHEMA, ENTERPRISE_REVIEW_PASS_ATTEMPTS,
+    ENTERPRISE_REVIEW_PASS_KINDS, ENTERPRISE_REVIEW_PLAN_SCHEMA,
 };
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
 pub use gateway_config::{

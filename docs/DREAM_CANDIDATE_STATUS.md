@@ -37,6 +37,11 @@ complete or that the product has reached 100%.
   requests/tokens/duration before a live review turn. Route drift, expiry,
   missing attestation, mutation/publication permission, and unknown fields fail
   closed. This is a prerequisite foundation, not a live gateway certification.
+- The enterprise review execution contract now freezes seven specialized
+  passes, derives per-pass budgets from the admitted route, accepts only safe
+  secret-free finding references, deduplicates cross-pass findings, and resumes
+  only from a plan-bound checkpoint. Its outcome remains explicitly
+  `quality_claim_eligible=false` until the live paired campaign is run.
 - Shared desktop/hosted black-box parity is present as a fail-closed fixture.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
@@ -88,6 +93,9 @@ unrelated signal.
 - Enterprise review admission unit suite: 4 passed, covering secret-free
   evidence plus expiry, route/model drift, fallback, egress, mutation, bound,
   and schema denials.
+- Enterprise review plan suite: 3 passed, covering deterministic seven-pass
+  decomposition, checkpoint resume/deduplication, unsafe-location rejection,
+  plan drift, and budget bounds.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.
