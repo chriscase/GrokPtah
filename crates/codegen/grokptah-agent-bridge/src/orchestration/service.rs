@@ -5665,23 +5665,7 @@ impl OrchestrationService {
     }
 
     fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
-        Ok(json!({
-            "runId": run.run_id,
-            "sessionId": run.session_id,
-            "state": run.state,
-            "finalResponse": run.final_response,
-            "terminalResult": run.terminal_result,
-            "stopCause": run.stop_cause,
-            "startSeq": run.start_seq,
-            "endSeq": run.end_seq,
-            "bounds": run.bounds,
-            "changes": run.aggregates.changes,
-            "tests": run.aggregates.tests,
-            "verification": run.aggregates.verification,
-            "usage": run.aggregates.usage,
-            "usageComplete": run.aggregates.usage_complete,
-            "usagePendingRequests": run.aggregates.usage_pending_requests,
-        }))
+        super::public_run_handoff_value(&super::project_public_run(&self.store, &run)?)
     }
 
     fn scoped_events_complete(

@@ -56,13 +56,14 @@ pub use provider_attempt::{
 pub use public_run::{
     encode_public_run_receipt, page_public_runs, project_public_run, project_public_run_progress,
     public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
-    public_run_from_receipt, public_run_progress_to_value, public_run_to_value, PublicChangeRecord,
-    PublicCompletionClaims, PublicCompletionEvidence, PublicCompletionObservations,
-    PublicCompletionUsage, PublicProviderAttempt, PublicProviderExecution, PublicProviderQuota,
-    PublicProviderRouteSummary, PublicQuotaLimits, PublicRun, PublicRunAggregates,
-    PublicRunApproval, PublicRunBounds, PublicRunExecution, PublicRunPage, PublicRunProgress,
-    PublicRunProgressDetail, PublicTestObservation, PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
-    PUBLIC_PROVIDER_ROUTE_KEYS, PUBLIC_RUN_LIST_PAGE_LIMIT, PUBLIC_RUN_RECEIPT_SCHEMA,
+    public_run_from_receipt, public_run_handoff_value, public_run_progress_to_value,
+    public_run_to_value, PublicChangeRecord, PublicCompletionClaims, PublicCompletionEvidence,
+    PublicCompletionObservations, PublicCompletionUsage, PublicProviderAttempt,
+    PublicProviderExecution, PublicProviderQuota, PublicProviderRouteSummary, PublicQuotaLimits,
+    PublicRun, PublicRunAggregates, PublicRunApproval, PublicRunBounds, PublicRunExecution,
+    PublicRunPage, PublicRunProgress, PublicRunProgressDetail, PublicTestObservation,
+    PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS, PUBLIC_PROVIDER_ROUTE_KEYS, PUBLIC_RUN_LIST_PAGE_LIMIT,
+    PUBLIC_RUN_RECEIPT_SCHEMA,
 };
 pub use quota::{
     QuotaClass, QuotaLimits, QuotaPoolKey, QuotaPoolUsage, QuotaReservation, QuotaReservationState,

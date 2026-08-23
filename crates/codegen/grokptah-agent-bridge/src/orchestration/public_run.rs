@@ -591,6 +591,28 @@ pub fn public_run_progress_to_value(progress: &PublicRunProgress) -> Result<Valu
     encode_allowlisted(progress)
 }
 
+/// Coordinator handoff built from the same scrubbed PublicRun as get/list.
+pub fn public_run_handoff_value(run: &PublicRun) -> Result<Value, OrchError> {
+    encode_allowlisted(&serde_json::json!({
+        "runId": run.run_id,
+        "sessionId": run.session_id,
+        "state": run.state,
+        "finalResponse": run.final_response,
+        "terminalResult": run.terminal_result,
+        "stopCause": run.stop_cause,
+        "startSeq": run.start_seq,
+        "endSeq": run.end_seq,
+        "bounds": run.bounds,
+        "changes": run.aggregates.changes,
+        "tests": run.aggregates.tests,
+        "verification": run.aggregates.verification,
+        "usage": run.aggregates.usage,
+        "usageComplete": run.aggregates.usage_complete,
+        "usagePendingRequests": run.aggregates.usage_pending_requests,
+        "errorCode": run.error_code,
+    }))
+}
+
 pub fn public_run_contains_forbidden_fields(value: &Value) -> bool {
     contains_forbidden_key(value)
 }
@@ -1482,6 +1504,7 @@ mod tests {
             &project_public_run_progress(&store, &loaded, false).unwrap(),
         )
         .unwrap();
+        let handoff = public_run_handoff_value(&projected).unwrap();
         let receipt = encode_public_run_receipt(&projected).unwrap();
         let replayed = public_run_from_receipt(&store, receipt.clone()).unwrap();
         let legacy = serde_json::to_value(&loaded).unwrap();
@@ -1512,6 +1535,20 @@ mod tests {
                 "{name} must use the typed public error code"
             );
         }
+        let handoff_encoded = handoff.to_string();
+        assert!(
+            !handoff_encoded.contains(BASE_URL_SENTINEL)
+                && !handoff_encoded.contains(CREDENTIAL_REF_SENTINEL),
+            "handoff MCP text leaked route secrets: {handoff_encoded}"
+        );
+        assert!(handoff.get("providerRoute").is_none());
+        assert!(handoff.get("providerExecution").is_none());
+        assert_eq!(
+            handoff["errorCode"], PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
+            "handoff must use the typed public error code"
+        );
+        assert!(handoff["finalResponse"].is_null());
+        assert!(handoff["terminalResult"].is_null());
         assert!(projected.final_response.is_none());
         assert!(projected.terminal_result.is_none());
     }
