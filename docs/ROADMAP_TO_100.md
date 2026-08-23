@@ -648,6 +648,9 @@ proof still required.
   - Unresolved P0/P1 UX/accessibility findings **block** the next
     integration/release gate. Lower findings require explicit disposition
     and regression coverage.
+  - The secret-free evidence shape is defined in
+    [`UI_REVIEW_EVIDENCE.md`](UI_REVIEW_EVIDENCE.md) and enforced by
+    `ui_review_evidence.rs`; it does not replace the dated expert review.
   No dated cadence review of an assembled head is recorded. Phase 2
   prototypes do not close this.
 

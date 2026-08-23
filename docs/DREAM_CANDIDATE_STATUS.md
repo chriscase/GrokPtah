@@ -60,6 +60,10 @@ complete or that the product has reached 100%.
   combined packaged-desktop/hosted-service evidence, measured RTO/RPO, backup
   confidentiality, and explicit active-target deletion refusal. It remains a
   runbook/report shape, not a dated production-like drill.
+- The recurring expert UI/UX review evidence contract now binds an exact
+  assembled SHA, packaged-window surfaces/workflows, visual state matrix,
+  accessibility checks, and severity disposition. It remains an evidence
+  contract; no dated expert review is claimed yet.
 - Shared desktop/hosted black-box parity is present as a fail-closed fixture.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
@@ -122,6 +126,9 @@ unrelated signal.
   unknown or malformed evidence.
 - Worker lease claimant fencing: bound-credential ownership check passed;
   independent worker leases remained distinct and durable across store reopen.
+- UI review evidence suite: 4 passed, covering complete packaged evidence,
+  missing visual states, unresolved P1 findings, malformed digests, unknown
+  fields, and missing deferred tracking.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.
@@ -141,6 +148,7 @@ unrelated signal.
    rotation of least-privilege credentials, retained evidence, and the
    operational soak.
 3. Complete visual acceptance of the packaged reconciliation workflow, then
-   complete live Grok Build quota/exhaustion evidence, isolated visual
-   Computer Use hardware proof, recurring expert UI reviews, a 72-hour
-   operational soak, and the enterprise-gateway long-running review lane.
+   execute the new recurring expert review cadence, then complete live Grok
+   Build quota/exhaustion evidence, isolated visual Computer Use hardware
+   proof, a 72-hour operational soak, and the enterprise-gateway long-running
+   review lane.

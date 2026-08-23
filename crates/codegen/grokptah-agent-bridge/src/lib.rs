@@ -54,6 +54,7 @@ mod ssrf;
 mod textutil;
 mod todo_list;
 mod types;
+pub mod ui_review_evidence;
 mod worktree_gc;
 
 pub use agents_personas::{
@@ -120,6 +121,11 @@ pub use provider_quota_receipt::{
 pub use ssrf::{check_url as ssrf_check_url, SsrfDecision};
 
 pub use textutil::{truncate_at_char_boundary, truncate_with_marker};
+pub use ui_review_evidence::{
+    UiReviewAccessibilityEvidence, UiReviewCadence, UiReviewDisposition, UiReviewEvidence,
+    UiReviewEvidenceError, UiReviewFinding, UiReviewSeverity, UiReviewStateEvidence,
+    REQUIRED_UI_REVIEW_STATES, UI_REVIEW_EVIDENCE_SCHEMA,
+};
 
 /// Coding-agent efficiency guidance (system prompt fragment for multi-file / multi-bug turns).
 pub use host_helpers::coding_agent_efficiency_guidance;
