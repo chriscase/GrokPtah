@@ -31,5 +31,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(ALWAYS_ON_GROKBOT_FIXTURE).unwrap();
         assert_eq!(value["schema"], ALWAYS_ON_GROKBOT_FIXTURE_SCHEMA);
         assert_eq!(value["schemaVersion"], 2);
+        assert_eq!(
+            value["failClosed"]["malformed"]["stopCause"],
+            "token_accounting_unavailable"
+        );
     }
 }

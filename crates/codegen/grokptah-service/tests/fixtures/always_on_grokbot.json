@@ -48,26 +48,31 @@
   "failClosed": {
     "cancel": {
       "runState": "cancelled",
+      "stopCause": "token_accounting_unavailable",
       "errorCode": "max_total_tokens_usage_unavailable",
       "posts": 1
     },
     "malformed": {
       "runState": "limit_reached",
+      "stopCause": "token_accounting_unavailable",
       "errorCode": "max_total_tokens_usage_unavailable",
       "posts": 1
     },
     "disconnect": {
       "runState": "limit_reached",
+      "stopCause": "token_accounting_unavailable",
       "errorCode": "max_total_tokens_usage_unavailable",
       "posts": 1
     },
     "status500": {
       "runState": "limit_reached",
+      "stopCause": "token_accounting_unavailable",
       "errorCode": "max_total_tokens_usage_unavailable",
       "posts": 1
     },
     "slow": {
       "runState": "limit_reached",
+      "stopCause": "token_accounting_unavailable",
       "errorCode": "max_total_tokens_usage_unavailable",
       "posts": 1
     }

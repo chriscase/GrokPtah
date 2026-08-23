@@ -115,6 +115,22 @@ fn run_error_code(run: &Value) -> &str {
     run["errorCode"].as_str().unwrap_or("")
 }
 
+fn run_stop_cause(run: &Value) -> &str {
+    run["stopCause"].as_str().unwrap_or("")
+}
+
+fn matches_fail_closed(
+    run: &Value,
+    run_id: &str,
+    expect: &always_on_support::FailClosedExpect,
+) -> bool {
+    run["runId"].as_str() == Some(run_id)
+        && run["state"].as_str() == Some(expect.run_state.as_str())
+        && run_stop_cause(run) == expect.stop_cause.as_str()
+        && run_error_code(run) == expect.error_code.as_str()
+        && pending_usage(run) == 0
+}
+
 async fn bootstrap_agent(client: &mut McpControlClient, workspace: &Path) -> (Uuid, String) {
     let created = call(
         client,
@@ -840,6 +856,17 @@ async fn fixture_schema_is_consumed() {
     assert_eq!(fixture.proposal_runs, 1);
     assert_eq!(fixture.native_work_by_step.get("step-a"), Some(&1));
     assert_eq!(fixture.posts_by_semantic.get("step-a"), Some(&1));
+    assert_eq!(fixture.posts_by_semantic.get("step-b-fix"), Some(&1));
+    assert_eq!(fixture.posts_by_semantic.get("manager-decision"), Some(&1));
+    let malformed = fixture.fail_closed_case("malformed");
+    assert_eq!(malformed.run_state, "limit_reached");
+    assert_eq!(malformed.stop_cause, "token_accounting_unavailable");
+    assert_eq!(malformed.error_code, "max_total_tokens_usage_unavailable");
+    assert_eq!(malformed.posts, 1);
+    let cancel = fixture.fail_closed_case("cancel");
+    assert_eq!(cancel.run_state, "cancelled");
+    assert_eq!(cancel.stop_cause, "token_accounting_unavailable");
+    assert_eq!(cancel.posts, 1);
     certify("fixture-cardinalities-drive-runtime-oracle");
     assert_eq!(fixture.ci_mode, "one-cycle-smoke");
     assert_eq!(
@@ -1311,6 +1338,20 @@ async fn fail_closed_invalid_directive_cancel_auth_workspace_provider_faults() {
         certify(assertion);
         faults.scan();
     }
+    let recorded = recorded_assertions();
+    for name in [
+        "malformed-provider-exact-terminal",
+        "disconnect-provider-exact-terminal",
+        "status500-provider-exact-terminal",
+        "timeout-provider-exact-terminal",
+        "cancel-two-restarts-no-resend",
+        "invalid-directive-zero-replacement",
+    ] {
+        assert!(
+            recorded.contains(name),
+            "required assertion {name} was not recorded by a runtime oracle: {recorded:?}"
+        );
+    }
 
     let mut auth = Campaign::start().await;
     let before_home = auth.service.durable_home_entries();
@@ -1501,18 +1542,18 @@ async fn fail_closed_two_restarts(
             "workspace": &campaign.workspace,
             "run_id": run_id
         }),
-        |value| {
-            value["runId"].as_str() == Some(run_id)
-                && value["state"].as_str() == Some(expect.run_state.as_str())
-                && run_error_code(value) == expect.error_code.as_str()
-                && pending_usage(value) == 0
-        },
+        |value| matches_fail_closed(value, run_id, expect),
     )
     .await;
     assert_eq!(
         run["state"].as_str(),
         Some(expect.run_state.as_str()),
         "{semantic} terminal state: {run}"
+    );
+    assert_eq!(
+        run_stop_cause(&run),
+        expect.stop_cause.as_str(),
+        "{semantic} stopCause: {run}"
     );
     assert_eq!(
         run_error_code(&run),
@@ -1532,15 +1573,11 @@ async fn fail_closed_two_restarts(
                 "workspace": &campaign.workspace,
                 "run_id": run_id
             }),
-            |value| {
-                value["runId"].as_str() == Some(run_id)
-                    && value["state"].as_str() == Some(expect.run_state.as_str())
-                    && run_error_code(value) == expect.error_code.as_str()
-                    && pending_usage(value) == 0
-            },
+            |value| matches_fail_closed(value, run_id, expect),
         )
         .await;
         assert_eq!(recovered["state"].as_str(), Some(expect.run_state.as_str()));
+        assert_eq!(run_stop_cause(&recovered), expect.stop_cause.as_str());
         assert_eq!(run_error_code(&recovered), expect.error_code.as_str());
         assert_eq!(pending_usage(&recovered), 0);
         assert_eq!(campaign.provider.count_for(semantic), expect.posts);
@@ -1635,10 +1672,25 @@ async fn soak_hold_restart(campaign: &mut Campaign, cycle: u64) {
         },
     )
     .await;
-    let pid_before = campaign.service.pid();
+    let pid0 = campaign.service.pid();
     let before = cardinalities(&mut campaign.client, campaign.session, &campaign.workspace).await;
     campaign.reopen().await;
-    assert_ne!(campaign.service.pid(), pid_before);
+    let pid1 = campaign.service.pid();
+    assert_ne!(pid1, pid0);
+    soak_assert_interrupted_hold(campaign, &run_id, &semantic, &before).await;
+    campaign.reopen().await;
+    let pid2 = campaign.service.pid();
+    assert_ne!(pid2, pid1);
+    assert_ne!(pid2, pid0);
+    soak_assert_interrupted_hold(campaign, &run_id, &semantic, &before).await;
+}
+
+async fn soak_assert_interrupted_hold(
+    campaign: &mut Campaign,
+    run_id: &str,
+    semantic: &str,
+    before: &EntityCardinalities,
+) {
     let recovered = poll_json(
         &mut campaign.client,
         "ptah_get_run",
@@ -1648,7 +1700,7 @@ async fn soak_hold_restart(campaign: &mut Campaign, cycle: u64) {
             "run_id": run_id
         }),
         |value| {
-            value["runId"].as_str() == Some(run_id.as_str())
+            value["runId"].as_str() == Some(run_id)
                 && value["state"].as_str() == Some("interrupted")
                 && pending_usage(value) == 0
         },
@@ -1656,15 +1708,15 @@ async fn soak_hold_restart(campaign: &mut Campaign, cycle: u64) {
     .await;
     assert_eq!(recovered["state"].as_str(), Some("interrupted"));
     assert_eq!(pending_usage(&recovered), 0);
-    assert_eq!(campaign.provider.count_for(&semantic), 1);
+    assert_eq!(campaign.provider.count_for(semantic), 1);
     let window = campaign.fixture.supervisor_period
         * u32::try_from(campaign.fixture.zero_growth_periods).expect("periods");
     tokio::time::sleep(window).await;
     assert_eq!(
         cardinalities(&mut campaign.client, campaign.session, &campaign.workspace).await,
-        before
+        *before
     );
-    assert_eq!(campaign.provider.count_for(&semantic), 1);
+    assert_eq!(campaign.provider.count_for(semantic), 1);
 }
 
 async fn barrier_restart_on_campaign(campaign: &mut Campaign) -> CausalJoin {
@@ -1686,7 +1738,16 @@ async fn barrier_restart_on_campaign(campaign: &mut Campaign) -> CausalJoin {
     )
     .await;
     let step = campaign.fixture.step_first.clone();
+    let pid0 = campaign.service.pid();
     campaign.reopen().await;
+    let pid1 = campaign.service.pid();
+    assert_ne!(pid1, pid0);
+    assert_interrupted_fence(campaign, &join, &step).await;
+    assert_zero_growth_window(campaign, &join, &step).await;
+    campaign.reopen().await;
+    let pid2 = campaign.service.pid();
+    assert_ne!(pid2, pid1);
+    assert_ne!(pid2, pid0);
     assert_interrupted_fence(campaign, &join, &step).await;
     assert_zero_growth_window(campaign, &join, &step).await;
     assert_eq!(campaign.provider.count_for(&step), posts);
@@ -1708,6 +1769,10 @@ async fn soak_one_bounded_cycle() {
     assert!(duration_ms <= campaign.fixture.ceilings.max_cycle_latency_ms);
     let growth = max.growth_from(&baseline);
     assert_resource_ceilings(&max, &growth, &campaign.fixture);
+    assert!(
+        campaign.provider.live_threads() <= campaign.fixture.ceilings.max_threads,
+        "provider live threads exceed ceiling"
+    );
     certify("soak-one-cycle-smoke-not-10m-or-24h");
     let mut report = json!({
         "schema": "grokptah.always_on_grokbot_soak_report.v1",
@@ -1718,8 +1783,9 @@ async fn soak_one_bounded_cycle() {
         "fixtureHash": campaign.fixture.digest(),
         "durationMs": duration_ms,
         "cycles": 1,
-        "restarts": 1,
+        "restarts": 2,
         "sends": campaign.provider.send_count(),
+        "providerLiveThreads": campaign.provider.live_threads(),
         "maxRssBytes": max.rss_bytes,
         "maxFdCount": max.fd_count,
         "maxThreads": max.threads,
@@ -1752,7 +1818,7 @@ async fn soak_loop(mode: &str, default_secs: u64) {
         max.max_with(&campaign.service.sample_tree());
         soak_hold_restart(&mut campaign, cycles.saturating_add(1)).await;
         max.max_with(&campaign.service.sample_tree());
-        restarts += 1;
+        restarts += 2;
         cycles += 1;
         max_cycle_latency_ms = max_cycle_latency_ms.max(cycle_started.elapsed().as_millis() as u64);
         campaign.scan();
@@ -1763,6 +1829,10 @@ async fn soak_loop(mode: &str, default_secs: u64) {
     );
     let growth = max.growth_from(&baseline);
     assert_resource_ceilings(&max, &growth, &campaign.fixture);
+    assert!(
+        campaign.provider.live_threads() <= campaign.fixture.ceilings.max_threads,
+        "provider live threads exceed ceiling"
+    );
     assert!(max_cycle_latency_ms <= campaign.fixture.ceilings.max_cycle_latency_ms);
     let soak24h = if mode == "24h" {
         if std::env::var("GROKBOT_SOAK_PINNED_HEAD_ARTIFACT")
@@ -1792,6 +1862,7 @@ async fn soak_loop(mode: &str, default_secs: u64) {
         "cycles": cycles,
         "restarts": restarts,
         "sends": campaign.provider.send_count(),
+        "providerLiveThreads": campaign.provider.live_threads(),
         "maxRssBytes": max.rss_bytes,
         "maxFdCount": max.fd_count,
         "maxThreads": max.threads,

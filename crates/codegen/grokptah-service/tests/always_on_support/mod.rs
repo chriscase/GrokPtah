@@ -41,6 +41,7 @@ const AMBIENT_CREDENTIAL_ENV: &[&str] = &[
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FailClosedExpect {
     pub run_state: String,
+    pub stop_cause: String,
     pub error_code: String,
     pub posts: u64,
 }
@@ -305,6 +306,7 @@ fn take_fail_closed(
         let mut row = expect_object(value, &format!("failClosed.{name}"))?;
         let expect = FailClosedExpect {
             run_state: take_string(&mut row, "runState")?,
+            stop_cause: take_string(&mut row, "stopCause")?,
             error_code: take_string(&mut row, "errorCode")?,
             posts: take_u64(&mut row, "posts")?,
         };
@@ -557,6 +559,21 @@ impl FakeProvider {
 
     pub fn send_count(&self) -> u64 {
         self.state.posts.load(Ordering::SeqCst)
+    }
+
+    pub fn live_threads(&self) -> u64 {
+        let accept = self
+            .accept_join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some() as u64;
+        let workers = self
+            .state
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as u64;
+        accept.saturating_add(workers)
     }
 
     pub fn count_for(&self, semantic_id: &str) -> u64 {
@@ -819,8 +836,12 @@ pub fn classify_provider_body(body: &str) -> String {
 
 fn classify_semantic(body: &str) -> String {
     let current = current_user_text(body);
-    let focus = objective_focus(&current);
-    let kind = prompt_kind(&current);
+    classify_current_user(&current)
+}
+
+fn classify_current_user(current: &str) -> String {
+    let focus = objective_focus(current);
+    let kind = prompt_kind(current);
     if let Some(rest) = current.split("CERT_HOLD ").nth(1) {
         let token = rest.split_whitespace().next().unwrap_or("");
         if !token.is_empty()
@@ -846,6 +867,9 @@ fn classify_semantic(body: &str) -> String {
     if current.contains("CERT_CANCEL") {
         return "fail-cancel".into();
     }
+    if current.contains("GROKBOT_SETUP") && kind.is_none() {
+        return "setup".into();
+    }
     match kind {
         Some("manager-decision") => "manager-decision".into(),
         Some("native") if focus.contains("GROKBOT_SUCCESS complete the replacement") => {
@@ -854,8 +878,9 @@ fn classify_semantic(body: &str) -> String {
         Some("native") if focus.contains("GROKBOT_FORCE_FAIL") => "step-b".into(),
         Some("native") if focus.contains("GROKBOT_SUCCESS first native unit") => "step-a".into(),
         Some("native") if focus.contains("GROKBOT_SUCCESS") => "native-success".into(),
-        _ if focus.contains("Return exactly this JSON envelope") => "manager-decision".into(),
-        _ if current.contains("GROKBOT_SETUP") => "setup".into(),
+        Some("native") => "other".into(),
+        None if focus.contains("Return exactly this JSON envelope") => "manager-decision".into(),
+        None if current.contains("GROKBOT_SETUP") => "setup".into(),
         _ => "other".into(),
     }
 }
@@ -2262,12 +2287,61 @@ mod classification_tests {
     }
 
     #[test]
-    fn replacement_native_is_not_manager_decision_when_envelope_is_in_relevant_messages() {
+    fn replacement_after_manager_history_is_not_a_second_manager_decision() {
+        let body = chat(vec![
+            json!({"role":"user","content":"GROKBOT_SETUP materialize the lane Agent"}),
+            json!({"role":"assistant","content":"GROKBOT_OK"}),
+            json!({"role":"user","content": managed("native", "GROKBOT_SUCCESS first native unit", "")}),
+            json!({"role":"assistant","content":"GROKBOT_OK"}),
+            json!({"role":"user","content": managed("native", "GROKBOT_FORCE_FAIL child that must be replaced", "")}),
+            json!({"role":"assistant","content":"provider-fail-v1"}),
+            json!({"role":"user","content": managed(
+                "manager-decision",
+                "Return exactly this JSON envelope with only directive replaced, and no prose. Envelope: {\"directive\":{\"type\":\"no_safe_action\"}}",
+                "- [result] GROKBOT_FORCE_FAIL child that must be replaced"
+            )}),
+            json!({"role":"assistant","content":"{\"directive\":{\"type\":\"append_replacement_steps\"}}"}),
+            json!({"role":"user","content": managed(
+                "native",
+                "GROKBOT_SUCCESS complete the replacement step",
+                "- [manager] Return exactly this JSON envelope Envelope: {\"directive\":{}}"
+            )}),
+        ]);
+        assert_eq!(classify_provider_body(&body), "step-b-fix");
+    }
+
+    #[test]
+    fn native_kind_does_not_become_manager_decision_when_envelope_is_in_objective() {
         let body = chat(vec![json!({"role":"user","content": managed(
             "native",
-            "GROKBOT_SUCCESS complete the replacement step",
-            "- [manager] Return exactly this JSON envelope Envelope: {\"directive\":{}} Snapshot: {\"kind\":\"native\"}"
+            "GROKBOT_SUCCESS complete the replacement step\nReturn exactly this JSON envelope must not steal identity",
+            ""
         )})]);
+        assert_eq!(classify_provider_body(&body), "step-b-fix");
+    }
+
+    #[test]
+    fn current_user_content_array_still_classifies_replacement() {
+        let body = json!({
+            "model": "grok-build",
+            "messages": [
+                {"role":"user","content": managed(
+                    "manager-decision",
+                    "Return exactly this JSON envelope with only directive replaced",
+                    ""
+                )},
+                {"role":"assistant","content":"{\"directive\":{}}"},
+                {"role":"user","content":[
+                    {"type":"text","text": managed(
+                        "native",
+                        "GROKBOT_SUCCESS complete the replacement step",
+                        "- [manager] Return exactly this JSON envelope"
+                    )}
+                ]}
+            ],
+            "stream": true
+        })
+        .to_string();
         assert_eq!(classify_provider_body(&body), "step-b-fix");
     }
 
@@ -2359,6 +2433,12 @@ mod fixture_schema_tests {
             .unwrap()
             .remove("status500");
         assert!(parse_fixture(&serde_json::to_vec(&missing_status).unwrap()).is_err());
+        let mut missing_stop = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        missing_stop["failClosed"]["malformed"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stopCause");
+        assert!(parse_fixture(&serde_json::to_vec(&missing_stop).unwrap()).is_err());
         let mut zero_posts = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
         zero_posts["failClosed"]["cancel"]["posts"] = serde_json::json!(0);
         assert!(parse_fixture(&serde_json::to_vec(&zero_posts).unwrap()).is_err());

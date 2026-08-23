@@ -402,6 +402,9 @@ fn classify_semantic(body: &str) -> String {
     let current = current_user_text(body);
     let focus = objective_focus(&current);
     let kind = prompt_kind(&current);
+    if current.contains("GROKBOT_SETUP") && kind.is_none() {
+        return "setup".into();
+    }
     match kind {
         Some("manager-decision") => "manager-decision".into(),
         Some("native") if focus.contains("GROKBOT_SUCCESS complete the replacement") => {
@@ -409,8 +412,10 @@ fn classify_semantic(body: &str) -> String {
         }
         Some("native") if focus.contains("GROKBOT_FORCE_FAIL") => "step-b".into(),
         Some("native") if focus.contains("GROKBOT_SUCCESS first native unit") => "step-a".into(),
-        _ if focus.contains("Return exactly this JSON envelope") => "manager-decision".into(),
-        _ if current.contains("GROKBOT_SETUP") => "setup".into(),
+        Some("native") if focus.contains("GROKBOT_SUCCESS") => "native-success".into(),
+        Some("native") => "other".into(),
+        None if focus.contains("Return exactly this JSON envelope") => "manager-decision".into(),
+        None if current.contains("GROKBOT_SETUP") => "setup".into(),
         _ => "other".into(),
     }
 }
@@ -1190,6 +1195,18 @@ mod tests {
             "interrupted_run_not_readmitted_within_window"
         );
         assert_eq!(value["clock"], "bounded-race-controlled-no-fake-clock-seam");
+        assert_eq!(
+            value["failClosed"]["malformed"]["runState"],
+            "limit_reached"
+        );
+        assert_eq!(
+            value["failClosed"]["malformed"]["stopCause"],
+            "token_accounting_unavailable"
+        );
+        assert_eq!(
+            value["happyPath"]["providerPostsBySemanticId"]["step-b-fix"],
+            1
+        );
         let projected = project_public_mcp_for_secret_scan(&json!({
             "agentId": "agent-550e8400-e29b-41d4-a716-446655440000",
             "spec": {"displayName": "agent-550e8400-e29b-41d4-a716-446655440000"},
