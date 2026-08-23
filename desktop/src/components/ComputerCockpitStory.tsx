@@ -290,6 +290,7 @@ api.computerUseCockpitStageAction = async (
           : action.type === "activate_target"
             ? "Application focus"
             : "Semantic action",
+      proposalOrigin: "operator",
       createdAt: new Date().toISOString(),
     },
   };
@@ -312,8 +313,55 @@ api.computerUseCockpitProposeAgentAction = async (
     observationId,
     { type: "set_value", element_id: elementId, text: "Ada Lovelace" },
   );
+  const nextSequence = (snapshot.local?.audit.at(-1)?.sequence ?? 0) + 1;
+  current = {
+    ...snapshot,
+    pendingApproval: snapshot.pendingApproval
+      ? { ...snapshot.pendingApproval, proposalOrigin: "agent" }
+      : null,
+    local: snapshot.local
+      ? {
+          ...snapshot.local,
+          audit: [
+            ...snapshot.local.audit,
+            {
+              sequence: nextSequence,
+              at: new Date().toISOString(),
+              surfaceEvent: "action_proposed",
+              operation: "action_proposed",
+              disposition: "staged",
+              actionClass: "text_entry",
+              observationId,
+            },
+            {
+              sequence: nextSequence + 1,
+              at: new Date().toISOString(),
+              surfaceEvent: "attention_moved",
+              attention: {
+                xBasisPoints: 3000,
+                yBasisPoints: 1700,
+                target: "semantic_element",
+              },
+              operation: "attention",
+              disposition: "moved",
+              actionClass: "text_entry",
+              observationId,
+            },
+            {
+              sequence: nextSequence + 2,
+              at: new Date().toISOString(),
+              surfaceEvent: "approval_required",
+              operation: "approval",
+              disposition: "required",
+              actionClass: "text_entry",
+              observationId,
+            },
+          ],
+        }
+      : null,
+  };
   return {
-    snapshot,
+    snapshot: structuredClone(current),
     summary: "Enter the requested name in the visible field",
     completed: false,
   };

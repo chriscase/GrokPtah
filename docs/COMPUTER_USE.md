@@ -175,9 +175,27 @@ keeps a detected retention gap sticky for the lifetime of the Run. After an
 expired cursor it resumes immediately before the retained window so current
 events can remain visible, but it never relabels the retained tail as a complete
 history. Both the persistent emergency strip and the cockpit show the gap while
-leaving Pause, Take over, and Stop usable. This successor still does **not** add
-an agent attention position/cursor, native physical preemption, a background-safe
-backend, or isolated visual execution.
+leaving Pause, Take over, and Stop usable.
+
+The stacked agent-attention successor records `action_proposed`, optional
+`attention_moved`, `approval_required`, and `approval_rejected` as typed durable
+surface events. Attention coordinates are normalized to `0..=10_000` basis
+points inside the authorized observation surface. They never retain a screen
+origin, display layout, native handle, semantic element ID, observed label or
+value, typed text, or model prose. A semantic element contributes a point only
+when its complete bounds are inside the current observation; missing or
+out-of-surface geometry produces no positional marker. Manual operator proposals never
+produce agent-attention evidence.
+
+The cockpit renders that evidence as an app-owned `Agent` marker and accessible
+live status, explicitly stating that the operating-system pointer has not
+moved. Simulator observations can show the normalized point. Native semantic
+observations mark the exact referenced row without fabricating a pointer
+location. Approval rejection removes the active marker, while the durable event
+remains replayable. This successor still does **not** add native physical
+preemption, a background-safe backend, an isolated helper/input domain, or
+isolated visual execution. Renderer replay while the host app remains resident
+is not evidence that pending approval authority survives a full process crash.
 
 ## Foundation (#268)
 
@@ -195,11 +213,13 @@ backend, or isolated visual execution.
 - a deterministic simulator used to test observation/action behavior without OS access.
 
 Audit entries retain a closed surface-event type plus bounded legacy operation
-metadata, dispositions, action classes, observation IDs, and error codes. Legacy
+metadata, dispositions, action classes, observation IDs, optional normalized
+attention points, and error codes. Legacy
 records without the typed field are classified only in their read projection;
 the durable evidence is not rewritten. Audit rows do not retain action payloads,
 typed text, screenshots, application values, window titles, credentials, or
-arbitrary model content. Evidence references are opaque IDs and hashes rather
+arbitrary model content. Attention rows also omit screen origins, element IDs,
+labels, values, and native handles. Evidence references are opaque IDs and hashes rather
 than filesystem paths.
 
 The durable run projection also exposes `controlDisposition` and `controlEpoch`. A paused run
@@ -382,7 +402,8 @@ attestation, packaging requirements, and disposable smoke fixture.
 | Isolated helper / input domain | later | Host-native independently isolated visual input, not a simulator fixture |
 | Semantic-first isolated visual fallback | later | Isolated visual input after semantic miss, never boolean-upgraded native AX |
 | App-owned exact Run surface / always-available Stop | stacked candidate | Exact binding, per-Run approvals, persistent shell controls; external Rust qualification pending |
-| Cockpit agent cursor | later | Agent-owned cursor UI on an isolated surface |
+| App-owned agent attention marker | stacked candidate | Typed/redacted proposal, attention, approval, and rejection evidence; normalized marker never moves or impersonates the OS pointer; external Rust and visual qualification pending |
+| Isolated visual agent cursor | later | Agent-owned cursor on a genuinely isolated input surface |
 | Other platforms | #275, #276 | Windows and Linux adapters behind the same contract |
 
 Provider support is capability-based, not model-name based. OpenAI-compatible corporate gateways

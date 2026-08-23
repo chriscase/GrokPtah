@@ -603,9 +603,15 @@ keyboard paths. The app-owned successor binds those controls to the exact Run
 outside cockpit visibility. Its typed-replay successor adds a closed
 redaction-safe event vocabulary, exact session/Run cursor persistence, and a
 sticky visible history-gap state that does not block emergency controls. These
-are candidate objects pending external Rust qualification and integration. They
-still do not add an agent-owned attention position/cursor or a physically
-preemptive native cancellation channel.
+are candidate objects pending external Rust qualification and integration. The
+stacked agent-attention successor adds redaction-safe proposal/attention/
+approval/rejection events plus an accessible app-owned marker bound to the exact
+current observation. It uses normalized in-surface coordinates, never moves or
+impersonates the operating-system pointer, emits no marker for a manual proposal,
+and refuses to invent a position for missing/out-of-surface geometry. It is still a
+candidate pending external Rust and visual qualification. It does **not** add a
+physically preemptive native cancellation channel, a background-safe backend, or
+an isolated visual input domain.
 [#286](https://github.com/chriscase/GrokPtah/issues/286) **open**.
 
 **Exit:** every [#286](https://github.com/chriscase/GrokPtah/issues/286)

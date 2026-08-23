@@ -25,9 +25,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::types::{
-    ActionClass, ComputerCapabilities, ComputerControlDisposition, ComputerError,
-    ComputerErrorCode, ComputerRun, ComputerRunState, ComputerSurfaceEvent, ComputerUseLimits,
-    GrantIssuer, SemanticAction, Sensitivity,
+    ActionClass, ComputerAttentionPoint, ComputerCapabilities, ComputerControlDisposition,
+    ComputerError, ComputerErrorCode, ComputerRun, ComputerRunState, ComputerSurfaceEvent,
+    ComputerUseLimits, GrantIssuer, SemanticAction, Sensitivity,
 };
 
 /// Hard ceiling on one event page regardless of the requested limit.
@@ -332,6 +332,7 @@ pub struct ComputerLocalAuditEntry {
     pub sequence: u64,
     pub at: DateTime<Utc>,
     pub surface_event: ComputerSurfaceEvent,
+    pub attention: Option<ComputerAttentionPoint>,
     pub operation: String,
     pub disposition: String,
     pub action_class: Option<ActionClass>,
@@ -422,6 +423,7 @@ impl ComputerLocalApproval {
                     sequence: entry.sequence,
                     at: entry.at,
                     surface_event: entry.projected_surface_event(),
+                    attention: entry.attention,
                     operation: entry.operation.clone(),
                     disposition: entry.disposition.clone(),
                     action_class: entry.action_class,
@@ -891,12 +893,18 @@ mod tests {
     fn event_entries_serialize_only_the_pinned_audit_keys() {
         let mut run = run();
         run.current_observation = Some(observation_with_secrets(&run.target.clone()));
-        run.record_audit(
-            "create_run",
-            "accepted",
+        run.record_surface_audit(
+            ComputerSurfaceEvent::AttentionMoved,
+            "attention",
+            "moved",
             Some(ActionClass::Semantic),
             Some("observation-01234567-89ab-cdef-0123-456789abcdef".into()),
-            Some(ComputerErrorCode::Interrupted),
+            None,
+            Some(ComputerAttentionPoint {
+                x_basis_points: 3_000,
+                y_basis_points: 1_700,
+                target: super::super::types::ComputerAttentionTarget::SemanticElement,
+            }),
         );
         let page = project_events(&run, None, 10);
         let wire = serde_json::to_string(&page).unwrap();
@@ -927,6 +935,7 @@ mod tests {
                 "sequence",
                 "at",
                 "surfaceEvent",
+                "attention",
                 "operation",
                 "disposition",
                 "actionClass",
@@ -936,7 +945,15 @@ mod tests {
         );
         assert_eq!(
             page.entries[0].surface_event,
-            ComputerSurfaceEvent::RunCreated
+            ComputerSurfaceEvent::AttentionMoved
+        );
+        assert_eq!(
+            serde_json::to_value(page.entries[0].attention).unwrap(),
+            serde_json::json!({
+                "xBasisPoints": 3000,
+                "yBasisPoints": 1700,
+                "target": "semantic_element"
+            })
         );
     }
 
@@ -1162,6 +1179,7 @@ mod tests {
                 "audit[].sequence".into(),
                 "audit[].at".into(),
                 "audit[].surfaceEvent".into(),
+                "audit[].attention".into(),
                 "audit[].operation".into(),
                 "audit[].disposition".into(),
                 "audit[].actionClass".into(),

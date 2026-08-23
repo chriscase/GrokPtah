@@ -469,6 +469,7 @@ describe("ComputerCockpit", () => {
         },
         actionSummary: "Enter visible text in Name",
         risk: "Text entry",
+        proposalOrigin: "operator" as const,
         createdAt: "2026-08-13T10:00:01Z",
       },
     };
@@ -480,6 +481,7 @@ describe("ComputerCockpit", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Stage text entry" }));
     expect(await screen.findByText("Ada Lovelace")).toBeTruthy();
     expect(screen.getByText("Frame 1 · one use")).toBeTruthy();
+    expect(screen.queryByTestId("computer-agent-cursor")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Approve once" }));
 
     expect(
@@ -583,6 +585,44 @@ describe("ComputerCockpit", () => {
     mocks.proposeAgent.mockResolvedValue({
       snapshot: {
         ...active,
+        local: {
+          ...active.local!,
+          audit: [
+            ...active.local!.audit,
+            {
+              sequence: 2,
+              at: "2026-08-13T10:00:02Z",
+              surfaceEvent: "action_proposed",
+              operation: "action_proposed",
+              disposition: "staged",
+              actionClass: "text_entry",
+              observationId: "observation-1",
+            },
+            {
+              sequence: 3,
+              at: "2026-08-13T10:00:02Z",
+              surfaceEvent: "attention_moved",
+              attention: {
+                xBasisPoints: 3000,
+                yBasisPoints: 1700,
+                target: "semantic_element",
+              },
+              operation: "attention",
+              disposition: "moved",
+              actionClass: "text_entry",
+              observationId: "observation-1",
+            },
+            {
+              sequence: 4,
+              at: "2026-08-13T10:00:02Z",
+              surfaceEvent: "approval_required",
+              operation: "approval",
+              disposition: "required",
+              actionClass: "text_entry",
+              observationId: "observation-1",
+            },
+          ],
+        },
         pendingApproval: {
           approvalId: "approval-model",
           ownerSessionId: "session-1",
@@ -597,6 +637,7 @@ describe("ComputerCockpit", () => {
           },
           actionSummary: "Enter visible text in Name",
           risk: "Text entry",
+          proposalOrigin: "agent",
           createdAt: "2026-08-13T10:00:02Z",
         },
       },
@@ -621,6 +662,141 @@ describe("ComputerCockpit", () => {
     expect(dialog.getAttribute("aria-labelledby")).toBe("computer-approval-title");
     expect(dialog.getAttribute("aria-describedby")).toBe("computer-approval-details");
     expect(screen.getByText("Enter the requested visible name", { exact: false })).toBeTruthy();
+    expect(screen.getByText("Agent attention · Name")).toBeTruthy();
+    expect(
+      screen.getByText(/Agent attention is on Name inside the authorized GrokPtah surface/),
+    ).toBeTruthy();
+    const marker = screen.getByTestId("computer-agent-cursor");
+    expect(marker).toHaveStyle({ left: "30%", top: "17%" });
+
+    mocks.discard.mockResolvedValue(active);
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    await waitFor(() => expect(mocks.discard).toHaveBeenCalledWith("session-1", "run-1"));
+    expect(screen.queryByTestId("computer-agent-cursor")).toBeNull();
+  });
+
+  it("marks the exact native semantic row without drawing a fake pointer", async () => {
+    const local = localView();
+    local.target = { appId: "com.example.editor", displayName: "Example Editor" };
+    local.audit.push({
+      sequence: 2,
+      at: "2026-08-13T10:00:02Z",
+      surfaceEvent: "attention_moved",
+      attention: {
+        xBasisPoints: 3000,
+        yBasisPoints: 1700,
+        target: "semantic_element",
+      },
+      operation: "attention",
+      disposition: "moved",
+      actionClass: "text_entry",
+      observationId: "observation-1",
+    });
+    const active = snapshot(local);
+    active.pendingApproval = {
+      approvalId: "approval-native-model",
+      ownerSessionId: "session-1",
+      runId: "run-1",
+      runVersion: 3,
+      observationId: "observation-1",
+      targetLabel: "Example Editor",
+      action: {
+        type: "set_value",
+        element_id: "observation-1-name",
+        text: "Ada Lovelace",
+      },
+      actionSummary: "Enter visible text in Name",
+      risk: "Text entry",
+      proposalOrigin: "agent",
+      createdAt: "2026-08-13T10:00:02Z",
+    };
+    mocks.snapshot.mockResolvedValue(active);
+
+    render(<ComputerCockpit {...props} />);
+
+    expect(await screen.findByText("Agent attention · Name")).toBeTruthy();
+    expect(screen.getByText("↖ Agent")).toBeTruthy();
+    expect(screen.queryByTestId("computer-agent-cursor")).toBeNull();
+  });
+
+  it("does not reuse an old attention point for a newer geometry-free proposal", async () => {
+    const local = localView();
+    local.audit.push(
+      {
+        sequence: 2,
+        at: "2026-08-13T10:00:02Z",
+        surfaceEvent: "action_proposed",
+        operation: "action_proposed",
+        disposition: "staged",
+        actionClass: "text_entry",
+        observationId: "observation-1",
+      },
+      {
+        sequence: 3,
+        at: "2026-08-13T10:00:02Z",
+        surfaceEvent: "attention_moved",
+        attention: {
+          xBasisPoints: 3000,
+          yBasisPoints: 1700,
+          target: "semantic_element",
+        },
+        operation: "attention",
+        disposition: "moved",
+        actionClass: "text_entry",
+        observationId: "observation-1",
+      },
+      {
+        sequence: 4,
+        at: "2026-08-13T10:00:03Z",
+        surfaceEvent: "approval_rejected",
+        operation: "approval",
+        disposition: "rejected",
+        actionClass: "text_entry",
+        observationId: "observation-1",
+      },
+      {
+        sequence: 5,
+        at: "2026-08-13T10:00:04Z",
+        surfaceEvent: "action_proposed",
+        operation: "action_proposed",
+        disposition: "staged",
+        actionClass: "text_entry",
+        observationId: "observation-1",
+      },
+      {
+        sequence: 6,
+        at: "2026-08-13T10:00:04Z",
+        surfaceEvent: "approval_required",
+        operation: "approval",
+        disposition: "required",
+        actionClass: "text_entry",
+        observationId: "observation-1",
+      },
+    );
+    const active = snapshot(local);
+    active.pendingApproval = {
+      approvalId: "approval-without-point",
+      ownerSessionId: "session-1",
+      runId: "run-1",
+      runVersion: 3,
+      observationId: "observation-1",
+      targetLabel: "Computer Use Simulator",
+      action: {
+        type: "set_value",
+        element_id: "observation-1-name",
+        text: "Ada Lovelace",
+      },
+      actionSummary: "Enter visible text in Name",
+      risk: "Text entry",
+      proposalOrigin: "agent",
+      createdAt: "2026-08-13T10:00:04Z",
+    };
+    mocks.snapshot.mockResolvedValue(active);
+
+    render(<ComputerCockpit {...props} />);
+
+    expect(await screen.findByText("Agent attention · Name")).toBeTruthy();
+    expect(screen.queryByTestId("computer-agent-cursor")).toBeNull();
   });
 
   it("keeps Stop available while model inference is pending", async () => {

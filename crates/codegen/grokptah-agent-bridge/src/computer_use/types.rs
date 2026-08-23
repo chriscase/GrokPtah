@@ -1044,6 +1044,106 @@ pub struct ObservationGeometry {
     pub scale_factor: f64,
 }
 
+/// What a normalized attention point refers to. The point never represents or
+/// controls the host operating-system pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerAttentionTarget {
+    Surface,
+    SemanticElement,
+}
+
+/// Redaction-safe position for the app-rendered agent attention marker.
+/// Coordinates are target-relative basis points (`0..=10_000`), so no screen
+/// origin, display arrangement, native handle, element ID, or observed text is
+/// persisted or projected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerAttentionPoint {
+    pub x_basis_points: u16,
+    pub y_basis_points: u16,
+    pub target: ComputerAttentionTarget,
+}
+
+impl ComputerAttentionPoint {
+    pub const MAX_BASIS_POINTS: u16 = 10_000;
+
+    pub fn validate(&self) -> ComputerResult<()> {
+        if self.x_basis_points > Self::MAX_BASIS_POINTS
+            || self.y_basis_points > Self::MAX_BASIS_POINTS
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "computer attention point is outside the authorized surface",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Derive a visual attention point from the same immutable observation and
+    /// semantic action that will be revalidated for approval. Missing or
+    /// out-of-surface element geometry yields no point instead of inventing a
+    /// cursor location.
+    pub fn for_action(observation: &ComputerObservation, action: &ComputerAction) -> Option<Self> {
+        match action {
+            ComputerAction::ActivateTarget => Some(Self {
+                x_basis_points: Self::MAX_BASIS_POINTS / 2,
+                y_basis_points: Self::MAX_BASIS_POINTS / 2,
+                target: ComputerAttentionTarget::Surface,
+            }),
+            ComputerAction::PointerClick { x, y, .. } => Self::from_logical_point(
+                *x,
+                *y,
+                &observation.geometry,
+                ComputerAttentionTarget::Surface,
+            ),
+            _ => {
+                let element = observation.element(action.referenced_element()?)?;
+                let bounds = element.bounds?;
+                if bounds.x < 0.0
+                    || bounds.y < 0.0
+                    || bounds.x + bounds.width > observation.geometry.width
+                    || bounds.y + bounds.height > observation.geometry.height
+                {
+                    return None;
+                }
+                Self::from_logical_point(
+                    bounds.x + bounds.width / 2.0,
+                    bounds.y + bounds.height / 2.0,
+                    &observation.geometry,
+                    ComputerAttentionTarget::SemanticElement,
+                )
+            }
+        }
+    }
+
+    fn from_logical_point(
+        x: f64,
+        y: f64,
+        surface: &ObservationGeometry,
+        target: ComputerAttentionTarget,
+    ) -> Option<Self> {
+        if surface.validate().is_err()
+            || !x.is_finite()
+            || !y.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || x > surface.width
+            || y > surface.height
+        {
+            return None;
+        }
+        let point = Self {
+            x_basis_points: ((x / surface.width) * f64::from(Self::MAX_BASIS_POINTS)).round()
+                as u16,
+            y_basis_points: ((y / surface.height) * f64::from(Self::MAX_BASIS_POINTS)).round()
+                as u16,
+            target,
+        };
+        point.validate().ok().map(|()| point)
+    }
+}
+
 impl ObservationGeometry {
     pub fn validate(&self) -> ComputerResult<()> {
         if !self.x.is_finite()
@@ -1408,6 +1508,8 @@ pub struct ComputerAuditEntry {
     /// time; new records persist the typed value directly.
     #[serde(default)]
     pub surface_event: ComputerSurfaceEvent,
+    #[serde(default)]
+    pub attention: Option<ComputerAttentionPoint>,
     pub operation: String,
     pub disposition: String,
     pub action_class: Option<ActionClass>,
@@ -2133,6 +2235,27 @@ impl ComputerRun {
         observation_id: Option<String>,
         error_code: Option<ComputerErrorCode>,
     ) {
+        self.record_surface_audit(
+            ComputerSurfaceEvent::classify(operation, disposition, error_code),
+            operation,
+            disposition,
+            action_class,
+            observation_id,
+            error_code,
+            None,
+        );
+    }
+
+    pub(crate) fn record_surface_audit(
+        &mut self,
+        surface_event: ComputerSurfaceEvent,
+        operation: &str,
+        disposition: &str,
+        action_class: Option<ActionClass>,
+        observation_id: Option<String>,
+        error_code: Option<ComputerErrorCode>,
+        attention: Option<ComputerAttentionPoint>,
+    ) {
         const MAX_AUDIT_ENTRIES: usize = 1_024;
         if self.audit.len() == MAX_AUDIT_ENTRIES {
             self.audit.remove(0);
@@ -2140,7 +2263,8 @@ impl ComputerRun {
         self.audit.push(ComputerAuditEntry {
             sequence: self.audit.last().map_or(1, |entry| entry.sequence + 1),
             at: Utc::now(),
-            surface_event: ComputerSurfaceEvent::classify(operation, disposition, error_code),
+            surface_event,
+            attention,
             operation: crate::textutil::truncate_at_char_boundary(operation, 64).to_string(),
             disposition: crate::textutil::truncate_at_char_boundary(disposition, 64).to_string(),
             action_class,
@@ -2329,6 +2453,64 @@ mod tests {
             display_name: "Demo".into(),
             sensitivity: Sensitivity::None,
         }
+    }
+
+    #[test]
+    fn attention_point_is_normalized_without_screen_or_element_identity() {
+        let observation = ComputerObservation {
+            observation_id: "observation-1".into(),
+            sequence: 1,
+            target: target(),
+            captured_at: Utc::now(),
+            geometry: ObservationGeometry {
+                x: 125.0,
+                y: 80.0,
+                width: 800.0,
+                height: 600.0,
+                scale_factor: 2.0,
+            },
+            screenshot: None,
+            elements: vec![SemanticElement {
+                element_id: "name-field".into(),
+                role: "text_field".into(),
+                label: Some("Name".into()),
+                value: None,
+                bounds: Some(ObservationGeometry {
+                    x: 40.0,
+                    y: 80.0,
+                    width: 400.0,
+                    height: 44.0,
+                    scale_factor: 2.0,
+                }),
+                enabled: true,
+                focused: false,
+                sensitivity: Sensitivity::None,
+                actions: BTreeSet::from([SemanticAction::SetValue]),
+            }],
+            elements_truncated: false,
+            sensitivity: Sensitivity::None,
+            authority: ObservationAuthority::default(),
+        };
+        let action = ComputerAction::SetValue {
+            element_id: "name-field".into(),
+            text: "Ada".into(),
+        };
+        let point = ComputerAttentionPoint::for_action(&observation, &action).unwrap();
+        assert_eq!(point.x_basis_points, 3_000);
+        assert_eq!(point.y_basis_points, 1_700);
+        assert_eq!(point.target, ComputerAttentionTarget::SemanticElement);
+        assert_eq!(
+            serde_json::to_value(point).unwrap(),
+            serde_json::json!({
+                "xBasisPoints": 3000,
+                "yBasisPoints": 1700,
+                "target": "semantic_element"
+            })
+        );
+
+        let mut outside = observation;
+        outside.elements[0].bounds.as_mut().unwrap().x = 760.0;
+        assert!(ComputerAttentionPoint::for_action(&outside, &action).is_none());
     }
 
     #[test]

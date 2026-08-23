@@ -5539,7 +5539,23 @@ button:disabled {
   font-size: 10px;
 }
 
+.computer-observation-meta {
+  display: flex;
+  align-items: flex-end;
+  flex-direction: column;
+  gap: 0.2rem;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: right;
+}
+
+.computer-agent-attention-summary {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .computer-demo-surface {
+  position: relative;
   display: grid;
   align-content: center;
   justify-items: start;
@@ -5550,6 +5566,58 @@ button:disabled {
   border-radius: 6px;
   background: #171b20;
   color: #eef1f4;
+}
+
+.computer-agent-cursor {
+  position: absolute;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.18rem;
+  transform: translate(-5px, -5px);
+  pointer-events: none;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.55));
+}
+
+.computer-agent-cursor::before {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border: 1px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  border-radius: 50%;
+  content: "";
+  animation: computer-agent-attention-pulse 1.8s ease-out infinite;
+}
+
+.computer-agent-cursor-arrow {
+  position: relative;
+  color: #fff;
+  font-size: 19px;
+  line-height: 1;
+  text-shadow: 0 0 0 var(--accent), 0 1px 3px #000;
+}
+
+.computer-agent-cursor-label,
+.computer-native-agent-marker {
+  padding: 0.12rem 0.32rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, #171b20 88%, var(--accent) 12%);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+@keyframes computer-agent-attention-pulse {
+  from {
+    opacity: 0.8;
+    transform: scale(0.45);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.35);
+  }
 }
 
 .computer-demo-surface.is-observed {
@@ -5597,6 +5665,12 @@ button:disabled {
   border-bottom: 1px solid #292f36;
 }
 
+.computer-native-observation > div.has-agent-attention {
+  position: relative;
+  box-shadow: inset 3px 0 0 var(--accent);
+  background: color-mix(in srgb, #171b20 90%, var(--accent) 10%);
+}
+
 .computer-native-observation span,
 .computer-native-observation small {
   color: #9aa3ad;
@@ -5613,6 +5687,12 @@ button:disabled {
 
 .computer-native-observation small {
   grid-column: 1 / -1;
+}
+
+.computer-native-observation .computer-native-agent-marker {
+  grid-column: 1 / -1;
+  justify-self: start;
+  color: var(--accent);
 }
 
 .computer-semantic-strip {
@@ -5892,6 +5972,15 @@ button:disabled {
     width: 100%;
   }
 
+  .computer-section-heading {
+    align-items: flex-start;
+  }
+
+  .computer-observation-meta {
+    align-items: flex-start;
+    text-align: left;
+  }
+
   .computer-control-actions button,
   .computer-paused button {
     flex: 1 1 auto;
@@ -5927,6 +6016,13 @@ button:disabled {
 
   .computer-native-permissions > button {
     justify-self: start;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .computer-agent-cursor::before {
+    animation: none;
+    opacity: 0.55;
   }
 }
 

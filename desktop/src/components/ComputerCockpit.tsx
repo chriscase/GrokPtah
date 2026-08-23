@@ -291,6 +291,39 @@ export function ComputerCockpit({
     ["status", "AXStaticText"].includes(element.role),
   );
   const approval = snapshot?.pendingApproval ?? null;
+  const agentProposalActive = approval?.proposalOrigin === "agent";
+  const agentAttentionElementId =
+    agentProposalActive && "element_id" in approval.action
+      ? approval.action.element_id
+      : null;
+  const agentProposalSequence =
+    agentProposalActive && observation
+      ? [...(run?.audit ?? [])]
+          .reverse()
+          .find(
+            (entry) =>
+              entry.surfaceEvent === "action_proposed" &&
+              entry.observationId === observation.observationId,
+          )?.sequence
+      : undefined;
+  const agentAttentionEntry =
+    agentProposalSequence !== undefined && observation
+      ? [...(run?.audit ?? [])]
+          .reverse()
+          .find(
+            (entry) =>
+              entry.surfaceEvent === "attention_moved" &&
+              entry.observationId === observation.observationId &&
+              entry.sequence > agentProposalSequence &&
+              entry.attention,
+          )
+      : undefined;
+  const agentAttention = agentAttentionEntry?.attention ?? null;
+  const agentAttentionLabel = agentProposalActive
+    ? observation?.elements.find(
+        (element) => element.elementId === agentAttentionElementId,
+      )?.label ?? run?.target.displayName ?? "authorized surface"
+    : null;
   const coordination = snapshot?.coordination ?? null;
   const coordinationStatus = coordination ? coordinationCopy(coordination) : null;
   const reconciliation = snapshot?.reconciliation ?? null;
@@ -817,8 +850,21 @@ export function ComputerCockpit({
                   <span className="computer-section-label">Observation</span>
                   <h2>{simulatorRun ? "Demo form" : "Semantic snapshot"}</h2>
                 </div>
-                <span>{observation ? `Frame ${observation.sequence}` : "No live frame"}</span>
+                <div className="computer-observation-meta">
+                  <span>{observation ? `Frame ${observation.sequence}` : "No live frame"}</span>
+                  {agentProposalActive && (
+                    <span className="computer-agent-attention-summary">
+                      Agent attention · {agentAttentionLabel}
+                    </span>
+                  )}
+                </div>
               </div>
+              {agentProposalActive && (
+                <p className="computer-visually-hidden" role="status" aria-live="polite">
+                  Agent attention is on {agentAttentionLabel} inside the authorized
+                  GrokPtah surface. The operating-system pointer has not moved.
+                </p>
+              )}
               {simulatorRun ? (
                 <div className={`computer-demo-surface ${observation ? "is-observed" : ""}`}>
                   <label>
@@ -827,14 +873,41 @@ export function ComputerCockpit({
                   </label>
                   <button type="button" disabled={!submitElement?.enabled}>Submit</button>
                   <output>{statusElement?.label ?? "Observation unavailable"}</output>
+                  {agentAttention && (
+                    <span
+                      className="computer-agent-cursor"
+                      data-testid="computer-agent-cursor"
+                      style={{
+                        left: `${agentAttention.xBasisPoints / 100}%`,
+                        top: `${agentAttention.yBasisPoints / 100}%`,
+                      }}
+                      title="App-rendered agent attention marker; operating-system pointer unchanged"
+                      aria-hidden
+                    >
+                      <span className="computer-agent-cursor-arrow">↖</span>
+                      <span className="computer-agent-cursor-label">Agent</span>
+                    </span>
+                  )}
                 </div>
               ) : (
                 <div className="computer-native-observation" aria-label="Observed macOS elements">
                   {(observation?.elements ?? []).slice(0, 48).map((element) => (
-                    <div key={element.elementId}>
+                    <div
+                      key={element.elementId}
+                      className={
+                        agentProposalActive && element.elementId === agentAttentionElementId
+                          ? "has-agent-attention"
+                          : ""
+                      }
+                    >
                       <span>{element.role.replace(/^AX/, "")}</span>
                       <strong>{element.label ?? element.value ?? "Unlabelled element"}</strong>
                       <small>{element.actions.join(" · ") || "read only"}</small>
+                      {agentProposalActive && element.elementId === agentAttentionElementId && (
+                        <span className="computer-native-agent-marker" aria-hidden>
+                          ↖ Agent
+                        </span>
+                      )}
                     </div>
                   ))}
                   {!observation?.elements.length && <span>No safe semantic elements exposed.</span>}

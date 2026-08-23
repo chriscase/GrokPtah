@@ -52,6 +52,8 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 | Stop/Take over versus in-flight action completion | Proven that cancellation wins and late completion becomes `uncertain` without incrementing action count. Takeover is durable bookkeeping-safe, not physically preemptive inside the native action gate | `ComputerUseService::cancellation_wins_over_an_inflight_action_completion`; desktop cockpit takeover tests |
 | Cockpit closed, Lane switched/archived, preview captured, or another approval read | App shell retains an exact Run binding and emergency controls; unique discovery fails closed on ambiguity; previews are excluded; approvals are per Run. Non-foreground owners receive only an opaque revoking-control token | `cockpit_discovery_fails_closed_when_multiple_runs_need_exact_binding`; `one_shot_preview_cannot_become_the_app_owned_control_surface`; `background_owner_retains_only_out_of_band_emergency_control`; `PersistentComputerRuns` tests |
 | App reload, session switch, bounded-journal eviction, or cursor expiry | The stacked app shell replays typed, redaction-safe events against the exact app-owned session/Run identity. Its cursor persists across reloads; an expired or initially truncated window becomes a sticky visible gap while the retained tail resumes. A gap never disables Stop or becomes “complete” later | `app_owned_event_replay_is_typed_cursor_addressed_and_owner_scoped`; `legacy_audit_rows_gain_typed_surface_events_only_at_projection`; `computerRunReplay` and `PersistentComputerRuns` tests |
+| Agent-attention UI confused with the host pointer or used as a data leak | The stacked candidate derives an optional point only from the exact current observation/action, stores target-relative basis points, omits screen origin and semantic identity/content, and renders an app-owned marker. Manual proposals emit no agent marker; absent or out-of-bounds geometry fails to no positional point | `attention_point_is_normalized_without_screen_or_element_identity`; desktop model/manual proposal tests; `ComputerCockpit` agent-attention tests |
+| Proposal rejected while a stale marker remains active | Rejection is bound to the exact current ready observation and proposal owner, records typed `approval_rejected`, removes the pending proposal, and carries no new attention point. Replay retains history but the live marker requires the current agent-origin approval | desktop model-proposal rejection test; `ComputerCockpit` approval correlation |
 | Restart during a run or mutation | Proven: active runs become `interrupted`, grants/observations clear, and claimed receipts become `uncertain` | durable store restart tests |
 | Evidence size, retention, integrity, and path leakage | Proven bounded evidence, hash/length verification, atomic records, retention, and opaque asset IDs | service evidence tests; store retention/integrity tests; `docs/COMPUTER_USE.md` |
 | Model/provider change during Computer inference | Proven at the model boundary; ephemeral qualification is cleared and late proposals are rejected | `computer_agent` and desktop proposal revalidation tests |
@@ -76,8 +78,10 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
   surface; hidden windows, separate Spaces, and global `CGEvent` injection do not qualify. Stage 1
   only makes isolation a typed, host-enforced contract. Remaining stages: authenticated isolated
   helper/input domain; out-of-band preemptive takeover after native entry; semantic-first isolated
-  visual fallback; cockpit agent attention position/cursor. Persistent Stop is present in the
-  stacked app-owned surface candidate, but remains part of the packaged acceptance gate.
+  visual fallback. A stacked candidate now renders a redaction-safe app-owned agent-attention
+  marker without moving the OS pointer, but it is not an isolated visual input backend. Persistent
+  Stop is present in the stacked app-owned surface candidate; both remain part of the packaged
+  acceptance gate.
 
 ## Verification command
 

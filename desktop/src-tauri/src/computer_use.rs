@@ -7,11 +7,11 @@ use chrono::{Duration, Utc};
 use grokptah_agent_bridge::MacOsObservationPlatform;
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
-    ComputerAgentProposal, ComputerAuthorityToken, ComputerBackendPublicView, ComputerCapabilities,
-    ComputerEmergencyControlToken, ComputerError, ComputerLocalApproval, ComputerObservation,
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerRun, ComputerRunEventPage, ComputerRunProjection,
-    ComputerRunState, ComputerSurfaceCoordination, ComputerTargetCandidate,
+    ComputerAgentProposal, ComputerAttentionPoint, ComputerAuthorityToken,
+    ComputerBackendPublicView, ComputerCapabilities, ComputerEmergencyControlToken, ComputerError,
+    ComputerLocalApproval, ComputerObservation, ComputerObservationPlatform, ComputerPermission,
+    ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun, ComputerRunEventPage,
+    ComputerRunProjection, ComputerRunState, ComputerSurfaceCoordination, ComputerTargetCandidate,
     ComputerUncertainSurfaceLease, ComputerUseLimits, ComputerUseService, SemanticAction,
     SimulatorBackend,
 };
@@ -40,7 +40,15 @@ pub struct PendingComputerApproval {
     pub action: ComputerAction,
     pub action_summary: String,
     pub risk: String,
+    pub proposal_origin: ComputerProposalOrigin,
     pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerProposalOrigin {
+    Operator,
+    Agent,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -574,6 +582,7 @@ impl DesktopComputerUse {
             expected_version,
             observation_id,
             action,
+            ComputerProposalOrigin::Operator,
         )
     }
 
@@ -584,8 +593,9 @@ impl DesktopComputerUse {
         expected_version: u64,
         observation_id: &str,
         action: ComputerAction,
+        proposal_origin: ComputerProposalOrigin,
     ) -> Result<ComputerCockpitSnapshot, String> {
-        let (_service, run) = self.owned_service(owner_session_id, run_id)?;
+        let (service, run) = self.owned_service(owner_session_id, run_id)?;
         if run.version != expected_version {
             return Err("The proposed action is based on a stale Computer Run".into());
         }
@@ -602,6 +612,10 @@ impl DesktopComputerUse {
             .map_err(|error| error.to_string())?;
 
         let (action_summary, risk) = approval_copy(observation, &action)?;
+        let action_class = action.class();
+        let attention = (proposal_origin == ComputerProposalOrigin::Agent)
+            .then(|| ComputerAttentionPoint::for_action(observation, &action))
+            .flatten();
 
         let mut pending = self
             .pending_approvals
@@ -609,6 +623,19 @@ impl DesktopComputerUse {
             .map_err(|_| "Computer Use approval state is unavailable".to_string())?;
         if pending.contains_key(run_id) {
             return Err("Resolve or discard the current Computer Use approval first".into());
+        }
+        if proposal_origin == ComputerProposalOrigin::Agent {
+            service
+                .record_agent_action_proposal(
+                    &Uuid::new_v4().to_string(),
+                    &self.operator_token(owner_session_id)?,
+                    run_id,
+                    expected_version,
+                    observation_id,
+                    action_class,
+                    attention,
+                )
+                .map_err(|error| error.to_string())?;
         }
         pending.insert(
             run_id.to_string(),
@@ -622,6 +649,7 @@ impl DesktopComputerUse {
                 action,
                 action_summary,
                 risk,
+                proposal_origin,
                 created_at: Utc::now(),
             },
         );
@@ -677,6 +705,7 @@ impl DesktopComputerUse {
                     expected_version,
                     observation_id,
                     action,
+                    ComputerProposalOrigin::Agent,
                 )?;
                 Ok(ComputerAgentProposalResult {
                     snapshot,
@@ -762,8 +791,34 @@ impl DesktopComputerUse {
         owner_session_id: Uuid,
         run_id: &str,
     ) -> Result<ComputerCockpitSnapshot, String> {
-        let _ = owned_run(&self.simulator()?, owner_session_id, run_id)?;
-        self.clear_pending_for_run(run_id)?;
+        let (service, _) = self.owned_service(owner_session_id, run_id)?;
+        let mut approvals = self
+            .pending_approvals
+            .lock()
+            .map_err(|_| "Computer Use approval state is unavailable".to_string())?;
+        let pending = approvals
+            .get(run_id)
+            .cloned()
+            .filter(|pending| pending.owner_session_id == owner_session_id)
+            .ok_or_else(|| "This Computer Use approval is stale or already resolved".to_string())?;
+        let audit = if pending.proposal_origin == ComputerProposalOrigin::Agent {
+            service
+                .record_agent_approval_rejected(
+                    &Uuid::new_v4().to_string(),
+                    &self.operator_token(owner_session_id)?,
+                    run_id,
+                    pending.run_version,
+                    &pending.observation_id,
+                    pending.action.class(),
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        };
+        approvals.remove(run_id);
+        drop(approvals);
+        audit?;
         self.cockpit_snapshot(owner_session_id, Some(run_id))
     }
 
@@ -1253,6 +1308,10 @@ mod tests {
             .await
             .unwrap();
         let approval = staged.pending_approval.unwrap();
+        assert_eq!(approval.proposal_origin, ComputerProposalOrigin::Operator);
+        assert!(!staged.local.unwrap().audit.iter().any(|entry| {
+            entry.surface_event == grokptah_agent_bridge::ComputerSurfaceEvent::AttentionMoved
+        }));
         let acted = desktop
             .approve_simulator_action(owner, &run.run_id, &approval.approval_id, "approve-once")
             .await
@@ -1310,8 +1369,46 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.completed);
-        assert!(result.snapshot.pending_approval.is_some());
-        assert_eq!(result.snapshot.local.unwrap().action_count, 0);
+        let pending = result.snapshot.pending_approval.as_ref().unwrap();
+        assert_eq!(pending.proposal_origin, ComputerProposalOrigin::Agent);
+        let staged = result.snapshot.local.as_ref().unwrap();
+        assert_eq!(staged.action_count, 0);
+        assert_eq!(staged.version, run.version);
+        let proposal_events = staged
+            .audit
+            .iter()
+            .rev()
+            .take(3)
+            .map(|entry| entry.surface_event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            proposal_events,
+            vec![
+                grokptah_agent_bridge::ComputerSurfaceEvent::ApprovalRequired,
+                grokptah_agent_bridge::ComputerSurfaceEvent::AttentionMoved,
+                grokptah_agent_bridge::ComputerSurfaceEvent::ActionProposed,
+            ]
+        );
+        let attention = staged
+            .audit
+            .iter()
+            .find_map(|entry| entry.attention)
+            .unwrap();
+        assert_eq!(attention.x_basis_points, 3_000);
+        assert_eq!(attention.y_basis_points, 1_700);
+        assert_eq!(
+            attention.target,
+            grokptah_agent_bridge::ComputerAttentionTarget::SemanticElement
+        );
+
+        let rejected = desktop
+            .discard_simulator_approval(owner, &run.run_id)
+            .unwrap();
+        assert!(rejected.pending_approval.is_none());
+        assert_eq!(
+            rejected.local.unwrap().audit.last().unwrap().surface_event,
+            grokptah_agent_bridge::ComputerSurfaceEvent::ApprovalRejected
+        );
 
         let stale = desktop
             .apply_model_proposal(

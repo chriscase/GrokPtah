@@ -16,11 +16,11 @@ use super::projection::{
 };
 use super::store::{ComputerStore, MutationClaim, MutationStamp};
 use super::types::{
-    validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerAuthorityToken,
-    ComputerBackend, ComputerBackendAttestation, ComputerControlDisposition,
-    ComputerEmergencyControlToken, ComputerError, ComputerErrorCode, ComputerObservation,
-    ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
-    ObservationAuthority, ResolvedAgentComputerRunAdmission,
+    validate_id, ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAttentionPoint,
+    ComputerAuthorityToken, ComputerBackend, ComputerBackendAttestation,
+    ComputerControlDisposition, ComputerEmergencyControlToken, ComputerError, ComputerErrorCode,
+    ComputerObservation, ComputerResult, ComputerRun, ComputerRunState, ComputerSurfaceEvent,
+    ComputerTarget, ComputerUseLimits, ObservationAuthority, ResolvedAgentComputerRunAdmission,
 };
 
 pub struct ComputerUseService {
@@ -628,6 +628,184 @@ impl ComputerUseService {
         };
         if let Err(error) = &result {
             self.record_denial(run_id, "authorize", None, error);
+        }
+        self.finish_mutation(request_id, &result)?;
+        result
+    }
+
+    /// Persist the redaction-safe UI evidence for one model-proposed action.
+    /// This does not grant authority, dispatch input, persist model text, or
+    /// alter the Run version used by the subsequent one-use approval. The
+    /// trusted desktop calls it only after `AgentHost` returns a qualified,
+    /// exact-observation proposal and after independently validating the
+    /// semantic action against the local observation.
+    pub fn record_agent_action_proposal(
+        &self,
+        request_id: &str,
+        caller: &ComputerAuthorityToken,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action_class: ActionClass,
+        attention: Option<ComputerAttentionPoint>,
+    ) -> ComputerResult<ComputerRun> {
+        validate_id("run_id", run_id)?;
+        validate_id("observation_id", observation_id)?;
+        if !matches!(action_class, ActionClass::Semantic | ActionClass::TextEntry) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "desktop agent proposals are limited to semantic actions",
+            ));
+        }
+        if let Some(point) = attention {
+            point.validate()?;
+        }
+        let current = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        let payload = json!({
+            "runId": run_id,
+            "expectedVersion": expected_version,
+            "observationId": observation_id,
+            "actionClass": action_class,
+            "attention": attention,
+        });
+        if let Some(replayed) = self.begin_mutation(
+            request_id,
+            "record_agent_action_proposal",
+            &payload,
+            caller,
+            Some(&current),
+        )? {
+            return replayed;
+        }
+        let result = self
+            .store
+            .update_run(run_id, |run| {
+                ensure_version(run, expected_version)?;
+                self.require_caller(run, caller)?;
+                if run.state != ComputerRunState::Ready
+                    || run
+                        .current_observation
+                        .as_ref()
+                        .map(|observation| observation.observation_id.as_str())
+                        != Some(observation_id)
+                {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::StaleObservation,
+                        "agent proposal is not bound to the current ready observation",
+                    ));
+                }
+                run.updated_at = Utc::now();
+                run.record_surface_audit(
+                    ComputerSurfaceEvent::ActionProposed,
+                    "action_proposed",
+                    "staged",
+                    Some(action_class),
+                    Some(observation_id.into()),
+                    None,
+                    None,
+                );
+                if let Some(point) = attention {
+                    run.record_surface_audit(
+                        ComputerSurfaceEvent::AttentionMoved,
+                        "attention",
+                        "moved",
+                        Some(action_class),
+                        Some(observation_id.into()),
+                        None,
+                        Some(point),
+                    );
+                }
+                run.record_surface_audit(
+                    ComputerSurfaceEvent::ApprovalRequired,
+                    "approval",
+                    "required",
+                    Some(action_class),
+                    Some(observation_id.into()),
+                    None,
+                    None,
+                );
+                Ok(())
+            })
+            .and_then(|run| run.ok_or_else(unknown_run));
+        if let Err(error) = &result {
+            self.record_denial(
+                run_id,
+                "record_agent_action_proposal",
+                Some(action_class),
+                error,
+            );
+        }
+        self.finish_mutation(request_id, &result)?;
+        result
+    }
+
+    /// Record an explicit rejection of the exact still-current model proposal.
+    /// Rejection carries no attention point so a replay consumer cannot mistake
+    /// an old marker for current agent intent.
+    pub fn record_agent_approval_rejected(
+        &self,
+        request_id: &str,
+        caller: &ComputerAuthorityToken,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action_class: ActionClass,
+    ) -> ComputerResult<ComputerRun> {
+        validate_id("run_id", run_id)?;
+        validate_id("observation_id", observation_id)?;
+        let current = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        let payload = json!({
+            "runId": run_id,
+            "expectedVersion": expected_version,
+            "observationId": observation_id,
+            "actionClass": action_class,
+        });
+        if let Some(replayed) = self.begin_mutation(
+            request_id,
+            "record_agent_approval_rejected",
+            &payload,
+            caller,
+            Some(&current),
+        )? {
+            return replayed;
+        }
+        let result = self
+            .store
+            .update_run(run_id, |run| {
+                ensure_version(run, expected_version)?;
+                self.require_caller(run, caller)?;
+                if run.state != ComputerRunState::Ready
+                    || run
+                        .current_observation
+                        .as_ref()
+                        .map(|observation| observation.observation_id.as_str())
+                        != Some(observation_id)
+                {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::StaleObservation,
+                        "approval rejection is not bound to the current ready observation",
+                    ));
+                }
+                run.updated_at = Utc::now();
+                run.record_surface_audit(
+                    ComputerSurfaceEvent::ApprovalRejected,
+                    "approval",
+                    "rejected",
+                    Some(action_class),
+                    Some(observation_id.into()),
+                    None,
+                    None,
+                );
+                Ok(())
+            })
+            .and_then(|run| run.ok_or_else(unknown_run));
+        if let Err(error) = &result {
+            self.record_denial(
+                run_id,
+                "record_agent_approval_rejected",
+                Some(action_class),
+                error,
+            );
         }
         self.finish_mutation(request_id, &result)?;
         result
@@ -2224,6 +2402,105 @@ mod tests {
                     .version,
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn agent_attention_events_are_idempotent_and_do_not_grant_or_dispatch() {
+        let (backend, service) = service();
+        let owner_session_id = Uuid::new_v4();
+        let token = ComputerAuthorityToken::local_operator(owner_session_id).unwrap();
+        let run = service
+            .create_run(
+                "create-attention-run",
+                &token,
+                None,
+                SimulatorBackend::demo_target(),
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "authorize-attention-run",
+                &token,
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let observation = service
+            .observe("observe-attention-run", &token, &run.run_id, run.version)
+            .await
+            .unwrap();
+        let current = service.get_run(&run.run_id).unwrap().unwrap();
+        let action = ComputerAction::SetValue {
+            element_id: format!("{}-name", observation.observation_id),
+            text: "not persisted in attention evidence".into(),
+        };
+        let attention = ComputerAttentionPoint::for_action(&observation, &action);
+        let staged = service
+            .record_agent_action_proposal(
+                "stage-agent-attention",
+                &token,
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                action.class(),
+                attention,
+            )
+            .unwrap();
+
+        assert_eq!(staged.version, current.version);
+        assert_eq!(staged.action_count, 0);
+        assert_eq!(backend.action_attempt_count(), 0);
+        assert_eq!(
+            staged
+                .audit
+                .iter()
+                .rev()
+                .take(3)
+                .map(|entry| entry.surface_event)
+                .collect::<Vec<_>>(),
+            vec![
+                ComputerSurfaceEvent::ApprovalRequired,
+                ComputerSurfaceEvent::AttentionMoved,
+                ComputerSurfaceEvent::ActionProposed,
+            ]
+        );
+        assert!(!serde_json::to_string(&staged.audit)
+            .unwrap()
+            .contains("not persisted in attention evidence"));
+
+        let replayed = service
+            .record_agent_action_proposal(
+                "stage-agent-attention",
+                &token,
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                action.class(),
+                attention,
+            )
+            .unwrap();
+        assert_eq!(replayed.audit.len(), staged.audit.len());
+
+        let rejected = service
+            .record_agent_approval_rejected(
+                "reject-agent-attention",
+                &token,
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                action.class(),
+            )
+            .unwrap();
+        assert_eq!(rejected.version, current.version);
+        assert_eq!(rejected.action_count, 0);
+        assert_eq!(
+            rejected.audit.last().unwrap().surface_event,
+            ComputerSurfaceEvent::ApprovalRejected
+        );
+        assert!(rejected.audit.last().unwrap().attention.is_none());
+        assert_eq!(backend.action_attempt_count(), 0);
     }
 
     #[tokio::test]

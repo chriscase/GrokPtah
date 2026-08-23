@@ -1073,10 +1073,17 @@ export type ComputerSurfaceEvent =
   | "terminal"
   | "denied";
 
+export interface ComputerAttentionPoint {
+  xBasisPoints: number;
+  yBasisPoints: number;
+  target: "surface" | "semantic_element";
+}
+
 export interface ComputerSurfaceEventEntry {
   sequence: number;
   at: string;
   surfaceEvent: ComputerSurfaceEvent;
+  attention?: ComputerAttentionPoint | null;
   operation: string;
   disposition: string;
   actionClass?: string | null;
@@ -1174,6 +1181,7 @@ export interface PendingComputerApproval {
   action: ComputerAction;
   actionSummary: string;
   risk: string;
+  proposalOrigin: "operator" | "agent";
   createdAt: string;
 }
 
