@@ -48,7 +48,7 @@ Command-line options override their environment equivalents:
 | `--listen ADDR` | `GROKPTAH_SERVICE_LISTEN` | `127.0.0.1:39200` |
 | `--token TOKEN` | `GROKPTAH_SERVICE_TOKEN` | required; remote coordinator authority |
 | `--workspace PATH` | `GROKPTAH_SERVICE_WORKSPACES` | required; repeatable |
-| `--client [ROLE:]ID=TOKEN` | `GROKPTAH_SERVICE_CLIENTS` | primary coordinator token only; additional credentials repeatable |
+| `--client [ROLE:]ID[/AGENT]=TOKEN` | `GROKPTAH_SERVICE_CLIENTS` | primary coordinator token plus repeatable operator/observer or Agent-bound worker credentials |
 | — | `GROKPTAH_SERVICE_AGENT_OWNER` | `primary` |
 | `--allow-remote` | `GROKPTAH_SERVICE_ALLOW_REMOTE` | disabled |
 | `--max-concurrent N` | `GROKPTAH_SERVICE_MAX_CONCURRENT` | `4` |
@@ -75,15 +75,23 @@ listener is non-loopback. The service never binds remotely by accident.
 
 The primary credential remains compatible with `GROKPTAH_SERVICE_TOKEN` and
 has `coordinator` authority. Add named credentials with repeated
-`--client [ROLE:]ID=TOKEN` options or a comma-separated
+`--client [ROLE:]ID[/AGENT]=TOKEN` options or a comma-separated
 `GROKPTAH_SERVICE_CLIENTS` value such as
 `operator:laptop=<token>,observer:dashboard=<token>`. The role prefix is
-optional and defaults to `coordinator`. Every credential maps to the configured
+optional and defaults to `coordinator`. A least-privilege worker uses
+`worker:<credential-id>/<agent-id>=<token>`; it is bound to that exact Agent
+and narrowed to the final configured workspace allowlist after all command-line
+overrides are resolved. Every credential maps to the configured
 `GROKPTAH_SERVICE_AGENT_OWNER` account (default `primary`), so devices can
 share durable Agent identities while Runs and audit entries retain the
-credential ID that initiated them. **Every one of those configured bearers
-can currently approve and promote within this service's scope.** Credentials
-are held in process memory and are never written into `GROKPTAH_HOME`.
+credential ID that initiated them. Credentials are held in process memory and
+are never written into `GROKPTAH_HOME`.
+
+For an operator-managed worker rotation, retain the stable credential and
+Agent IDs, replace only the token in the external secret configuration, and
+restart the sole-writer service. Existing MCP sessions do not survive the
+process restart; the old token must fail initialization and the replacement
+must open a new session. Never record either token in soak evidence.
 
 ### Authority tiers and capability discovery
 
@@ -96,6 +104,7 @@ filesystem permissions.
 | --- | --- | --- |
 | `observer` | dashboards and read-only inspection | no submission, queue, Work, Manager, routine, approval, promotion, or Computer Use mutations |
 | `coordinator` | long-running agents and ordinary remote orchestration | may submit/cancel/retry Runs and coordinate Work, Managers, workers, and routines; cannot approve Work or Runs, promote/discard Runs, change managed-execution authority, or access Computer Use |
+| `worker` | one independently running durable Agent | coordinator operation ceiling narrowed to one configured Agent and the service workspace allowlist; cannot impersonate another Agent, approve/promote, administer managed execution, or access Computer Use |
 | `operator` | explicitly trusted remote administration | adds protected Work/Run approval, promotion/discard, and managed-execution administration; still cannot access Computer Use |
 | local operator | trusted in-process desktop adapter only | never selectable by a bearer credential |
 

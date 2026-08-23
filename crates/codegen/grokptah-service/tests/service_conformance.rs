@@ -1020,6 +1020,91 @@ async fn hosted_service_exposes_worker_and_message_state() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn configured_worker_rotation_survives_service_restart_without_widening_authority() {
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+    let old_token = "worker-old-token-with-enough-entropy";
+    let new_token = "worker-new-token-with-enough-entropy";
+
+    let worker_credential = |token: &str| {
+        AuthCredential::new("worker-build-1", token)
+            .unwrap()
+            .with_agent_binding("agent-build-1")
+            .unwrap()
+            .with_workspace_roots([workspace.clone()])
+            .unwrap()
+    };
+    let service_config = |token: &str| {
+        let mut config = ServiceConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            TOKEN,
+            vec![workspace.clone()],
+            false,
+            2,
+            Duration::from_secs(8),
+        )
+        .unwrap()
+        .with_runtime_home(env._home.path())
+        .unwrap();
+        config.client_credentials.push(worker_credential(token));
+        config
+    };
+
+    let first = start_service(service_config(old_token)).await.unwrap();
+    let mut worker = McpControlClient::new(format!("http://{}", first.addr), old_token);
+    worker.initialize().await.unwrap();
+    let before = worker
+        .call_tool("ptah_get_authority_capabilities", json!({}))
+        .await
+        .unwrap()
+        .structured;
+    assert_eq!(before["principal"]["role"], "remote_coordinator");
+    assert_eq!(before["principal"]["credentialId"], "worker-build-1");
+    assert_eq!(before["scopes"]["agentIds"], json!(["agent-build-1"]));
+    let tools = worker.list_tools().await.unwrap();
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    for required in ["ptah_claim_work", "ptah_heartbeat_worker"] {
+        assert!(names.contains(&required), "missing worker tool {required}");
+    }
+    for denied in [
+        "ptah_approve_work",
+        "ptah_approve_run",
+        "ptah_promote_run",
+        "ptah_set_managed_execution",
+        "ptah_authorize_work_execution",
+        "ptah_list_computer_runs",
+    ] {
+        assert!(!names.contains(&denied), "worker authority leaked {denied}");
+    }
+    worker.close_session().await.unwrap();
+    first.stop_and_wait().await;
+
+    let second = start_service(service_config(new_token)).await.unwrap();
+    let mut stale = McpControlClient::new(format!("http://{}", second.addr), old_token);
+    assert!(
+        stale.initialize().await.is_err(),
+        "old worker token survived rotation"
+    );
+    let mut rotated = McpControlClient::new(format!("http://{}", second.addr), new_token);
+    rotated.initialize().await.unwrap();
+    let after = rotated
+        .call_tool("ptah_get_authority_capabilities", json!({}))
+        .await
+        .unwrap()
+        .structured;
+    assert_eq!(after["principal"], before["principal"]);
+    assert_eq!(after["scopes"], before["scopes"]);
+    assert_eq!(after["operations"], before["operations"]);
+    assert_eq!(after["documentHash"], before["documentHash"]);
+    rotated.close_session().await.unwrap();
+    second.stop_and_wait().await;
+}
+
+#[tokio::test]
 async fn hosted_service_exposes_native_executor_controls() {
     let env = ServiceEnv::new();
     let workspace = env.workspace_path();

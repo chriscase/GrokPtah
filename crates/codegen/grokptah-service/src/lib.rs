@@ -174,6 +174,7 @@ impl ServiceConfig {
             bail!("at least one service client credential is required");
         }
         let mut credential_ids = HashSet::new();
+        let mut credential_tokens = HashSet::new();
         let Some(primary) = self
             .client_credentials
             .iter()
@@ -187,6 +188,12 @@ impl ServiceConfig {
         for credential in &self.client_credentials {
             if !credential_ids.insert(credential.id.as_str()) {
                 bail!("duplicate service client credential id: {}", credential.id);
+            }
+            if !credential_tokens.insert(credential.token()) {
+                bail!("duplicate service client credential token");
+            }
+            if credential.bound_agent_id().is_some() && !credential.has_explicit_workspace_scope() {
+                bail!("Agent-bound worker credentials require explicit workspace grants");
             }
             if !self.listen.ip().is_loopback() && credential.token().len() < 24 {
                 bail!("remote listeners require every bearer token to be at least 24 characters");
@@ -289,8 +296,26 @@ where
             value => bail!("unexpected argument {value}"),
         }
     }
+    scope_configured_workers(&mut config)?;
     config.validate()?;
     Ok(StartupAction::Run(config))
+}
+
+fn scope_configured_workers(config: &mut ServiceConfig) -> Result<()> {
+    let roots = config.workspaces.clone();
+    config.client_credentials = std::mem::take(&mut config.client_credentials)
+        .into_iter()
+        .map(|credential| {
+            if credential.bound_agent_id().is_some() {
+                credential
+                    .with_workspace_roots(roots.clone())
+                    .map_err(|error| anyhow::anyhow!(error.message))
+            } else {
+                Ok(credential)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(())
 }
 
 fn next_value<I>(iter: &mut I, flag: &str) -> Result<String>
@@ -316,17 +341,30 @@ fn env_bool(name: &str) -> bool {
 fn parse_client_credential(spec: &str) -> Result<AuthCredential> {
     let (identity, token) = spec
         .split_once('=')
-        .with_context(|| "client credential must use [ROLE:]ID=TOKEN format")?;
+        .with_context(|| "client credential must use [ROLE:]ID[/AGENT]=TOKEN format")?;
     let (role, id) = identity
         .split_once(':')
         .map(|(role, id)| (role.trim(), id.trim()))
         .unwrap_or(("coordinator", identity.trim()));
     let credential = match role {
-        "coordinator" => AuthCredential::new(id, token),
-        "operator" => AuthCredential::operator(id, token),
-        "observer" => AuthCredential::observer(id, token),
+        "coordinator" if !id.contains('/') => AuthCredential::new(id, token),
+        "operator" if !id.contains('/') => AuthCredential::operator(id, token),
+        "observer" if !id.contains('/') => AuthCredential::observer(id, token),
+        "worker" => {
+            let (credential_id, agent_id) = id
+                .split_once('/')
+                .with_context(|| "worker credential must use worker:ID/AGENT=TOKEN format")?;
+            if credential_id.contains('/') || agent_id.contains('/') {
+                bail!("worker credential must contain exactly one ID/AGENT separator");
+            }
+            return AuthCredential::new(credential_id.trim(), token)
+                .and_then(|credential| credential.with_agent_binding(agent_id.trim()))
+                .map_err(|error| anyhow::anyhow!(error.message));
+        }
         _ => {
-            bail!("client credential role must be coordinator, operator, or observer")
+            bail!(
+                "client credential role must be coordinator, operator, observer, or worker; only worker uses /AGENT"
+            )
         }
     };
     credential.map_err(|error| anyhow::anyhow!(error.message))
@@ -341,7 +379,7 @@ fn parse_client_credentials(value: &str) -> Result<Vec<AuthCredential>> {
 }
 
 pub fn help_text() -> &'static str {
-    "GrokPtah headless service\n\nUsage: grokptah-service [options]\n\nOptions:\n  --listen ADDR                 Bind address (default 127.0.0.1:39200)\n  --token TOKEN                 Coordinator bearer (or GROKPTAH_SERVICE_TOKEN)\n  --workspace PATH              Allowlisted workspace; repeatable\n  --client [ROLE:]ID=TOKEN      Named coordinator/operator/observer credential\n  --allow-remote                Permit non-loopback bind; health requires auth\n  --max-concurrent N            Concurrent request/run ceiling (default 4)\n  --request-timeout-ms N        Request deadline (default 120000)\n  -h, --help                    Show this help\n      --version                 Show the service version\n\nGROKPTAH_SERVICE_CLIENTS accepts comma-separated [ROLE:]ID=TOKEN entries.\nThe default role is coordinator; local-operator authority is never bearer-selectable.\nGROKPTAH_SERVICE_AGENT_OWNER names the durable Agent owner account.\nSet GROKPTAH_HOME to choose the durable service data directory."
+    "GrokPtah headless service\n\nUsage: grokptah-service [options]\n\nOptions:\n  --listen ADDR                         Bind address (default 127.0.0.1:39200)\n  --token TOKEN                         Coordinator bearer (or GROKPTAH_SERVICE_TOKEN)\n  --workspace PATH                      Allowlisted workspace; repeatable\n  --client [ROLE:]ID[/AGENT]=TOKEN      Named coordinator/operator/observer/worker credential\n  --allow-remote                        Permit non-loopback bind; health requires auth\n  --max-concurrent N                    Concurrent request/run ceiling (default 4)\n  --request-timeout-ms N                Request deadline (default 120000)\n  -h, --help                            Show this help\n      --version                         Show the service version\n\nGROKPTAH_SERVICE_CLIENTS accepts comma-separated [ROLE:]ID[/AGENT]=TOKEN entries.\nThe default role is coordinator. Worker credentials require worker:ID/AGENT=TOKEN and are scoped to the configured workspaces.\nLocal-operator authority is never bearer-selectable.\nGROKPTAH_SERVICE_AGENT_OWNER names the durable Agent owner account.\nSet GROKPTAH_HOME to choose the durable service data directory."
 }
 
 pub struct ServiceHandle {
@@ -525,6 +563,56 @@ mod tests {
             .client_credentials
             .push(AuthCredential::new("laptop", "another-token").unwrap());
         assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
+    fn command_line_worker_is_agent_bound_and_scoped_after_workspace_resolution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_text = workspace.path().display().to_string();
+        let action = parse_args(vec![
+            "--listen".to_string(),
+            "127.0.0.1:0".to_string(),
+            "--token".to_string(),
+            "primary-token".to_string(),
+            "--workspace".to_string(),
+            workspace_text,
+            "--client".to_string(),
+            "worker:build-1/agent-build-1=worker-token-1".to_string(),
+        ])
+        .unwrap();
+        let StartupAction::Run(config) = action else {
+            panic!("expected run action");
+        };
+        let worker = config
+            .client_credentials
+            .iter()
+            .find(|credential| credential.id == "build-1")
+            .expect("configured worker credential");
+        assert_eq!(worker.role(), AuthorityRole::RemoteCoordinator);
+        assert_eq!(worker.bound_agent_id(), Some("agent-build-1"));
+        assert!(worker.has_explicit_workspace_scope());
+        config.validate().unwrap();
+
+        assert!(parse_client_credential("worker:missing-agent=token").is_err());
+        assert!(parse_client_credential("worker:id/agent/extra=token").is_err());
+        assert!(parse_client_credential("coordinator:id/agent=token").is_err());
+    }
+
+    #[test]
+    fn duplicate_client_tokens_fail_before_service_start() {
+        let mut config = ServiceConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "shared-token",
+            vec![PathBuf::from("/tmp/project")],
+            false,
+            2,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        config
+            .client_credentials
+            .push(AuthCredential::observer("observer", "shared-token").unwrap());
+        assert!(config.validate().is_err());
     }
 
     #[test]

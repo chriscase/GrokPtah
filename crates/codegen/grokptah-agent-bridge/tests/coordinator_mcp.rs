@@ -56,6 +56,8 @@ async fn independent_worker_recovers_assignment_and_messages() {
         AuthCredential::new("worker", "worker-token-307")
             .unwrap()
             .with_agent_binding(worker.agent_id.clone())
+            .unwrap()
+            .with_workspace_roots([workspace.path().to_path_buf()])
             .unwrap(),
     ])
     .unwrap();

@@ -367,6 +367,12 @@ impl AuthCredential {
     /// Narrow this bearer to one durable worker identity. The secret remains
     /// private; only the stable identity is carried into authorization/audit.
     pub fn with_agent_binding(mut self, agent_id: impl Into<String>) -> Result<Self, OrchError> {
+        if self.computer_read.is_some() {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "a Computer-read credential cannot be converted into a worker credential",
+            ));
+        }
         let agent_id = agent_id.into().trim().to_string();
         if agent_id.is_empty()
             || agent_id.len() > 256
@@ -386,6 +392,12 @@ impl AuthCredential {
 
     pub fn bound_agent_id(&self) -> Option<&str> {
         self.bound_agent_id.as_deref()
+    }
+
+    /// Whether this credential carries an explicit canonical workspace
+    /// narrowing instead of inheriting the service-wide allowlist.
+    pub fn has_explicit_workspace_scope(&self) -> bool {
+        self.workspace_roots.is_some()
     }
 
     /// Issue a credential bound to exactly one host-owned Computer-read
@@ -437,6 +449,12 @@ impl AuthCredential {
         service_allowlist: &WorkspaceAllowlist,
     ) -> Result<WorkspaceAllowlist, OrchError> {
         let Some(roots) = self.workspace_roots.as_ref() else {
+            if self.bound_agent_id.is_some() {
+                return Err(OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "an Agent-bound worker credential requires explicit workspace grants",
+                ));
+            }
             return Ok(service_allowlist.clone());
         };
         if roots.iter().any(|root| !service_allowlist.contains(root)) {
@@ -653,15 +671,18 @@ mod tests {
 
     #[test]
     fn worker_binding_is_narrow_and_defaults_missing_identity() {
+        let workspace = tempdir().unwrap();
         let credential = AuthCredential::new("worker", "worker-token")
             .unwrap()
             .with_agent_binding("worker-a")
+            .unwrap()
+            .with_workspace_roots([workspace.path().to_path_buf()])
             .unwrap();
         let auth = authenticate_bearer(
             Some("Bearer worker-token"),
             &[credential],
             "account-1",
-            &WorkspaceAllowlist::default(),
+            &WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
         )
         .unwrap();
         assert_eq!(auth.bound_agent_id(), Some("worker-a"));
@@ -702,6 +723,24 @@ mod tests {
                 "invalid worker identity should fail closed: {invalid:?}"
             );
         }
+
+        let unscoped = AuthCredential::new("worker", "token")
+            .unwrap()
+            .with_agent_binding("worker-a")
+            .unwrap();
+        assert!(unscoped
+            .effective_allowlist(&WorkspaceAllowlist::default())
+            .is_err());
+
+        let workspace = tempdir().unwrap();
+        let computer_read = AuthCredential::with_computer_read_grant(
+            "computer-read",
+            "read-token",
+            Uuid::new_v4(),
+            workspace.path(),
+        )
+        .unwrap();
+        assert!(computer_read.with_agent_binding("worker-a").is_err());
     }
 
     #[test]
