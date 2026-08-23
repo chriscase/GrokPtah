@@ -30,7 +30,11 @@ pub const MAX_REVIEW_JSON_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SYNTHETIC_BODY_BYTES: usize = 4 * 1024;
 pub const SCORER_IDENTITY: &str = "grokptah.code-review-scorer.v1|one-to-one|tp=file+symbol+region+category+causal_atom|fp=duplicate+lure|severity-weighted|brier-ece|completeness";
 pub const RUNNER_IDENTITY: &str =
-    "grokptah.code-review-runner.v1|fake-contract|live-fail-closed-enterprise-lease";
+    "grokptah.code-review-runner.v1|fake-loopback-transport|live-fail-closed-enterprise-lease";
+pub const SCORER_SOURCE: &[u8] = include_bytes!("review_score.rs");
+pub const RUNNER_SOURCE: &[u8] = include_bytes!("review_runner.rs");
+pub const MANIFEST_SOURCE: &[u8] = include_bytes!("review_manifest.rs");
+pub const REPORT_SOURCE: &[u8] = include_bytes!("review_report.rs");
 
 const MAX_ID_BYTES: usize = 96;
 
@@ -247,6 +251,7 @@ pub enum ArtifactRole {
     SealedPublicReport,
     SuiteManifest,
     DigestFingerprint,
+    ImplementationIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -387,7 +392,24 @@ pub struct FakeProviderManifest {
     pub quota: FakeQuota,
     pub adversarial_scenarios: Vec<AdversarialScenario>,
     pub denied_mutators: Vec<ReviewTool>,
+    pub malicious_calls: Vec<MaliciousCall>,
+    pub canary_probes: Vec<CanaryProbe>,
     pub arm_scripts: Vec<ArmScript>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MaliciousCall {
+    pub id: String,
+    pub tool: ReviewTool,
+    pub wire_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryProbe {
+    pub id: String,
+    pub logical_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -664,8 +686,10 @@ impl ReviewCampaign {
         if self.actions.len() != 15 || self.oracles.len() != 24 {
             bail!("review campaign must declare the complete action and oracle sets");
         }
-        if self.artifacts.len() != 3 {
-            bail!("review campaign must declare report, suite, and fingerprint artifacts");
+        if self.artifacts.len() != 4 {
+            bail!(
+                "review campaign must declare report, suite, fingerprint, and implementation artifacts"
+            );
         }
         let mut artifact_ids = HashSet::new();
         let mut artifact_paths = HashSet::new();
@@ -919,6 +943,28 @@ impl FakeProviderManifest {
         {
             bail!("fake provider must deny every mutator and publish tool");
         }
+        if self.malicious_calls.len() != 5 {
+            bail!("fake provider must script one malicious call per denied tool");
+        }
+        let mut malicious_ids = HashSet::new();
+        let mut malicious_tools = HashSet::new();
+        for call in &self.malicious_calls {
+            validate_kebab_id(&call.id)?;
+            validate_wire_name(&call.wire_name)?;
+            if !malicious_ids.insert(call.id.as_str()) || !malicious_tools.insert(call.tool) {
+                bail!("fake provider contains a duplicate malicious call");
+            }
+            if !call.tool.forbidden_for_review() {
+                bail!("malicious call must target a denied mutator or publish tool");
+            }
+        }
+        if self.canary_probes.len() != 1 {
+            bail!("fake provider must declare exactly one inaccessible-canary probe");
+        }
+        for probe in &self.canary_probes {
+            validate_kebab_id(&probe.id)?;
+            validate_kebab_id(&probe.logical_name)?;
+        }
         if self.arm_scripts.len() != EXPECTED_CASE_COUNT * 2 {
             bail!("fake provider must script both arms for every case");
         }
@@ -1054,11 +1100,19 @@ impl ReviewBundle {
 }
 
 pub fn scorer_digest() -> String {
-    digest(SCORER_IDENTITY.as_bytes())
+    digest(SCORER_SOURCE)
 }
 
 pub fn runner_digest() -> String {
-    digest(RUNNER_IDENTITY.as_bytes())
+    digest(RUNNER_SOURCE)
+}
+
+pub fn manifest_source_digest() -> String {
+    digest(MANIFEST_SOURCE)
+}
+
+pub fn report_source_digest() -> String {
+    digest(REPORT_SOURCE)
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -1153,6 +1207,13 @@ fn bind_bundle(
     }
     if !unused_scripts.is_empty() {
         bail!("fake provider declares a script that no campaign case consumes");
+    }
+    if provider
+        .canary_probes
+        .iter()
+        .any(|probe| probe.logical_name != corpus.inaccessible_canary.logical_name)
+    {
+        bail!("canary probe must address the corpus inaccessible canary by logical name");
     }
     Ok(())
 }
@@ -1304,6 +1365,20 @@ where
         if !unique.insert(*value) {
             bail!("review campaign contains a duplicate {name}");
         }
+    }
+    Ok(())
+}
+
+fn validate_wire_name(value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_ID_BYTES {
+        bail!("wire name length is outside its bound");
+    }
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b':'))
+    {
+        bail!("wire name contains a disallowed character");
     }
     Ok(())
 }

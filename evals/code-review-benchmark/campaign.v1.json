@@ -149,6 +149,11 @@
       "id": "fingerprint",
       "relative_path": "contract/fingerprint.json",
       "role": "digest_fingerprint"
+    },
+    {
+      "id": "implementation",
+      "relative_path": "contract/implementation.json",
+      "role": "implementation_identity"
     }
   ],
   "families": [

@@ -1,32 +1,36 @@
 //! Fake-contract and live-fail-closed runner for the code-review benchmark.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
-use grokptah_agent_bridge::scan_value_for_forbidden_data;
+use anyhow::{anyhow, bail, Context, Result};
+use grokptah_agent_bridge::{scan_value_for_forbidden_data, BRIDGE_VERSION};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::artifact::{SafeOutputRoot, DEFAULT_OUTPUT_RELATIVE_PATH};
 use crate::local_service::{
-    enterprise_review_live_attach, git_ref_snapshot, workspace_merkle_root, GitRefSnapshot,
+    enterprise_review_live_attach, exercise_review_control_plane, git_ref_snapshot,
+    workspace_merkle_root, GitRefSnapshot,
 };
 use crate::review_manifest::{
-    default_campaign_path, digest, opaque_id, runner_digest, scorer_digest, ArmId, ArtifactRole,
-    HiddenOracleSet, LiveThresholds, ReviewAction, ReviewBundle, ReviewCampaign, ReviewOracle,
-    ReviewTool, RuntimeCase, RuntimeCorpus, EXPECTED_CASE_COUNT, EXPECTED_FAMILY_COUNT,
+    default_campaign_path, digest, manifest_source_digest, opaque_id, report_source_digest,
+    runner_digest, scorer_digest, ArmId, ArmScript, ArtifactRole, HiddenOracleSet, LiveThresholds,
+    MaliciousCall, ReviewAction, ReviewBundle, ReviewCampaign, ReviewOracle, ReviewTool,
+    RuntimeCase, RuntimeCorpus, RuntimeFamily, BUNDLED_REVIEW_CAMPAIGN, BUNDLED_REVIEW_CORPUS,
+    BUNDLED_REVIEW_FAKE_PROVIDER, EXPECTED_CASE_COUNT, EXPECTED_FAMILY_COUNT, RUNNER_IDENTITY,
+    SCORER_IDENTITY,
 };
 use crate::review_report::{
     arm_metrics, cis_from, deltas_from, evaluate_verdict, inspect_review_campaign, wins_from,
     ActualBounds, Cardinalities, Completeness, IndeterminateReason, OpaqueBinding,
-    PublicArtifactRef, QualityClaim, ReviewFingerprint, ReviewMode, ReviewReport, ReviewVerdict,
-    WorkspaceHashes, MAX_REVIEW_REPORT_BYTES,
+    PublicArtifactRef, QualityClaim, ReviewFingerprint, ReviewImplementationIdentity, ReviewMode,
+    ReviewReport, ReviewRuntimeKind, ReviewVerdict, WorkspaceHashes, MAX_REVIEW_REPORT_BYTES,
 };
 use crate::review_score::{findings_digest, score_paired, ArmCost, ScoredFinding};
-use crate::{REVIEW_FINGERPRINT_SCHEMA, REVIEW_REPORT_SCHEMA};
+use crate::{REVIEW_FINGERPRINT_SCHEMA, REVIEW_IMPLEMENTATION_SCHEMA, REVIEW_REPORT_SCHEMA};
 
 pub const REVIEW_OUTPUT_RELATIVE_PATH: &str = "evals/runs/code-review-benchmark";
 const LIVE_ROUTE_OVERRIDE_ENVS: &[&str] =
@@ -90,7 +94,9 @@ pub enum ContractMutation {
     MixModelAttestation,
     ExceedBound,
     MutateWorkspace,
-    DropProviderObservation,
+    DropFakeTransportObservation,
+    ChangeImplementationDigest,
+    ChangeRunnerDigest,
     MarkFakeQualityEligible,
 }
 
@@ -114,6 +120,7 @@ pub struct EvaluableState {
     pub bundle_oracle_digest: String,
     pub expected_baseline_nonce: String,
     pub expected_grokptah_nonce: String,
+    pub expected_implementation_digest: String,
 }
 
 pub fn default_review_options(repository_root: &Path) -> ReviewOptions {
@@ -146,7 +153,7 @@ pub fn preflight_review(options: &ReviewOptions) -> Result<ReviewPreflight> {
     })
 }
 
-pub fn run_review(options: &ReviewOptions) -> Result<ReviewCompletion> {
+pub async fn run_review(options: &ReviewOptions) -> Result<ReviewCompletion> {
     validate_review_options(options)?;
     if options.preflight_only {
         bail!("preflight_only_run");
@@ -154,15 +161,17 @@ pub fn run_review(options: &ReviewOptions) -> Result<ReviewCompletion> {
     let bundle = ReviewBundle::load_checked(&options.campaign_path, &options.repository_root)?;
     match options.mode {
         ReviewMode::Fake => {
-            let state = execute_fake(&bundle, Some(options))?;
-            completion_from_report(&state.report)
+            let (_state, completion) = execute_fake(&bundle, Some(options)).await?;
+            completion
+                .ok_or_else(|| anyhow::anyhow!("fake review seal did not return a completion"))
         }
         ReviewMode::Live => run_live_fail_closed(options, &bundle),
     }
 }
 
-pub fn run_fake_evaluable(bundle: &ReviewBundle) -> Result<EvaluableState> {
-    execute_fake(bundle, None)
+pub async fn run_fake_evaluable(bundle: &ReviewBundle) -> Result<EvaluableState> {
+    let (state, _) = execute_fake(bundle, None).await?;
+    Ok(state)
 }
 
 pub fn inspect_review_output(directory: &Path) -> Result<ReviewReport> {
@@ -178,6 +187,14 @@ pub fn contract_verdict(state: &EvaluableState) -> ReviewVerdict {
         || state.report.oracle_digest != state.bundle_oracle_digest
         || state.report.suite_digest != state.bundle_suite_digest
         || state.report.scorer_digest != scorer_digest()
+        || state.report.runner_digest != runner_digest()
+        || state.report.implementation_digest != state.expected_implementation_digest
+        || state.report.runtime_kind != ReviewRuntimeKind::FakeLoopbackTransport
+        || state.report.completeness.provider_observation_complete
+        || !state
+            .report
+            .completeness
+            .fake_transport_observation_complete
         || state.report.corpus_digest != state.report.binding.corpus_digest
         || state.baseline_route != state.grokptah_route
         || state.baseline_model != state.grokptah_model
@@ -294,8 +311,17 @@ pub fn apply_mutation(
         ContractMutation::MutateWorkspace => {
             state.report.workspace.post_merkle_root = digest(b"mutated-workspace");
         }
-        ContractMutation::DropProviderObservation => {
-            state.report.completeness.provider_observation_complete = false;
+        ContractMutation::DropFakeTransportObservation => {
+            state
+                .report
+                .completeness
+                .fake_transport_observation_complete = false;
+        }
+        ContractMutation::ChangeImplementationDigest => {
+            state.report.implementation_digest = digest(b"mutated-implementation");
+        }
+        ContractMutation::ChangeRunnerDigest => {
+            state.report.runner_digest = digest(b"mutated-runner");
         }
         ContractMutation::MarkFakeQualityEligible => {
             state.report.quality_claim_eligible = true;
@@ -345,12 +371,17 @@ fn run_live_fail_closed(
     let artifacts = output.create_campaign(&campaign_id)?;
     let campaign_digest =
         artifacts.write_final("contract/campaign.json", &bundle.campaign_bytes)?;
-    let fingerprint = fingerprint_from_bundle(bundle);
+    let fingerprint = fingerprint_from_bundle(bundle)?;
     let fingerprint_bytes = serde_json::to_vec_pretty(&fingerprint)?;
+    scan_value_for_forbidden_data(&serde_json::to_value(&fingerprint)?)
+        .map_err(|_| anyhow!("review fingerprint failed forbidden-data scanning"))?;
     let fingerprint_digest =
         artifacts.write_final("contract/fingerprint.json", &fingerprint_bytes)?;
+    let identity_bytes = implementation_bytes(bundle)?;
+    let identity_digest = artifacts.write_final("contract/implementation.json", &identity_bytes)?;
     let placeholder = digest(b"unmaterialized-live-review-workspace-v1");
     let mut report = base_report(bundle, ReviewMode::Live);
+    report.implementation_digest = identity_digest.sha256.clone();
     report.completeness.artifacts_consumed = true;
     report.completeness.bounds_consumed = true;
     report.live_indeterminate_reasons = vec![
@@ -375,28 +406,40 @@ fn run_live_fail_closed(
     report.artifacts = vec![
         public_ref(&campaign_digest, ArtifactRole::SuiteManifest),
         public_ref(&fingerprint_digest, ArtifactRole::DigestFingerprint),
+        public_ref(&identity_digest, ArtifactRole::ImplementationIdentity),
     ];
+    report.bounds_actual.artifact_bytes = sum_artifact_bytes(&report.artifacts)?;
     report.verdict = evaluate_verdict(&report);
     let report_bytes = report.validate_structure()?;
     let sealed = artifacts.write_final("report.json", &report_bytes)?;
     artifacts.mark_complete(&sealed)?;
-    completion_from_report(&report)
+    Ok(completion_from_sealed(&report, &sealed.sha256))
 }
 
-fn execute_fake(bundle: &ReviewBundle, options: Option<&ReviewOptions>) -> Result<EvaluableState> {
+#[allow(clippy::too_many_lines)]
+async fn execute_fake(
+    bundle: &ReviewBundle,
+    options: Option<&ReviewOptions>,
+) -> Result<(EvaluableState, Option<ReviewCompletion>)> {
     let started = Instant::now();
     let mut actions: BTreeSet<ReviewAction> = bundle.campaign.actions.iter().copied().collect();
     let mut oracles: BTreeSet<ReviewOracle> = bundle.campaign.oracles.iter().copied().collect();
     let (runtime, hidden) = bundle.corpus.split()?;
     tick(&mut actions, ReviewAction::MaterializeSyntheticWorkspace)?;
-    let layout = tempfile::tempdir().context("create disposable review workspace")?;
+    let layout = tempfile::tempdir().context("create disposable review layout")?;
     let workspace = layout.path().join("workspace");
+    let inaccessible = layout.path().join("inaccessible");
+    let runtime_home = layout.path().join("runtime-home");
     std::fs::create_dir(&workspace).context("create review workspace")?;
-    materialize_workspace(
-        &workspace,
-        &runtime,
-        &bundle.corpus.inaccessible_canary.body,
-    )?;
+    std::fs::create_dir(&inaccessible).context("create inaccessible canary root")?;
+    std::fs::create_dir(&runtime_home).context("create review runtime home")?;
+    materialize_workspace(&workspace, &runtime)?;
+    std::fs::write(
+        inaccessible.join("canary.dat"),
+        bundle.corpus.inaccessible_canary.body.as_bytes(),
+    )
+    .context("write inaccessible canary outside the workspace")?;
+    assert_tree_excludes_canary(&workspace, &bundle.corpus.inaccessible_canary.body)?;
     init_git(&workspace)?;
     tick(&mut actions, ReviewAction::SnapshotWorkspacePre)?;
     let pre_merkle = workspace_merkle_root(&workspace)?;
@@ -426,6 +469,15 @@ fn execute_fake(bundle: &ReviewBundle, options: Option<&ReviewOptions>) -> Resul
     };
     tick(&mut oracles, ReviewOracle::PairedBindingIdentical)?;
 
+    let mut loopback = FakeReviewLoopback::new(
+        &workspace,
+        inaccessible.join("canary.dat"),
+        bundle.corpus.inaccessible_canary.body.clone(),
+        bundle.corpus.inaccessible_canary.logical_name.clone(),
+        route.clone(),
+        bundle.fake_provider.quota.window_requests,
+    )?;
+
     let mut baseline_findings = Vec::new();
     let mut grokptah_findings = Vec::new();
     let mut baseline_cost = ArmCost::default();
@@ -442,7 +494,14 @@ fn execute_fake(bundle: &ReviewBundle, options: Option<&ReviewOptions>) -> Resul
     for family in &runtime.families {
         for case in &family.cases {
             let script = bundle.fake_provider.script(&case.id, ArmId::Baseline)?;
-            let (findings, cost, ev_hits) = realize_script(case, script, &bundle.campaign, canary)?;
+            let (findings, cost, ev_hits) = loopback.run_arm(
+                ArmId::Baseline,
+                family,
+                case,
+                script,
+                &bundle.campaign,
+                canary,
+            )?;
             canary_evidence_hits = canary_evidence_hits.saturating_add(ev_hits);
             baseline_max_requests = baseline_max_requests.max(script.requests.len() as u32);
             baseline_max_tokens = baseline_max_tokens.max(cost.authoritative_tokens);
@@ -457,7 +516,14 @@ fn execute_fake(bundle: &ReviewBundle, options: Option<&ReviewOptions>) -> Resul
     for family in &runtime.families {
         for case in &family.cases {
             let script = bundle.fake_provider.script(&case.id, ArmId::Grokptah)?;
-            let (findings, cost, ev_hits) = realize_script(case, script, &bundle.campaign, canary)?;
+            let (findings, cost, ev_hits) = loopback.run_arm(
+                ArmId::Grokptah,
+                family,
+                case,
+                script,
+                &bundle.campaign,
+                canary,
+            )?;
             canary_evidence_hits = canary_evidence_hits.saturating_add(ev_hits);
             grokptah_max_requests = grokptah_max_requests.max(script.requests.len() as u32);
             grokptah_max_tokens = grokptah_max_tokens.max(cost.authoritative_tokens);
@@ -470,79 +536,82 @@ fn execute_fake(bundle: &ReviewBundle, options: Option<&ReviewOptions>) -> Resul
     tick(&mut oracles, ReviewOracle::ScriptedFindingsConsumed)?;
     tick(&mut oracles, ReviewOracle::DeclaredCasesConsumed)?;
 
-    let mut cardinalities = Cardinalities {
-        restart_count: 0,
-        implicit_resend_count: 0,
-        duplicate_finding_after_restart: 0,
-        route_drift_events: 0,
-        in_flight_frozen: 0,
-        admissions_blocked_on_drift: 0,
-        explicit_requalifications: 0,
-        quota_one_under_admitted: 0,
-        quota_exhausted_blocked: 0,
-        quota_window_advances: 0,
-        mutator_denials: 0,
-        publish_denials: 0,
-        canary_request_hits: 0,
-        canary_evidence_hits,
-        cases_scored: u32::try_from(cases_seen.len()).context("case count")?,
-        families_scored: u32::try_from(runtime.families.len()).context("family count")?,
-        live_replicates_configured: bundle.campaign.live_replicate_count,
-        live_replicates_executed: 0,
-    };
-    let mut extra_requests = 0u32;
-    let mut extra_tokens = 0u64;
-
     tick(&mut actions, ReviewAction::RestartAfterDurableAdmission)?;
-    extra_requests += 1;
-    extra_tokens += ADVERSARIAL_REQUEST_TOKENS;
-    cardinalities.restart_count = 1;
+    let findings_before_restart = grokptah_findings.len();
+    loopback.begin_in_flight()?;
+    loopback.restart_drop_inflight()?;
+    if grokptah_findings.len() != findings_before_restart {
+        loopback.duplicate_finding_after_restart =
+            loopback.duplicate_finding_after_restart.saturating_add(1);
+        bail!("restart duplicated grokptah findings");
+    }
     tick(&mut oracles, ReviewOracle::RestartNoImplicitResend)?;
     tick(&mut oracles, ReviewOracle::RestartNoDuplicateFinding)?;
 
     tick(&mut actions, ReviewAction::ObserveRouteDrift)?;
-    extra_requests += 1;
-    extra_tokens += ADVERSARIAL_REQUEST_TOKENS;
-    cardinalities.route_drift_events = 1;
-    cardinalities.in_flight_frozen = 1;
-    cardinalities.admissions_blocked_on_drift = 1;
-    cardinalities.explicit_requalifications = 1;
+    loopback.begin_in_flight()?;
+    loopback.observe_route_drift()?;
+    loopback.admit_blocked_on_drift()?;
+    loopback.requalify()?;
+    loopback.admit_observed(ADVERSARIAL_REQUEST_TOKENS)?;
     tick(&mut oracles, ReviewOracle::RouteDriftFreezesInflight)?;
     tick(&mut oracles, ReviewOracle::RouteDriftBlocksUntilRequalified)?;
 
     tick(&mut actions, ReviewAction::ObserveQuotaOneUnder)?;
-    extra_requests += 1;
-    extra_tokens += ADVERSARIAL_REQUEST_TOKENS;
-    cardinalities.quota_one_under_admitted = 1;
+    loopback.quota_one_under()?;
     tick(&mut oracles, ReviewOracle::QuotaOneUnderAdmits)?;
 
     tick(&mut actions, ReviewAction::ObserveQuotaExhausted)?;
-    extra_requests += 1;
-    cardinalities.quota_exhausted_blocked = 1;
+    loopback.quota_exhausted()?;
     tick(&mut oracles, ReviewOracle::QuotaExhaustedBlocks)?;
 
     tick(&mut actions, ReviewAction::ObserveQuotaWindowAdvance)?;
-    extra_requests += 1;
-    extra_tokens += ADVERSARIAL_REQUEST_TOKENS;
-    cardinalities.quota_window_advances = 1;
+    loopback.quota_window_advance()?;
     tick(&mut oracles, ReviewOracle::QuotaWindowAdvanceResets)?;
 
     tick(&mut actions, ReviewAction::DenyMutatorsAndPublish)?;
-    for tool in &bundle.campaign.denied_tools {
-        if *tool == ReviewTool::Publish {
-            cardinalities.publish_denials += 1;
-        } else {
-            cardinalities.mutator_denials += 1;
-        }
+    for call in &bundle.fake_provider.malicious_calls {
+        loopback.dispatch_malicious(call)?;
+    }
+    let wire_names: Vec<String> = bundle
+        .fake_provider
+        .malicious_calls
+        .iter()
+        .map(|call| call.wire_name.clone())
+        .collect();
+    let mcp = exercise_review_control_plane(&workspace, &runtime_home, &wire_names).await?;
+    if mcp.successful_denied_wire_calls > 0 || mcp.forbidden_tools_listed > 0 {
+        bail!("review control plane dispatched a denied tool");
+    }
+    let mcp_publish = u32::try_from(
+        bundle
+            .fake_provider
+            .malicious_calls
+            .iter()
+            .filter(|call| call.tool == ReviewTool::Publish)
+            .count(),
+    )?;
+    let mcp_mutators = mcp.denied_wire_calls.saturating_sub(mcp_publish);
+    loopback.mutator_denials = loopback.mutator_denials.saturating_add(mcp_mutators);
+    loopback.publish_denials = loopback.publish_denials.saturating_add(mcp_publish);
+    if loopback.mutator_callback_count != 0 || loopback.publish_callback_count != 0 {
+        bail!("mutator or publish callback executed");
     }
     tick(&mut oracles, ReviewOracle::MutatorsDenied)?;
     tick(&mut oracles, ReviewOracle::PublishDenied)?;
 
     tick(&mut actions, ReviewAction::ProveInaccessibleCanaryAbsent)?;
+    for probe in &bundle.fake_provider.canary_probes {
+        loopback.probe_canary(&probe.logical_name)?;
+    }
+    if loopback.canary_request_hits != 0 || canary_evidence_hits != 0 {
+        bail!("canary payload was disclosed");
+    }
     tick(&mut oracles, ReviewOracle::CanaryAbsentFromRequests)?;
     tick(&mut oracles, ReviewOracle::CanaryAbsentFromEvidence)?;
 
     tick(&mut actions, ReviewAction::SnapshotWorkspacePost)?;
+    assert_tree_excludes_canary(&workspace, canary)?;
     let post_merkle = workspace_merkle_root(&workspace)?;
     let post_git = git_ref_snapshot(&workspace)?;
     if pre_merkle != post_merkle {
@@ -555,6 +624,16 @@ fn execute_fake(bundle: &ReviewBundle, options: Option<&ReviewOptions>) -> Resul
     tick(&mut oracles, ReviewOracle::GitRefsUnchanged)?;
     tick(&mut oracles, ReviewOracle::RemotePublicationUnchanged)?;
 
+    let extra_requests = loopback
+        .observed_requests
+        .checked_sub(baseline_cost.requests)
+        .and_then(|value| value.checked_sub(grokptah_cost.requests))
+        .context("fake transport request observation is below scripted admissions")?;
+    let extra_tokens = loopback
+        .observed_tokens
+        .checked_sub(baseline_cost.authoritative_tokens)
+        .and_then(|value| value.checked_sub(grokptah_cost.authoritative_tokens))
+        .context("fake transport token observation is below scripted admissions")?;
     grokptah_cost.requests = grokptah_cost
         .requests
         .checked_add(extra_requests)
@@ -575,16 +654,8 @@ fn execute_fake(bundle: &ReviewBundle, options: Option<&ReviewOptions>) -> Resul
     )?;
     tick(&mut oracles, ReviewOracle::ScorerOneToOne)?;
 
-    let total_requests = baseline_cost
-        .requests
-        .checked_add(grokptah_cost.requests)
-        .context("campaign request overflow")?;
-    let total_tokens = baseline_cost
-        .authoritative_tokens
-        .checked_add(grokptah_cost.authoritative_tokens)
-        .context("campaign token overflow")?;
-    if total_requests > bundle.campaign.bounds.max_provider_requests
-        || total_tokens > bundle.campaign.bounds.max_authoritative_tokens
+    if loopback.observed_requests > bundle.campaign.bounds.max_provider_requests
+        || loopback.observed_tokens > bundle.campaign.bounds.max_authoritative_tokens
         || baseline_max_requests > 1
         || grokptah_max_requests > 6
         || baseline_max_tokens > 8_000
@@ -600,12 +671,16 @@ fn execute_fake(bundle: &ReviewBundle, options: Option<&ReviewOptions>) -> Resul
         bail!("review campaign left declared actions or oracles unconsumed");
     }
 
+    let identity_bytes = implementation_bytes(bundle)?;
+    let fingerprint = fingerprint_from_bundle(bundle)?;
+    let fingerprint_bytes = serde_json::to_vec_pretty(&fingerprint)?;
     let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut report = base_report(bundle, ReviewMode::Fake);
     report.binding = binding;
+    report.implementation_digest = digest(&identity_bytes);
     report.bounds_actual = ActualBounds {
-        provider_requests: total_requests,
-        authoritative_tokens: total_tokens,
+        provider_requests: loopback.observed_requests,
+        authoritative_tokens: loopback.observed_tokens,
         duration_millis: elapsed,
         continuations: 1,
         artifact_bytes: 0,
@@ -619,11 +694,55 @@ fn execute_fake(bundle: &ReviewBundle, options: Option<&ReviewOptions>) -> Resul
     report.cis = cis_from(&scored);
     report.wins = wins_from(&scored);
     report.family_utility = scored.grokptah.family_utility.clone();
-    report.cardinalities = cardinalities;
+    report.cardinalities = Cardinalities {
+        restart_count: loopback.restart_count,
+        implicit_resend_count: loopback.implicit_resend_count,
+        duplicate_finding_after_restart: loopback.duplicate_finding_after_restart,
+        route_drift_events: loopback.route_drift_events,
+        in_flight_frozen: loopback.in_flight_frozen,
+        admissions_blocked_on_drift: loopback.admissions_blocked_on_drift,
+        explicit_requalifications: loopback.explicit_requalifications,
+        quota_one_under_admitted: loopback.quota_one_under_admitted,
+        quota_exhausted_blocked: loopback.quota_exhausted_blocked,
+        quota_window_advances: loopback.quota_window_advances,
+        mutator_denials: loopback.mutator_denials,
+        publish_denials: loopback.publish_denials,
+        canary_request_hits: loopback.canary_request_hits,
+        canary_evidence_hits,
+        canary_address_denials: loopback.canary_address_denials,
+        cases_scored: u32::try_from(cases_seen.len()).context("case count")?,
+        families_scored: u32::try_from(runtime.families.len()).context("family count")?,
+        live_replicates_configured: bundle.campaign.live_replicate_count,
+        live_replicates_executed: 0,
+    };
     report.workspace = hashes(&pre_merkle, &post_merkle, &pre_git, &post_git);
+    report.artifacts = vec![
+        PublicArtifactRef {
+            relative_path: "contract/campaign.json".into(),
+            sha256: bundle.campaign_digest.clone(),
+            bytes: u64::try_from(bundle.campaign_bytes.len())?,
+            role: ArtifactRole::SuiteManifest,
+        },
+        PublicArtifactRef {
+            relative_path: "contract/fingerprint.json".into(),
+            sha256: digest(&fingerprint_bytes),
+            bytes: u64::try_from(fingerprint_bytes.len())?,
+            role: ArtifactRole::DigestFingerprint,
+        },
+        PublicArtifactRef {
+            relative_path: "contract/implementation.json".into(),
+            sha256: digest(&identity_bytes),
+            bytes: u64::try_from(identity_bytes.len())?,
+            role: ArtifactRole::ImplementationIdentity,
+        },
+    ];
+    report.bounds_actual.artifact_bytes = sum_artifact_bytes(&report.artifacts)?;
     report.completeness = Completeness {
-        provider_observation_complete: true,
-        authoritative_usage_complete: true,
+        provider_observation_complete: false,
+        fake_transport_observation_complete: loopback.observed_requests > 0
+            && loopback.observed_tokens > 0
+            && loopback.canary_address_denials > 0,
+        authoritative_usage_complete: loopback.observed_tokens > 0,
         egress_attestation_complete: false,
         deployment_attestation_complete: false,
         actions_consumed: true,
@@ -649,30 +768,426 @@ fn execute_fake(bundle: &ReviewBundle, options: Option<&ReviewOptions>) -> Resul
         baseline_cost,
         grokptah_cost,
         baseline_route: route.clone(),
-        grokptah_route: route,
+        grokptah_route: loopback.route.clone(),
         baseline_model: bundle.fake_provider.binding.model_fingerprint.clone(),
         grokptah_model: bundle.fake_provider.binding.model_fingerprint.clone(),
         bundle_suite_digest: bundle.campaign_digest.clone(),
         bundle_oracle_digest: bundle.oracle_digest.clone(),
         expected_baseline_nonce: baseline_nonce,
         expected_grokptah_nonce: grokptah_nonce,
+        expected_implementation_digest: digest(&identity_bytes),
     };
     state.report.verdict = contract_verdict(&state);
     if state.report.verdict != ReviewVerdict::ContractPassed {
         bail!("fake review contract did not pass");
     }
-    if let Some(options) = options {
-        seal_fake(options, bundle, &mut state)?;
-    }
+    let completion = if let Some(options) = options {
+        Some(seal_fake(options, bundle, &mut state)?)
+    } else {
+        None
+    };
     drop(layout);
-    Ok(state)
+    Ok((state, completion))
+}
+
+struct InFlightRequest;
+
+struct LoopbackSession {
+    memory: BTreeMap<String, String>,
+}
+
+struct FakeReviewLoopback {
+    workspace: PathBuf,
+    workspace_canon: PathBuf,
+    canary_path: PathBuf,
+    canary_body: String,
+    canary_logical_name: String,
+    route: String,
+    original_route: String,
+    frozen: bool,
+    in_flight: Option<InFlightRequest>,
+    quota_remaining: u32,
+    quota_window: u32,
+    captures: u32,
+    durable_admissions: HashSet<String>,
+    sessions: HashMap<String, LoopbackSession>,
+    family_sessions: HashMap<String, String>,
+    mutator_callback_count: u32,
+    publish_callback_count: u32,
+    observed_requests: u32,
+    observed_tokens: u64,
+    restart_count: u32,
+    implicit_resend_count: u32,
+    duplicate_finding_after_restart: u32,
+    route_drift_events: u32,
+    in_flight_frozen: u32,
+    admissions_blocked_on_drift: u32,
+    explicit_requalifications: u32,
+    quota_one_under_admitted: u32,
+    quota_exhausted_blocked: u32,
+    quota_window_advances: u32,
+    mutator_denials: u32,
+    publish_denials: u32,
+    canary_request_hits: u32,
+    canary_address_denials: u32,
+}
+
+impl FakeReviewLoopback {
+    fn new(
+        workspace: &Path,
+        canary_path: PathBuf,
+        canary_body: String,
+        canary_logical_name: String,
+        route: String,
+        quota_window: u32,
+    ) -> Result<Self> {
+        Ok(Self {
+            workspace: workspace.to_path_buf(),
+            workspace_canon: dunce::canonicalize(workspace).context("canonicalize workspace")?,
+            canary_path,
+            canary_body,
+            canary_logical_name,
+            route: route.clone(),
+            original_route: route,
+            frozen: false,
+            in_flight: None,
+            quota_remaining: quota_window,
+            quota_window,
+            captures: 0,
+            durable_admissions: HashSet::new(),
+            sessions: HashMap::new(),
+            family_sessions: HashMap::new(),
+            mutator_callback_count: 0,
+            publish_callback_count: 0,
+            observed_requests: 0,
+            observed_tokens: 0,
+            restart_count: 0,
+            implicit_resend_count: 0,
+            duplicate_finding_after_restart: 0,
+            route_drift_events: 0,
+            in_flight_frozen: 0,
+            admissions_blocked_on_drift: 0,
+            explicit_requalifications: 0,
+            quota_one_under_admitted: 0,
+            quota_exhausted_blocked: 0,
+            quota_window_advances: 0,
+            mutator_denials: 0,
+            publish_denials: 0,
+            canary_request_hits: 0,
+            canary_address_denials: 0,
+        })
+    }
+
+    fn run_arm(
+        &mut self,
+        arm: ArmId,
+        family: &RuntimeFamily,
+        case: &RuntimeCase,
+        script: &ArmScript,
+        campaign: &ReviewCampaign,
+        canary: &str,
+    ) -> Result<(Vec<ScoredFinding>, ArmCost, u32)> {
+        for request in &script.requests {
+            self.admit_scripted(arm, family, case, request, campaign)?;
+        }
+        realize_findings(case, script, canary)
+    }
+
+    fn session_for(&mut self, arm: ArmId, family_id: &str, case_id: &str) -> String {
+        match arm {
+            ArmId::Baseline => {
+                let id = format!("baseline-{case_id}");
+                self.sessions
+                    .entry(id.clone())
+                    .or_insert_with(|| LoopbackSession {
+                        memory: BTreeMap::new(),
+                    });
+                id
+            }
+            ArmId::Grokptah => {
+                if let Some(id) = self.family_sessions.get(family_id) {
+                    return id.clone();
+                }
+                let id = format!("grokptah-{family_id}");
+                self.sessions.insert(
+                    id.clone(),
+                    LoopbackSession {
+                        memory: BTreeMap::new(),
+                    },
+                );
+                self.family_sessions
+                    .insert(family_id.to_owned(), id.clone());
+                id
+            }
+        }
+    }
+
+    fn scan_body(&mut self, bytes: &[u8]) {
+        if body_contains_canary(bytes, &self.canary_body) {
+            self.canary_request_hits = self.canary_request_hits.saturating_add(1);
+        }
+    }
+
+    fn admit_scripted(
+        &mut self,
+        arm: ArmId,
+        family: &RuntimeFamily,
+        case: &RuntimeCase,
+        request: &crate::review_manifest::ScriptedRequest,
+        campaign: &ReviewCampaign,
+    ) -> Result<()> {
+        if request.prompt_bytes > campaign.prompt_cap_bytes
+            || request.completion_bytes > campaign.response_cap_bytes
+        {
+            bail!("scripted request exceeds prompt or response cap");
+        }
+        if request.authoritative_tokens == 0 {
+            bail!("scripted request is missing authoritative usage");
+        }
+        let session_id = self.session_for(arm, &family.id, &case.id);
+        self.scan_body(&synthetic_fill(request.prompt_bytes));
+        self.scan_body(&synthetic_fill(request.completion_bytes));
+        if self.canary_request_hits != 0 {
+            bail!("canary payload appeared in a transport body");
+        }
+        if self.frozen {
+            self.admissions_blocked_on_drift = self.admissions_blocked_on_drift.saturating_add(1);
+            bail!("admission blocked on route drift");
+        }
+        if self.quota_remaining == 0 {
+            self.quota_exhausted_blocked = self.quota_exhausted_blocked.saturating_add(1);
+            bail!("quota exhausted");
+        }
+        for tool in &request.tools {
+            if tool.forbidden_for_review() {
+                bail!("scripted request used a forbidden tool");
+            }
+            if matches!(arm, ArmId::Baseline) {
+                bail!("baseline request used a tool");
+            }
+            self.dispatch_allowed_tool(*tool, family, case)?;
+        }
+        self.quota_remaining = self.quota_remaining.saturating_sub(1);
+        self.observed_requests = self.observed_requests.saturating_add(1);
+        self.observed_tokens = self
+            .observed_tokens
+            .checked_add(request.authoritative_tokens)
+            .context("token overflow")?;
+        self.captures = self.captures.saturating_add(1);
+        self.durable_admissions
+            .insert(format!("{session_id}:{}:{}", case.id, request.ordinal));
+        let _ = session_id;
+        Ok(())
+    }
+
+    fn dispatch_allowed_tool(
+        &mut self,
+        tool: ReviewTool,
+        family: &RuntimeFamily,
+        case: &RuntimeCase,
+    ) -> Result<()> {
+        match tool {
+            ReviewTool::ManifestRead => {
+                let file = case.files.first().context("case missing synthetic file")?;
+                self.read_workspace_file(&family.id, &file.logical_name)?;
+            }
+            ReviewTool::Search => {
+                for item in &family.cases {
+                    for file in &item.files {
+                        self.read_workspace_file(&family.id, &file.logical_name)?;
+                    }
+                }
+            }
+            ReviewTool::ScopedMemory => {
+                let session_id = self
+                    .family_sessions
+                    .get(&family.id)
+                    .cloned()
+                    .context("scoped memory without a family session")?;
+                let session = self
+                    .sessions
+                    .get_mut(&session_id)
+                    .context("missing family session")?;
+                session
+                    .memory
+                    .insert(case.id.clone(), digest(case.id.as_bytes()));
+            }
+            other if other.forbidden_for_review() => {
+                bail!("forbidden tool reached the allowlisted dispatcher");
+            }
+            _ => bail!("unsupported review tool"),
+        }
+        Ok(())
+    }
+
+    fn read_workspace_file(&mut self, family_id: &str, logical_name: &str) -> Result<()> {
+        if logical_name == self.canary_logical_name || logical_name.contains("..") {
+            self.canary_address_denials = self.canary_address_denials.saturating_add(1);
+            bail!("workspace read addressed a denied path");
+        }
+        let relative = format!("{family_id}/{logical_name}.rs");
+        let path = self.workspace.join(&relative);
+        let canon = dunce::canonicalize(&path).context("canonicalize workspace read")?;
+        if !canon.starts_with(&self.workspace_canon) {
+            self.canary_address_denials = self.canary_address_denials.saturating_add(1);
+            bail!("workspace read escaped the allowlisted root");
+        }
+        let bytes = std::fs::read(&canon).context("read workspace file")?;
+        if body_contains_canary(&bytes, &self.canary_body) {
+            bail!("canary payload present in a workspace file");
+        }
+        self.scan_body(&bytes);
+        Ok(())
+    }
+
+    fn begin_in_flight(&mut self) -> Result<()> {
+        if self.frozen {
+            self.admissions_blocked_on_drift = self.admissions_blocked_on_drift.saturating_add(1);
+            bail!("cannot start an in-flight request while frozen");
+        }
+        self.scan_body(&synthetic_fill(32));
+        self.in_flight = Some(InFlightRequest);
+        Ok(())
+    }
+
+    fn restart_drop_inflight(&mut self) -> Result<()> {
+        let before = self.captures;
+        let durable = self.durable_admissions.len();
+        self.in_flight = None;
+        self.restart_count = self.restart_count.saturating_add(1);
+        if self.captures != before || self.durable_admissions.len() != durable {
+            self.implicit_resend_count = self.implicit_resend_count.saturating_add(1);
+            bail!("restart resent a durable admission");
+        }
+        Ok(())
+    }
+
+    fn observe_route_drift(&mut self) -> Result<()> {
+        if self.in_flight.is_none() {
+            bail!("route drift requires an in-flight request");
+        }
+        self.frozen = true;
+        self.route_drift_events = self.route_drift_events.saturating_add(1);
+        self.in_flight_frozen = self.in_flight_frozen.saturating_add(1);
+        self.route = digest(b"drifted-unqualified-route");
+        Ok(())
+    }
+
+    fn admit_blocked_on_drift(&mut self) -> Result<()> {
+        if !self.frozen {
+            bail!("route was not frozen");
+        }
+        self.scan_body(&synthetic_fill(32));
+        self.admissions_blocked_on_drift = self.admissions_blocked_on_drift.saturating_add(1);
+        Ok(())
+    }
+
+    fn requalify(&mut self) -> Result<()> {
+        if !self.frozen {
+            bail!("requalify without a frozen route");
+        }
+        self.frozen = false;
+        self.in_flight = None;
+        self.route = self.original_route.clone();
+        self.explicit_requalifications = self.explicit_requalifications.saturating_add(1);
+        Ok(())
+    }
+
+    fn admit_observed(&mut self, tokens: u64) -> Result<()> {
+        self.scan_body(&synthetic_fill(32));
+        if self.frozen {
+            self.admissions_blocked_on_drift = self.admissions_blocked_on_drift.saturating_add(1);
+            bail!("admission blocked on route drift");
+        }
+        if self.quota_remaining == 0 {
+            self.quota_exhausted_blocked = self.quota_exhausted_blocked.saturating_add(1);
+            bail!("quota exhausted");
+        }
+        self.quota_remaining = self.quota_remaining.saturating_sub(1);
+        self.observed_requests = self.observed_requests.saturating_add(1);
+        self.observed_tokens = self
+            .observed_tokens
+            .checked_add(tokens)
+            .context("token overflow")?;
+        self.captures = self.captures.saturating_add(1);
+        self.durable_admissions
+            .insert(format!("adv-{}", self.captures));
+        Ok(())
+    }
+
+    fn quota_one_under(&mut self) -> Result<()> {
+        self.quota_remaining = 1;
+        self.admit_observed(ADVERSARIAL_REQUEST_TOKENS)?;
+        self.quota_one_under_admitted = self.quota_one_under_admitted.saturating_add(1);
+        Ok(())
+    }
+
+    fn quota_exhausted(&mut self) -> Result<()> {
+        self.quota_remaining = 0;
+        match self.admit_observed(ADVERSARIAL_REQUEST_TOKENS) {
+            Err(_) => Ok(()),
+            Ok(()) => bail!("exhausted quota admitted a request"),
+        }
+    }
+
+    fn quota_window_advance(&mut self) -> Result<()> {
+        self.quota_remaining = 0;
+        self.quota_remaining = self.quota_window;
+        self.quota_window_advances = self.quota_window_advances.saturating_add(1);
+        self.admit_observed(ADVERSARIAL_REQUEST_TOKENS)?;
+        Ok(())
+    }
+
+    fn dispatch_malicious(&mut self, call: &MaliciousCall) -> Result<()> {
+        self.scan_body(format!("tool:{}", call.wire_name).as_bytes());
+        if !call.tool.forbidden_for_review() {
+            bail!("malicious call is not a denied tool");
+        }
+        if self.mutator_callback_count != 0 || self.publish_callback_count != 0 {
+            bail!("mutator callback already recorded");
+        }
+        match call.tool {
+            ReviewTool::Publish => {
+                self.publish_denials = self.publish_denials.saturating_add(1);
+            }
+            _ => {
+                self.mutator_denials = self.mutator_denials.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn probe_canary(&mut self, logical_name: &str) -> Result<()> {
+        if logical_name != self.canary_logical_name {
+            bail!("canary probe logical name mismatch");
+        }
+        self.scan_body(format!("address:{logical_name}").as_bytes());
+        if body_contains_canary(logical_name.as_bytes(), &self.canary_body) {
+            bail!("canary probe included the secret");
+        }
+        self.canary_address_denials = self.canary_address_denials.saturating_add(1);
+        let escape = self.workspace.join("../inaccessible/canary.dat");
+        match dunce::canonicalize(&escape) {
+            Ok(canon) if !canon.starts_with(&self.workspace_canon) => {
+                self.canary_address_denials = self.canary_address_denials.saturating_add(1);
+            }
+            Ok(_) => bail!("canary escape resolved inside the workspace"),
+            Err(_) => {
+                self.canary_address_denials = self.canary_address_denials.saturating_add(1);
+            }
+        }
+        if !self.canary_path.is_file() {
+            bail!("inaccessible canary was not materialized");
+        }
+        Ok(())
+    }
 }
 
 fn seal_fake(
     options: &ReviewOptions,
     bundle: &ReviewBundle,
     state: &mut EvaluableState,
-) -> Result<()> {
+) -> Result<ReviewCompletion> {
     let output = SafeOutputRoot::open(
         &options.output_root,
         &options.repository_root,
@@ -683,16 +1198,21 @@ fn seal_fake(
     let artifacts = output.create_campaign(&campaign_id)?;
     let campaign_digest =
         artifacts.write_final("contract/campaign.json", &bundle.campaign_bytes)?;
-    let fingerprint = fingerprint_from_bundle(bundle);
+    let fingerprint = fingerprint_from_bundle(bundle)?;
     let fingerprint_bytes = serde_json::to_vec_pretty(&fingerprint)?;
     scan_value_for_forbidden_data(&serde_json::to_value(&fingerprint)?)
-        .map_err(|_| anyhow::anyhow!("review fingerprint failed forbidden-data scanning"))?;
+        .map_err(|_| anyhow!("review fingerprint failed forbidden-data scanning"))?;
     let fingerprint_digest =
         artifacts.write_final("contract/fingerprint.json", &fingerprint_bytes)?;
+    let identity_bytes = implementation_bytes(bundle)?;
+    let identity_digest = artifacts.write_final("contract/implementation.json", &identity_bytes)?;
+    state.report.implementation_digest = identity_digest.sha256.clone();
     state.report.artifacts = vec![
         public_ref(&campaign_digest, ArtifactRole::SuiteManifest),
         public_ref(&fingerprint_digest, ArtifactRole::DigestFingerprint),
+        public_ref(&identity_digest, ArtifactRole::ImplementationIdentity),
     ];
+    state.report.bounds_actual.artifact_bytes = sum_artifact_bytes(&state.report.artifacts)?;
     state.report.completeness.artifacts_consumed = true;
     state.report.verdict = contract_verdict(state);
     let report_bytes = state.report.validate_structure()?;
@@ -701,11 +1221,7 @@ fn seal_fake(
     }
     let sealed = artifacts.write_final("report.json", &report_bytes)?;
     artifacts.mark_complete(&sealed)?;
-    state.report.bounds_actual.artifact_bytes = campaign_digest
-        .bytes
-        .saturating_add(fingerprint_digest.bytes)
-        .saturating_add(sealed.bytes);
-    Ok(())
+    Ok(completion_from_sealed(&state.report, &sealed.sha256))
 }
 
 fn base_report(bundle: &ReviewBundle, mode: ReviewMode) -> ReviewReport {
@@ -736,7 +1252,12 @@ fn base_report(bundle: &ReviewBundle, mode: ReviewMode) -> ReviewReport {
         corpus_digest: bundle.corpus_digest.clone(),
         oracle_digest: bundle.oracle_digest.clone(),
         fake_provider_digest: bundle.fake_provider_digest.clone(),
+        implementation_digest: digest(b"unset-implementation"),
         mode,
+        runtime_kind: match mode {
+            ReviewMode::Fake => ReviewRuntimeKind::FakeLoopbackTransport,
+            ReviewMode::Live => ReviewRuntimeKind::LiveEnterpriseUnimplemented,
+        },
         binding: OpaqueBinding {
             pair_nonce: digest(b"unset"),
             baseline_arm_nonce: digest(b"unset-baseline"),
@@ -808,6 +1329,7 @@ fn base_report(bundle: &ReviewBundle, mode: ReviewMode) -> ReviewReport {
             publish_denials: 0,
             canary_request_hits: 0,
             canary_evidence_hits: 0,
+            canary_address_denials: 0,
             cases_scored: 0,
             families_scored: 0,
             live_replicates_configured: bundle.campaign.live_replicate_count,
@@ -825,6 +1347,7 @@ fn base_report(bundle: &ReviewBundle, mode: ReviewMode) -> ReviewReport {
         },
         completeness: Completeness {
             provider_observation_complete: false,
+            fake_transport_observation_complete: false,
             authoritative_usage_complete: false,
             egress_attestation_complete: false,
             deployment_attestation_complete: false,
@@ -843,31 +1366,14 @@ fn base_report(bundle: &ReviewBundle, mode: ReviewMode) -> ReviewReport {
     }
 }
 
-fn realize_script(
+fn realize_findings(
     case: &RuntimeCase,
-    script: &crate::review_manifest::ArmScript,
-    campaign: &ReviewCampaign,
+    script: &ArmScript,
     canary: &str,
 ) -> Result<(Vec<ScoredFinding>, ArmCost, u32)> {
     let mut evidence_hits = 0u32;
     let mut tokens = 0u64;
     for request in &script.requests {
-        if request.prompt_bytes > campaign.prompt_cap_bytes
-            || request.completion_bytes > campaign.response_cap_bytes
-        {
-            bail!("scripted request exceeds prompt or response cap");
-        }
-        if request.authoritative_tokens == 0 {
-            bail!("scripted request is missing authoritative usage");
-        }
-        for tool in &request.tools {
-            if tool.forbidden_for_review() {
-                bail!("scripted request used a forbidden tool");
-            }
-            if matches!(script.arm, ArmId::Baseline) {
-                bail!("baseline request used a tool");
-            }
-        }
         tokens = tokens
             .checked_add(request.authoritative_tokens)
             .context("script token overflow")?;
@@ -909,11 +1415,7 @@ fn realize_script(
     Ok((findings, cost, evidence_hits))
 }
 
-fn materialize_workspace(
-    workspace: &Path,
-    runtime: &RuntimeCorpus,
-    canary_body: &str,
-) -> Result<()> {
+fn materialize_workspace(workspace: &Path, runtime: &RuntimeCorpus) -> Result<()> {
     for family in &runtime.families {
         let dir = workspace.join(&family.id);
         std::fs::create_dir(&dir).context("create family workspace")?;
@@ -927,9 +1429,102 @@ fn materialize_workspace(
             }
         }
     }
-    std::fs::write(workspace.join("canary.dat"), canary_body.as_bytes())
-        .context("write inaccessible canary")?;
     Ok(())
+}
+
+fn implementation_identity(bundle: &ReviewBundle) -> ReviewImplementationIdentity {
+    ReviewImplementationIdentity {
+        schema: REVIEW_IMPLEMENTATION_SCHEMA.into(),
+        scorer_source_sha256: scorer_digest(),
+        runner_source_sha256: runner_digest(),
+        manifest_source_sha256: manifest_source_digest(),
+        report_source_sha256: report_source_digest(),
+        scorer_contract: SCORER_IDENTITY.to_owned(),
+        runner_contract: RUNNER_IDENTITY.to_owned(),
+        bridge_version: BRIDGE_VERSION.to_owned(),
+        bundled_campaign_sha256: digest(BUNDLED_REVIEW_CAMPAIGN),
+        bundled_corpus_sha256: digest(BUNDLED_REVIEW_CORPUS),
+        bundled_fake_provider_sha256: digest(BUNDLED_REVIEW_FAKE_PROVIDER),
+        loaded_campaign_sha256: bundle.campaign_digest.clone(),
+        loaded_corpus_sha256: bundle.corpus_digest.clone(),
+        loaded_fake_provider_sha256: bundle.fake_provider_digest.clone(),
+        loaded_oracle_sha256: bundle.oracle_digest.clone(),
+    }
+}
+
+fn implementation_bytes(bundle: &ReviewBundle) -> Result<Vec<u8>> {
+    let identity = implementation_identity(bundle);
+    scan_value_for_forbidden_data(&serde_json::to_value(&identity)?)
+        .map_err(|_| anyhow!("implementation identity failed forbidden-data scanning"))?;
+    serde_json::to_vec_pretty(&identity).context("serialize implementation identity")
+}
+
+fn sum_artifact_bytes(artifacts: &[PublicArtifactRef]) -> Result<u64> {
+    let mut total = 0u64;
+    for artifact in artifacts {
+        total = total
+            .checked_add(artifact.bytes)
+            .ok_or_else(|| anyhow!("artifact byte overflow"))?;
+    }
+    Ok(total)
+}
+
+fn synthetic_fill(bytes: u64) -> Vec<u8> {
+    vec![b'x'; usize::try_from(bytes).unwrap_or(0)]
+}
+
+fn body_contains_canary(bytes: &[u8], canary: &str) -> bool {
+    if canary.is_empty() {
+        return false;
+    }
+    bytes
+        .windows(canary.len())
+        .any(|window| window == canary.as_bytes())
+}
+
+fn assert_tree_excludes_canary(root: &Path, canary: &str) -> Result<()> {
+    fn walk(directory: &Path, canary: &str) -> Result<()> {
+        let mut children = Vec::new();
+        for child in std::fs::read_dir(directory).context("read workspace tree for canary")? {
+            children.push(child.context("read workspace entry")?);
+        }
+        for child in children {
+            let path = child.path();
+            let metadata = std::fs::symlink_metadata(&path).context("stat workspace entry")?;
+            if metadata.file_type().is_symlink() {
+                bail!("workspace tree contains a symbolic link");
+            }
+            if child.file_name() == ".git" {
+                continue;
+            }
+            if metadata.is_dir() {
+                walk(&path, canary)?;
+            } else if metadata.is_file() {
+                if child.file_name() == "canary.dat" {
+                    bail!("canary file is present in the review workspace");
+                }
+                let bytes = std::fs::read(&path).context("read workspace file")?;
+                if body_contains_canary(&bytes, canary) {
+                    bail!("canary payload is present in the review workspace");
+                }
+            } else {
+                bail!("workspace tree contains a non-regular entry");
+            }
+        }
+        Ok(())
+    }
+    walk(root, canary)
+}
+
+fn completion_from_sealed(report: &ReviewReport, report_sha256: &str) -> ReviewCompletion {
+    ReviewCompletion {
+        campaign_id: report.campaign_id.clone(),
+        verdict: report.verdict,
+        quality_claim_eligible: report.quality_claim_eligible,
+        fake_cannot_prove_quality: report.quality_claim == QualityClaim::FakeCannotProveQuality,
+        report_sha256: report_sha256.to_owned(),
+        notice: report.quality_claim,
+    }
 }
 
 fn init_git(workspace: &Path) -> Result<()> {
@@ -990,8 +1585,9 @@ fn hashes(
     }
 }
 
-fn fingerprint_from_bundle(bundle: &ReviewBundle) -> ReviewFingerprint {
-    ReviewFingerprint {
+fn fingerprint_from_bundle(bundle: &ReviewBundle) -> Result<ReviewFingerprint> {
+    let identity_bytes = implementation_bytes(bundle)?;
+    Ok(ReviewFingerprint {
         schema: REVIEW_FINGERPRINT_SCHEMA.into(),
         campaign_id: bundle.campaign.campaign_id.clone(),
         suite_digest: bundle.campaign_digest.clone(),
@@ -1000,6 +1596,12 @@ fn fingerprint_from_bundle(bundle: &ReviewBundle) -> ReviewFingerprint {
         scorer_digest: scorer_digest(),
         runner_digest: runner_digest(),
         fake_provider_digest: bundle.fake_provider_digest.clone(),
+        implementation_digest: digest(&identity_bytes),
+        scorer_source_sha256: scorer_digest(),
+        runner_source_sha256: runner_digest(),
+        bundled_campaign_sha256: digest(BUNDLED_REVIEW_CAMPAIGN),
+        bundled_corpus_sha256: digest(BUNDLED_REVIEW_CORPUS),
+        bundled_fake_provider_sha256: digest(BUNDLED_REVIEW_FAKE_PROVIDER),
         case_ids: bundle.campaign.case_ids(),
         family_ids: bundle
             .campaign
@@ -1010,7 +1612,7 @@ fn fingerprint_from_bundle(bundle: &ReviewBundle) -> ReviewFingerprint {
         action_count: bundle.campaign.actions.len() as u32,
         oracle_count: bundle.campaign.oracles.len() as u32,
         artifact_count: bundle.campaign.artifacts.len() as u32,
-    }
+    })
 }
 
 fn public_ref(digest: &crate::artifact::ArtifactDigest, role: ArtifactRole) -> PublicArtifactRef {
@@ -1020,18 +1622,6 @@ fn public_ref(digest: &crate::artifact::ArtifactDigest, role: ArtifactRole) -> P
         bytes: digest.bytes,
         role,
     }
-}
-
-fn completion_from_report(report: &ReviewReport) -> Result<ReviewCompletion> {
-    let bytes = serde_json::to_vec(report)?;
-    Ok(ReviewCompletion {
-        campaign_id: report.campaign_id.clone(),
-        verdict: report.verdict,
-        quality_claim_eligible: report.quality_claim_eligible,
-        fake_cannot_prove_quality: report.quality_claim == QualityClaim::FakeCannotProveQuality,
-        report_sha256: digest(&bytes),
-        notice: report.quality_claim,
-    })
 }
 
 fn add_cost(total: &mut ArmCost, add: ArmCost) -> Result<()> {

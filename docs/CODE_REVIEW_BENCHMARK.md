@@ -32,15 +32,26 @@ benchmark. Fake runs **cannot prove quality**.
   completeness calibration, paired lift with project-cluster bootstrap, and
   cost ratios. Hidden oracles never enter the review-runtime input boundary.
 - Workspace immutability: pre/post Merkle roots, Git ref fingerprints, and
-  remote publication counts must match. Shell, write, MCP, Computer, and
-  publish are denied. Public artifacts are numeric/structural only.
+  remote publication counts must match after scripted malicious calls through
+  the fake loopback dispatcher and the public MCP control-plane allowlist.
+  Shell, write, MCP, Computer, and publish are denied with zero callbacks.
+  Public artifacts are numeric/structural only; hidden oracles are not copied
+  into the sealed campaign directory. Inspect rehashes retained
+  campaign/fingerprint/implementation identity artifacts and this binary's
+  bundled suite/source `include_bytes!` digests.
 - Fake/live separation: the deterministic fake proves scorer mutations,
-  request/cardinality/restart/route-drift/quota/publish-denial/redaction
-  behavior and **must** emit `qualityClaimEligible=false`. Only an
-  operator-owned approved live compatible gateway with a gateway-signed
-  deployment attestation **and** an external egress-firewall attestation
-  could prove lift. Those attestations are **not implemented**. Live mode
-  is Indeterminate.
+  report-seal hash/bounds consistency, inspect reproducibility of retained
+  suite/fingerprint/implementation identity artifacts, and a **fake loopback
+  transport** safety state machine (request admission, restart without
+  implicit resend, route-drift freeze, quota one-under/exhaust/window,
+  mutator/publish denial, inaccessible-canary address denial). It does
+  **not** run a GrokPtah Agent production review turn, a live provider, or
+  gateway observation. Runtime safety scenarios against a live enterprise
+  route remain unimplemented/Indeterminate. Fake runs **must** emit
+  `qualityClaimEligible=false`. Only an operator-owned approved live
+  compatible gateway with a gateway-signed deployment attestation **and**
+  an external egress-firewall attestation could prove lift. Those
+  attestations are **not implemented**. Live mode is Indeterminate.
 
 Public report schema: `grokptah.code-review-benchmark.v1`.
 

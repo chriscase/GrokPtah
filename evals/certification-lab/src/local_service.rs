@@ -15,7 +15,7 @@ use grokptah_agent_bridge::provider_observation::ProviderObservationSession;
 use grokptah_agent_bridge::{
     home_override_serial, start_control_server_with, AgentHost, AgentHostHandle,
     ControlServerHandle, ControlServerLimits, HostConfig, McpControlClient, OrchestrationConfig,
-    OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist,
+    OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist, FORBIDDEN_TOOLS,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -322,6 +322,127 @@ pub fn enterprise_review_live_attach() -> Result<(), EnterpriseReviewLiveGap> {
     })
 }
 
+/// Observed denials from the public MCP control-plane allowlist.
+///
+/// This is not a GrokPtah Agent review turn and does not observe a live
+/// provider. It records that scripted malicious wire names were refused by
+/// the first real control-plane authorization boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewControlPlaneEvidence {
+    pub listed_tool_count: u32,
+    pub forbidden_tools_listed: u32,
+    pub denied_wire_calls: u32,
+    pub successful_denied_wire_calls: u32,
+    pub restart_count: u32,
+}
+
+/// Whether this process can bind a loopback listener for the isolated control plane.
+pub(crate) fn loopback_bind_available() -> bool {
+    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => {
+            drop(listener);
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(error) => panic!("unexpected loopback availability failure: {error}"),
+    }
+}
+
+/// Drive scripted malicious wire names through [`LocalService`] + [`McpControlClient`].
+///
+/// `always_approve` stays false. Successful dispatch of a denied wire name is a
+/// contract failure. Restart reopens the same durable home and must still omit
+/// [`FORBIDDEN_TOOLS`].
+pub async fn exercise_review_control_plane(
+    workspace: &Path,
+    runtime_home: &Path,
+    wire_names: &[String],
+) -> Result<ReviewControlPlaneEvidence> {
+    if !loopback_bind_available() {
+        bail!("review_loopback_bind_unavailable");
+    }
+    if wire_names.is_empty() {
+        bail!("review control plane requires scripted malicious wire names");
+    }
+    let config = LocalServiceConfig::new(
+        runtime_home,
+        vec![workspace.to_path_buf()],
+        LocalServiceMode::Offline,
+        1,
+        3,
+        60_000,
+        8_000,
+    );
+    let mut service = LocalService::start(config).await?;
+    let mut client = service.client();
+    client
+        .initialize()
+        .await
+        .context("initialize review control-plane client")?;
+    let listed = client
+        .list_tools()
+        .await
+        .context("list review control-plane tools")?;
+    let listed_names: HashSet<&str> = listed.iter().map(|tool| tool.name.as_str()).collect();
+    let mut forbidden_tools_listed = 0u32;
+    for forbidden in FORBIDDEN_TOOLS {
+        if listed_names.contains(*forbidden) {
+            forbidden_tools_listed = forbidden_tools_listed.saturating_add(1);
+        }
+    }
+    if forbidden_tools_listed > 0 {
+        service.stop().await;
+        bail!("forbidden tool listed on the review control plane");
+    }
+    let mut denied_wire_calls = 0u32;
+    let mut successful_denied_wire_calls = 0u32;
+    for name in wire_names {
+        match client.call_tool(name, serde_json::json!({})).await {
+            Ok(result) if !result.is_error => {
+                successful_denied_wire_calls = successful_denied_wire_calls.saturating_add(1);
+            }
+            Ok(_) | Err(_) => {
+                denied_wire_calls = denied_wire_calls.saturating_add(1);
+            }
+        }
+    }
+    service
+        .restart()
+        .await
+        .context("restart review control plane")?;
+    let mut client = service.client();
+    client
+        .initialize()
+        .await
+        .context("reinitialize review control-plane client")?;
+    let listed_after = client
+        .list_tools()
+        .await
+        .context("list review control-plane tools after restart")?;
+    for forbidden in FORBIDDEN_TOOLS {
+        if listed_after.iter().any(|tool| tool.name == *forbidden) {
+            service.stop().await;
+            bail!("forbidden tool listed on the review control plane after restart");
+        }
+    }
+    let listed_tool_count =
+        u32::try_from(listed_after.len()).context("listed tool count overflow")?;
+    service.stop().await;
+    if successful_denied_wire_calls > 0 {
+        bail!("malicious control-plane call succeeded");
+    }
+    if denied_wire_calls != u32::try_from(wire_names.len()).context("wire name count")? {
+        bail!("control plane did not deny every scripted malicious wire name");
+    }
+    Ok(ReviewControlPlaneEvidence {
+        listed_tool_count,
+        forbidden_tools_listed: 0,
+        denied_wire_calls,
+        successful_denied_wire_calls: 0,
+        restart_count: 1,
+    })
+}
+
 /// Merkle root over a directory tree. Symbolic links fail closed. Relative
 /// paths are mixed into the digest but never returned.
 pub fn workspace_merkle_root(root: &Path) -> Result<String> {
@@ -471,16 +592,11 @@ impl Drop for ProcessEnvironment {
 
 #[cfg(test)]
 pub(crate) fn loopback_test_available() -> bool {
-    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) {
-        Ok(listener) => {
-            drop(listener);
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("loopback integration skipped: execution sandbox forbids listeners");
-            false
-        }
-        Err(error) => panic!("unexpected loopback availability failure: {error}"),
+    if loopback_bind_available() {
+        true
+    } else {
+        eprintln!("loopback integration skipped: execution sandbox forbids listeners");
+        false
     }
 }
 

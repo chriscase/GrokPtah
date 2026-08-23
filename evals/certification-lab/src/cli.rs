@@ -423,11 +423,11 @@ async fn dispatch(command: Command) -> Result<(ExitClass, serde_json::Value)> {
             };
             Ok((ExitClass::Passed, serde_json::to_value(summary)?))
         }
-        Command::Review(args) => review(args),
+        Command::Review(args) => review(args).await,
     }
 }
 
-fn review(args: ReviewArgs) -> Result<(ExitClass, serde_json::Value)> {
+async fn review(args: ReviewArgs) -> Result<(ExitClass, serde_json::Value)> {
     let repository = canonical_repository(&args.repository.repository)?;
     let options = ReviewOptions {
         repository_root: repository.clone(),
@@ -463,7 +463,7 @@ fn review(args: ReviewArgs) -> Result<(ExitClass, serde_json::Value)> {
         return Ok((exit, serde_json::to_value(summary)?));
     }
     stderr_progress(options.mode, "review_start");
-    let completion = run_review(&options)?;
+    let completion = run_review(&options).await?;
     stderr_progress(options.mode, "review_complete");
     Ok((
         exit_for_review_verdict(completion.verdict),

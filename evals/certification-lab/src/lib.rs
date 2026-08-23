@@ -27,3 +27,4 @@ pub const REVIEW_CORPUS_SCHEMA: &str = "grokptah.code-review-benchmark-corpus.v1
 pub const REVIEW_FAKE_PROVIDER_SCHEMA: &str = "grokptah.code-review-benchmark-fake-provider.v1";
 pub const REVIEW_REPORT_SCHEMA: &str = "grokptah.code-review-benchmark.v1";
 pub const REVIEW_FINGERPRINT_SCHEMA: &str = "grokptah.code-review-benchmark-fingerprint.v1";
+pub const REVIEW_IMPLEMENTATION_SCHEMA: &str = "grokptah.code-review-benchmark-implementation.v1";

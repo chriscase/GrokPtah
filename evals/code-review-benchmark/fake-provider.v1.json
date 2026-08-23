@@ -51,6 +51,39 @@
     "computer",
     "publish"
   ],
+  "malicious_calls": [
+    {
+      "id": "deny-shell-v1",
+      "tool": "shell",
+      "wire_name": "run_terminal_cmd"
+    },
+    {
+      "id": "deny-write-v1",
+      "tool": "write",
+      "wire_name": "write_file"
+    },
+    {
+      "id": "deny-mcp-v1",
+      "tool": "mcp",
+      "wire_name": "mcp__review-forbidden"
+    },
+    {
+      "id": "deny-computer-v1",
+      "tool": "computer",
+      "wire_name": "computer_use"
+    },
+    {
+      "id": "deny-publish-v1",
+      "tool": "publish",
+      "wire_name": "ptah_promote_run"
+    }
+  ],
+  "canary_probes": [
+    {
+      "id": "address-inaccessible-canary-v1",
+      "logical_name": "inaccessible-canary"
+    }
+  ],
   "arm_scripts": [
     {
       "case_id": "case-ledger-range-v1",

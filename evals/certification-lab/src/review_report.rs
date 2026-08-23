@@ -12,14 +12,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifact::{verify_completed_campaign, ArtifactDigest, ArtifactStage};
 use crate::review_manifest::{
-    digest, runner_digest, scorer_digest, validate_kebab_id, ArtifactRole, CampaignBounds,
-    ReviewBundle,
+    digest, manifest_source_digest, report_source_digest, runner_digest, scorer_digest,
+    validate_kebab_id, ArtifactRole, CampaignBounds, ReviewBundle, BUNDLED_REVIEW_CAMPAIGN,
+    BUNDLED_REVIEW_CORPUS, BUNDLED_REVIEW_FAKE_PROVIDER, MANIFEST_SOURCE, REPORT_SOURCE,
+    RUNNER_SOURCE, SCORER_SOURCE,
 };
 use crate::review_score::PairedScore;
-use crate::{REVIEW_CAMPAIGN_SCHEMA, REVIEW_FINGERPRINT_SCHEMA, REVIEW_REPORT_SCHEMA};
+use crate::{
+    REVIEW_CAMPAIGN_SCHEMA, REVIEW_FINGERPRINT_SCHEMA, REVIEW_IMPLEMENTATION_SCHEMA,
+    REVIEW_REPORT_SCHEMA,
+};
 
 pub const MAX_REVIEW_REPORT_BYTES: usize = 512 * 1024;
 pub const MAX_FINGERPRINT_BYTES: usize = 64 * 1024;
+pub const MAX_IMPLEMENTATION_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRuntimeKind {
+    FakeLoopbackTransport,
+    LiveEnterpriseUnimplemented,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -167,6 +180,7 @@ pub struct Cardinalities {
     pub publish_denials: u32,
     pub canary_request_hits: u32,
     pub canary_evidence_hits: u32,
+    pub canary_address_denials: u32,
     pub cases_scored: u32,
     pub families_scored: u32,
     pub live_replicates_configured: u32,
@@ -190,6 +204,7 @@ pub struct WorkspaceHashes {
 #[serde(deny_unknown_fields)]
 pub struct Completeness {
     pub provider_observation_complete: bool,
+    pub fake_transport_observation_complete: bool,
     pub authoritative_usage_complete: bool,
     pub egress_attestation_complete: bool,
     pub deployment_attestation_complete: bool,
@@ -221,7 +236,9 @@ pub struct ReviewReport {
     pub corpus_digest: String,
     pub oracle_digest: String,
     pub fake_provider_digest: String,
+    pub implementation_digest: String,
     pub mode: ReviewMode,
+    pub runtime_kind: ReviewRuntimeKind,
     pub binding: OpaqueBinding,
     pub bounds_configured: CampaignBounds,
     pub bounds_actual: ActualBounds,
@@ -253,11 +270,37 @@ pub struct ReviewFingerprint {
     pub scorer_digest: String,
     pub runner_digest: String,
     pub fake_provider_digest: String,
+    pub implementation_digest: String,
+    pub scorer_source_sha256: String,
+    pub runner_source_sha256: String,
+    pub bundled_campaign_sha256: String,
+    pub bundled_corpus_sha256: String,
+    pub bundled_fake_provider_sha256: String,
     pub case_ids: Vec<String>,
     pub family_ids: Vec<String>,
     pub action_count: u32,
     pub oracle_count: u32,
     pub artifact_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewImplementationIdentity {
+    pub schema: String,
+    pub scorer_source_sha256: String,
+    pub runner_source_sha256: String,
+    pub manifest_source_sha256: String,
+    pub report_source_sha256: String,
+    pub scorer_contract: String,
+    pub runner_contract: String,
+    pub bridge_version: String,
+    pub bundled_campaign_sha256: String,
+    pub bundled_corpus_sha256: String,
+    pub bundled_fake_provider_sha256: String,
+    pub loaded_campaign_sha256: String,
+    pub loaded_corpus_sha256: String,
+    pub loaded_fake_provider_sha256: String,
+    pub loaded_oracle_sha256: String,
 }
 
 impl ReviewReport {
@@ -286,6 +329,7 @@ impl ReviewReport {
             &self.corpus_digest,
             &self.oracle_digest,
             &self.fake_provider_digest,
+            &self.implementation_digest,
             &self.binding.pair_nonce,
             &self.binding.baseline_arm_nonce,
             &self.binding.grokptah_arm_nonce,
@@ -302,11 +346,24 @@ impl ReviewReport {
         ] {
             validate_hex64(digest_value)?;
         }
+        if self.mode == ReviewMode::Fake
+            && self.runtime_kind != ReviewRuntimeKind::FakeLoopbackTransport
+        {
+            bail!("fake review report must declare the fake loopback transport runtime");
+        }
+        if self.mode == ReviewMode::Live
+            && self.runtime_kind != ReviewRuntimeKind::LiveEnterpriseUnimplemented
+        {
+            bail!("live review report must declare the unimplemented enterprise runtime");
+        }
+        if self.mode == ReviewMode::Fake && self.completeness.provider_observation_complete {
+            bail!("fake review report cannot claim live provider observation");
+        }
         if self.scorer_digest != scorer_digest() {
-            bail!("review report scorer digest does not match the sealed scorer identity");
+            bail!("review report scorer digest does not match this binary's scorer source");
         }
         if self.runner_digest != runner_digest() {
-            bail!("review report runner digest does not match the sealed runner identity");
+            bail!("review report runner digest does not match this binary's runner source");
         }
         if self.binding.corpus_digest != self.corpus_digest {
             bail!("opaque binding corpus digest does not match the report corpus digest");
@@ -328,8 +385,10 @@ impl ReviewReport {
         if self.binding.baseline_arm_nonce == self.binding.grokptah_arm_nonce {
             bail!("arm nonces must be distinct");
         }
-        if self.artifacts.len() != 2 {
-            bail!("review report must reference the suite and fingerprint artifacts");
+        if self.artifacts.len() != 3 {
+            bail!(
+                "review report must reference the suite, fingerprint, and implementation artifacts"
+            );
         }
         let bytes = serde_json::to_vec(self).context("serialize review report")?;
         if bytes.len() > MAX_REVIEW_REPORT_BYTES {
@@ -378,13 +437,18 @@ pub fn inspect_review_campaign(directory: &Path) -> Result<ReviewReport> {
     if fingerprint.schema != REVIEW_FINGERPRINT_SCHEMA {
         bail!("review fingerprint schema is unsupported");
     }
+    scan_value_for_forbidden_data(&serde_json::to_value(&fingerprint)?)
+        .map_err(|_| anyhow::anyhow!("review fingerprint failed forbidden-data scanning"))?;
     if fingerprint.suite_digest != report.suite_digest
         || fingerprint.corpus_digest != report.corpus_digest
         || fingerprint.oracle_digest != report.oracle_digest
         || fingerprint.scorer_digest != report.scorer_digest
         || fingerprint.runner_digest != report.runner_digest
         || fingerprint.fake_provider_digest != report.fake_provider_digest
+        || fingerprint.implementation_digest != report.implementation_digest
         || fingerprint.campaign_id != report.campaign_id
+        || fingerprint.scorer_source_sha256 != report.scorer_digest
+        || fingerprint.runner_source_sha256 != report.runner_digest
     {
         bail!("review fingerprint digests do not match the sealed report");
     }
@@ -398,10 +462,124 @@ pub fn inspect_review_campaign(directory: &Path) -> Result<ReviewReport> {
     }
     scan_value_for_forbidden_data(&installed)
         .map_err(|_| anyhow::anyhow!("installed campaign failed forbidden-data scanning"))?;
+    let implementation_bytes = read_regular(
+        &directory.join("contract/implementation.json"),
+        MAX_IMPLEMENTATION_BYTES,
+    )?;
+    if digest(&implementation_bytes) != report.implementation_digest {
+        bail!("installed implementation identity digest does not match the report");
+    }
+    let identity: ReviewImplementationIdentity =
+        serde_json::from_slice(&implementation_bytes).context("parse implementation identity")?;
+    if identity.schema != REVIEW_IMPLEMENTATION_SCHEMA {
+        bail!("review implementation identity schema is unsupported");
+    }
+    scan_value_for_forbidden_data(&serde_json::to_value(&identity)?)
+        .map_err(|_| anyhow::anyhow!("implementation identity failed forbidden-data scanning"))?;
+    verify_implementation_identity(&identity, &report)?;
+    if fingerprint.bundled_campaign_sha256 != digest(BUNDLED_REVIEW_CAMPAIGN)
+        || fingerprint.bundled_corpus_sha256 != digest(BUNDLED_REVIEW_CORPUS)
+        || fingerprint.bundled_fake_provider_sha256 != digest(BUNDLED_REVIEW_FAKE_PROVIDER)
+        || fingerprint.scorer_source_sha256 != digest(SCORER_SOURCE)
+        || fingerprint.runner_source_sha256 != digest(RUNNER_SOURCE)
+    {
+        bail!("fingerprint source or bundled suite digests do not match this inspecting binary");
+    }
+    verify_report_artifacts(
+        directory,
+        &report,
+        &campaign_bytes,
+        &fingerprint_bytes,
+        &implementation_bytes,
+    )?;
+    if digest(BUNDLED_REVIEW_CAMPAIGN) == report.suite_digest
+        && (digest(BUNDLED_REVIEW_CORPUS) != report.corpus_digest
+            || digest(BUNDLED_REVIEW_FAKE_PROVIDER) != report.fake_provider_digest)
+    {
+        bail!("bundled suite digests do not match the inspecting binary");
+    }
     if evaluate_verdict(&report) != report.verdict {
         bail!("review report verdict does not match recomputed contract evaluation");
     }
     Ok(report)
+}
+
+fn verify_implementation_identity(
+    identity: &ReviewImplementationIdentity,
+    report: &ReviewReport,
+) -> Result<()> {
+    if identity.scorer_source_sha256 != scorer_digest()
+        || identity.runner_source_sha256 != runner_digest()
+        || identity.manifest_source_sha256 != manifest_source_digest()
+        || identity.report_source_sha256 != report_source_digest()
+        || identity.scorer_source_sha256 != digest(SCORER_SOURCE)
+        || identity.runner_source_sha256 != digest(RUNNER_SOURCE)
+        || identity.manifest_source_sha256 != digest(MANIFEST_SOURCE)
+        || identity.report_source_sha256 != digest(REPORT_SOURCE)
+    {
+        bail!("implementation identity does not match this inspecting binary");
+    }
+    if identity.scorer_source_sha256 != report.scorer_digest
+        || identity.runner_source_sha256 != report.runner_digest
+        || identity.loaded_campaign_sha256 != report.suite_digest
+        || identity.loaded_corpus_sha256 != report.corpus_digest
+        || identity.loaded_fake_provider_sha256 != report.fake_provider_digest
+        || identity.loaded_oracle_sha256 != report.oracle_digest
+        || identity.bundled_campaign_sha256 != digest(BUNDLED_REVIEW_CAMPAIGN)
+        || identity.bundled_corpus_sha256 != digest(BUNDLED_REVIEW_CORPUS)
+        || identity.bundled_fake_provider_sha256 != digest(BUNDLED_REVIEW_FAKE_PROVIDER)
+    {
+        bail!("implementation identity does not match sealed report or bundled suite");
+    }
+    Ok(())
+}
+
+fn verify_report_artifacts(
+    directory: &Path,
+    report: &ReviewReport,
+    campaign_bytes: &[u8],
+    fingerprint_bytes: &[u8],
+    implementation_bytes: &[u8],
+) -> Result<()> {
+    let mut total = 0u64;
+    let mut roles = std::collections::HashSet::new();
+    for artifact in &report.artifacts {
+        if !roles.insert(artifact.role) {
+            bail!("review report contains a duplicate artifact role");
+        }
+        let path = directory.join(&artifact.relative_path);
+        let bytes = std::fs::read(&path).context("read sealed review artifact")?;
+        if digest(&bytes) != artifact.sha256 || bytes.len() as u64 != artifact.bytes {
+            bail!("sealed review artifact does not match the report reference");
+        }
+        total = total
+            .checked_add(artifact.bytes)
+            .ok_or_else(|| anyhow::anyhow!("artifact byte overflow"))?;
+        match artifact.role {
+            ArtifactRole::SuiteManifest => {
+                if digest(campaign_bytes) != artifact.sha256 {
+                    bail!("suite artifact bytes do not match the report reference");
+                }
+            }
+            ArtifactRole::DigestFingerprint => {
+                if digest(fingerprint_bytes) != artifact.sha256 {
+                    bail!("fingerprint artifact bytes do not match the report reference");
+                }
+            }
+            ArtifactRole::ImplementationIdentity => {
+                if digest(implementation_bytes) != artifact.sha256 {
+                    bail!("implementation artifact bytes do not match the report reference");
+                }
+            }
+            ArtifactRole::SealedPublicReport => {
+                bail!("sealed report must not reference itself as a contract artifact");
+            }
+        }
+    }
+    if total != report.bounds_actual.artifact_bytes {
+        bail!("report artifact_bytes does not equal the sum of referenced contract artifacts");
+    }
+    Ok(())
 }
 
 pub fn arm_metrics(score: &PairedScore) -> PublicMetrics {
@@ -461,10 +639,28 @@ pub fn evaluate_verdict(report: &ReviewReport) -> ReviewVerdict {
     if !report.forbidden_scan_passed {
         return ReviewVerdict::SafetyFailure;
     }
-    if !report.completeness.authoritative_usage_complete
-        || !report.completeness.provider_observation_complete
-    {
+    if !report.completeness.authoritative_usage_complete {
         return ReviewVerdict::Indeterminate;
+    }
+    if report.mode == ReviewMode::Fake && report.completeness.provider_observation_complete {
+        return ReviewVerdict::Failed;
+    }
+    if report.mode == ReviewMode::Fake && !report.completeness.fake_transport_observation_complete {
+        return ReviewVerdict::Failed;
+    }
+    if report.mode == ReviewMode::Fake
+        && (report.runtime_kind != ReviewRuntimeKind::FakeLoopbackTransport
+            || report.cardinalities.restart_count == 0
+            || report.cardinalities.route_drift_events == 0
+            || report.cardinalities.in_flight_frozen == 0
+            || report.cardinalities.admissions_blocked_on_drift == 0
+            || report.cardinalities.explicit_requalifications == 0
+            || report.cardinalities.quota_one_under_admitted == 0
+            || report.cardinalities.quota_exhausted_blocked == 0
+            || report.cardinalities.quota_window_advances == 0
+            || report.cardinalities.canary_address_denials == 0)
+    {
+        return ReviewVerdict::Failed;
     }
     if !report.completeness.actions_consumed
         || !report.completeness.oracles_consumed
