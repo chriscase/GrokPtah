@@ -375,9 +375,9 @@ impl ComputerUseService {
                         }
                         .and_then(|()| self.policy.authorize_observation_exposure(&observation))
                         .and_then(|()| {
-                            let interned = self
-                                .store
-                                .intern_physical_domain(&self.backend.physical_input_domain())?;
+                            let interned = self.store.intern_physical_domain(
+                                self.backend_attestation.physical_domain(),
+                            )?;
                             self.policy
                                 .authorize_surface(&prepared, &interned.binding)?;
                             let (freshness, frame_epoch) =
