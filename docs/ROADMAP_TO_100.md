@@ -663,7 +663,13 @@ substitute.
 **Exists today:** `ComputerUseTier::VisualFallbackAct` is not granted by
 the first probe. [#288](https://github.com/chriscase/GrokPtah/issues/288)
 **open**. Hidden windows, Spaces, and global `CGEvent` injection **do not
-qualify**.
+qualify**. The source-only Stage 9 investigation now selects an authenticated,
+networkless-by-default disposable VM as the arbitrary-GUI boundary and rejects
+hidden windows, Spaces, live coordinate injection, the simulator, and a WebView
+alone as sufficient proof. See
+[`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
+helper, guest image, packaged entitlement proof, or host-native dispatch exists
+yet, so this decision satisfies no #288 acceptance checkbox.
 
 **Exit:** every [#288](https://github.com/chriscase/GrokPtah/issues/288)
 acceptance criterion. **This row cannot be marked Explicitly unsupported as
