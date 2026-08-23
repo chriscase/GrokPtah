@@ -1607,6 +1607,80 @@ impl OrchestrationService {
         Ok(())
     }
 
+    /// Issue and install one least-privilege worker credential without
+    /// replacing the primary control-plane bearer. The returned credential
+    /// contains the secret for one trusted local handoff; callers must not
+    /// persist or project its token.
+    pub fn issue_worker_credential(
+        &self,
+        agent_id: impl Into<String>,
+        workspace_roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<AuthCredential, OrchError> {
+        let credential = AuthCredential::issue_worker(agent_id, workspace_roots)?;
+        let service_allowlist = self.config.lock().allowlist.clone();
+        credential.effective_allowlist(&service_allowlist)?;
+
+        let mut credentials = self.auth_credentials.lock();
+        if !credentials.iter().any(|entry| entry.id == "primary") {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "primary credential must be configured before issuing workers",
+            ));
+        }
+        if credentials.iter().any(|entry| entry.id == credential.id) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "auth credential ids must be unique",
+            ));
+        }
+        if credentials
+            .iter()
+            .any(|entry| entry.token() == credential.token())
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "auth credential token values must be unique",
+            ));
+        }
+        self.bus
+            .add_control_secrets([credential.token().to_string()]);
+        credentials.push(credential.clone());
+        Ok(credential)
+    }
+
+    /// Rotate one installed worker bearer in place. Its stable credential id,
+    /// Agent binding, role, and workspace scope remain unchanged; the old
+    /// token stops authenticating as soon as the replacement is installed.
+    pub fn rotate_worker_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<AuthCredential, OrchError> {
+        let mut credentials = self.auth_credentials.lock();
+        let index = credentials
+            .iter()
+            .position(|entry| entry.id == credential_id)
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "worker credential id is not installed",
+                )
+            })?;
+        let rotated = credentials[index].rotate_worker_token()?;
+        if credentials
+            .iter()
+            .enumerate()
+            .any(|(entry_index, entry)| entry_index != index && entry.token() == rotated.token())
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "auth credential token values must be unique",
+            ));
+        }
+        self.bus.add_control_secrets([rotated.token().to_string()]);
+        credentials[index] = rotated.clone();
+        Ok(rotated)
+    }
+
     pub fn set_agent_owner_id(&self, owner_id: String) -> Result<(), OrchError> {
         let owner_id = owner_id.trim().to_string();
         if owner_id.is_empty() || owner_id.len() > 128 {

@@ -45,6 +45,47 @@ fn started_host() -> grokptah_agent_bridge::AgentHostHandle {
     host
 }
 
+#[tokio::test]
+async fn host_issued_worker_credential_is_installed_and_rotated_in_place() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let workspace = tempdir().unwrap();
+    let store = OrchStore::open(home.path().join("orch")).unwrap();
+    let orch = OrchestrationService::new(
+        host,
+        EventBus::new(64),
+        store,
+        OrchestrationConfig {
+            bearer_token: "primary-secret".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
+
+    let issued = orch
+        .issue_worker_credential("worker-runtime", [workspace.path().to_path_buf()])
+        .unwrap();
+    let old_token = issued.token().to_string();
+    assert!(orch
+        .auth_header(Some(&format!("Bearer {old_token}")))
+        .is_ok());
+
+    let rotated = orch.rotate_worker_credential(&issued.id).unwrap();
+    assert_eq!(rotated.id, issued.id);
+    assert_eq!(rotated.bound_agent_id(), Some("worker-runtime"));
+    assert_ne!(rotated.token(), old_token);
+    assert!(orch
+        .auth_header(Some(&format!("Bearer {old_token}")))
+        .is_err());
+    assert!(orch
+        .auth_header(Some(&format!("Bearer {}", rotated.token())))
+        .is_ok());
+
+    orch.stop_background_tasks().await;
+    set_grokptah_home_override(None);
+}
+
 /// S2: `PromptQueueChanged` is published *after* the mutation lock is
 /// released, so the bus `seq` reflects publish order, not commit order. The
 /// per-session `revision` is stamped under the mutation lock instead, which

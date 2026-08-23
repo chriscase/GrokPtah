@@ -32,8 +32,9 @@ complete or that the product has reached 100%.
 - The host now has a least-privilege worker-credential issuance seam: it creates
   an Agent-bound credential with canonical workspace roots and can rotate the
   bearer while preserving the worker identity and scope. The constructor and
-  rotation denial/continuity checks pass; runtime installation, durable
-  rotation evidence, and the independent worker campaign remain open.
+  rotation denial/continuity checks pass, and the service can install or
+  replace that credential without replacing the primary bearer. Durable
+  rotation evidence and the independent worker campaign remain open.
 - Computer Use observation now re-checks the durable conflict-domain poison
   fence even for an already-granted Agent, so an uncertain sibling dispatch
   cannot be bypassed by a stale grant.
@@ -135,6 +136,9 @@ unrelated signal.
   unknown or malformed evidence.
 - Worker lease claimant fencing: bound-credential ownership check passed;
   independent worker leases remained distinct and durable across store reopen.
+- Host-issued worker credential lifecycle: focused unit and integration tests
+  passed; installation preserves the primary credential and rotation rejects
+  the old bearer while retaining the worker id and scope.
 - UI review evidence suite: 4 passed, covering complete packaged evidence,
   missing visual states, unresolved P1 findings, malformed digests, unknown
   fields, and missing deferred tracking.
