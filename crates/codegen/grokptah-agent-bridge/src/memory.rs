@@ -128,6 +128,7 @@ std::thread_local! {
     static COMMIT_CUTPOINT: std::cell::Cell<CommitCutpoint> =
         const { std::cell::Cell::new(CommitCutpoint::None) };
     static RECOVERY_PARENT_FSYNC_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RECOVERY_JOURNAL_FSYNC_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn current_cutpoint() -> CommitCutpoint {
@@ -1322,21 +1323,37 @@ fn is_owned_scratch(canonical: &Path, candidate: &Path) -> bool {
     name.ends_with(".tmp")
         || name.ends_with(".tmp.ready")
         || name.ends_with(".tmp.quarantine")
+        || name.ends_with(".ambiguous.quarantine")
         || (name.ends_with(".quarantine") && name.contains(".tmp"))
 }
 
 fn quarantine_dest(path: &Path) -> Option<PathBuf> {
+    quarantine_dest_with_suffix(path, "quarantine")
+}
+
+fn ambiguous_quarantine_dest(path: &Path) -> Option<PathBuf> {
+    quarantine_dest_with_suffix(path, "ambiguous.quarantine")
+}
+
+fn quarantine_dest_with_suffix(path: &Path, suffix: &str) -> Option<PathBuf> {
     let parent = path.parent()?;
     let name = path.file_name()?.to_str()?;
     if name.starts_with('.') {
-        Some(parent.join(format!("{name}.quarantine")))
+        Some(parent.join(format!("{name}.{suffix}")))
     } else {
-        Some(parent.join(format!(".{name}.quarantine")))
+        Some(parent.join(format!(".{name}.{suffix}")))
     }
 }
 
 fn quarantine(path: &Path) {
     let Some(dest) = quarantine_dest(path) else {
+        return;
+    };
+    let _ = fs::rename(path, dest);
+}
+
+fn quarantine_ambiguous(path: &Path) {
+    let Some(dest) = ambiguous_quarantine_dest(path) else {
         return;
     };
     let _ = fs::rename(path, dest);
@@ -1360,6 +1377,20 @@ fn recovery_parent_fsync_should_fail() -> bool {
     }
 }
 
+fn recovery_journal_fsync_should_fail() -> bool {
+    #[cfg(test)]
+    {
+        if std::env::var("GROKPTAH_MEMORY_FSYNC_FAIL").ok().as_deref() == Some("recovery_journal") {
+            return true;
+        }
+        RECOVERY_JOURNAL_FSYNC_FAIL.with(|cell| cell.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 fn fsync_dir_for_recovery(dir: &Path) -> std::io::Result<()> {
     hang_if_requested("recovery_parent_fsync");
     if recovery_parent_fsync_should_fail() {
@@ -1370,9 +1401,24 @@ fn fsync_dir_for_recovery(dir: &Path) -> std::io::Result<()> {
     fsync_dir(dir)
 }
 
+fn fsync_dir_for_recovery_journal(dir: &Path) -> std::io::Result<()> {
+    hang_if_requested("recovery_journal_fsync");
+    if recovery_journal_fsync_should_fail() {
+        return Err(std::io::Error::other(
+            "injected recovery journal parent fsync failure",
+        ));
+    }
+    fsync_dir(dir)
+}
+
 #[cfg(test)]
 fn set_recovery_parent_fsync_fail(fail: bool) {
     RECOVERY_PARENT_FSYNC_FAIL.with(|cell| cell.set(fail));
+}
+
+#[cfg(test)]
+fn set_recovery_journal_fsync_fail(fail: bool) {
+    RECOVERY_JOURNAL_FSYNC_FAIL.with(|cell| cell.set(fail));
 }
 
 const RECOVERY_SCHEMA: &str = "grokptah.memory.recovery.v1";
@@ -1451,17 +1497,32 @@ fn journal_error(journal: &RecoveryJournal) -> MemoryError {
     )
 }
 
-fn read_recovery_journal(canonical: &Path) -> Option<RecoveryJournal> {
-    let path = recovery_journal_path(canonical);
-    let raw = read_bounded(&path, MAX_PERSISTED_BYTES).ok()?;
-    let journal: RecoveryJournal = serde_json::from_slice(&raw).ok()?;
-    if journal.schema != RECOVERY_SCHEMA || journal.request_key.is_empty() {
-        return None;
-    }
-    Some(journal)
+fn io_not_found(path: &Path, error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == ErrorKind::NotFound)
+        || !path.exists()
 }
 
-fn write_recovery_journal(canonical: &Path, journal: &RecoveryJournal) -> Result<(), MemoryError> {
+fn read_recovery_journal(canonical: &Path) -> Result<Option<RecoveryJournal>, MemoryError> {
+    let path = recovery_journal_path(canonical);
+    let raw = match read_bounded(&path, MAX_PERSISTED_BYTES) {
+        Ok(raw) => raw,
+        Err(error) if io_not_found(&path, &error) => return Ok(None),
+        Err(_) => return Err(MemoryError::Durable),
+    };
+    let journal: RecoveryJournal =
+        serde_json::from_slice(&raw).map_err(|_| MemoryError::Durable)?;
+    if journal.schema != RECOVERY_SCHEMA || journal.request_key.is_empty() {
+        return Err(MemoryError::Durable);
+    }
+    Ok(Some(journal))
+}
+
+fn persist_recovery_journal(
+    canonical: &Path,
+    journal: &RecoveryJournal,
+) -> Result<(), MemoryError> {
     let path = recovery_journal_path(canonical);
     let parent = path.parent().ok_or(MemoryError::Durable)?;
     let raw = serde_json::to_vec_pretty(journal).map_err(|_| MemoryError::Durable)?;
@@ -1471,12 +1532,37 @@ fn write_recovery_journal(canonical: &Path, journal: &RecoveryJournal) -> Result
             .and_then(|name| name.to_str())
             .unwrap_or("memory.json.recovery")
     ));
-    fs::write(&tmp, &raw).map_err(|_| MemoryError::Durable)?;
-    if let Ok(file) = File::open(&tmp) {
-        file.sync_all().map_err(|_| MemoryError::Durable)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(&tmp).map_err(|_| MemoryError::Durable)?;
+    file.write_all(&raw).map_err(|_| MemoryError::Durable)?;
+    file.flush().map_err(|_| MemoryError::Durable)?;
+    file.sync_all().map_err(|_| MemoryError::Durable)?;
+    drop(file);
     fs::rename(&tmp, &path).map_err(|_| MemoryError::Durable)?;
     Ok(())
+}
+
+fn sibling_ambiguous_quarantines_exist(canonical: &Path) -> bool {
+    let Some(parent) = canonical.parent() else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        is_owned_scratch(canonical, &path)
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".ambiguous.quarantine"))
+    })
 }
 
 fn make_recovery_journal(
@@ -1527,7 +1613,7 @@ fn finish_existing_journal(canonical: &Path, journal: RecoveryJournal) -> Result
 }
 
 fn recover_scope(address: &MemoryAddress, canonical: &Path) -> Result<(), MemoryError> {
-    if let Some(journal) = read_recovery_journal(canonical) {
+    if let Some(journal) = read_recovery_journal(canonical)? {
         return finish_existing_journal(canonical, journal);
     }
     let temps = sibling_temps(canonical);
@@ -1568,6 +1654,9 @@ fn recover_scope(address: &MemoryAddress, canonical: &Path) -> Result<(), Memory
     }
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let Some(max_gen) = ranked.first().map(|item| item.0) else {
+        if sibling_ambiguous_quarantines_exist(canonical) {
+            return Err(MemoryError::Durable);
+        }
         enforce_footprint(canonical);
         return Ok(());
     };
@@ -1591,14 +1680,18 @@ fn recover_scope(address: &MemoryAddress, canonical: &Path) -> Result<(), Memory
             &mut payloads,
             candidates,
         );
-        write_recovery_journal(canonical, &journal)?;
+        persist_recovery_journal(canonical, &journal)?;
+        let parent = canonical.parent().ok_or(MemoryError::Durable)?;
+        if fsync_dir_for_recovery_journal(parent).is_err() {
+            // Leave candidates in place so a journal that never became durable
+            // cannot reopen as an empty store.
+            return Err(journal_error(&journal));
+        }
         for (_, temp, ready_path, _) in ranked {
             let _ = fs::remove_file(&ready_path);
-            quarantine(&temp);
+            quarantine_ambiguous(&temp);
         }
-        if let Some(parent) = canonical.parent() {
-            let _ = fsync_dir(parent);
-        }
+        let _ = fsync_dir(parent);
         return Err(journal_error(&journal));
     }
     let (_, winner, winner_ready, winner_raw) = winners.into_iter().next().unwrap();
@@ -1612,7 +1705,7 @@ fn recover_scope(address: &MemoryAddress, canonical: &Path) -> Result<(), Memory
             generation: max_gen,
         }],
     );
-    write_recovery_journal(canonical, &journal)?;
+    persist_recovery_journal(canonical, &journal)?;
     if fs::rename(&winner, canonical).is_err() {
         quarantine(&winner);
         let _ = fs::remove_file(&winner_ready);
@@ -2880,17 +2973,28 @@ mod tests {
         CutGuard
     }
 
-    struct RecoveryFsyncGuard;
+    struct RecoveryFsyncGuard {
+        journal: bool,
+    }
 
     impl Drop for RecoveryFsyncGuard {
         fn drop(&mut self) {
-            set_recovery_parent_fsync_fail(false);
+            if self.journal {
+                set_recovery_journal_fsync_fail(false);
+            } else {
+                set_recovery_parent_fsync_fail(false);
+            }
         }
     }
 
     fn fail_recovery_parent_fsync() -> RecoveryFsyncGuard {
         set_recovery_parent_fsync_fail(true);
-        RecoveryFsyncGuard
+        RecoveryFsyncGuard { journal: false }
+    }
+
+    fn fail_recovery_journal_fsync() -> RecoveryFsyncGuard {
+        set_recovery_journal_fsync_fail(true);
+        RecoveryFsyncGuard { journal: true }
     }
 
     fn fixture() -> Fixture {
@@ -5012,8 +5116,8 @@ mod tests {
         let journal = recovery_journal_path(&path);
         let journal_bytes = fs::read(&journal).expect("ambiguous recovery journal");
         assert!(!journal_bytes.is_empty());
-        assert!(quarantine_dest(&tie_a).unwrap().is_file() || !tie_a.exists());
-        assert!(quarantine_dest(&tie_b).unwrap().is_file() || !tie_b.exists());
+        assert!(ambiguous_quarantine_dest(&tie_a).unwrap().is_file() || !tie_a.exists());
+        assert!(ambiguous_quarantine_dest(&tie_b).unwrap().is_file() || !tie_b.exists());
         assert!(!tie_a.exists());
         assert!(!tie_b.exists());
         let write_err =
@@ -5157,6 +5261,106 @@ mod tests {
         assert_eq!(one["request_key"], request_key);
         assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
         assert_eq!(inspect(&address).unwrap_err(), err);
+    }
+
+    fn plant_ambiguous_ready_tie(address: &MemoryAddress) -> (PathBuf, PathBuf, PathBuf) {
+        let path = path_for(address).unwrap();
+        let parent = path.parent().unwrap();
+        let file = path.file_name().unwrap().to_str().unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut tie = serde_json::from_slice::<serde_json::Value>(&original).unwrap();
+        tie["generation"] = serde_json::json!(12);
+        fs::remove_file(&path).unwrap();
+        let tie_a = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+        let tie_b = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+        fs::write(&tie_a, serde_json::to_vec_pretty(&tie).unwrap()).unwrap();
+        fs::write(format!("{}.ready", tie_a.display()), b"ready").unwrap();
+        fs::write(&tie_b, serde_json::to_vec_pretty(&tie).unwrap()).unwrap();
+        fs::write(format!("{}.ready", tie_b.display()), b"ready").unwrap();
+        (path, tie_a, tie_b)
+    }
+
+    #[test]
+    fn recover_ambiguous_journal_fsync_failure_retains_candidates_and_identity() {
+        let home = IsolatedHome::install();
+        let source = tempfile::tempdir().unwrap();
+        let address = MemoryAccess::new(source.path(), Some("horizon-agent".into())).project();
+        remember(&address, "canonical seed", &[]).unwrap();
+        let (path, tie_a, tie_b) = plant_ambiguous_ready_tie(&address);
+        let _fail = fail_recovery_journal_fsync();
+        let err = inspect(&address).unwrap_err();
+        let MemoryError::AmbiguousRecovery {
+            evidence_digest,
+            request_key,
+            generation,
+        } = err.clone()
+        else {
+            panic!("expected AmbiguousRecovery, got {err:?}");
+        };
+        assert_eq!(generation, 12);
+        assert_eq!(request_key, format!("recovery:{evidence_digest}"));
+        assert!(
+            tie_a.is_file() && tie_b.is_file(),
+            "journal fsync failure must not quarantine candidates"
+        );
+        assert!(!path.exists());
+        let journal = recovery_journal_path(&path);
+        let journal_bytes = fs::read(&journal).expect("ambiguous recovery journal");
+        let write_err =
+            remember(&address, "must not overwrite ambiguous history", &[]).unwrap_err();
+        assert!(write_err.to_string().contains("ambiguous"), "{write_err}");
+        assert_eq!(inspect(&address).unwrap_err(), err);
+        let first = spawn_reopen(
+            home.path(),
+            source.path(),
+            &[("GROKPTAH_MEMORY_FSYNC_FAIL", "recovery_journal")],
+        )
+        .wait_with_output()
+        .unwrap();
+        let second = spawn_reopen(
+            home.path(),
+            source.path(),
+            &[("GROKPTAH_MEMORY_FSYNC_FAIL", "recovery_journal")],
+        )
+        .wait_with_output()
+        .unwrap();
+        let one = assert_child_executed_exactly_one_test(&first);
+        let two = assert_child_executed_exactly_one_test(&second);
+        assert_eq!(one, two);
+        assert_eq!(one, err.tool_payload());
+        assert_eq!(one["code"], "ambiguous_recovery");
+        assert_eq!(one["request_key"], request_key);
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+        assert!(tie_a.is_file() && tie_b.is_file());
+        assert_eq!(inspect(&address).unwrap_err(), err);
+    }
+
+    #[test]
+    fn recover_corrupt_or_missing_journal_after_ambiguous_is_not_empty_store() {
+        let _home = IsolatedHome::install();
+        let source = tempfile::tempdir().unwrap();
+        let address = MemoryAccess::new(source.path(), Some("horizon-agent".into())).project();
+        remember(&address, "canonical seed", &[]).unwrap();
+        let (path, tie_a, tie_b) = plant_ambiguous_ready_tie(&address);
+        let first_err = inspect(&address).unwrap_err();
+        assert!(matches!(first_err, MemoryError::AmbiguousRecovery { .. }));
+        assert!(!path.exists());
+        assert!(!tie_a.exists() && !tie_b.exists());
+        let journal = recovery_journal_path(&path);
+        assert!(journal.is_file());
+        fs::write(&journal, b"{not-json").unwrap();
+        let corrupt = inspect(&address).unwrap_err();
+        assert_eq!(corrupt, MemoryError::Durable);
+        assert!(list_facts(&address).is_err());
+        assert!(remember(&address, "must not create empty store", &[]).is_err());
+        assert!(!path.exists());
+        fs::remove_file(&journal).unwrap();
+        let missing = inspect(&address).unwrap_err();
+        assert_eq!(missing, MemoryError::Durable);
+        assert!(list_facts(&address).is_err());
+        assert!(remember(&address, "must not create empty store", &[]).is_err());
+        assert!(!path.exists());
+        assert!(sibling_ambiguous_quarantines_exist(&path));
     }
 
     #[test]
