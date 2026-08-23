@@ -2457,7 +2457,12 @@ async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_a
             bounds: RunBounds::default(),
         },
     );
-    let workspace_text = workspace.path().display().to_string();
+    let workspace_text = workspace
+        .path()
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
     let route = failing_provider_route(FAILING_QUOTA);
     let now = chrono::Utc::now();
     let mut run = RunRecord {
