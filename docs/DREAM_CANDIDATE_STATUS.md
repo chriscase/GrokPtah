@@ -99,6 +99,10 @@ complete or that the product has reached 100%.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
   gateway, so the candidate parity campaign still needs a host run.
+- Certification-lab shutdown now awaits each Tokio worker exactly once; the
+  prior timeout-then-second-await path could panic with `JoinHandle polled
+  after completion`. The offline lab suite is now a clean 90/90, but this is
+  harness/restart reliability evidence, not a live or 72-hour soak claim.
 
 ## Verification recorded
 

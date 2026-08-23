@@ -1528,13 +1528,13 @@ impl OrchestrationService {
         }
         let joins = std::mem::take(&mut *self.join_handles.lock());
         for mut join in joins {
-            if tokio::time::timeout(Duration::from_secs(6), &mut join)
-                .await
-                .is_err()
-            {
-                join.abort();
+            match tokio::time::timeout(Duration::from_secs(6), &mut join).await {
+                Ok(_) => {}
+                Err(_) => {
+                    join.abort();
+                    let _ = join.await;
+                }
             }
-            let _ = join.await;
         }
         self.native_executor.lock().enabled = false;
         self.manager_supervisor.lock().enabled = false;
