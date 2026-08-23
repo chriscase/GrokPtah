@@ -60,6 +60,8 @@ jobs:
         run: |
           npm run typecheck
           npm test
+      - name: Validate isolated visual helper source
+        run: src-tauri/macos/isolated-visual-helper/verify-helper-source.sh
       - name: Cargo tests (desktop)
         working-directory: desktop/src-tauri
         # cargo test compiles the library, binary, and test targets.

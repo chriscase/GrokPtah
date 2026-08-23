@@ -1,0 +1,103 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  echo "usage: verify-helper-source.sh" >&2
+  exit 64
+fi
+
+script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd -P)
+helper_source="$script_dir/main.m"
+configuration="$script_dir/grokptah-isolated-config-v1.json"
+work=$(mktemp -d /private/tmp/grokptah-helper-source-proof.XXXXXX)
+cleanup() {
+  rm -rf -- "$work"
+}
+trap cleanup EXIT HUP INT TERM
+
+sh -n "$script_dir/build-helper.sh"
+sh -n "$script_dir/package-signed-app.sh"
+plutil -lint \
+  "$script_dir/isolated-visual-helper.entitlements.plist" \
+  "$script_dir/grokptah-main.entitlements.plist"
+jq -e '
+  .schemaVersion == 1 and
+  .guestProtocolVersion == 1 and
+  .kernelCommandLine == "panic=-1 reboot=t init=/init grokptah.isolated_visual=1" and
+  .securityProfile == {
+    "networkDevices": 0,
+    "hostClipboard": false,
+    "sharedDirectories": false,
+    "credentialForwarding": false,
+    "hostInputForwarding": false,
+    "usbPassthrough": false,
+    "camera": false,
+    "microphone": false
+  } and
+  .limits == {
+    "virtualCpus": 2,
+    "memoryMib": 4096,
+    "overlayBytes": 8589934592,
+    "displayWidth": 1280,
+    "displayHeight": 800,
+    "framesPerSecond": 10,
+    "encodedFrameBytes": 16777216,
+    "durationSeconds": 600,
+    "inputEvents": 256,
+    "textEventBytes": 4096
+  }
+' "$configuration" >/dev/null
+for required in \
+  'machine.networkDevices = @[];' \
+  'machine.directorySharingDevices = @[];' \
+  'machine.audioDevices = @[];' \
+  'machine.storageDevices = @[];' \
+  'machine.keyboards = @[];' \
+  'machine.pointingDevices = @[];'; do
+  grep -F "$required" "$helper_source" >/dev/null
+done
+for forbidden in \
+  VZNATNetworkDeviceAttachment \
+  VZVirtioFileSystemDeviceConfiguration \
+  NSPasteboard \
+  CGEventPost \
+  NSURLSession; do
+  if grep -F "$forbidden" "$helper_source" >/dev/null; then
+    echo "helper source contains forbidden capability: $forbidden" >&2
+    exit 1
+  fi
+done
+
+helper="$work/grokptah-isolated-visual-helper"
+"$script_dir/build-helper.sh" "$helper"
+test "$(stat -f '%Lp' "$helper")" = "555"
+file "$helper" | grep -F 'Mach-O 64-bit executable'
+otool -L "$helper" | grep -F '/Virtualization.framework/'
+
+control_fifo="$work/control"
+event_fifo="$work/events"
+event_capture="$work/events.bin"
+mkfifo -m 0600 "$control_fifo" "$event_fifo"
+dd if="$event_fifo" of="$event_capture" status=none &
+event_reader=$!
+printf '\003' >"$control_fifo" &
+control_writer=$!
+set +e
+"$helper" 3<"$configuration" 4<"$configuration" 5<"$control_fifo" 6>"$event_fifo"
+helper_exit=$?
+set -e
+wait "$control_writer"
+wait "$event_reader"
+if [ "$helper_exit" -ne 4 ]; then
+  echo "invalid start command was not rejected before VM launch" >&2
+  exit 1
+fi
+event_hex=$(od -An -tx1 -v "$event_capture" | tr -d ' \n')
+expected_hex=4750544900010001000000000000000047505449000100040000000400000000
+if [ "$event_hex" != "$expected_hex" ]; then
+  echo "helper emitted an unexpected bootstrap event sequence" >&2
+  exit 1
+fi
+
+trap - EXIT HUP INT TERM
+rm -rf -- "$work"

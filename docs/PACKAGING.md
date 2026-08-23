@@ -32,6 +32,50 @@ Confirm provenance by building from a clean worktree with no local edits
 with the artifact. This establishes source provenance; signing, notarization,
 and reproducible-build guarantees are separate concerns.
 
+## Isolated visual helper candidate
+
+The Stage 9 candidate has a credentialed **assembler**, not a committed binary or a shipped
+backend. The default unsigned desktop build deliberately does not include an isolated helper or
+guest image. CI syntax-checks and links the helper source, but that proves only that the native
+source can build against the selected macOS SDK.
+
+The helper source and its closed configuration live under
+`desktop/src-tauri/macos/isolated-visual-helper/`. The executable accepts no arguments, clears its
+environment, and accepts only four inherited descriptors: immutable guest image, immutable
+configuration, host-only control pipe, and host-only event pipe. Its initial Virtualization
+configuration has one bounded display and virtio socket, but no network, shared directory, audio,
+storage, keyboard, pointing, or serial device. It waits for an explicit one-byte start authorization
+and implements bounded graceful-then-forced shutdown. This is a no-input bootstrap; it does not
+implement the guest agent, frame carrier, input, overlay, or host supervisor.
+
+On an authorized release machine with a valid non-ad-hoc signing identity and a separately built,
+reviewed guest kernel image with an embedded initramfs, assemble a new output app rather than
+mutating the unsigned input app:
+
+```sh
+desktop/src-tauri/macos/isolated-visual-helper/package-signed-app.sh \
+  /absolute/path/to/unsigned/GrokPtah.app \
+  /absolute/canonical/output/GrokPtah.app \
+  /absolute/path/to/grokptah-isolated-guest-v1.img \
+  REVIEWED_64_CHARACTER_LOWERCASE_GUEST_SHA256 \
+  "Developer ID Application: reviewed identity"
+```
+
+The script always selects the reviewed configuration beside its own source. It refuses
+symlinked/noncanonical inputs, guest-digest mismatch, configuration drift,
+pre-existing output/artifact targets, ad-hoc signing, and unexpected package locations. It builds
+and signs the helper first with only App Sandbox and Virtualization entitlements, copies the
+immutable guest/configuration, derives the content and canonical designated-requirement digests,
+writes the signed-bundle manifest, signs the outer app with an empty main-process entitlement set,
+and runs strict all-architecture nested verification. Timestamping requires the release machine's
+normal Apple signing access.
+If any step fails, treat the new output path as incomplete and discard that exact output before a
+retry; the unsigned input app and source artifacts are never modified.
+
+No valid signing identity is present on the current development host, no guest image builder or
+reviewed guest artifact is in this slice, and the assembler has not produced a claimable package.
+Notarization and runtime/destructive lifecycle certification remain separate required gates.
+
 ## Troubleshooting: DMG bundling fails after the `.app` succeeds
 
 Symptom: the release binary and `GrokPtah.app` build, then the `dmg` target

@@ -684,10 +684,15 @@ team/identifier checks, a canonical designated-requirement digest, and the helpe
 virtualization entitlement boundary. It rejects VM networking, debug attachment, unreviewed helper
 entitlements, path replacement, and content/manifest drift. No helper, guest, configuration, signing
 pipeline, or entitlement file is actually added by that verifier slice; it has no packaged runtime
-evidence. The protocol does not implement a carrier, transfer frame bytes, render a frame, or launch
-a guest. These are contracts and verifier/measurement primitives, not packaged evidence. See
+evidence. A following source slice adds the minimal helper, exact entitlement/configuration files,
+and a credentialed nested-signing assembler. The helper's closed inherited-descriptor bootstrap can
+configure a one-display/virtio-socket VM with no network/share/audio/storage/host-input devices and
+bounded graceful/forced stop, but there is no reviewed guest image, signing identity, assembled app,
+host supervisor, launch, or cleanup run. The protocol does not implement a carrier, transfer frame
+bytes, render a frame, or launch a guest. These are contracts and unshipped source/pipeline
+primitives, not packaged evidence. See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
-helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
+signed/built helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
 source slices satisfy no #288 acceptance checkbox.
 
 **Exit:** every [#288](https://github.com/chriscase/GrokPtah/issues/288)

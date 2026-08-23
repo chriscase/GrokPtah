@@ -186,9 +186,16 @@ available.
    exact application/team identity, App Sandbox, and virtualization entitlements. VM networking,
    debug attachment, mismatched teams, unreviewed helper entitlements, path replacement, and
    content/manifest drift fail closed. This is verifier **source**, not evidence that the helper,
-   guest, configuration, signing pipeline, or entitlement profile is actually packaged. No VM is
-   launched and no cleanup is run. Actual artifact production plus signed-package and destructive
-   campaign evidence remain.
+   guest, configuration, signing pipeline, or entitlement profile is actually packaged. The next
+   source slice adds a minimal helper, its exact App Sandbox + Virtualization entitlement file, a
+   closed configuration, and a credentialed assembler. The helper accepts only inherited immutable
+   guest/configuration handles plus private control/event pipes; it clears its environment, refuses
+   arguments, builds a bounded one-display/virtio-socket VM with no network/share/audio/storage/host
+   input devices, requires an explicit start byte, and performs bounded graceful-then-forced stop.
+   The assembler signs the helper before the outer unprivileged app and derives the content and
+   designated-requirement manifest. CI links only the unsigned helper source. This slice supplies no
+   reviewed guest image, signing identity, built helper, assembled app, host supervisor, launch, or
+   cleanup run. Actual guest production plus signed-package and destructive campaign evidence remain.
 4. Add authenticated virtio-socket frame/health transport and render read-only frames. The candidate
    now defines the transport-independent, read-only protocol core: a non-serializable/redacted
    32-byte channel key authenticates the exact protocol version, Run, surface incarnation, message
@@ -209,14 +216,15 @@ available.
 
 The existing simulator remains the only dispatchable isolated proof. The Stage 8 measured
 background candidate is not a substitute. The typed input, read-only host-probe, no-input lifecycle,
-open-handle content-measurement, fixed-path packaged-identity verifier, and authenticated
-read-protocol candidates do not enable
+open-handle content-measurement, fixed-path packaged-identity verifier, unshipped helper/assembler
+source, and authenticated read-protocol candidates do not enable
 `HostNative`, expose isolated actions to a model or cockpit approval flow, qualify a provider for
 visual fallback, package a VM image/helper, carry or render frame bytes, or satisfy any #288
 acceptance checkbox. The verifier can establish signed package identity only when invoked by a real
-correctly signed package containing the exact artifacts; source tests and Objective-C syntax checks
-are not that runtime evidence. The manifest accepts only the locked-down profile and bounded
-resources, but synthetic or caller-opened content digests are not packaged identity. A present
+correctly signed package containing the exact artifacts; source tests, Objective-C syntax checks,
+and an unsigned helper link are not that runtime evidence. The manifest accepts only the locked-down
+profile and bounded resources, but synthetic or caller-opened content digests are not packaged
+identity. A present
 framework, valid contract, verifier implementation, content hash, authenticated metadata envelope,
 or entitlement declaration is not a packaged helper, booted guest, carrier, rendered frame,
 isolation campaign, dispatch, cleanup campaign, or release proof.

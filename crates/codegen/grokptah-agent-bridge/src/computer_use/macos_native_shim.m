@@ -455,10 +455,15 @@ static NSString *GPTValidatePackagedCode(
             checkedEntitlements[@"com.apple.developer.team-identifier"];
         NSString *expectedApplicationIdentifier = [NSString
             stringWithFormat:@"%@.%@", observedTeam, expectedIdentifier];
-        if (![applicationIdentifier isKindOfClass:[NSString class]] ||
-            ![applicationIdentifier isEqualToString:expectedApplicationIdentifier] ||
-            ![entitlementTeam isKindOfClass:[NSString class]] ||
-            ![entitlementTeam isEqualToString:observedTeam]) {
+        BOOL applicationIdentifierMatches =
+            applicationIdentifier == nil ||
+            ([applicationIdentifier isKindOfClass:[NSString class]] &&
+             [applicationIdentifier isEqualToString:expectedApplicationIdentifier]);
+        BOOL entitlementTeamMatches =
+            entitlementTeam == nil ||
+            ([entitlementTeam isKindOfClass:[NSString class]] &&
+             [entitlementTeam isEqualToString:observedTeam]);
+        if (!applicationIdentifierMatches || !entitlementTeamMatches) {
             CFRelease(rawInformation);
             CFRelease(code);
             return @"Packaged isolated helper has inconsistent sandbox identity entitlements";

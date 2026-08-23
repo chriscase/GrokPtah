@@ -53,6 +53,9 @@ jobs:
         working-directory: desktop
         run: npm ci
 
+      - name: Validate isolated visual helper source
+        run: desktop/src-tauri/macos/isolated-visual-helper/verify-helper-source.sh
+
       - name: Build unsigned desktop bundle
         working-directory: desktop
         run: npm run tauri:build

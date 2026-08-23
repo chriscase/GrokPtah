@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "guestProtocolVersion": 1,
+  "kernelCommandLine": "panic=-1 reboot=t init=/init grokptah.isolated_visual=1",
+  "securityProfile": {
+    "networkDevices": 0,
+    "hostClipboard": false,
+    "sharedDirectories": false,
+    "credentialForwarding": false,
+    "hostInputForwarding": false,
+    "usbPassthrough": false,
+    "camera": false,
+    "microphone": false
+  },
+  "limits": {
+    "virtualCpus": 2,
+    "memoryMib": 4096,
+    "overlayBytes": 8589934592,
+    "displayWidth": 1280,
+    "displayHeight": 800,
+    "framesPerSecond": 10,
+    "encodedFrameBytes": 16777216,
+    "durationSeconds": 600,
+    "inputEvents": 256,
+    "textEventBytes": 4096
+  }
+}
