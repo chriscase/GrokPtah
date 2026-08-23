@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComputerCockpit } from "./ComputerCockpit";
 import type {
@@ -583,6 +583,80 @@ describe("ComputerCockpit", () => {
     expect(stop).toBeEnabled();
     fireEvent.click(stop);
     await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("session-1", "run-1"));
+  });
+
+  it("keeps Stop and Take over actionable while an approved action is still in flight", async () => {
+    const pending = snapshot(localView());
+    pending.pendingApproval = {
+      approvalId: "approval-inflight",
+      ownerSessionId: "session-1",
+      runId: "run-1",
+      runVersion: 3,
+      observationId: "observation-1",
+      targetLabel: "Computer Use Simulator",
+      action: {
+        type: "set_value",
+        element_id: "observation-1-name",
+        text: "Ada Lovelace",
+      },
+      actionSummary: "Enter visible text in Name",
+      risk: "Text entry",
+      createdAt: "2026-08-13T10:00:02Z",
+    };
+    mocks.snapshot.mockResolvedValue(pending);
+    let rejectApprove: (reason: Error) => void = () => {};
+    mocks.approve.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectApprove = reject;
+      }),
+    );
+    mocks.takeOver.mockResolvedValue(
+      snapshot(
+        localView("paused", {
+          controlDisposition: "operator_takeover",
+        }),
+      ),
+    );
+    mocks.stop.mockResolvedValue(snapshot(localView("cancelled")));
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Approve once" }));
+    await waitFor(() => expect(mocks.approve).toHaveBeenCalledTimes(1));
+
+    const takeOver = screen.getByRole("button", { name: "Take over" });
+    const stop = screen.getByRole("button", { name: "Stop" });
+    expect(takeOver).toBeEnabled();
+    expect(stop).toBeEnabled();
+    expect(takeOver).toHaveAttribute("aria-keyshortcuts", "Control+Shift+T");
+    expect(stop).toHaveAttribute("aria-keyshortcuts", "Control+Shift+S");
+
+    fireEvent.click(takeOver);
+    await waitFor(() =>
+      expect(mocks.takeOver).toHaveBeenCalledWith("session-1", "run-1"),
+    );
+    await act(async () => {
+      rejectApprove(new Error("late action result must not replace takeover"));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("late action result must not replace takeover")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("session-1", "run-1"));
+  });
+
+  it("provides out-of-band keyboard paths for Stop and Take over", async () => {
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
+    mocks.takeOver.mockReturnValue(new Promise(() => {}));
+    mocks.stop.mockReturnValue(new Promise(() => {}));
+    render(<ComputerCockpit {...props} />);
+    await screen.findByText("Frame 1");
+
+    fireEvent.keyDown(window, { key: "T", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "S", ctrlKey: true, shiftKey: true });
+
+    await waitFor(() => {
+      expect(mocks.takeOver).toHaveBeenCalledWith("session-1", "run-1");
+      expect(mocks.stop).toHaveBeenCalledWith("session-1", "run-1");
+    });
   });
 
   it("discards a stale response after the owning session changes", async () => {

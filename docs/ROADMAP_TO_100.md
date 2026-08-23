@@ -596,8 +596,11 @@ for a local-only slice, but **release** of the surface as 100% does.
 **Exists today:** Experimental foreground semantic CU + cockpit projection
 ([`computerActivity.ts`](../desktop/src/lib/computerActivity.ts)). The stacked
 coordination candidate adds a local-only, secret-free queue/owner explanation
-for the durable WorkAttempt surface ledger; it does not add an agent-owned
-cursor or physical preemption channel.
+for the durable WorkAttempt surface ledger. Its stacked emergency-control
+successor keeps Pause / Stop / Take over outside the ordinary UI busy gate,
+uses current host state rather than a client-held version, and provides stable
+keyboard paths. It still does not add an agent-owned cursor or a physically
+preemptive native cancellation channel.
 [#286](https://github.com/chriscase/GrokPtah/issues/286) **open**.
 
 **Exit:** every [#286](https://github.com/chriscase/GrokPtah/issues/286)

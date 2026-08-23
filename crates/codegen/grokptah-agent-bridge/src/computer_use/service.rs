@@ -1268,16 +1268,18 @@ impl ComputerUseService {
         result
     }
 
+    /// Out-of-band operator control. Authorization is evaluated against the
+    /// current durable Run while the store is locked; a stale UI snapshot can
+    /// never turn Pause into an optimistic-concurrency conflict.
     pub async fn pause(
         &self,
         request_id: &str,
         caller: &ComputerAuthorityToken,
         run_id: &str,
-        expected_version: u64,
     ) -> ComputerResult<ComputerRun> {
         validate_id("run_id", run_id)?;
         let current = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
-        let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
+        let payload = json!({ "runId": run_id });
         if let Some(replayed) =
             self.begin_mutation(request_id, "pause", &payload, caller, Some(&current))?
         {
@@ -1286,7 +1288,6 @@ impl ComputerUseService {
         let paused = self
             .store
             .update_run_and_revoke_surface_leases(run_id, "paused", Utc::now(), |run| {
-                ensure_version(run, expected_version)?;
                 self.require_caller(run, caller)?;
                 if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
                     return Err(ComputerError::new(
@@ -1312,20 +1313,20 @@ impl ComputerUseService {
         result
     }
 
-    /// Yields durable operator control. This is bookkeeping-safe takeover: it
-    /// revokes grants, bumps epochs, and cancels later backend work. It is not
-    /// physically preemptive once an action is already inside the native
-    /// action gate.
+    /// Yields durable operator control. Authorization is evaluated against the
+    /// current durable Run while the store is locked, never a client-held Run
+    /// version. This is bookkeeping-safe takeover: it revokes grants, bumps
+    /// epochs, and cancels later backend work. It is not physically preemptive
+    /// once an action is already inside the native action gate.
     pub async fn take_over(
         &self,
         request_id: &str,
         caller: &ComputerAuthorityToken,
         run_id: &str,
-        expected_version: u64,
     ) -> ComputerResult<ComputerRun> {
         validate_id("run_id", run_id)?;
         let current = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
-        let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
+        let payload = json!({ "runId": run_id });
         if let Some(replayed) =
             self.begin_mutation(request_id, "take_over", &payload, caller, Some(&current))?
         {
@@ -1334,7 +1335,6 @@ impl ComputerUseService {
         let taken_over = self
             .store
             .update_run_and_revoke_surface_leases(run_id, "operator_takeover", Utc::now(), |run| {
-                ensure_version(run, expected_version)?;
                 self.require_takeover_caller(run, caller)?;
                 run.transition(ComputerRunState::Paused)?;
                 revoke_authority(run);
@@ -2445,15 +2445,9 @@ mod tests {
         });
         backend.action_entered.notified().await;
 
-        let acting = service.get_run(&run.run_id).unwrap().unwrap();
         let operator = ComputerAuthorityToken::local_operator(run.owner_session_id).unwrap();
         let taken_over = service
-            .take_over(
-                "take-over-agent-run",
-                &operator,
-                &run.run_id,
-                acting.version,
-            )
+            .take_over("take-over-agent-run", &operator, &run.run_id)
             .await
             .unwrap();
         assert_eq!(taken_over.state, ComputerRunState::Paused);
@@ -3280,7 +3274,7 @@ mod tests {
             )
             .unwrap();
         let paused = service
-            .pause("pause-1", &caller(&run, &service), &run.run_id, run.version)
+            .pause("pause-1", &caller(&run, &service), &run.run_id)
             .await
             .unwrap();
         assert_eq!(paused.state, ComputerRunState::Paused);
@@ -3299,6 +3293,54 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::InvalidState);
+    }
+
+    #[tokio::test]
+    async fn emergency_controls_accept_awaiting_authorization_without_client_version() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        let operator = ComputerAuthorityToken::local_operator(owner).unwrap();
+        let pause_run = service
+            .create_run(
+                "create-awaiting-pause",
+                &operator,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            service
+                .pause("pause-awaiting", &operator, &pause_run.run_id)
+                .await
+                .unwrap()
+                .control_disposition,
+            ComputerControlDisposition::Paused
+        );
+
+        let takeover_operator = ComputerAuthorityToken::local_operator(Uuid::new_v4()).unwrap();
+        let takeover_run = service
+            .create_run(
+                "create-awaiting-takeover",
+                &takeover_operator,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let taken_over = service
+            .take_over(
+                "takeover-awaiting",
+                &takeover_operator,
+                &takeover_run.run_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(taken_over.state, ComputerRunState::Paused);
+        assert_eq!(
+            taken_over.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
     }
 
     #[tokio::test]
@@ -3323,12 +3365,7 @@ mod tests {
             )
             .unwrap();
         let taken_over = service
-            .take_over(
-                "takeover-1",
-                &caller(&run, &service),
-                &run.run_id,
-                run.version,
-            )
+            .take_over("takeover-1", &caller(&run, &service), &run.run_id)
             .await
             .unwrap();
 
@@ -3365,12 +3402,7 @@ mod tests {
             )
             .unwrap();
         let taken_over = service
-            .take_over(
-                "takeover-fence",
-                &caller(&run, &service),
-                &run.run_id,
-                run.version,
-            )
+            .take_over("takeover-fence", &caller(&run, &service), &run.run_id)
             .await
             .unwrap();
 
@@ -3393,12 +3425,7 @@ mod tests {
         assert!(persisted.control_epoch > run.control_epoch);
 
         let error = service
-            .pause(
-                "pause-after-takeover",
-                &caller(&run, &service),
-                &run.run_id,
-                taken_over.version,
-            )
+            .pause("pause-after-takeover", &caller(&run, &service), &run.run_id)
             .await
             .unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::InvalidState);
@@ -3873,6 +3900,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_uses_current_durable_version_and_wins_inflight_action_race() {
+        let dir = tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend::default());
+        let service = Arc::new(trusted_fixture_service(
+            backend.clone(),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        ));
+        let run = service
+            .create_run(
+                "create-pause-race",
+                &ComputerAuthorityToken::local_operator(Uuid::new_v4()).unwrap(),
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "grant-pause-race",
+                &caller(&run, &service),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let observation = service
+            .observe(
+                "observe-pause-race",
+                &caller(&run, &service),
+                &run.run_id,
+                run.version,
+            )
+            .await
+            .unwrap();
+        let before_dispatch = service.get_run(&run.run_id).unwrap().unwrap();
+        let before_dispatch_version = before_dispatch.version;
+        let action_service = service.clone();
+        let action_run_id = run.run_id.clone();
+        let action_observation = observation.clone();
+        let action_caller = caller(&run, &service);
+        let action = tokio::spawn(async move {
+            action_service
+                .act(
+                    "act-pause-race",
+                    &action_caller,
+                    &action_run_id,
+                    before_dispatch_version,
+                    &action_observation.observation_id,
+                    ComputerAction::SetValue {
+                        element_id: format!("{}-name", action_observation.observation_id),
+                        text: "Ada".into(),
+                    },
+                )
+                .await
+        });
+        backend.action_entered.notified().await;
+        let acting = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(acting.state, ComputerRunState::Acting);
+        assert!(acting.version > before_dispatch_version);
+
+        let paused = service
+            .pause("pause-race", &caller(&run, &service), &run.run_id)
+            .await
+            .unwrap();
+        assert_eq!(paused.state, ComputerRunState::Paused);
+        assert_eq!(
+            paused.control_disposition,
+            ComputerControlDisposition::Paused
+        );
+        assert!(paused
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.revoked_at.is_some()));
+        assert_eq!(
+            action.await.unwrap().unwrap_err().code,
+            ComputerErrorCode::UncertainOutcome
+        );
+        let persisted = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(persisted.state, ComputerRunState::Paused);
+        assert_eq!(
+            persisted.control_disposition,
+            ComputerControlDisposition::Paused
+        );
+        assert!(persisted
+            .audit
+            .iter()
+            .any(|entry| entry.operation == "pause" && entry.disposition == "paused"));
+    }
+
+    #[tokio::test]
+    async fn takeover_uses_current_durable_version_and_wins_inflight_action_race() {
+        let dir = tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend::default());
+        let service = Arc::new(trusted_fixture_service(
+            backend.clone(),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        ));
+        let run = service
+            .create_run(
+                "create-takeover-race",
+                &ComputerAuthorityToken::local_operator(Uuid::new_v4()).unwrap(),
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "grant-takeover-race",
+                &caller(&run, &service),
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let observation = service
+            .observe(
+                "observe-takeover-race",
+                &caller(&run, &service),
+                &run.run_id,
+                run.version,
+            )
+            .await
+            .unwrap();
+        let before_dispatch = service.get_run(&run.run_id).unwrap().unwrap();
+        let before_dispatch_version = before_dispatch.version;
+        let action_service = service.clone();
+        let action_run_id = run.run_id.clone();
+        let action_observation = observation.clone();
+        let action_caller = caller(&run, &service);
+        let action = tokio::spawn(async move {
+            action_service
+                .act(
+                    "act-takeover-race",
+                    &action_caller,
+                    &action_run_id,
+                    before_dispatch_version,
+                    &action_observation.observation_id,
+                    ComputerAction::SetValue {
+                        element_id: format!("{}-name", action_observation.observation_id),
+                        text: "Ada".into(),
+                    },
+                )
+                .await
+        });
+        backend.action_entered.notified().await;
+        let acting = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(acting.state, ComputerRunState::Acting);
+        assert!(acting.version > before_dispatch_version);
+
+        let taken_over = service
+            .take_over("takeover-race", &caller(&run, &service), &run.run_id)
+            .await
+            .unwrap();
+        assert_eq!(taken_over.state, ComputerRunState::Paused);
+        assert_eq!(
+            taken_over.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
+        assert!(taken_over
+            .grant
+            .as_ref()
+            .is_some_and(|grant| grant.revoked_at.is_some()));
+        assert_eq!(
+            action.await.unwrap().unwrap_err().code,
+            ComputerErrorCode::UncertainOutcome
+        );
+        let persisted = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(persisted.state, ComputerRunState::Paused);
+        assert_eq!(
+            persisted.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
+        assert!(persisted.audit.iter().any(|entry| {
+            entry.operation == "take_over" && entry.disposition == "operator_control"
+        }));
+    }
+
+    #[tokio::test]
     async fn scoped_reads_refuse_another_session_and_never_confirm_run_existence() {
         let (_backend, service) = service();
         let owner = Uuid::new_v4();
@@ -4278,7 +4484,7 @@ mod tests {
         );
         assert_eq!(
             service
-                .take_over("takeover-intruder", &other, &run.run_id, run.version)
+                .take_over("takeover-intruder", &other, &run.run_id)
                 .await
                 .unwrap_err()
                 .code,
@@ -4930,23 +5136,13 @@ mod tests {
 
         let (run, _) = authorized_ready(&service, "pause-table", None).await;
         let paused = service
-            .pause(
-                "pause-once",
-                &caller(&run, &service),
-                &run.run_id,
-                run.version,
-            )
+            .pause("pause-once", &caller(&run, &service), &run.run_id)
             .await
             .unwrap();
         assert!(paused.control_epoch > run.control_epoch);
         assert_eq!(backend.cancels.load(Ordering::SeqCst), 1);
         let replayed = service
-            .pause(
-                "pause-once",
-                &caller(&run, &service),
-                &run.run_id,
-                run.version,
-            )
+            .pause("pause-once", &caller(&run, &service), &run.run_id)
             .await
             .unwrap();
         assert_eq!(paused, replayed);
@@ -4954,22 +5150,12 @@ mod tests {
 
         let (run, _) = authorized_ready(&service, "takeover-table", None).await;
         let taken = service
-            .take_over(
-                "takeover-once",
-                &caller(&run, &service),
-                &run.run_id,
-                run.version,
-            )
+            .take_over("takeover-once", &caller(&run, &service), &run.run_id)
             .await
             .unwrap();
         let cancels = backend.cancels.load(Ordering::SeqCst);
         let replayed = service
-            .take_over(
-                "takeover-once",
-                &caller(&run, &service),
-                &run.run_id,
-                run.version,
-            )
+            .take_over("takeover-once", &caller(&run, &service), &run.run_id)
             .await
             .unwrap();
         assert_eq!(taken, replayed);

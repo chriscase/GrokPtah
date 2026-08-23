@@ -1028,14 +1028,10 @@ pub async fn computer_use_cockpit_pause(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-    expected_version: u64,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
     let owner = computer_owner(&state, &session_id)?;
     state.host.cancel_computer_agent(owner);
-    state
-        .computer_use
-        .pause_simulator(owner, &run_id, expected_version)
-        .await
+    state.computer_use.pause_simulator(owner, &run_id).await
 }
 
 #[tauri::command]
@@ -1043,14 +1039,10 @@ pub async fn computer_use_cockpit_take_over(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-    expected_version: u64,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
     let owner = computer_owner(&state, &session_id)?;
     state.host.cancel_computer_agent(owner);
-    state
-        .computer_use
-        .take_over_simulator(owner, &run_id, expected_version)
-        .await
+    state.computer_use.take_over_simulator(owner, &run_id).await
 }
 
 #[tauri::command]

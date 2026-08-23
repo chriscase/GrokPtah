@@ -16,8 +16,10 @@ Computer Use treats observation and action as separate privileged operations:
    optional remaining-use count.
 4. An observation receives a monotonic ID. Every action must reference the current observation.
 5. Policy is checked again immediately before the backend action. Takeover is durable
-   bookkeeping-safe (revokes grants, bumps epochs, cancels later work). It is not physically
-   preemptive once an action is already inside the native action gate.
+   bookkeeping-safe (revokes grants, bumps epochs, cancels later work). The stacked emergency
+   control candidate removes the UI mutation-busy gate and stale client-version gate from Pause,
+   Stop, and Take over; stable keyboard paths remain available while a backend call is unresolved.
+   It is not physically preemptive once an action is already inside the native action gate.
 6. Successful actions invalidate the observation, forcing the caller to observe again.
 
 Authorization is fail-closed. Grants do not survive restart, pause, cancellation, completion,
@@ -146,6 +148,14 @@ authority handles never enter the DTO. Workspace-scoped coordinator reads do not
 queue depth or another workspace's Agent identity. This makes contention understandable without
 turning the read surface into a cross-workspace activity oracle. It is not an agent-owned cursor,
 an out-of-band preemption channel, a background-safe backend, or isolated visual execution.
+
+The stacked emergency-control candidate treats Pause and Take over like Stop: each local gesture
+gets a fresh mutation request, authorization is re-evaluated against the current durable Run while
+the store is locked, and no client-held Run version can make the control lose to an in-flight
+action. The cockpit does not disable Stop or Take over behind its ordinary mutation busy flag and
+advertises `Control+Shift+S` / `Control+Shift+T` keyboard paths. These changes close the known
+surface reachability and stale-version race only. The native backend still needs a genuinely
+out-of-band cancellation channel before takeover is physically preemptive.
 
 ## Foundation (#268)
 

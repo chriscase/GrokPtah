@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
 import {
   computerActivityAnnouncement,
@@ -145,6 +145,7 @@ export function ComputerCockpit({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const requestEpoch = useRef(0);
+  const emergencyEpoch = useRef(0);
   const proposalFocus = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
@@ -195,22 +196,68 @@ export function ComputerCockpit({
     success?: string,
   ): Promise<boolean> => {
     const epoch = requestEpoch.current;
+    const emergencyAtStart = emergencyEpoch.current;
     setBusy(true);
     setError(null);
     try {
       const next = await mutation();
-      if (requestEpoch.current !== epoch) return false;
+      if (
+        requestEpoch.current !== epoch ||
+        emergencyEpoch.current !== emergencyAtStart
+      ) {
+        return false;
+      }
       setSnapshot(next);
       setNotice(success ?? null);
       onRunState?.(next.local?.state ?? null);
       return true;
     } catch (reason) {
-      if (requestEpoch.current === epoch) setError(String(reason));
+      if (
+        requestEpoch.current === epoch &&
+        emergencyEpoch.current === emergencyAtStart
+      ) {
+        setError(String(reason));
+      }
       return false;
     } finally {
       if (requestEpoch.current === epoch) setBusy(false);
     }
   };
+
+  // Emergency controls must not join the ordinary mutation busy gate. They
+  // are specifically required to race an observation/action that is still
+  // awaiting its backend, and the host re-reads current durable state.
+  const applyEmergency = useCallback(
+    async (
+      mutation: () => Promise<ComputerCockpitSnapshot>,
+      success: string,
+    ): Promise<void> => {
+      const epoch = requestEpoch.current;
+      const controlEpoch = emergencyEpoch.current + 1;
+      emergencyEpoch.current = controlEpoch;
+      setError(null);
+      try {
+        const next = await mutation();
+        if (
+          requestEpoch.current !== epoch ||
+          emergencyEpoch.current !== controlEpoch
+        ) {
+          return;
+        }
+        setSnapshot(next);
+        setNotice(success);
+        onRunState?.(next.local?.state ?? null);
+      } catch (reason) {
+        if (
+          requestEpoch.current === epoch &&
+          emergencyEpoch.current === controlEpoch
+        ) {
+          setError(String(reason));
+        }
+      }
+    },
+    [onRunState],
+  );
 
   const run = snapshot?.local ?? null;
   // Status rendering reads the authoritative projection, which is the same
@@ -241,6 +288,35 @@ export function ComputerCockpit({
     agentEligibility?.model === model ? agentEligibility.tier : computerUseTier;
   const effectiveAgentSource =
     agentEligibility?.model === model ? agentEligibility.source : computerCapabilitySource;
+
+  useEffect(() => {
+    if (!sessionId || !run || isTerminal(run)) return;
+    const onEmergencyKey = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return;
+      const key = event.key.toLowerCase();
+      if (key === "s") {
+        event.preventDefault();
+        void applyEmergency(
+          () => api.computerUseCockpitStop(sessionId, run.runId),
+          "Computer Run stopped.",
+        );
+      } else if (key === "t" && !hasOperatorTakeover(run)) {
+        event.preventDefault();
+        void applyEmergency(
+          () => api.computerUseCockpitTakeOver(sessionId, run.runId),
+          "You have control. All Computer Use authority was revoked.",
+        );
+      } else if (key === "p" && run.state !== "paused") {
+        event.preventDefault();
+        void applyEmergency(
+          () => api.computerUseCockpitPause(sessionId, run.runId),
+          "Computer Run paused.",
+        );
+      }
+    };
+    window.addEventListener("keydown", onEmergencyKey);
+    return () => window.removeEventListener("keydown", onEmergencyKey);
+  }, [applyEmergency, run, sessionId]);
 
   const qualifyAgent = async () => {
     if (!sessionId) return;
@@ -625,11 +701,13 @@ export function ComputerCockpit({
             <div className="computer-control-actions">
               <button
                 type="button"
-                disabled={busy || run.state !== "ready"}
-                title={run.state !== "ready" ? "Pause is available while the run is ready" : undefined}
+                disabled={isTerminal(run) || run.state === "paused"}
+                title="Pause now · Control+Shift+P"
+                aria-keyshortcuts="Control+Shift+P"
                 onClick={() =>
-                  void apply(() =>
-                    api.computerUseCockpitPause(sessionId, run.runId, run.version),
+                  void applyEmergency(
+                    () => api.computerUseCockpitPause(sessionId, run.runId),
+                    "Computer Run paused.",
                   )
                 }
               >
@@ -637,10 +715,12 @@ export function ComputerCockpit({
               </button>
               <button
                 type="button"
-                disabled={busy || isTerminal(run) || run.state === "paused"}
+                disabled={isTerminal(run) || hasOperatorTakeover(run)}
+                title="Take over now · Control+Shift+T"
+                aria-keyshortcuts="Control+Shift+T"
                 onClick={() =>
-                  void apply(
-                    () => api.computerUseCockpitTakeOver(sessionId, run.runId, run.version),
+                  void applyEmergency(
+                    () => api.computerUseCockpitTakeOver(sessionId, run.runId),
                     "You have control. All Computer Use authority was revoked.",
                   )
                 }
@@ -650,9 +730,11 @@ export function ComputerCockpit({
               <button
                 type="button"
                 className="danger"
-                disabled={busy || isTerminal(run)}
+                disabled={isTerminal(run)}
+                title="Stop now · Control+Shift+S"
+                aria-keyshortcuts="Control+Shift+S"
                 onClick={() =>
-                  void apply(
+                  void applyEmergency(
                     () => api.computerUseCockpitStop(sessionId, run.runId),
                     "Computer Run stopped.",
                   )

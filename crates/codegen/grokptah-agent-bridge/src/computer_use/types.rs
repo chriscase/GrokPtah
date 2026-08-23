@@ -2054,6 +2054,9 @@ impl ComputerRun {
             ) | (
                 ComputerRunState::AwaitingAuthorization,
                 ComputerRunState::Cancelled
+            ) | (
+                ComputerRunState::AwaitingAuthorization,
+                ComputerRunState::Paused
             ) | (ComputerRunState::Ready, ComputerRunState::Observing)
                 | (ComputerRunState::Ready, ComputerRunState::Acting)
                 | (ComputerRunState::Ready, ComputerRunState::Paused)

@@ -716,7 +716,6 @@ impl DesktopComputerUse {
         &self,
         owner_session_id: Uuid,
         run_id: &str,
-        expected_version: u64,
     ) -> Result<ComputerCockpitSnapshot, String> {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
@@ -725,7 +724,6 @@ impl DesktopComputerUse {
                 &Uuid::new_v4().to_string(),
                 &self.operator_token(owner_session_id)?,
                 run_id,
-                expected_version,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -736,7 +734,6 @@ impl DesktopComputerUse {
         &self,
         owner_session_id: Uuid,
         run_id: &str,
-        expected_version: u64,
     ) -> Result<ComputerCockpitSnapshot, String> {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
@@ -745,7 +742,6 @@ impl DesktopComputerUse {
                 &Uuid::new_v4().to_string(),
                 &self.operator_token(owner_session_id)?,
                 run_id,
-                expected_version,
             )
             .await
             .map_err(|error| error.to_string())?;

@@ -429,25 +429,15 @@ export const api = {
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_discard_approval", {
       sessionId,
     }),
-  computerUseCockpitPause: (
-    sessionId: string,
-    runId: string,
-    expectedVersion: number,
-  ) =>
+  computerUseCockpitPause: (sessionId: string, runId: string) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_pause", {
       sessionId,
       runId,
-      expectedVersion,
     }),
-  computerUseCockpitTakeOver: (
-    sessionId: string,
-    runId: string,
-    expectedVersion: number,
-  ) =>
+  computerUseCockpitTakeOver: (sessionId: string, runId: string) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_take_over", {
       sessionId,
       runId,
-      expectedVersion,
     }),
   computerUseCockpitReconcileUncertainSurface: (
     sessionId: string,
