@@ -2065,6 +2065,68 @@ mod tests {
         parse_timestamp(&fixture().epoch).unwrap()
     }
 
+    fn emit_logical_years_evidence(
+        spec: &Fixture,
+        critical_recall_pct: u32,
+        stale_as_current_pct: u32,
+        conflict_recall_pct: u32,
+        conflict_false_positive_pct: u32,
+        duplicate_rate_pct: u32,
+    ) {
+        let Ok(output) = std::env::var("GROKPTAH_MEMORY_EVIDENCE_OUTPUT") else {
+            return;
+        };
+        let candidate_sha = std::env::var("GROKPTAH_CANDIDATE_SHA")
+            .expect("GROKPTAH_CANDIDATE_SHA is required when capturing evidence");
+        let mut evidence = crate::memory_certification::MemoryLongHorizonEvidence {
+            schema: crate::memory_certification::MEMORY_LONG_HORIZON_EVIDENCE_SCHEMA.to_owned(),
+            certification_id: "memory-logical-years-campaign-v1".to_owned(),
+            candidate_sha,
+            fixture_id: spec.fixture_id.clone(),
+            fixture_digest: format!("{:x}", Sha256::digest(FIXTURE.as_bytes())),
+            core_source_digest: format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/memory.rs"
+                )))
+            ),
+            logical_years: spec.logical_years,
+            scopes: vec![
+                "project".to_owned(),
+                "agent_private".to_owned(),
+                "team".to_owned(),
+            ],
+            critical_recall_pct,
+            stale_as_current_pct,
+            conflict_recall_pct,
+            conflict_false_positive_pct,
+            duplicate_rate_pct,
+            hot_store_within_byte_bound: true,
+            repeated_read_reopen_deterministic: true,
+            secret_free: true,
+            claim_eligible: false,
+            evidence_digest: String::new(),
+        };
+        evidence.evidence_digest = crate::memory_certification::expected_evidence_digest(&evidence);
+        evidence
+            .validate()
+            .expect("captured memory evidence validates");
+        let bytes = serde_json::to_vec_pretty(&evidence).expect("memory evidence JSON");
+        let output = PathBuf::from(output);
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent).expect("memory evidence parent");
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output)
+            .expect("create memory evidence artifact without clobber");
+        file.write_all(&bytes)
+            .expect("write memory evidence artifact");
+        file.sync_all().expect("sync memory evidence artifact");
+    }
+
     fn access_at(source: &Path, actor: Option<String>, now: DateTime<Utc>) -> MemoryAccess {
         MemoryAccess::new(source, actor).with_clock(Arc::new(FakeClock::new(now)))
     }
@@ -3641,6 +3703,15 @@ mod tests {
             "storage-tree file ceiling {files}"
         );
         assert!(bytes <= MAX_SCOPE_FOOTPRINT_BYTES as u64 * 8);
+
+        emit_logical_years_evidence(
+            &spec,
+            critical_recall as u32,
+            stale_pct as u32,
+            conflict_recall,
+            conflict_fp,
+            duplicate_rate,
+        );
 
         let _ = home.path();
         let _ = spec.workload.writes_per_year;
