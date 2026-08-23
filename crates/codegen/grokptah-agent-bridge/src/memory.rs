@@ -45,7 +45,7 @@ const MAX_SCOPE_FOOTPRINT_BYTES: usize = 384 * 1024;
 const MAX_SCOPE_FILES: usize = 24;
 const MAX_CRITICAL_FACTS: usize = 16;
 const MAX_CRITICAL_BYTES: usize = 16 * 1024;
-const MAX_INJECT_CHARS: usize = 6_000;
+pub(crate) const MAX_INJECT_BYTES: usize = 6_000;
 const RECEIPT_HORIZON_DAYS: i64 = 3650;
 const SCHEMA_V2: &str = "grokptah.memory.v2";
 const SCOPED_WORKSPACE_KEY_VERSION: &str = "v1-sha256";
@@ -1922,7 +1922,7 @@ pub(crate) fn inject_context(address: &MemoryAddress) -> anyhow::Result<String> 
             escape_evidence(fact.claim_key.as_deref().unwrap_or("")),
             escape_evidence(&fact.text)
         );
-        if used + line.len() > MAX_INJECT_CHARS {
+        if used + line.len() > MAX_INJECT_BYTES {
             break;
         }
         out.push_str(&line);

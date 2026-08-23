@@ -47,9 +47,10 @@ pub use managed::{
 pub use manager::{
     parse_manager_directive, ManagerCoordinationMode, ManagerCoordinationPolicy,
     ManagerDecisionRecord, ManagerDecisionState, ManagerDirective, ManagerDirectiveEnvelope,
-    ManagerNotification, ManagerPlan, ManagerPlanState, ManagerStep, ManagerStepSpec,
-    ManagerStepState, MANAGER_SCHEMA_VERSION, MAX_MANAGER_DIRECTIVE_BYTES, MAX_MANAGER_IN_FLIGHT,
-    MAX_MANAGER_REPLANS, MAX_MANAGER_STEPS,
+    ManagerMemoryAttribution, ManagerNotification, ManagerPlan, ManagerPlanState, ManagerStep,
+    ManagerStepSpec, ManagerStepState, MANAGER_SCHEMA_VERSION, MAX_MANAGER_DIRECTIVE_BYTES,
+    MAX_MANAGER_IN_FLIGHT, MAX_MANAGER_MEMORY_CONTEXT_BYTES, MAX_MANAGER_REPLANS,
+    MAX_MANAGER_STEPS,
 };
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,

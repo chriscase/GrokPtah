@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::message::MessageKind;
-use super::types::hash_payload;
+use super::types::{hash_payload, AgentMemoryPolicy};
 use super::workload::{AssignmentStatus, WorkDependency, WorkItem, WorkPolicy, WorkState};
 use super::OrchError;
 
@@ -22,6 +22,7 @@ pub const MAX_MANAGER_STEPS: usize = 64;
 pub const MAX_MANAGER_IN_FLIGHT: u32 = 16;
 pub const MAX_MANAGER_REPLANS: u32 = 16;
 pub const MAX_MANAGER_DIRECTIVE_BYTES: usize = 16 * 1024;
+pub const MAX_MANAGER_MEMORY_CONTEXT_BYTES: usize = crate::memory::MAX_INJECT_BYTES;
 const MAX_MANAGER_ID_BYTES: usize = 256;
 const MAX_MANAGER_TEXT_BYTES: usize = 32 * 1024;
 
@@ -82,8 +83,141 @@ pub enum ManagerDecisionState {
     HumanRequired,
 }
 
+/// Immutable attribution for the exact memory context presented to one
+/// manager-decision occurrence. The raw quoted context lives only in the
+/// occurrence's durable Work objective; this record carries bounded metadata
+/// and hashes so a directive cannot silently move to a different scope or
+/// later memory view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ManagerMemoryAttribution {
+    pub schema_version: u32,
+    pub manager_agent_id: String,
+    pub agent_spec_revision: u64,
+    pub source_workspace_digest: String,
+    pub project_scope_enabled: bool,
+    pub agent_private_scope_enabled: bool,
+    #[serde(default)]
+    pub team_scope_ids: Vec<String>,
+    pub scope_policy_digest: String,
+    pub project_context_digest: String,
+    pub project_context_bytes: u64,
+    pub project_context_present: bool,
+    pub attribution_digest: String,
+}
+
+impl ManagerMemoryAttribution {
+    pub fn new(
+        manager_agent_id: impl Into<String>,
+        agent_spec_revision: u64,
+        source_workspace: &str,
+        policy: &AgentMemoryPolicy,
+        project_context: &str,
+    ) -> Result<Self, OrchError> {
+        let manager_agent_id = manager_agent_id.into();
+        let mut team_scope_ids = policy.team_ids.clone();
+        team_scope_ids.sort();
+        team_scope_ids.dedup();
+        let source_workspace_digest = hash_payload(&json!({
+            "sourceWorkspace": source_workspace,
+        }));
+        let scope_policy_digest = hash_payload(&json!({
+            "projectScope": policy.project_scope,
+            "agentPrivateScope": policy.agent_private_scope,
+            "teamIds": team_scope_ids,
+        }));
+        let project_context_digest = hash_payload(&json!({
+            "projectContext": project_context,
+        }));
+        let mut attribution = Self {
+            schema_version: MANAGER_SCHEMA_VERSION,
+            manager_agent_id,
+            agent_spec_revision,
+            source_workspace_digest,
+            project_scope_enabled: policy.project_scope,
+            agent_private_scope_enabled: policy.agent_private_scope,
+            team_scope_ids,
+            scope_policy_digest,
+            project_context_digest,
+            project_context_bytes: project_context.len() as u64,
+            project_context_present: !project_context.is_empty(),
+            attribution_digest: String::new(),
+        };
+        attribution.attribution_digest = hash_payload(&attribution.digest_material());
+        attribution.validate()?;
+        Ok(attribution)
+    }
+
+    fn digest_material(&self) -> Value {
+        json!({
+            "schemaVersion": self.schema_version,
+            "managerAgentId": self.manager_agent_id,
+            "agentSpecRevision": self.agent_spec_revision,
+            "sourceWorkspaceDigest": self.source_workspace_digest,
+            "projectScopeEnabled": self.project_scope_enabled,
+            "agentPrivateScopeEnabled": self.agent_private_scope_enabled,
+            "teamScopeIds": self.team_scope_ids,
+            "scopePolicyDigest": self.scope_policy_digest,
+            "projectContextDigest": self.project_context_digest,
+            "projectContextBytes": self.project_context_bytes,
+            "projectContextPresent": self.project_context_present,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != MANAGER_SCHEMA_VERSION || self.agent_spec_revision == 0 {
+            return Err(invalid(
+                "manager memory attribution schema or revision is invalid",
+            ));
+        }
+        validate_id(&self.manager_agent_id, "manager memory agent_id")?;
+        if self.team_scope_ids.len() > 64 {
+            return Err(invalid("manager memory team scopes exceed their bound"));
+        }
+        let mut canonical_team_ids = self.team_scope_ids.clone();
+        canonical_team_ids.sort();
+        canonical_team_ids.dedup();
+        if canonical_team_ids != self.team_scope_ids {
+            return Err(invalid("manager memory team scopes are not canonical"));
+        }
+        for team_id in &self.team_scope_ids {
+            validate_id(team_id, "manager memory team_id")?;
+        }
+        for (value, field) in [
+            (&self.source_workspace_digest, "source_workspace_digest"),
+            (&self.scope_policy_digest, "scope_policy_digest"),
+            (&self.project_context_digest, "project_context_digest"),
+            (&self.attribution_digest, "attribution_digest"),
+        ] {
+            validate_sha256(value, field)?;
+        }
+        let expected_scope_digest = hash_payload(&json!({
+            "projectScope": self.project_scope_enabled,
+            "agentPrivateScope": self.agent_private_scope_enabled,
+            "teamIds": self.team_scope_ids,
+        }));
+        if self.scope_policy_digest != expected_scope_digest {
+            return Err(invalid(
+                "manager memory scope policy digest is inconsistent",
+            ));
+        }
+        if self.project_context_bytes > MAX_MANAGER_MEMORY_CONTEXT_BYTES as u64
+            || self.project_context_present != (self.project_context_bytes > 0)
+            || (!self.project_scope_enabled && self.project_context_present)
+        {
+            return Err(invalid(
+                "manager memory context bounds or scope are inconsistent",
+            ));
+        }
+        if self.attribution_digest != hash_payload(&self.digest_material()) {
+            return Err(invalid("manager memory attribution digest is inconsistent"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagerDecisionRecord {
     pub schema_version: u32,
     pub decision_id: String,
@@ -91,12 +225,14 @@ pub struct ManagerDecisionRecord {
     pub expected_plan_revision: u64,
     pub manager_agent_id: String,
     pub agent_spec_revision: u64,
+    pub memory_attribution: ManagerMemoryAttribution,
     #[serde(default)]
     pub triggering_work_ids: Vec<String>,
     #[serde(default)]
     pub triggering_message_ids: Vec<String>,
     pub input_snapshot_hash: String,
     pub decision_work_id: String,
+    pub decision_work_objective_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     pub state: ManagerDecisionState,
@@ -124,6 +260,14 @@ impl ManagerDecisionRecord {
         {
             return Err(invalid("manager decision references exceed their bounds"));
         }
+        self.memory_attribution.validate()?;
+        if self.memory_attribution.manager_agent_id != self.manager_agent_id
+            || self.memory_attribution.agent_spec_revision != self.agent_spec_revision
+        {
+            return Err(invalid(
+                "manager decision memory attribution does not match its Agent fence",
+            ));
+        }
         for (value, field) in [
             (&self.decision_id, "decision_id"),
             (&self.plan_id, "plan_id"),
@@ -133,6 +277,10 @@ impl ManagerDecisionRecord {
         ] {
             validate_id(value, field)?;
         }
+        validate_sha256(
+            &self.decision_work_objective_digest,
+            "decision_work_objective_digest",
+        )?;
         for id in self
             .triggering_work_ids
             .iter()
@@ -165,6 +313,7 @@ pub struct ManagerDirectiveEnvelope {
     pub manager_agent_id: String,
     pub expected_agent_spec_revision: u64,
     pub input_snapshot_hash: String,
+    pub memory_attribution_digest: String,
     pub directive: ManagerDirective,
 }
 
@@ -303,6 +452,10 @@ pub fn parse_manager_directive(raw: &str) -> Result<ManagerDirectiveEnvelope, Or
     ] {
         validate_id(value, field)?;
     }
+    validate_sha256(
+        &envelope.memory_attribution_digest,
+        "memory_attribution_digest",
+    )?;
     match &envelope.directive {
         ManagerDirective::AppendReplacementSteps {
             reason,
@@ -362,6 +515,7 @@ fn validate_directive_json_shape(value: &Value) -> Result<(), OrchError> {
             "managerAgentId",
             "expectedAgentSpecRevision",
             "inputSnapshotHash",
+            "memoryAttributionDigest",
             "directive",
         ],
         "$",
@@ -1264,6 +1418,19 @@ fn validate_text(value: &str, field: &str) -> Result<(), OrchError> {
     Ok(())
 }
 
+fn validate_sha256(value: &str, field: &str) -> Result<(), OrchError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(invalid(format!(
+            "{field} must be a 64-character lowercase hexadecimal digest"
+        )));
+    }
+    Ok(())
+}
+
 fn invalid(message: impl Into<String>) -> OrchError {
     OrchError::new(super::OrchErrorCode::InvalidRequest, message)
 }
@@ -1287,6 +1454,8 @@ fn work_state_label(state: WorkState) -> &'static str {
 mod tests {
     use super::*;
 
+    const MEMORY_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn spec(step_id: &str, dependencies: &[&str]) -> ManagerStepSpec {
         ManagerStepSpec {
             step_id: step_id.into(),
@@ -1297,6 +1466,43 @@ mod tests {
             assigned_agent_id: None,
             policy: WorkPolicy::default(),
         }
+    }
+
+    #[test]
+    fn manager_memory_attribution_is_canonical_bounded_and_tamper_evident() {
+        let policy = AgentMemoryPolicy {
+            project_scope: true,
+            agent_private_scope: false,
+            team_ids: vec!["team-b".into(), "team-a".into(), "team-b".into()],
+        };
+        let attribution = ManagerMemoryAttribution::new(
+            "manager",
+            7,
+            "/tmp/source",
+            &policy,
+            "quoted project context",
+        )
+        .unwrap();
+        assert_eq!(attribution.team_scope_ids, ["team-a", "team-b"]);
+        assert_eq!(attribution.project_context_bytes, 22);
+        attribution.validate().unwrap();
+
+        let mut tampered = attribution.clone();
+        tampered.project_context_bytes += 1;
+        assert!(tampered.validate().is_err());
+
+        let disabled = AgentMemoryPolicy {
+            project_scope: false,
+            ..AgentMemoryPolicy::default()
+        };
+        assert!(ManagerMemoryAttribution::new(
+            "manager",
+            7,
+            "/tmp/source",
+            &disabled,
+            "context must not cross a disabled scope",
+        )
+        .is_err());
     }
 
     #[test]
@@ -1531,6 +1737,7 @@ mod tests {
             "managerAgentId": "agent-1",
             "expectedAgentSpecRevision": 2,
             "inputSnapshotHash": "abc",
+            "memoryAttributionDigest": MEMORY_DIGEST,
             "directive": {
                 "type": "append_replacement_steps",
                 "reason": "replace failure",
@@ -1571,6 +1778,7 @@ mod tests {
                 "managerAgentId": "agent-1",
                 "expectedAgentSpecRevision": 2,
                 "inputSnapshotHash": "abc",
+                "memoryAttributionDigest": MEMORY_DIGEST,
                 "directive": directive
             })
             .to_string()
@@ -1652,6 +1860,11 @@ mod tests {
                 json!("x".repeat(MAX_MANAGER_ID_BYTES + 1)),
                 "oversized snapshot hash",
             ),
+            (
+                "memoryAttributionDigest",
+                json!("A".repeat(64)),
+                "non-canonical memory attribution digest",
+            ),
         ] {
             let mut tampered: Value = serde_json::from_str(&envelope(no_safe_action())).unwrap();
             tampered[field] = value;
@@ -1721,15 +1934,15 @@ mod tests {
         }
         rejected(&depth_bomb, "deeply nested output");
         rejected(
-            r#"{"schemaVersion":1,"schemaVersion":1,"occurrenceId":"d","planId":"p","expectedPlanRevision":3,"managerAgentId":"a","expectedAgentSpecRevision":2,"inputSnapshotHash":"h","directive":{"type":"no_safe_action","reason":"r"}}"#,
+            r#"{"schemaVersion":1,"schemaVersion":1,"occurrenceId":"d","planId":"p","expectedPlanRevision":3,"managerAgentId":"a","expectedAgentSpecRevision":2,"inputSnapshotHash":"h","memoryAttributionDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","directive":{"type":"no_safe_action","reason":"r"}}"#,
             "duplicate envelope key",
         );
         rejected(
-            r#"{"schemaVersion":1,"occurrenceId":"d","planId":"p","expectedPlanRevision":3,"managerAgentId":"a","expectedAgentSpecRevision":2,"inputSnapshotHash":"h","directive":{"type":"no_safe_action","reason":"audited","reason":"applied"}}"#,
+            r#"{"schemaVersion":1,"occurrenceId":"d","planId":"p","expectedPlanRevision":3,"managerAgentId":"a","expectedAgentSpecRevision":2,"inputSnapshotHash":"h","memoryAttributionDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","directive":{"type":"no_safe_action","reason":"audited","reason":"applied"}}"#,
             "duplicate key nested in the directive",
         );
         rejected(
-            r#"{"schemaVersion":1,"occurrenceId":"d","planId":"p","expectedPlanRevision":3,"managerAgentId":"a","expectedAgentSpecRevision":2,"inputSnapshotHash":"h","directive":{"type":"append_replacement_steps","reason":"r","replacesStepIds":["failed"],"steps":[{"stepId":"audited","stepId":"applied","kind":"coding","objective":"o"}]}}"#,
+            r#"{"schemaVersion":1,"occurrenceId":"d","planId":"p","expectedPlanRevision":3,"managerAgentId":"a","expectedAgentSpecRevision":2,"inputSnapshotHash":"h","memoryAttributionDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","directive":{"type":"append_replacement_steps","reason":"r","replacesStepIds":["failed"],"steps":[{"stepId":"audited","stepId":"applied","kind":"coding","objective":"o"}]}}"#,
             "duplicate key nested inside an array element",
         );
         rejected(

@@ -9,7 +9,7 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
-    McpRemoteError, SessionKind,
+    McpRemoteError, MemoryScope, SessionKind,
 };
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -39,6 +39,8 @@ async fn autonomous_manager_replans_once_and_reaches_success() {
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
     let manager = host.ensure_session_agent(lane.id).unwrap();
+    host.memory_remember(lane.id, MemoryScope::Project, "frozen manager project fact")
+        .unwrap();
     let store = OrchStore::open(home.path().join("orchestration")).unwrap();
     let orch = OrchestrationService::new(
         host.clone(),
@@ -145,6 +147,22 @@ async fn autonomous_manager_replans_once_and_reaches_success() {
         .load_work_item(&decision.decision_work_id)
         .unwrap()
         .unwrap();
+    let frozen_objective = decision_work.objective.clone();
+    assert!(frozen_objective.contains("frozen manager project fact"));
+    assert!(decision.memory_attribution.project_context_present);
+    host.memory_remember(
+        lane.id,
+        MemoryScope::Project,
+        "later ambient fact must not rewrite this occurrence",
+    )
+    .unwrap();
+    orch.drive_manager_supervisor_once().await;
+    let replayed_work = fixture_store
+        .load_work_item(&decision.decision_work_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replayed_work.objective, frozen_objective);
+    assert!(!replayed_work.objective.contains("later ambient fact"));
     let directive = json!({
         "schemaVersion": 1,
         "occurrenceId": decision.decision_id,
@@ -153,6 +171,7 @@ async fn autonomous_manager_replans_once_and_reaches_success() {
         "managerAgentId": decision.manager_agent_id,
         "expectedAgentSpecRevision": decision.agent_spec_revision,
         "inputSnapshotHash": decision.input_snapshot_hash,
+        "memoryAttributionDigest": decision.memory_attribution.attribution_digest,
         "directive": {
             "type": "append_replacement_steps",
             "reason": "replace deterministic failure",

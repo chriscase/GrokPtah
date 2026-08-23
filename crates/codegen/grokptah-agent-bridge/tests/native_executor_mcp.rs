@@ -9,17 +9,19 @@ use grokptah_agent_bridge::orchestration::{
     hash_payload, public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
     safe_id_filename, AssignmentStatus, AuthContext, AuthCredential, ChangeRecord,
     IdempotencyClaim, ManagedExecutionIntent, ManagedExecutionPolicy, ManagedIntentState,
-    OrchStore, OrchestrationConfig, OrchestrationService, ProviderAttemptState, ProviderRetryClass,
+    ManagerDecisionRecord, ManagerDecisionState, ManagerMemoryAttribution, OrchStore,
+    OrchestrationConfig, OrchestrationService, ProviderAttemptState, ProviderRetryClass,
     ProviderRoute, ProviderRouteSnapshot, ProviderSendCertainty, PublicRun, QuotaClass,
     QuotaLimits, QuotaReservation, QuotaReservationState, RunAggregates, RunBounds, RunProgress,
     RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkProviderRouteConstraint, WorkState,
-    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION, PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
-    PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
+    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION, MANAGER_SCHEMA_VERSION,
+    PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION, PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
 };
 use grokptah_agent_bridge::{
     model_selection_key, set_grokptah_home_override, start_control_server, AgentHost,
-    CapabilitySource, EffortLevel, HostConfig, McpControlClient, McpRemoteError, ModelCapabilities,
-    ProviderDeadlineClass, ProviderDialect, ProviderKind, SessionKind, SessionUpdate,
+    CapabilitySource, EffortLevel, HostConfig, McpControlClient, McpRemoteError, MemoryScope,
+    ModelCapabilities, ProviderDeadlineClass, ProviderDialect, ProviderKind, SessionKind,
+    SessionUpdate,
 };
 use serde_json::json;
 use std::path::Path;
@@ -722,12 +724,23 @@ async fn blocking_provider(State(state): State<BlockingProviderState>) -> Json<s
 struct ProposalProviderState {
     requests: Arc<AtomicUsize>,
     saw_host_denial: Arc<AtomicBool>,
+    saw_ambient_memory: Arc<AtomicBool>,
 }
 
 async fn proposal_only_provider(
     State(state): State<ProposalProviderState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    if body["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with("Untrusted memory evidence"))
+        })
+    }) {
+        state.saw_ambient_memory.store(true, Ordering::SeqCst);
+    }
     let request = state.requests.fetch_add(1, Ordering::SeqCst);
     let message = if request == 0 {
         json!({
@@ -1199,11 +1212,13 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(AtomicUsize::new(0));
     let saw_host_denial = Arc::new(AtomicBool::new(false));
+    let saw_ambient_memory = Arc::new(AtomicBool::new(false));
     let app = Router::new()
         .route("/v1/chat/completions", post(proposal_only_provider))
         .with_state(ProposalProviderState {
             requests: requests.clone(),
             saw_host_denial: saw_host_denial.clone(),
+            saw_ambient_memory: saw_ambient_memory.clone(),
         });
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -1225,6 +1240,12 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     let lane = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(lane.id, workspace.path()).unwrap();
     let agent = host.ensure_session_agent(lane.id).unwrap();
+    host.memory_remember(
+        lane.id,
+        MemoryScope::Project,
+        "ambient project memory must not be reinjected into a manager proposal",
+    )
+    .unwrap();
     let orch = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
@@ -1249,7 +1270,7 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     .unwrap();
     let mut work = WorkItem::new(
         "manager-decision",
-        "return exactly one typed manager directive envelope",
+        "return exactly one typed manager directive envelope from frozen manager project fact",
         session,
         workspace_text.clone(),
         "manager-supervisor",
@@ -1262,7 +1283,46 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     work.source_manager_plan_id = Some("manager-plan-test".into());
     work.source_manager_step_id = Some("__manager_decision__".into());
     work.validate().unwrap();
-    orch.store().save_work_item(&work).unwrap();
+    let manager_spec = orch
+        .store()
+        .load_agent(&agent_id)
+        .unwrap()
+        .unwrap()
+        .current_spec()
+        .unwrap()
+        .clone();
+    let now = chrono::Utc::now();
+    let decision = ManagerDecisionRecord {
+        schema_version: MANAGER_SCHEMA_VERSION,
+        decision_id: "manager-decision-test".into(),
+        plan_id: "manager-plan-test".into(),
+        expected_plan_revision: 1,
+        manager_agent_id: agent_id.clone(),
+        agent_spec_revision: manager_spec.revision,
+        memory_attribution: ManagerMemoryAttribution::new(
+            &agent_id,
+            manager_spec.revision,
+            &workspace_text,
+            &manager_spec.memory,
+            "frozen manager project fact",
+        )
+        .unwrap(),
+        triggering_work_ids: Vec::new(),
+        triggering_message_ids: Vec::new(),
+        input_snapshot_hash: "manager-snapshot-test".into(),
+        decision_work_id: work.work_id.clone(),
+        decision_work_objective_digest: hash_payload(&json!({"objective": work.objective})),
+        run_id: None,
+        state: ManagerDecisionState::AwaitingResult,
+        proposed_directive: None,
+        outcome: None,
+        applied_mutation_ids: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    };
+    orch.store()
+        .save_manager_decision_with_work(&decision, &work)
+        .unwrap();
 
     orch.drive_native_executor_once().await;
     let admission_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
@@ -1339,6 +1399,7 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     assert_ne!(agent.current_run_id.as_deref(), Some(run_id.as_str()));
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     assert!(saw_host_denial.load(Ordering::SeqCst));
+    assert!(!saw_ambient_memory.load(Ordering::SeqCst));
     assert!(!workspace.path().join("proposal-escape.txt").exists());
     assert_eq!(run.aggregates.permissions_requested, 0);
     assert_eq!(run.aggregates.permissions_granted, 0);
@@ -1349,6 +1410,68 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     assert!(!events
         .iter()
         .any(|entry| matches!(&entry.update, SessionUpdate::PermissionRequired { .. })));
+
+    // A later rewrite of the durable Work objective cannot broaden the
+    // frozen memory view or spend provider quota. Admission binds the exact
+    // objective digest before it creates an intent or Run.
+    let mut tampered_work = WorkItem::new(
+        "manager-decision",
+        "frozen manager occurrence",
+        session,
+        workspace_text.clone(),
+        "manager-supervisor",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    tampered_work.parent_work_id = Some("manager-root-tampered".into());
+    tampered_work.assigned_agent_id = Some(agent_id.clone());
+    tampered_work.assignment_status = AssignmentStatus::Accepted;
+    tampered_work.source_manager_plan_id = Some("manager-plan-tampered".into());
+    tampered_work.source_manager_step_id = Some("__manager_decision__".into());
+    tampered_work.validate().unwrap();
+    let tampered_decision = ManagerDecisionRecord {
+        schema_version: MANAGER_SCHEMA_VERSION,
+        decision_id: "manager-decision-tampered".into(),
+        plan_id: "manager-plan-tampered".into(),
+        expected_plan_revision: 1,
+        manager_agent_id: agent_id.clone(),
+        agent_spec_revision: manager_spec.revision,
+        memory_attribution: ManagerMemoryAttribution::new(
+            &agent_id,
+            manager_spec.revision,
+            &workspace_text,
+            &manager_spec.memory,
+            "frozen manager occurrence",
+        )
+        .unwrap(),
+        triggering_work_ids: Vec::new(),
+        triggering_message_ids: Vec::new(),
+        input_snapshot_hash: "manager-snapshot-tampered".into(),
+        decision_work_id: tampered_work.work_id.clone(),
+        decision_work_objective_digest: hash_payload(
+            &json!({"objective": tampered_work.objective}),
+        ),
+        run_id: None,
+        state: ManagerDecisionState::AwaitingResult,
+        proposed_directive: None,
+        outcome: None,
+        applied_mutation_ids: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    };
+    orch.store()
+        .save_manager_decision_with_work(&tampered_decision, &tampered_work)
+        .unwrap();
+    tampered_work.objective = "frozen manager occurrence plus silently widened later memory".into();
+    tampered_work.bump_at(chrono::Utc::now());
+    orch.store().save_work_item(&tampered_work).unwrap();
+    orch.drive_native_executor_once().await;
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert!(orch
+        .store()
+        .live_managed_intent_for_work(&tampered_work.work_id)
+        .unwrap()
+        .is_none());
 
     orch.store()
         .update_run(&run_id, |run| {

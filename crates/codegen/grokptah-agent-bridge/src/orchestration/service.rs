@@ -67,6 +67,47 @@ fn validate_provider_route_for_purpose(
     crate::native_coding_readiness::validate_provider_route_for_purpose(route, purpose)
 }
 
+fn validate_manager_decision_work_binding(
+    store: &OrchStore,
+    work: &WorkItem,
+    agent_id: &str,
+    agent_spec_revision: u64,
+) -> Result<(), OrchError> {
+    if work.source_manager_step_id.as_deref() != Some("__manager_decision__") {
+        return Ok(());
+    }
+    let plan_id = work.source_manager_plan_id.as_deref().ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::Conflict,
+            "manager decision Work has no durable plan occurrence",
+        )
+    })?;
+    let matching = store
+        .list_manager_decisions(Some(plan_id))?
+        .into_iter()
+        .filter(|decision| decision.decision_work_id == work.work_id)
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(OrchError::new(
+            OrchErrorCode::Conflict,
+            "manager decision Work has no unique durable occurrence",
+        ));
+    }
+    let decision = &matching[0];
+    if decision.state != ManagerDecisionState::AwaitingResult
+        || decision.manager_agent_id != agent_id
+        || decision.agent_spec_revision != agent_spec_revision
+        || decision.decision_work_objective_digest
+            != hash_payload(&json!({"objective": work.objective}))
+    {
+        return Err(OrchError::new(
+            OrchErrorCode::StaleVersion,
+            "manager decision Work no longer matches its frozen occurrence",
+        ));
+    }
+    Ok(())
+}
+
 /// Enforce a WorkItem's immutable provider identity at the last safe point
 /// before a Run is assigned an id or persisted.
 ///
@@ -607,8 +648,8 @@ impl OrchestrationService {
             &plan.workspace,
         )?;
         let spec = agent.current_spec()?.clone();
-        let mut snapshot = ManagerPlan::manager_decision_snapshot(plan, &items);
-        if let Some(snapshot) = snapshot.as_object_mut() {
+        let mut occurrence_snapshot = ManagerPlan::manager_decision_snapshot(plan, &items);
+        if let Some(snapshot) = occurrence_snapshot.as_object_mut() {
             snapshot.insert("managerAgentSpecRevision".into(), json!(spec.revision));
             snapshot.insert(
                 "effectiveBounds".into(),
@@ -616,8 +657,8 @@ impl OrchestrationService {
             );
             snapshot.insert("toolAuthority".into(), json!("none"));
         }
-        let decision_id = ManagerPlan::manager_decision_id(plan, &snapshot);
-        let snapshot_hash = hash_payload(&snapshot);
+        let decision_id = ManagerPlan::manager_decision_id(plan, &occurrence_snapshot);
+        let snapshot_hash = hash_payload(&occurrence_snapshot);
         let mut decision = if let Some(decision) = self.store.load_manager_decision(&decision_id)? {
             if decision.input_snapshot_hash != snapshot_hash {
                 return Err(OrchError::new(
@@ -627,6 +668,29 @@ impl OrchestrationService {
             }
             decision
         } else {
+            let (memory_attribution, project_memory_context) = self
+                .host
+                .capture_manager_memory_attribution(
+                    plan.session_id,
+                    &plan.manager_agent_id,
+                    spec.revision,
+                )
+                .map_err(|error| {
+                    OrchError::new(
+                        OrchErrorCode::Conflict,
+                        format!("manager memory capture failed closed: {error:#}"),
+                    )
+                })?;
+            let mut reasoning_snapshot = occurrence_snapshot.clone();
+            if let Some(snapshot) = reasoning_snapshot.as_object_mut() {
+                snapshot.insert(
+                    "memoryAttribution".into(),
+                    serde_json::to_value(&memory_attribution).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })?,
+                );
+                snapshot.insert("projectMemoryContext".into(), json!(project_memory_context));
+            }
             let work_id = format!("manager-decision-work-{}", &decision_id[17..]);
             let mut policy = WorkPolicy::default();
             policy.bounds.max_prompt_bytes = 32 * 1024;
@@ -643,15 +707,19 @@ impl OrchestrationService {
                 "managerAgentId": plan.manager_agent_id,
                 "expectedAgentSpecRevision": spec.revision,
                 "inputSnapshotHash": snapshot_hash,
+                "memoryAttributionDigest": memory_attribution.attribution_digest,
                 "directive": {"type": "no_safe_action", "reason": "replace with one allowed directive"},
             });
             let objective = format!(
                 "Return exactly this JSON envelope with only directive replaced, and no prose. You have no tool authority. Envelope: {} Snapshot: {}",
                 serde_json::to_string(&envelope_template)
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
-                serde_json::to_string(&snapshot)
+                serde_json::to_string(&reasoning_snapshot)
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             );
+            let decision_work_objective_digest = hash_payload(&json!({
+                "objective": objective,
+            }));
             let mut work = WorkItem::new_at(
                 "manager-decision",
                 objective,
@@ -675,6 +743,7 @@ impl OrchestrationService {
                 expected_plan_revision: plan.revision,
                 manager_agent_id: plan.manager_agent_id.clone(),
                 agent_spec_revision: spec.revision,
+                memory_attribution,
                 triggering_work_ids: plan
                     .steps
                     .iter()
@@ -694,6 +763,7 @@ impl OrchestrationService {
                     .collect(),
                 input_snapshot_hash: snapshot_hash,
                 decision_work_id: work_id,
+                decision_work_objective_digest,
                 run_id: None,
                 state: ManagerDecisionState::AwaitingResult,
                 proposed_directive: None,
@@ -730,6 +800,16 @@ impl OrchestrationService {
                 "manager decision Work is missing",
             ));
         };
+        if hash_payload(&json!({"objective": work.objective}))
+            != decision.decision_work_objective_digest
+        {
+            decision.state = ManagerDecisionState::Rejected;
+            decision.outcome = Some("manager decision Work objective changed after capture".into());
+            decision.updated_at = now;
+            self.store.save_manager_decision(&decision)?;
+            report.decisions_rejected += 1;
+            return Ok(());
+        }
         if matches!(work.state, WorkState::Failed | WorkState::Cancelled) {
             decision.state = ManagerDecisionState::Rejected;
             decision.outcome = Some("manager decision Work did not succeed".into());
@@ -802,6 +882,7 @@ impl OrchestrationService {
             || envelope.manager_agent_id != decision.manager_agent_id
             || envelope.expected_agent_spec_revision != decision.agent_spec_revision
             || envelope.input_snapshot_hash != decision.input_snapshot_hash
+            || envelope.memory_attribution_digest != decision.memory_attribution.attribution_digest
         {
             return Err(OrchError::new(
                 OrchErrorCode::StaleVersion,
@@ -1404,6 +1485,7 @@ impl OrchestrationService {
         secret: &str,
     ) -> Result<(), OrchError> {
         let now = Utc::now();
+        validate_manager_decision_work_binding(&self.store, work, &agent.agent_id, spec.revision)?;
         let parent = match &work.parent_work_id {
             Some(parent_id) => self
                 .store
@@ -8804,5 +8886,64 @@ mod provider_route_constraint_tests {
             assert!(!error.message.contains("premium-fallback"));
             assert!(!error.message.contains("stronger-model"));
         }
+    }
+
+    #[test]
+    fn manager_decision_work_objective_is_frozen_before_admission() {
+        let home = tempfile::tempdir().unwrap();
+        let store = OrchStore::open(home.path()).unwrap();
+        let session_id = Uuid::new_v4();
+        let mut work = WorkItem::new(
+            "manager-decision",
+            "frozen objective",
+            session_id,
+            "/tmp/manager-memory-binding",
+            "manager-supervisor",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        work.parent_work_id = Some("root".into());
+        work.assigned_agent_id = Some("manager".into());
+        work.assignment_status = super::super::workload::AssignmentStatus::Accepted;
+        work.source_manager_plan_id = Some("plan".into());
+        work.source_manager_step_id = Some("__manager_decision__".into());
+        work.validate().unwrap();
+        let now = Utc::now();
+        let decision = ManagerDecisionRecord {
+            schema_version: MANAGER_SCHEMA_VERSION,
+            decision_id: "manager-decision-binding".into(),
+            plan_id: "plan".into(),
+            expected_plan_revision: 1,
+            manager_agent_id: "manager".into(),
+            agent_spec_revision: 3,
+            memory_attribution: super::super::manager::ManagerMemoryAttribution::new(
+                "manager",
+                3,
+                "/tmp/manager-memory-binding",
+                &AgentMemoryPolicy::default(),
+                "quoted memory",
+            )
+            .unwrap(),
+            triggering_work_ids: Vec::new(),
+            triggering_message_ids: Vec::new(),
+            input_snapshot_hash: "snapshot".into(),
+            decision_work_id: work.work_id.clone(),
+            decision_work_objective_digest: hash_payload(&json!({"objective": work.objective})),
+            run_id: None,
+            state: ManagerDecisionState::AwaitingResult,
+            proposed_directive: None,
+            outcome: None,
+            applied_mutation_ids: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        store
+            .save_manager_decision_with_work(&decision, &work)
+            .unwrap();
+        validate_manager_decision_work_binding(&store, &work, "manager", 3).unwrap();
+
+        work.objective = "silently widened objective".into();
+        assert!(validate_manager_decision_work_binding(&store, &work, "manager", 3).is_err());
+        assert!(validate_manager_decision_work_binding(&store, &work, "manager", 4).is_err());
     }
 }

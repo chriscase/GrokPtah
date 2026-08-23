@@ -47,12 +47,13 @@ use crate::orchestration::{
     AgentContinuationPlan, AgentLaneAssociation, AgentRecord, AgentResumePlan, AgentSpec,
     AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
-    ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, ProviderRouteSnapshot,
-    ProviderSendCertainty, PublicRun, QuotaClass, QuotaLimits, QuotaReservation,
-    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
-    RoutineTrigger, RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose,
-    RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy,
-    WorkTemplate, DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
+    ContinuationTestInput, ManagerMemoryAttribution, MissedRunPolicy, OrchStore, PromotionState,
+    ProviderRouteSnapshot, ProviderSendCertainty, PublicRun, QuotaClass, QuotaLimits,
+    QuotaReservation, RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord,
+    RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger, RunAggregates, RunBounds, RunExecution,
+    RunExecutionMode, RunPurpose, RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem,
+    WorkItemSnapshot, WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
+    DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -4796,7 +4797,11 @@ impl AgentHostHandle {
     /// offline paths can still assert wire context quality after `/compact`.
     pub fn wire_messages_preview(&self, id: Uuid) -> Result<Vec<serde_json::Value>> {
         self.ensure_transcript_loaded(id)?;
-        let memory_access = self.memory_access_for_session(id)?;
+        let memory_access = if self.session_run_is_manager_proposal(id)? {
+            None
+        } else {
+            Some(self.memory_access_for_session(id)?)
+        };
         let g = self.inner.lock();
         let s = g
             .sessions
@@ -4817,7 +4822,7 @@ impl AgentHostHandle {
             &history,
             s.compacted_summary.as_deref(),
             &s.cwd,
-            Some(&memory_access),
+            memory_access.as_ref(),
             plan,
         ))
     }
@@ -4920,6 +4925,55 @@ impl AgentHostHandle {
             spec.memory.agent_private_scope,
             spec.memory.team_ids,
         )
+    }
+
+    /// Capture the exact bounded project-memory view used by a durable
+    /// manager-decision occurrence. A second spec read closes the policy
+    /// time-of-check/time-of-use window before the attribution is returned.
+    pub(crate) fn capture_manager_memory_attribution(
+        &self,
+        session_id: Uuid,
+        expected_agent_id: &str,
+        expected_spec_revision: u64,
+    ) -> Result<(ManagerMemoryAttribution, String)> {
+        let bound_agent_id = self
+            .inner
+            .lock()
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("unknown session"))?
+            .agent_id
+            .clone()
+            .ok_or_else(|| anyhow!("manager Lane has no durable Agent binding"))?;
+        if bound_agent_id != expected_agent_id {
+            bail!("manager Lane Agent binding changed before memory capture");
+        }
+        let before = self
+            .session_agent_spec(session_id)?
+            .ok_or_else(|| anyhow!("manager Agent specification is unavailable"))?;
+        if before.revision != expected_spec_revision || before.revision == 0 {
+            bail!("manager Agent specification changed before memory capture");
+        }
+        let memory_access = self.memory_access_for_session(session_id)?;
+        let project_context = memory_access
+            .project_if_allowed()
+            .map(|address| crate::memory::inject_context(&address))
+            .transpose()?
+            .unwrap_or_default();
+        let after = self
+            .session_agent_spec(session_id)?
+            .ok_or_else(|| anyhow!("manager Agent specification is unavailable"))?;
+        if after != before {
+            bail!("manager Agent specification changed during memory capture");
+        }
+        let attribution = ManagerMemoryAttribution::new(
+            expected_agent_id,
+            expected_spec_revision,
+            &before.source_workspace,
+            &before.memory,
+            &project_context,
+        )?;
+        Ok((attribution, project_context))
     }
 
     fn memory_address_for_session(
@@ -9422,12 +9476,16 @@ impl AgentHostHandle {
         let plan_ref = active_plan
             .as_ref()
             .map(|(g, steps)| (g.as_str(), steps.as_slice()));
-        let memory_access = self.memory_access_for_session(session_id)?;
+        let memory_access = if self.session_run_is_manager_proposal(session_id)? {
+            None
+        } else {
+            Some(self.memory_access_for_session(session_id)?)
+        };
         let mut messages = build_agent_messages(
             history,
             compacted_summary.as_deref(),
             cwd,
-            Some(&memory_access),
+            memory_access.as_ref(),
             plan_ref,
         );
 
