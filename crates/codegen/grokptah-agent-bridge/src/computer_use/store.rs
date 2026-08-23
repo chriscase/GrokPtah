@@ -540,6 +540,9 @@ impl ComputerStore {
         // Mutation receipts remain the independent exact-request replay
         // fence after an acknowledged/known-not-injected lease is retired.
         let leases = self.prune_surface_leases_unlocked(now, 1)?;
+        if has_unresolved_uncertainty(&leases, &conflict_domain_id) {
+            return Err(uncertain_conflict_domain_error());
+        }
         if leases.len() >= MAX_SURFACE_LEASES {
             return Err(ComputerError::new(
                 ComputerErrorCode::LimitReached,
@@ -626,6 +629,9 @@ impl ComputerStore {
         };
         let mut leases = self.list_surface_leases_unlocked()?;
         self.expire_surface_leases_unlocked(&mut leases, now)?;
+        if has_unresolved_uncertainty(&leases, &conflict_domain_id) {
+            return Err(uncertain_conflict_domain_error());
+        }
         if leases.iter().any(|lease| {
             lease.conflict_domain_id == conflict_domain_id && lease.state.owns_domain_capacity()
         }) {
@@ -747,6 +753,9 @@ impl ComputerStore {
             .ok_or_else(|| ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown run"))?;
         lease.assert_run_fence(&run)?;
         self.assert_live_lease_surface(&lease)?;
+        if has_unresolved_uncertainty(&leases, &lease.conflict_domain_id) {
+            return Err(uncertain_conflict_domain_error());
+        }
         if leases.iter().any(|other| {
             other.lease_id != lease.lease_id
                 && other.conflict_domain_id == lease.conflict_domain_id
@@ -2137,6 +2146,20 @@ fn write_json_exclusive<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<
 
 fn internal_error(error: impl ToString) -> ComputerError {
     ComputerError::new(ComputerErrorCode::Internal, error.to_string())
+}
+
+fn has_unresolved_uncertainty(leases: &[ComputerSurfaceLease], conflict_domain_id: &str) -> bool {
+    leases.iter().any(|lease| {
+        lease.conflict_domain_id == conflict_domain_id
+            && lease.state == ComputerSurfaceLeaseState::Uncertain
+    })
+}
+
+fn uncertain_conflict_domain_error() -> ComputerError {
+    ComputerError::new(
+        ComputerErrorCode::UncertainOutcome,
+        "the physical Computer input domain has an unresolved uncertain dispatch and cannot be reassigned",
+    )
 }
 
 #[cfg(test)]
