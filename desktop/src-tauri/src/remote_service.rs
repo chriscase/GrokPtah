@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -678,6 +679,7 @@ struct RemoteServiceClient {
     base_url: String,
     token: String,
     mcp: McpControlClient,
+    advertised_tools: BTreeSet<String>,
 }
 
 impl RemoteServiceClient {
@@ -691,13 +693,9 @@ impl RemoteServiceClient {
             base_url: base_url.clone(),
             token: token.clone(),
             mcp: McpControlClient::new(base_url, token),
+            advertised_tools: BTreeSet::new(),
         };
         client.reconnect().await?;
-        let tools = client
-            .mcp
-            .list_tools()
-            .await
-            .context("list remote service tools")?;
         for required in [
             "ptah_list_sessions",
             "ptah_create_session",
@@ -712,7 +710,6 @@ impl RemoteServiceClient {
             "ptah_list_work",
             "ptah_get_work",
             "ptah_retry_work",
-            "ptah_approve_work",
             "ptah_cancel_work",
             "ptah_create_routine",
             "ptah_list_routines",
@@ -726,7 +723,7 @@ impl RemoteServiceClient {
             "ptah_steer",
             "ptah_cancel",
         ] {
-            if !tools.iter().any(|tool| tool.name == required) {
+            if !client.advertised_tools.contains(required) {
                 bail!("remote service does not advertise {required}");
             }
         }
@@ -738,11 +735,20 @@ impl RemoteServiceClient {
         mcp.initialize()
             .await
             .context("initialize remote MCP service")?;
+        let advertised_tools = mcp
+            .list_tools()
+            .await
+            .context("list remote service tools")?
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
         self.mcp = mcp;
+        self.advertised_tools = advertised_tools;
         Ok(())
     }
 
     async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        self.require_advertised_tool(name)?;
         let first = self.mcp.call_tool(name, arguments.clone()).await;
         let result = match first {
             Ok(result) => result,
@@ -753,6 +759,7 @@ impl RemoteServiceClient {
                 self.reconnect()
                     .await
                     .context("reconnect remote MCP service")?;
+                self.require_advertised_tool(name)?;
                 self.mcp.call_tool(name, arguments).await.with_context(|| {
                     format!(
                         "remote MCP request failed after reconnect (initial error: {first_error})"
@@ -764,6 +771,13 @@ impl RemoteServiceClient {
             bail!("remote service rejected {name}: {}", result.raw);
         }
         Ok(result.structured)
+    }
+
+    fn require_advertised_tool(&self, name: &str) -> Result<()> {
+        if !self.advertised_tools.contains(name) {
+            bail!("remote credential does not grant {name}");
+        }
+        Ok(())
     }
 
     async fn list_persistent_agents(&mut self) -> Result<Vec<AgentRecord>> {
@@ -2070,6 +2084,21 @@ mod tests {
             RemoteServiceClient::connect(base_url.clone(), "desktop-remote-token".into())
                 .await
                 .unwrap();
+        assert!(!client.advertised_tools.contains("ptah_approve_work"));
+        let approval_error = client
+            .approve_work(
+                Uuid::nil(),
+                workspace.path().display().to_string(),
+                "work-not-created".into(),
+                None,
+                None,
+                "desktop-remote-approval".into(),
+            )
+            .await
+            .unwrap_err();
+        assert!(approval_error
+            .to_string()
+            .contains("remote credential does not grant ptah_approve_work"));
         assert!(client.list_persistent_agents().await.unwrap().is_empty());
         let empty_page = client.list_runs().await.unwrap();
         assert!(empty_page.runs.is_empty());
