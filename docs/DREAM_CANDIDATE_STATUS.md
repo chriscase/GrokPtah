@@ -136,6 +136,8 @@ unrelated signal.
 - Independent-worker evidence suite: 4 passed, covering complete multi-worker
   evidence, short-soak and duplicate-execution denial, missing checks,
   credential-rotation denial, and unknown fields.
+- Hosted-service security regression: `ServiceConfig` debug output now redacts
+  bearer material; the dedicated unit test and service Clippy gate pass.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.

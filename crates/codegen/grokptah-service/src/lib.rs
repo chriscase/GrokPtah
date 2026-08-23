@@ -24,7 +24,7 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:39200";
 const DEFAULT_MAX_CONCURRENT: usize = 4;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServiceConfig {
     pub listen: SocketAddr,
     pub token: String,
@@ -42,6 +42,31 @@ pub struct ServiceConfig {
     /// Explicit durable root for embedders and hosted deployments. `None`
     /// preserves the `GROKPTAH_HOME`/desktop discovery behavior.
     pub runtime_home: Option<RuntimeHome>,
+}
+
+impl std::fmt::Debug for ServiceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceConfig")
+            .field("listen", &self.listen)
+            .field("token", &"[redacted]")
+            .field(
+                "workspaces",
+                &format_args!("{} workspace(s)", self.workspaces.len()),
+            )
+            .field("allow_remote", &self.allow_remote)
+            .field("max_concurrent", &self.max_concurrent)
+            .field("request_timeout", &self.request_timeout)
+            .field(
+                "client_credentials",
+                &format_args!("{} credential(s)", self.client_credentials.len()),
+            )
+            .field("agent_owner_id", &self.agent_owner_id)
+            .field(
+                "runtime_home",
+                &self.runtime_home.as_ref().map(|_| "[configured]"),
+            )
+            .finish()
+    }
 }
 
 impl ServiceConfig {
@@ -519,5 +544,22 @@ mod tests {
             config.runtime_home.unwrap().path(),
             dunce::canonicalize(temp.path()).unwrap()
         );
+    }
+
+    #[test]
+    fn service_config_debug_redacts_all_bearer_material() {
+        let config = ServiceConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "super-secret-service-token",
+            vec![PathBuf::from("/tmp/project")],
+            false,
+            2,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("super-secret-service-token"));
+        assert!(debug.contains("[redacted]"));
+        assert!(debug.contains("1 credential(s)"));
     }
 }
