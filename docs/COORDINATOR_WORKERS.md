@@ -145,13 +145,13 @@ returns the original Work or message and creates no duplicate.
 ## Follow-up
 
 - **Production-shaped worker credential issuance.** The runtime now supports
-  binding a credential to one Agent and rejects cross-identity worker and
-  message operations. A deployment still needs a real issuance/rotation
-  workflow plus independent multi-worker evidence before this is a release
-  claim.
+  host-issued, workspace-scoped credentials bound to one Agent, in-place
+  rotation, and rejection of cross-identity worker and message operations.
+  A deployment still needs retained issuance/rotation evidence plus an
+  independent multi-worker campaign before this is a release claim.
 - **Coordinator-only versus worker-only tools.** Keep the current
-  operator-equivalent bearer model until that binding exists; do not split
-  the control-plane credential set in this slice.
+  explicit credential set and scope; the primary bearer remains the
+  coordinator path while issued worker bearers are narrower.
 - **`WorkDecision` attribution on block / reprioritize / review.** Populate
   `actor_agent_id` and `policy_revision` once those APIs accept an optional
   acting Agent. They remain absent here because the request has no Agent

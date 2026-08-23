@@ -47,9 +47,12 @@ concurrent attempt per WorkItem in this first slice; a multi-node scheduler,
 database backend, and approval-decision operation remain follow-on work.
 Named bearers can be narrowed to one durable Agent identity with
 `AuthCredential::with_agent_binding`; the service rejects cross-agent worker,
-heartbeat, assignment, and message mutations for such a bearer. Credential
-issuance/rotation and an independent long-running multi-worker proof are still
-required for the Stage 6 release gate.
+heartbeat, assignment, and message mutations for such a bearer. The host can
+issue and install a canonical-workspace worker credential and rotate it in
+place without replacing the primary bearer; already-open streams revalidate a
+secret-free token fingerprint. Retained issuance/rotation evidence and an
+independent long-running multi-worker proof are still required for the Stage 6
+release gate.
 
 ## Service reconciliation
 
