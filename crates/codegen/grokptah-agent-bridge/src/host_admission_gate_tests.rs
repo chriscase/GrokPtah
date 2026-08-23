@@ -297,6 +297,10 @@ fn session_prompt_inner_must_admit_before_session_mutation() {
         host_src.contains("terminalize_unstarted_admission"),
         "post-admit failures must terminalize rather than delete the Run"
     );
+    assert!(
+        host_src.contains("require_durable_admission"),
+        "compensation must match DurableAdmission instead of collapsing Uncertain"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -884,6 +888,45 @@ async fn first_use_rejection_leaves_no_agent_or_session_binding() {
     assert!(host.session_inspect(lane_id).unwrap().agent_id.is_none());
     assert_session_unmutated(&host, lane_id, &before_title, &before_transcript, None);
     drain_turn_started(&mut events);
+    host.stop().unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn existing_agent_association_is_not_persisted_before_admission() {
+    let (base_url, requests, server) = spawn_xai_sse().await;
+    let mut home = IsolatedHome::enter();
+    home.remove("GROKPTAH_AGENT_OFFLINE");
+    home.set("XAI_API_BASE", &base_url);
+    home.set("XAI_API_KEY", "synthetic-p2-assoc-key");
+    save_measured_history(&base_url, "grok-route");
+    let (host, lane_id, _workspace) = xai_host("grok-route");
+    let store = host.ensure_orchestration_store().unwrap();
+    let agent_id = host
+        .session_inspect(lane_id)
+        .unwrap()
+        .agent_id
+        .expect("existing agent");
+    let mut agent = store.load_agent(&agent_id).unwrap().unwrap();
+    agent.lane_ids.clear();
+    agent.lane_associations.clear();
+    store.save_agent(&agent).unwrap();
+    let before = serde_json::to_value(store.load_agent(&agent_id).unwrap().unwrap()).unwrap();
+    assert!(before["laneIds"]
+        .as_array()
+        .is_some_and(|ids| ids.is_empty()));
+    host.set_desktop_admission_cutpoint(Some(DesktopAdmissionCutpoint::BeforePersist));
+    assert!(host
+        .session_prompt_with_max_rounds(lane_id, "must not dispatch".into(), Some(1))
+        .await
+        .is_err());
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    let after = serde_json::to_value(store.load_agent(&agent_id).unwrap().unwrap()).unwrap();
+    assert_eq!(
+        after, before,
+        "prepare_session_agent must not persist association backfill before admission"
+    );
     host.stop().unwrap();
     server.abort();
 }

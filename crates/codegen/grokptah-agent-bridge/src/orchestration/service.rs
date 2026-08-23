@@ -2098,27 +2098,25 @@ impl OrchestrationService {
         limit: Option<usize>,
     ) -> Result<serde_json::Value, OrchError> {
         let claimed = self.authorize_queue_request(session_id, workspace)?;
-        let runs = self
+        let claimed_workspace = claimed.display().to_string();
+        let page = self
             .store
-            .list_runs()
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .list_runs_for_session_page(session_id, Some(claimed_workspace.as_str()), cursor, limit)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let runs = page
+            .runs
             .into_iter()
-            .filter(|run| {
-                run.session_id == session_id && run.workspace == claimed.display().to_string()
-            })
             .map(|mut run| {
                 self.refresh_queue_position(&mut run);
                 super::project_public_run(&self.store, &run)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let page = super::page_public_runs(runs, cursor, limit);
-        let runs = page
-            .runs
+        let encoded = runs
             .iter()
             .map(super::public_run_to_value)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({
-            "runs": runs,
+            "runs": encoded,
             "totalCount": page.total_count,
             "truncated": page.truncated,
             "nextCursor": page.next_cursor,

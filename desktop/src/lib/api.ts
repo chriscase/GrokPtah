@@ -18,6 +18,7 @@ import type {
   SubagentInfo,
   DurableRun,
   DurableRunEventPage,
+  DurableRunPage,
   RunExecutionMode,
   RunReview,
   WorkspaceUiState,
@@ -647,8 +648,8 @@ export const api = {
     invoke<SessionCompletionRecord[]>("session_completion_history", {
       sessionId,
     }),
-  runList: (sessionId: string) =>
-    invoke<DurableRun[]>("run_list", { sessionId }),
+  runList: (sessionId: string, cursor?: string, limit?: number) =>
+    invoke<DurableRunPage>("run_list", { sessionId, cursor, limit }),
   runGet: (sessionId: string, runId: string) =>
     invoke<DurableRun | null>("run_get", { sessionId, runId }),
   runEvents: (sessionId: string, runId: string, afterSeq = 0, limit = 80) =>

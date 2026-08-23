@@ -60,6 +60,8 @@ struct OrchStoreInner {
     persist_cut: Mutex<Option<AdmissionPersistCut>>,
     #[cfg(test)]
     attempt_index_files_read: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    session_run_index_files_read: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -104,7 +106,8 @@ impl DurableAdmission {
     pub fn into_result(self) -> anyhow::Result<()> {
         match self {
             Self::Committed => Ok(()),
-            Self::DefinitelyNotCommitted(error) | Self::Uncertain(error) => Err(error),
+            Self::DefinitelyNotCommitted(error) => Err(error),
+            Self::Uncertain(error) => Err(UncertainAdmission(error).into()),
         }
     }
 
@@ -114,6 +117,18 @@ impl DurableAdmission {
         } else {
             Self::DefinitelyNotCommitted(error)
         }
+    }
+}
+
+/// Typed failure for [`DurableAdmission::Uncertain`]. Callers must not treat
+/// this as a zero-effect rejection: recovery may still commit the write.
+#[derive(Debug, thiserror::Error)]
+#[error("durable admission is uncertain: {0}")]
+pub struct UncertainAdmission(#[source] pub anyhow::Error);
+
+impl UncertainAdmission {
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
     }
 }
 
@@ -161,6 +176,23 @@ pub struct ProviderAttemptPage {
     pub attempts: Vec<ProviderAttemptRecord>,
     pub total_count: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionRunIndexEntry {
+    run_id: String,
+    session_id: Uuid,
+    workspace: String,
+    created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunRecordPage {
+    pub runs: Vec<RunRecord>,
+    pub total_count: usize,
+    pub truncated: bool,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -283,6 +315,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("quota-admission-intents"))?;
         fs::create_dir_all(root.join("provider-attempts"))?;
         fs::create_dir_all(root.join("provider-attempt-index"))?;
+        fs::create_dir_all(root.join("session-run-index"))?;
         fs::create_dir_all(root.join("admission-abort"))?;
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
@@ -348,6 +381,8 @@ impl OrchStore {
                 persist_cut: Mutex::new(None),
                 #[cfg(test)]
                 attempt_index_files_read: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                session_run_index_files_read: std::sync::atomic::AtomicUsize::new(0),
             }),
         };
         store.recover_quota_admission_intents()?;
@@ -360,6 +395,7 @@ impl OrchStore {
         store.recover_manager_creation_intents()?;
         store.reconcile_provider_attempt_ledger()?;
         store.mark_unfinished_interrupted()?;
+        store.rebuild_session_run_index()?;
         store.reconcile_quota_ledger()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
@@ -494,6 +530,18 @@ impl OrchStore {
         Ok(self
             .provider_attempt_index_dir(run_id)?
             .join(format!("{safe_attempt}.json")))
+    }
+
+    fn session_run_index_dir(&self, session_id: Uuid) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(&session_id.to_string())?;
+        Ok(self.inner.root.join("session-run-index").join(safe))
+    }
+
+    fn session_run_index_path(&self, session_id: Uuid, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe_run = safe_id_filename(run_id)?;
+        Ok(self
+            .session_run_index_dir(session_id)?
+            .join(format!("{safe_run}.json")))
     }
 
     fn admission_abort_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
@@ -720,6 +768,20 @@ impl OrchStore {
     }
 
     #[cfg(test)]
+    pub fn session_run_index_files_read(&self) -> usize {
+        self.inner
+            .session_run_index_files_read
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn reset_session_run_index_files_read(&self) {
+        self.inner
+            .session_run_index_files_read
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     pub fn set_persist_cut(&self, cut: Option<AdmissionPersistCut>) {
         *self.inner.persist_cut.lock() = cut;
     }
@@ -832,6 +894,220 @@ impl OrchStore {
         Ok(rebuilt)
     }
 
+    fn write_run_record_at_unlocked(&self, path: &Path, run: &RunRecord) -> anyhow::Result<()> {
+        atomic_write_json(path, run)?;
+        self.index_session_run_unlocked(run)
+    }
+
+    fn index_session_run_unlocked(&self, run: &RunRecord) -> anyhow::Result<()> {
+        let dir = self
+            .session_run_index_dir(run.session_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        fs::create_dir_all(&dir)?;
+        let path = self
+            .session_run_index_path(run.session_id, &run.run_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let entry = SessionRunIndexEntry {
+            run_id: run.run_id.clone(),
+            session_id: run.session_id,
+            workspace: run.workspace.clone(),
+            created_at: run.created_at,
+        };
+        atomic_write_json(&path, &entry)
+    }
+
+    fn remove_session_run_index_unlocked(&self, run: &RunRecord) -> anyhow::Result<()> {
+        let path = match self.session_run_index_path(run.session_id, &run.run_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(()),
+        };
+        if path.is_file() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn list_session_run_index_unlocked(
+        &self,
+        session_id: Uuid,
+    ) -> anyhow::Result<Vec<SessionRunIndexEntry>> {
+        let dir = match self.session_run_index_dir(session_id) {
+            Ok(dir) => dir,
+            Err(_) => return Ok(Vec::new()),
+        };
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            #[cfg(test)]
+            self.inner
+                .session_run_index_files_read
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let record: SessionRunIndexEntry = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            if record.session_id == session_id {
+                entries.push(record);
+            }
+        }
+        entries.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then(right.run_id.cmp(&left.run_id))
+        });
+        Ok(entries)
+    }
+
+    fn rebuild_session_run_index(&self) -> anyhow::Result<usize> {
+        let _guard = self.inner.lock.lock();
+        let mut rebuilt = 0;
+        let mut live = std::collections::HashSet::new();
+        for run in self.list_runs_unlocked()? {
+            live.insert((run.session_id, run.run_id.clone()));
+            self.index_session_run_unlocked(&run)?;
+            rebuilt += 1;
+        }
+        let index_root = self.inner.root.join("session-run-index");
+        if index_root.is_dir() {
+            for session_dir in fs::read_dir(&index_root)? {
+                let session_dir = session_dir?.path();
+                if !session_dir.is_dir() {
+                    continue;
+                }
+                for entry in fs::read_dir(&session_dir)? {
+                    let path = entry?.path();
+                    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Ok(text) = fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let Ok(record) = serde_json::from_str::<SessionRunIndexEntry>(&text) else {
+                        continue;
+                    };
+                    if !live.contains(&(record.session_id, record.run_id)) {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+        }
+        Ok(rebuilt)
+    }
+
+    /// Session-scoped Run query: total matching count plus one bounded page.
+    /// Does not scan Runs owned by another session.
+    pub fn list_runs_for_session_page(
+        &self,
+        session_id: Uuid,
+        workspace: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<RunRecordPage> {
+        let _guard = self.inner.lock.lock();
+        self.list_runs_for_session_page_unlocked(session_id, workspace, cursor, limit)
+    }
+
+    /// Every Run for one session (and optional workspace), from the session index.
+    pub fn list_runs_for_session(
+        &self,
+        session_id: Uuid,
+        workspace: Option<&str>,
+    ) -> anyhow::Result<Vec<RunRecord>> {
+        let _guard = self.inner.lock.lock();
+        let mut entries = self.list_session_run_index_unlocked(session_id)?;
+        if let Some(workspace) = workspace {
+            entries.retain(|entry| workspaces_match(&entry.workspace, workspace));
+        }
+        let mut runs = Vec::new();
+        for entry in entries {
+            #[cfg(test)]
+            self.inner
+                .session_run_index_files_read
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(run) = self.load_run_unlocked(&entry.run_id)? {
+                if run.session_id == session_id
+                    && workspace.is_none_or(|workspace| workspaces_match(&run.workspace, workspace))
+                {
+                    runs.push(run);
+                }
+            }
+        }
+        Ok(runs)
+    }
+
+    fn list_runs_for_session_page_unlocked(
+        &self,
+        session_id: Uuid,
+        workspace: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<RunRecordPage> {
+        let mut entries = self.list_session_run_index_unlocked(session_id)?;
+        if let Some(workspace) = workspace {
+            entries.retain(|entry| workspaces_match(&entry.workspace, workspace));
+        }
+        let total_count = entries.len();
+        if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+            if let Some(index) = entries.iter().position(|entry| entry.run_id == cursor) {
+                entries = entries.split_off(index.saturating_add(1));
+            } else {
+                entries.clear();
+            }
+        }
+        let limit = limit
+            .unwrap_or(MAX_PUBLIC_RUN_LIST)
+            .clamp(1, MAX_PUBLIC_RUN_LIST);
+        let truncated = entries.len() > limit;
+        let mut runs = Vec::new();
+        for entry in entries.into_iter().take(limit) {
+            #[cfg(test)]
+            self.inner
+                .session_run_index_files_read
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(run) = self.load_run_unlocked(&entry.run_id)? {
+                if run.session_id == session_id
+                    && workspace.is_none_or(|workspace| workspaces_match(&run.workspace, workspace))
+                {
+                    runs.push(run);
+                }
+            }
+        }
+        let next_cursor = truncated
+            .then(|| runs.last().map(|run| run.run_id.clone()))
+            .flatten();
+        Ok(RunRecordPage {
+            runs,
+            total_count,
+            truncated,
+            next_cursor,
+        })
+    }
+
+    fn list_runs_unlocked(&self) -> anyhow::Result<Vec<RunRecord>> {
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("runs");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for e in fs::read_dir(dir)? {
+            let e = e?;
+            if e.path().extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(e.path()) {
+                if let Ok(r) = serde_json::from_str::<RunRecord>(&text) {
+                    out.push(r);
+                }
+            }
+        }
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
+    }
+
     fn save_provider_attempt_unlocked(
         &self,
         attempt: &ProviderAttemptRecord,
@@ -921,7 +1197,7 @@ impl OrchStore {
         let run_path = self
             .run_path(run_id)
             .map_err(|error| anyhow::anyhow!(error))?;
-        if let Err(error) = atomic_write_json(&run_path, &run) {
+        if let Err(error) = self.write_run_record_at_unlocked(&run_path, &run) {
             let mut not_sent = attempt.clone();
             not_sent
                 .finish(ProviderSendCertainty::KnownNotSent, None, None, Utc::now())
@@ -1038,7 +1314,7 @@ impl OrchStore {
             let path = self
                 .run_path(&run.run_id)
                 .map_err(|error| anyhow::anyhow!(error))?;
-            atomic_write_json(&path, &run)?;
+            self.write_run_record_at_unlocked(&path, &run)?;
         }
         // Keep settlement retryable even if an earlier call durably applied
         // the attempt to the Run and then failed before writing the quota row.
@@ -1236,7 +1512,7 @@ impl OrchStore {
         {
             return outcome;
         }
-        if let Err(error) = atomic_write_json(&run_path, run) {
+        if let Err(error) = self.write_run_record_at_unlocked(&run_path, run) {
             let reservation_removed = remove_file_durable(&reservation_path).is_ok();
             let intent_removed = remove_file_durable(&intent_path).is_ok();
             return DurableAdmission::from_partial_write(
@@ -1323,7 +1599,7 @@ impl OrchStore {
         let result = self
             .run_path(&run.run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))
-            .and_then(|path| atomic_write_json(&path, run));
+            .and_then(|path| self.write_run_record_at_unlocked(&path, run));
         if result.is_ok() {
             if let Err(error) = self.sync_quota_for_run_unlocked(run) {
                 *self.inner.last_run_error.lock() = Some(error.to_string());
@@ -1490,7 +1766,7 @@ impl OrchStore {
             let run_path = self
                 .run_path(run_id)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            atomic_write_json(&run_path, &run)?;
+            self.write_run_record_at_unlocked(&run_path, &run)?;
         }
         if self.hit_result_persist_cut(AdmissionPersistCut::AfterAbortRun) {
             anyhow::bail!(
@@ -1687,7 +1963,7 @@ impl OrchStore {
                 "injected persist cut AfterQuota; durable recovery intent requires restart"
             );
         }
-        if let Err(error) = atomic_write_json(&run_path, run) {
+        if let Err(error) = self.write_run_record_at_unlocked(&run_path, run) {
             let run_rollback = match fs::symlink_metadata(&run_path) {
                 Ok(_) => remove_file_durable(&run_path),
                 Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
@@ -1853,7 +2129,7 @@ impl OrchStore {
             quota_reservation: None,
         };
         atomic_write_json(&intent_path, &intent)?;
-        if let Err(error) = atomic_write_json(&run_path, &run) {
+        if let Err(error) = self.write_run_record_at_unlocked(&run_path, &run) {
             if remove_file_durable(&intent_path).is_err() {
                 return Err(
                     error.context("promote queued Run; durable recovery intent requires restart")
@@ -1862,7 +2138,9 @@ impl OrchStore {
             return Err(error.context("promote queued Run"));
         }
         if let Err(error) = atomic_write_json(&agent_path, &agent) {
-            if atomic_write_json(&run_path, &prior_run).is_err()
+            if self
+                .write_run_record_at_unlocked(&run_path, &prior_run)
+                .is_err()
                 || remove_file_durable(&intent_path).is_err()
             {
                 return Err(error
@@ -1945,7 +2223,7 @@ impl OrchStore {
         let path = self
             .run_path(run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        if let Err(error) = atomic_write_json(&path, &run) {
+        if let Err(error) = self.write_run_record_at_unlocked(&path, &run) {
             *self.inner.last_run_error.lock() = Some(error.to_string());
             return Err(error);
         }
@@ -1958,24 +2236,7 @@ impl OrchStore {
     }
 
     pub fn list_runs(&self) -> anyhow::Result<Vec<RunRecord>> {
-        let mut out = Vec::new();
-        let dir = self.inner.root.join("runs");
-        if !dir.is_dir() {
-            return Ok(out);
-        }
-        for e in fs::read_dir(dir)? {
-            let e = e?;
-            if e.path().extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(text) = fs::read_to_string(e.path()) {
-                if let Ok(r) = serde_json::from_str::<RunRecord>(&text) {
-                    out.push(r);
-                }
-            }
-        }
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        Ok(out)
+        self.list_runs_unlocked()
     }
 
     // --- Durable workloads -------------------------------------------------
@@ -6087,6 +6348,7 @@ impl OrchStore {
             match fs::remove_file(path) {
                 Ok(()) => {
                     report.run_files_removed += 1;
+                    let _ = self.remove_session_run_index_unlocked(run);
                     for attempt in provider_attempts
                         .iter()
                         .filter(|attempt| attempt.run_id == run.run_id)
@@ -6253,7 +6515,7 @@ impl OrchStore {
             if let Some(corrupt) = &corrupt_target {
                 fs::rename(&run_path, corrupt)?;
             }
-            atomic_write_json(&run_path, &final_run)?;
+            self.write_run_record_at_unlocked(&run_path, &final_run)?;
             fs::remove_file(&intent_path)?;
             Ok(())
         })();
@@ -6559,7 +6821,7 @@ impl OrchStore {
                 self.ensure_quota_capacity_unlocked(&intent.reservation)?;
             }
             atomic_write_json(&reservation_path, &intent.reservation)?;
-            atomic_write_json(&run_path, &intent.run)?;
+            self.write_run_record_at_unlocked(&run_path, &intent.run)?;
             remove_file_durable(&path)?;
             recovered += 1;
         }
@@ -6606,7 +6868,7 @@ impl OrchStore {
                 let path = self
                     .run_path(&run.run_id)
                     .map_err(|error| anyhow::anyhow!(error))?;
-                atomic_write_json(&path, &run)?;
+                self.write_run_record_at_unlocked(&path, &run)?;
                 self.sync_quota_for_run_unlocked(&run)?;
                 reconciled += 1;
             }
@@ -6769,7 +7031,7 @@ impl OrchStore {
                     "Agent activation recovery conflicts with another active Run"
                 );
             }
-            atomic_write_json(&run_path, &intent.run)?;
+            self.write_run_record_at_unlocked(&run_path, &intent.run)?;
             self.save_agent_spec_unlocked(
                 &intent.activated_agent.agent_id,
                 intent.activated_agent.current_spec()?,
@@ -9160,5 +9422,172 @@ mod tests {
         let _ = store.list_provider_attempts_for_run(&own.run_id).unwrap();
         let second_read = store.attempt_index_files_read();
         assert_eq!(second_read, files_read);
+    }
+
+    #[test]
+    fn save_run_with_quota_uncertain_is_typed_and_not_zero_effect() {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (run, reservation) = quota_backed_run(
+            "uncertain-result",
+            RunState::Running,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        let store = OrchStore::open(root.path()).unwrap();
+        store.set_persist_cut(Some(AdmissionPersistCut::AfterQuota));
+        let error = store.save_run_with_quota(&run, &reservation).unwrap_err();
+        assert!(
+            UncertainAdmission::is(&error),
+            "Uncertain must not collapse to an ordinary zero-effect error: {error}"
+        );
+        assert!(store
+            .load_quota_reservation(&reservation.reservation_id)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .quota_admission_intent_path(&run.run_id)
+            .unwrap()
+            .is_file());
+    }
+
+    #[test]
+    fn session_run_index_pages_without_scanning_foreign_sessions() {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let limits = super::super::quota::QuotaLimits {
+            max_in_flight_reservations: 1024,
+            ..super::super::quota::QuotaLimits::default()
+        };
+        let own_session = Uuid::from_u128(0x1111);
+        let foreign_session = Uuid::from_u128(0x2222);
+        let store = OrchStore::open(root.path()).unwrap();
+        for index in 0..200 {
+            let created = now + Duration::milliseconds(index as i64);
+            let (mut run, _) = quota_backed_run(
+                &format!("own-run-{index:03}"),
+                RunState::Completed,
+                created,
+                limits,
+            );
+            run.session_id = own_session;
+            run.workspace = "/tmp/own-session".into();
+            run.created_at = created;
+            run.updated_at = created;
+            let reservation =
+                super::super::quota::QuotaReservation::for_run(&run, "owner-1", limits, created)
+                    .unwrap();
+            store.save_run_with_quota(&run, &reservation).unwrap();
+        }
+        for index in 0..400 {
+            let created = now + Duration::milliseconds(index as i64);
+            let (mut run, _) = quota_backed_run(
+                &format!("foreign-run-{index:03}"),
+                RunState::Completed,
+                created,
+                limits,
+            );
+            run.session_id = foreign_session;
+            run.workspace = "/tmp/foreign-session".into();
+            run.created_at = created;
+            run.updated_at = created;
+            let reservation =
+                super::super::quota::QuotaReservation::for_run(&run, "owner-1", limits, created)
+                    .unwrap();
+            store.save_run_with_quota(&run, &reservation).unwrap();
+        }
+        store.reset_session_run_index_files_read();
+        let page = store
+            .list_runs_for_session_page(own_session, Some("/tmp/own-session"), None, None)
+            .unwrap();
+        let files_read = store.session_run_index_files_read();
+        assert_eq!(page.total_count, 200);
+        assert!(page.truncated);
+        assert_eq!(page.runs.len(), MAX_PUBLIC_RUN_LIST);
+        assert_eq!(page.runs[0].run_id, "own-run-199");
+        assert_eq!(
+            page.runs.last().map(|run| run.run_id.as_str()),
+            Some("own-run-072")
+        );
+        assert_eq!(page.next_cursor.as_deref(), Some("own-run-072"));
+        assert!(
+            files_read <= 200 + MAX_PUBLIC_RUN_LIST,
+            "session index must not scan foreign Runs; files_read={files_read}"
+        );
+        store.reset_session_run_index_files_read();
+        let _ = store
+            .list_runs_for_session_page(own_session, Some("/tmp/own-session"), None, None)
+            .unwrap();
+        assert_eq!(store.session_run_index_files_read(), files_read);
+    }
+
+    #[test]
+    fn persist_cut_subprocess_kill_then_two_reopens() {
+        const ROOT: &str = "GROKPTAH_ADMISSION_KILL_ROOT";
+        const MODE: &str = "GROKPTAH_ADMISSION_KILL_MODE";
+        if let Ok(root) = std::env::var(ROOT) {
+            let store = OrchStore::open(&root).unwrap();
+            let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+            let (mut run, reservation) = quota_backed_run(
+                "kill-run",
+                RunState::Running,
+                now,
+                super::super::quota::QuotaLimits::default(),
+            );
+            match std::env::var(MODE).unwrap().as_str() {
+                "after-quota" => {
+                    store.set_persist_cut(Some(AdmissionPersistCut::AfterQuota));
+                    let _ = store.admit_run_with_quota(&run, &reservation);
+                }
+                "after-abort-journal" => {
+                    let agent = waiting_agent(run.session_id, "agent-kill");
+                    run.agent_id = Some(agent.agent_id.clone());
+                    run.agent_spec_revision = Some(agent.current_spec().unwrap().revision);
+                    store.save_agent(&agent).unwrap();
+                    store
+                        .save_run_and_activate_agent_with_quota(&run, &agent.agent_id, &reservation)
+                        .unwrap();
+                    store.set_persist_cut(Some(AdmissionPersistCut::AfterAbortJournal));
+                    let _ = store.terminalize_unstarted_admission(
+                        &run.run_id,
+                        "admission_aborted",
+                        "subprocess kill after abort journal",
+                    );
+                }
+                other => panic!("unknown kill mode {other}"),
+            }
+            #[cfg(unix)]
+            unsafe {
+                libc::raise(libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            std::process::abort();
+        }
+
+        for mode in ["after-quota", "after-abort-journal"] {
+            let root = tempdir().unwrap();
+            let exe = std::env::current_exe().unwrap();
+            let status = std::process::Command::new(&exe)
+                .arg("--exact")
+                .arg("orchestration::store::tests::persist_cut_subprocess_kill_then_two_reopens")
+                .env(ROOT, root.path())
+                .env(MODE, mode)
+                .env("RUST_TEST_THREADS", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(
+                !status.success(),
+                "{mode} helper must die before Drop cleanup"
+            );
+            assert_two_reopens_agree(root.path(), "kill-run", "quota-kill-run");
+            if mode == "after-abort-journal" {
+                let reopened = OrchStore::open(root.path()).unwrap();
+                let recovered = reopened.load_run("kill-run").unwrap().unwrap();
+                assert!(recovered.state.is_terminal());
+                assert_eq!(recovered.error_code.as_deref(), Some("admission_aborted"));
+            }
+        }
     }
 }

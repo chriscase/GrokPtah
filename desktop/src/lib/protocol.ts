@@ -612,6 +612,13 @@ export interface DurableRun {
   providerExecution?: ProviderExecutionProjection | null;
 }
 
+export interface DurableRunPage {
+  runs: DurableRun[];
+  totalCount: number;
+  truncated: boolean;
+  nextCursor?: string | null;
+}
+
 export type SessionUpdate =
   | { type: "agent_message_chunk"; session_id: string; text: string }
   | { type: "agent_thought_chunk"; session_id: string; text: string }

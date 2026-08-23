@@ -1703,11 +1703,11 @@ mod tests {
     #[test]
     fn tauri_run_surfaces_must_return_public_runs() {
         let commands = include_str!("commands.rs");
-        assert!(commands.contains("list_public_session_runs"));
+        assert!(commands.contains("list_public_session_runs_page"));
         assert!(commands.contains("get_public_session_run"));
         assert!(commands.contains("promote_public_session_run"));
         assert!(commands.contains("discard_public_session_run"));
-        assert!(commands.contains("Result<Vec<PublicRun>"));
+        assert!(commands.contains("Result<PublicRunPage"));
         assert!(commands.contains("Result<Option<PublicRun>"));
         assert!(!commands.contains("host.get_session_run("));
         assert!(!commands.contains("host.promote_run("));
