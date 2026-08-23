@@ -14,7 +14,9 @@ The shared bridge contract is
 `crates/codegen/grokptah-agent-bridge/src/enterprise_review.rs`.
 `EnterpriseReviewLease` is the only object the future gateway broker should
 hand to the review runtime. It contains opaque identifiers and fingerprints,
-never a bearer, URL, API key, or provider response.
+never a bearer, URL, API key, or provider response. Its gateway attestation is
+detached-signed with an operator-selected Ed25519 key; the runtime verifies it
+against a separate public trust record before treating the route as admitted.
 
 ## Admission contract
 
@@ -76,13 +78,16 @@ The fake benchmark remains a contract test only and must continue to report
 
 The certification lab can now consume the broker handoff without receiving a
 bearer or endpoint. Set `GROKPTAH_ENTERPRISE_REVIEW_LEASE` to a disposable,
-regular JSON file containing one `EnterpriseReviewLease` and run the live
-preflight. The loader rejects missing, stale, malformed, symlinked, oversized,
-or broadened leases before any provider call. The resulting evidence is the
+regular JSON file containing one `EnterpriseReviewLease`, and
+`GROKPTAH_ENTERPRISE_REVIEW_TRUST` to a separate regular JSON file containing
+the operator-selected `EnterpriseGatewayTrust` public key. The loader rejects
+missing, stale, malformed, symlinked, oversized, unsigned, incorrectly signed,
+or broadened material before any provider call. The resulting evidence is the
 existing secret-free `EnterpriseReviewEvidence` projection.
 
 ```sh
 export GROKPTAH_ENTERPRISE_REVIEW_LEASE=/run/user/1000/grokptah/review-lease.json
+export GROKPTAH_ENTERPRISE_REVIEW_TRUST=/run/user/1000/grokptah/review-trust.json
 cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
   review --repository "$PWD" --live --preflight
 ```

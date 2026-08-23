@@ -202,10 +202,12 @@ unrelated signal.
   provider must bind `127.0.0.1`.
 - The certification lab now accepts a bounded
   `GROKPTAH_ENTERPRISE_REVIEW_LEASE` file and re-admits the existing
-  secret-free enterprise review contract. Missing, stale, malformed,
-  symlinked, oversized, or broadened leases fail closed; a valid lease still
-  produces only an indeterminate live report until real provider usage,
-  restart, and paired-quality evidence are captured.
+  secret-free enterprise review contract. It now also requires a separate
+  operator-selected `GROKPTAH_ENTERPRISE_REVIEW_TRUST` file and verifies the
+  lease's detached Ed25519 gateway signature. Missing, stale, malformed,
+  symlinked, oversized, unsigned, incorrectly signed, or broadened material
+  fails closed; a valid lease still produces only an indeterminate live report
+  until real provider usage, restart, and paired-quality evidence are captured.
 - A typed, digest-bound `MemoryLongHorizonEvidence` contract now exists for
   the deterministic logical-years campaign. It requires the three memory
   scopes, ten logical years, exact quality oracles, storage/reopen bounds, and

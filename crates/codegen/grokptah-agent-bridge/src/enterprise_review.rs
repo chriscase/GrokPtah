@@ -8,12 +8,14 @@
 //! the product-side boundary that refuses to run without both.
 
 use chrono::{DateTime, Utc};
+use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const ENTERPRISE_REVIEW_LEASE_SCHEMA: &str = "grokptah.enterprise-review-lease.v1";
 pub const ENTERPRISE_REVIEW_ATTESTATION_SCHEMA: &str = "grokptah.enterprise-gateway-attestation.v1";
 pub const ENTERPRISE_REVIEW_EVIDENCE_SCHEMA: &str = "grokptah.enterprise-review-evidence.v1";
+pub const ENTERPRISE_REVIEW_TRUST_SCHEMA: &str = "grokptah.enterprise-review-trust.v1";
 pub const MAX_ENTERPRISE_REVIEW_REQUESTS: u32 = 400;
 pub const MAX_ENTERPRISE_REVIEW_TOKENS: u64 = 1_250_000;
 pub const MAX_ENTERPRISE_REVIEW_DURATION_MS: u64 = 8 * 60 * 60 * 1000;
@@ -37,6 +39,26 @@ pub struct EnterpriseGatewayAttestation {
     pub expires_at: DateTime<Utc>,
     pub no_premium_fallback: bool,
     pub egress_firewall_attested: bool,
+    /// Optional detached signature over the canonical attestation payload.
+    /// The legacy admission helper accepts unsigned metadata for deterministic
+    /// contract tests; production callers must use
+    /// [`admit_enterprise_review_with_trust`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// Public-key trust material supplied by the operator-owned broker. It is
+/// deliberately separate from the lease so a route cannot choose its own
+/// verification key. The key is public and may safely be persisted in a
+/// configuration file; bearer material never crosses this boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnterpriseGatewayTrust {
+    pub schema: String,
+    pub key_id: String,
+    pub public_key_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +179,9 @@ pub enum EnterpriseReviewAdmissionError {
     PublicationNotAllowed,
     BoundExceeded(&'static str),
     RouteBindingMismatch,
+    AttestationSignatureMissing,
+    AttestationSignatureInvalid,
+    AttestationTrustInvalid,
 }
 
 impl std::fmt::Display for EnterpriseReviewAdmissionError {
@@ -177,6 +202,18 @@ impl std::fmt::Display for EnterpriseReviewAdmissionError {
             Self::PublicationNotAllowed => write!(f, "publication is not allowed for review"),
             Self::BoundExceeded(name) => write!(f, "enterprise review bound exceeded: {name}"),
             Self::RouteBindingMismatch => write!(f, "enterprise route binding digest mismatch"),
+            Self::AttestationSignatureMissing => {
+                write!(f, "enterprise gateway attestation signature is missing")
+            }
+            Self::AttestationSignatureInvalid => {
+                write!(f, "enterprise gateway attestation signature is invalid")
+            }
+            Self::AttestationTrustInvalid => {
+                write!(
+                    f,
+                    "enterprise gateway attestation trust material is invalid"
+                )
+            }
         }
     }
 }
@@ -301,6 +338,95 @@ pub fn admit_enterprise_review(
     })
 }
 
+/// Admit an enterprise review only when the broker's gateway attestation is
+/// cryptographically bound to an operator-selected public key. This is the
+/// production-facing variant; the unsigned helper above remains available for
+/// hermetic schema tests and intentionally cannot establish live trust.
+pub fn admit_enterprise_review_with_trust(
+    lease: &EnterpriseReviewLease,
+    policy: &EnterpriseReviewPolicy,
+    now: DateTime<Utc>,
+    trust: &EnterpriseGatewayTrust,
+) -> Result<EnterpriseReviewEvidence, EnterpriseReviewAdmissionError> {
+    let evidence = admit_enterprise_review(lease, policy, now)?;
+    verify_enterprise_gateway_attestation(&lease.attestation, trust)?;
+    Ok(evidence)
+}
+
+/// Verify a detached Ed25519 signature over the canonical, secret-free
+/// attestation payload. The payload excludes the signature fields themselves
+/// and includes every routing, model, policy, validity, and egress claim.
+pub fn verify_enterprise_gateway_attestation(
+    attestation: &EnterpriseGatewayAttestation,
+    trust: &EnterpriseGatewayTrust,
+) -> Result<(), EnterpriseReviewAdmissionError> {
+    if trust.schema != ENTERPRISE_REVIEW_TRUST_SCHEMA
+        || !valid_opaque_id(&trust.key_id)
+        || trust.public_key_hex.len() != 64
+        || !trust
+            .public_key_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(EnterpriseReviewAdmissionError::AttestationTrustInvalid);
+    }
+    let signing_key_id = attestation
+        .signing_key_id
+        .as_deref()
+        .ok_or(EnterpriseReviewAdmissionError::AttestationSignatureMissing)?;
+    let signature = attestation
+        .signature
+        .as_deref()
+        .ok_or(EnterpriseReviewAdmissionError::AttestationSignatureMissing)?;
+    if signing_key_id != trust.key_id
+        || signature.len() != 128
+        || !signature.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(EnterpriseReviewAdmissionError::AttestationSignatureInvalid);
+    }
+    let public_key = decode_hex(&trust.public_key_hex)
+        .ok_or(EnterpriseReviewAdmissionError::AttestationTrustInvalid)?;
+    let signature =
+        decode_hex(signature).ok_or(EnterpriseReviewAdmissionError::AttestationSignatureInvalid)?;
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(&attestation_signing_bytes(attestation), &signature)
+        .map_err(|_| EnterpriseReviewAdmissionError::AttestationSignatureInvalid)
+}
+
+/// Canonical bytes signed by the gateway broker. This is public so a broker
+/// implementation can produce the exact payload without copying credentials
+/// or endpoint URLs into the lease.
+pub fn attestation_signing_bytes(attestation: &EnterpriseGatewayAttestation) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        schema: &'a str,
+        route_id: &'a str,
+        endpoint_fingerprint: &'a str,
+        model_id: &'a str,
+        model_tier: EnterpriseModelTier,
+        deployment_revision: &'a str,
+        issued_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        no_premium_fallback: bool,
+        egress_firewall_attested: bool,
+        signing_key_id: &'a Option<String>,
+    }
+    serde_json::to_vec(&Payload {
+        schema: &attestation.schema,
+        route_id: &attestation.route_id,
+        endpoint_fingerprint: &attestation.endpoint_fingerprint,
+        model_id: &attestation.model_id,
+        model_tier: attestation.model_tier,
+        deployment_revision: &attestation.deployment_revision,
+        issued_at: attestation.issued_at,
+        expires_at: attestation.expires_at,
+        no_premium_fallback: attestation.no_premium_fallback,
+        egress_firewall_attested: attestation.egress_firewall_attested,
+        signing_key_id: &attestation.signing_key_id,
+    })
+    .expect("attestation signing payload serialization is infallible")
+}
+
 pub fn expected_route_binding_digest(lease: &EnterpriseReviewLease) -> String {
     let mut hasher = Sha256::new();
     hasher.update(lease.route_id.as_bytes());
@@ -323,6 +449,21 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
         .as_ref()
         .iter()
         .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)? as u8;
+            let low = (pair[1] as char).to_digit(16)? as u8;
+            Some((high << 4) | low)
+        })
         .collect()
 }
 
@@ -372,6 +513,8 @@ mod tests {
                 expires_at: now + chrono::Duration::hours(1),
                 no_premium_fallback: true,
                 egress_firewall_attested: true,
+                signing_key_id: None,
+                signature: None,
             },
         };
         lease.route_binding_digest = expected_route_binding_digest(&lease);
@@ -389,6 +532,86 @@ mod tests {
         let encoded = serde_json::to_string(&evidence).unwrap();
         assert!(!encoded.contains("credential-opaque"));
         assert!(!encoded.contains("https://"));
+    }
+
+    fn trusted_signed_lease(now: DateTime<Utc>) -> (EnterpriseReviewLease, EnterpriseGatewayTrust) {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).unwrap();
+        let trust = EnterpriseGatewayTrust {
+            schema: ENTERPRISE_REVIEW_TRUST_SCHEMA.into(),
+            key_id: "broker-key-1".into(),
+            public_key_hex: hex_digest(key_pair.public_key().as_ref()),
+        };
+        let mut lease = lease(now);
+        lease.attestation.signing_key_id = Some(trust.key_id.clone());
+        lease.attestation.signature = Some(hex_digest(
+            key_pair
+                .sign(&attestation_signing_bytes(&lease.attestation))
+                .as_ref(),
+        ));
+        (lease, trust)
+    }
+
+    #[test]
+    fn trusted_admission_requires_and_verifies_gateway_signature() {
+        let now = Utc::now();
+        let (lease, trust) = trusted_signed_lease(now);
+        admit_enterprise_review_with_trust(&lease, &EnterpriseReviewPolicy::default(), now, &trust)
+            .unwrap();
+
+        let mut missing = lease.clone();
+        missing.attestation.signature = None;
+        assert_eq!(
+            admit_enterprise_review_with_trust(
+                &missing,
+                &EnterpriseReviewPolicy::default(),
+                now,
+                &trust,
+            ),
+            Err(EnterpriseReviewAdmissionError::AttestationSignatureMissing)
+        );
+
+        let mut tampered = lease;
+        tampered.attestation.model_id = "different-model".into();
+        assert_eq!(
+            admit_enterprise_review_with_trust(
+                &tampered,
+                &EnterpriseReviewPolicy::default(),
+                now,
+                &trust,
+            ),
+            Err(EnterpriseReviewAdmissionError::AttestationMismatch(
+                "model_id"
+            ))
+        );
+    }
+
+    #[test]
+    fn trust_material_and_key_id_drift_fail_closed() {
+        let now = Utc::now();
+        let (lease, mut trust) = trusted_signed_lease(now);
+        trust.key_id = "other-key".into();
+        assert_eq!(
+            admit_enterprise_review_with_trust(
+                &lease,
+                &EnterpriseReviewPolicy::default(),
+                now,
+                &trust,
+            ),
+            Err(EnterpriseReviewAdmissionError::AttestationSignatureInvalid)
+        );
+        trust.key_id = "broker-key-1".into();
+        trust.public_key_hex = "0".repeat(64);
+        assert_eq!(
+            admit_enterprise_review_with_trust(
+                &lease,
+                &EnterpriseReviewPolicy::default(),
+                now,
+                &trust,
+            ),
+            Err(EnterpriseReviewAdmissionError::AttestationSignatureInvalid)
+        );
     }
 
     #[test]

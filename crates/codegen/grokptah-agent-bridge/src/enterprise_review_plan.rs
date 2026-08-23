@@ -753,6 +753,8 @@ mod tests {
                 expires_at: now + Duration::hours(2),
                 no_premium_fallback: true,
                 egress_firewall_attested: true,
+                signing_key_id: None,
+                signature: None,
             },
         };
         lease.route_binding_digest =

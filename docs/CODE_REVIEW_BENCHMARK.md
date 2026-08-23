@@ -120,7 +120,9 @@ service/provider production changes that are out of allowlist:
 1. A service-issued disposable enterprise-gateway lease for an operator-owned
    approved live compatible gateway.
 2. A gateway-signed deployment attestation proving approved/modest tier,
-   backend revision, validity, and no premium fallback.
+   backend revision, validity, and no premium fallback. The candidate now
+   verifies this detached Ed25519 signature against an operator-selected
+   public trust record before admission.
 3. An external egress-firewall attestation allowing only that opaque approved
    endpoint.
 4. Production support for a modest OpenAI-compatible enterprise route that

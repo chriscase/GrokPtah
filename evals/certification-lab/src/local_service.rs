@@ -14,18 +14,20 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use grokptah_agent_bridge::provider_observation::ProviderObservationSession;
 use grokptah_agent_bridge::{
-    admit_enterprise_review, home_override_serial, start_control_server_with, AgentHost,
+    admit_enterprise_review_with_trust, home_override_serial, start_control_server_with, AgentHost,
     AgentHostHandle, AuthCredential, ControlServerHandle, ControlServerLimits,
-    EnterpriseReviewEvidence, EnterpriseReviewLease, EnterpriseReviewPolicy, HostConfig,
-    McpControlClient, OrchestrationConfig, OrchestrationService, RunBounds, RuntimeHome,
-    WorkspaceAllowlist, FORBIDDEN_TOOLS,
+    EnterpriseGatewayTrust, EnterpriseReviewEvidence, EnterpriseReviewLease,
+    EnterpriseReviewPolicy, HostConfig, McpControlClient, OrchestrationConfig,
+    OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist, FORBIDDEN_TOOLS,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const OFFLINE_ENV: &str = "GROKPTAH_AGENT_OFFLINE";
 const ENTERPRISE_REVIEW_LEASE_ENV: &str = "GROKPTAH_ENTERPRISE_REVIEW_LEASE";
+const ENTERPRISE_REVIEW_TRUST_ENV: &str = "GROKPTAH_ENTERPRISE_REVIEW_TRUST";
 const MAX_ENTERPRISE_REVIEW_LEASE_BYTES: u64 = 64 * 1024;
+const MAX_ENTERPRISE_REVIEW_TRUST_BYTES: u64 = 8 * 1024;
 pub const DEFAULT_LIVE_MODEL: &str = "grok-build";
 
 /// Whether locally hosted model turns use the deterministic offline runtime or
@@ -331,7 +333,8 @@ pub struct EnterpriseReviewLiveGap {
 
 /// Load and re-admit the operator-owned enterprise review lease.
 ///
-/// The broker hands the lab a path to a short-lived, secret-free JSON lease;
+/// The broker hands the lab paths to a short-lived, secret-free JSON lease and
+/// an operator-selected public-key trust record;
 /// bearer tokens, endpoint URLs, and provider responses never cross this
 /// boundary. The file must be a regular file under the caller's control and
 /// is bounded before parsing. A valid lease still only proves admission: the
@@ -344,8 +347,15 @@ pub fn enterprise_review_live_evidence() -> Result<EnterpriseReviewEvidence, Ent
         gateway_signed_deployment_attestation: false,
         egress_firewall_attestation: false,
     })?;
+    let trust_path =
+        std::env::var_os(ENTERPRISE_REVIEW_TRUST_ENV).ok_or(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        })?;
     let path = PathBuf::from(path);
-    if !path.is_absolute() {
+    let trust_path = PathBuf::from(trust_path);
+    if !path.is_absolute() || !trust_path.is_absolute() {
         return Err(EnterpriseReviewLiveGap {
             disposable_lease: false,
             gateway_signed_deployment_attestation: false,
@@ -376,18 +386,56 @@ pub fn enterprise_review_live_evidence() -> Result<EnterpriseReviewEvidence, Ent
             egress_firewall_attestation: false,
         });
     }
+    let trust_metadata =
+        std::fs::symlink_metadata(&trust_path).map_err(|_| EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        })?;
+    if !trust_metadata.file_type().is_file()
+        || trust_metadata.len() > MAX_ENTERPRISE_REVIEW_TRUST_BYTES
+    {
+        return Err(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        });
+    }
+    let trust_bytes = std::fs::read(&trust_path).map_err(|_| EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
+    if trust_bytes.len() as u64 > MAX_ENTERPRISE_REVIEW_TRUST_BYTES {
+        return Err(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        });
+    }
     let lease: EnterpriseReviewLease =
         serde_json::from_slice(&bytes).map_err(|_| EnterpriseReviewLiveGap {
             disposable_lease: false,
             gateway_signed_deployment_attestation: false,
             egress_firewall_attestation: false,
         })?;
-    let evidence = admit_enterprise_review(&lease, &EnterpriseReviewPolicy::default(), Utc::now())
-        .map_err(|_| EnterpriseReviewLiveGap {
+    let trust: EnterpriseGatewayTrust =
+        serde_json::from_slice(&trust_bytes).map_err(|_| EnterpriseReviewLiveGap {
             disposable_lease: false,
             gateway_signed_deployment_attestation: false,
             egress_firewall_attestation: false,
         })?;
+    let evidence = admit_enterprise_review_with_trust(
+        &lease,
+        &EnterpriseReviewPolicy::default(),
+        Utc::now(),
+        &trust,
+    )
+    .map_err(|_| EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
     evidence.validate().map_err(|_| EnterpriseReviewLiveGap {
         disposable_lease: false,
         gateway_signed_deployment_attestation: false,
@@ -682,8 +730,9 @@ pub(crate) fn loopback_test_available() -> bool {
 mod tests {
     use chrono::{Duration, Utc};
     use grokptah_agent_bridge::{
-        expected_route_binding_digest, EnterpriseGatewayAttestation, EnterpriseModelTier,
-        ENTERPRISE_REVIEW_ATTESTATION_SCHEMA, ENTERPRISE_REVIEW_LEASE_SCHEMA,
+        attestation_signing_bytes, expected_route_binding_digest, EnterpriseGatewayAttestation,
+        EnterpriseGatewayTrust, EnterpriseModelTier, ENTERPRISE_REVIEW_ATTESTATION_SCHEMA,
+        ENTERPRISE_REVIEW_LEASE_SCHEMA, ENTERPRISE_REVIEW_TRUST_SCHEMA,
         MAX_ENTERPRISE_REVIEW_DURATION_MS, MAX_ENTERPRISE_REVIEW_REQUESTS,
         MAX_ENTERPRISE_REVIEW_TOKENS,
     };
@@ -806,19 +855,52 @@ mod tests {
                 expires_at: now + Duration::hours(1),
                 no_premium_fallback: true,
                 egress_firewall_attested: true,
+                signing_key_id: None,
+                signature: None,
             },
         };
         lease.route_binding_digest = expected_route_binding_digest(&lease);
         lease
     }
 
+    fn signed_enterprise_lease() -> (EnterpriseReviewLease, EnterpriseGatewayTrust) {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let mut lease = valid_enterprise_lease();
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).unwrap();
+        let trust = EnterpriseGatewayTrust {
+            schema: ENTERPRISE_REVIEW_TRUST_SCHEMA.to_owned(),
+            key_id: "broker-key-1".to_owned(),
+            public_key_hex: key_pair
+                .public_key()
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        };
+        lease.attestation.signing_key_id = Some(trust.key_id.clone());
+        lease.attestation.signature = Some(
+            key_pair
+                .sign(&attestation_signing_bytes(&lease.attestation))
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        );
+        (lease, trust)
+    }
+
     #[test]
     fn enterprise_review_live_attach_requires_broker_lease_file() {
         let _serial = home_override_serial();
         let previous = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV);
+        let previous_trust = std::env::var_os(ENTERPRISE_REVIEW_TRUST_ENV);
         // SAFETY: the home-override serialization guard prevents concurrent
         // certification tests from observing this process-local override.
-        unsafe { std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV) };
+        unsafe {
+            std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV);
+            std::env::remove_var(ENTERPRISE_REVIEW_TRUST_ENV);
+        }
         let error = enterprise_review_live_attach().unwrap_err();
         assert!(!error.disposable_lease);
         assert!(!error.gateway_signed_deployment_attestation);
@@ -829,6 +911,10 @@ mod tests {
                 Some(value) => std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, value),
                 None => std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV),
             }
+            match previous_trust {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_TRUST_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_TRUST_ENV),
+            }
         }
     }
 
@@ -837,15 +923,20 @@ mod tests {
         let _serial = home_override_serial();
         let root = tempdir().expect("lease root");
         let lease_path = root.path().join("lease.json");
-        std::fs::write(
-            &lease_path,
-            serde_json::to_vec(&valid_enterprise_lease()).expect("lease JSON"),
-        )
-        .expect("write lease");
+        let trust_path = root.path().join("trust.json");
+        let (lease, trust) = signed_enterprise_lease();
+        std::fs::write(&lease_path, serde_json::to_vec(&lease).expect("lease JSON"))
+            .expect("write lease");
+        std::fs::write(&trust_path, serde_json::to_vec(&trust).expect("trust JSON"))
+            .expect("write trust");
         let previous = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV);
+        let previous_trust = std::env::var_os(ENTERPRISE_REVIEW_TRUST_ENV);
         // SAFETY: the home-override serialization guard prevents concurrent
         // certification tests from observing this process-local override.
-        unsafe { std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, &lease_path) };
+        unsafe {
+            std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, &lease_path);
+            std::env::set_var(ENTERPRISE_REVIEW_TRUST_ENV, &trust_path);
+        }
         let evidence = enterprise_review_live_evidence().expect("valid lease evidence");
         assert!(evidence.secret_free);
         assert_eq!(evidence.route_id, "company-gateway");
@@ -858,6 +949,10 @@ mod tests {
                 Some(value) => std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, value),
                 None => std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV),
             }
+            match previous_trust {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_TRUST_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_TRUST_ENV),
+            }
         }
     }
 
@@ -868,22 +963,31 @@ mod tests {
         let root = tempdir().expect("lease root");
         let target = root.path().join("target.json");
         let link = root.path().join("lease.json");
-        std::fs::write(
-            &target,
-            serde_json::to_vec(&valid_enterprise_lease()).expect("lease JSON"),
-        )
-        .expect("write lease");
+        let trust_path = root.path().join("trust.json");
+        let (lease, trust) = signed_enterprise_lease();
+        std::fs::write(&target, serde_json::to_vec(&lease).expect("lease JSON"))
+            .expect("write lease");
+        std::fs::write(&trust_path, serde_json::to_vec(&trust).expect("trust JSON"))
+            .expect("write trust");
         std::os::unix::fs::symlink(&target, &link).expect("symlink lease");
         let previous = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV);
+        let previous_trust = std::env::var_os(ENTERPRISE_REVIEW_TRUST_ENV);
         // SAFETY: the home-override serialization guard prevents concurrent
         // certification tests from observing this process-local override.
-        unsafe { std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, &link) };
+        unsafe {
+            std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, &link);
+            std::env::set_var(ENTERPRISE_REVIEW_TRUST_ENV, &trust_path);
+        }
         assert!(enterprise_review_live_evidence().is_err());
         // SAFETY: see the guard above.
         unsafe {
             match previous {
                 Some(value) => std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, value),
                 None => std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV),
+            }
+            match previous_trust {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_TRUST_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_TRUST_ENV),
             }
         }
     }
