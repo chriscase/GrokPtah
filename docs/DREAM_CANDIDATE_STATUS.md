@@ -31,6 +31,12 @@ complete or that the product has reached 100%.
   `Uncertain`, the lease is quarantined rather than falsely marked successful,
   the mutation is replay-safe, and the conflict domain is released only after
   that explicit operator confirmation.
+- The shared enterprise review admission boundary now validates a disposable,
+  secret-free route/model lease, modest-tier gateway attestation, no-fallback
+  policy, external egress attestation, read-only permissions, and bounded
+  requests/tokens/duration before a live review turn. Route drift, expiry,
+  missing attestation, mutation/publication permission, and unknown fields fail
+  closed. This is a prerequisite foundation, not a live gateway certification.
 - Shared desktop/hosted black-box parity is present as a fail-closed fixture.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
@@ -58,6 +64,9 @@ complete or that the product has reached 100%.
 - Native Coding Readiness/provider-attempt suite: 15 passed, including frozen
   provider routes, quota-backed admission, stale qualification fencing, and
   restart-safe no-duplicate behavior.
+- Enterprise review admission unit suite: 4 passed, covering secret-free
+  evidence plus expiry, route/model drift, fallback, egress, mutation, bound,
+  and schema denials.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.

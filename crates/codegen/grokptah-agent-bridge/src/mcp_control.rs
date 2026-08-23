@@ -4419,6 +4419,8 @@ mod tests {
         host: &crate::host::AgentHostHandle,
         home: &std::path::Path,
         roots: Vec<std::path::PathBuf>,
+        session_id: Uuid,
+        workspace: &std::path::Path,
     ) -> Arc<OrchestrationService> {
         let service = OrchestrationService::new(
             host.clone(),
@@ -4431,13 +4433,15 @@ mod tests {
                 bounds: RunBounds::default(),
             },
         );
-        // These projection tests exercise a trusted loopback desktop adapter.
-        // Production bearer constructors cannot create this credential role;
-        // remote coordinator/observer denial is covered separately.
+        // These projection tests exercise a scoped loopback desktop adapter.
+        // The read grant is explicit; an otherwise valid bearer must not gain
+        // Computer Use reads merely by knowing a session or workspace ID.
         service
-            .set_auth_credentials(vec![AuthCredential::trusted_local_test(
+            .set_auth_credentials(vec![AuthCredential::with_computer_read_grant(
                 "primary",
                 "computer-token",
+                session_id,
+                workspace,
             )
             .unwrap()])
             .unwrap();
@@ -4465,7 +4469,7 @@ mod tests {
 
         let canon_a = canonical_workspace_string(ws_a.path()).unwrap();
         let canon_b = canonical_workspace_string(ws_b.path()).unwrap();
-        let computer = ComputerUseService::new(
+        let computer = ComputerUseService::new_simulator(
             Arc::new(SimulatorBackend::new()),
             host.ensure_computer_store().unwrap(),
         );
@@ -4503,6 +4507,8 @@ mod tests {
             &host,
             home.path(),
             vec![ws_a.path().to_path_buf(), ws_b.path().to_path_buf()],
+            session_a.id,
+            ws_a.path(),
         );
         let srv = start_control_server(orch, 0).await.unwrap();
         let fixture = initialized_computer_fixture(srv).await;
@@ -4814,7 +4820,8 @@ mod tests {
 
         let canon = canonical_workspace_string(ws.path()).unwrap();
         let store = host.ensure_computer_store().unwrap();
-        let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store.clone());
+        let computer =
+            ComputerUseService::new_simulator(Arc::new(SimulatorBackend::new()), store.clone());
         let operator = ComputerAuthorityToken::local_operator(session.id).unwrap();
         let run = computer
             .create_run(
@@ -4836,7 +4843,13 @@ mod tests {
             })
             .unwrap();
 
-        let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
+        let orch = computer_orch(
+            &host,
+            home.path(),
+            vec![ws.path().to_path_buf()],
+            session.id,
+            ws.path(),
+        );
         let srv = start_control_server(orch, 0).await.unwrap();
         let fixture = initialized_computer_fixture(srv).await;
 
@@ -4917,7 +4930,8 @@ mod tests {
         {
             let store =
                 ComputerStore::open(crate::discover::grokptah_home().join("computer-use")).unwrap();
-            let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store);
+            let computer =
+                ComputerUseService::new_simulator(Arc::new(SimulatorBackend::new()), store);
             let operator = ComputerAuthorityToken::local_operator(session.id).unwrap();
             let run = computer
                 .create_run(
@@ -4947,7 +4961,13 @@ mod tests {
                 .unwrap();
         }
 
-        let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
+        let orch = computer_orch(
+            &host,
+            home.path(),
+            vec![ws.path().to_path_buf()],
+            session.id,
+            ws.path(),
+        );
         let srv = start_control_server(orch, 0).await.unwrap();
         let fixture = initialized_computer_fixture(srv).await;
 
@@ -5023,7 +5043,13 @@ mod tests {
         let _outside =
             ComputerStore::open(crate::discover::grokptah_home().join("computer-use")).unwrap();
 
-        let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
+        let orch = computer_orch(
+            &host,
+            home.path(),
+            vec![ws.path().to_path_buf()],
+            session.id,
+            ws.path(),
+        );
         let srv = start_control_server(orch, 0).await.unwrap();
         let fixture = initialized_computer_fixture(srv).await;
         let (status, body) = call_tool(

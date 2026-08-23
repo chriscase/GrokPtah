@@ -10,6 +10,7 @@ mod completion;
 mod computer_agent;
 pub mod computer_use;
 mod discover;
+pub mod enterprise_review;
 pub mod eval_oracle;
 pub mod eval_report;
 pub mod event_bus;
@@ -63,6 +64,14 @@ pub use certification::{
     ProviderDialectClass, ProviderIdentity, ProviderRouteClass, StreamFraming, UsageEvidence,
     MAX_CAPTURE_ATTEMPTS, MAX_CAPTURE_BYTES, MAX_CAPTURE_CHECKS, MAX_PROMOTABLE_ARTIFACT_BYTES,
     MAX_RAW_ARTIFACT_BYTES, PERSISTENT_AGENT_CAPTURE_SCHEMA,
+};
+pub use enterprise_review::{
+    admit_enterprise_review, expected_route_binding_digest, EnterpriseGatewayAttestation,
+    EnterpriseModelTier, EnterpriseReviewAdmissionError, EnterpriseReviewEvidence,
+    EnterpriseReviewLease, EnterpriseReviewPolicy, ENTERPRISE_REVIEW_ATTESTATION_SCHEMA,
+    ENTERPRISE_REVIEW_EVIDENCE_SCHEMA, ENTERPRISE_REVIEW_LEASE_SCHEMA,
+    MAX_ENTERPRISE_REVIEW_DURATION_MS, MAX_ENTERPRISE_REVIEW_REQUESTS,
+    MAX_ENTERPRISE_REVIEW_TOKENS,
 };
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
 pub use gateway_config::{

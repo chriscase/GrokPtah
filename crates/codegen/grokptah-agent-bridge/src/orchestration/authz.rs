@@ -223,18 +223,6 @@ impl AuthCredential {
         Ok(credential)
     }
 
-    /// Unit-test-only transport adapter credential. Production bearer
-    /// constructors can never request local-operator authority.
-    #[cfg(test)]
-    pub(crate) fn trusted_local_test(
-        id: impl Into<String>,
-        token: impl Into<String>,
-    ) -> Result<Self, OrchError> {
-        let mut credential = Self::new(id, token)?;
-        credential.role = AuthorityRole::LocalOperator;
-        Ok(credential)
-    }
-
     pub fn token(&self) -> &str {
         &self.token
     }

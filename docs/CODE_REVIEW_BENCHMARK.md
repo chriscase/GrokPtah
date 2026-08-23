@@ -11,6 +11,14 @@ from the **same** model used single-pass, without code/secret egress or
 workspace/PR mutation. This pull request only builds the fail-closed
 benchmark. Fake runs **cannot prove quality**.
 
+The candidate now has a shared fail-closed lease boundary for the eventual live
+lane: [`ENTERPRISE_REVIEW_LANE.md`](ENTERPRISE_REVIEW_LANE.md) and
+`crates/codegen/grokptah-agent-bridge/src/enterprise_review.rs`. The boundary
+binds an opaque route/model/credential fingerprint, expiry, modest tier, no
+fallback, read-only policy, bounded requests/tokens/duration, and an external
+egress attestation. It emits only secret-free evidence. It does not create a
+gateway lease or claim live provider quality.
+
 ## What this slice contains
 
 - Strict deny-unknown campaign, corpus, and fake-provider schemas under
