@@ -71,3 +71,24 @@ can pass.
 
 The fake benchmark remains a contract test only and must continue to report
 `qualityClaimEligible=false`.
+
+## Certification-lab host attachment
+
+The certification lab can now consume the broker handoff without receiving a
+bearer or endpoint. Set `GROKPTAH_ENTERPRISE_REVIEW_LEASE` to a disposable,
+regular JSON file containing one `EnterpriseReviewLease` and run the live
+preflight. The loader rejects missing, stale, malformed, symlinked, oversized,
+or broadened leases before any provider call. The resulting evidence is the
+existing secret-free `EnterpriseReviewEvidence` projection.
+
+```sh
+export GROKPTAH_ENTERPRISE_REVIEW_LEASE=/run/user/1000/grokptah/review-lease.json
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  review --repository "$PWD" --live --preflight
+```
+
+This attachment proves admission only. The runner still returns an
+**indeterminate** live report until the operator-owned broker supplies real
+provider observations, authoritative usage/quota evidence, restart continuity,
+and the paired multi-hour quality result. Ambient API keys, token commands,
+compatible-gateway discovery, and fallback routes remain refused.

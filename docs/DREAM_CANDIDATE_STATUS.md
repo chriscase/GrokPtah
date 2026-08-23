@@ -200,6 +200,12 @@ unrelated signal.
 - The review-benchmark contract keeps its fail-closed live behavior; the
   fake-loopback quality path is also host-only in this sandbox because its
   provider must bind `127.0.0.1`.
+- The certification lab now accepts a bounded
+  `GROKPTAH_ENTERPRISE_REVIEW_LEASE` file and re-admits the existing
+  secret-free enterprise review contract. Missing, stale, malformed,
+  symlinked, oversized, or broadened leases fail closed; a valid lease still
+  produces only an indeterminate live report until real provider usage,
+  restart, and paired-quality evidence are captured.
 - The candidate's 10-minute Always-On soak was attempted and stopped before
   execution because the sandbox denied the fake provider's loopback bind
   (`Operation not permitted`); no soak evidence is claimed.

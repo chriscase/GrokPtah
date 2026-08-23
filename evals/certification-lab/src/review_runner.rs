@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::artifact::{SafeOutputRoot, DEFAULT_OUTPUT_RELATIVE_PATH};
 use crate::local_service::{
-    enterprise_review_live_attach, exercise_review_control_plane, git_ref_snapshot,
+    enterprise_review_live_evidence, exercise_review_control_plane, git_ref_snapshot,
     workspace_merkle_root, GitRefSnapshot,
 };
 use crate::review_manifest::{
@@ -145,7 +145,7 @@ pub fn preflight_review(options: &ReviewOptions) -> Result<ReviewPreflight> {
         live_replicates_configured: bundle.campaign.live_replicate_count,
         quality_claim_eligible: false,
         fake_cannot_prove_quality: options.mode == ReviewMode::Fake,
-        enterprise_gateway_lease: enterprise_review_live_attach().is_ok(),
+        enterprise_gateway_lease: enterprise_review_live_evidence().is_ok(),
         notice: match options.mode {
             ReviewMode::Fake => QualityClaim::FakeCannotProveQuality,
             ReviewMode::Live => QualityClaim::LiveAttestationMissing,
@@ -358,9 +358,10 @@ fn run_live_fail_closed(
     if ambient_override_present() {
         bail!("live_ambient_route_or_credential_override_present");
     }
-    if enterprise_review_live_attach().is_ok() {
-        bail!("enterprise_gateway_live_attach_must_remain_unimplemented");
-    }
+    // A valid broker lease proves only that admission can be re-established.
+    // The runner still emits an indeterminate report until a real provider
+    // campaign supplies authoritative usage and paired quality evidence.
+    let enterprise_lease_admitted = enterprise_review_live_evidence().is_ok();
     let output = SafeOutputRoot::open(
         &options.output_root,
         &options.repository_root,
@@ -384,13 +385,18 @@ fn run_live_fail_closed(
     report.implementation_digest = identity_digest.sha256.clone();
     report.completeness.artifacts_consumed = true;
     report.completeness.bounds_consumed = true;
-    report.live_indeterminate_reasons = vec![
-        IndeterminateReason::EnterpriseGatewayLeaseUnimplemented,
-        IndeterminateReason::DeploymentAttestationMissing,
-        IndeterminateReason::EgressFirewallAttestationMissing,
-        IndeterminateReason::LiveReplicatesNotExecuted,
-        IndeterminateReason::AuthoritativeUsageMissing,
-    ];
+    report.live_indeterminate_reasons = [
+        (!enterprise_lease_admitted)
+            .then_some(IndeterminateReason::EnterpriseGatewayLeaseUnimplemented),
+        (!enterprise_lease_admitted).then_some(IndeterminateReason::DeploymentAttestationMissing),
+        (!enterprise_lease_admitted)
+            .then_some(IndeterminateReason::EgressFirewallAttestationMissing),
+        Some(IndeterminateReason::LiveReplicatesNotExecuted),
+        Some(IndeterminateReason::AuthoritativeUsageMissing),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     report.quality_claim = QualityClaim::LiveAttestationMissing;
     report.forbidden_scan_passed = true;
     report.workspace = WorkspaceHashes {

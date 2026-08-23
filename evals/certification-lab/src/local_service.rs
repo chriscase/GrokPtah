@@ -11,16 +11,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use grokptah_agent_bridge::provider_observation::ProviderObservationSession;
 use grokptah_agent_bridge::{
-    home_override_serial, start_control_server_with, AgentHost, AgentHostHandle, AuthCredential,
-    ControlServerHandle, ControlServerLimits, HostConfig, McpControlClient, OrchestrationConfig,
-    OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist, FORBIDDEN_TOOLS,
+    admit_enterprise_review, home_override_serial, start_control_server_with, AgentHost,
+    AgentHostHandle, AuthCredential, ControlServerHandle, ControlServerLimits,
+    EnterpriseReviewEvidence, EnterpriseReviewLease, EnterpriseReviewPolicy, HostConfig,
+    McpControlClient, OrchestrationConfig, OrchestrationService, RunBounds, RuntimeHome,
+    WorkspaceAllowlist, FORBIDDEN_TOOLS,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const OFFLINE_ENV: &str = "GROKPTAH_AGENT_OFFLINE";
+const ENTERPRISE_REVIEW_LEASE_ENV: &str = "GROKPTAH_ENTERPRISE_REVIEW_LEASE";
+const MAX_ENTERPRISE_REVIEW_LEASE_BYTES: u64 = 64 * 1024;
 pub const DEFAULT_LIVE_MODEL: &str = "grok-build";
 
 /// Whether locally hosted model turns use the deterministic offline runtime or
@@ -314,10 +319,9 @@ fn generated_token() -> String {
 
 /// Live enterprise-gateway attach for the code-review benchmark.
 ///
-/// The current host does not issue a disposable enterprise-gateway lease,
-/// a gateway-signed modest-tier deployment attestation, or an external
-/// egress-firewall attestation. Compatible-gateway ambient routes remain
-/// refused; this API never installs a bypass.
+/// The host accepts only a broker-issued, short-lived lease file. It does not
+/// mint leases, discover ambient gateways, or install a compatible-gateway
+/// bypass. Missing, stale, malformed, or broadened evidence remains refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnterpriseReviewLiveGap {
     pub disposable_lease: bool,
@@ -325,12 +329,75 @@ pub struct EnterpriseReviewLiveGap {
     pub egress_firewall_attestation: bool,
 }
 
-pub fn enterprise_review_live_attach() -> Result<(), EnterpriseReviewLiveGap> {
-    Err(EnterpriseReviewLiveGap {
+/// Load and re-admit the operator-owned enterprise review lease.
+///
+/// The broker hands the lab a path to a short-lived, secret-free JSON lease;
+/// bearer tokens, endpoint URLs, and provider responses never cross this
+/// boundary. The file must be a regular file under the caller's control and
+/// is bounded before parsing. A valid lease still only proves admission: the
+/// live review runner remains indeterminate until real provider observations,
+/// usage receipts, and paired quality evidence exist.
+pub fn enterprise_review_live_evidence() -> Result<EnterpriseReviewEvidence, EnterpriseReviewLiveGap>
+{
+    let path = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV).ok_or(EnterpriseReviewLiveGap {
         disposable_lease: false,
         gateway_signed_deployment_attestation: false,
         egress_firewall_attestation: false,
-    })
+    })?;
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        });
+    }
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_ENTERPRISE_REVIEW_LEASE_BYTES {
+        return Err(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        });
+    }
+    let bytes = std::fs::read(&path).map_err(|_| EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
+    if bytes.len() as u64 > MAX_ENTERPRISE_REVIEW_LEASE_BYTES {
+        return Err(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        });
+    }
+    let lease: EnterpriseReviewLease =
+        serde_json::from_slice(&bytes).map_err(|_| EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        })?;
+    let evidence = admit_enterprise_review(&lease, &EnterpriseReviewPolicy::default(), Utc::now())
+        .map_err(|_| EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        })?;
+    evidence.validate().map_err(|_| EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
+    Ok(evidence)
+}
+
+pub fn enterprise_review_live_attach() -> Result<(), EnterpriseReviewLiveGap> {
+    enterprise_review_live_evidence().map(|_| ())
 }
 
 /// Observed denials from the public MCP control-plane allowlist.
@@ -613,6 +680,13 @@ pub(crate) fn loopback_test_available() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, Utc};
+    use grokptah_agent_bridge::{
+        expected_route_binding_digest, EnterpriseGatewayAttestation, EnterpriseModelTier,
+        ENTERPRISE_REVIEW_ATTESTATION_SCHEMA, ENTERPRISE_REVIEW_LEASE_SCHEMA,
+        MAX_ENTERPRISE_REVIEW_DURATION_MS, MAX_ENTERPRISE_REVIEW_REQUESTS,
+        MAX_ENTERPRISE_REVIEW_TOKENS,
+    };
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -701,12 +775,117 @@ mod tests {
         assert!(config.with_model("grok-build").is_ok());
     }
 
+    fn valid_enterprise_lease() -> EnterpriseReviewLease {
+        let now = Utc::now();
+        let mut lease = EnterpriseReviewLease {
+            schema: ENTERPRISE_REVIEW_LEASE_SCHEMA.to_owned(),
+            lease_id: "lease-certification".to_owned(),
+            credential_id: "credential-certification".to_owned(),
+            route_id: "company-gateway".to_owned(),
+            endpoint_fingerprint: "a".repeat(64),
+            model_id: "modest-review-v1".to_owned(),
+            model_tier: EnterpriseModelTier::Modest,
+            issued_at: now - Duration::minutes(1),
+            expires_at: now + Duration::hours(1),
+            route_binding_digest: String::new(),
+            read_only: true,
+            allow_network: false,
+            allow_workspace_writes: false,
+            allow_publication: false,
+            max_requests: MAX_ENTERPRISE_REVIEW_REQUESTS,
+            max_tokens: MAX_ENTERPRISE_REVIEW_TOKENS,
+            max_duration_ms: MAX_ENTERPRISE_REVIEW_DURATION_MS,
+            attestation: EnterpriseGatewayAttestation {
+                schema: ENTERPRISE_REVIEW_ATTESTATION_SCHEMA.to_owned(),
+                route_id: "company-gateway".to_owned(),
+                endpoint_fingerprint: "a".repeat(64),
+                model_id: "modest-review-v1".to_owned(),
+                model_tier: EnterpriseModelTier::Modest,
+                deployment_revision: "deployment-certification".to_owned(),
+                issued_at: now - Duration::minutes(1),
+                expires_at: now + Duration::hours(1),
+                no_premium_fallback: true,
+                egress_firewall_attested: true,
+            },
+        };
+        lease.route_binding_digest = expected_route_binding_digest(&lease);
+        lease
+    }
+
     #[test]
-    fn enterprise_review_live_attach_is_unimplemented() {
+    fn enterprise_review_live_attach_requires_broker_lease_file() {
+        let _serial = home_override_serial();
+        let previous = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV);
+        // SAFETY: the home-override serialization guard prevents concurrent
+        // certification tests from observing this process-local override.
+        unsafe { std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV) };
         let error = enterprise_review_live_attach().unwrap_err();
         assert!(!error.disposable_lease);
         assert!(!error.gateway_signed_deployment_attestation);
         assert!(!error.egress_firewall_attestation);
+        // SAFETY: see the guard above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn enterprise_review_live_attach_validates_secret_free_lease_file() {
+        let _serial = home_override_serial();
+        let root = tempdir().expect("lease root");
+        let lease_path = root.path().join("lease.json");
+        std::fs::write(
+            &lease_path,
+            serde_json::to_vec(&valid_enterprise_lease()).expect("lease JSON"),
+        )
+        .expect("write lease");
+        let previous = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV);
+        // SAFETY: the home-override serialization guard prevents concurrent
+        // certification tests from observing this process-local override.
+        unsafe { std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, &lease_path) };
+        let evidence = enterprise_review_live_evidence().expect("valid lease evidence");
+        assert!(evidence.secret_free);
+        assert_eq!(evidence.route_id, "company-gateway");
+        assert!(!serde_json::to_string(&evidence)
+            .expect("evidence JSON")
+            .contains("https://"));
+        // SAFETY: see the guard above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn enterprise_review_live_attach_rejects_symlinked_lease_file() {
+        let _serial = home_override_serial();
+        let root = tempdir().expect("lease root");
+        let target = root.path().join("target.json");
+        let link = root.path().join("lease.json");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&valid_enterprise_lease()).expect("lease JSON"),
+        )
+        .expect("write lease");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink lease");
+        let previous = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV);
+        // SAFETY: the home-override serialization guard prevents concurrent
+        // certification tests from observing this process-local override.
+        unsafe { std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, &link) };
+        assert!(enterprise_review_live_evidence().is_err());
+        // SAFETY: see the guard above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV),
+            }
+        }
     }
 
     #[test]
