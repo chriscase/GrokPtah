@@ -34,7 +34,8 @@ generation, and isolation proof are intrinsic to the Computer Use contract. Back
 closed `ComputerCapabilityTier`:
 
 - `foreground_semantic` — may require activating the real target. Current macOS native Computer
-  Use is this tier and must not be advertised as isolated.
+  Use is this tier and must not be advertised as isolated. It is one host-global-foreground
+  conflict domain (capacity 1). Per-window IDs are target identity, not isolation.
 - `measured_background_safe_semantic` — host-measured semantic actions that must not activate or
   move the pointer. `ActivateTarget` is forbidden and cannot silently fall back to foreground.
 - `independently_isolated_visual_input_domain` — pointer, key, and visual actions. Stage 1 only
@@ -50,7 +51,8 @@ combinations cannot deserialize into background or isolated authority.
 
 Every run, grant, observation, and policy check is bound to a host-interned opaque surface ID and
 incarnation for an attested physical input domain, plus target generation, a host-minted
-frame epoch, and control/authority epoch. Backends do not mint surface authority; syntactic
+frame epoch, and control/authority epoch. Native macOS interns one host-global-foreground domain;
+two windows share that domain's freshness clocks. Backends do not mint surface authority; syntactic
 prefixes are not proof of issuance. A serialized wall-clock timestamp is not dispatch proof.
 Monotonic freshness ticks are exact-current for the live surface incarnation: an older tick is
 stale. Restart invalidates the live clocks.
@@ -80,9 +82,12 @@ This stage does **not** implement an isolated helper process, visual compositor,
 UI, background Accessibility execution, a durable dispatch-intent journal, pointer/keyboard
 injection, or out-of-band preemptive takeover. Those remain later stages; this contract makes
 them structurally representable without lying that macOS is isolated today. Stage 1 is not
-stable or release-ready: MCP Computer read methods still ignore authenticated bearer identity
-in `orchestration/service.rs`, which is owned by the active PR #352 security repair and is an
-unresolved least-privilege blocker.
+stable or release-ready. MCP Computer reads now require an immutable credential grant; Agent
+principal minting and packaged hardware/TCC/takeover remain fail-closed or unverified. A later
+coordinator can bind host-sealed capability documents, WorkAttempt surface leases, and
+principal-bound receipts to these types without exposing raw `ComputerRun`. Stage 1 does not
+implement that coordinator, does not simulate N isolated surfaces, and does not widen MCP
+mutations.
 
 ## Foundation (#268)
 
@@ -266,7 +271,7 @@ attestation, packaging requirements, and disposable smoke fixture.
 | Stage | Issues | Outcome |
 |---|---|---|
 | Safety kernel | #268, #274 | Typed contract, simulator, durable authority, adversarial gates |
-| Isolation contract | stage 1 | Host-enforced tier, sealed token, interned surface, exact freshness, typed proof. Not isolated or preemptive. Not release-ready until the PR #352 authority slice lands. |
+| Isolation contract | stage 1 | Host-enforced tier, sealed token, interned surface, exact freshness, typed proof. Native macOS is a singleton host-global-foreground conflict domain (capacity 1). Not isolated or preemptive. |
 | macOS observe | #269 | Consented target selection, capture, redaction, semantic snapshots |
 | Operator UX and model proof | #273, #272 | Visible runs/approvals and capability-based provider conformance |
 | macOS act | #270 | Bounded semantic actions with durable bookkeeping-safe local takeover (not physically preemptive inside the native action gate) |

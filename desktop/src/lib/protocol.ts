@@ -1106,6 +1106,8 @@ export interface ComputerBackendPublicView {
   textEntry: boolean;
   keyChords: boolean;
   pointerFallback: boolean;
+  /** Host-global foreground conflict-domain capacity. Stage 1 is always 1. */
+  foregroundConflictCapacity: number;
 }
 
 export interface ComputerLocalElement {

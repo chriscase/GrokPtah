@@ -561,6 +561,19 @@ pub fn macos_native_capability_proof() -> ComputerCapabilityProof {
     }
 }
 
+/// Stage-1 host-global foreground conflict-domain capacity. Native macOS and
+/// every current backend report 1. This is not isolated-surface capacity and
+/// is not ledger occupancy (`maxRunRecords`).
+pub const FOREGROUND_CONFLICT_DOMAIN_CAPACITY: u32 = 1;
+
+/// Singleton physical input domain for native macOS. Per-window, process, and
+/// bundle IDs are target identity; they are not isolation and must not intern
+/// separate conflict domains.
+pub fn macos_native_physical_input_domain() -> PhysicalInputDomain {
+    PhysicalInputDomain::attested("macos-native", "host-global-foreground")
+        .expect("host-global-foreground is a valid attested domain")
+}
+
 /// Opaque attested physical input-domain identity. Backends supply a stable
 /// fingerprint; the host hashes it and never projects native handles.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2363,6 +2376,9 @@ mod tests {
             button: PointerButton::Primary,
         }));
         assert!(caps.allows_action(&ComputerAction::ActivateTarget));
+        let domain = macos_native_physical_input_domain();
+        assert_eq!(domain, macos_native_physical_input_domain());
+        assert_eq!(FOREGROUND_CONFLICT_DOMAIN_CAPACITY, 1);
     }
 
     #[test]

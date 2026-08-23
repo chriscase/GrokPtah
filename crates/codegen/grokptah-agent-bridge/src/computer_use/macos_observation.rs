@@ -14,10 +14,11 @@ use super::platform::{
     ComputerPlatformStatus, ComputerTargetCandidate,
 };
 use super::types::{
-    macos_native_capability_proof, ActionOutcome, ComputerAction, ComputerBackend,
-    ComputerCapabilities, ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult,
-    ComputerTarget, ComputerUseLimits, EvidenceRef, ObservationGeometry, PhysicalInputDomain,
-    SemanticAction, SemanticElement, Sensitivity, MAX_LABEL_BYTES,
+    macos_native_capability_proof, macos_native_physical_input_domain, ActionOutcome,
+    ComputerAction, ComputerBackend, ComputerCapabilities, ComputerError, ComputerErrorCode,
+    ComputerObservation, ComputerResult, ComputerTarget, ComputerUseLimits, EvidenceRef,
+    ObservationGeometry, PhysicalInputDomain, SemanticAction, SemanticElement, Sensitivity,
+    MAX_LABEL_BYTES,
 };
 
 const MAX_TARGET_CANDIDATES: usize = 128;
@@ -67,12 +68,10 @@ impl MacNativeIdentity {
         Ok(())
     }
 
+    /// Window/process/bundle identify the target, not a private input domain.
+    #[allow(clippy::unused_self)]
     fn physical_input_domain(&self) -> PhysicalInputDomain {
-        PhysicalInputDomain::attested(
-            "macos-native",
-            &format!("{}:{}:{}", self.window_id, self.process_id, self.bundle_id),
-        )
-        .expect("validated native identity is an attested physical domain")
+        macos_native_physical_input_domain()
     }
 }
 
@@ -1290,6 +1289,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_macos_windows_share_one_host_global_foreground_conflict_domain() {
+        let mail = MacNativeIdentity {
+            window_id: 11,
+            process_id: 101,
+            bundle_id: "com.apple.mail".into(),
+        };
+        let safari = MacNativeIdentity {
+            window_id: 22,
+            process_id: 202,
+            bundle_id: "com.apple.Safari".into(),
+        };
+        assert_eq!(mail.physical_input_domain(), safari.physical_input_domain());
+        assert_eq!(
+            mail.physical_input_domain(),
+            macos_native_physical_input_domain()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::computer_use::ComputerStore::open(dir.path().join("computer-use")).unwrap();
+        let interned_mail = store
+            .intern_physical_domain(&mail.physical_input_domain())
+            .unwrap();
+        let interned_safari = store
+            .intern_physical_domain(&safari.physical_input_domain())
+            .unwrap();
+        assert_eq!(interned_mail.binding, interned_safari.binding);
+        assert_eq!(crate::computer_use::FOREGROUND_CONFLICT_DOMAIN_CAPACITY, 1);
+    }
+
     #[tokio::test]
     async fn secure_values_are_removed_and_evidence_is_exactly_scoped() {
         let source = Arc::new(FixtureSource::granted());
@@ -1626,7 +1655,10 @@ mod tests {
             .capabilities()
             .proof
             .isolated_input_is_dispatchable());
-        assert!(!backend.physical_input_domain().as_key().contains("window"));
+        assert_eq!(
+            backend.physical_input_domain(),
+            macos_native_physical_input_domain()
+        );
         assert!(!candidate.target.window_id.contains("macos-window-"));
         assert!(!candidate
             .target

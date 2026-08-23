@@ -216,6 +216,10 @@ pub struct ComputerBackendPublicView {
     pub text_entry: bool,
     pub key_chords: bool,
     pub pointer_fallback: bool,
+    /// Host-global foreground conflict-domain capacity. Stage 1 always
+    /// reports 1. This is not N-surface isolation and is not run-record
+    /// occupancy.
+    pub foreground_conflict_capacity: u32,
 }
 
 impl ComputerBackendPublicView {
@@ -227,6 +231,7 @@ impl ComputerBackendPublicView {
             text_entry: capabilities.text_entry,
             key_chords: capabilities.key_chords,
             pointer_fallback: capabilities.pointer_fallback,
+            foreground_conflict_capacity: crate::computer_use::FOREGROUND_CONFLICT_DOMAIN_CAPACITY,
         }
     }
 }
@@ -1148,8 +1153,14 @@ mod tests {
                 "textEntry".into(),
                 "keyChords".into(),
                 "pointerFallback".into(),
+                "foregroundConflictCapacity".into(),
             ])
         );
+        assert_eq!(
+            view.foreground_conflict_capacity,
+            crate::computer_use::FOREGROUND_CONFLICT_DOMAIN_CAPACITY
+        );
+        assert_eq!(view.foreground_conflict_capacity, 1);
         let wire = serde_json::to_string(&encoded).unwrap();
         assert!(!wire.contains("proof"));
         assert!(!wire.contains("tier"));

@@ -161,6 +161,7 @@ const backend = {
   textEntry: true,
   keyChords: false,
   pointerFallback: false,
+  foregroundConflictCapacity: 1,
 };
 
 const nativeBackend = {
