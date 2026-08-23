@@ -1,3 +1,6 @@
+import { readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import {
   act,
   cleanup,
@@ -242,18 +245,30 @@ describe("preview and output", () => {
     expect(container.querySelector(".tool-card-output")).toBeNull();
   });
 
-  it("shows a live placeholder when a running call has no output yet", () => {
+  it("shows an honest live placeholder per state when there is no output yet", () => {
+    // Pending has not started; saying "Running…" would overstate it.
     const { container, rerender } = render(
       <ToolCallCard item={tool({ status: "pending" })} />,
     );
+    expect(screen.getByText("Waiting to start…")).toBeInTheDocument();
+    expect(screen.queryByText("Running…")).toBeNull();
+    // Collapsed pending card without output previews "waiting…".
+    fireEvent.click(header("read_file"));
+    expect(container.querySelector(".tool-card-preview")).toHaveTextContent(
+      "waiting…",
+    );
+
+    // Running says so, in body and collapsed preview alike.
+    rerender(<ToolCallCard item={tool({ callId: "c2", status: "running" })} />);
     expect(screen.getByText("Running…")).toBeInTheDocument();
-    // Collapsed live card without output previews "running…".
+    expect(screen.queryByText("Waiting to start…")).toBeNull();
     fireEvent.click(header("read_file"));
     expect(container.querySelector(".tool-card-preview")).toHaveTextContent(
       "running…",
     );
+
     // Settled with no output → explicit empty marker (expanded view).
-    rerender(<ToolCallCard item={tool({ status: "completed" })} />);
+    rerender(<ToolCallCard item={tool({ callId: "c3", status: "completed" })} />);
     fireEvent.click(header("read_file"));
     expect(screen.getByText("(no output)")).toBeInTheDocument();
   });
@@ -345,16 +360,40 @@ describe("copy output", () => {
     expect(screen.getByTestId("tool-card-copy-status").textContent).toBe("");
   });
 
-  it("keeps the label unchanged when the clipboard refuses", async () => {
+  it("shows and announces the failure when the clipboard refuses", async () => {
+    vi.useFakeTimers();
     setClipboard(vi.fn(() => Promise.reject(new Error("nope"))));
     render(<ToolCallCard item={tool({ output: "data" })} />);
     fireEvent.click(header("read_file"));
+
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Copy output" }));
     });
-    expect(
-      screen.getByRole("button", { name: "Copy output" }),
-    ).toBeInTheDocument();
+    // A silent no-op would read as success and ship stale evidence: the
+    // refusal must be visible on the control and announced to AT.
+    const failed = screen.getByRole("button", { name: "Copy failed" });
+    expect(failed).toHaveClass("is-failed");
+    expect(screen.getByTestId("tool-card-copy-status")).toHaveTextContent(
+      "Copy failed",
+    );
+
+    // Transient: the affordance returns so the user can retry.
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    const retry = screen.getByRole("button", { name: "Copy output" });
+    expect(retry).not.toHaveClass("is-failed");
+    expect(screen.getByTestId("tool-card-copy-status").textContent).toBe("");
+
+    // A later successful copy is unaffected by the earlier failure.
+    setClipboard(vi.fn(() => Promise.resolve()));
+    await act(async () => {
+      fireEvent.click(retry);
+    });
+    expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument();
+    expect(screen.getByTestId("tool-card-copy-status")).toHaveTextContent(
+      "Output copied",
+    );
   });
 
   it("offers no copy affordance without output", () => {
@@ -479,5 +518,22 @@ describe("ToolHistoryGroup", () => {
     const toggle = screen.getByRole("button", { name: "Show 1 earlier tool" });
     expect(toggle.tagName).toBe("BUTTON");
     expect(toggle).toHaveAttribute("type", "button");
+  });
+});
+
+describe("ToolCallCard CSS contrast contract (PR #360 audit)", () => {
+  it("colors live status text with the state token, not the raw accent", () => {
+    const root = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(join(root, "ToolCallCard.css"), "utf8");
+    // --state-attention is identical to --accent in dark but holds 4.5:1+
+    // in light, where the raw accent only reaches ~2.9:1 as text.
+    expect(css).toMatch(
+      /status-pending \.tool-card-status\s*{[^}]*var\(--state-attention\)/s,
+    );
+    expect(css).not.toMatch(
+      /status-pending \.tool-card-status\s*{[^}]*var\(--accent\)/s,
+    );
+    // The clipboard-failure state must have a visible treatment.
+    expect(css).toMatch(/\.tool-card-copy\.is-failed\s*{[^}]*var\(--danger\)/s);
   });
 });

@@ -484,8 +484,60 @@ describe("ProviderReadinessCenter layout contract", () => {
     expect(css).toMatch(/min-width:\s*0/);
     expect(css).toMatch(/overflow-wrap:\s*anywhere/);
     expect(css).toMatch(/max-width:\s*100%/);
-    expect(css).toMatch(/@media \(max-width: 640px\)/);
     expect(css).not.toMatch(/white-space:\s*nowrap/);
     expect(css).not.toMatch(/overflow-x:\s*auto/);
+  });
+
+  it("collapses its grids by container width, not viewport width", () => {
+    // The card renders in a ~260px docked Settings pane at a 1440px window,
+    // so a viewport media query can never see the crush (PR #360 audit P2).
+    const css = readFileSync(join(root, "ProviderReadinessCenter.css"), "utf8");
+
+    // The card itself is the size container…
+    expect(css).toMatch(
+      /\.provider-readiness\s*{[^}]*container-type:\s*inline-size/s,
+    );
+
+    // …single column is the base (and the no-container-support fallback)…
+    const labelColumn = /grid-template-columns:\s*minmax\(0,\s*9\.5rem\)/g;
+    expect(css.match(labelColumn)).toHaveLength(1);
+
+    // …and the label column only ever appears behind a container gate.
+    const gate = css.indexOf("@container (min-width: 30rem)");
+    expect(gate).toBeGreaterThan(-1);
+    expect(css.indexOf("minmax(0, 9.5rem)")).toBeGreaterThan(gate);
+
+    // No viewport-keyed grid collapse may sneak back in.
+    const mediaBlocks = css.split("@media").slice(1);
+    for (const block of mediaBlocks) {
+      expect(block).not.toContain("grid-template-columns");
+    }
+  });
+
+  it("colors verdict text with tokens that hold 4.5:1 in the light theme", () => {
+    const css = readFileSync(join(root, "ProviderReadinessCenter.css"), "utf8");
+    // Attention verdict: --state-attention (identical to --accent in dark,
+    // 4.5:1+ in light, unlike --accent's ~2.9:1).
+    expect(css).toMatch(
+      /is-attention \.provider-readiness-verdict\s*{[^}]*var\(--state-attention\)/s,
+    );
+    expect(css).not.toMatch(
+      /is-attention \.provider-readiness-verdict\s*{[^}]*var\(--accent\)/s,
+    );
+    // Ok verdict keeps dark --ok but darkens for light via a text mix.
+    expect(css).toMatch(
+      /\[data-theme="light"\][^{]*is-ok \.provider-readiness-verdict\s*{[^}]*color-mix\(in srgb, var\(--ok\)/s,
+    );
+  });
+});
+
+describe("blocking-reason summary copy", () => {
+  it("separates multiple blocking failures instead of running them together", () => {
+    const view = deriveProviderReadiness(input({ report: report() }));
+    expect(view.verdict).toBe("discussion_only");
+    // Two failed checks must not fuse into one unpunctuated sentence.
+    expect(view.summary).toMatch(
+      /No native tool call; Tool-result continuation:/,
+    );
   });
 });
