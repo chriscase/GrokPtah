@@ -15,30 +15,53 @@ use super::projection::{
 use super::store::{ComputerStore, MutationClaim, MutationStamp};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerAuthorityToken,
-    ComputerBackend, ComputerControlDisposition, ComputerError, ComputerErrorCode,
-    ComputerObservation, ComputerResult, ComputerRun, ComputerRunState, ComputerTarget,
-    ComputerUseLimits, ObservationAuthority,
+    ComputerBackend, ComputerBackendAttestation, ComputerControlDisposition, ComputerError,
+    ComputerErrorCode, ComputerObservation, ComputerResult, ComputerRun, ComputerRunState,
+    ComputerTarget, ComputerUseLimits, ObservationAuthority,
 };
 
 pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
     store: ComputerStore,
     policy: ComputerPolicy,
+    backend_attestation: ComputerBackendAttestation,
 }
 
 impl ComputerUseService {
+    /// Construct an embedder-provided backend. Public backend claims remain
+    /// unproven until GrokPtah binds the exact built-in implementation.
     pub fn new(backend: Arc<dyn ComputerBackend>, store: ComputerStore) -> Self {
+        Self::new_trusted(backend, store, ComputerBackendAttestation::unproven())
+    }
+
+    /// Construct the built-in simulator. The attestation is bound to the same
+    /// simulator instance retained by this service and cannot be transferred
+    /// to an arbitrary downstream backend.
+    pub fn new_simulator(
+        backend: Arc<super::simulator::SimulatorBackend>,
+        store: ComputerStore,
+    ) -> Self {
+        let backend_attestation = backend.host_attestation();
+        Self::new_trusted(backend, store, backend_attestation)
+    }
+
+    pub(crate) fn new_trusted(
+        backend: Arc<dyn ComputerBackend>,
+        store: ComputerStore,
+        backend_attestation: ComputerBackendAttestation,
+    ) -> Self {
         Self {
             backend,
             store,
             policy: ComputerPolicy,
+            backend_attestation,
         }
     }
 
     pub fn capabilities(&self) -> super::types::ComputerCapabilities {
-        let mut capabilities = self.backend.capabilities();
-        capabilities.hydrate_legacy();
-        capabilities
+        self.backend_attestation
+            .attest_capabilities(self.backend.capabilities())
+            .unwrap_or_else(|_| super::types::ComputerCapabilities::unproven("unproven"))
     }
 
     pub fn list_runs(&self) -> ComputerResult<Vec<ComputerRun>> {
@@ -205,9 +228,9 @@ impl ComputerUseService {
         }
         let result = (|| {
             self.store.can_create_run()?;
-            let mut capabilities = self.backend.capabilities();
-            capabilities.hydrate_legacy();
-            capabilities.validate()?;
+            let capabilities = self
+                .backend_attestation
+                .attest_capabilities(self.backend.capabilities())?;
             if capabilities.proof.backend_id() == crate::computer_use::MACOS_NATIVE_BACKEND_ID
                 && !matches!(
                     capabilities.proof,
@@ -221,7 +244,7 @@ impl ComputerUseService {
             }
             let interned = self
                 .store
-                .intern_physical_domain(&self.backend.physical_input_domain())?;
+                .intern_physical_domain(self.backend_attestation.physical_domain())?;
             let proof = interned.stamp_proof(capabilities.proof)?;
             proof.validate()?;
             let mut run = ComputerRun::new_with_isolation(
@@ -352,9 +375,9 @@ impl ComputerUseService {
                         }
                         .and_then(|()| self.policy.authorize_observation_exposure(&observation))
                         .and_then(|()| {
-                            let interned = self
-                                .store
-                                .intern_physical_domain(&self.backend.physical_input_domain())?;
+                            let interned = self.store.intern_physical_domain(
+                                self.backend_attestation.physical_domain(),
+                            )?;
                             self.policy
                                 .authorize_surface(&prepared, &interned.binding)?;
                             let (freshness, frame_epoch) =
@@ -1021,6 +1044,21 @@ mod tests {
         }
     }
 
+    fn trusted_fixture_service(
+        backend: Arc<dyn ComputerBackend>,
+        store: ComputerStore,
+    ) -> ComputerUseService {
+        let mut capabilities = backend.capabilities();
+        capabilities.hydrate_legacy();
+        let attestation = ComputerBackendAttestation::trusted(
+            capabilities.proof.backend_id(),
+            capabilities.proof.tier(),
+            backend.physical_input_domain(),
+        )
+        .expect("trusted test backend registration is valid");
+        ComputerUseService::new_trusted(backend, store, attestation)
+    }
+
     #[async_trait::async_trait]
     impl ComputerBackend for EvidenceBackend {
         fn capabilities(&self) -> ComputerCapabilities {
@@ -1191,7 +1229,7 @@ mod tests {
     fn service() -> (Arc<SimulatorBackend>, ComputerUseService) {
         let dir = tempdir().unwrap().keep();
         let backend = Arc::new(SimulatorBackend::new());
-        let service = ComputerUseService::new(
+        let service = ComputerUseService::new_simulator(
             backend.clone(),
             ComputerStore::open(dir.join("computer-use")).unwrap(),
         );
@@ -1220,7 +1258,7 @@ mod tests {
     #[tokio::test]
     async fn backend_cannot_replace_the_host_minted_observation_identity() {
         let dir = tempdir().unwrap();
-        let service = ComputerUseService::new(
+        let service = trusted_fixture_service(
             Arc::new(MismatchedObservationBackend::default()),
             ComputerStore::open(dir.path()).unwrap(),
         );
@@ -1674,7 +1712,7 @@ mod tests {
     #[tokio::test]
     async fn evidence_limit_is_committed_before_returning_the_error() {
         let dir = tempdir().unwrap();
-        let service = ComputerUseService::new(
+        let service = trusted_fixture_service(
             Arc::new(EvidenceBackend::default()),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         );
@@ -1720,7 +1758,7 @@ mod tests {
     async fn evidence_read_requires_current_asset_and_validates_backend_bytes() {
         let dir = tempdir().unwrap();
         let backend = Arc::new(EvidenceBackend::default());
-        let service = ComputerUseService::new(
+        let service = trusted_fixture_service(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         );
@@ -1884,7 +1922,7 @@ mod tests {
     async fn concurrent_actions_execute_the_backend_at_most_once() {
         let dir = tempdir().unwrap();
         let backend = Arc::new(BlockingBackend::default());
-        let service = Arc::new(ComputerUseService::new(
+        let service = Arc::new(trusted_fixture_service(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         ));
@@ -1964,7 +2002,7 @@ mod tests {
     async fn cancellation_wins_over_an_inflight_action_completion() {
         let dir = tempdir().unwrap();
         let backend = Arc::new(BlockingBackend::default());
-        let service = Arc::new(ComputerUseService::new(
+        let service = Arc::new(trusted_fixture_service(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         ));
@@ -2329,7 +2367,7 @@ mod tests {
         let owner = Uuid::new_v4();
         let run_id;
         {
-            let service = ComputerUseService::new(
+            let service = ComputerUseService::new_simulator(
                 Arc::new(SimulatorBackend::new()),
                 ComputerStore::open(dir.join("computer-use")).unwrap(),
             );
@@ -2354,7 +2392,7 @@ mod tests {
                 .unwrap();
         }
 
-        let service = ComputerUseService::new(
+        let service = ComputerUseService::new_simulator(
             Arc::new(SimulatorBackend::new()),
             ComputerStore::open(dir.join("computer-use")).unwrap(),
         );
@@ -2467,7 +2505,7 @@ mod tests {
     #[tokio::test]
     async fn background_fixture_cannot_activate_and_isolated_fixture_can_pointer() {
         let dir = tempdir().unwrap();
-        let background = ComputerUseService::new(
+        let background = ComputerUseService::new_simulator(
             Arc::new(SimulatorBackend::measured_background_safe()),
             ComputerStore::open(dir.path().join("bg")).unwrap(),
         );
@@ -2520,7 +2558,7 @@ mod tests {
             ComputerErrorCode::ForbiddenAction
         );
 
-        let isolated = ComputerUseService::new(
+        let isolated = ComputerUseService::new_simulator(
             Arc::new(SimulatorBackend::independently_isolated()),
             ComputerStore::open(dir.path().join("iso")).unwrap(),
         );
@@ -2593,7 +2631,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let backend = Arc::new(BlockingBackend::default());
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
-        let service = ComputerUseService::new(backend.clone(), store);
+        let service = trusted_fixture_service(backend.clone(), store);
         let owner = Uuid::new_v4();
         let run_a = service
             .create_run(
@@ -2683,8 +2721,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let backend = Arc::new(SimulatorBackend::new());
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
-        let first = ComputerUseService::new(backend.clone(), store.clone());
-        let second = ComputerUseService::new(backend, store);
+        let first = ComputerUseService::new_simulator(backend.clone(), store.clone());
+        let second = ComputerUseService::new_simulator(backend, store);
         let owner = Uuid::new_v4();
         let run_a = first
             .create_run(
@@ -2864,6 +2902,56 @@ mod tests {
     #[derive(Debug)]
     struct UnprovenBackend;
 
+    #[derive(Debug)]
+    struct ForgedIsolatedBackend {
+        claimed_domain: crate::computer_use::PhysicalInputDomain,
+    }
+
+    impl ForgedIsolatedBackend {
+        fn new(domain: &str) -> Self {
+            Self {
+                claimed_domain: crate::computer_use::PhysicalInputDomain::attested(
+                    "attacker", domain,
+                )
+                .expect("forged fixture domain is syntactically valid"),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for ForgedIsolatedBackend {
+        fn capabilities(&self) -> ComputerCapabilities {
+            SimulatorBackend::independently_isolated().capabilities()
+        }
+
+        fn physical_input_domain(&self) -> crate::computer_use::PhysicalInputDomain {
+            self.claimed_domain.clone()
+        }
+
+        async fn observe(
+            &self,
+            _run_id: &str,
+            _observation_id: &str,
+            _target: &ComputerTarget,
+            _limits: &ComputerUseLimits,
+        ) -> ComputerResult<ComputerObservation> {
+            panic!("an unattested backend must never receive observation dispatch")
+        }
+
+        async fn act(
+            &self,
+            _run_id: &str,
+            _observation: &ComputerObservation,
+            _action: &ComputerAction,
+        ) -> ComputerResult<ActionOutcome> {
+            panic!("an unattested backend must never receive action dispatch")
+        }
+
+        async fn cancel(&self, _run_id: &str) -> ComputerResult<()> {
+            panic!("an unattested backend must never receive cancellation dispatch")
+        }
+    }
+
     #[async_trait::async_trait]
     impl ComputerBackend for UnprovenBackend {
         fn capabilities(&self) -> ComputerCapabilities {
@@ -2922,6 +3010,45 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::ForbiddenAction);
+    }
+
+    #[test]
+    fn public_backend_cannot_self_attest_isolation_or_parallel_input_domains() {
+        let dir = tempdir().unwrap();
+        let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
+        let first = ComputerUseService::new(
+            Arc::new(ForgedIsolatedBackend::new("forged-domain-a")),
+            store.clone(),
+        );
+        let second = ComputerUseService::new(
+            Arc::new(ForgedIsolatedBackend::new("forged-domain-b")),
+            store.clone(),
+        );
+
+        assert_eq!(
+            first.capabilities().tier,
+            crate::computer_use::ComputerCapabilityTier::Unproven
+        );
+        assert_eq!(
+            second.capabilities().tier,
+            crate::computer_use::ComputerCapabilityTier::Unproven
+        );
+        for (request_id, service) in [("forged-a", &first), ("forged-b", &second)] {
+            assert_eq!(
+                service
+                    .create_run(
+                        request_id,
+                        &ComputerAuthorityToken::local_operator(Uuid::new_v4()).unwrap(),
+                        None,
+                        SimulatorBackend::demo_target(),
+                        Default::default(),
+                    )
+                    .unwrap_err()
+                    .code,
+                ComputerErrorCode::ForbiddenAction
+            );
+        }
+        assert!(store.list_runs().unwrap().is_empty());
     }
 
     async fn authorized_ready(
@@ -3004,7 +3131,7 @@ mod tests {
     async fn epoch_changing_exact_retries_return_the_original_typed_result_once() {
         let backend = Arc::new(CountingBackend::new());
         let dir = tempdir().unwrap().keep();
-        let service = ComputerUseService::new(
+        let service = trusted_fixture_service(
             backend.clone(),
             ComputerStore::open(dir.join("computer-use")).unwrap(),
         );

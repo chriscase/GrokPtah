@@ -91,7 +91,7 @@ impl DesktopComputerUse {
             ),
         };
         let simulator = store.clone().map(|store| {
-            Arc::new(ComputerUseService::new(
+            Arc::new(ComputerUseService::new_simulator(
                 Arc::new(SimulatorBackend::new()),
                 store,
             ))
@@ -199,11 +199,10 @@ impl DesktopComputerUse {
             .ok_or_else(|| {
                 "Computer Use selection is stale; refresh the window list".to_string()
             })?;
-        let backend = platform
-            .bind_target(selection_token)
+        let service = platform
+            .bind_target_service(selection_token, store)
             .await
             .map_err(|error| error.to_string())?;
-        let service = ComputerUseService::new(backend, store);
         let limits = ComputerUseLimits {
             max_actions: 1,
             max_duration_secs: 5 * 60,
@@ -400,15 +399,16 @@ impl DesktopComputerUse {
             return Err("The reviewed Computer Use target no longer matches".into());
         }
         let platform = self.platform()?;
-        let backend = platform
-            .bind_target(selection_token)
-            .await
-            .map_err(|error| error.to_string())?;
         let store = self
             .store
             .clone()
             .ok_or_else(|| self.initialization_error())?;
-        let service = Arc::new(ComputerUseService::new(backend, store));
+        let service = Arc::new(
+            platform
+                .bind_target_service(selection_token, store)
+                .await
+                .map_err(|error| error.to_string())?,
+        );
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,
@@ -947,126 +947,18 @@ fn unsupported_status(detail: Option<String>) -> ComputerPlatformStatus {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use async_trait::async_trait;
-    use grokptah_agent_bridge::computer_use::{ObservationGeometry, SemanticElement, Sensitivity};
-    use grokptah_agent_bridge::{
-        ActionOutcome, ComputerBackend, ComputerCapabilityProof, ComputerStore, ComputerTarget,
-        PhysicalInputDomain,
-    };
+    use grokptah_agent_bridge::computer_use::{ObservationGeometry, Sensitivity};
+    use grokptah_agent_bridge::{ComputerStore, ComputerTarget};
 
     use super::*;
 
     const NATIVE_TEST_APP_ID: &str = "com.example.grokptah-native-fixture";
 
     #[derive(Debug)]
-    struct NativeTestBackend {
-        target: ComputerTarget,
-        actions: Arc<AtomicUsize>,
-        domain: PhysicalInputDomain,
-    }
-
-    #[async_trait]
-    impl ComputerBackend for NativeTestBackend {
-        fn capabilities(&self) -> ComputerCapabilities {
-            ComputerCapabilities::from_proof(ComputerCapabilityProof::ForegroundSemantic {
-                backend_id: "native_test_backend".into(),
-                observe: true,
-                semantic_actions: true,
-                text_entry: true,
-            })
-            .expect("native test backend is foreground-semantic")
-        }
-
-        fn physical_input_domain(&self) -> PhysicalInputDomain {
-            self.domain.clone()
-        }
-
-        async fn observe(
-            &self,
-            _run_id: &str,
-            observation_id: &str,
-            target: &ComputerTarget,
-            limits: &ComputerUseLimits,
-        ) -> Result<ComputerObservation, ComputerError> {
-            if target != &self.target {
-                return Err(ComputerError::new(
-                    grokptah_agent_bridge::ComputerErrorCode::ForbiddenTarget,
-                    "test target changed",
-                ));
-            }
-            let observation = ComputerObservation {
-                observation_id: observation_id.to_string(),
-                sequence: 1,
-                target: self.target.clone(),
-                captured_at: Utc::now(),
-                geometry: ObservationGeometry {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 720.0,
-                    height: 520.0,
-                    scale_factor: 1.0,
-                },
-                screenshot: None,
-                elements: vec![SemanticElement {
-                    element_id: "native-name".into(),
-                    role: "AXTextField".into(),
-                    label: Some("Project label".into()),
-                    value: Some("before".into()),
-                    bounds: None,
-                    enabled: true,
-                    focused: false,
-                    sensitivity: Sensitivity::None,
-                    actions: BTreeSet::from([SemanticAction::SetValue]),
-                }],
-                elements_truncated: false,
-                sensitivity: Sensitivity::None,
-                authority: Default::default(),
-            };
-            observation.validate(limits)?;
-            Ok(observation)
-        }
-
-        async fn act(
-            &self,
-            _run_id: &str,
-            observation: &ComputerObservation,
-            action: &ComputerAction,
-        ) -> Result<ActionOutcome, ComputerError> {
-            if observation.target != self.target
-                || !matches!(
-                    action,
-                    ComputerAction::SetValue { element_id, .. } if element_id == "native-name"
-                )
-            {
-                return Err(ComputerError::new(
-                    grokptah_agent_bridge::ComputerErrorCode::ForbiddenAction,
-                    "test action escaped its semantic binding",
-                ));
-            }
-            self.actions.fetch_add(1, Ordering::SeqCst);
-            Ok(ActionOutcome::bounded("native test action", Some(true)))
-        }
-
-        async fn act_if_current(
-            &self,
-            run_id: &str,
-            observation: &ComputerObservation,
-            action: &ComputerAction,
-        ) -> Result<ActionOutcome, ComputerError> {
-            self.act(run_id, observation, action).await
-        }
-
-        async fn cancel(&self, _run_id: &str) -> Result<(), ComputerError> {
-            Ok(())
-        }
-    }
-
-    #[derive(Debug)]
     struct NativeTestPlatform {
         candidate: ComputerTargetCandidate,
-        actions: Arc<AtomicUsize>,
+        backend: Arc<SimulatorBackend>,
         available: std::sync::Mutex<bool>,
     }
 
@@ -1095,10 +987,11 @@ mod tests {
             Ok(vec![self.candidate.clone()])
         }
 
-        async fn bind_target(
+        async fn bind_target_service(
             &self,
             selection_token: &str,
-        ) -> Result<Arc<dyn ComputerBackend>, ComputerError> {
+            store: ComputerStore,
+        ) -> Result<ComputerUseService, ComputerError> {
             let mut available = self.available.lock().unwrap();
             if selection_token != self.candidate.selection_token || !*available {
                 return Err(ComputerError::new(
@@ -1107,12 +1000,10 @@ mod tests {
                 ));
             }
             *available = false;
-            Ok(Arc::new(NativeTestBackend {
-                target: self.candidate.target.clone(),
-                actions: self.actions.clone(),
-                domain: PhysicalInputDomain::attested("desktop-native-test", NATIVE_TEST_APP_ID)
-                    .expect("native test domain is attested"),
-            }))
+            Ok(ComputerUseService::new_simulator(
+                self.backend.clone(),
+                store,
+            ))
         }
     }
 
@@ -1128,7 +1019,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _guard = grokptah_agent_bridge::home_override_serial();
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
-        let simulator = Arc::new(ComputerUseService::new(
+        let simulator = Arc::new(ComputerUseService::new_simulator(
             Arc::new(SimulatorBackend::new()),
             store.clone(),
         ));
@@ -1157,11 +1048,10 @@ mod tests {
     fn native_test_desktop() -> (
         tempfile::TempDir,
         DesktopComputerUse,
-        Arc<AtomicUsize>,
+        Arc<SimulatorBackend>,
         Uuid,
     ) {
         let (dir, mut desktop, owner) = test_desktop();
-        let actions = Arc::new(AtomicUsize::new(0));
         let target = ComputerTarget {
             app_id: NATIVE_TEST_APP_ID.into(),
             window_id: "native-window".into(),
@@ -1169,6 +1059,8 @@ mod tests {
             display_name: "Disposable Native Fixture".into(),
             sensitivity: Sensitivity::None,
         };
+        let backend =
+            Arc::new(SimulatorBackend::foreground_semantic_for_target(target.clone()).unwrap());
         desktop.platform = Some(Arc::new(NativeTestPlatform {
             candidate: ComputerTargetCandidate {
                 selection_token: "native-selection".into(),
@@ -1184,10 +1076,10 @@ mod tests {
                 active: true,
                 minimized: false,
             },
-            actions: actions.clone(),
+            backend: backend.clone(),
             available: std::sync::Mutex::new(true),
         }));
-        (dir, desktop, actions, owner)
+        (dir, desktop, backend, owner)
     }
 
     #[tokio::test]
@@ -1400,15 +1292,25 @@ mod tests {
 
     #[tokio::test]
     async fn native_run_uses_the_same_exact_one_use_approval_path() {
-        let (_dir, desktop, actions, owner) = native_test_desktop();
+        let (_dir, desktop, backend, owner) = native_test_desktop();
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let started = desktop
             .start_native(owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
             .await
             .unwrap();
-        assert_eq!(started.backend.backend_id, "native_test_backend");
+        assert_eq!(
+            started.backend.backend_id,
+            grokptah_agent_bridge::SIMULATOR_FOREGROUND_BACKEND_ID
+        );
         let run = started.local.unwrap();
         let observation = run.observation.as_ref().unwrap();
+        let element_id = observation
+            .elements
+            .iter()
+            .find(|element| element.actions.contains(&SemanticAction::SetValue))
+            .unwrap()
+            .element_id
+            .clone();
         let staged = desktop
             .stage_simulator_action(
                 owner,
@@ -1416,28 +1318,25 @@ mod tests {
                 run.version,
                 &observation.observation_id,
                 ComputerAction::SetValue {
-                    element_id: "native-name".into(),
+                    element_id,
                     text: "after".into(),
                 },
             )
             .await
             .unwrap();
         let approval = staged.pending_approval.unwrap();
-        assert_eq!(
-            approval.action_summary,
-            "Enter visible text in Project label"
-        );
+        assert_eq!(approval.action_summary, "Enter visible text in Name");
         let acted = desktop
             .approve_simulator_action(owner, &approval.approval_id, "native-approve-once")
             .await
             .unwrap();
-        assert_eq!(actions.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.mutation_count(), 1);
         assert_eq!(acted.local.unwrap().state, ComputerRunState::Paused);
         assert!(desktop
             .approve_simulator_action(owner, &approval.approval_id, "native-approve-once")
             .await
             .is_err());
-        assert_eq!(actions.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.mutation_count(), 1);
     }
 
     #[tokio::test]

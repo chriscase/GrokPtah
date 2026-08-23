@@ -607,6 +607,88 @@ impl PhysicalInputDomain {
     }
 }
 
+/// Opaque host attestation for one compiled-in Computer backend.
+///
+/// The public `ComputerBackend` trait remains implementable by embedders, but
+/// the public service constructor is deliberately unproven. Trusted
+/// constructors are crate-private, so an arbitrary backend cannot turn a
+/// self-selected backend id or physical-domain fingerprint into
+/// background/isolated authority.
+#[derive(Debug, Clone)]
+pub(crate) struct ComputerBackendAttestation {
+    trust: ComputerBackendTrust,
+    physical_domain: PhysicalInputDomain,
+}
+
+#[derive(Debug, Clone)]
+enum ComputerBackendTrust {
+    Unproven,
+    Trusted {
+        backend_id: String,
+        tier: ComputerCapabilityTier,
+    },
+}
+
+impl ComputerBackendAttestation {
+    /// Fail-closed attestation used by every downstream backend unless the
+    /// GrokPtah host registry recognizes its compiled-in implementation.
+    pub(crate) fn unproven() -> Self {
+        Self {
+            trust: ComputerBackendTrust::Unproven,
+            // Unknown backends share the native foreground conflict domain.
+            // They cannot manufacture parallel capacity by varying a string.
+            physical_domain: macos_native_physical_input_domain(),
+        }
+    }
+
+    pub(crate) fn trusted(
+        backend_id: impl Into<String>,
+        tier: ComputerCapabilityTier,
+        physical_domain: PhysicalInputDomain,
+    ) -> ComputerResult<Self> {
+        let backend_id = backend_id.into();
+        validate_id("backend_id", &backend_id)?;
+        if tier == ComputerCapabilityTier::Unproven {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "trusted backend attestation requires a proven tier",
+            ));
+        }
+        Ok(Self {
+            trust: ComputerBackendTrust::Trusted { backend_id, tier },
+            physical_domain,
+        })
+    }
+
+    pub(crate) fn physical_domain(&self) -> &PhysicalInputDomain {
+        &self.physical_domain
+    }
+
+    pub(crate) fn attest_capabilities(
+        &self,
+        mut claimed: ComputerCapabilities,
+    ) -> ComputerResult<ComputerCapabilities> {
+        match &self.trust {
+            ComputerBackendTrust::Unproven => Ok(ComputerCapabilities::unproven("unproven")),
+            ComputerBackendTrust::Trusted { backend_id, tier } => {
+                claimed.hydrate_legacy();
+                claimed.validate()?;
+                if claimed.backend_id != *backend_id
+                    || claimed.proof.backend_id() != backend_id
+                    || claimed.tier != *tier
+                    || claimed.proof.tier() != *tier
+                {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::Unauthorized,
+                        "backend capability claim does not match its host attestation",
+                    ));
+                }
+                Ok(claimed)
+            }
+        }
+    }
+}
+
 /// Host-minted opaque surface identity plus incarnation. Native process and
 /// window handles must never appear here. Prefixes are not proof of issuance;
 /// only the host surface registry mints these identities.
@@ -1918,8 +2000,9 @@ impl ComputerRun {
 pub trait ComputerBackend: Send + Sync + std::fmt::Debug {
     fn capabilities(&self) -> ComputerCapabilities;
 
-    /// Stable attested physical input domain. The host interns this into a
-    /// shared surface binding; backends must not mint surface authority.
+    /// Legacy/advisory backend domain. The service never uses this value as
+    /// authority; only the opaque host attestation supplies the conflict
+    /// domain that is interned into a surface.
     fn physical_input_domain(&self) -> PhysicalInputDomain;
 
     async fn observe(

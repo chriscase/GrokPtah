@@ -39,7 +39,6 @@ async fn main() -> anyhow::Result<()> {
             candidate.target.app_id == DEMO_BUNDLE_ID && candidate.on_screen && !candidate.minimized
         })
         .ok_or_else(|| anyhow::anyhow!("repository Computer Use demo window is not running"))?;
-    let backend = platform.bind_target(&candidate.selection_token).await?;
     let temp = tempfile::tempdir()?;
     set_grokptah_home_override(Some(temp.path().join(".grokptah")));
     let host = AgentHost::create(HostConfig {
@@ -49,10 +48,12 @@ async fn main() -> anyhow::Result<()> {
     host.start()?;
     let session = host.session_new()?;
     let caller = host.computer_operator_token(session.id)?;
-    let service = ComputerUseService::new(
-        backend,
-        ComputerStore::open(temp.path().join("computer-use"))?,
-    );
+    let service = platform
+        .bind_target_service(
+            &candidate.selection_token,
+            ComputerStore::open(temp.path().join("computer-use"))?,
+        )
+        .await?;
     // Live smoke has no AgentHost session cwd. Fail closed with None rather
     // than inventing a workspace from process cwd or the demo bundle path.
     let run = service.create_run(

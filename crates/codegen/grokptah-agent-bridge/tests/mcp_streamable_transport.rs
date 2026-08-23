@@ -2230,7 +2230,7 @@ async fn live_computer_reads_node_smoke() {
 
     let canon = canonical_workspace_string(ws.path()).unwrap();
     let canon_other = canonical_workspace_string(ws_other.path()).unwrap();
-    let computer = ComputerUseService::new(
+    let computer = ComputerUseService::new_simulator(
         std::sync::Arc::new(SimulatorBackend::new()),
         host.ensure_computer_store().unwrap(),
     );
