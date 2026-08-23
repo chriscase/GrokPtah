@@ -111,6 +111,14 @@ fn is_terminal_run(state: Option<&str>) -> bool {
     )
 }
 
+fn allowed_after_sends(before: u64) -> std::ops::RangeInclusive<u64> {
+    if before == 0 {
+        0..=1
+    } else {
+        before..=before
+    }
+}
+
 fn run_error_code(run: &Value) -> &str {
     run["errorCode"].as_str().unwrap_or("")
 }
@@ -706,6 +714,37 @@ async fn tick_once(
     .await;
 }
 
+async fn wait_for_allowed_send_stability(campaign: &Campaign, semantic: &str, before: u64) -> u64 {
+    let mut previous = campaign.provider.count_for(semantic);
+    assert!(
+        allowed_after_sends(before).contains(&previous),
+        "provider sends changed outside the KnownNotSent allowance: before={before} observed={previous}"
+    );
+    let mut stable_periods = 0u64;
+    let deadline = Instant::now()
+        + campaign.fixture.supervisor_period
+            * u32::try_from(campaign.fixture.zero_growth_periods.saturating_add(2))
+                .expect("bounded stability periods");
+    while Instant::now() < deadline {
+        tokio::time::sleep(campaign.fixture.supervisor_period).await;
+        let current = campaign.provider.count_for(semantic);
+        assert!(
+            allowed_after_sends(before).contains(&current),
+            "provider sends changed outside the KnownNotSent allowance: before={before} observed={current}"
+        );
+        if current == previous {
+            stable_periods += 1;
+            if stable_periods >= campaign.fixture.zero_growth_periods {
+                return current;
+            }
+        } else {
+            previous = current;
+            stable_periods = 0;
+        }
+    }
+    panic!("provider sends did not stabilize for {semantic}: before={before} last={previous}");
+}
+
 async fn assert_zero_growth_window(campaign: &mut Campaign, join: &CausalJoin, semantic: &str) {
     let before = cardinalities(&mut campaign.client, campaign.session, &campaign.workspace).await;
     let posts = campaign.provider.count_for(semantic);
@@ -1086,7 +1125,30 @@ async fn scheduler_window_restart_observations_keep_exact_identities() {
                 .await,
             )
         };
+        let before_sends = if semantic.is_empty() {
+            0
+        } else {
+            campaign.provider.count_for(semantic)
+        };
         campaign.reopen().await;
+        if !step_id.is_empty() {
+            tick_once(
+                &mut campaign.client,
+                campaign.session,
+                &campaign.workspace,
+                &plan_id,
+                &format!("{name}-after-reopen-a"),
+            )
+            .await;
+            tick_once(
+                &mut campaign.client,
+                campaign.session,
+                &campaign.workspace,
+                &plan_id,
+                &format!("{name}-after-reopen-b"),
+            )
+            .await;
+        }
         let (plan, work, runs, intents) = observe(
             &mut campaign.client,
             campaign.session,
@@ -1127,7 +1189,12 @@ async fn scheduler_window_restart_observations_keep_exact_identities() {
             assert_eq!(after.run_id, before.run_id, "{name} run changed");
             if matches!(state, Some("succeeded" | "failed")) {
                 assert_eq!(after.work_state.as_str(), state.unwrap());
-                assert_eq!(after.provider_posts, before.provider_posts);
+                assert!(
+                    allowed_after_sends(before.provider_posts).contains(&after.provider_posts),
+                    "{name} provider sends changed outside the KnownNotSent allowance: before={} after={}",
+                    before.provider_posts,
+                    after.provider_posts
+                );
             }
         } else {
             let (before_work_id, before_join) = before_window.expect("scheduler-window work id");
@@ -1158,9 +1225,52 @@ async fn scheduler_window_restart_observations_keep_exact_identities() {
                 assert_eq!(after.run_id, before.run_id, "{name} run changed");
             }
         }
+        if !step_id.is_empty() {
+            let after_sends =
+                wait_for_allowed_send_stability(&campaign, semantic, before_sends).await;
+            tick_once(
+                &mut campaign.client,
+                campaign.session,
+                &campaign.workspace,
+                &plan_id,
+                &format!("{name}-stability-a"),
+            )
+            .await;
+            tick_once(
+                &mut campaign.client,
+                campaign.session,
+                &campaign.workspace,
+                &plan_id,
+                &format!("{name}-stability-b"),
+            )
+            .await;
+            let again_sends = campaign.provider.count_for(semantic);
+            assert_eq!(
+                after_sends, again_sends,
+                "{name} duplicate tick resumed or duplicated a provider send"
+            );
+        }
         campaign.scan();
         certify("scheduler-window-not-a-cutpoint");
         certify("restart-exact-target-identities");
+    }
+}
+
+#[test]
+fn allowed_after_sends_known_not_sent_may_send_once() {
+    let cases: &[(u64, u64, bool)] = &[
+        (0, 0, true),
+        (0, 1, true),
+        (1, 1, true),
+        (1, 2, false),
+        (2, 3, false),
+    ];
+    for (before, after, expected) in cases {
+        assert_eq!(
+            allowed_after_sends(*before).contains(after),
+            *expected,
+            "allowed_after_sends({before}).contains({after})"
+        );
     }
 }
 
@@ -1766,7 +1876,11 @@ async fn soak_one_bounded_cycle() {
     let _ = barrier_restart_on_campaign(&mut campaign).await;
     max.max_with(&campaign.service.sample_tree());
     let duration_ms = started.elapsed().as_millis() as u64;
-    assert!(duration_ms <= campaign.fixture.ceilings.max_cycle_latency_ms);
+    assert!(
+        duration_ms <= campaign.fixture.ceilings.max_cycle_latency_ms,
+        "one-cycle smoke exceeded latency ceiling: actual={duration_ms}ms ceiling={}ms",
+        campaign.fixture.ceilings.max_cycle_latency_ms
+    );
     let growth = max.growth_from(&baseline);
     assert_resource_ceilings(&max, &growth, &campaign.fixture);
     assert!(

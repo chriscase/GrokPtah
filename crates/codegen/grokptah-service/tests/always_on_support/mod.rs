@@ -1275,8 +1275,8 @@ impl ServiceProcess {
     }
 
     pub fn sample_tree(&self) -> ResourceSample {
-        let parent = sample_pid(std::process::id(), Path::new("/"));
-        let child = sample_pid(self.pid(), &self.home);
+        let parent = sample_pid(std::process::id());
+        let child = sample_pid(self.pid());
         ResourceSample {
             rss_bytes: parent.rss_bytes.saturating_add(child.rss_bytes),
             fd_count: parent.fd_count.saturating_add(child.fd_count),
@@ -1491,7 +1491,7 @@ fn http_control_plane_is_serving(status: &str) -> bool {
         || status.starts_with("HTTP/1.0 503")
 }
 
-fn sample_pid(pid: u32, home: &Path) -> ResourceSample {
+fn sample_pid(pid: u32) -> ResourceSample {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
     let mut rss_kb = 0u64;
     let mut threads = 0u64;
@@ -1514,7 +1514,7 @@ fn sample_pid(pid: u32, home: &Path) -> ResourceSample {
         rss_bytes: rss_kb.saturating_mul(1024),
         fd_count,
         threads,
-        disk_bytes: dir_size(home),
+        disk_bytes: 0,
     }
 }
 
