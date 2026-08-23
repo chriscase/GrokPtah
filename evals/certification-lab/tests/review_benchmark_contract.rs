@@ -132,10 +132,11 @@ async fn each_contract_mutation_flips_pass() {
 async fn live_mode_is_indeterminate_without_enterprise_lease() {
     let repository = repository_root();
     let output = tempfile::tempdir().unwrap();
+    let output_root = dunce::canonicalize(output.path()).unwrap();
     let options = ReviewOptions {
         repository_root: repository.clone(),
         campaign_path: repository.join("evals/code-review-benchmark/campaign.v1.json"),
-        output_root: output.path().to_path_buf(),
+        output_root: output_root.clone(),
         artifact_budget_bytes: 128 * 1024 * 1024,
         mode: ReviewMode::Live,
         preflight_only: false,
@@ -148,7 +149,7 @@ async fn live_mode_is_indeterminate_without_enterprise_lease() {
     assert_eq!(completion.verdict, ReviewVerdict::Indeterminate);
     assert!(!completion.quality_claim_eligible);
     let campaign =
-        grokptah_certification_lab::review_runner::latest_review_campaign_dir(output.path())
+        grokptah_certification_lab::review_runner::latest_review_campaign_dir(&output_root)
             .unwrap();
     let report = inspect_review_campaign(&campaign).unwrap();
     assert_eq!(report.verdict, ReviewVerdict::Indeterminate);
@@ -165,13 +166,14 @@ async fn live_mode_is_indeterminate_without_enterprise_lease() {
 async fn fake_review_cli_seals_and_inspects() {
     let repository = repository_root();
     let output = tempfile::tempdir().unwrap();
+    let output_root = dunce::canonicalize(output.path()).unwrap();
     let review = Cli {
         command: Command::Review(ReviewArgs {
             repository: RepositoryArgs {
                 repository: repository.clone(),
             },
             campaign: None,
-            output: Some(output.path().to_path_buf()),
+            output: Some(output_root.clone()),
             live: false,
             preflight: false,
             artifact_budget_bytes: 128 * 1024 * 1024,
@@ -179,7 +181,7 @@ async fn fake_review_cli_seals_and_inspects() {
     };
     assert_eq!(execute(review).await, ExitClass::Passed);
     let campaign =
-        grokptah_certification_lab::review_runner::latest_review_campaign_dir(output.path())
+        grokptah_certification_lab::review_runner::latest_review_campaign_dir(&output_root)
             .unwrap();
     let inspect = Cli {
         command: Command::Inspect(InspectArgs {
@@ -205,17 +207,18 @@ async fn fake_review_cli_seals_and_inspects() {
 async fn sealed_completion_hash_matches_report_bytes_and_inspect() {
     let repository = repository_root();
     let output = tempfile::tempdir().unwrap();
+    let output_root = dunce::canonicalize(output.path()).unwrap();
     let options = ReviewOptions {
         repository_root: repository.clone(),
         campaign_path: repository.join("evals/code-review-benchmark/campaign.v1.json"),
-        output_root: output.path().to_path_buf(),
+        output_root: output_root.clone(),
         artifact_budget_bytes: 128 * 1024 * 1024,
         mode: ReviewMode::Fake,
         preflight_only: false,
     };
     let completion = run_review(&options).await.unwrap();
     let campaign =
-        grokptah_certification_lab::review_runner::latest_review_campaign_dir(output.path())
+        grokptah_certification_lab::review_runner::latest_review_campaign_dir(&output_root)
             .unwrap();
     let report_bytes = std::fs::read(campaign.join("report.json")).unwrap();
     assert_eq!(completion.report_sha256, digest(&report_bytes));
@@ -239,17 +242,18 @@ async fn sealed_completion_hash_matches_report_bytes_and_inspect() {
 async fn inspect_fails_on_missing_or_mismatched_implementation_artifact() {
     let repository = repository_root();
     let output = tempfile::tempdir().unwrap();
+    let output_root = dunce::canonicalize(output.path()).unwrap();
     let options = ReviewOptions {
         repository_root: repository.clone(),
         campaign_path: repository.join("evals/code-review-benchmark/campaign.v1.json"),
-        output_root: output.path().to_path_buf(),
+        output_root: output_root.clone(),
         artifact_budget_bytes: 128 * 1024 * 1024,
         mode: ReviewMode::Fake,
         preflight_only: false,
     };
     run_review(&options).await.unwrap();
     let campaign =
-        grokptah_certification_lab::review_runner::latest_review_campaign_dir(output.path())
+        grokptah_certification_lab::review_runner::latest_review_campaign_dir(&output_root)
             .unwrap();
     let identity = campaign.join("contract/implementation.json");
     let original = std::fs::read(&identity).unwrap();
