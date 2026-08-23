@@ -496,6 +496,10 @@ remote bearers remain coordinator-scoped.
     its production issuance/rotation from stage 3 apply);
   - **retained evidence** (attempt history, artifacts, ordered events
     suitable for cursor replay and audit).
+  The secret-free evidence shape is defined in
+  [`WORKER_CERTIFICATION_EVIDENCE.md`](WORKER_CERTIFICATION_EVIDENCE.md) and
+  enforced by `worker_certification_evidence.rs`; it does not substitute for
+  the dated production-shaped campaign.
   Documented #305 **non-goals** may remain Explicitly unsupported: scheduler
   or webhook adapters, model-based prioritizer, automatic permission
   approval/promotion, distributed consensus or multi-node scheduler, public

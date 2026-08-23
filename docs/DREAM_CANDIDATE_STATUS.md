@@ -64,6 +64,10 @@ complete or that the product has reached 100%.
   assembled SHA, packaged-window surfaces/workflows, visual state matrix,
   accessibility checks, and severity disposition. It remains an evidence
   contract; no dated expert review is claimed yet.
+- The independent-worker evidence contract now binds exact-candidate
+  multi-worker leases, restart/no-duplicate outcomes, per-worker credential
+  issuance and rotation, retained audit evidence, and a measured 72-hour soak.
+  It remains a contract until a real production-shaped campaign is executed.
 - Shared desktop/hosted black-box parity is present as a fail-closed fixture.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
@@ -129,6 +133,9 @@ unrelated signal.
 - UI review evidence suite: 4 passed, covering complete packaged evidence,
   missing visual states, unresolved P1 findings, malformed digests, unknown
   fields, and missing deferred tracking.
+- Independent-worker evidence suite: 4 passed, covering complete multi-worker
+  evidence, short-soak and duplicate-execution denial, missing checks,
+  credential-rotation denial, and unknown fields.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.

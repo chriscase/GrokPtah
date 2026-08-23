@@ -55,6 +55,7 @@ mod textutil;
 mod todo_list;
 mod types;
 pub mod ui_review_evidence;
+pub mod worker_certification_evidence;
 mod worktree_gc;
 
 pub use agents_personas::{
@@ -125,6 +126,11 @@ pub use ui_review_evidence::{
     UiReviewAccessibilityEvidence, UiReviewCadence, UiReviewDisposition, UiReviewEvidence,
     UiReviewEvidenceError, UiReviewFinding, UiReviewSeverity, UiReviewStateEvidence,
     REQUIRED_UI_REVIEW_STATES, UI_REVIEW_EVIDENCE_SCHEMA,
+};
+pub use worker_certification_evidence::{
+    LongRunningWorkerEvidence, WorkerCertificationEvidenceError, WorkerCheckEvidence,
+    WorkerCredentialLifecycleEvidence, REQUIRED_SOAK_SECONDS, REQUIRED_WORKER_CHECKS,
+    WORKER_CERTIFICATION_EVIDENCE_SCHEMA,
 };
 
 /// Coding-agent efficiency guidance (system prompt fragment for multi-file / multi-bug turns).
