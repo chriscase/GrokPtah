@@ -84,9 +84,37 @@ Public projections expose `capabilityTier`, opaque `surfaceId` / `surfaceIncarna
 window handles, raw attestation material, agent IDs, spec revisions, input-domain IDs, or
 measurement IDs.
 
+### Measured-background text entry candidate
+
+The Stage 8 candidate implements one deliberately narrow native instance of
+`measured_background_safe_semantic`: visible Accessibility `set value` on one exact, locally
+calibrated text field. It is not inferred from an application name, bundle allowlist, AX action
+name, hidden window, or successful foreground action.
+
+Calibration requires the local operator to select an exact visible, non-minimized background
+window, name one unambiguous non-secure text field, and acknowledge that the target is disposable.
+GrokPtah changes that field to a distinct probe value, measures the frontmost process, active
+foreground window, and physical pointer before and after native dispatch, verifies the AX
+postcondition, restores the original value through the same measured path, and re-observes the
+restored value. Any ambiguous label, unreadable value, secure/sensitive field, truncated tree,
+foreground transition, pointer movement, active-window change, restore failure, or uncertain
+native outcome fails closed.
+
+Success returns an opaque, two-minute, one-use receipt bound to the exact picker token, target
+generation, native process/window identity, and semantic-element digest. Consuming it creates a
+run whose proof and grant allow `text_entry` only. Every real action repeats exact target/tree
+freshness checks plus native foreground-app, active-window, pointer, and postcondition measurement.
+There is no activation, raw input, clipboard, cross-application switch, or silent foreground
+fallback. `invoke`, `select`, `scroll`, and arbitrary targets remain unsupported at this tier until
+they receive their own measured calibration and evidence.
+
+This is a source-qualified candidate, not a claim that [#287](https://github.com/chriscase/GrokPtah/issues/287)
+or Stage 8 is complete. Packaged native disposable-fixture evidence, strict Rust/native
+qualification, and the remaining per-action/target dispositions are still required.
+
 This stage does **not** implement an isolated helper process, visual compositor, agent cursor
-UI, background Accessibility execution, pointer/keyboard injection on the real desktop, or
-out-of-band preemptive takeover. Those remain later stages; this contract makes them
+UI, general background Accessibility execution, pointer/keyboard injection on the real desktop,
+or physically reversible takeover after an atomic OS API begins. Those remain later stages; this contract makes them
 structurally representable without lying that macOS is isolated today. The candidate now applies
 role-scoped bearer authority and immutable session/workspace grants to MCP Computer reads;
 packaged hardware/TCC/takeover remain fail-closed or unverified. The host now does implement the
@@ -377,10 +405,12 @@ deterministic simulator. Its report is redacted and explicitly records that no a
 ## macOS observation and semantic action slices (#269, #270)
 
 The native adapter uses a runtime-loaded ScreenCaptureKit shim plus Accessibility semantic
-snapshots behind the same platform-neutral backend. It advertises **foreground-semantic**
-capability only (`pointer_fallback=false`, `key_chords=false`). Bringing the real target to
-the foreground is an authorized, disruptive `ActivateTarget`, not an isolated or background-safe
-action. The Computer Run cockpit exposes non-prompting status, explicit per-permission requests,
+snapshots behind the same platform-neutral backend. Its established path advertises
+**foreground-semantic** capability (`pointer_fallback=false`, `key_chords=false`). The Stage 8
+candidate adds a separate exact measured-background text-entry backend and proof; it never upgrades
+the foreground backend by inference. Bringing the real target to the foreground remains an
+authorized, disruptive `ActivateTarget`, not an isolated or background-safe action. The Computer
+Run cockpit exposes non-prompting status, explicit per-permission requests,
 bounded window discovery, exact scope review, one-use approvals, evidence and audit visibility,
 pause, Stop, Take over, and non-cancelling steering. Native actions are limited to activation,
 Accessibility invoke, visible value entry, selection, and semantic scrolling. Every mutation
@@ -394,7 +424,7 @@ attestation, packaging requirements, and disposable smoke fixture.
 - no unattended or continuously autonomous model invocation;
 - no MCP mutation/evidence surface;
 - no raw arbitrary keyboard, pointer, coordinate fallback, clipboard, AppleScript, or shell endpoint;
-- no background or unattended grant;
+- no unattended, cross-target, or inferred background grant;
 - no cross-application target switching inside a run.
 
 ## Delivery sequence
@@ -409,6 +439,7 @@ attestation, packaging requirements, and disposable smoke fixture.
 | Coordinator interoperability | #271 | Scoped Computer Run MCP tools and event visibility |
 | WorkAttempt surface coordination | current stacked draft | Host-resolved Agent/Work/spec authority, deterministic per-domain queue, exact-current frame fence, durable dispatch identity, restart/expiry outcomes, secret-free local queue/owner projection |
 | Out-of-band native cancellation channel | stacked candidate | Exact per-action atomic signal; Stop/Take over no longer wait on the action gate and preempt native preflight/activation waits. An atomic AX call already entered remains uncertain and non-replayable; external Rust/native qualification pending |
+| Measured background text entry | stacked candidate | Reversible disposable-target calibration, one-use exact receipt, text-entry-only proof/grant, and native before/after foreground-app, active-window, pointer, and postcondition measurement. No activation or raw fallback; packaged native and strict external qualification pending; #287 remains open. |
 | Isolated helper / input domain | later | Host-native independently isolated visual input, not a simulator fixture |
 | Semantic-first isolated visual fallback | later | Isolated visual input after semantic miss, never boolean-upgraded native AX |
 | App-owned exact Run surface / always-available Stop | stacked candidate | Exact binding, per-Run approvals, persistent shell controls; external Rust qualification pending |

@@ -633,8 +633,17 @@ preview.
 **Depends on:** stage 7 (activity/attention events without OS-pointer
 takeover).
 
-**Exists today:** Foreground activation required (`GPTTargetIsFocused`).
-[#287](https://github.com/chriscase/GrokPtah/issues/287) **open**.
+**Exists today:** The shipped/base native path requires foreground activation
+(`GPTTargetIsFocused`). A stacked source-qualified candidate adds one narrow
+measured-background path: reversible disposable-target calibration and a
+short-lived, one-use, exact target/process/window/element receipt for visible
+text entry only. Native dispatch measures the foreground process, active
+window, and physical pointer before/after, rechecks that the target remains
+background, and denies activation/raw fallback. The cockpit visibly separates
+the two modes. Deterministic source/UI tests pass; strict external Rust/native
+and packaged disposable-fixture evidence are pending. Invoke/select/scroll and
+unsupported-target dispositions remain open. [#287](https://github.com/chriscase/GrokPtah/issues/287)
+**open**; this candidate does not meet the full stage exit.
 
 **Exit:** every [#287](https://github.com/chriscase/GrokPtah/issues/287)
 acceptance criterion, including: a supported background action leaves

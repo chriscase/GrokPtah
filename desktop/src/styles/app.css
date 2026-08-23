@@ -5282,6 +5282,68 @@ button:disabled {
   justify-self: start;
 }
 
+.computer-background-calibration {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.7rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--overlay-soft) 82%, transparent);
+}
+
+.computer-background-calibration .computer-launch-mode {
+  justify-self: start;
+  margin: 0;
+}
+
+.computer-background-probe {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.computer-background-probe > .settings-hint,
+.computer-background-probe > .computer-scope-check,
+.computer-background-probe > .computer-background-proof {
+  grid-column: 1 / -1;
+}
+
+.computer-background-probe > label:not(.computer-scope-check) {
+  display: grid;
+  gap: 0.3rem;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.computer-background-probe input[type="text"],
+.computer-background-probe label:not(.computer-scope-check) input {
+  min-width: 0;
+}
+
+.computer-background-probe > button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.computer-background-proof {
+  display: flex;
+  gap: 0.35rem 0.65rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 48%, var(--border-soft));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  color: var(--text);
+  font-size: 11px;
+}
+
+.computer-background-proof span {
+  color: var(--muted);
+}
+
 .computer-native-permissions {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
@@ -6016,6 +6078,28 @@ button:disabled {
 
   .computer-native-permissions > button {
     justify-self: start;
+  }
+
+  .computer-background-probe {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .computer-background-probe > * {
+    grid-column: 1;
+  }
+
+  .computer-background-calibration .computer-launch-mode {
+    display: grid;
+    width: 100%;
+  }
+
+  .computer-background-calibration .computer-launch-mode button {
+    border-right: 0;
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .computer-background-calibration .computer-launch-mode button:last-child {
+    border-bottom: 0;
   }
 }
 

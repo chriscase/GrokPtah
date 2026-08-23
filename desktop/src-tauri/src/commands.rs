@@ -976,6 +976,48 @@ pub async fn computer_use_cockpit_start_native(
 }
 
 #[tauri::command]
+pub async fn computer_use_measure_background_text_entry(
+    state: State<'_, AppState>,
+    session_id: String,
+    selection_token: String,
+    reviewed_target_app_id: String,
+    element_label: String,
+    probe_text: String,
+    disposable_target_acknowledged: bool,
+) -> Result<grokptah_agent_bridge::ComputerBackgroundSafetyReceipt, String> {
+    let _owner = computer_work_owner(&state, &session_id)?;
+    state
+        .computer_use
+        .measure_background_text_entry(
+            &selection_token,
+            &reviewed_target_app_id,
+            &element_label,
+            &probe_text,
+            disposable_target_acknowledged,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_start_measured_background(
+    state: State<'_, AppState>,
+    session_id: String,
+    selection_token: String,
+    measurement_token: String,
+    reviewed_target_app_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .start_measured_background(
+            computer_work_owner(&state, &session_id)?,
+            &selection_token,
+            &measurement_token,
+            &reviewed_target_app_id,
+        )
+        .await
+}
+
+#[tauri::command]
 pub async fn computer_use_cockpit_refresh(
     state: State<'_, AppState>,
     session_id: String,

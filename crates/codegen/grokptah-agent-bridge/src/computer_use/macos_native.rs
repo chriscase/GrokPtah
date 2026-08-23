@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use super::macos_observation::{
     MacActionCancellation, MacActionCancellationSignal, MacNativeIdentity, MacObservationSource,
-    RawMacActionRequest, RawMacObservation, RawMacSemanticAction, RawMacSemanticNode, RawMacTarget,
+    MacSemanticExecutionMode, RawMacActionRequest, RawMacObservation, RawMacSemanticAction,
+    RawMacSemanticNode, RawMacTarget,
 };
 use super::platform::{ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus};
 use super::types::{
@@ -285,6 +286,10 @@ impl MacObservationSource for NativeMacObservationSource {
         )))
     }
 
+    fn supports_measured_background(&self) -> bool {
+        true
+    }
+
     async fn act(
         &self,
         identity: &MacNativeIdentity,
@@ -354,6 +359,7 @@ fn native_error_code(status: i32) -> ComputerErrorCode {
         8 => ComputerErrorCode::InvalidRequest,
         9 => ComputerErrorCode::ForbiddenAction,
         10 => ComputerErrorCode::Interrupted,
+        11 => ComputerErrorCode::UncertainOutcome,
         _ => ComputerErrorCode::BackendFailure,
     }
 }
@@ -476,6 +482,7 @@ struct NativeActionEnvelope<'a> {
     element_index: Option<usize>,
     expected_element: Option<NativeExpectedElement<'a>>,
     action: NativeActionPayload<'a>,
+    execution_mode: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -573,6 +580,10 @@ fn encode_action_request(
             delta_x,
             delta_y,
         },
+        execution_mode: match request.execution_mode {
+            MacSemanticExecutionMode::ForegroundRequired => "foreground_required",
+            MacSemanticExecutionMode::MeasuredBackground => "measured_background",
+        },
     };
     let encoded = serde_json::to_vec(&envelope)
         .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
@@ -627,6 +638,7 @@ mod tests {
         assert_eq!(native_error_code(1), ComputerErrorCode::UnsupportedPlatform);
         assert_eq!(native_error_code(3), ComputerErrorCode::TargetClosed);
         assert_eq!(native_error_code(10), ComputerErrorCode::Interrupted);
+        assert_eq!(native_error_code(11), ComputerErrorCode::UncertainOutcome);
         assert_eq!(native_error_code(999), ComputerErrorCode::BackendFailure);
     }
 
@@ -665,7 +677,6 @@ mod tests {
     fn native_shim_exposes_semantic_accessibility_without_raw_input() {
         let shim = include_str!("macos_native_shim.m");
         for forbidden in [
-            "CGEventCreate",
             "CGEventPost",
             "CGWarpMouseCursorPosition",
             "CGAssociateMouseAndMouseCursorPosition",
@@ -682,6 +693,10 @@ mod tests {
         assert!(shim.contains("gpt_macos_cancellation_create"));
         assert!(shim.contains("gpt_macos_cancellation_signal"));
         assert!(shim.contains("GPT_MAC_INTERRUPTED"));
+        assert!(shim.contains("GPT_MAC_UNCERTAIN_OUTCOME"));
+        assert!(shim.contains("GPTCaptureUserInteractionState"));
+        assert!(shim.contains("CGEventGetLocation"));
+        assert!(shim.contains("measured_background"));
         assert!(shim.contains("AXUIElementPerformAction"));
         assert!(shim.contains("AXUIElementSetAttributeValue"));
         assert!(shim.contains("GPTTargetIsFocused"));

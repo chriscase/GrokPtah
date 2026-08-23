@@ -7,6 +7,7 @@ import {
 import type {
   ComputerAction,
   ComputerAgentEligibility,
+  ComputerBackgroundSafetyReceipt,
   ComputerCockpitSnapshot,
   ComputerLocalApproval,
   ComputerLocalElement,
@@ -146,6 +147,14 @@ export function ComputerCockpit({
   const [launchMode, setLaunchMode] = useState<"simulator" | "macos">("simulator");
   const [nativeTargets, setNativeTargets] = useState<ComputerTargetCandidate[]>([]);
   const [selectedNativeToken, setSelectedNativeToken] = useState<string | null>(null);
+  const [nativeExecutionMode, setNativeExecutionMode] = useState<
+    "foreground" | "measured_background"
+  >("foreground");
+  const [backgroundReceipt, setBackgroundReceipt] =
+    useState<ComputerBackgroundSafetyReceipt | null>(null);
+  const [backgroundElementLabel, setBackgroundElementLabel] = useState("Project label");
+  const [backgroundProbeText, setBackgroundProbeText] = useState("grokptah-background-probe");
+  const [disposableTargetAcknowledged, setDisposableTargetAcknowledged] = useState(false);
   const [platformStatus, setPlatformStatus] = useState<ComputerPlatformStatus | null>(null);
   const [scopeReviewed, setScopeReviewed] = useState(false);
   const [name, setName] = useState("Ada Lovelace");
@@ -176,6 +185,11 @@ export function ComputerCockpit({
     setScopeReviewed(false);
     setNativeTargets([]);
     setSelectedNativeToken(null);
+    setNativeExecutionMode("foreground");
+    setBackgroundReceipt(null);
+    setBackgroundElementLabel("Project label");
+    setBackgroundProbeText("grokptah-background-probe");
+    setDisposableTargetAcknowledged(false);
     setPlatformStatus(null);
     setError(null);
     setNotice(null);
@@ -462,12 +476,45 @@ export function ComputerCockpit({
       );
       setNativeTargets(eligible);
       setSelectedNativeToken(null);
+      setBackgroundReceipt(null);
+      setDisposableTargetAcknowledged(false);
       setScopeReviewed(false);
       setNotice(
         eligible.length ? "Choose one exact macOS window." : "No eligible windows found.",
       );
     } catch (reason) {
       if (requestEpoch.current === epoch) setError(String(reason));
+    } finally {
+      if (requestEpoch.current === epoch) setBusy(false);
+    }
+  };
+
+  const measureBackgroundTextEntry = async () => {
+    if (!sessionId || !selectedNativeTarget) return;
+    const epoch = requestEpoch.current;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const receipt = await api.computerUseMeasureBackgroundTextEntry(
+        sessionId,
+        selectedNativeTarget.selectionToken,
+        selectedNativeTarget.target.appId,
+        backgroundElementLabel.trim(),
+        backgroundProbeText,
+        disposableTargetAcknowledged,
+      );
+      if (requestEpoch.current !== epoch) return;
+      setBackgroundReceipt(receipt);
+      setScopeReviewed(false);
+      setNotice(
+        "Background text entry measured. The disposable value was restored; start this Run before the short-lived proof expires.",
+      );
+    } catch (reason) {
+      if (requestEpoch.current === epoch) {
+        setBackgroundReceipt(null);
+        setError(String(reason));
+      }
     } finally {
       if (requestEpoch.current === epoch) setBusy(false);
     }
@@ -575,7 +622,11 @@ export function ComputerCockpit({
               </h2>
             </div>
             <span className="computer-origin">
-              {launchMode === "simulator" ? "Local simulator" : "Native Accessibility"}
+              {launchMode === "simulator"
+                ? "Local simulator"
+                : nativeExecutionMode === "measured_background"
+                  ? "Native Accessibility · measured background"
+                  : "Native Accessibility · foreground"}
             </span>
           </div>
           <div className="computer-launch-mode" role="group" aria-label="Computer Run target type">
@@ -660,6 +711,8 @@ export function ComputerCockpit({
                         checked={selectedNativeToken === candidate.selectionToken}
                         onChange={() => {
                           setSelectedNativeToken(candidate.selectionToken);
+                          setBackgroundReceipt(null);
+                          setDisposableTargetAcknowledged(false);
                           setScopeReviewed(false);
                           setNotice(null);
                         }}
@@ -675,6 +728,114 @@ export function ComputerCockpit({
                   ))}
                 </div>
               )}
+              {selectedNativeTarget && (
+                <div className="computer-background-calibration">
+                  <div
+                    className="computer-launch-mode"
+                    role="group"
+                    aria-label="macOS semantic execution mode"
+                  >
+                    <button
+                      type="button"
+                      className={nativeExecutionMode === "foreground" ? "active" : ""}
+                      aria-pressed={nativeExecutionMode === "foreground"}
+                      onClick={() => {
+                        setNativeExecutionMode("foreground");
+                        setBackgroundReceipt(null);
+                        setScopeReviewed(false);
+                      }}
+                    >
+                      Foreground semantic
+                    </button>
+                    <button
+                      type="button"
+                      className={nativeExecutionMode === "measured_background" ? "active" : ""}
+                      aria-pressed={nativeExecutionMode === "measured_background"}
+                      onClick={() => {
+                        setNativeExecutionMode("measured_background");
+                        setScopeReviewed(false);
+                      }}
+                    >
+                      Measured background text
+                    </button>
+                  </div>
+                  {nativeExecutionMode === "measured_background" && (
+                    <div className="computer-background-probe">
+                      <p className="settings-hint is-warning">
+                        Calibration changes one visible text field, proves GrokPtah did not change
+                        your foreground app, active window, or pointer, then restores the original
+                        value. Use only a disposable target. Invoke, selection, scroll, hidden
+                        windows, and automatic foreground fallback remain unavailable.
+                      </p>
+                      <label>
+                        <span>Exact accessibility label</span>
+                        <input
+                          value={backgroundElementLabel}
+                          maxLength={256}
+                          onChange={(event) => {
+                            setBackgroundElementLabel(event.target.value);
+                            setBackgroundReceipt(null);
+                            setScopeReviewed(false);
+                          }}
+                        />
+                      </label>
+                      <label>
+                        <span>Temporary probe value</span>
+                        <input
+                          value={backgroundProbeText}
+                          maxLength={256}
+                          onChange={(event) => {
+                            setBackgroundProbeText(event.target.value);
+                            setBackgroundReceipt(null);
+                            setScopeReviewed(false);
+                          }}
+                        />
+                      </label>
+                      <label className="computer-scope-check">
+                        <input
+                          type="checkbox"
+                          checked={disposableTargetAcknowledged}
+                          onChange={(event) => {
+                            setDisposableTargetAcknowledged(event.target.checked);
+                            setBackgroundReceipt(null);
+                            setScopeReviewed(false);
+                          }}
+                        />
+                        This exact target is disposable and may be changed and restored
+                      </label>
+                      {selectedNativeTarget.active && (
+                        <p className="settings-hint is-warning" role="status">
+                          Put another app in front, then refresh the window list. Background
+                          calibration is denied while this target is active.
+                        </p>
+                      )}
+                      <button
+                        type="button"
+                        disabled={
+                          busy ||
+                          selectedNativeTarget.active ||
+                          !disposableTargetAcknowledged ||
+                          !backgroundElementLabel.trim() ||
+                          !backgroundProbeText
+                        }
+                        onClick={() => void measureBackgroundTextEntry()}
+                      >
+                        Calibrate and restore
+                      </button>
+                      {backgroundReceipt && (
+                        <p className="computer-background-proof" role="status">
+                          <strong>Measured for this exact target</strong>
+                          <span>
+                            Visible text entry only · proof valid for {Math.round(
+                              backgroundReceipt.validForMillis / 1000,
+                            )} seconds
+                          </span>
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
           <dl className="computer-scope-grid">
@@ -686,14 +847,23 @@ export function ComputerCockpit({
                   : selectedNativeTarget?.target.appId ?? "Choose a window above"}
               </dd>
             </div>
-            <div><dt>Allowed input</dt><dd>Semantic invoke and visible text entry</dd></div>
+            <div>
+              <dt>Allowed input</dt>
+              <dd>
+                {launchMode === "macos" && nativeExecutionMode === "measured_background"
+                  ? "Visible text entry on one measured element; no activation"
+                  : "Semantic invoke and visible text entry"}
+              </dd>
+            </div>
             <div><dt>Grant</dt><dd>One action, then pause</dd></div>
             <div>
               <dt>Evidence</dt>
               <dd>
                 {launchMode === "simulator"
                   ? "Semantic demo data; no screen capture"
-                  : "Redacted window capture and bounded Accessibility tree"}
+                  : nativeExecutionMode === "measured_background"
+                    ? "Redacted capture plus before/after foreground, active-window, and pointer equality"
+                    : "Redacted window capture and bounded Accessibility tree"}
               </dd>
             </div>
           </dl>
@@ -711,13 +881,20 @@ export function ComputerCockpit({
             disabled={
               !scopeReviewed ||
               busy ||
-              (launchMode === "macos" && !selectedNativeTarget)
+              (launchMode === "macos" && !selectedNativeTarget) ||
+              (launchMode === "macos" &&
+                nativeExecutionMode === "measured_background" &&
+                !backgroundReceipt)
             }
             title={
               !scopeReviewed
                 ? "Review and accept the exact scope first"
                 : launchMode === "macos" && !selectedNativeTarget
                   ? "Choose an exact macOS window first"
+                  : launchMode === "macos" &&
+                      nativeExecutionMode === "measured_background" &&
+                      !backgroundReceipt
+                    ? "Calibrate and restore the disposable target first"
                   : undefined
             }
             onClick={() =>
@@ -725,14 +902,23 @@ export function ComputerCockpit({
                 () =>
                   launchMode === "simulator"
                     ? api.computerUseCockpitStartSimulator(sessionId, SIMULATOR_APP_ID)
-                    : api.computerUseCockpitStartNative(
-                        sessionId,
-                        selectedNativeTarget?.selectionToken ?? "",
-                        selectedNativeTarget?.target.appId ?? "",
-                      ),
+                    : nativeExecutionMode === "measured_background"
+                      ? api.computerUseCockpitStartMeasuredBackground(
+                          sessionId,
+                          selectedNativeTarget?.selectionToken ?? "",
+                          backgroundReceipt?.measurementToken ?? "",
+                          selectedNativeTarget?.target.appId ?? "",
+                        )
+                      : api.computerUseCockpitStartNative(
+                          sessionId,
+                          selectedNativeTarget?.selectionToken ?? "",
+                          selectedNativeTarget?.target.appId ?? "",
+                        ),
                 launchMode === "simulator"
                   ? "Simulator observed. No action has run."
-                  : "macOS target observed. No action has run.",
+                  : nativeExecutionMode === "measured_background"
+                    ? "Measured background target observed. No action has run."
+                    : "macOS target observed. No action has run.",
               )
             }
           >

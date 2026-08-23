@@ -25,8 +25,8 @@ mod types;
 
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerTargetCandidate,
+    ComputerBackgroundSafetyReceipt, ComputerObservationPlatform, ComputerPermission,
+    ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate,
 };
 pub use policy::ComputerPolicy;
 pub use projection::{
@@ -56,18 +56,19 @@ pub use simulator::SimulatorBackend;
 pub use store::ComputerStore;
 pub(crate) use types::ResolvedAgentComputerRunAdmission;
 pub use types::{
-    macos_native_capability_proof, macos_native_physical_input_domain, ActionClass, ActionGrant,
-    ActionOutcome, AgentComputerRunRequest, ComputerAction, ComputerAttentionPoint,
-    ComputerAttentionTarget, ComputerAuditEntry, ComputerAuthorityToken, ComputerBackend,
-    ComputerCapabilities, ComputerCapabilityProof, ComputerCapabilityTier,
-    ComputerControlDisposition, ComputerEmergencyControlToken, ComputerError, ComputerErrorCode,
-    ComputerKey, ComputerObservation, ComputerPrincipal, ComputerRun, ComputerRunState,
-    ComputerSurfaceBinding, ComputerSurfaceEvent, ComputerTarget, ComputerUseLimits,
-    ComputerWorkAttemptBinding, EvidenceRef, GrantIssuer, IsolationProofOrigin,
-    ObservationAuthority, ObservationGeometry, PhysicalInputDomain, PointerButton, SemanticAction,
-    SemanticElement, Sensitivity, SurfaceFreshnessFence, AGENT_PRINCIPAL_INTEGRATION_BLOCKER,
-    COMPUTER_RECEIPT_SCHEMA_VERSION, COMPUTER_RUN_SCHEMA_VERSION,
-    FOREGROUND_CONFLICT_DOMAIN_CAPACITY, MACOS_INTERRUPTED_BACKEND_ID, MACOS_NATIVE_BACKEND_ID,
+    macos_background_safe_capability_proof, macos_native_capability_proof,
+    macos_native_physical_input_domain, ActionClass, ActionGrant, ActionOutcome,
+    AgentComputerRunRequest, ComputerAction, ComputerAttentionPoint, ComputerAttentionTarget,
+    ComputerAuditEntry, ComputerAuthorityToken, ComputerBackend, ComputerCapabilities,
+    ComputerCapabilityProof, ComputerCapabilityTier, ComputerControlDisposition,
+    ComputerEmergencyControlToken, ComputerError, ComputerErrorCode, ComputerKey,
+    ComputerObservation, ComputerPrincipal, ComputerRun, ComputerRunState, ComputerSurfaceBinding,
+    ComputerSurfaceEvent, ComputerTarget, ComputerUseLimits, ComputerWorkAttemptBinding,
+    EvidenceRef, GrantIssuer, IsolationProofOrigin, ObservationAuthority, ObservationGeometry,
+    PhysicalInputDomain, PointerButton, SemanticAction, SemanticElement, Sensitivity,
+    SurfaceFreshnessFence, AGENT_PRINCIPAL_INTEGRATION_BLOCKER, COMPUTER_RECEIPT_SCHEMA_VERSION,
+    COMPUTER_RUN_SCHEMA_VERSION, FOREGROUND_CONFLICT_DOMAIN_CAPACITY,
+    MACOS_BACKGROUND_SAFE_BACKEND_ID, MACOS_INTERRUPTED_BACKEND_ID, MACOS_NATIVE_BACKEND_ID,
     SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
     SIMULATOR_ISOLATED_BACKEND_ID,
 };

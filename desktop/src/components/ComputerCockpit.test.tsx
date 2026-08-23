@@ -18,6 +18,8 @@ const mocks = vi.hoisted(() => ({
   targets: vi.fn(),
   start: vi.fn(),
   startNative: vi.fn(),
+  measureBackground: vi.fn(),
+  startBackground: vi.fn(),
   refresh: vi.fn(),
   stage: vi.fn(),
   approve: vi.fn(),
@@ -40,6 +42,8 @@ vi.mock("../lib/api", () => ({
     computerUseListTargets: mocks.targets,
     computerUseCockpitStartSimulator: mocks.start,
     computerUseCockpitStartNative: mocks.startNative,
+    computerUseMeasureBackgroundTextEntry: mocks.measureBackground,
+    computerUseCockpitStartMeasuredBackground: mocks.startBackground,
     computerUseCockpitRefresh: mocks.refresh,
     computerUseCockpitStageAction: mocks.stage,
     computerUseCockpitApprove: mocks.approve,
@@ -410,6 +414,119 @@ describe("ComputerCockpit", () => {
         "com.example.fixture",
       ),
     );
+  });
+
+  it("calibrates and binds one exact measured-background text-entry run", async () => {
+    mocks.targets.mockResolvedValue([
+      {
+        selectionToken: "selection-background",
+        target: {
+          appId: "com.example.disposable",
+          windowId: "macos-window-background",
+          generation: 9,
+          displayName: "Disposable Background Fixture",
+          sensitivity: "none",
+        },
+        geometry: { x: 0, y: 0, width: 720, height: 520, scaleFactor: 1 },
+        onScreen: true,
+        active: false,
+        minimized: false,
+      },
+    ]);
+    mocks.measureBackground.mockResolvedValue({
+      measurementToken: "measurement-1",
+      target: {
+        appId: "com.example.disposable",
+        windowId: "macos-window-background",
+        generation: 9,
+        displayName: "Disposable Background Fixture",
+        sensitivity: "none",
+      },
+      supportedActionClasses: ["text_entry"],
+      validForMillis: 120_000,
+    });
+    mocks.startBackground.mockResolvedValue(snapshot(localView()));
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "macOS app" }));
+    const findTargets = screen.getByRole("button", { name: "Find eligible windows" });
+    await waitFor(() => expect(findTargets).toBeEnabled());
+    fireEvent.click(findTargets);
+    fireEvent.click(
+      await screen.findByRole("radio", { name: /Disposable Background Fixture/ }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Measured background text" }),
+    );
+    expect(screen.getByRole("button", { name: "Start Computer Run" })).toBeDisabled();
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "This exact target is disposable and may be changed and restored",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Calibrate and restore" }));
+    await waitFor(() =>
+      expect(mocks.measureBackground).toHaveBeenCalledWith(
+        "session-1",
+        "selection-background",
+        "com.example.disposable",
+        "Project label",
+        "grokptah-background-probe",
+        true,
+      ),
+    );
+    expect(await screen.findByText("Measured for this exact target")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "I reviewed this exact target and one-action scope",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start Computer Run" }));
+    await waitFor(() =>
+      expect(mocks.startBackground).toHaveBeenCalledWith(
+        "session-1",
+        "selection-background",
+        "measurement-1",
+        "com.example.disposable",
+      ),
+    );
+  });
+
+  it("does not calibrate a background target while it is active", async () => {
+    mocks.targets.mockResolvedValue([
+      {
+        selectionToken: "selection-active",
+        target: {
+          appId: "com.example.active",
+          windowId: "macos-window-active",
+          generation: 10,
+          displayName: "Active Fixture",
+          sensitivity: "none",
+        },
+        geometry: { x: 0, y: 0, width: 720, height: 520, scaleFactor: 1 },
+        onScreen: true,
+        active: true,
+        minimized: false,
+      },
+    ]);
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "macOS app" }));
+    const findTargets = screen.getByRole("button", { name: "Find eligible windows" });
+    await waitFor(() => expect(findTargets).toBeEnabled());
+    fireEvent.click(findTargets);
+    fireEvent.click(await screen.findByRole("radio", { name: /Active Fixture/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Measured background text" }),
+    );
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "This exact target is disposable and may be changed and restored",
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Calibrate and restore" })).toBeDisabled();
+    expect(screen.getByText(/Put another app in front/)).toBeTruthy();
+    expect(mocks.measureBackground).not.toHaveBeenCalled();
   });
 
   it("blocks native discovery until required permissions are granted", async () => {

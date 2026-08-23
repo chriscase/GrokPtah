@@ -8,10 +8,11 @@ use grokptah_agent_bridge::MacOsObservationPlatform;
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
     ComputerAgentProposal, ComputerAttentionPoint, ComputerAuthorityToken,
-    ComputerBackendPublicView, ComputerCapabilities, ComputerEmergencyControlToken, ComputerError,
-    ComputerLocalApproval, ComputerObservation, ComputerObservationPlatform, ComputerPermission,
-    ComputerPermissionStatus, ComputerPlatformStatus, ComputerRun, ComputerRunEventPage,
-    ComputerRunProjection, ComputerRunState, ComputerSurfaceCoordination, ComputerTargetCandidate,
+    ComputerBackendPublicView, ComputerBackgroundSafetyReceipt, ComputerCapabilities,
+    ComputerEmergencyControlToken, ComputerError, ComputerLocalApproval, ComputerObservation,
+    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerRun, ComputerRunEventPage, ComputerRunProjection,
+    ComputerRunState, ComputerSurfaceCoordination, ComputerTargetCandidate,
     ComputerUncertainSurfaceLease, ComputerUseLimits, ComputerUseService, SemanticAction,
     SimulatorBackend,
 };
@@ -496,6 +497,117 @@ impl DesktopComputerUse {
         let service = Arc::new(
             platform
                 .bind_target_service(selection_token, store)
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+        let limits = ComputerUseLimits {
+            max_actions: 8,
+            max_duration_secs: 10 * 60,
+            max_observation_age_millis: 10_000,
+            max_evidence_bytes: 16 * 1024 * 1024,
+            ..ComputerUseLimits::default()
+        };
+        let caller = self.operator_token(owner_session_id)?;
+        let run = service
+            .create_run(
+                &Uuid::new_v4().to_string(),
+                &caller,
+                self.session_workspace(owner_session_id),
+                target,
+                limits,
+            )
+            .map_err(|error| error.to_string())?;
+        self.app_owned_run_ids
+            .lock()
+            .map_err(|_| "Computer Use app-owned Run state is unavailable".to_string())?
+            .insert(run.run_id.clone());
+        self.native_services
+            .lock()
+            .map_err(|_| "Computer Use native run state is unavailable".to_string())?
+            .insert(run.run_id.clone(), service.clone());
+        self.clear_pending_for_owner(owner_session_id)?;
+        if let Err(error) = authorize_and_observe_once(&service, &run, &caller).await {
+            let _ = service
+                .cancel(&Uuid::new_v4().to_string(), &caller, &run.run_id)
+                .await;
+            self.native_services
+                .lock()
+                .map_err(|_| "Computer Use native run state is unavailable".to_string())?
+                .remove(&run.run_id);
+            self.app_owned_run_ids
+                .lock()
+                .map_err(|_| "Computer Use app-owned Run state is unavailable".to_string())?
+                .remove(&run.run_id);
+            return Err(error.to_string());
+        }
+        self.cockpit_snapshot(owner_session_id, Some(&run.run_id))
+    }
+
+    pub async fn measure_background_text_entry(
+        &self,
+        selection_token: &str,
+        reviewed_target_app_id: &str,
+        element_label: &str,
+        probe_text: &str,
+        disposable_target_acknowledged: bool,
+    ) -> Result<ComputerBackgroundSafetyReceipt, String> {
+        let _guard = self.operation.lock().await;
+        let target = self
+            .selections
+            .lock()
+            .map_err(|_| "Computer Use selection state is unavailable".to_string())?
+            .get(selection_token)
+            .cloned()
+            .ok_or_else(|| {
+                "Computer Use selection is stale; refresh the window list".to_string()
+            })?;
+        if target.app_id != reviewed_target_app_id {
+            return Err("The reviewed Computer Use target no longer matches".into());
+        }
+        self.platform()?
+            .measure_background_text_entry(
+                selection_token,
+                element_label,
+                probe_text,
+                disposable_target_acknowledged,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn start_measured_background(
+        &self,
+        owner_session_id: Uuid,
+        selection_token: &str,
+        measurement_token: &str,
+        reviewed_target_app_id: &str,
+    ) -> Result<ComputerCockpitSnapshot, String> {
+        let _platform_guard = self.operation.lock().await;
+        let _operation_guard = self.simulator_operation.lock().await;
+        let index = self.simulator()?;
+        if has_active_desktop_run(&index, owner_session_id)? {
+            return Err("This session already has an active Computer Run".into());
+        }
+        self.prune_native_services(&index)?;
+        let target = self
+            .selections
+            .lock()
+            .map_err(|_| "Computer Use selection state is unavailable".to_string())?
+            .remove(selection_token)
+            .ok_or_else(|| {
+                "Computer Use selection is stale; refresh the window list".to_string()
+            })?;
+        if reviewed_target_app_id != target.app_id {
+            return Err("The reviewed Computer Use target no longer matches".into());
+        }
+        let platform = self.platform()?;
+        let store = self
+            .store
+            .clone()
+            .ok_or_else(|| self.initialization_error())?;
+        let service = Arc::new(
+            platform
+                .bind_measured_background_target_service(selection_token, measurement_token, store)
                 .await
                 .map_err(|error| error.to_string())?,
         );
@@ -1078,9 +1190,16 @@ async fn authorize_and_observe_once(
     caller: &ComputerAuthorityToken,
 ) -> Result<ComputerObservation, ComputerError> {
     let now = Utc::now();
+    let mut action_classes = BTreeSet::new();
+    if run.capability_proof.semantic_actions() {
+        action_classes.insert(ActionClass::Semantic);
+    }
+    if run.capability_proof.text_entry() {
+        action_classes.insert(ActionClass::TextEntry);
+    }
     let grant = ActionGrant::for_run(
         run,
-        BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        action_classes,
         now,
         now + Duration::minutes(2),
         Some(1),

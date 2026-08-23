@@ -1,8 +1,10 @@
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::types::{
-    validate_id, ComputerError, ComputerErrorCode, ComputerResult, ComputerTarget,
+    validate_id, ActionClass, ComputerError, ComputerErrorCode, ComputerResult, ComputerTarget,
     ObservationGeometry,
 };
 use super::{ComputerStore, ComputerUseService};
@@ -76,6 +78,19 @@ pub struct ComputerTargetCandidate {
     pub minimized: bool,
 }
 
+/// Short-lived local proof that one exact disposable target/action survived
+/// reversible host measurement without changing the user's foreground app,
+/// active window, or physical pointer. Native handles and element content are
+/// deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerBackgroundSafetyReceipt {
+    pub measurement_token: String,
+    pub target: ComputerTarget,
+    pub supported_action_classes: BTreeSet<ActionClass>,
+    pub valid_for_millis: u64,
+}
+
 impl ComputerTargetCandidate {
     pub fn validate(&self) -> ComputerResult<()> {
         validate_id("selection_token", &self.selection_token)?;
@@ -114,6 +129,34 @@ pub trait ComputerObservationPlatform: Send + Sync + std::fmt::Debug {
         selection_token: &str,
         store: ComputerStore,
     ) -> ComputerResult<ComputerUseService>;
+
+    /// Explicit local-only calibration path. Implementations must mutate only
+    /// an acknowledged disposable target and restore its original value.
+    async fn measure_background_text_entry(
+        &self,
+        _selection_token: &str,
+        _element_label: &str,
+        _probe_text: &str,
+        _disposable_target_acknowledged: bool,
+    ) -> ComputerResult<ComputerBackgroundSafetyReceipt> {
+        Err(ComputerError::new(
+            ComputerErrorCode::UnsupportedPlatform,
+            "this Computer platform does not support measured background calibration",
+        ))
+    }
+
+    /// Consume one short-lived measurement and its exact picker selection.
+    async fn bind_measured_background_target_service(
+        &self,
+        _selection_token: &str,
+        _measurement_token: &str,
+        _store: ComputerStore,
+    ) -> ComputerResult<ComputerUseService> {
+        Err(ComputerError::new(
+            ComputerErrorCode::UnsupportedPlatform,
+            "this Computer platform cannot bind measured background execution",
+        ))
+    }
 }
 
 #[cfg(test)]

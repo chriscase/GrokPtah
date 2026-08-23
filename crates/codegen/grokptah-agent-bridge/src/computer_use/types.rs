@@ -346,6 +346,7 @@ impl ComputerCapabilityProof {
                 validate_id("backend_id", backend_id)?;
                 if backend_id == SIMULATOR_ISOLATED_BACKEND_ID
                     || backend_id == SIMULATOR_BACKGROUND_BACKEND_ID
+                    || backend_id == MACOS_BACKGROUND_SAFE_BACKEND_ID
                 {
                     return Err(ComputerError::new(
                         ComputerErrorCode::InvalidRequest,
@@ -361,10 +362,12 @@ impl ComputerCapabilityProof {
             } => {
                 validate_id("backend_id", backend_id)?;
                 validate_id("measurement_id", measurement_id)?;
-                if is_native_macos_backend(backend_id) {
+                if is_native_macos_backend(backend_id)
+                    && backend_id != MACOS_BACKGROUND_SAFE_BACKEND_ID
+                {
                     return Err(ComputerError::new(
                         ComputerErrorCode::ForbiddenAction,
-                        "a native macOS backend cannot carry background-safe proof",
+                        "an unmeasured native macOS backend cannot carry background-safe proof",
                     ));
                 }
                 Ok(())
@@ -541,8 +544,13 @@ fn parse_isolated_proof(value: &serde_json::Value) -> ComputerResult<ComputerCap
 }
 
 pub const MACOS_NATIVE_BACKEND_ID: &str = "macos_accessibility_semantic";
+pub const MACOS_BACKGROUND_SAFE_BACKEND_ID: &str = "macos_accessibility_measured_background_safe";
 pub const MACOS_INTERRUPTED_BACKEND_ID: &str = "macos_interrupted";
-const MACOS_NATIVE_BACKEND_IDS: &[&str] = &[MACOS_NATIVE_BACKEND_ID, MACOS_INTERRUPTED_BACKEND_ID];
+const MACOS_NATIVE_BACKEND_IDS: &[&str] = &[
+    MACOS_NATIVE_BACKEND_ID,
+    MACOS_BACKGROUND_SAFE_BACKEND_ID,
+    MACOS_INTERRUPTED_BACKEND_ID,
+];
 
 fn is_native_macos_backend(backend_id: &str) -> bool {
     MACOS_NATIVE_BACKEND_IDS.contains(&backend_id)
@@ -560,6 +568,20 @@ pub fn macos_native_capability_proof() -> ComputerCapabilityProof {
         observe: true,
         semantic_actions: true,
         text_entry: true,
+    }
+}
+
+/// Host-measured macOS Accessibility capability. This proof is used only by
+/// a backend bound to one live, reversible, disposable-target calibration.
+/// The store replaces the placeholder measurement identity with its own
+/// interned host identity before the proof can authorize a Run.
+pub fn macos_background_safe_capability_proof() -> ComputerCapabilityProof {
+    ComputerCapabilityProof::MeasuredBackgroundSafeSemantic {
+        backend_id: MACOS_BACKGROUND_SAFE_BACKEND_ID.into(),
+        observe: true,
+        semantic_actions: false,
+        text_entry: true,
+        measurement_id: "pending-host-binding".into(),
     }
 }
 
@@ -2155,12 +2177,20 @@ impl ComputerRun {
         }
         surface.validate()?;
         proof.validate()?;
-        if is_native_macos_backend(proof.backend_id())
-            && !matches!(proof, ComputerCapabilityProof::ForegroundSemantic { .. })
-        {
+        let invalid_native_proof = match proof.backend_id() {
+            MACOS_NATIVE_BACKEND_ID | MACOS_INTERRUPTED_BACKEND_ID => {
+                !matches!(proof, ComputerCapabilityProof::ForegroundSemantic { .. })
+            }
+            MACOS_BACKGROUND_SAFE_BACKEND_ID => !matches!(
+                proof,
+                ComputerCapabilityProof::MeasuredBackgroundSafeSemantic { .. }
+            ),
+            _ => false,
+        };
+        if invalid_native_proof {
             return Err(ComputerError::new(
                 ComputerErrorCode::ForbiddenAction,
-                "native macOS Computer Use can only be stamped foreground-semantic",
+                "native macOS Computer Use proof does not match its compiled-in execution mode",
             ));
         }
         if let Some(isolated_surface) = proof.isolated_surface() {
@@ -2819,6 +2849,49 @@ mod tests {
             .unwrap_err()
             .code,
             ComputerErrorCode::ForbiddenAction
+        );
+    }
+
+    #[test]
+    fn measured_native_background_proof_is_exact_and_text_entry_only() {
+        let proof = macos_background_safe_capability_proof();
+        proof.validate().unwrap();
+        assert_eq!(
+            proof.tier(),
+            ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
+        );
+        assert_eq!(proof.backend_id(), MACOS_BACKGROUND_SAFE_BACKEND_ID);
+        assert!(proof.observe());
+        assert!(!proof.semantic_actions());
+        assert!(proof.text_entry());
+        assert!(!proof.key_chords());
+        assert!(!proof.pointer_fallback());
+
+        let owner = Uuid::new_v4();
+        let run = ComputerRun::new_with_isolation(
+            owner,
+            None,
+            target(),
+            Default::default(),
+            ComputerPrincipal::local_operator(owner),
+            ComputerSurfaceBinding::issue(),
+            proof,
+        )
+        .unwrap();
+        assert_eq!(
+            run.capability_proof.tier(),
+            ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
+        );
+
+        let forged_foreground = ComputerCapabilityProof::ForegroundSemantic {
+            backend_id: MACOS_BACKGROUND_SAFE_BACKEND_ID.into(),
+            observe: true,
+            semantic_actions: true,
+            text_entry: true,
+        };
+        assert_eq!(
+            forged_foreground.validate().unwrap_err().code,
+            ComputerErrorCode::InvalidRequest
         );
     }
 

@@ -467,15 +467,22 @@ impl ComputerUseService {
             let capabilities = self
                 .backend_attestation
                 .attest_capabilities(self.backend.capabilities())?;
-            if capabilities.proof.backend_id() == crate::computer_use::MACOS_NATIVE_BACKEND_ID
-                && !matches!(
+            let invalid_native_proof = match capabilities.proof.backend_id() {
+                crate::computer_use::MACOS_NATIVE_BACKEND_ID
+                | crate::computer_use::MACOS_INTERRUPTED_BACKEND_ID => !matches!(
                     capabilities.proof,
                     crate::computer_use::ComputerCapabilityProof::ForegroundSemantic { .. }
-                )
-            {
+                ),
+                crate::computer_use::MACOS_BACKGROUND_SAFE_BACKEND_ID => !matches!(
+                    capabilities.proof,
+                    crate::computer_use::ComputerCapabilityProof::MeasuredBackgroundSafeSemantic { .. }
+                ),
+                _ => false,
+            };
+            if invalid_native_proof {
                 return Err(ComputerError::new(
                     ComputerErrorCode::ForbiddenAction,
-                    "native macOS Computer Use can only advertise foreground-semantic capability",
+                    "native macOS Computer Use proof does not match its compiled-in execution mode",
                 ));
             }
             let interned = self

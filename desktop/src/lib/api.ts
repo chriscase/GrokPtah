@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
   AuthState,
+  ComputerBackgroundSafetyReceipt,
   ComputerObservationPreview,
   ComputerAgentEligibility,
   ComputerAgentProposalResult,
@@ -403,6 +404,34 @@ export const api = {
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_start_native", {
       sessionId,
       selectionToken,
+      reviewedTargetAppId,
+    }),
+  computerUseMeasureBackgroundTextEntry: (
+    sessionId: string,
+    selectionToken: string,
+    reviewedTargetAppId: string,
+    elementLabel: string,
+    probeText: string,
+    disposableTargetAcknowledged: boolean,
+  ) =>
+    invoke<ComputerBackgroundSafetyReceipt>("computer_use_measure_background_text_entry", {
+      sessionId,
+      selectionToken,
+      reviewedTargetAppId,
+      elementLabel,
+      probeText,
+      disposableTargetAcknowledged,
+    }),
+  computerUseCockpitStartMeasuredBackground: (
+    sessionId: string,
+    selectionToken: string,
+    measurementToken: string,
+    reviewedTargetAppId: string,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_start_measured_background", {
+      sessionId,
+      selectionToken,
+      measurementToken,
       reviewedTargetAppId,
     }),
   computerUseCockpitRefresh: (

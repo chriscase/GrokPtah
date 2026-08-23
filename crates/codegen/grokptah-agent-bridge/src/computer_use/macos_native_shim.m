@@ -34,6 +34,7 @@ enum {
     GPT_MAC_INVALID_REQUEST = 8,
     GPT_MAC_FORBIDDEN_ACTION = 9,
     GPT_MAC_INTERRUPTED = 10,
+    GPT_MAC_UNCERTAIN_OUTCOME = 11,
 };
 
 typedef struct {
@@ -65,6 +66,59 @@ bool gpt_macos_cancellation_is_signalled(const void *context) {
 
 void gpt_macos_cancellation_free(void *context) {
     free(context);
+}
+
+typedef struct {
+    BOOL valid;
+    pid_t frontmost_process_id;
+    uint32_t active_window_id;
+    CGPoint pointer_location;
+} GPTMacUserInteractionState;
+
+static GPTMacUserInteractionState GPTCaptureUserInteractionState(void) {
+    GPTMacUserInteractionState state = {0};
+    NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+    if (frontmost == nil || frontmost.processIdentifier <= 0) {
+        return state;
+    }
+    CGEventRef event = CGEventCreate(NULL);
+    if (event == NULL) {
+        return state;
+    }
+    state.pointer_location = CGEventGetLocation(event);
+    CFRelease(event);
+    state.frontmost_process_id = frontmost.processIdentifier;
+
+    CFArrayRef windowInfo = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (windowInfo == NULL) {
+        return state;
+    }
+    for (NSDictionary *entry in (__bridge NSArray *)windowInfo) {
+        NSNumber *owner = entry[(id)kCGWindowOwnerPID];
+        NSNumber *layer = entry[(id)kCGWindowLayer];
+        NSNumber *window = entry[(id)kCGWindowNumber];
+        if ([owner isKindOfClass:[NSNumber class]] &&
+            owner.intValue == state.frontmost_process_id &&
+            [layer isKindOfClass:[NSNumber class]] && layer.intValue == 0 &&
+            [window isKindOfClass:[NSNumber class]] && window.unsignedIntValue != 0) {
+            state.active_window_id = window.unsignedIntValue;
+            break;
+        }
+    }
+    CFRelease(windowInfo);
+    state.valid = state.active_window_id != 0;
+    return state;
+}
+
+static BOOL GPTUserInteractionStateEqual(
+    GPTMacUserInteractionState before,
+    GPTMacUserInteractionState after) {
+    return before.valid && after.valid &&
+           before.frontmost_process_id == after.frontmost_process_id &&
+           before.active_window_id == after.active_window_id &&
+           CGPointEqualToPoint(before.pointer_location, after.pointer_location);
 }
 
 static const NSUInteger GPT_MAX_AX_DEPTH = 32;
@@ -938,6 +992,10 @@ static GPTMacNativeResult GPTActImpl(
         NSString *bundleID = request[@"bundleId"];
         NSDictionary *action = request[@"action"];
         NSString *kind = [action isKindOfClass:[NSDictionary class]] ? action[@"kind"] : nil;
+        NSString *executionMode = request[@"executionMode"];
+        BOOL measuredBackground =
+            [executionMode isKindOfClass:[NSString class]] &&
+            [executionMode isEqualToString:@"measured_background"];
         CGRect expectedFrame = CGRectZero;
         if (![windowNumber isKindOfClass:[NSNumber class]] || windowNumber.unsignedIntValue == 0 ||
             ![processNumber isKindOfClass:[NSNumber class]] || processNumber.intValue <= 0 ||
@@ -945,6 +1003,8 @@ static GPTMacNativeResult GPTActImpl(
             bundleID.length > 256 || GPTDeniedBundle(bundleID) ||
             ![action isKindOfClass:[NSDictionary class]] ||
             ![kind isKindOfClass:[NSString class]] ||
+            ![executionMode isKindOfClass:[NSString class]] ||
+            (![executionMode isEqualToString:@"foreground_required"] && !measuredBackground) ||
             !GPTReadFrame(request[@"expectedFrame"], &expectedFrame)) {
             return GPTErrorResult(GPT_MAC_INVALID_REQUEST, @"invalid macOS action binding");
         }
@@ -953,6 +1013,11 @@ static GPTMacNativeResult GPTActImpl(
         ]];
         if (![allowedKinds containsObject:kind]) {
             return GPTErrorResult(GPT_MAC_FORBIDDEN_ACTION, @"unsupported macOS semantic action");
+        }
+        if (measuredBackground && ![kind isEqualToString:@"set_value"]) {
+            return GPTErrorResult(
+                GPT_MAC_FORBIDDEN_ACTION,
+                @"this measured background backend supports visible text entry only");
         }
 
         if (@available(macOS 14.0, *)) {
@@ -988,6 +1053,12 @@ static GPTMacNativeResult GPTActImpl(
             }
 
             if ([kind isEqualToString:@"activate"]) {
+                if (measuredBackground) {
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_FORBIDDEN_ACTION,
+                        @"measured background dispatch cannot activate a target");
+                }
                 if (request[@"elementIndex"] != [NSNull null] ||
                     request[@"expectedElement"] != [NSNull null]) {
                     CFRelease(axWindow);
@@ -1036,16 +1107,19 @@ static GPTMacNativeResult GPTActImpl(
             NSString *requiredAction = [expectedElement isKindOfClass:[NSDictionary class]]
                 ? expectedElement[@"requiredAction"]
                 : nil;
+            BOOL targetFocused = GPTTargetIsFocused(processID, bundleID, axWindow);
             if (![elementIndex isKindOfClass:[NSNumber class]] ||
                 elementIndex.unsignedIntegerValue >= 10000 ||
                 ![expectedElement isKindOfClass:[NSDictionary class]] ||
                 ![requiredAction isKindOfClass:[NSString class]] ||
                 ![requiredAction isEqualToString:kind] ||
-                !GPTTargetIsFocused(processID, bundleID, axWindow)) {
+                (measuredBackground ? targetFocused : !targetFocused)) {
                 CFRelease(axWindow);
                 return GPTErrorResult(
                     GPT_MAC_TARGET_CHANGED,
-                    @"authorized macOS target lost exact focus before dispatch");
+                    measuredBackground
+                        ? @"measured background target became foreground before dispatch"
+                        : @"authorized macOS target lost exact focus before dispatch");
             }
             BOOL traversalTruncated = NO;
             AXUIElementRef element = GPTCopyAXElementAtIndex(
@@ -1060,12 +1134,27 @@ static GPTMacNativeResult GPTActImpl(
                     GPT_MAC_TARGET_CHANGED,
                     @"macOS element changed since the approved observation");
             }
-            if (!GPTTargetIsFocused(processID, bundleID, axWindow)) {
+            targetFocused = GPTTargetIsFocused(processID, bundleID, axWindow);
+            if (measuredBackground ? targetFocused : !targetFocused) {
                 CFRelease(element);
                 CFRelease(axWindow);
                 return GPTErrorResult(
                     GPT_MAC_TARGET_CHANGED,
-                    @"authorized macOS target lost focus at dispatch boundary");
+                    measuredBackground
+                        ? @"measured background target became foreground at dispatch boundary"
+                        : @"authorized macOS target lost focus at dispatch boundary");
+            }
+            GPTMacUserInteractionState interactionBefore = {0};
+            if (measuredBackground) {
+                interactionBefore = GPTCaptureUserInteractionState();
+                if (!interactionBefore.valid ||
+                    interactionBefore.frontmost_process_id == processID) {
+                    CFRelease(element);
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_FORBIDDEN_ACTION,
+                        @"foreground app/window/pointer state could not prove a background boundary");
+                }
             }
             if (gpt_macos_cancellation_is_signalled(cancellation)) {
                 CFRelease(element);
@@ -1144,6 +1233,17 @@ static GPTMacNativeResult GPTActImpl(
                     GPT_MAC_INTERRUPTED,
                     @"macOS semantic action completion lost to local takeover");
             }
+            if (measuredBackground) {
+                GPTMacUserInteractionState interactionAfter =
+                    GPTCaptureUserInteractionState();
+                if (!GPTUserInteractionStateEqual(interactionBefore, interactionAfter) ||
+                    GPTTargetIsFocused(processID, bundleID, axWindow)) {
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_UNCERTAIN_OUTCOME,
+                        @"background action changed foreground app, active window, or physical pointer");
+                }
+            }
             if (actionError != kAXErrorSuccess) {
                 CFRelease(axWindow);
                 return GPTErrorResult(
@@ -1160,11 +1260,13 @@ static GPTMacNativeResult GPTActImpl(
             CFRelease(axWindow);
             SCWindow *afterWindow = GPTFindWindow(
                 GPTShareableContent(), windowID, processID, bundleID);
-            if (!focusPreserved || afterWindow == nil ||
+            if ((measuredBackground ? focusPreserved : !focusPreserved) || afterWindow == nil ||
                 !GPTFrameMatches(expectedFrame, afterWindow.frame)) {
                 return GPTErrorResult(
                     GPT_MAC_TARGET_CHANGED,
-                    @"authorized macOS target changed after action dispatch");
+                    measuredBackground
+                        ? @"measured background target changed after action dispatch"
+                        : @"authorized macOS target changed after action dispatch");
             }
             return GPTActionResult(summary, postcondition);
         }

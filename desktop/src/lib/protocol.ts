@@ -1013,6 +1013,13 @@ export interface ComputerTargetCandidate {
   minimized: boolean;
 }
 
+export interface ComputerBackgroundSafetyReceipt {
+  measurementToken: string;
+  target: ComputerTargetCandidate["target"];
+  supportedActionClasses: Array<"semantic" | "text_entry" | "key_chord" | "pointer_fallback">;
+  validForMillis: number;
+}
+
 export interface ComputerObservationPreview {
   observation: {
     observationId: string;

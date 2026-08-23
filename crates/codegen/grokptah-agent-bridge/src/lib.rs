@@ -167,11 +167,12 @@ pub use completion::{
 };
 pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
 pub use computer_use::{
-    canonical_workspace_string, macos_native_capability_proof, macos_native_physical_input_domain,
-    project_run_at, ActionClass, ActionGrant, ActionGrantSummary, ActionOutcome,
-    ActionOutcomeSummary, AgentComputerRunRequest, ComputerAction, ComputerAttentionPoint,
-    ComputerAttentionTarget, ComputerAuditEntry, ComputerAuthorityToken, ComputerBackend,
-    ComputerBackendPublicView, ComputerCapabilities, ComputerCapabilityProof,
+    canonical_workspace_string, macos_background_safe_capability_proof,
+    macos_native_capability_proof, macos_native_physical_input_domain, project_run_at, ActionClass,
+    ActionGrant, ActionGrantSummary, ActionOutcome, ActionOutcomeSummary, AgentComputerRunRequest,
+    ComputerAction, ComputerAttentionPoint, ComputerAttentionTarget, ComputerAuditEntry,
+    ComputerAuthorityToken, ComputerBackend, ComputerBackendPublicView,
+    ComputerBackgroundSafetyReceipt, ComputerCapabilities, ComputerCapabilityProof,
     ComputerCapabilityTier, ComputerControlDisposition, ComputerEmergencyControlToken,
     ComputerError, ComputerErrorCode, ComputerErrorSummary, ComputerKey, ComputerLocalApproval,
     ComputerLocalAuditEntry, ComputerLocalElement, ComputerLocalError, ComputerLocalGrant,
@@ -186,8 +187,9 @@ pub use computer_use::{
     MacOsObservationPlatform, ObservationAuthority, ObservationSummary, PhysicalInputDomain,
     SemanticAction, SimulatorBackend, SurfaceFreshnessFence, AGENT_PRINCIPAL_INTEGRATION_BLOCKER,
     COMPUTER_RECEIPT_SCHEMA_VERSION, COMPUTER_RUN_SCHEMA_VERSION, DEFAULT_EVENT_PAGE,
-    FOREGROUND_CONFLICT_DOMAIN_CAPACITY, MACOS_INTERRUPTED_BACKEND_ID, MACOS_NATIVE_BACKEND_ID,
-    MAX_EVENT_PAGE, SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
+    FOREGROUND_CONFLICT_DOMAIN_CAPACITY, MACOS_BACKGROUND_SAFE_BACKEND_ID,
+    MACOS_INTERRUPTED_BACKEND_ID, MACOS_NATIVE_BACKEND_ID, MAX_EVENT_PAGE,
+    SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
     SIMULATOR_ISOLATED_BACKEND_ID,
 };
 pub use discover::{

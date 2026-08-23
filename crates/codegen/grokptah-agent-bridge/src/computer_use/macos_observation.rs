@@ -11,20 +11,22 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::platform::{
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerTargetCandidate,
+    ComputerBackgroundSafetyReceipt, ComputerObservationPlatform, ComputerPermission,
+    ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate,
 };
 use super::types::{
-    macos_native_capability_proof, macos_native_physical_input_domain, ActionOutcome,
-    ComputerAction, ComputerBackend, ComputerBackendAttestation, ComputerCapabilities,
-    ComputerCapabilityTier, ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult,
-    ComputerTarget, ComputerUseLimits, EvidenceRef, ObservationGeometry, PhysicalInputDomain,
-    SemanticAction, SemanticElement, Sensitivity, MAX_LABEL_BYTES,
+    macos_background_safe_capability_proof, macos_native_capability_proof,
+    macos_native_physical_input_domain, ActionOutcome, ComputerAction, ComputerBackend,
+    ComputerBackendAttestation, ComputerCapabilities, ComputerCapabilityTier, ComputerError,
+    ComputerErrorCode, ComputerObservation, ComputerResult, ComputerTarget, ComputerUseLimits,
+    EvidenceRef, ObservationGeometry, PhysicalInputDomain, SemanticAction, SemanticElement,
+    Sensitivity, MAX_LABEL_BYTES,
 };
 use super::{ComputerStore, ComputerUseService};
 
 const MAX_TARGET_CANDIDATES: usize = 128;
 const SELECTION_LEASE_TTL: StdDuration = StdDuration::from_secs(120);
+const BACKGROUND_MEASUREMENT_TTL: StdDuration = StdDuration::from_secs(120);
 const MAX_EVIDENCE_VAULT_BYTES: usize = 64 * 1024 * 1024;
 const MIN_CAPTURE_INTERVAL: StdDuration = StdDuration::from_millis(500);
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -130,7 +132,15 @@ pub(crate) struct RawMacActionRequest {
     pub element_index: Option<usize>,
     pub expected_element: Option<RawMacSemanticNode>,
     pub action: ComputerAction,
+    pub execution_mode: MacSemanticExecutionMode,
     pub cancellation: MacActionCancellation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MacSemanticExecutionMode {
+    #[default]
+    ForegroundRequired,
+    MeasuredBackground,
 }
 
 pub(crate) trait MacActionCancellationSignal: Send + Sync + std::fmt::Debug {
@@ -216,6 +226,13 @@ pub(crate) trait MacObservationSource: Send + Sync + std::fmt::Debug {
         Ok(MacActionCancellation::default())
     }
 
+    /// Only the compiled-in native source and deterministic in-crate fixtures
+    /// may claim that `MeasuredBackground` performs before/after host-state
+    /// measurement. Third-party sources remain fail-closed.
+    fn supports_measured_background(&self) -> bool {
+        false
+    }
+
     async fn act(
         &self,
         identity: &MacNativeIdentity,
@@ -230,10 +247,20 @@ struct TargetLease {
     native: RawMacTarget,
 }
 
+#[derive(Debug, Clone)]
+struct BackgroundMeasurementLease {
+    issued_at: Instant,
+    selection_token: String,
+    target: ComputerTarget,
+    native_identity: MacNativeIdentity,
+    element_digest: String,
+}
+
 #[derive(Debug)]
 pub struct MacOsObservationPlatform {
     source: Arc<dyn MacObservationSource>,
     leases: Mutex<HashMap<String, TargetLease>>,
+    background_measurements: Mutex<HashMap<String, BackgroundMeasurementLease>>,
 }
 
 impl MacOsObservationPlatform {
@@ -242,6 +269,7 @@ impl MacOsObservationPlatform {
         Self {
             source,
             leases: Mutex::new(HashMap::new()),
+            background_measurements: Mutex::new(HashMap::new()),
         }
     }
 
@@ -252,39 +280,56 @@ impl MacOsObservationPlatform {
         )))
     }
 
-    async fn bind_target_backend(
-        &self,
-        selection_token: &str,
-    ) -> ComputerResult<Arc<dyn ComputerBackend>> {
+    fn target_lease(&self, selection_token: &str) -> ComputerResult<TargetLease> {
         super::types::validate_id("selection_token", selection_token)?;
-        let lease = self.leases.lock().remove(selection_token).ok_or_else(|| {
-            ComputerError::new(
-                ComputerErrorCode::Unauthorized,
-                "unknown or already-consumed computer-use selection",
-            )
-        })?;
+        let lease = self
+            .leases
+            .lock()
+            .get(selection_token)
+            .cloned()
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "unknown or already-consumed computer-use selection",
+                )
+            })?;
         if lease.issued_at.elapsed() >= SELECTION_LEASE_TTL {
             return Err(ComputerError::new(
                 ComputerErrorCode::Unauthorized,
                 "computer-use selection expired",
             ));
         }
+        Ok(lease)
+    }
+
+    async fn revalidate_lease(&self, lease: &TargetLease) -> ComputerResult<RawMacTarget> {
         require_platform_ready(&self.status())?;
         let current = self
             .source
             .revalidate_target(&lease.native.identity)
             .await?;
         validate_raw_target(&current)?;
-        if current.identity != lease.native.identity {
+        if current.identity != lease.native.identity || current.frame != lease.native.frame {
             return Err(ComputerError::new(
                 ComputerErrorCode::TargetChanged,
-                "selected macOS target identity changed",
+                "selected macOS target identity or geometry changed",
             ));
         }
-        Ok(Arc::new(MacOsObservationBackend {
+        Ok(current)
+    }
+
+    fn backend_from_lease(
+        &self,
+        lease: TargetLease,
+        execution_mode: MacSemanticExecutionMode,
+        measured_element_digest: Option<String>,
+    ) -> Arc<dyn ComputerBackend> {
+        Arc::new(MacOsObservationBackend {
             source: self.source.clone(),
             target: lease.candidate.target,
             native_identity: lease.native.identity,
+            execution_mode,
+            measured_element_digest,
             sequence: Mutex::new(0),
             observation_gate: tokio::sync::Mutex::new(()),
             last_capture_started: Mutex::new(None),
@@ -293,7 +338,315 @@ impl MacOsObservationPlatform {
             active_action_cancellation: Mutex::new(None),
             action_snapshot: Mutex::new(None),
             evidence: EvidenceVault::default(),
-        }))
+        })
+    }
+
+    async fn restore_background_probe(
+        &self,
+        lease: &TargetLease,
+        element_index: usize,
+        original_element: &RawMacSemanticNode,
+        element_digest: &str,
+        probe_text: &str,
+        original_value: &str,
+    ) -> ComputerResult<()> {
+        let observed = self
+            .source
+            .observe(&lease.native.identity, &ComputerUseLimits::default())
+            .await;
+        let (restore_index, restore_element) = match observed {
+            Ok(observation) => {
+                if observation.identity != lease.native.identity
+                    || observation.frame != lease.native.frame
+                {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::UncertainOutcome,
+                        "background probe target changed before disposable-value restoration",
+                    ));
+                }
+                let (index, element) = observation
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, node)| mac_background_element_digest(node) == element_digest)
+                    .ok_or_else(|| {
+                        ComputerError::new(
+                            ComputerErrorCode::UncertainOutcome,
+                            "background probe element disappeared before restoration",
+                        )
+                    })?;
+                if element.value.as_deref() == Some(original_value) {
+                    return Ok(());
+                }
+                if element.value.as_deref() != Some(probe_text) {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::UncertainOutcome,
+                        "background probe element has an unexpected value before restoration",
+                    ));
+                }
+                (index, element.clone())
+            }
+            Err(_) => {
+                // The mutation may already have crossed the native boundary.
+                // A synthesized exact expected value lets the shim restore it
+                // only if the same semantic element currently contains the
+                // probe value; otherwise native attestation fails closed.
+                let mut expected = original_element.clone();
+                expected.value = Some(probe_text.to_string());
+                (element_index, expected)
+            }
+        };
+        let restore = RawMacActionRequest {
+            target_frame: lease.native.frame,
+            element_index: Some(restore_index),
+            expected_element: Some(restore_element),
+            action: ComputerAction::SetValue {
+                element_id: "background-probe-element".into(),
+                text: original_value.to_string(),
+            },
+            execution_mode: MacSemanticExecutionMode::MeasuredBackground,
+            cancellation: self.source.action_cancellation()?,
+        };
+        let outcome = self.source.act(&lease.native.identity, &restore).await?;
+        if outcome.expected_postcondition_met != Some(true) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::UncertainOutcome,
+                "background probe could not prove restoration of the disposable value",
+            ));
+        }
+        let restored = self
+            .source
+            .observe(&lease.native.identity, &ComputerUseLimits::default())
+            .await?;
+        if restored.identity != lease.native.identity
+            || restored.frame != lease.native.frame
+            || !restored.nodes.iter().any(|node| {
+                mac_background_element_digest(node) == element_digest
+                    && node.value.as_deref() == Some(original_value)
+            })
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::UncertainOutcome,
+                "background probe restoration did not survive exact-target re-observation",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn bind_target_backend(
+        &self,
+        selection_token: &str,
+    ) -> ComputerResult<Arc<dyn ComputerBackend>> {
+        let lease = self.target_lease(selection_token)?;
+        self.revalidate_lease(&lease).await?;
+        self.leases.lock().remove(selection_token);
+        Ok(self.backend_from_lease(lease, MacSemanticExecutionMode::ForegroundRequired, None))
+    }
+
+    /// Calibrate one exact visible text-entry element on a disposable target.
+    /// The probe performs a reversible value change through the native
+    /// background path. Success means both mutations verified their direct AX
+    /// postcondition while the native shim measured no foreground app, active
+    /// window, or physical-pointer change. The returned proof is short-lived,
+    /// one-use, and process/window/element bound.
+    pub async fn measure_background_text_entry(
+        &self,
+        selection_token: &str,
+        element_label: &str,
+        probe_text: &str,
+        disposable_target_acknowledged: bool,
+    ) -> ComputerResult<ComputerBackgroundSafetyReceipt> {
+        if !disposable_target_acknowledged {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "background calibration requires explicit disposable-target acknowledgement",
+            ));
+        }
+        if !self.source.supports_measured_background() {
+            return Err(ComputerError::new(
+                ComputerErrorCode::UnsupportedPlatform,
+                "this macOS source cannot measure background dispatch",
+            ));
+        }
+        let label = bounded_required(element_label, MAX_LABEL_BYTES).ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "background probe element label is missing or too long",
+            )
+        })?;
+        let probe_action = ComputerAction::SetValue {
+            element_id: "background-probe-element".into(),
+            text: probe_text.to_string(),
+        };
+        probe_action.validate(&ComputerUseLimits::default())?;
+
+        let lease = self.target_lease(selection_token)?;
+        let current = self.revalidate_lease(&lease).await?;
+        if current.active || !current.on_screen || current.minimized {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenTarget,
+                "background calibration requires a visible, non-minimized target that is not foreground",
+            ));
+        }
+        let before = self
+            .source
+            .observe(&lease.native.identity, &ComputerUseLimits::default())
+            .await?;
+        if before.identity != lease.native.identity
+            || before.frame != lease.native.frame
+            || before.nodes_truncated
+            || before.sensitivity.is_hard_denied()
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::SensitiveSurface,
+                "background calibration target is stale, truncated, or sensitive",
+            ));
+        }
+        let mut matches = before.nodes.iter().enumerate().filter(|(_, node)| {
+            node.label.as_deref() == Some(label.as_str())
+                && node.enabled
+                && !mac_node_is_secure(node)
+                && !node.sensitivity.is_hard_denied()
+                && node.actions.contains(&RawMacSemanticAction::SetValue)
+        });
+        let (element_index, element) = matches.next().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "no exact visible non-sensitive text-entry element matched the probe label",
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "background probe element label is ambiguous",
+            ));
+        }
+        let original_value = element.value.clone().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "background text-entry calibration requires a readable reversible value",
+            )
+        })?;
+        ComputerAction::SetValue {
+            element_id: "background-probe-element".into(),
+            text: original_value.clone(),
+        }
+        .validate(&ComputerUseLimits::default())?;
+        if original_value == probe_text {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "background probe value must differ from the current disposable value",
+            ));
+        }
+        let element_digest = mac_background_element_digest(element);
+        let first = RawMacActionRequest {
+            target_frame: before.frame,
+            element_index: Some(element_index),
+            expected_element: Some(element.clone()),
+            action: probe_action,
+            execution_mode: MacSemanticExecutionMode::MeasuredBackground,
+            cancellation: self.source.action_cancellation()?,
+        };
+        let first_outcome = self.source.act(&lease.native.identity, &first).await;
+        let first_proved = first_outcome
+            .as_ref()
+            .is_ok_and(|outcome| outcome.expected_postcondition_met == Some(true));
+        let restoration = self
+            .restore_background_probe(
+                &lease,
+                element_index,
+                element,
+                &element_digest,
+                probe_text,
+                &original_value,
+            )
+            .await;
+        if !first_proved || restoration.is_err() {
+            return Err(ComputerError::new(
+                ComputerErrorCode::UncertainOutcome,
+                "background calibration did not prove both mutation and disposable-value restoration",
+            ));
+        }
+        let final_target = self.revalidate_lease(&lease).await?;
+        if final_target.active || !final_target.on_screen || final_target.minimized {
+            return Err(ComputerError::new(
+                ComputerErrorCode::UncertainOutcome,
+                "background probe changed target visibility or foreground state",
+            ));
+        }
+
+        let measurement_token = Uuid::new_v4().to_string();
+        self.background_measurements.lock().insert(
+            measurement_token.clone(),
+            BackgroundMeasurementLease {
+                issued_at: Instant::now(),
+                selection_token: selection_token.to_string(),
+                target: lease.candidate.target.clone(),
+                native_identity: lease.native.identity,
+                element_digest,
+            },
+        );
+        Ok(ComputerBackgroundSafetyReceipt {
+            measurement_token,
+            target: lease.candidate.target,
+            supported_action_classes: BTreeSet::from([super::types::ActionClass::TextEntry]),
+            valid_for_millis: BACKGROUND_MEASUREMENT_TTL.as_millis() as u64,
+        })
+    }
+
+    pub async fn bind_measured_background_target_service(
+        &self,
+        selection_token: &str,
+        measurement_token: &str,
+        store: ComputerStore,
+    ) -> ComputerResult<ComputerUseService> {
+        super::types::validate_id("measurement_token", measurement_token)?;
+        let measurement = self
+            .background_measurements
+            .lock()
+            .remove(measurement_token)
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "unknown or already-consumed background measurement",
+                )
+            })?;
+        if measurement.issued_at.elapsed() >= BACKGROUND_MEASUREMENT_TTL
+            || measurement.selection_token != selection_token
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "background measurement expired or does not bind this selection",
+            ));
+        }
+        let lease = self.target_lease(selection_token)?;
+        if lease.candidate.target != measurement.target
+            || lease.native.identity != measurement.native_identity
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenTarget,
+                "background measurement does not bind the selected target generation",
+            ));
+        }
+        let current = self.revalidate_lease(&lease).await?;
+        if current.active || !current.on_screen || current.minimized {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenTarget,
+                "measured background target became foreground, hidden, or minimized",
+            ));
+        }
+        self.leases.lock().remove(selection_token);
+        let backend = self.backend_from_lease(
+            lease,
+            MacSemanticExecutionMode::MeasuredBackground,
+            Some(measurement.element_digest),
+        );
+        let attestation = ComputerBackendAttestation::trusted(
+            super::types::MACOS_BACKGROUND_SAFE_BACKEND_ID,
+            ComputerCapabilityTier::MeasuredBackgroundSafeSemantic,
+            macos_native_physical_input_domain(),
+        )?;
+        Ok(ComputerUseService::new_trusted(backend, store, attestation))
     }
 
     #[cfg(test)]
@@ -332,6 +685,7 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
         // an old token after permissions or native enumeration fail would make
         // the visible picker state weaker than the authorization state.
         self.leases.lock().clear();
+        self.background_measurements.lock().clear();
         require_platform_ready(&self.status())?;
         let raw_targets = self.source.list_targets().await?;
         let mut candidates = Vec::new();
@@ -394,6 +748,38 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
         )?;
         Ok(ComputerUseService::new_trusted(backend, store, attestation))
     }
+
+    async fn measure_background_text_entry(
+        &self,
+        selection_token: &str,
+        element_label: &str,
+        probe_text: &str,
+        disposable_target_acknowledged: bool,
+    ) -> ComputerResult<ComputerBackgroundSafetyReceipt> {
+        MacOsObservationPlatform::measure_background_text_entry(
+            self,
+            selection_token,
+            element_label,
+            probe_text,
+            disposable_target_acknowledged,
+        )
+        .await
+    }
+
+    async fn bind_measured_background_target_service(
+        &self,
+        selection_token: &str,
+        measurement_token: &str,
+        store: ComputerStore,
+    ) -> ComputerResult<ComputerUseService> {
+        MacOsObservationPlatform::bind_measured_background_target_service(
+            self,
+            selection_token,
+            measurement_token,
+            store,
+        )
+        .await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +799,8 @@ struct MacOsObservationBackend {
     source: Arc<dyn MacObservationSource>,
     target: ComputerTarget,
     native_identity: MacNativeIdentity,
+    execution_mode: MacSemanticExecutionMode,
+    measured_element_digest: Option<String>,
     sequence: Mutex<u64>,
     observation_gate: tokio::sync::Mutex<()>,
     last_capture_started: Mutex<Option<Instant>>,
@@ -426,8 +814,14 @@ struct MacOsObservationBackend {
 #[async_trait]
 impl ComputerBackend for MacOsObservationBackend {
     fn capabilities(&self) -> ComputerCapabilities {
-        ComputerCapabilities::from_proof(macos_native_capability_proof())
-            .expect("macOS native proof is foreground-semantic")
+        let proof = match self.execution_mode {
+            MacSemanticExecutionMode::ForegroundRequired => macos_native_capability_proof(),
+            MacSemanticExecutionMode::MeasuredBackground => {
+                macos_background_safe_capability_proof()
+            }
+        };
+        ComputerCapabilities::from_proof(proof)
+            .expect("compiled-in macOS native capability proof is valid")
     }
 
     fn physical_input_domain(&self) -> PhysicalInputDomain {
@@ -581,12 +975,39 @@ impl ComputerBackend for MacOsObservationBackend {
         }
         let (element_index, expected_element) =
             action_element(snapshot.nodes.as_slice(), observation, action)?;
+        if self.execution_mode == MacSemanticExecutionMode::MeasuredBackground {
+            let current = self.source.revalidate_target(&self.native_identity).await?;
+            validate_raw_target(&current)?;
+            if current.identity != self.native_identity
+                || current.frame != snapshot.target_frame
+                || current.active
+                || !current.on_screen
+                || current.minimized
+            {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::ForbiddenAction,
+                    "measured background dispatch requires the exact visible target to remain in the background",
+                ));
+            }
+            if !matches!(action, ComputerAction::SetValue { .. })
+                || expected_element.as_ref().is_none_or(|element| {
+                    self.measured_element_digest.as_deref()
+                        != Some(mac_background_element_digest(element).as_str())
+                })
+            {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::ForbiddenAction,
+                    "this measurement authorizes text entry on one exact semantic element only",
+                ));
+            }
+        }
         let cancellation = self.source.action_cancellation()?;
         let request = RawMacActionRequest {
             target_frame: snapshot.target_frame,
             element_index,
             expected_element,
             action: action.clone(),
+            execution_mode: self.execution_mode,
             cancellation: cancellation.clone(),
         };
         *self.active_action_cancellation.lock() = Some((run_id.to_string(), cancellation.clone()));
@@ -694,6 +1115,30 @@ fn mac_shape_digest(nodes: &[RawMacSemanticNode]) -> String {
         hasher.update([0]);
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn mac_background_element_digest(node: &RawMacSemanticNode) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(node.role.as_bytes());
+    hasher.update([0]);
+    hasher.update(node.subrole.as_deref().unwrap_or("").as_bytes());
+    hasher.update([0]);
+    hasher.update(node.label.as_deref().unwrap_or("").as_bytes());
+    hasher.update([0]);
+    hasher.update(format!("{:?}", node.frame).as_bytes());
+    hasher.update([u8::from(node.enabled)]);
+    hasher.update(format!("{:?}", node.sensitivity).as_bytes());
+    hasher.update([0]);
+    hasher.update(format!("{:?}", node.actions).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn mac_node_is_secure(node: &RawMacSemanticNode) -> bool {
+    node.role.to_ascii_lowercase().contains("secure")
+        || node
+            .subrole
+            .as_ref()
+            .is_some_and(|subrole| subrole.to_ascii_lowercase().contains("secure"))
 }
 
 fn action_element(
@@ -841,12 +1286,7 @@ fn normalize_observation(
             elements_truncated = true;
             continue;
         };
-        let secure_role = role.to_ascii_lowercase().contains("secure")
-            || node
-                .subrole
-                .as_ref()
-                .is_some_and(|subrole| subrole.to_ascii_lowercase().contains("secure"));
-        let sensitivity = if secure_role {
+        let sensitivity = if mac_node_is_secure(&node) {
             Sensitivity::Secure
         } else {
             node.sensitivity
@@ -1143,6 +1583,8 @@ mod tests {
         action_postcondition: Mutex<Option<bool>>,
         action_requests: Mutex<Vec<RawMacActionRequest>>,
         content_label: Mutex<String>,
+        text_value: Mutex<String>,
+        background_interference: AtomicBool,
         block_action_before_dispatch: AtomicBool,
         action_entered: tokio::sync::Notify,
         release_action: tokio::sync::Notify,
@@ -1176,6 +1618,8 @@ mod tests {
                 action_postcondition: Mutex::new(None),
                 action_requests: Mutex::new(Vec::new()),
                 content_label: Mutex::new("Continue".into()),
+                text_value: Mutex::new("public-demo-value".into()),
+                background_interference: AtomicBool::new(false),
                 block_action_before_dispatch: AtomicBool::new(false),
                 action_entered: tokio::sync::Notify::new(),
                 release_action: tokio::sync::Notify::new(),
@@ -1282,10 +1726,31 @@ mod tests {
                         sensitivity: Sensitivity::None,
                         actions: vec![RawMacSemanticAction::SetValue],
                     },
+                    RawMacSemanticNode {
+                        role: "AXTextField".into(),
+                        subrole: None,
+                        label: Some("Project label".into()),
+                        value: Some(self.text_value.lock().clone()),
+                        frame: Some(ObservationGeometry {
+                            x: frame.x + 3.0,
+                            y: frame.y + 2.0,
+                            width: 0.5,
+                            height: 1.0,
+                            scale_factor: 1.0,
+                        }),
+                        enabled: true,
+                        focused: false,
+                        sensitivity: Sensitivity::None,
+                        actions: vec![RawMacSemanticAction::SetValue],
+                    },
                 ],
                 nodes_truncated: *self.nodes_truncated.lock(),
                 sensitivity: Sensitivity::None,
             })
+        }
+
+        fn supports_measured_background(&self) -> bool {
+            true
         }
 
         async fn act(
@@ -1309,9 +1774,15 @@ mod tests {
                 .ok_or_else(|| {
                     ComputerError::new(ComputerErrorCode::TargetChanged, "fixture target changed")
                 })?;
-            if target.frame != request.target_frame
-                || (!matches!(&request.action, ComputerAction::ActivateTarget) && !target.active)
-            {
+            let focus_invalid = match request.execution_mode {
+                MacSemanticExecutionMode::ForegroundRequired => {
+                    !matches!(&request.action, ComputerAction::ActivateTarget) && !target.active
+                }
+                MacSemanticExecutionMode::MeasuredBackground => {
+                    target.active || !matches!(&request.action, ComputerAction::SetValue { .. })
+                }
+            };
+            if target.frame != request.target_frame || focus_invalid {
                 return Err(ComputerError::new(
                     ComputerErrorCode::TargetChanged,
                     "fixture target geometry or focus changed",
@@ -1328,6 +1799,14 @@ mod tests {
                     "fixture action was cancelled before dispatch",
                 ));
             }
+            if request.execution_mode == MacSemanticExecutionMode::MeasuredBackground
+                && self.background_interference.load(Ordering::SeqCst)
+            {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::UncertainOutcome,
+                    "fixture background dispatch changed user interaction state",
+                ));
+            }
             self.action_requests.lock().push(request.clone());
             if let Some(postcondition) = *self.action_postcondition.lock() {
                 return Ok(ActionOutcome::bounded(
@@ -1339,7 +1818,18 @@ mod tests {
                 ComputerAction::ActivateTarget => {
                     ActionOutcome::bounded("Activated fixture target", Some(true))
                 }
-                ComputerAction::SetValue { .. } | ComputerAction::Select { .. } => {
+                ComputerAction::SetValue { text, .. } => {
+                    if request
+                        .expected_element
+                        .as_ref()
+                        .and_then(|element| element.label.as_deref())
+                        == Some("Project label")
+                    {
+                        *self.text_value.lock() = text.clone();
+                    }
+                    ActionOutcome::bounded("Verified fixture mutation", Some(true))
+                }
+                ComputerAction::Select { .. } => {
                     ActionOutcome::bounded("Verified fixture mutation", Some(true))
                 }
                 ComputerAction::Invoke { .. } | ComputerAction::Scroll { .. } => {
@@ -1602,6 +2092,300 @@ mod tests {
         );
         assert_eq!(final_run.action_count, 0);
         assert!(source.action_requests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn measured_background_text_entry_is_reversible_one_use_and_exact() {
+        let source = Arc::new(FixtureSource::granted());
+        source.targets.lock()[0].active = false;
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let receipt = platform
+            .measure_background_text_entry(
+                &candidate.selection_token,
+                "Project label",
+                "background-probe-value",
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.target, candidate.target);
+        assert_eq!(
+            receipt.supported_action_classes,
+            BTreeSet::from([crate::computer_use::ActionClass::TextEntry])
+        );
+        assert_eq!(source.text_value.lock().as_str(), "public-demo-value");
+        let requests = source.action_requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            request.execution_mode == MacSemanticExecutionMode::MeasuredBackground
+        }));
+        drop(requests);
+
+        let directory = tempfile::tempdir().unwrap();
+        let service = platform
+            .bind_measured_background_target_service(
+                &candidate.selection_token,
+                &receipt.measurement_token,
+                ComputerStore::open(directory.path().join("computer-use")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let owner_session_id = Uuid::new_v4();
+        let caller =
+            crate::computer_use::ComputerAuthorityToken::local_operator(owner_session_id).unwrap();
+        let run = service
+            .create_run(
+                "create-background-run",
+                &caller,
+                None,
+                candidate.target,
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            run.capability_proof.tier(),
+            ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
+        );
+        assert!(!run.capability_proof.semantic_actions());
+        assert!(run.capability_proof.text_entry());
+        let now = Utc::now();
+        let run = service
+            .authorize(
+                "authorize-background-run",
+                &caller,
+                &run.run_id,
+                run.version,
+                crate::computer_use::ActionGrant::for_run(
+                    &run,
+                    BTreeSet::from([crate::computer_use::ActionClass::TextEntry]),
+                    now,
+                    now + chrono::Duration::minutes(5),
+                    Some(1),
+                ),
+            )
+            .unwrap();
+        let observation = service
+            .observe("observe-background-run", &caller, &run.run_id, run.version)
+            .await
+            .unwrap();
+        let element_id = observation
+            .elements
+            .iter()
+            .find(|element| element.label.as_deref() == Some("Project label"))
+            .unwrap()
+            .element_id
+            .clone();
+        let current = service.get_run(&run.run_id).unwrap().unwrap();
+        let outcome = service
+            .act(
+                "act-background-run",
+                &caller,
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                ComputerAction::SetValue {
+                    element_id,
+                    text: "agent-background-value".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.expected_postcondition_met, Some(true));
+        assert_eq!(source.text_value.lock().as_str(), "agent-background-value");
+        assert_eq!(
+            platform
+                .bind_measured_background_target_service(
+                    &candidate.selection_token,
+                    &receipt.measurement_token,
+                    ComputerStore::open(directory.path().join("second-use")).unwrap(),
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+    }
+
+    #[tokio::test]
+    async fn background_probe_requires_disposable_ack_and_fails_closed_on_interference() {
+        let source = Arc::new(FixtureSource::granted());
+        source.targets.lock()[0].active = false;
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        assert_eq!(
+            platform
+                .measure_background_text_entry(
+                    &candidate.selection_token,
+                    "Project label",
+                    "background-probe-value",
+                    false,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+        source.background_interference.store(true, Ordering::SeqCst);
+        assert_eq!(
+            platform
+                .measure_background_text_entry(
+                    &candidate.selection_token,
+                    "Project label",
+                    "background-probe-value",
+                    true,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::UncertainOutcome
+        );
+        assert_eq!(source.text_value.lock().as_str(), "public-demo-value");
+        assert!(source.action_requests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_probe_rejects_foreground_hidden_minimized_and_secure_targets() {
+        let configurations: [fn(&mut RawMacTarget); 3] = [
+            |target: &mut RawMacTarget| target.active = true,
+            |target: &mut RawMacTarget| target.on_screen = false,
+            |target: &mut RawMacTarget| target.minimized = true,
+        ];
+        for configure in configurations {
+            let source = Arc::new(FixtureSource::granted());
+            {
+                let mut targets = source.targets.lock();
+                targets[0].active = false;
+                configure(&mut targets[0]);
+            }
+            let platform = MacOsObservationPlatform::with_source(source);
+            let candidate = platform.list_targets().await.unwrap().remove(0);
+            assert_eq!(
+                platform
+                    .measure_background_text_entry(
+                        &candidate.selection_token,
+                        "Project label",
+                        "background-probe-value",
+                        true,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                ComputerErrorCode::ForbiddenTarget
+            );
+        }
+
+        let source = Arc::new(FixtureSource::granted());
+        source.targets.lock()[0].active = false;
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        assert_eq!(
+            platform
+                .measure_background_text_entry(
+                    &candidate.selection_token,
+                    "Password",
+                    "must-not-be-written",
+                    true,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::ForbiddenAction
+        );
+        assert_eq!(source.text_value.lock().as_str(), "public-demo-value");
+        assert!(source.action_requests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn measured_background_service_denies_foreground_transition() {
+        let source = Arc::new(FixtureSource::granted());
+        source.targets.lock()[0].active = false;
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let receipt = platform
+            .measure_background_text_entry(
+                &candidate.selection_token,
+                "Project label",
+                "background-probe-value",
+                true,
+            )
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let service = platform
+            .bind_measured_background_target_service(
+                &candidate.selection_token,
+                &receipt.measurement_token,
+                ComputerStore::open(directory.path().join("computer-use")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let owner_session_id = Uuid::new_v4();
+        let caller =
+            crate::computer_use::ComputerAuthorityToken::local_operator(owner_session_id).unwrap();
+        let run = service
+            .create_run(
+                "create-background-transition-run",
+                &caller,
+                None,
+                candidate.target,
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
+        let now = Utc::now();
+        let run = service
+            .authorize(
+                "authorize-background-transition-run",
+                &caller,
+                &run.run_id,
+                run.version,
+                crate::computer_use::ActionGrant::for_run(
+                    &run,
+                    BTreeSet::from([crate::computer_use::ActionClass::TextEntry]),
+                    now,
+                    now + chrono::Duration::minutes(5),
+                    Some(1),
+                ),
+            )
+            .unwrap();
+        let observation = service
+            .observe(
+                "observe-background-transition-run",
+                &caller,
+                &run.run_id,
+                run.version,
+            )
+            .await
+            .unwrap();
+        let element_id = observation
+            .elements
+            .iter()
+            .find(|element| element.label.as_deref() == Some("Project label"))
+            .unwrap()
+            .element_id
+            .clone();
+        source.targets.lock()[0].active = true;
+        let current = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            service
+                .act(
+                    "act-after-foreground-transition",
+                    &caller,
+                    &run.run_id,
+                    current.version,
+                    &observation.observation_id,
+                    ComputerAction::SetValue {
+                        element_id,
+                        text: "must-not-dispatch".into(),
+                    },
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::ForbiddenAction
+        );
+        assert_eq!(source.text_value.lock().as_str(), "public-demo-value");
+        assert_eq!(source.action_requests.lock().len(), 2);
     }
 
     #[tokio::test]
