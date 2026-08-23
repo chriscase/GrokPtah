@@ -35,8 +35,8 @@ complete or that the product has reached 100%.
 
 - Coordinator store suite: 12 passed, 0 failed.
 - Orchestration library suite: 121 selected tests passed, 0 failed.
-- Computer Use uncertain-domain regression: passed; bridge Clippy with
-- `-D warnings`: passed after the observation-fence change.
+- Computer Use uncertain-domain regression: passed; bridge Clippy with `-D
+  warnings`: passed after the observation-fence change.
 - `memory::tests`: 34 passed, 0 failed.
 - Host memory-scope suite: 6 passed, including versioned replay and payload
   conflict rejection.
