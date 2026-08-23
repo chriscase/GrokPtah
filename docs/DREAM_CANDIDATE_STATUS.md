@@ -142,7 +142,7 @@ unrelated signal.
 - Host memory-scope suite: 6 passed, including versioned replay and payload
   conflict rejection.
 - Host helper schema test: passed; bridge Clippy with `-D warnings`: passed.
-- `memory_long_horizon` integration fixture: 1 passed, 0 failed.
+- `memory_long_horizon` integration fixture: 2 passed, 0 failed.
 - `grokptah-agent-bridge` Clippy with `-D warnings`: passed.
 - Native Coding Readiness/provider-attempt suite: 15 passed, including frozen
   provider routes, quota-backed admission, stale qualification fencing, and
