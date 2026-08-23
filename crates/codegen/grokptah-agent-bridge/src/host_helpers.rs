@@ -1059,6 +1059,14 @@ pub(crate) fn coding_agent_tools(
                     "properties": {
                         "text": { "type": "string", "description": "Fact to remember" },
                         "tags": { "type": "array", "items": { "type": "string" } },
+                        "idempotency_key": { "type": "string", "description": "Optional stable key for replay-safe versioned writes" },
+                        "claim_key": { "type": "string", "description": "Optional bounded claim identity for versioned history" },
+                        "valid_from": { "type": "string", "description": "Optional RFC3339 activation instant" },
+                        "valid_until": { "type": "string", "description": "Optional RFC3339 expiry instant" },
+                        "supersedes": { "type": "string", "description": "Optional predecessor fact id" },
+                        "expected_head_id": { "type": "string", "description": "Expected predecessor head when superseding" },
+                        "expected_head_revision": { "type": "integer", "minimum": 1, "description": "Expected predecessor revision when superseding" },
+                        "salience": { "type": "string", "enum": ["low", "medium", "high"] },
                         "scope": memory_scope_schema()
                     },
                     "required": ["text", "scope"]
@@ -5074,6 +5082,21 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
                 tool["function"]["parameters"]["properties"]["scope"]["properties"]["kind"]["enum"],
                 serde_json::json!(["project", "agent_private", "team"])
             );
+            if name == "memory_write" {
+                let properties = &tool["function"]["parameters"]["properties"];
+                for field in [
+                    "idempotency_key",
+                    "claim_key",
+                    "valid_from",
+                    "valid_until",
+                    "supersedes",
+                    "expected_head_id",
+                    "expected_head_revision",
+                    "salience",
+                ] {
+                    assert!(properties.get(field).is_some(), "missing {field}");
+                }
+            }
         }
     }
 

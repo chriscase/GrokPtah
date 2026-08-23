@@ -4962,6 +4962,29 @@ impl AgentHostHandle {
         crate::memory::remember(&address, text, &[]).map_err(|error| anyhow!(error))
     }
 
+    /// Host-authorized replay-safe memory write for orchestration callers.
+    /// The caller supplies the idempotency and claim identities; scope and
+    /// source-workspace ownership are still resolved from the bound Lane.
+    pub fn memory_remember_versioned(
+        &self,
+        session_id: Uuid,
+        scope: MemoryScope,
+        idempotency_key: &str,
+        text: &str,
+        claim_key: &str,
+        tags: Vec<String>,
+    ) -> Result<(String, u64, bool)> {
+        let address = self.memory_address_for_session(session_id, scope)?;
+        let ack = crate::memory::remember_versioned(
+            &address,
+            crate::memory::VersionedWriteRequest::new(idempotency_key, text, claim_key)
+                .with_tags(tags),
+            crate::memory::WriteClass::Normal,
+        )
+        .map_err(|error| anyhow!(error))?;
+        Ok((ack.id, ack.revision, ack.replayed))
+    }
+
     pub fn set_model(&self, model: String) {
         let changed = self.inner.lock().model != model;
         if changed {
@@ -10487,13 +10510,111 @@ impl AgentHostHandle {
                     })
                     .unwrap_or_default();
                 let address = self.memory_address_from_args(session_id, &args)?;
+                let advanced_keys = [
+                    "idempotency_key",
+                    "claim_key",
+                    "valid_from",
+                    "valid_until",
+                    "supersedes",
+                    "expected_head_id",
+                    "expected_head_revision",
+                    "salience",
+                ];
+                let advanced_requested = advanced_keys.iter().any(|key| args.get(*key).is_some());
+                let versioned_request = if advanced_requested {
+                    let optional_string = |name: &str| -> Result<Option<String>> {
+                        args.get(name)
+                            .map(|value| {
+                                value
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .ok_or_else(|| anyhow!("memory_write {name} must be a string"))
+                            })
+                            .transpose()
+                    };
+                    let idempotency_key = optional_string("idempotency_key")?
+                        .ok_or_else(|| anyhow!("versioned memory_write requires idempotency_key"))?;
+                    if args.get("tags").is_some()
+                        && args["tags"]
+                            .as_array()
+                            .is_none_or(|values| values.iter().any(|value| !value.is_string()))
+                    {
+                        return Err(anyhow!("memory_write tags must be an array of strings"));
+                    }
+                    let claim_key = optional_string("claim_key")?
+                        .unwrap_or_else(|| format!("tool:{idempotency_key}"));
+                    let mut request = crate::memory::VersionedWriteRequest::new(
+                        idempotency_key,
+                        text.clone(),
+                        claim_key,
+                    )
+                    .with_tags(tags.clone());
+                    if let Some(value) = optional_string("valid_from")? {
+                        request = request.with_valid_from(value);
+                    }
+                    if let Some(value) = optional_string("valid_until")? {
+                        request = request.with_valid_until(value);
+                    }
+                    let supersedes = optional_string("supersedes")?;
+                    let expected_head_id = optional_string("expected_head_id")?;
+                    let expected_head_revision = args
+                        .get("expected_head_revision")
+                        .map(|value| {
+                            value.as_u64().ok_or_else(|| {
+                                anyhow!("memory_write expected_head_revision must be an integer")
+                            })
+                        })
+                        .transpose()?;
+                    match (supersedes, expected_head_id, expected_head_revision) {
+                        (Some(predecessor), Some(expected_id), Some(expected_revision))
+                            if predecessor == expected_id => {
+                                request = request.superseding(predecessor, expected_revision);
+                            }
+                        (None, None, None) => {}
+                        _ => {
+                            return Err(anyhow!(
+                                "versioned memory supersession requires matching supersedes, expected_head_id, and expected_head_revision"
+                            ));
+                        }
+                    }
+                    let salience = args
+                        .get("salience")
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .ok_or_else(|| anyhow!("memory_write salience must be a string"))
+                        })
+                        .transpose()?;
+                    match salience {
+                        None | Some("medium") => {}
+                        Some("low") => request = request.with_salience_low(),
+                        Some("high") => request = request.with_salience_high(),
+                        Some(_) => return Err(anyhow!("memory_write salience is invalid")),
+                    }
+                    Some(request)
+                } else {
+                    None
+                };
                 self.run_tool_for_output(
                     session_id,
                     "memory_write",
                     &args,
                     || async move {
-                        let id = crate::memory::remember(&address, &text, &tags)?;
-                        let out = format!("Remembered fact {id}: {text}");
+                        let out = if let Some(request) = versioned_request {
+                            let ack = crate::memory::remember_versioned(
+                                &address,
+                                request,
+                                crate::memory::WriteClass::Normal,
+                            )
+                            .map_err(|error| anyhow!(error))?;
+                            format!(
+                                "Remembered versioned fact {} revision {} (replayed={}): {}",
+                                ack.id, ack.revision, ack.replayed, text
+                            )
+                        } else {
+                            let id = crate::memory::remember(&address, &text, &tags)?;
+                            format!("Remembered fact {id}: {text}")
+                        };
                         Ok(local_tools::ToolResult::basic(
                             "memory_write".into(),
                             ToolCallKind::Edit,

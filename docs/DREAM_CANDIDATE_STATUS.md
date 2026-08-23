@@ -11,6 +11,10 @@ complete or that the product has reached 100%.
   supersession chains, expiry-aware retrieval, conflict reporting, bounded
   compaction, crash-safe commit cutpoints, replay receipts, and secret-shaped
   evidence redaction.
+- The host now exposes replay-safe versioned memory writes to orchestration
+  callers, and the model-facing `memory_write` schema accepts explicit
+  idempotency, claim, temporal, supersession, and salience fields while keeping
+  legacy writes compatible.
 - The logical-years certification fixture is typed with deny-unknown fields and
   remains secret-free.
 - The certification now covers rollback-safe temporal history and pressure
@@ -23,6 +27,9 @@ complete or that the product has reached 100%.
 ## Verification recorded
 
 - `memory::tests`: 34 passed, 0 failed.
+- Host memory-scope suite: 6 passed, including versioned replay and payload
+  conflict rejection.
+- Host helper schema test: passed; bridge Clippy with `-D warnings`: passed.
 - `memory_long_horizon` integration fixture: 1 passed, 0 failed.
 - `grokptah-agent-bridge` Clippy with `-D warnings`: passed.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
