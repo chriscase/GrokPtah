@@ -3,6 +3,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <Security/Security.h>
 
 #include <stdbool.h>
 #include <dlfcn.h>
@@ -21,6 +22,12 @@ typedef struct {
     uint8_t *error;
     size_t error_len;
 } GPTMacNativeResult;
+
+typedef struct {
+    bool operating_system_supported;
+    bool framework_available;
+    bool virtualization_entitlement_present;
+} GPTMacVirtualizationProbe;
 
 enum {
     GPT_MAC_OK = 0,
@@ -201,6 +208,46 @@ bool gpt_macos_observation_supported(void) {
         return GPTLoadScreenCaptureKit();
     }
     return false;
+}
+
+GPTMacVirtualizationProbe gpt_macos_virtualization_probe(void) {
+    GPTMacVirtualizationProbe result = {0};
+    if (@available(macOS 14.0, *)) {
+        result.operating_system_supported = true;
+    } else {
+        return result;
+    }
+
+    static BOOL framework_available = NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *handle = dlopen(
+            "/System/Library/Frameworks/Virtualization.framework/Virtualization",
+            RTLD_LAZY | RTLD_LOCAL);
+        framework_available = handle != NULL &&
+                              NSClassFromString(@"VZVirtualMachine") != nil &&
+                              NSClassFromString(@"VZVirtualMachineConfiguration") != nil &&
+                              NSClassFromString(@"VZVirtioGraphicsDeviceConfiguration") != nil &&
+                              NSClassFromString(@"VZVirtioSocketDeviceConfiguration") != nil &&
+                              NSClassFromString(@"VZVirtualMachineView") != nil;
+    });
+    result.framework_available = framework_available;
+
+    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
+    if (task != NULL) {
+        CFTypeRef entitlement = SecTaskCopyValueForEntitlement(
+            task,
+            CFSTR("com.apple.security.virtualization"),
+            NULL);
+        if (entitlement != NULL) {
+            result.virtualization_entitlement_present =
+                CFGetTypeID(entitlement) == CFBooleanGetTypeID() &&
+                CFBooleanGetValue((CFBooleanRef)entitlement);
+            CFRelease(entitlement);
+        }
+        CFRelease(task);
+    }
+    return result;
 }
 
 bool gpt_macos_screen_recording_granted(void) {

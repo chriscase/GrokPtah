@@ -15,7 +15,10 @@ use super::macos_observation::{
     MacSemanticExecutionMode, RawMacActionRequest, RawMacObservation, RawMacSemanticAction,
     RawMacSemanticNode, RawMacTarget,
 };
-use super::platform::{ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus};
+use super::platform::{
+    ComputerIsolatedVisualStatus, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus,
+};
 use super::types::{
     ActionOutcome, ComputerAction, ComputerError, ComputerErrorCode, ComputerResult,
     ComputerUseLimits, ObservationGeometry, Sensitivity,
@@ -35,8 +38,16 @@ struct NativeResult {
     error_len: usize,
 }
 
+#[repr(C)]
+struct NativeVirtualizationProbe {
+    operating_system_supported: bool,
+    framework_available: bool,
+    virtualization_entitlement_present: bool,
+}
+
 unsafe extern "C" {
     fn gpt_macos_observation_supported() -> bool;
+    fn gpt_macos_virtualization_probe() -> NativeVirtualizationProbe;
     fn gpt_macos_screen_recording_granted() -> bool;
     fn gpt_macos_request_screen_recording() -> bool;
     fn gpt_macos_accessibility_granted() -> bool;
@@ -61,6 +72,20 @@ unsafe extern "C" {
         cancellation: *const c_void,
     ) -> NativeResult;
     fn gpt_macos_result_free(result: *mut NativeResult);
+}
+
+pub(crate) fn isolated_visual_status() -> ComputerIsolatedVisualStatus {
+    // Pure host/package introspection. The native side performs no VM launch,
+    // permission request, image read, or helper discovery.
+    let probe = unsafe { gpt_macos_virtualization_probe() };
+    let status = ComputerIsolatedVisualStatus::read_only_probe(
+        true,
+        probe.operating_system_supported,
+        probe.framework_available,
+        probe.virtualization_entitlement_present,
+    );
+    debug_assert!(status.validate().is_ok());
+    status
 }
 
 #[derive(Debug, Default)]

@@ -666,10 +666,13 @@ the first probe. [#288](https://github.com/chriscase/GrokPtah/issues/288)
 qualify**. The source-only Stage 9 investigation now selects an authenticated,
 networkless-by-default disposable VM as the arbitrary-GUI boundary and rejects
 hidden windows, Spaces, live coordinate injection, the simulator, and a WebView
-alone as sufficient proof. See
+alone as sufficient proof. The Stage 9 candidate also has an additive guest-only pointer
+move/button/text contract and a read-only macOS probe for the minimum OS, required Virtualization
+classes, and exact entitlement. The probe explicitly reports the packaged helper/image as pending
+and never launches a VM or grants authority. See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
-helper, guest image, packaged entitlement proof, or host-native dispatch exists
-yet, so this decision satisfies no #288 acceptance checkbox.
+helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
+source slices satisfy no #288 acceptance checkbox.
 
 **Exit:** every [#288](https://github.com/chriscase/GrokPtah/issues/288)
 acceptance criterion. **This row cannot be marked Explicitly unsupported as

@@ -107,6 +107,7 @@ pub fn run() {
             commands::persistent_agent_resume_plan,
             commands::persistent_agent_resume,
             commands::computer_use_status,
+            commands::computer_use_isolated_visual_status,
             commands::computer_use_request_permission,
             commands::computer_use_list_targets,
             commands::computer_use_observe_once,

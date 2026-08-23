@@ -165,6 +165,9 @@ available.
    The pointer move/button and text-input type/policy slice is implemented in the Stage 9 candidate;
    authenticated transport events and replay evidence remain part of steps 4–5.
 2. Build a read-only Virtualization-framework availability/configuration probe with no VM launch.
+   The Stage 9 probe candidate now checks the minimum OS, required framework classes, and exact
+   virtualization entitlement, then reports the first blocker in Settings. It hard-codes the
+   helper/image as unready and records `launchAttempted: false`; it cannot mint a capability proof.
 3. Package and measure a minimal helper and immutable guest fixture; run the no-input lifecycle and
    cleanup campaign.
 4. Add authenticated virtio-socket frame/health transport and render read-only frames.
@@ -179,8 +182,8 @@ available.
 ## Status and nonclaims
 
 The existing simulator remains the only dispatchable isolated proof. The Stage 8 measured
-background candidate is not a substitute. The typed input-contract candidate does not enable
-`HostNative`, expose isolated actions to a model or cockpit approval flow, qualify a provider for
-visual fallback, package a VM image/helper, or satisfy any #288 acceptance checkbox. It selects the
-production boundary and establishes the fail-closed action vocabulary required before the first
-safe VM input can exist.
+background candidate is not a substitute. The typed input-contract and read-only host-probe
+candidates do not enable `HostNative`, expose isolated actions to a model or cockpit approval flow,
+qualify a provider for visual fallback, package a VM image/helper, or satisfy any #288 acceptance
+checkbox. The probe dynamically checks availability only; a present framework or entitlement is
+not a VM, guest, isolation, dispatch, or packaged-release proof.

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type {
   AuthState,
+  ComputerIsolatedVisualStatus,
   ComputerObservationPreview,
   ComputerPermissionStatus,
   ComputerPlatformStatus,
@@ -97,6 +98,8 @@ export function SettingsPanel({
   const readinessReportSelection = useRef(-1);
   const [computerStatus, setComputerStatus] =
     useState<ComputerPlatformStatus | null>(null);
+  const [isolatedVisualStatus, setIsolatedVisualStatus] =
+    useState<ComputerIsolatedVisualStatus | null>(null);
   const [computerTargets, setComputerTargets] = useState<
     ComputerTargetCandidate[]
   >([]);
@@ -154,7 +157,12 @@ export function SettingsPanel({
   }, [open]);
 
   const refreshComputerUse = useCallback(async () => {
-    setComputerStatus(await api.computerUseStatus());
+    const [status, isolated] = await Promise.all([
+      api.computerUseStatus(),
+      api.computerUseIsolatedVisualStatus(),
+    ]);
+    setComputerStatus(status);
+    setIsolatedVisualStatus(isolated);
   }, []);
 
   useEffect(() => {
@@ -222,9 +230,13 @@ export function SettingsPanel({
     try {
       const result = await fn(isCurrent);
       if (!isCurrent()) return undefined;
-      const status = await api.computerUseStatus();
+      const [status, isolated] = await Promise.all([
+        api.computerUseStatus(),
+        api.computerUseIsolatedVisualStatus(),
+      ]);
       if (!isCurrent()) return undefined;
       setComputerStatus(status);
+      setIsolatedVisualStatus(isolated);
       if (okMsg) setNotice(okMsg);
       return result;
     } catch (error) {
@@ -641,6 +653,49 @@ export function SettingsPanel({
                   Read-only macOS observation. Captures require a fresh local
                   window selection; keyboard and pointer control are disabled.
                 </p>
+
+                {isolatedVisualStatus && (
+                  <div
+                    className="computer-permission-list"
+                    aria-label="Isolated visual workspace readiness"
+                  >
+                    <div className="computer-permission-row">
+                      <div>
+                        <strong>Isolated visual workspace</strong>
+                        <span>
+                          {isolatedVisualStatus.available
+                            ? "Ready"
+                            : "Not available yet"}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="computer-permission-row">
+                      <div>
+                        <strong>Host virtualization</strong>
+                        <span>
+                          {isolatedVisualStatus.hostCapable
+                            ? "Ready"
+                            : "Needs setup"}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="computer-permission-row">
+                      <div>
+                        <strong>Packaged isolated environment</strong>
+                        <span>
+                          {isolatedVisualStatus.backendPackaged &&
+                          isolatedVisualStatus.guestImageMeasured
+                            ? "Measured and ready"
+                            : "Pending"}
+                        </span>
+                      </div>
+                    </div>
+                    <p className="settings-hint">
+                      {isolatedVisualStatus.detail}. This check is read-only and
+                      did not launch a virtual machine.
+                    </p>
+                  </div>
+                )}
 
                 {computerStatus ? (
                   <div className="computer-permission-list">

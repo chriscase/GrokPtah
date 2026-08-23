@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 
 use grokptah_agent_bridge::{
-    desktop_auto_update_enabled, AuthState, BackgroundTask, ComputerAction, ComputerPermission,
-    ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
-    JournalPage, McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
-    PromptQueueRunNextResult, PromptQueueSnapshot, PromptQueueTakeResult, ProviderDeadlineClass,
-    ProviderProfileUpdate, ProviderQualificationReport, PublicRun, PublicRunPage, RunExecutionMode,
-    RunReview, RunState, SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary,
-    SkillInfo, SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION,
-    PRODUCT_NAME,
+    computer_isolated_visual_status, desktop_auto_update_enabled, AuthState, BackgroundTask,
+    ComputerAction, ComputerIsolatedVisualStatus, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel, JournalPage, McpServerInfo,
+    ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry, PromptQueueRunNextResult,
+    PromptQueueSnapshot, PromptQueueTakeResult, ProviderDeadlineClass, ProviderProfileUpdate,
+    ProviderQualificationReport, PublicRun, PublicRunPage, RunExecutionMode, RunReview, RunState,
+    SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
+    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
@@ -798,6 +798,11 @@ pub async fn persistent_agent_resume(
 #[tauri::command]
 pub fn computer_use_status(state: State<'_, AppState>) -> ComputerPlatformStatus {
     state.computer_use.status()
+}
+
+#[tauri::command]
+pub fn computer_use_isolated_visual_status() -> ComputerIsolatedVisualStatus {
+    computer_isolated_visual_status()
 }
 
 #[tauri::command]

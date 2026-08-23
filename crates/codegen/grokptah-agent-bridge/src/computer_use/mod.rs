@@ -25,8 +25,9 @@ mod types;
 
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
-    ComputerBackgroundSafetyReceipt, ComputerObservationPlatform, ComputerPermission,
-    ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate,
+    computer_isolated_visual_status, ComputerBackgroundSafetyReceipt,
+    ComputerIsolatedVisualBlocker, ComputerIsolatedVisualStatus, ComputerObservationPlatform,
+    ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate,
 };
 pub use policy::ComputerPolicy;
 pub use projection::{

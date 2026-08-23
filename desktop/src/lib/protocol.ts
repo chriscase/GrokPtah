@@ -992,6 +992,28 @@ export interface ComputerPlatformStatus {
   detail?: string | null;
 }
 
+export interface ComputerIsolatedVisualStatus {
+  platformId: string;
+  available: boolean;
+  hostCapable: boolean;
+  minimumOsVersion: string;
+  operatingSystemSupported: boolean;
+  virtualizationFrameworkAvailable: boolean;
+  virtualizationEntitlementPresent: boolean;
+  backendPackaged: boolean;
+  guestImageMeasured: boolean;
+  launchAttempted: boolean;
+  blocker?:
+    | "unsupported_platform"
+    | "minimum_os"
+    | "framework_unavailable"
+    | "entitlement_missing"
+    | "backend_not_packaged"
+    | "guest_image_not_measured"
+    | null;
+  detail: string;
+}
+
 export interface ComputerTargetCandidate {
   selectionToken: string;
   target: {

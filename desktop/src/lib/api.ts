@@ -11,6 +11,7 @@ import type {
   ComputerRunEventPage,
   ComputerPermissionStatus,
   ComputerPlatformStatus,
+  ComputerIsolatedVisualStatus,
   ComputerTargetCandidate,
   ModelInfo,
   SearchHit,
@@ -335,6 +336,10 @@ export const api = {
     }),
   computerUseStatus: () =>
     invoke<ComputerPlatformStatus>("computer_use_status"),
+  computerUseIsolatedVisualStatus: () =>
+    invoke<ComputerIsolatedVisualStatus>(
+      "computer_use_isolated_visual_status",
+    ),
   computerUseRequestPermission: (
     permission: "screen_recording" | "accessibility",
   ) =>
