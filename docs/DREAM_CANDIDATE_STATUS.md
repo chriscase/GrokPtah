@@ -250,6 +250,22 @@ unrelated signal.
   claimed because this sandbox refused `127.0.0.1:0` listener creation before
   the test body. The retained logical-years artifact must be recaptured by an
   integrated host/CI campaign before Stage 5 is called certified.
+- Candidate `a530f20d59d64b1d9825690c45c553a1c4191852` adds the exact-head
+  Stage 5 `memory` runner. Its ten-gate manifest binds the fresh logical-years
+  payload, scope/crash/restart checks, frozen Manager attribution/objective,
+  durable Manager-store recovery, and the host-only supervisor/native proofs
+  into one deny-unknown sealed report. Certification-lab qualification is
+  `97 passed`; strict all-target Clippy passes for both lab and bridge; the
+  Manager store is `5 passed`. The full bridge run produced `643 passed` plus
+  36 loopback/socket-denied failures in this sandbox; one parallel freshness
+  timing case passed when rerun alone. A local runner exercise failed closed
+  with no report or completion seal, so no Stage 5 certification is claimed.
+- Rust campaign builds now require explicit
+  `RUSTC_WRAPPER=/opt/homebrew/bin/sccache`, the namespaced GrokPtah sccache
+  directory, and a Rust/toolchain/feature-compatible external
+  `CARGO_TARGET_DIR`. The prior in-checkout bridge and lab targets were inactive
+  and removed after open-handle checks; future compatible runs reuse the
+  external target serially.
 - The candidate's 10-minute Always-On soak was attempted and stopped before
   execution because the sandbox denied the fake provider's loopback bind
   (`Operation not permitted`); no soak evidence is claimed.

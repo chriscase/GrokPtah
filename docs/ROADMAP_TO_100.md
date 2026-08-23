@@ -432,12 +432,23 @@ refused before provider admission or plan mutation.
 One retained logical-years artifact exists at
 [`docs/evidence/memory-long-horizon-campaign-v1.json`](evidence/memory-long-horizon-campaign-v1.json),
 but it predates the Manager slice and deliberately remains
-`claim_eligible: false`. Stage 5 is therefore **implementation-complete in the
-candidate but not yet certification-complete**: the current integrated head
-still needs one retained exact-head campaign that binds the logical-years,
-crash/restart, scope, and Manager-attribution proofs together. The loopback
-manager/native suites must also be rerun on a host/CI runner because this
-sandbox currently refuses local listener creation.
+`claim_eligible: false`. Candidate `a530f20d59d64b1d9825690c45c553a1c4191852`
+adds the integrated `memory` campaign runner documented in
+[`PERSISTENT_AGENT_CERTIFICATION_LAB.md`](PERSISTENT_AGENT_CERTIFICATION_LAB.md).
+It requires a clean exact head, runs ten ordered gates with exact green
+cardinalities, binds fresh logical-years evidence to that same SHA, retains
+only bounded digests, rechecks head/cleanliness, and seals only after every
+gate passes. Tampered, incomplete, reordered, drifted, or false-claim evidence
+fails independent inspection.
+
+Stage 5 is therefore **implementation-complete in the candidate but not yet
+certification-complete**. A local fail-closed exercise created only an
+incomplete ignored campaign and no report/completion seal; it does not count
+as evidence. The current integrated head still needs one retained passing
+exact-head campaign on a host/CI runner that permits the required supervisor
+and native loopback gates. Run it serially with the explicit sccache and
+external-target environment in the lab guide; an in-checkout target is not an
+acceptable campaign setup.
 
 **Exit (all required):**
 

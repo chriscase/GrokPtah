@@ -81,6 +81,50 @@ cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
   run --repository "$PWD"
 ```
 
+### Exact-head Stage 5 memory campaign
+
+The `memory` command is the deny-unknown integrated exit runner for roadmap
+stage 5. It requires one clean Git checkout and binds the report to that exact
+40-character commit. It executes the ordered logical-years, crash/cutpoint,
+compaction/reopen, cross-process restart, scope-isolation, Manager attribution,
+Manager objective, Manager-store restart, supervisor loopback, and native
+proposal gates. A missing, reordered, failed, cardinality-mismatched, or
+candidate-drifted gate leaves an incomplete campaign and cannot create a
+completion seal or certification claim.
+
+Run it serially with the pinned shared compiler cache and a compatibility-keyed
+external target. These variables are mandatory; do not create another target
+inside the checkout:
+
+```sh
+export RUSTC_WRAPPER=/opt/homebrew/bin/sccache
+export SCCACHE_DIR=/Users/chriscase/Library/Caches/grokptah/sccache
+export CARGO_TARGET_DIR=/Users/chriscase/Library/Caches/grokptah/targets/rust-1.92.0-stage5-memory-default
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  memory --repository "$PWD"
+```
+
+Owner: the single Stage 5 campaign process. Reuse that target only for this
+Rust 1.92.0/default-feature family and never concurrently. Before the command,
+record disk headroom and verify that no other process owns the target. After
+the command, record the target size, cache statistics, and owner state. Retain
+the shared target for the next serial compatible run; delete only a separately
+named incompatible/concurrent target after final process and open-handle
+checks.
+
+A passing run writes a sealed report beneath
+`evals/runs/memory-stage5-cert/<campaign-id>/`. Independently verify it with:
+
+```sh
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  inspect --campaign "$PWD/evals/runs/memory-stage5-cert/<campaign-id>"
+```
+
+The sealed report retains command/output digests and exact test cardinalities,
+not raw transcripts or credentials. This accelerated logical-years campaign is
+separate from the stage-6 72-hour operational soak.
+
 The default run selects the seven deterministic probes above, creates a
 disposable runtime home and workspace, uses the offline provider path, and
 writes under `evals/runs/persistent-agent-cert/<campaign-id>/`. Override
