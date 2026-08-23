@@ -807,6 +807,17 @@ struct SessionWorkspaceArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ListRunsArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateSessionArgs {
     workspace: PathBuf,
     #[serde(default)]
@@ -1871,7 +1882,9 @@ fn tool_input_schema(name: &str) -> Value {
             "additionalProperties": false,
             "properties": {
                 "session_id": session,
-                "workspace": workspace
+                "workspace": workspace,
+                "cursor": {"type": "string", "minLength": 1, "maxLength": 256},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 128}
             }
         }),
         "ptah_get_persistent_agent" => json!({
@@ -2717,8 +2730,14 @@ async fn dispatch_tool(
             orch.list_persistent_agents(auth)
         }
         "ptah_list_runs" => {
-            let args: SessionWorkspaceArgs = parse_value(args)?;
-            orch.list_runs_scoped(auth, args.session_id, &args.workspace)
+            let args: ListRunsArgs = parse_value(args)?;
+            orch.list_runs_scoped_page(
+                auth,
+                args.session_id,
+                &args.workspace,
+                args.cursor.as_deref(),
+                args.limit,
+            )
         }
         "ptah_get_persistent_agent" => {
             let args: PersistentAgentArgs = parse_value(args)?;

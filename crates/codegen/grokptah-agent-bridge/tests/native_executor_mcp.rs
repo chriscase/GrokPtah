@@ -6,15 +6,20 @@ use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use grokptah_agent_bridge::orchestration::{
-    AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, ProviderAttemptState,
-    ProviderRetryClass, ProviderRoute, ProviderSendCertainty, QuotaClass, QuotaReservationState,
-    RunBounds, RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState,
-    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
+    hash_payload, public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
+    AssignmentStatus, AuthContext, ChangeRecord, IdempotencyClaim, ManagedExecutionIntent,
+    ManagedExecutionPolicy, ManagedIntentState, OrchStore, OrchestrationConfig,
+    OrchestrationService, ProviderAttemptState, ProviderRetryClass, ProviderRoute,
+    ProviderRouteSnapshot, ProviderSendCertainty, PublicRun, QuotaClass, QuotaLimits,
+    QuotaReservation, QuotaReservationState, RunAggregates, RunBounds, RunProgress, RunPurpose,
+    RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
+    MANAGED_EXECUTION_SCHEMA_VERSION, PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+    PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
 };
 use grokptah_agent_bridge::{
-    model_selection_key, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
-    McpControlClient, McpRemoteError, SessionKind, SessionUpdate,
+    model_selection_key, set_grokptah_home_override, start_control_server, AgentHost,
+    CapabilitySource, EffortLevel, HostConfig, McpControlClient, McpRemoteError, ModelCapabilities,
+    ProviderDeadlineClass, ProviderDialect, ProviderKind, SessionKind, SessionUpdate,
 };
 use serde_json::json;
 use std::path::Path;
@@ -414,6 +419,115 @@ fn auth() -> AuthContext {
     }
 }
 
+fn assert_public_payload_hides_route(
+    payload: &serde_json::Value,
+    route: &ProviderRouteSnapshot,
+    extra_sentinels: &[&str],
+) {
+    fn walk(value: &serde_json::Value, path: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    assert!(
+                        !key.eq_ignore_ascii_case("providerRoute")
+                            && !key.eq_ignore_ascii_case("provider_route"),
+                        "providerRoute leaked at {path}.{key}"
+                    );
+                    walk(child, &format!("{path}.{key}"));
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for (index, child) in values.iter().enumerate() {
+                    walk(child, &format!("{path}[{index}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(payload, "$");
+    let encoded = payload.to_string();
+    let qualification = route.qualification_record_id.as_deref().unwrap_or_default();
+    for sentinel in [route.base_url.as_str(), route.credential_ref.as_str()]
+        .into_iter()
+        .chain([
+            route.credential_fingerprint.as_str(),
+            route.endpoint_fingerprint.as_str(),
+            qualification,
+            route.selection_key.as_str(),
+        ])
+        .chain(extra_sentinels.iter().copied())
+    {
+        if sentinel.is_empty() {
+            continue;
+        }
+        assert!(
+            !encoded.contains(sentinel),
+            "public payload leaked {sentinel}: {encoded}"
+        );
+    }
+    assert!(!public_run_contains_forbidden_fields(payload));
+    if let Some(route_json) = payload
+        .get("providerExecution")
+        .and_then(|value| value.get("route"))
+        .or_else(|| {
+            payload
+                .get("runs")
+                .and_then(|runs| runs.get(0))
+                .and_then(|run| run.get("providerExecution"))
+                .and_then(|value| value.get("route"))
+        })
+    {
+        assert!(route_json.get("quotaReservationId").is_none());
+        assert!(route_json.get("selectionKey").is_none());
+        assert!(route_json.get("qualificationRecordId").is_none());
+        assert!(
+            public_provider_route_keys_are_allowlisted(route_json),
+            "providerExecution.route keys must be exact-allowlisted: {route_json}"
+        );
+    }
+}
+
+fn mcp_text_value(raw: &serde_json::Value) -> serde_json::Value {
+    let text = raw
+        .get("content")
+        .and_then(|content| content.get(0))
+        .and_then(|item| item.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("MCP tool result must include content[0].text");
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({ "text": text }))
+}
+
+fn assert_public_surfaces_hide_route(
+    get_run: &serde_json::Value,
+    list_runs: &serde_json::Value,
+    progress: &serde_json::Value,
+    host_list: &[PublicRun],
+    host_get: &PublicRun,
+    route: &ProviderRouteSnapshot,
+    extra_sentinels: &[&str],
+) {
+    assert_public_payload_hides_route(get_run, route, extra_sentinels);
+    assert_public_payload_hides_route(list_runs, route, extra_sentinels);
+    assert_public_payload_hides_route(&list_runs["runs"][0], route, extra_sentinels);
+    assert_public_payload_hides_route(progress, route, extra_sentinels);
+    let host_list_value = serde_json::to_value(host_list).unwrap();
+    let host_get_value = serde_json::to_value(host_get).unwrap();
+    assert_public_payload_hides_route(&host_list_value, route, extra_sentinels);
+    assert_public_payload_hides_route(&host_get_value, route, extra_sentinels);
+    let decoded: PublicRun = serde_json::from_value(get_run.clone()).unwrap();
+    assert_public_payload_hides_route(
+        &serde_json::to_value(&decoded).unwrap(),
+        route,
+        extra_sentinels,
+    );
+    let decoded_list: Vec<PublicRun> = serde_json::from_value(list_runs["runs"].clone()).unwrap();
+    assert_public_payload_hides_route(
+        &serde_json::to_value(&decoded_list).unwrap(),
+        route,
+        extra_sentinels,
+    );
+}
+
 fn run_record(
     intent_id: &str,
     session: Uuid,
@@ -711,7 +825,7 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         "native",
         "Verify the frozen provider route at native admission",
         lane.id,
-        workspace_text,
+        workspace_text.clone(),
         "operator",
         WorkPolicy::default(),
     )
@@ -816,6 +930,77 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         .get_progress_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
         .unwrap();
     assert_eq!(progress["providerExecution"], *provider_execution);
+    let listed = orch
+        .list_runs_scoped(&auth(), lane.id, workspace.path())
+        .unwrap();
+    let control = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let mcp_get = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    let mcp_list = client
+        .call_tool(
+            "ptah_list_runs",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+            }),
+        )
+        .await
+        .unwrap();
+    let mcp_progress = client
+        .call_tool(
+            "ptah_get_progress",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    let host_list = host.list_public_session_runs(lane.id).unwrap();
+    let host_get = host
+        .get_public_session_run(lane.id, &run.run_id)
+        .unwrap()
+        .expect("desktop get must see the admitted Run");
+    let sentinels = ["synthetic-native-route-key"];
+    assert_public_surfaces_hide_route(
+        &admitted_view,
+        &listed,
+        &progress,
+        &host_list,
+        &host_get,
+        run_route,
+        &sentinels,
+    );
+    assert_public_surfaces_hide_route(
+        &mcp_get.structured,
+        &mcp_list.structured,
+        &mcp_progress.structured,
+        &host_list,
+        &host_get,
+        run_route,
+        &sentinels,
+    );
+    assert_public_surfaces_hide_route(
+        &mcp_text_value(&mcp_get.raw),
+        &mcp_text_value(&mcp_list.raw),
+        &mcp_text_value(&mcp_progress.raw),
+        &host_list,
+        &host_get,
+        run_route,
+        &sentinels,
+    );
     let admitted_capacity = orch.get_capacity(&auth()).unwrap();
     assert_eq!(admitted_capacity["providerQuota"]["activeReservations"], 1);
     assert_eq!(
@@ -2171,4 +2356,314 @@ async fn failed_permission_respond_then_recovery_does_not_unpark() {
     );
     orch.stop_background_tasks().await;
     let _ = workspace;
+}
+
+const FAILING_BASE_URL: &str = "http://127.0.0.1:35201/leak-base-url-sentinel-pr352/v1";
+const FAILING_CREDENTIAL_REF: &str = "keychain:provider/leak-cred-ref-sentinel-pr352";
+const FAILING_CREDENTIAL_FP: &str = "v1-sha256:leak-cred-fp-sentinel-pr352";
+const FAILING_QUOTA: &str = "quota-leak-reservation-sentinel-pr352";
+
+fn failing_provider_route(reservation_id: &str) -> ProviderRouteSnapshot {
+    let mut route = ProviderRouteSnapshot {
+        schema_version: PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+        provider_id: "env-grokptah".into(),
+        model_id: "leak-model".into(),
+        wire_model_id: "leak-model".into(),
+        selection_key: model_selection_key("env-grokptah", "leak-model"),
+        kind: ProviderKind::OpenAiCompatible,
+        dialect: ProviderDialect::OpenAiChatCompletions,
+        base_url: FAILING_BASE_URL.into(),
+        endpoint_fingerprint: "pending".into(),
+        credential_ref: FAILING_CREDENTIAL_REF.into(),
+        credential_fingerprint: FAILING_CREDENTIAL_FP.into(),
+        capabilities: ModelCapabilities {
+            chat: true,
+            tools: true,
+            stream: true,
+            source: CapabilitySource::Measured,
+            qualification_schema: Some("grokptah.provider-qualification.v1".into()),
+            ..ModelCapabilities::default()
+        },
+        deadline_class: ProviderDeadlineClass::Standard,
+        effort: EffortLevel::Medium,
+        qualification_record_id: None,
+        quota_class: Some(QuotaClass::CodingExecution),
+        quota_reservation_id: Some(reservation_id.into()),
+        snapshot_hash: "pending".into(),
+    };
+    route.endpoint_fingerprint = hash_payload(&json!({
+        "kind": route.kind,
+        "dialect": route.dialect,
+        "baseUrl": route.base_url,
+    }));
+    route.qualification_record_id = Some(hash_payload(&json!({
+        "providerId": route.provider_id,
+        "modelId": route.model_id,
+        "wireModelId": route.wire_model_id,
+        "endpointFingerprint": route.endpoint_fingerprint,
+        "credentialFingerprint": route.credential_fingerprint,
+        "qualificationSchema": route.capabilities.qualification_schema,
+    })));
+    let material = json!({
+        "schemaVersion": route.schema_version,
+        "providerId": route.provider_id,
+        "modelId": route.model_id,
+        "wireModelId": route.wire_model_id,
+        "selectionKey": route.selection_key,
+        "kind": route.kind,
+        "dialect": route.dialect,
+        "baseUrl": route.base_url,
+        "endpointFingerprint": route.endpoint_fingerprint,
+        "credentialRef": route.credential_ref,
+        "credentialFingerprint": route.credential_fingerprint,
+        "capabilities": route.capabilities,
+        "deadlineClass": route.deadline_class,
+        "effort": route.effort,
+        "qualificationRecordId": route.qualification_record_id,
+        "quotaClass": route.quota_class,
+        "quotaReservationId": route.quota_reservation_id,
+    });
+    route.snapshot_hash = hash_payload(&material);
+    route
+        .validate()
+        .expect("failing provider route must validate");
+    route
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_and_replay() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let store = host.ensure_orchestration_store().unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let workspace_text = dunce::canonicalize(workspace.path())
+        .unwrap()
+        .display()
+        .to_string();
+    let route = failing_provider_route(FAILING_QUOTA);
+    let now = chrono::Utc::now();
+    let mut run = RunRecord {
+        run_id: "native-failing-provider".into(),
+        session_id: lane.id,
+        workspace: workspace_text.clone(),
+        request_id: "native-failing-req".into(),
+        client_id: Some("mcp".into()),
+        state: RunState::Failed,
+        purpose: RunPurpose::Execution,
+        provider_route: Some(route.clone()),
+        agent_id: None,
+        retry_of: None,
+        parent_run_id: None,
+        agent_spec_revision: None,
+        checkpoint_id: None,
+        continuation_context_id: None,
+        continuation_context_hash: None,
+        continuation_fidelity: None,
+        queue_position: None,
+        bounds: RunBounds {
+            max_total_tokens: Some(8_000),
+            ..RunBounds::default()
+        },
+        prompt_preview: format!("retry {}", route.selection_key),
+        start_seq: Some(1),
+        end_seq: Some(2),
+        created_at: now,
+        updated_at: now,
+        terminal_result: Some(format!("credential {} rejected", FAILING_CREDENTIAL_REF)),
+        final_response: Some(format!("failed calling {FAILING_BASE_URL}")),
+        error_code: Some("provider_failed".into()),
+        stop_cause: None,
+        aggregates: RunAggregates {
+            changes: vec![ChangeRecord {
+                path: format!("called {FAILING_BASE_URL}"),
+                summary: format!("ref {FAILING_CREDENTIAL_REF}"),
+            }],
+            ..RunAggregates::default()
+        },
+        progress: Some(RunProgress {
+            round: 1,
+            max_rounds: 4,
+            last_tool: Some(format!("mcp:{FAILING_CREDENTIAL_FP}")),
+            detail: format!("upstream {} fingerprint", route.endpoint_fingerprint),
+            updated_at: now,
+        }),
+        execution: None,
+        approval: None,
+    };
+    let reservation =
+        QuotaReservation::for_run(&run, "primary", QuotaLimits::default(), now).unwrap();
+    store.save_run_with_quota(&run, &reservation).unwrap();
+
+    let control = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let scope = json!({
+        "session_id": lane.id,
+        "workspace": workspace_text,
+        "run_id": run.run_id,
+    });
+    let get_run = client
+        .call_tool("ptah_get_run", scope.clone())
+        .await
+        .unwrap();
+    let list_runs = client
+        .call_tool(
+            "ptah_list_runs",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+            }),
+        )
+        .await
+        .unwrap();
+    let progress = client
+        .call_tool("ptah_get_progress", scope.clone())
+        .await
+        .unwrap();
+    assert!(!get_run.is_error, "{:?}", get_run.raw);
+    assert!(!list_runs.is_error, "{:?}", list_runs.raw);
+    assert!(!progress.is_error, "{:?}", progress.raw);
+    for (name, payload) in [
+        ("get-structured", &get_run.structured),
+        ("get-text", &mcp_text_value(&get_run.raw)),
+        ("list-structured", &list_runs.structured["runs"][0]),
+        ("progress-structured", &progress.structured),
+        ("progress-text", &mcp_text_value(&progress.raw)),
+    ] {
+        assert_public_payload_hides_route(payload, &route, &[]);
+        let encoded = payload.to_string();
+        assert!(
+            !encoded.contains(FAILING_BASE_URL),
+            "{name} leaked base_url: {encoded}"
+        );
+        assert!(
+            !encoded.contains(FAILING_CREDENTIAL_REF),
+            "{name} leaked credential ref"
+        );
+        assert_eq!(
+            payload.get("errorCode"),
+            Some(&json!(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)),
+            "{name} must use the typed public error code: {payload}"
+        );
+    }
+    assert_public_payload_hides_route(&list_runs.structured, &route, &[]);
+    assert_public_payload_hides_route(&mcp_text_value(&list_runs.raw), &route, &[]);
+    assert!(!mcp_text_value(&list_runs.raw)
+        .to_string()
+        .contains(FAILING_BASE_URL));
+    assert_eq!(list_runs.structured["totalCount"], 1);
+    assert_eq!(list_runs.structured["truncated"], false);
+
+    let persisted = serde_json::to_value(store.load_run(&run.run_id).unwrap().unwrap()).unwrap();
+    let promote_request = "native-promote-replay";
+    let approval_id = "native-approval-replay";
+    let promote_hash = hash_payload(&json!({
+        "sessionId": lane.id,
+        "workspace": workspace_text,
+        "runId": run.run_id,
+        "approvalId": approval_id,
+    }));
+    assert!(matches!(
+        store
+            .claim_idempotency("ptah_promote_run", promote_request, &promote_hash)
+            .unwrap(),
+        IdempotencyClaim::Perform
+    ));
+    store
+        .complete_idempotency(
+            "ptah_promote_run",
+            promote_request,
+            &promote_hash,
+            Some(run.run_id.clone()),
+            persisted.clone(),
+        )
+        .unwrap();
+    let promote = client
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": promote_request,
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+                "approval_id": approval_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!promote.is_error, "{:?}", promote.raw);
+    assert_public_payload_hides_route(&promote.structured, &route, &[]);
+    assert_public_payload_hides_route(&mcp_text_value(&promote.raw), &route, &[]);
+    let promote_text = mcp_text_value(&promote.raw).to_string();
+    assert!(!promote_text.contains(FAILING_BASE_URL));
+    assert!(!promote_text.contains(FAILING_CREDENTIAL_REF));
+
+    let discard_route = failing_provider_route("quota-leak-discard-sentinel-pr352");
+    run.run_id = "native-failing-discard".into();
+    run.request_id = "native-failing-discard-req".into();
+    run.provider_route = Some(discard_route.clone());
+    let discard_reservation =
+        QuotaReservation::for_run(&run, "primary", QuotaLimits::default(), now).unwrap();
+    store
+        .save_run_with_quota(&run, &discard_reservation)
+        .unwrap();
+    let discard_request = "native-discard-replay";
+    let discard_hash = hash_payload(&json!({
+        "sessionId": lane.id,
+        "workspace": workspace_text,
+        "runId": run.run_id,
+    }));
+    assert!(matches!(
+        store
+            .claim_idempotency("ptah_discard_run", discard_request, &discard_hash)
+            .unwrap(),
+        IdempotencyClaim::Perform
+    ));
+    store
+        .complete_idempotency(
+            "ptah_discard_run",
+            discard_request,
+            &discard_hash,
+            Some(run.run_id.clone()),
+            serde_json::to_value(&run).unwrap(),
+        )
+        .unwrap();
+    let discard = client
+        .call_tool(
+            "ptah_discard_run",
+            json!({
+                "request_id": discard_request,
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!discard.is_error, "{:?}", discard.raw);
+    assert_public_payload_hides_route(&discard.structured, &discard_route, &[]);
+    assert_public_payload_hides_route(&mcp_text_value(&discard.raw), &discard_route, &[]);
+    client.close_session().await.unwrap();
+    orch.stop_background_tasks().await;
 }

@@ -605,8 +605,18 @@ export interface DurableRun {
   } | null;
   execution?: RunExecution | null;
   approval?: RunApproval | null;
-  /** Secret-free operator projection derived from the route/quota/attempt ledgers. */
+  /** Secret-free operator projection derived from the route/quota/attempt ledgers.
+   * The frozen providerRoute snapshot is not part of this public contract.
+   * Omitting it in TypeScript does not remove it from a raw RunRecord payload.
+   */
   providerExecution?: ProviderExecutionProjection | null;
+}
+
+export interface DurableRunPage {
+  runs: DurableRun[];
+  totalCount: number;
+  truncated: boolean;
+  nextCursor?: string | null;
 }
 
 export type SessionUpdate =

@@ -159,7 +159,7 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
 
     // Discard removes only the execution worktree; the completed memory tool
     // write remains durable at the source-workspace address.
-    host.discard_run(session.id, run_id).unwrap();
+    host.discard_public_session_run(session.id, run_id).unwrap();
     assert_eq!(
         host.memory_list(session.id, MemoryScope::Project)
             .unwrap()
@@ -174,7 +174,7 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
         .await
         .unwrap();
     let promoted_run = host
-        .list_session_runs(session.id)
+        .list_public_session_runs(session.id)
         .unwrap()
         .into_iter()
         .filter(|run| run.run_id != run_id)
@@ -187,7 +187,8 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
     )
     .unwrap();
     host.review_run(session.id, &promoted_run.run_id).unwrap();
-    host.promote_run(session.id, &promoted_run.run_id).unwrap();
+    host.promote_public_session_run(session.id, &promoted_run.run_id, None)
+        .unwrap();
     assert_eq!(
         fs::read_to_string(workspace.path().join("promoted.txt")).unwrap(),
         "promoted content"
