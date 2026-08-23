@@ -35,6 +35,13 @@ complete or that the product has reached 100%.
   rotation denial/continuity checks pass, and the service can install or
   replace that credential without replacing the primary bearer. Durable
   rotation evidence and the independent worker campaign remain open.
+- The candidate enforces a role-scoped authority ceiling for hosted bearers:
+  `RemoteCoordinator`, explicit `RemoteOperator`, and `Observer` credentials
+  expose different operation sets, while only the trusted local adapter gets
+  `LocalOperator` authority. Computer-read capability is an immutable,
+  session/workspace-bound grant; no bearer can widen it through MCP arguments.
+  Production-shaped credential issuance and the retained worker campaign are
+  still open.
 - Computer Use observation now re-checks the durable conflict-domain poison
   fence even for an already-granted Agent, so an uncertain sibling dispatch
   cannot be bypassed by a stale grant.
@@ -147,6 +154,10 @@ unrelated signal.
 - Host-issued worker credential lifecycle: focused unit and integration tests
   passed; installation preserves the primary credential and rotation rejects
   the old bearer while retaining the worker id and scope.
+- Authority role and Computer-read fencing: 16 filtered authority/host tests
+  passed, including observer read-only ceilings, remote-operator denial of
+  Computer Use, scoped Computer-read grants, stale/revoked authority, and
+  frozen AgentSpec authority.
 - UI review evidence suite: 4 passed, covering complete packaged evidence,
   missing visual states, unresolved P1 findings, malformed digests, unknown
   fields, and missing deferred tracking.
