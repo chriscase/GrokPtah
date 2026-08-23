@@ -126,6 +126,63 @@ fn bound_worker_attempt_check_rejects_foreign_claimants() {
 }
 
 #[test]
+fn independent_workers_hold_distinct_leases_across_restart() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let first = WorkItem::new(
+        "worker-a-task",
+        "first independent task",
+        Uuid::new_v4(),
+        "/tmp/project",
+        "coordinator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    let second = WorkItem::new(
+        "worker-b-task",
+        "second independent task",
+        first.session_id,
+        "/tmp/project",
+        "coordinator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    store.save_work_item(&first).unwrap();
+    store.save_work_item(&second).unwrap();
+    let first_claim = store.claim_work(&first.work_id, "worker-a", None).unwrap();
+    let second_claim = store.claim_work(&second.work_id, "worker-b", None).unwrap();
+    assert_ne!(
+        first_claim.attempt.attempt_id,
+        second_claim.attempt.attempt_id
+    );
+    assert_eq!(first_claim.attempt.claimant_id, "worker-a");
+    assert_eq!(second_claim.attempt.claimant_id, "worker-b");
+    drop(store);
+
+    let reopened = OrchStore::open(home.path()).unwrap();
+    assert_eq!(
+        reopened
+            .load_work_item(&first.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Leased
+    );
+    assert_eq!(
+        reopened
+            .load_work_item(&second.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Leased
+    );
+    let first_attempts = reopened.list_work_attempts(Some(&first.work_id)).unwrap();
+    let second_attempts = reopened.list_work_attempts(Some(&second.work_id)).unwrap();
+    assert_eq!(first_attempts[0].claimant_id, "worker-a");
+    assert_eq!(second_attempts[0].claimant_id, "worker-b");
+}
+
+#[test]
 fn expired_lease_requeues_without_duplicate_live_attempt() {
     let home = tempdir().unwrap();
     let (store, item) = new_work(home.path(), "expire me");
