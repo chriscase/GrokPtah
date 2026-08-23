@@ -129,12 +129,13 @@ unrelated signal.
 - Native Coding Readiness/provider-attempt suite: 15 passed, including frozen
   provider routes, quota-backed admission, stale qualification fencing, and
   restart-safe no-duplicate behavior.
-- Enterprise review admission unit suite: 4 passed, covering secret-free
+- Enterprise review admission unit suite: 5 passed, covering secret-free
   evidence plus expiry, route/model drift, fallback, egress, mutation, bound,
   and schema denials.
-- Enterprise review plan suite: 4 passed, covering deterministic seven-pass
+- Enterprise review plan suite: 5 passed, covering deterministic seven-pass
   decomposition, checkpoint resume/deduplication, interrupted-pass retry
-  history, unsafe-location rejection, plan drift, and budget bounds.
+  history, unsafe-location rejection, plan drift, budget bounds, and
+  tampered-admission rejection.
 - Provider-quota receipt suite: 4 passed, covering bound-pair readiness,
   route/credential drift, ordering, non-429 exhaustion, tampered digests, and
   unknown fields.
