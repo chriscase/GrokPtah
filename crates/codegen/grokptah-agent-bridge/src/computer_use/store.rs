@@ -974,7 +974,18 @@ impl ComputerStore {
                     Ok(None)
                 }
             }
-            ComputerSurfaceLeaseState::Granted => Ok(Some(lease)),
+            ComputerSurfaceLeaseState::Granted => {
+                // A sibling dispatch may have become uncertain after this
+                // Agent received its grant. Re-check the durable domain fence
+                // before returning an observation; an already-granted lease
+                // must not become a way around the poison state.
+                let _guard = self.inner.lock.lock();
+                let leases = self.list_surface_leases_unlocked()?;
+                if has_unresolved_uncertainty(&leases, &lease.conflict_domain_id) {
+                    return Err(uncertain_conflict_domain_error());
+                }
+                Ok(Some(lease))
+            }
             ComputerSurfaceLeaseState::Dispatching => Err(ComputerError::new(
                 ComputerErrorCode::InvalidState,
                 "Agent surface lease is already dispatching",
