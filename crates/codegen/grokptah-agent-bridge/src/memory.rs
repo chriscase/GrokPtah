@@ -1960,7 +1960,7 @@ fn declared_bounds_json() -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::discover::{home_override_serial, set_grokptah_home_override};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::sync::Barrier;
     use std::time::{Duration as StdDuration, Instant};
 
@@ -3273,7 +3273,7 @@ mod tests {
         Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "grokptah_agent_bridge::memory::tests::cross_process_writer_entry",
+                "memory::tests::cross_process_writer_entry",
                 "--nocapture",
             ])
             .env("GROKPTAH_HOME", home)
@@ -3283,6 +3283,8 @@ mod tests {
             .env("GROKPTAH_MEMORY_SUBPROC_CLAIM", claim)
             .env("GROKPTAH_MEMORY_SUBPROC_GO", &go)
             .env("GROKPTAH_MEMORY_SUBPROC_ARRIVED", &arrived)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap()
     }
