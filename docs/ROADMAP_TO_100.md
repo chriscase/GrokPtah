@@ -414,7 +414,9 @@ and host parity before treating hosted memory as production-shaped).
 `agent_private` / `team` descriptors, 80-fact / 800-character / 6_000-inject
 bounds ([`MEMORY_SCOPES.md`](MEMORY_SCOPES.md), `memory.rs`,
 `tests/memory_scopes.rs`). Team scope is denied unless host policy approves
-an ID. There is **no** accelerated logical-years retention proof, no
+an ID. The candidate now includes a digest-bound `MemoryLongHorizonEvidence`
+schema for the eventual retained campaign report, but there is **no**
+accelerated logical-years retention proof, no
 revision/supersession/expiry/conflict protocol beyond exact-text
 deduplication, no compaction/retrieval-quality eval, and no Manager frozen
 memory attribution contract.

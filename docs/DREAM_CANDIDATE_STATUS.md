@@ -206,6 +206,10 @@ unrelated signal.
   symlinked, oversized, or broadened leases fail closed; a valid lease still
   produces only an indeterminate live report until real provider usage,
   restart, and paired-quality evidence are captured.
+- A typed, digest-bound `MemoryLongHorizonEvidence` contract now exists for
+  the deterministic logical-years campaign. It requires the three memory
+  scopes, ten logical years, exact quality oracles, storage/reopen bounds, and
+  a secret-free evidence digest; no retained campaign artifact is claimed yet.
 - The candidate's 10-minute Always-On soak was attempted and stopped before
   execution because the sandbox denied the fake provider's loopback bind
   (`Operation not permitted`); no soak evidence is claimed.

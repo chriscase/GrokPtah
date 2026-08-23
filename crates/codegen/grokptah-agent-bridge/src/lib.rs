@@ -31,6 +31,7 @@ pub mod mcp_control;
 pub mod mcp_control_client;
 mod mcp_runtime;
 mod memory;
+pub mod memory_certification;
 mod models_catalog;
 mod native_coding_readiness;
 pub mod operations_drill;
@@ -107,6 +108,11 @@ pub use live_attestation::{
 pub use live_provider_certification::{
     expected_evidence_digest, LiveProviderCampaignEvidence, LiveProviderCampaignEvidenceError,
     LIVE_PROVIDER_CAMPAIGN_EVIDENCE_SCHEMA,
+};
+pub use memory_certification::{
+    expected_evidence_digest as expected_memory_evidence_digest, MemoryLongHorizonEvidence,
+    MemoryLongHorizonEvidenceError, MEMORY_LONG_HORIZON_EVIDENCE_SCHEMA, REQUIRED_LOGICAL_YEARS,
+    REQUIRED_MEMORY_SCOPES,
 };
 pub use operations_drill::{
     BuildTargetCleanupEvidence, OperationsDrillCheck, OperationsDrillEnvironment,
