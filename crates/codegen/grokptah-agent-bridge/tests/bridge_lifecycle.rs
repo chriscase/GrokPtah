@@ -17,7 +17,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, home_override_serial, model_selection_key,
-    set_grokptah_home_override, AgentHost, HostConfig, PermissionDecision, RunState, SessionUpdate,
+    orchestration::PublicCompletionEvidence, set_grokptah_home_override, AgentHost, HostConfig,
+    PermissionDecision, RunState, SessionUpdate,
 };
 use tokio::time::timeout;
 
@@ -268,7 +269,7 @@ async fn session_lifecycle_prompt_streams_message() {
     assert_eq!(runs[0].client_id.as_deref(), Some("desktop"));
     assert_eq!(
         runs[0].aggregates.verification,
-        Some(history[0].evidence.clone())
+        Some(PublicCompletionEvidence::from(&history[0].evidence))
     );
     drop(host);
 
