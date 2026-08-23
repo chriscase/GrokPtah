@@ -34,10 +34,12 @@ and reproducible-build guarantees are separate concerns.
 
 ## Isolated visual helper candidate
 
-The Stage 9 candidate has a credentialed **assembler**, not a committed binary or a shipped
-backend. The default unsigned desktop build deliberately does not include an isolated helper or
-guest image. CI syntax-checks and links the helper source, but that proves only that the native
-source can build against the selected macOS SDK.
+The Stage 9 candidate has a credentialed **assembler** and a Linux-only guest-image **source
+builder**, not a committed binary or a shipped backend. The default unsigned desktop build
+deliberately does not include an isolated helper or guest image. macOS CI syntax-checks and links
+the helper source and validates the guest source; a separate pinned Linux workflow builds the
+guest image twice and compares the outputs. Those checks establish source/build reproducibility
+only; they are not packaged identity, boot, or runtime evidence.
 
 The helper source and its closed configuration live under
 `desktop/src-tauri/macos/isolated-visual-helper/`. The executable accepts no arguments, clears its
@@ -72,9 +74,10 @@ normal Apple signing access.
 If any step fails, treat the new output path as incomplete and discard that exact output before a
 retry; the unsigned input app and source artifacts are never modified.
 
-No valid signing identity is present on the current development host, no guest image builder or
-reviewed guest artifact is in this slice, and the assembler has not produced a claimable package.
-Notarization and runtime/destructive lifecycle certification remain separate required gates.
+No valid signing identity is present on the current development host, and the Linux builder has
+not produced a reviewed artifact in a release package. The assembler has not produced a claimable
+package. Notarization and runtime/destructive lifecycle certification remain separate required
+gates.
 
 ## Troubleshooting: DMG bundling fails after the `.app` succeeds
 

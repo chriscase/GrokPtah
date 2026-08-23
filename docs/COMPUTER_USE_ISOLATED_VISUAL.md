@@ -193,9 +193,13 @@ available.
    arguments, builds a bounded one-display/virtio-socket VM with no network/share/audio/storage/host
    input devices, requires an explicit start byte, and performs bounded graceful-then-forced stop.
    The assembler signs the helper before the outer unprivileged app and derives the content and
-   designated-requirement manifest. CI links only the unsigned helper source. This slice supplies no
-   reviewed guest image, signing identity, built helper, assembled app, host supervisor, launch, or
-   cleanup run. Actual guest production plus signed-package and destructive campaign evidence remain.
+   designated-requirement manifest. CI links only the unsigned helper source. The repository now
+   also carries a pinned Linux arm64 guest-source lock, closed kernel fragment, freestanding guest
+   PID 1, protocol self-test, and a Linux-only deterministic image-builder candidate. Dedicated
+   Linux CI builds that source twice and compares image/manifest bytes, but no output is embedded
+   or reviewed as a release artifact. This slice supplies no reviewed guest image, signing
+   identity, built helper, assembled app, host supervisor, launch, or cleanup run. Actual guest
+   production plus signed-package and destructive campaign evidence remain.
 4. Add authenticated virtio-socket frame/health transport and render read-only frames. The candidate
    now defines the transport-independent, read-only protocol core: a non-serializable/redacted
    32-byte channel key authenticates the exact protocol version, Run, surface incarnation, message
@@ -217,7 +221,7 @@ available.
 The existing simulator remains the only dispatchable isolated proof. The Stage 8 measured
 background candidate is not a substitute. The typed input, read-only host-probe, no-input lifecycle,
 open-handle content-measurement, fixed-path packaged-identity verifier, unshipped helper/assembler
-source, and authenticated read-protocol candidates do not enable
+source, pinned guest-source/image-builder candidate, and authenticated read-protocol candidates do not enable
 `HostNative`, expose isolated actions to a model or cockpit approval flow, qualify a provider for
 visual fallback, package a VM image/helper, carry or render frame bytes, or satisfy any #288
 acceptance checkbox. The verifier can establish signed package identity only when invoked by a real

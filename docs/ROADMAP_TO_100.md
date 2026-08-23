@@ -687,10 +687,13 @@ pipeline, or entitlement file is actually added by that verifier slice; it has n
 evidence. A following source slice adds the minimal helper, exact entitlement/configuration files,
 and a credentialed nested-signing assembler. The helper's closed inherited-descriptor bootstrap can
 configure a one-display/virtio-socket VM with no network/share/audio/storage/host-input devices and
-bounded graceful/forced stop, but there is no reviewed guest image, signing identity, assembled app,
-host supervisor, launch, or cleanup run. The protocol does not implement a carrier, transfer frame
-bytes, render a frame, or launch a guest. These are contracts and unshipped source/pipeline
-primitives, not packaged evidence. See
+   bounded graceful/forced stop, but there is no reviewed guest image, signing identity, assembled app,
+   host supervisor, launch, or cleanup run. The protocol does not implement a carrier, transfer frame
+   bytes, render a frame, or launch a guest. The repository now also carries a pinned Linux arm64
+   guest-source lock, closed kernel fragment, freestanding guest PID 1, protocol self-test, and a
+   Linux-only deterministic image-builder candidate. A dedicated Linux workflow builds that source
+   twice and compares image/manifest bytes; it deliberately does not embed or publish the output.
+   These are contracts and unshipped source/pipeline primitives, not packaged evidence. See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 signed/built helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
 source slices satisfy no #288 acceptance checkbox.

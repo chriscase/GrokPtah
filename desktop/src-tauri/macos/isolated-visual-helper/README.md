@@ -59,5 +59,9 @@ input through the authenticated protocol documented in `docs/COMPUTER_USE_ISOLAT
   hardened runtime/library validation, the helper's designated-requirement digest, and the exact
   entitlement/content boundary.
 
-There is currently no reviewed guest image or valid signing identity on the development host, so the
-credentialed assembler has not been run and no package/runtime claim exists.
+The repository now carries a pinned Linux arm64 guest-source lock, a closed kernel fragment, a
+freestanding guest PID 1, and a Linux-only deterministic image-builder candidate under
+`../isolated-visual-guest/`. The builder is exercised only by the dedicated Linux CI workflow; it
+is intentionally not run on this macOS host. There is still no reviewed guest artifact or valid
+signing identity on the development host, so the credentialed assembler has not been run and no
+package/runtime claim exists.

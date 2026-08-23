@@ -1,0 +1,64 @@
+#include <stdio.h>
+#include <string.h>
+
+#include "protocol.h"
+
+static int require_bytes(const gpt_u8 *observed, const gpt_u8 *expected, gpt_size length) {
+    return gpt_constant_time_equal(observed, expected, length);
+}
+
+int main(void) {
+    static const gpt_u8 expected_hmac[32] = {
+        0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,
+        0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,
+        0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7,
+        0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7,
+    };
+    gpt_u8 key[20];
+    memset(key, 0x0b, sizeof(key));
+    gpt_u8 digest[32];
+    gpt_hmac_sha256(
+        key,
+        sizeof(key),
+        (const gpt_u8 *)"Hi There",
+        sizeof("Hi There") - 1U,
+        digest);
+    if (!require_bytes(digest, expected_hmac, sizeof(digest))) {
+        fputs("HMAC-SHA256 self-test failed\n", stderr);
+        return 1;
+    }
+
+    gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES];
+    for (gpt_u32 index = 0; index < sizeof(challenge); ++index) {
+        challenge[index] = (gpt_u8)index;
+    }
+    gpt_u8 ready[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];
+    gpt_u8 stopped[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];
+    if (!gpt_guest_bootstrap_frame(challenge, GPT_GUEST_BOOTSTRAP_EVENT_READY, ready) ||
+        !gpt_guest_bootstrap_frame(
+            challenge,
+            GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK,
+            stopped) ||
+        !gpt_guest_bootstrap_frame_valid(
+            challenge,
+            GPT_GUEST_BOOTSTRAP_EVENT_READY,
+            ready) ||
+        !gpt_guest_bootstrap_frame_valid(
+            challenge,
+            GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK,
+            stopped) ||
+        require_bytes(ready, stopped, sizeof(ready))) {
+        fputs("bootstrap frame self-test failed\n", stderr);
+        return 1;
+    }
+    ready[20] ^= 1U;
+    if (gpt_guest_bootstrap_frame_valid(
+            challenge,
+            GPT_GUEST_BOOTSTRAP_EVENT_READY,
+            ready)) {
+        fputs("tampered bootstrap frame was accepted\n", stderr);
+        return 1;
+    }
+    puts("isolated guest bootstrap protocol self-test: ok");
+    return 0;
+}

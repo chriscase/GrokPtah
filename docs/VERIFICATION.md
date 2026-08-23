@@ -36,10 +36,12 @@ For the report-producing operator command and scenario matrix, see
 The manually dispatched `Desktop Release Build` workflow builds the reviewed
 commit on a GitHub-hosted macOS runner and uploads an unsigned app/DMG bundle
 for seven days. It does not sign, notarize, publish, or use release secrets.
-Regular Desktop CI and this workflow also syntax-check and link the
-isolated-visual helper candidate, but deliberately do not embed that unsigned
-helper or a guest image in the uploaded app. That source check is not packaged
-identity or VM evidence.
+Regular Desktop CI and this workflow syntax-check and link the isolated-visual
+helper candidate and validate the guest source, but deliberately do not embed
+that unsigned helper or a guest image in the uploaded app. The separate
+`Isolated Visual Guest Candidate` workflow builds the pinned Linux guest twice
+and compares the image/manifest outputs. These source/build checks are not
+packaged identity, boot, or VM lifecycle evidence.
 
 The workflow keeps `CARGO_HOME` and `CARGO_TARGET_DIR` under the runner's
 private temporary directory. Its cache key includes the OS, architecture,
