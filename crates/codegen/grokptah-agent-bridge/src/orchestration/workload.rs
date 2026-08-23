@@ -165,7 +165,7 @@ impl AttemptState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkRetryPolicy {
     pub max_attempts: u32,
     pub retry_failed: bool,
@@ -199,8 +199,64 @@ impl WorkRetryPolicy {
     }
 }
 
+/// Immutable provider identity required by one durable WorkItem.
+///
+/// All values are secret-free and originate from an admitted, signed route
+/// lease. Native execution must compare this constraint with the exact
+/// provider snapshot captured immediately before Run creation; a mutable
+/// Agent selection or provider profile cannot widen it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkProviderRouteConstraint {
+    pub provider_id: String,
+    pub model_id: String,
+    pub endpoint_fingerprint: String,
+    pub credential_fingerprint: String,
+    pub route_binding_digest: String,
+}
+
+impl WorkProviderRouteConstraint {
+    pub fn validate(&self) -> Result<(), OrchError> {
+        validate_text(&self.provider_id, MAX_WORK_ACTOR_BYTES, "provider_id")?;
+        validate_text(&self.model_id, MAX_WORK_ACTOR_BYTES, "model_id")?;
+        for (value, field) in [
+            (&self.endpoint_fingerprint, "endpoint_fingerprint"),
+            (&self.route_binding_digest, "route_binding_digest"),
+        ] {
+            if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(invalid(format!(
+                    "work provider route {field} must be a 64-character hexadecimal fingerprint"
+                )));
+            }
+        }
+        if !valid_credential_fingerprint(&self.credential_fingerprint) {
+            return Err(invalid(
+                "work provider route credential_fingerprint must use v1-sha256:<64 lowercase hex>",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn matches(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        endpoint_fingerprint: &str,
+        credential_fingerprint: &str,
+    ) -> bool {
+        self.provider_id == provider_id
+            && self.model_id == model_id
+            && self
+                .endpoint_fingerprint
+                .eq_ignore_ascii_case(endpoint_fingerprint)
+            && self
+                .credential_fingerprint
+                .eq_ignore_ascii_case(credential_fingerprint)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkPolicy {
     pub bounds: RunBounds,
     pub retry: WorkRetryPolicy,
@@ -211,6 +267,10 @@ pub struct WorkPolicy {
     /// Work-level override. Default inherit: Agent policy decides.
     #[serde(default)]
     pub managed_execution: super::managed::ManagedWorkMode,
+    /// Optional exact provider route required at native execution time.
+    /// Generic WorkItems omit it; enterprise gateway review passes require it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_route_constraint: Option<WorkProviderRouteConstraint>,
 }
 
 impl Default for WorkPolicy {
@@ -221,6 +281,7 @@ impl Default for WorkPolicy {
             requires_approval: false,
             max_concurrent_attempts: 1,
             managed_execution: super::managed::ManagedWorkMode::Inherit,
+            provider_route_constraint: None,
         }
     }
 }
@@ -233,6 +294,9 @@ impl WorkPolicy {
             return Err(invalid(
                 "policy.max_concurrent_attempts must be exactly one in the single-owner runtime",
             ));
+        }
+        if let Some(constraint) = &self.provider_route_constraint {
+            constraint.validate()?;
         }
         Ok(())
     }
@@ -770,6 +834,15 @@ fn validate_text(value: &str, max_bytes: usize, field: &str) -> Result<(), OrchE
     Ok(())
 }
 
+fn valid_credential_fingerprint(value: &str) -> bool {
+    value.strip_prefix("v1-sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,5 +899,65 @@ mod tests {
         assert!(WorkState::Succeeded.is_terminal());
         assert!(WorkState::Failed.is_terminal());
         assert!(!WorkState::Leased.is_claimable());
+    }
+
+    fn route_constraint() -> WorkProviderRouteConstraint {
+        WorkProviderRouteConstraint {
+            provider_id: "company-gateway".into(),
+            model_id: "modest-review-v1".into(),
+            endpoint_fingerprint: "a".repeat(64),
+            credential_fingerprint: format!("v1-sha256:{}", "b".repeat(64)),
+            route_binding_digest: "c".repeat(64),
+        }
+    }
+
+    #[test]
+    fn signed_route_constraint_rejects_every_identity_drift() {
+        let constraint = route_constraint();
+        constraint.validate().unwrap();
+        assert!(constraint.matches(
+            "company-gateway",
+            "modest-review-v1",
+            &"a".repeat(64),
+            &format!("v1-sha256:{}", "b".repeat(64)),
+        ));
+        assert!(!constraint.matches(
+            "premium-fallback",
+            "modest-review-v1",
+            &"a".repeat(64),
+            &format!("v1-sha256:{}", "b".repeat(64)),
+        ));
+        assert!(!constraint.matches(
+            "company-gateway",
+            "stronger-model",
+            &"a".repeat(64),
+            &format!("v1-sha256:{}", "b".repeat(64)),
+        ));
+        assert!(!constraint.matches(
+            "company-gateway",
+            "modest-review-v1",
+            &"d".repeat(64),
+            &format!("v1-sha256:{}", "b".repeat(64)),
+        ));
+        assert!(!constraint.matches(
+            "company-gateway",
+            "modest-review-v1",
+            &"a".repeat(64),
+            &format!("v1-sha256:{}", "e".repeat(64)),
+        ));
+    }
+
+    #[test]
+    fn route_constraint_schema_is_strict_and_uses_host_credential_identity() {
+        let constraint = route_constraint();
+        let mut value = serde_json::to_value(&constraint).unwrap();
+        value["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WorkProviderRouteConstraint>(value).is_err());
+
+        let mut invalid = constraint.clone();
+        invalid.credential_fingerprint = "b".repeat(64);
+        assert!(invalid.validate().is_err());
+        invalid.credential_fingerprint = format!("v1-sha256:{}", "B".repeat(64));
+        assert!(invalid.validate().is_err());
     }
 }

@@ -32,6 +32,10 @@ pub struct EnterpriseGatewayAttestation {
     pub schema: String,
     pub route_id: String,
     pub endpoint_fingerprint: String,
+    /// Exact secret-free credential identity expected on the admitted host
+    /// route. A token may rotate only when the host proves the same identity;
+    /// a different fingerprint requires a fresh signed lease.
+    pub credential_fingerprint: String,
     pub model_id: String,
     pub model_tier: EnterpriseModelTier,
     pub deployment_revision: String,
@@ -69,6 +73,7 @@ pub struct EnterpriseReviewLease {
     pub credential_id: String,
     pub route_id: String,
     pub endpoint_fingerprint: String,
+    pub credential_fingerprint: String,
     pub model_id: String,
     pub model_tier: EnterpriseModelTier,
     pub issued_at: DateTime<Utc>,
@@ -116,6 +121,8 @@ pub struct EnterpriseReviewEvidence {
     pub schema: String,
     pub lease_id: String,
     pub route_id: String,
+    pub endpoint_fingerprint: String,
+    pub credential_fingerprint: String,
     pub model_id: String,
     pub model_tier: EnterpriseModelTier,
     pub route_binding_digest: String,
@@ -144,7 +151,10 @@ impl EnterpriseReviewEvidence {
                 return Err(EnterpriseReviewAdmissionError::InvalidField(name));
             }
         }
-        if !valid_fingerprint(&self.route_binding_digest) || !valid_fingerprint(&self.policy_digest)
+        if !valid_fingerprint(&self.endpoint_fingerprint)
+            || !valid_credential_fingerprint(&self.credential_fingerprint)
+            || !valid_fingerprint(&self.route_binding_digest)
+            || !valid_fingerprint(&self.policy_digest)
         {
             return Err(EnterpriseReviewAdmissionError::InvalidField("fingerprint"));
         }
@@ -247,6 +257,7 @@ pub fn admit_enterprise_review(
         }
     }
     if !valid_fingerprint(&lease.endpoint_fingerprint)
+        || !valid_credential_fingerprint(&lease.credential_fingerprint)
         || !valid_fingerprint(&lease.route_binding_digest)
     {
         return Err(EnterpriseReviewAdmissionError::InvalidField("fingerprint"));
@@ -267,6 +278,10 @@ pub fn admit_enterprise_review(
         (
             lease.endpoint_fingerprint == lease.attestation.endpoint_fingerprint,
             "endpoint_fingerprint",
+        ),
+        (
+            lease.credential_fingerprint == lease.attestation.credential_fingerprint,
+            "credential_fingerprint",
         ),
         (lease.model_id == lease.attestation.model_id, "model_id"),
         (
@@ -327,6 +342,8 @@ pub fn admit_enterprise_review(
         schema: ENTERPRISE_REVIEW_EVIDENCE_SCHEMA.to_owned(),
         lease_id: lease.lease_id.clone(),
         route_id: lease.route_id.clone(),
+        endpoint_fingerprint: lease.endpoint_fingerprint.clone(),
+        credential_fingerprint: lease.credential_fingerprint.clone(),
         model_id: lease.model_id.clone(),
         model_tier: lease.model_tier,
         route_binding_digest: lease.route_binding_digest.clone(),
@@ -402,6 +419,7 @@ pub fn attestation_signing_bytes(attestation: &EnterpriseGatewayAttestation) -> 
         schema: &'a str,
         route_id: &'a str,
         endpoint_fingerprint: &'a str,
+        credential_fingerprint: &'a str,
         model_id: &'a str,
         model_tier: EnterpriseModelTier,
         deployment_revision: &'a str,
@@ -415,6 +433,7 @@ pub fn attestation_signing_bytes(attestation: &EnterpriseGatewayAttestation) -> 
         schema: &attestation.schema,
         route_id: &attestation.route_id,
         endpoint_fingerprint: &attestation.endpoint_fingerprint,
+        credential_fingerprint: &attestation.credential_fingerprint,
         model_id: &attestation.model_id,
         model_tier: attestation.model_tier,
         deployment_revision: &attestation.deployment_revision,
@@ -432,6 +451,8 @@ pub fn expected_route_binding_digest(lease: &EnterpriseReviewLease) -> String {
     hasher.update(lease.route_id.as_bytes());
     hasher.update([0]);
     hasher.update(lease.endpoint_fingerprint.as_bytes());
+    hasher.update([0]);
+    hasher.update(lease.credential_fingerprint.as_bytes());
     hasher.update([0]);
     hasher.update(lease.model_id.as_bytes());
     hasher.update([0]);
@@ -479,6 +500,15 @@ fn valid_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_credential_fingerprint(value: &str) -> bool {
+    value.strip_prefix("v1-sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +520,7 @@ mod tests {
             credential_id: "credential-opaque".into(),
             route_id: "company-gateway".into(),
             endpoint_fingerprint: "a".repeat(64),
+            credential_fingerprint: format!("v1-sha256:{}", "b".repeat(64)),
             model_id: "modest-review-v1".into(),
             model_tier: EnterpriseModelTier::Modest,
             issued_at: now - chrono::Duration::minutes(1),
@@ -506,6 +537,7 @@ mod tests {
                 schema: ENTERPRISE_REVIEW_ATTESTATION_SCHEMA.into(),
                 route_id: "company-gateway".into(),
                 endpoint_fingerprint: "a".repeat(64),
+                credential_fingerprint: format!("v1-sha256:{}", "b".repeat(64)),
                 model_id: "modest-review-v1".into(),
                 model_tier: EnterpriseModelTier::Modest,
                 deployment_revision: "deploy-1".into(),

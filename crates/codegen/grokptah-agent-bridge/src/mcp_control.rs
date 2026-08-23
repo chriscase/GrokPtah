@@ -1954,7 +1954,8 @@ fn tool_input_schema(name: &str) -> Value {
     let enterprise_attestation = json!({
         "type": "object",
         "required": [
-            "schema", "route_id", "endpoint_fingerprint", "model_id", "model_tier",
+            "schema", "route_id", "endpoint_fingerprint", "credential_fingerprint",
+            "model_id", "model_tier",
             "deployment_revision", "issued_at", "expires_at", "no_premium_fallback",
             "egress_firewall_attested"
         ],
@@ -1963,6 +1964,7 @@ fn tool_input_schema(name: &str) -> Value {
             "schema": {"type": "string", "const": "grokptah.enterprise-gateway-attestation.v1"},
             "route_id": {"type": "string", "minLength": 1, "maxLength": 256},
             "endpoint_fingerprint": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+            "credential_fingerprint": {"type": "string", "pattern": "^v1-sha256:[0-9a-f]{64}$"},
             "model_id": {"type": "string", "minLength": 1, "maxLength": 256},
             "model_tier": {"type": "string", "const": "modest"},
             "deployment_revision": {"type": "string", "minLength": 1, "maxLength": 256},
@@ -1978,7 +1980,7 @@ fn tool_input_schema(name: &str) -> Value {
         "type": "object",
         "required": [
             "schema", "lease_id", "credential_id", "route_id", "endpoint_fingerprint",
-            "model_id", "model_tier", "issued_at", "expires_at", "route_binding_digest",
+            "credential_fingerprint", "model_id", "model_tier", "issued_at", "expires_at", "route_binding_digest",
             "read_only", "allow_network", "allow_workspace_writes", "allow_publication",
             "max_requests", "max_tokens", "max_duration_ms", "attestation"
         ],
@@ -1989,6 +1991,7 @@ fn tool_input_schema(name: &str) -> Value {
             "credential_id": {"type": "string", "minLength": 1, "maxLength": 256},
             "route_id": {"type": "string", "minLength": 1, "maxLength": 256},
             "endpoint_fingerprint": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+            "credential_fingerprint": {"type": "string", "pattern": "^v1-sha256:[0-9a-f]{64}$"},
             "model_id": {"type": "string", "minLength": 1, "maxLength": 256},
             "model_tier": {"type": "string", "const": "modest"},
             "issued_at": {"type": "string", "format": "date-time"},

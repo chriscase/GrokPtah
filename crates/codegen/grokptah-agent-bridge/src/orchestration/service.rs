@@ -53,7 +53,7 @@ use super::types::*;
 use super::worker::{reject_privilege_amplification, WorkerHostKind};
 use super::workload::{
     WorkAttempt, WorkAttemptView, WorkDecision, WorkDependency, WorkItem, WorkPolicy, WorkProgress,
-    WorkResult, WorkState,
+    WorkProviderRouteConstraint, WorkResult, WorkState,
 };
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
@@ -65,6 +65,41 @@ fn validate_provider_route_for_purpose(
     purpose: RunPurpose,
 ) -> Result<(), OrchError> {
     crate::native_coding_readiness::validate_provider_route_for_purpose(route, purpose)
+}
+
+/// Enforce a WorkItem's immutable provider identity at the last safe point
+/// before a Run is assigned an id or persisted.
+///
+/// The preliminary managed-work route contains only provider/model ids. The
+/// exact endpoint and credential identity exist only after the host captures a
+/// provider snapshot, so this check must remain on the Run admission path. A
+/// constrained WorkItem can never use offline execution or a fallback route.
+fn validate_required_work_provider_route(
+    route: Option<&super::types::ProviderRouteSnapshot>,
+    constraint: Option<&WorkProviderRouteConstraint>,
+) -> Result<(), OrchError> {
+    let Some(constraint) = constraint else {
+        return Ok(());
+    };
+    constraint.validate()?;
+    let Some(route) = route else {
+        return Err(OrchError::new(
+            OrchErrorCode::Conflict,
+            "work requires an exact provider route, but no provider route is available",
+        ));
+    };
+    if !constraint.matches(
+        &route.provider_id,
+        &route.model_id,
+        &route.endpoint_fingerprint,
+        &route.credential_fingerprint,
+    ) {
+        return Err(OrchError::new(
+            OrchErrorCode::Conflict,
+            "captured provider route does not match the WorkItem's signed route constraint",
+        ));
+    }
+    Ok(())
 }
 
 fn provider_projection_error(_error: anyhow::Error) -> OrchError {
@@ -1303,6 +1338,18 @@ impl OrchestrationService {
                 self.native_executor.lock().skipped_unroutable += 1;
                 continue;
             };
+            if work
+                .policy
+                .provider_route_constraint
+                .as_ref()
+                .is_some_and(|constraint| {
+                    constraint.provider_id != route.provider_id
+                        || constraint.model_id != route.model_id
+                })
+            {
+                self.native_executor.lock().skipped_unroutable += 1;
+                continue;
+            }
             let decisions = self.store.list_work_decisions(&work.work_id)?;
             let capacity = ManagedAdmissionCapacity {
                 live_intents_for_agent: self.store.live_managed_intents_for_agent(&agent_id)?,
@@ -1449,6 +1496,7 @@ impl OrchestrationService {
                 "ptah_native_execute",
                 Some(&intent.agent_id),
                 Some(intent.agent_spec_revision),
+                work.policy.provider_route_constraint.as_ref(),
                 work.kind == "manager-decision"
                     && work.source_manager_step_id.as_deref() == Some("__manager_decision__"),
             )
@@ -7323,6 +7371,7 @@ impl OrchestrationService {
             "ptah_submit_task",
             None,
             None,
+            None,
             false,
         )
         .await
@@ -7343,6 +7392,7 @@ impl OrchestrationService {
         idempotency_tool: &str,
         expected_agent_id: Option<&str>,
         expected_agent_spec_revision: Option<u64>,
+        required_provider_route: Option<&WorkProviderRouteConstraint>,
         proposal_only: bool,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = idempotency_tool;
@@ -7367,6 +7417,7 @@ impl OrchestrationService {
             "executionMode": execution_mode,
             "allowQueue": allow_queue,
             "retryOf": retry_of,
+            "requiredProviderRoute": required_provider_route,
         });
         let phash = hash_payload(&payload);
 
@@ -7536,6 +7587,8 @@ impl OrchestrationService {
                     })?,
             )
         };
+        validate_required_work_provider_route(provider_route.as_ref(), required_provider_route)
+            .map_err(|error| self.fail_claim(&mut lease, None, session_id, &claimed, error))?;
         if let Some(route) = provider_route.as_ref() {
             validate_provider_route_for_purpose(route, run_purpose)
                 .map_err(|error| self.fail_claim(&mut lease, None, session_id, &claimed, error))?;
@@ -7882,6 +7935,7 @@ impl OrchestrationService {
                 allow_queue,
                 Some(source_run_id),
                 tool,
+                None,
                 None,
                 None,
                 false,
@@ -8673,5 +8727,82 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | SteeringInjected { session_id, .. }
         | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
+    }
+}
+
+#[cfg(test)]
+mod provider_route_constraint_tests {
+    use super::*;
+    use crate::gateway_config::{
+        ModelCapabilities, ProviderDeadlineClass, ProviderDialect, ProviderKind,
+    };
+    use crate::orchestration::PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION;
+    use crate::types::EffortLevel;
+
+    fn constraint() -> WorkProviderRouteConstraint {
+        WorkProviderRouteConstraint {
+            provider_id: "company-gateway".into(),
+            model_id: "modest-review-v1".into(),
+            endpoint_fingerprint: "a".repeat(64),
+            credential_fingerprint: format!("v1-sha256:{}", "b".repeat(64)),
+            route_binding_digest: "c".repeat(64),
+        }
+    }
+
+    fn route() -> ProviderRouteSnapshot {
+        ProviderRouteSnapshot {
+            schema_version: PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+            provider_id: "company-gateway".into(),
+            model_id: "modest-review-v1".into(),
+            wire_model_id: "modest-review-v1".into(),
+            selection_key: "opaque-selection".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            dialect: ProviderDialect::OpenAiChatCompletions,
+            base_url: "https://gateway.invalid/v1".into(),
+            endpoint_fingerprint: "a".repeat(64),
+            credential_ref: "keychain:company-gateway".into(),
+            credential_fingerprint: format!("v1-sha256:{}", "b".repeat(64)),
+            capabilities: ModelCapabilities::default(),
+            deadline_class: ProviderDeadlineClass::Standard,
+            effort: EffortLevel::Medium,
+            qualification_record_id: None,
+            quota_class: None,
+            quota_reservation_id: None,
+            snapshot_hash: "snapshot".into(),
+        }
+    }
+
+    #[test]
+    fn exact_work_route_is_required_before_run_creation() {
+        let constraint = constraint();
+        let route = route();
+        validate_required_work_provider_route(Some(&route), Some(&constraint)).unwrap();
+        validate_required_work_provider_route(None, None).unwrap();
+        assert!(validate_required_work_provider_route(None, Some(&constraint)).is_err());
+
+        for drifted in [
+            ProviderRouteSnapshot {
+                provider_id: "premium-fallback".into(),
+                ..route.clone()
+            },
+            ProviderRouteSnapshot {
+                model_id: "stronger-model".into(),
+                ..route.clone()
+            },
+            ProviderRouteSnapshot {
+                endpoint_fingerprint: "d".repeat(64),
+                ..route.clone()
+            },
+            ProviderRouteSnapshot {
+                credential_fingerprint: format!("v1-sha256:{}", "e".repeat(64)),
+                ..route.clone()
+            },
+        ] {
+            let error = validate_required_work_provider_route(Some(&drifted), Some(&constraint))
+                .expect_err("every signed route drift must fail closed");
+            assert_eq!(error.code, OrchErrorCode::Conflict);
+            assert!(!error.message.contains("premium-fallback"));
+            assert!(!error.message.contains("stronger-model"));
+        }
     }
 }

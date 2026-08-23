@@ -109,6 +109,7 @@ pub struct EnterpriseReviewPass {
     pub request_budget: u32,
     pub token_budget: u64,
     pub duration_budget_ms: u64,
+    pub provider_route_constraint: crate::orchestration::WorkProviderRouteConstraint,
 }
 
 impl EnterpriseReviewPass {
@@ -137,6 +138,7 @@ impl EnterpriseReviewPass {
                     retry_expired: true,
                     backoff_ms: 0,
                 },
+                provider_route_constraint: Some(self.provider_route_constraint.clone()),
                 ..crate::orchestration::WorkPolicy::default()
             },
         }
@@ -342,6 +344,13 @@ pub fn build_enterprise_review_plan(
             request_budget,
             token_budget,
             duration_budget_ms: duration_budget,
+            provider_route_constraint: crate::orchestration::WorkProviderRouteConstraint {
+                provider_id: admission.route_id.clone(),
+                model_id: admission.model_id.clone(),
+                endpoint_fingerprint: admission.endpoint_fingerprint.clone(),
+                credential_fingerprint: admission.credential_fingerprint.clone(),
+                route_binding_digest: admission.route_binding_digest.clone(),
+            },
         })
         .collect::<Vec<_>>();
     let mut plan = EnterpriseReviewPlan {
@@ -459,6 +468,15 @@ impl EnterpriseReviewPlan {
                 || pass.request_budget == 0
                 || pass.token_budget == 0
                 || pass.duration_budget_ms == 0
+                || pass.provider_route_constraint.provider_id != self.admission.route_id
+                || pass.provider_route_constraint.model_id != self.admission.model_id
+                || pass.provider_route_constraint.endpoint_fingerprint
+                    != self.admission.endpoint_fingerprint
+                || pass.provider_route_constraint.credential_fingerprint
+                    != self.admission.credential_fingerprint
+                || pass.provider_route_constraint.route_binding_digest
+                    != self.admission.route_binding_digest
+                || pass.provider_route_constraint.validate().is_err()
             {
                 return Err(EnterpriseReviewPlanError::InvalidPass("shape"));
             }
@@ -665,6 +683,21 @@ impl EnterpriseReviewWorkPlan {
                 || !valid_fingerprint(&item.work_key)
                 || !valid_fingerprint(&item.objective_digest)
                 || item.template.kind != format!("enterprise_review:{}", item.kind.id())
+                || item
+                    .template
+                    .policy
+                    .provider_route_constraint
+                    .as_ref()
+                    .is_none_or(|constraint| {
+                        constraint.provider_id != self.admission.route_id
+                            || constraint.model_id != self.admission.model_id
+                            || constraint.endpoint_fingerprint
+                                != self.admission.endpoint_fingerprint
+                            || constraint.credential_fingerprint
+                                != self.admission.credential_fingerprint
+                            || constraint.route_binding_digest
+                                != self.admission.route_binding_digest
+                    })
             {
                 return Err(EnterpriseReviewPlanError::InvalidField("work_item"));
             }
@@ -755,6 +788,7 @@ mod tests {
             credential_id: "credential-plan".into(),
             route_id: "company-gateway".into(),
             endpoint_fingerprint: "a".repeat(64),
+            credential_fingerprint: format!("v1-sha256:{}", "b".repeat(64)),
             model_id: "modest-review-v1".into(),
             model_tier: super::super::enterprise_review::EnterpriseModelTier::Modest,
             issued_at: now - Duration::minutes(1),
@@ -772,6 +806,7 @@ mod tests {
                     .into(),
                 route_id: "company-gateway".into(),
                 endpoint_fingerprint: "a".repeat(64),
+                credential_fingerprint: format!("v1-sha256:{}", "b".repeat(64)),
                 model_id: "modest-review-v1".into(),
                 model_tier: super::super::enterprise_review::EnterpriseModelTier::Modest,
                 deployment_revision: "deployment-plan".into(),
@@ -896,6 +931,21 @@ mod tests {
                 && item.review_id == first.review_id
                 && item.template.validate().is_ok()
                 && item.template.objective.contains(&item.objective_digest)
+                && item
+                    .template
+                    .policy
+                    .provider_route_constraint
+                    .as_ref()
+                    .is_some_and(|constraint| {
+                        constraint.provider_id == first.admission.route_id
+                            && constraint.model_id == first.admission.model_id
+                            && constraint.endpoint_fingerprint
+                                == first.admission.endpoint_fingerprint
+                            && constraint.credential_fingerprint
+                                == first.admission.credential_fingerprint
+                            && constraint.route_binding_digest
+                                == first.admission.route_binding_digest
+                    })
         }));
         let encoded = serde_json::to_string(&first).unwrap();
         assert!(encoded.contains("company-gateway"));
@@ -906,6 +956,16 @@ mod tests {
         unknown_nested["work_items"][0]["template"]["unexpectedPolicyField"] =
             serde_json::json!(true);
         assert!(serde_json::from_value::<EnterpriseReviewWorkPlan>(unknown_nested).is_err());
+
+        let mut unknown_policy = serde_json::to_value(&first).unwrap();
+        unknown_policy["work_items"][0]["template"]["policy"]["unexpected"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<EnterpriseReviewWorkPlan>(unknown_policy).is_err());
+
+        let mut unknown_retry = serde_json::to_value(&first).unwrap();
+        unknown_retry["work_items"][0]["template"]["policy"]["retry"]["unexpected"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<EnterpriseReviewWorkPlan>(unknown_retry).is_err());
 
         let mut invalid_work_plan = first.clone();
         invalid_work_plan.work_items[0].work_key = "0".repeat(64);
@@ -920,6 +980,20 @@ mod tests {
         assert_eq!(
             invalid_admission.validate(),
             Err(EnterpriseReviewPlanError::InvalidField("admission"))
+        );
+
+        let mut drifted_route = first.clone();
+        drifted_route.work_items[0]
+            .template
+            .policy
+            .provider_route_constraint
+            .as_mut()
+            .unwrap()
+            .credential_fingerprint = format!("v1-sha256:{}", "e".repeat(64));
+        drifted_route.work_plan_digest = work_plan_digest(&drifted_route);
+        assert_eq!(
+            drifted_route.validate(),
+            Err(EnterpriseReviewPlanError::InvalidField("work_item"))
         );
 
         let mut tampered = plan();

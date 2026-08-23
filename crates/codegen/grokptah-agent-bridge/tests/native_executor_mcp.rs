@@ -12,8 +12,8 @@ use grokptah_agent_bridge::orchestration::{
     OrchStore, OrchestrationConfig, OrchestrationService, ProviderAttemptState, ProviderRetryClass,
     ProviderRoute, ProviderRouteSnapshot, ProviderSendCertainty, PublicRun, QuotaClass,
     QuotaLimits, QuotaReservation, QuotaReservationState, RunAggregates, RunBounds, RunProgress,
-    RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
-    MANAGED_EXECUTION_SCHEMA_VERSION, PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+    RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkProviderRouteConstraint, WorkState,
+    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION, PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
     PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
 };
 use grokptah_agent_bridge::{
@@ -1084,6 +1084,109 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
     assert_eq!(settled_capacity["providerQuota"]["consumedReservations"], 1);
     assert_eq!(settled_capacity["providerQuota"]["tokensConsumed"], 10);
 
+    orch.stop_background_tasks().await;
+    host.stop().unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn signed_work_route_drift_creates_no_run_and_sends_no_provider_request() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(blocking_provider))
+        .with_state(BlockingProviderState {
+            requests: requests.clone(),
+            release: release.clone(),
+        });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.remove("GROKPTAH_AGENT_OFFLINE");
+    env.set("GROKPTAH_API_BASE", format!("http://{address}/v1"));
+    env.set("GROKPTAH_API_KEY", "synthetic-signed-route-key");
+
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.set_model(model_selection_key("env-grokptah", "signed-route-model"));
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let agent = host.ensure_session_agent(lane.id).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("orchestration")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "native-token-signed-route".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    orch.set_managed_execution(
+        &auth(&orch),
+        lane.id,
+        workspace.path(),
+        &agent.agent_id,
+        retry_policy(false),
+    )
+    .unwrap();
+
+    let policy = WorkPolicy {
+        provider_route_constraint: Some(WorkProviderRouteConstraint {
+            provider_id: "env-grokptah".into(),
+            model_id: "signed-route-model".into(),
+            endpoint_fingerprint: "f".repeat(64),
+            credential_fingerprint: format!("v1-sha256:{}", "e".repeat(64)),
+            route_binding_digest: "d".repeat(64),
+        }),
+        ..WorkPolicy::default()
+    };
+    let mut work = WorkItem::new(
+        "enterprise_review:security",
+        "Refuse a drifted signed route before provider dispatch",
+        lane.id,
+        workspace.path().display().to_string(),
+        "operator",
+        policy,
+    )
+    .unwrap();
+    work.assigned_agent_id = Some(agent.agent_id.clone());
+    work.assignment_status = AssignmentStatus::Accepted;
+    work.validate().unwrap();
+    orch.store().save_work_item(&work).unwrap();
+
+    orch.drive_native_executor_once().await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert!(orch.store().list_runs().unwrap().is_empty());
+    assert!(orch
+        .store()
+        .live_managed_intent_for_work(&work.work_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        orch.store()
+            .load_work_item(&work.work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Queued
+    );
+
+    release.add_permits(1);
     orch.stop_background_tasks().await;
     host.stop().unwrap();
     server.abort();

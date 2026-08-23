@@ -24,7 +24,8 @@ The runtime accepts a lease only when all of these are true:
 
 - the lease and gateway attestation use the exact versioned schemas;
 - lease and attestation validity windows include the current time;
-- route, endpoint fingerprint, model, and modest-tier binding match exactly;
+- route, endpoint fingerprint, credential-identity fingerprint, model, and
+  modest-tier binding match exactly;
 - the route-binding digest matches the canonical lease fields;
 - premium fallback is explicitly disabled;
 - an external egress-firewall attestation is present;
@@ -49,6 +50,15 @@ worker credential, bind the workspace, and persist the resulting WorkItems.
 The plan retains and validates the secret-free admission evidence, including
 the exact route/model/policy binding, so a recovered plan cannot silently
 broaden its permissions or fallback policy.
+Every projected `WorkTemplate` also carries the signed provider, model,
+endpoint, credential-identity, and route-binding fingerprints in its immutable
+`WorkPolicy`. Native execution first rejects provider/model drift during
+managed-work selection, then compares the full constraint with the exact
+`ProviderRouteSnapshot` captured immediately before Run creation. Offline
+execution, another endpoint, another credential principal, or a premium
+fallback therefore fails before a Run exists. The constraint is also part of
+the Run request's idempotency hash, so replay cannot substitute a different
+route policy.
 Its nested durable work template is also deny-unknown, so a transport or
 broker cannot add an unrecognized policy field that deserialization would
 otherwise discard.
@@ -80,6 +90,12 @@ operator-owned broker, approved gateway, gateway-signed deployment attestation,
 external egress-firewall attestation, authoritative usage, durable worker
 execution, and multi-hour paired quality run remain required before Stage 12
 can pass.
+
+The broker must encode `credential_fingerprint` in the host's canonical
+secret-free identity form, `v1-sha256:<64 lowercase hexadecimal characters>`.
+For OIDC, this binds the durable principal rather than a short-lived access
+token, so token refresh for the same principal remains valid while principal
+drift requires a fresh signed lease.
 
 The fake benchmark remains a contract test only and must continue to report
 `qualityClaimEligible=false`.

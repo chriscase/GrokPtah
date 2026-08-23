@@ -77,6 +77,14 @@ complete or that the product has reached 100%.
   materializing the seven passes and is guarded by the existing `WorkCreate`
   authority. Unsigned or caller-prebuilt plans cannot enter through this
   surface.
+- Signed enterprise review identity now survives all the way to native Run
+  admission. Every projected WorkItem freezes provider, model, endpoint,
+  canonical credential-principal, and route-binding fingerprints; managed
+  selection rejects provider/model drift, and the exact pre-Run provider
+  snapshot rejects endpoint/credential drift, offline execution, and fallback.
+  The constraint also participates in the idempotency payload. This closes the
+  prior gap where signed admission could materialize durable work whose Agent
+  selection later resolved through mutable provider state.
 - The provider-quota receipt contract now requires a named campaign, credential
   and route binding plus distinct provider-side consumption and HTTP-429
   exhaustion observations. Digests, ordering, schema, and secret-free output
@@ -118,10 +126,14 @@ The assembled candidate was rerun in an isolated checkout after the UI and
 enterprise slices were present:
 
 - Enterprise admission: 4 passed, 0 failed.
-- Full `grokptah-agent-bridge` library suite: 675 passed, 0 failed;
+- Full `grokptah-agent-bridge` library suite: 678 passed, 0 failed;
   signed-attestation verification and all existing Computer Use, memory, and
   orchestration regressions are included.
 - Agent bridge Clippy (`-D warnings`, library target): passed.
+- Native executor MCP integration suite: 19 passed, 0 failed; the signed-route
+  drift regression records zero provider requests, zero Runs, and no live
+  intent when endpoint or credential identity differs at admission.
+- Agent bridge Clippy (`-D warnings`, all targets): passed.
 - Certification-lab `cargo check --locked`: passed.
 - Desktop TypeScript typecheck: passed.
 - Desktop Vitest: 46 files, 357 tests passed.

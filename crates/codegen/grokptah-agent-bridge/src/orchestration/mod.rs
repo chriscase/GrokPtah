@@ -116,6 +116,6 @@ pub use worker::{
 pub use workload::{
     lease_duration, AssignmentStatus, AttemptState, WorkApproval, WorkArtifactRef, WorkAttempt,
     WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency, WorkItem,
-    WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState,
-    WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
+    WorkItemSnapshot, WorkPolicy, WorkProgress, WorkProviderRouteConstraint, WorkResult,
+    WorkRetryPolicy, WorkState, WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };
