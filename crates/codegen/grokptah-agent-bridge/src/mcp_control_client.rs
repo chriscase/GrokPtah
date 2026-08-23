@@ -402,13 +402,8 @@ impl McpControlClient {
         if let Some(session_id) = response_session_id {
             self.session_id = Some(session_id);
         }
-        if let Some(err) = v.get("error") {
-            let data_code = err
-                .get("data")
-                .and_then(|data| data.get("code"))
-                .and_then(Value::as_str)
-                .and_then(normalize_remote_error_code);
-            return Err(McpRemoteError { data_code }.into());
+        if let Some(error) = mcp_remote_error_from_json(&v) {
+            return Err(error);
         }
         if !status.is_success() {
             return Err(McpHttpStatusError.into());
@@ -578,6 +573,10 @@ impl McpControlClient {
             .map_err(|_| McpTransportError)?
             .map_err(|_| McpTransportError)?;
         if !response.status().is_success() {
+            let value = bounded_response_json(response).await.unwrap_or(Value::Null);
+            if let Some(error) = mcp_remote_error_from_json(&value) {
+                return Err(error);
+            }
             return Err(McpHttpStatusError.into());
         }
         let content_type = response
@@ -713,6 +712,17 @@ fn append_bounded_response_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> anyhow::R
     Ok(())
 }
 
+fn mcp_remote_error_from_json(value: &Value) -> Option<anyhow::Error> {
+    value.get("error").map(|err| {
+        let data_code = err
+            .get("data")
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str)
+            .and_then(normalize_remote_error_code);
+        McpRemoteError { data_code }.into()
+    })
+}
+
 fn normalize_remote_error_code(value: &str) -> Option<String> {
     match value {
         "unauthenticated"
@@ -725,6 +735,7 @@ fn normalize_remote_error_code(value: &str) -> Option<String> {
         | "internal"
         | "timeout"
         | "invalid_request"
+        | "unknown_session"
         | "unsupported"
         | "conflict"
         | "admission_uncertain" => Some(value.to_owned()),
@@ -885,6 +896,10 @@ mod tests {
         assert_eq!(
             normalize_remote_error_code("admission_uncertain").as_deref(),
             Some("admission_uncertain")
+        );
+        assert_eq!(
+            normalize_remote_error_code("unknown_session").as_deref(),
+            Some("unknown_session")
         );
         assert!(normalize_remote_error_code("xai_private_token_material_123456789").is_none());
         assert!(normalize_remote_error_code("unknown_future_code").is_none());

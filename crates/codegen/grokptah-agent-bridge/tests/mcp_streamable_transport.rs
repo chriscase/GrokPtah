@@ -700,6 +700,11 @@ async fn session_map_hard_capped_under_initialize_spam() {
         "evicted session still accepted: {}",
         stale.status()
     );
+    let stale_body: serde_json::Value = stale.json().await.unwrap();
+    assert_eq!(
+        stale_body["error"]["data"]["code"], "unknown_session",
+        "evicted MCP transport session must be typed, not application invalid_request: {stale_body}"
+    );
     srv.stop();
     set_grokptah_home_override(None);
 }

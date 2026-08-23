@@ -618,7 +618,11 @@ async fn streamable_get_handler(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "jsonrpc": "2.0",
-                "error": {"code": -32600, "message": "missing or unknown mcp-session-id"}
+                "error": {
+                    "code": -32600,
+                    "message": "missing or unknown mcp-session-id",
+                    "data": {"code": "unknown_session"}
+                }
             })),
         )
             .into_response();
@@ -1670,7 +1674,7 @@ fn require_session_if_present(state: &AppState, headers: &HeaderMap) -> Result<(
     let mut g = state.sessions.lock();
     let Some(s) = g.get_mut(&sid) else {
         return Err(OrchError::new(
-            OrchErrorCode::InvalidRequest,
+            OrchErrorCode::UnknownSession,
             "unknown mcp-session-id",
         ));
     };
@@ -1786,7 +1790,7 @@ fn status_for(e: &OrchError) -> StatusCode {
     match e.code {
         OrchErrorCode::Unauthenticated => StatusCode::UNAUTHORIZED,
         OrchErrorCode::ForbiddenScope | OrchErrorCode::WorkspaceMismatch => StatusCode::FORBIDDEN,
-        OrchErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        OrchErrorCode::InvalidRequest | OrchErrorCode::UnknownSession => StatusCode::BAD_REQUEST,
         OrchErrorCode::StaleVersion
         | OrchErrorCode::Conflict
         | OrchErrorCode::AdmissionUncertain => StatusCode::CONFLICT,

@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
-    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, PublicRun,
-    PublicRunPage, RoutineRecord, RoutineSnapshot, RunExecutionMode, RunScope, RunState,
+    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, McpRemoteError,
+    PublicRun, PublicRunPage, RoutineRecord, RoutineSnapshot, RunExecutionMode, RunScope, RunState,
     RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
@@ -1576,17 +1576,20 @@ fn normalize_base_url(value: &str) -> Result<String> {
 
 /// Reconnect only for transport failures, retryable HTTP statuses, or a
 /// server-side MCP session that disappeared during a restart. Application
-/// errors such as an invalid request or a terminal run must be returned
-/// directly; replaying those requests can duplicate mutations.
+/// errors such as `invalid_request`, `admission_uncertain`, `conflict`, or a
+/// terminal run must be returned directly; replaying those requests can
+/// duplicate mutations.
 fn should_reconnect_remote_error(error: &anyhow::Error) -> bool {
+    if is_stale_mcp_session_error(error) {
+        return true;
+    }
     let message = error.to_string();
     if let Some(rest) = message.strip_prefix("MCP HTTP ") {
         let status = rest
             .split_whitespace()
             .next()
             .and_then(|value| value.parse::<u16>().ok());
-        return message.contains("unknown mcp-session-id")
-            || status.is_some_and(|code| code == 408 || code == 429 || code >= 500);
+        return status.is_some_and(|code| code == 408 || code == 429 || code >= 500);
     }
     if message.starts_with("MCP error:")
         || message.starts_with("MCP remote error:")
@@ -1598,6 +1601,18 @@ fn should_reconnect_remote_error(error: &anyhow::Error) -> bool {
         return false;
     }
     true
+}
+
+fn is_stale_mcp_session_error(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<McpRemoteError>()
+        .and_then(McpRemoteError::data_code)
+        == Some("unknown_session")
+    {
+        return true;
+    }
+    let message = error.to_string();
+    message == "MCP remote error: unknown_session" || message.contains("unknown mcp-session-id")
 }
 
 fn decode_remote_run_page(value: Value) -> Result<PublicRunPage> {
@@ -1922,6 +1937,9 @@ mod tests {
             "MCP HTTP 400 Bad Request: unknown mcp-session-id"
         )));
         assert!(should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: unknown_session"
+        )));
+        assert!(should_reconnect_remote_error(&anyhow::anyhow!(
             "MCP HTTP 503 Service Unavailable"
         )));
         assert!(should_reconnect_remote_error(&anyhow::anyhow!(
@@ -1940,10 +1958,19 @@ mod tests {
             "MCP error: invalid request"
         )));
         assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: invalid_request"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
             "MCP remote error: admission_uncertain"
         )));
         assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
             "MCP remote error: conflict"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: workspace_mismatch"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: capacity_exhausted"
         )));
     }
 
