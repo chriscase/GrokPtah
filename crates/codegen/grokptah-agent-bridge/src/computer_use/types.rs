@@ -57,6 +57,8 @@ pub type ComputerResult<T> = Result<T, ComputerError>;
 
 /// Durable Computer Run schema. `0` means a legacy record missing the field.
 pub const COMPUTER_RUN_SCHEMA_VERSION: u32 = 1;
+/// Durable Computer mutation receipt schema. `0` means a legacy unversioned receipt.
+pub const COMPUTER_RECEIPT_SCHEMA_VERSION: u32 = 1;
 
 /// Agent ComputerPrincipal minting is fail-closed in this allowlist. Resolving a
 /// durable Agent ID and the exact current spec revision requires `AgentHost` /
@@ -676,7 +678,7 @@ impl SurfaceFreshnessFence {
 /// closed for Agent identity until the out-of-allowlist host Agent registry
 /// lands. The wrapper is opaque so other crates cannot mint self-issued
 /// authority. The public issue path is
-/// `ComputerUseService::local_operator_token`.
+/// [`crate::host::AgentHostHandle::computer_operator_token`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ComputerPrincipal {
@@ -762,8 +764,9 @@ impl ComputerPrincipal {
 }
 
 /// Host-resolved caller identity. Fields are private so callers cannot mint
-/// authority; [`crate::computer_use::ComputerUseService::local_operator_token`]
-/// is the public issue path.
+/// authority; [`crate::host::AgentHostHandle::computer_operator_token`] is the
+/// public issue path. Raw `ComputerUseService` callers cannot construct a token
+/// from an arbitrary session UUID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputerAuthorityToken {
     principal: ComputerPrincipal,
@@ -773,6 +776,10 @@ impl ComputerAuthorityToken {
     pub(crate) fn from_host_principal(principal: ComputerPrincipal) -> ComputerResult<Self> {
         principal.validate()?;
         Ok(Self { principal })
+    }
+
+    pub(crate) fn local_operator(session_id: Uuid) -> ComputerResult<Self> {
+        Self::from_host_principal(ComputerPrincipal::local_operator(session_id))
     }
 
     pub fn principal(&self) -> &ComputerPrincipal {
@@ -1916,6 +1923,22 @@ pub trait ComputerBackend: Send + Sync + std::fmt::Debug {
         observation: &ComputerObservation,
         action: &ComputerAction,
     ) -> ComputerResult<ActionOutcome>;
+
+    /// Backend-attested atomic action: compare the live native AX/tree/frame
+    /// generation and surface incarnation to the exact observed attestation
+    /// under the same dispatch lock immediately before input. Unsupported
+    /// backends must deny without performing input.
+    async fn act_if_current(
+        &self,
+        _run_id: &str,
+        _observation: &ComputerObservation,
+        _action: &ComputerAction,
+    ) -> ComputerResult<ActionOutcome> {
+        Err(ComputerError::new(
+            ComputerErrorCode::ForbiddenAction,
+            "backend does not attest exact-current action",
+        ))
+    }
 
     /// Returns only process-owned evidence for the exact run and opaque asset ID.
     async fn read_evidence(

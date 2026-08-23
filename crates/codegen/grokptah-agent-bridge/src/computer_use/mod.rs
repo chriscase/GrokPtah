@@ -29,10 +29,12 @@ pub use platform::{
 };
 pub use policy::ComputerPolicy;
 pub use projection::{
-    project_run_at, ActionGrantSummary, ActionOutcomeSummary, ComputerErrorSummary,
-    ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress,
-    ComputerRunProjection, ComputerScopeCapacity, ComputerTargetSummary, ObservationSummary,
-    DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    project_run_at, ActionGrantSummary, ActionOutcomeSummary, ComputerBackendPublicView,
+    ComputerErrorSummary, ComputerLocalApproval, ComputerLocalAuditEntry, ComputerLocalElement,
+    ComputerLocalError, ComputerLocalGrant, ComputerLocalLimits, ComputerLocalObservation,
+    ComputerLocalTarget, ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange,
+    ComputerRunProgress, ComputerRunProjection, ComputerScopeCapacity, ComputerTargetSummary,
+    ObservationSummary, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
 pub use reads::{ComputerReadBinding, ComputerRunReads};
 
@@ -58,7 +60,8 @@ pub use types::{
     ComputerRunState, ComputerSurfaceBinding, ComputerTarget, ComputerUseLimits, EvidenceRef,
     GrantIssuer, IsolationProofOrigin, ObservationAuthority, ObservationGeometry,
     PhysicalInputDomain, PointerButton, SemanticAction, SemanticElement, Sensitivity,
-    SurfaceFreshnessFence, AGENT_PRINCIPAL_INTEGRATION_BLOCKER, MACOS_INTERRUPTED_BACKEND_ID,
-    MACOS_NATIVE_BACKEND_ID, SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
+    SurfaceFreshnessFence, AGENT_PRINCIPAL_INTEGRATION_BLOCKER, COMPUTER_RECEIPT_SCHEMA_VERSION,
+    COMPUTER_RUN_SCHEMA_VERSION, MACOS_INTERRUPTED_BACKEND_ID, MACOS_NATIVE_BACKEND_ID,
+    SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
     SIMULATOR_ISOLATED_BACKEND_ID,
 };

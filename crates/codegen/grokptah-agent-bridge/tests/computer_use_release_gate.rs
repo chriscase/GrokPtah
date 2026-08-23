@@ -13,7 +13,6 @@ use std::sync::{
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use tempfile::TempDir;
-use uuid::Uuid;
 
 use grokptah_agent_bridge::computer_use::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuthorityToken,
@@ -22,7 +21,9 @@ use grokptah_agent_bridge::computer_use::{
     ObservationGeometry, PhysicalInputDomain, PointerButton, SemanticAction, SemanticElement,
     Sensitivity,
 };
-use grokptah_agent_bridge::ComputerUseService;
+use grokptah_agent_bridge::{
+    home_override_serial, set_grokptah_home_override, AgentHost, ComputerUseService, HostConfig,
+};
 
 #[derive(Debug, Clone, Copy)]
 enum BackendMode {
@@ -144,6 +145,15 @@ impl ComputerBackend for ReleaseGateBackend {
         ))
     }
 
+    async fn act_if_current(
+        &self,
+        run_id: &str,
+        observation: &ComputerObservation,
+        action: &ComputerAction,
+    ) -> Result<ActionOutcome, ComputerError> {
+        self.act(run_id, observation, action).await
+    }
+
     async fn cancel(&self, _run_id: &str) -> Result<(), ComputerError> {
         Ok(())
     }
@@ -160,9 +170,11 @@ fn grant(run: &ComputerRun, classes: BTreeSet<ActionClass>) -> ActionGrant {
     )
 }
 
-fn caller(run: &ComputerRun, service: &ComputerUseService) -> ComputerAuthorityToken {
-    service
-        .local_operator_token(run.owner_session_id)
+fn caller(
+    run: &ComputerRun,
+    host: &grokptah_agent_bridge::AgentHostHandle,
+) -> ComputerAuthorityToken {
+    host.computer_operator_token(run.owner_session_id)
         .expect("release-gate owner is a valid local operator")
 }
 
@@ -174,15 +186,28 @@ fn fixture(
     Arc<ReleaseGateBackend>,
     ComputerUseService,
     ComputerRun,
+    grokptah_agent_bridge::AgentHostHandle,
 ) {
     let directory = tempfile::tempdir().expect("fixture directory");
+    let _guard = home_override_serial();
+    set_grokptah_home_override(Some(directory.path().join(".grokptah")));
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().expect("host starts");
+    let session = host.session_new().expect("live session");
+    let caller = host
+        .computer_operator_token(session.id)
+        .expect("live operator token");
+    set_grokptah_home_override(None);
     let backend = Arc::new(ReleaseGateBackend::new(mode));
     let store = ComputerStore::open(directory.path().join("computer-use")).expect("store");
     let service = ComputerUseService::new(backend.clone(), store);
     let run = service
         .create_run(
             "release-gate-create",
-            Uuid::new_v4(),
+            &caller,
             None,
             target(),
             Default::default(),
@@ -191,13 +216,13 @@ fn fixture(
     let run = service
         .authorize(
             "release-gate-authorize",
-            &caller(&run, &service),
+            &caller,
             &run.run_id,
             run.version,
             grant(&run, classes),
         )
         .expect("authorize run");
-    (directory, backend, service, run)
+    (directory, backend, service, run, host)
 }
 
 fn target() -> ComputerTarget {
@@ -212,14 +237,14 @@ fn target() -> ComputerTarget {
 
 #[tokio::test]
 async fn observed_instruction_text_cannot_expand_action_scope() {
-    let (_directory, backend, service, run) = fixture(
+    let (_directory, backend, service, run, host) = fixture(
         BackendMode::PromptInjection,
         BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
     );
     let observation = service
         .observe(
             "release-gate-observe-injection",
-            &caller(&run, &service),
+            &caller(&run, &host),
             &run.run_id,
             run.version,
         )
@@ -234,7 +259,7 @@ async fn observed_instruction_text_cannot_expand_action_scope() {
     let error = service
         .act(
             "release-gate-invented-action",
-            &caller(&run, &service),
+            &caller(&run, &host),
             &run.run_id,
             current.version,
             &observation.observation_id,
@@ -250,14 +275,14 @@ async fn observed_instruction_text_cannot_expand_action_scope() {
 
 #[tokio::test]
 async fn sensitive_observation_fails_before_model_visible_action_or_dispatch() {
-    let (_directory, backend, service, run) = fixture(
+    let (_directory, backend, service, run, host) = fixture(
         BackendMode::SensitiveObservation,
         BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
     );
     let error = service
         .observe(
             "release-gate-observe-sensitive",
-            &caller(&run, &service),
+            &caller(&run, &host),
             &run.run_id,
             run.version,
         )
@@ -276,14 +301,14 @@ async fn sensitive_observation_fails_before_model_visible_action_or_dispatch() {
 
 #[tokio::test]
 async fn observation_target_drift_fails_inflight_run_and_revokes_authority() {
-    let (_directory, _backend, service, run) = fixture(
+    let (_directory, _backend, service, run, host) = fixture(
         BackendMode::TargetDrift,
         BTreeSet::from([ActionClass::Semantic]),
     );
     let error = service
         .observe(
             "release-gate-observe-drift",
-            &caller(&run, &service),
+            &caller(&run, &host),
             &run.run_id,
             run.version,
         )
@@ -301,14 +326,14 @@ async fn observation_target_drift_fails_inflight_run_and_revokes_authority() {
 
 #[tokio::test]
 async fn permission_revocation_fails_action_and_clears_authority() {
-    let (_directory, backend, service, run) = fixture(
+    let (_directory, backend, service, run, host) = fixture(
         BackendMode::PermissionRevoked,
         BTreeSet::from([ActionClass::TextEntry]),
     );
     let observation = service
         .observe(
             "release-gate-observe-revoked",
-            &caller(&run, &service),
+            &caller(&run, &host),
             &run.run_id,
             run.version,
         )
@@ -318,7 +343,7 @@ async fn permission_revocation_fails_action_and_clears_authority() {
     let error = service
         .act(
             "release-gate-act-revoked",
-            &caller(&run, &service),
+            &caller(&run, &host),
             &run.run_id,
             current.version,
             &observation.observation_id,
@@ -342,14 +367,14 @@ async fn permission_revocation_fails_action_and_clears_authority() {
 
 #[tokio::test]
 async fn unsupported_pointer_fallback_never_reaches_backend() {
-    let (_directory, backend, service, run) = fixture(
+    let (_directory, backend, service, run, host) = fixture(
         BackendMode::Permissive,
         BTreeSet::from([ActionClass::PointerFallback]),
     );
     let observation = service
         .observe(
             "release-gate-observe-pointer",
-            &caller(&run, &service),
+            &caller(&run, &host),
             &run.run_id,
             run.version,
         )
@@ -359,7 +384,7 @@ async fn unsupported_pointer_fallback_never_reaches_backend() {
     let error = service
         .act(
             "release-gate-act-pointer",
-            &caller(&run, &service),
+            &caller(&run, &host),
             &run.run_id,
             current.version,
             &observation.observation_id,

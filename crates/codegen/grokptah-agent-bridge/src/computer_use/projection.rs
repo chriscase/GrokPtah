@@ -25,8 +25,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::types::{
-    ActionClass, ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerRun,
-    ComputerRunState, ComputerUseLimits, GrantIssuer, Sensitivity,
+    ActionClass, ComputerCapabilities, ComputerControlDisposition, ComputerError,
+    ComputerErrorCode, ComputerRun, ComputerRunState, ComputerUseLimits, GrantIssuer,
+    SemanticAction, Sensitivity,
 };
 
 /// Hard ceiling on one event page regardless of the requested limit.
@@ -202,6 +203,175 @@ pub struct ComputerScopeCapacity {
     pub max_run_records: u32,
     pub bound_runs: u32,
     pub bound_active_runs: u32,
+}
+
+/// Public backend flags for the local cockpit. Typed capability proofs stay
+/// host-internal and must never ride a Tauri snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerBackendPublicView {
+    pub backend_id: String,
+    pub observe: bool,
+    pub semantic_actions: bool,
+    pub text_entry: bool,
+    pub key_chords: bool,
+    pub pointer_fallback: bool,
+}
+
+impl ComputerBackendPublicView {
+    pub fn from_capabilities(capabilities: &ComputerCapabilities) -> Self {
+        Self {
+            backend_id: capabilities.backend_id.clone(),
+            observe: capabilities.observe,
+            semantic_actions: capabilities.semantic_actions,
+            text_entry: capabilities.text_entry,
+            key_chords: capabilities.key_chords,
+            pointer_fallback: capabilities.pointer_fallback,
+        }
+    }
+}
+
+/// Allowlisted local observation element. Geometry, sensitivity, focus, and
+/// evidence handles are omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerLocalElement {
+    pub element_id: String,
+    pub role: String,
+    pub label: Option<String>,
+    pub value: Option<String>,
+    pub enabled: bool,
+    pub actions: BTreeSet<SemanticAction>,
+}
+
+/// Local-only observation detail needed to render an approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerLocalObservation {
+    pub observation_id: String,
+    pub sequence: u64,
+    pub captured_at: DateTime<Utc>,
+    pub elements: Vec<ComputerLocalElement>,
+}
+
+/// Allowlisted grant projection for the local cockpit. Principal, surface,
+/// incarnation, and epoch handles stay internal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerLocalGrant {
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub action_classes: BTreeSet<ActionClass>,
+}
+
+/// Allowlisted durable audit row. Backend-chosen messages are absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerLocalAuditEntry {
+    pub sequence: u64,
+    pub at: DateTime<Utc>,
+    pub operation: String,
+    pub disposition: String,
+    pub action_class: Option<ActionClass>,
+    pub observation_id: Option<String>,
+    pub error_code: Option<ComputerErrorCode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerLocalTarget {
+    pub app_id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerLocalLimits {
+    pub max_actions: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerLocalError {
+    pub code: ComputerErrorCode,
+}
+
+/// Purpose-built local approval/observation DTO. This is the only run detail
+/// the desktop snapshot may serialize alongside the coordinator projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerLocalApproval {
+    pub run_id: String,
+    pub state: ComputerRunState,
+    pub version: u64,
+    pub action_count: u32,
+    pub limits: ComputerLocalLimits,
+    pub control_disposition: ComputerControlDisposition,
+    pub target: ComputerLocalTarget,
+    pub observation: Option<ComputerLocalObservation>,
+    pub grant: Option<ComputerLocalGrant>,
+    pub audit: Vec<ComputerLocalAuditEntry>,
+    pub last_error: Option<ComputerLocalError>,
+}
+
+impl ComputerLocalApproval {
+    pub fn from_run(run: &ComputerRun) -> Self {
+        Self {
+            run_id: run.run_id.clone(),
+            state: run.state,
+            version: run.version,
+            action_count: run.action_count,
+            limits: ComputerLocalLimits {
+                max_actions: run.limits.max_actions,
+            },
+            control_disposition: run.control_disposition,
+            target: ComputerLocalTarget {
+                app_id: run.target.app_id.clone(),
+                display_name: run.target.display_name.clone(),
+            },
+            observation: run.current_observation.as_ref().map(|observation| {
+                ComputerLocalObservation {
+                    observation_id: observation.observation_id.clone(),
+                    sequence: observation.sequence,
+                    captured_at: observation.captured_at,
+                    elements: observation
+                        .elements
+                        .iter()
+                        .map(|element| ComputerLocalElement {
+                            element_id: element.element_id.clone(),
+                            role: element.role.clone(),
+                            label: element.label.clone(),
+                            value: element.value.clone(),
+                            enabled: element.enabled,
+                            actions: element.actions.clone(),
+                        })
+                        .collect(),
+                }
+            }),
+            grant: run.grant.as_ref().map(|grant| ComputerLocalGrant {
+                expires_at: grant.expires_at,
+                revoked_at: grant.revoked_at,
+                action_classes: grant.action_classes.clone(),
+            }),
+            audit: run
+                .audit
+                .iter()
+                .map(|entry| ComputerLocalAuditEntry {
+                    sequence: entry.sequence,
+                    at: entry.at,
+                    operation: entry.operation.clone(),
+                    disposition: entry.disposition.clone(),
+                    action_class: entry.action_class,
+                    observation_id: entry.observation_id.clone(),
+                    error_code: entry.error_code,
+                })
+                .collect(),
+            last_error: run
+                .last_error
+                .as_ref()
+                .map(|error| ComputerLocalError { code: error.code }),
+        }
+    }
 }
 
 /// Ownership failure. Unknown runs and cross-session runs deliberately produce
@@ -803,5 +973,191 @@ mod tests {
                 "initiatingPrincipalKind",
             ])
         );
+    }
+
+    fn json_key_paths(value: &serde_json::Value) -> BTreeSet<String> {
+        fn walk(prefix: &str, value: &serde_json::Value, out: &mut BTreeSet<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        out.insert(path.clone());
+                        walk(&path, child, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    if let Some(first) = items.first() {
+                        let path = format!("{prefix}[]");
+                        walk(&path, first, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = BTreeSet::new();
+        walk("", value, &mut out);
+        out
+    }
+
+    fn populated_run() -> ComputerRun {
+        let mut run = ComputerRun::attested_foreground_for_test(
+            Uuid::new_v4(),
+            Some("/secret/workspace".into()),
+            target(),
+            ComputerUseLimits::default(),
+        )
+        .unwrap();
+        run.current_observation = Some(observation_with_secrets(&run.target.clone()));
+        let now = Utc::now();
+        run.grant = Some(ActionGrant::for_run(
+            &run,
+            BTreeSet::from([ActionClass::Semantic]),
+            now,
+            now + Duration::minutes(5),
+            Some(1),
+        ));
+        run.last_outcome = Some(ActionOutcome::bounded("BACKEND_TEXT_SUMMARY", Some(true)));
+        run.last_error = Some(ComputerError::new(
+            ComputerErrorCode::BackendFailure,
+            "BACKEND_ERROR_MESSAGE",
+        ));
+        run.record_audit(
+            "act",
+            "denied",
+            Some(ActionClass::Semantic),
+            Some("observation-01234567-89ab-cdef-0123-456789abcdef".into()),
+            Some(ComputerErrorCode::BackendFailure),
+        );
+        run
+    }
+
+    #[test]
+    fn local_approval_dto_is_allowlisted_and_rejects_unknown_fields() {
+        let run = populated_run();
+        let local = ComputerLocalApproval::from_run(&run);
+        let encoded = serde_json::to_value(&local).unwrap();
+        assert_eq!(
+            json_key_paths(&encoded),
+            BTreeSet::from([
+                "runId".into(),
+                "state".into(),
+                "version".into(),
+                "actionCount".into(),
+                "limits".into(),
+                "limits.maxActions".into(),
+                "controlDisposition".into(),
+                "target".into(),
+                "target.appId".into(),
+                "target.displayName".into(),
+                "observation".into(),
+                "observation.observationId".into(),
+                "observation.sequence".into(),
+                "observation.capturedAt".into(),
+                "observation.elements".into(),
+                "observation.elements[].elementId".into(),
+                "observation.elements[].role".into(),
+                "observation.elements[].label".into(),
+                "observation.elements[].value".into(),
+                "observation.elements[].enabled".into(),
+                "observation.elements[].actions".into(),
+                "grant".into(),
+                "grant.expiresAt".into(),
+                "grant.revokedAt".into(),
+                "grant.actionClasses".into(),
+                "audit".into(),
+                "audit[].sequence".into(),
+                "audit[].at".into(),
+                "audit[].operation".into(),
+                "audit[].disposition".into(),
+                "audit[].actionClass".into(),
+                "audit[].observationId".into(),
+                "audit[].errorCode".into(),
+                "lastError".into(),
+                "lastError.code".into(),
+            ])
+        );
+
+        let wire = serde_json::to_string(&encoded).unwrap();
+        for forbidden in [
+            "workspace",
+            "initiatingPrincipal",
+            "capabilityProof",
+            "SECRET_ASSET_TOKEN",
+            "BACKEND_TEXT_SUMMARY",
+            "BACKEND_ERROR_MESSAGE",
+            "grantId",
+            "usesRemaining",
+            "surfaceId",
+            "incarnation",
+            "authorityEpoch",
+            "controlEpoch",
+            "ownerSessionId",
+            "screenshot",
+            "evidence",
+            "lastOutcome",
+        ] {
+            assert!(
+                !wire.contains(forbidden),
+                "{forbidden} must not appear in the local approval DTO"
+            );
+        }
+        assert!(wire.contains("PRIVATE_DOCUMENT_LABEL"));
+        assert_eq!(
+            local.last_error.as_ref().unwrap().code,
+            ComputerErrorCode::BackendFailure
+        );
+
+        let mut with_workspace = encoded.clone();
+        with_workspace
+            .as_object_mut()
+            .unwrap()
+            .insert("workspace".into(), serde_json::json!("/secret/workspace"));
+        assert!(serde_json::from_value::<ComputerLocalApproval>(with_workspace).is_err());
+
+        let mut with_nested = encoded;
+        with_nested["observation"]
+            .as_object_mut()
+            .unwrap()
+            .insert("screenshot".into(), serde_json::json!({"assetId": "x"}));
+        assert!(serde_json::from_value::<ComputerLocalApproval>(with_nested).is_err());
+    }
+
+    #[test]
+    fn backend_public_view_omits_proof_and_rejects_unknown_fields() {
+        let capabilities = ComputerCapabilities::from_proof(
+            crate::computer_use::ComputerCapabilityProof::ForegroundSemantic {
+                backend_id: crate::computer_use::SIMULATOR_FOREGROUND_BACKEND_ID.into(),
+                observe: true,
+                semantic_actions: true,
+                text_entry: true,
+            },
+        )
+        .unwrap();
+        let view = ComputerBackendPublicView::from_capabilities(&capabilities);
+        let encoded = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            json_key_paths(&encoded),
+            BTreeSet::from([
+                "backendId".into(),
+                "observe".into(),
+                "semanticActions".into(),
+                "textEntry".into(),
+                "keyChords".into(),
+                "pointerFallback".into(),
+            ])
+        );
+        let wire = serde_json::to_string(&encoded).unwrap();
+        assert!(!wire.contains("proof"));
+        assert!(!wire.contains("tier"));
+        let mut extra = encoded;
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("proof".into(), serde_json::json!({"kind": "unproven"}));
+        assert!(serde_json::from_value::<ComputerBackendPublicView>(extra).is_err());
     }
 }

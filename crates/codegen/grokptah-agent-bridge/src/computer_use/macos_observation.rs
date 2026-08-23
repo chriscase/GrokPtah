@@ -123,6 +123,7 @@ pub(crate) struct RawMacObservation {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct RawMacActionRequest {
     pub target_frame: ObservationGeometry,
     pub element_index: Option<usize>,
@@ -171,6 +172,7 @@ pub struct MacOsObservationPlatform {
 }
 
 impl MacOsObservationPlatform {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn with_source(source: Arc<dyn MacObservationSource>) -> Self {
         Self {
             source,
@@ -312,6 +314,9 @@ struct MacActionSnapshot {
     target_frame: ObservationGeometry,
     nodes: Vec<RawMacSemanticNode>,
     nodes_truncated: bool,
+    identity: MacNativeIdentity,
+    content_digest: String,
+    shape_digest: String,
 }
 
 #[derive(Debug)]
@@ -380,6 +385,9 @@ impl ComputerBackend for MacOsObservationBackend {
             target_frame: raw.frame,
             nodes: raw.nodes.clone(),
             nodes_truncated: raw.nodes_truncated,
+            identity: raw.identity.clone(),
+            content_digest: mac_content_digest(&raw.nodes),
+            shape_digest: mac_shape_digest(&raw.nodes),
         };
         let observation = normalize_observation(
             run_id,
@@ -405,6 +413,15 @@ impl ComputerBackend for MacOsObservationBackend {
     }
 
     async fn act(
+        &self,
+        run_id: &str,
+        observation: &ComputerObservation,
+        action: &ComputerAction,
+    ) -> ComputerResult<ActionOutcome> {
+        self.act_if_current(run_id, observation, action).await
+    }
+
+    async fn act_if_current(
         &self,
         _run_id: &str,
         observation: &ComputerObservation,
@@ -445,6 +462,30 @@ impl ComputerBackend for MacOsObservationBackend {
                 "macOS native semantic walk was truncated; action dispatch is denied",
             ));
         }
+        let live = self
+            .source
+            .observe(&self.native_identity, &ComputerUseLimits::default())
+            .await?;
+        if live.identity != snapshot.identity
+            || live.identity != self.native_identity
+            || live.frame != snapshot.target_frame
+            || mac_shape_digest(&live.nodes) != snapshot.shape_digest
+        {
+            *self.action_snapshot.lock() = None;
+            return Err(ComputerError::new(
+                ComputerErrorCode::TargetChanged,
+                "macOS action target geometry or selected-element shape changed",
+            ));
+        }
+        if mac_content_digest(&live.nodes) != snapshot.content_digest
+            || live.nodes_truncated != snapshot.nodes_truncated
+        {
+            *self.action_snapshot.lock() = None;
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "macOS action is not attested against the current AX/tree generation",
+            ));
+        }
         let (element_index, expected_element) =
             action_element(snapshot.nodes.as_slice(), observation, action)?;
         let request = RawMacActionRequest {
@@ -459,9 +500,6 @@ impl ComputerBackend for MacOsObservationBackend {
                 "macOS action was cancelled before dispatch",
             ));
         }
-        // Consume the attestation before crossing the native mutation
-        // boundary. A target or postcondition error after dispatch is an
-        // uncertain physical outcome and must never make this frame reusable.
         *self.action_snapshot.lock() = None;
         let outcome = self.source.act(&self.native_identity, &request).await?;
         if self.cancellation_epoch.load(Ordering::SeqCst) != epoch {
@@ -493,6 +531,31 @@ impl ComputerBackend for MacOsObservationBackend {
         self.evidence.remove_run(run_id);
         Ok(())
     }
+}
+
+fn mac_content_digest(nodes: &[RawMacSemanticNode]) -> String {
+    let mut hasher = Sha256::new();
+    for node in nodes {
+        hasher.update(node.label.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+        hasher.update(node.value.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn mac_shape_digest(nodes: &[RawMacSemanticNode]) -> String {
+    let mut hasher = Sha256::new();
+    for node in nodes {
+        hasher.update(node.role.as_bytes());
+        hasher.update([0]);
+        hasher.update(format!("{:?}", node.frame).as_bytes());
+        hasher.update([0]);
+        hasher.update([u8::from(node.enabled), u8::from(node.focused)]);
+        hasher.update(format!("{:?}", node.actions).as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn action_element(
@@ -941,6 +1004,7 @@ mod tests {
         action_error: Mutex<Option<ComputerErrorCode>>,
         action_postcondition: Mutex<Option<bool>>,
         action_requests: Mutex<Vec<RawMacActionRequest>>,
+        content_label: Mutex<String>,
     }
 
     impl FixtureSource {
@@ -970,6 +1034,7 @@ mod tests {
                 action_error: Mutex::new(None),
                 action_postcondition: Mutex::new(None),
                 action_requests: Mutex::new(Vec::new()),
+                content_label: Mutex::new("Continue".into()),
             }
         }
     }
@@ -1042,7 +1107,7 @@ mod tests {
                     RawMacSemanticNode {
                         role: "AXButton".into(),
                         subrole: None,
-                        label: Some("Continue".into()),
+                        label: Some(self.content_label.lock().clone()),
                         value: None,
                         frame: Some(ObservationGeometry {
                             x: frame.x + 1.0,
@@ -1779,6 +1844,37 @@ mod tests {
                 .unwrap_err()
                 .code,
             ComputerErrorCode::TargetChanged
+        );
+        assert!(source.action_requests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_shape_content_drift_fails_before_native_input() {
+        let source = Arc::new(FixtureSource::granted());
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let backend = platform
+            .bind_target(&candidate.selection_token)
+            .await
+            .unwrap();
+        let observation = backend
+            .observe(
+                "run",
+                "content-drift-observation",
+                &candidate.target,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let element_id = observation.elements[0].element_id.clone();
+        *source.content_label.lock() = "Submit".into();
+        assert_eq!(
+            backend
+                .act("run", &observation, &ComputerAction::Invoke { element_id },)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::StaleObservation
         );
         assert!(source.action_requests.lock().is_empty());
     }

@@ -15,10 +15,11 @@ use uuid::Uuid;
 use super::types::{
     validate_id, validate_workspace, ComputerControlDisposition, ComputerError, ComputerErrorCode,
     ComputerPrincipal, ComputerResult, ComputerRun, ComputerRunState, ComputerSurfaceBinding,
-    PhysicalInputDomain, SurfaceFreshnessFence, COMPUTER_RUN_SCHEMA_VERSION,
+    PhysicalInputDomain, SurfaceFreshnessFence, COMPUTER_RECEIPT_SCHEMA_VERSION,
+    COMPUTER_RUN_SCHEMA_VERSION,
 };
 
-const MAX_RECEIPTS: usize = 2_048;
+pub(crate) const MAX_RECEIPTS: usize = 2_048;
 const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const TERMINAL_RUN_AGE: Duration = Duration::days(30);
 const TERMINAL_RECEIPT_AGE: Duration = Duration::days(7);
@@ -87,6 +88,8 @@ struct MutationReceipt {
     result: Option<serde_json::Value>,
     error: Option<ComputerError>,
     #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
     caller_kind: Option<String>,
     #[serde(default)]
     caller_owner_session_id: Option<Uuid>,
@@ -97,17 +100,33 @@ struct MutationReceipt {
     #[serde(default)]
     run_id: Option<String>,
     #[serde(default)]
-    authority_epoch: Option<u64>,
+    surface_id: Option<String>,
     #[serde(default)]
-    control_epoch: Option<u64>,
+    incarnation: Option<String>,
+    #[serde(default)]
+    grant_id: Option<String>,
+    #[serde(default)]
+    frame_epoch: Option<u64>,
+    #[serde(default, alias = "authorityEpoch")]
+    pre_authority_epoch: Option<u64>,
+    #[serde(default, alias = "controlEpoch")]
+    pre_control_epoch: Option<u64>,
+    #[serde(default)]
+    post_authority_epoch: Option<u64>,
+    #[serde(default)]
+    post_control_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct MutationStamp {
     pub principal: ComputerPrincipal,
     pub run_id: Option<String>,
-    pub authority_epoch: u64,
-    pub control_epoch: u64,
+    pub surface_id: Option<String>,
+    pub incarnation: Option<String>,
+    pub grant_id: Option<String>,
+    pub frame_epoch: Option<u64>,
+    pub pre_authority_epoch: u64,
+    pub pre_control_epoch: u64,
 }
 
 impl MutationStamp {
@@ -115,8 +134,24 @@ impl MutationStamp {
         Self {
             principal,
             run_id: run.map(|run| run.run_id.clone()),
-            authority_epoch: run.map(|run| run.authority_epoch).unwrap_or(0),
-            control_epoch: run.map(|run| run.control_epoch).unwrap_or(0),
+            surface_id: run.and_then(|run| {
+                run.surface
+                    .is_issued()
+                    .then(|| run.surface.surface_id.clone())
+            }),
+            incarnation: run.and_then(|run| {
+                run.surface
+                    .is_issued()
+                    .then(|| run.surface.incarnation.clone())
+            }),
+            grant_id: run.and_then(|run| run.grant.as_ref().map(|grant| grant.grant_id.clone())),
+            frame_epoch: run.and_then(|run| {
+                run.current_observation
+                    .as_ref()
+                    .map(|observation| observation.authority.frame_epoch)
+            }),
+            pre_authority_epoch: run.map(|run| run.authority_epoch).unwrap_or(0),
+            pre_control_epoch: run.map(|run| run.control_epoch).unwrap_or(0),
         }
     }
 
@@ -337,6 +372,27 @@ impl ComputerStore {
         ))
     }
 
+    pub(crate) fn replay_mutation(
+        &self,
+        request_id: &str,
+        operation: &str,
+        payload_hash: &str,
+        stamp: &MutationStamp,
+    ) -> ComputerResult<Option<ComputerResult<serde_json::Value>>> {
+        let _guard = self.inner.lock.lock();
+        let path = self.receipt_path(request_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(self.interpret_existing_receipt(
+            &self.read_receipt_path(&path)?,
+            request_id,
+            operation,
+            payload_hash,
+            stamp,
+        )?))
+    }
+
     pub(crate) fn claim_mutation(
         &self,
         request_id: &str,
@@ -347,40 +403,24 @@ impl ComputerStore {
         let _guard = self.inner.lock.lock();
         let path = self.receipt_path(request_id)?;
         if path.is_file() {
-            let receipt = self.read_receipt_path(&path)?;
-            if !receipt_is_stamped(&receipt) {
-                return Ok(MutationClaim::Uncertain);
-            }
-            if receipt.request_id != request_id
-                || receipt.operation != operation
-                || receipt.payload_hash != payload_hash
-            {
-                return Err(ComputerError::new(
-                    ComputerErrorCode::Conflict,
-                    "request id was reused with a different computer-use mutation",
-                ));
-            }
-            if !receipt_matches_stamp(&receipt, stamp) {
-                return Err(ComputerError::new(
-                    ComputerErrorCode::Unauthorized,
-                    "idempotency receipt is not bound to this caller and run authority",
-                ));
-            }
-            return Ok(match receipt.state {
-                ReceiptState::Claimed => MutationClaim::Pending,
-                ReceiptState::Uncertain => MutationClaim::Uncertain,
-                ReceiptState::Succeeded => {
-                    MutationClaim::Replay(Ok(receipt.result.unwrap_or(serde_json::Value::Null)))
-                }
-                ReceiptState::Failed => {
-                    MutationClaim::Replay(Err(receipt.error.unwrap_or_else(|| {
-                        ComputerError::new(
-                            ComputerErrorCode::Internal,
-                            "stored mutation failed without an error",
-                        )
-                    })))
-                }
-            });
+            return Ok(
+                match self.interpret_existing_receipt(
+                    &self.read_receipt_path(&path)?,
+                    request_id,
+                    operation,
+                    payload_hash,
+                    stamp,
+                )? {
+                    Ok(value) => MutationClaim::Replay(Ok(value)),
+                    Err(error) if error.code == ComputerErrorCode::Pending => {
+                        MutationClaim::Pending
+                    }
+                    Err(error) if error.code == ComputerErrorCode::UncertainOutcome => {
+                        MutationClaim::Uncertain
+                    }
+                    Err(error) => MutationClaim::Replay(Err(error)),
+                },
+            );
         }
         if count_json_files(&self.inner.root.join("receipts")).map_err(internal_error)?
             >= MAX_RECEIPTS
@@ -400,16 +440,71 @@ impl ComputerStore {
             updated_at: now,
             result: None,
             error: None,
+            schema_version: COMPUTER_RECEIPT_SCHEMA_VERSION,
             caller_kind: Some(stamp.kind().to_string()),
             caller_owner_session_id: stamp.owner_session_id(),
             caller_agent_id: stamp.agent_id(),
             caller_agent_spec_revision: stamp.agent_spec_revision(),
             run_id: stamp.run_id.clone(),
-            authority_epoch: Some(stamp.authority_epoch),
-            control_epoch: Some(stamp.control_epoch),
+            surface_id: stamp.surface_id.clone(),
+            incarnation: stamp.incarnation.clone(),
+            grant_id: stamp.grant_id.clone(),
+            frame_epoch: stamp.frame_epoch,
+            pre_authority_epoch: Some(stamp.pre_authority_epoch),
+            pre_control_epoch: Some(stamp.pre_control_epoch),
+            post_authority_epoch: None,
+            post_control_epoch: None,
         };
         write_json_exclusive(&path, &receipt).map_err(internal_error)?;
         Ok(MutationClaim::Perform)
+    }
+
+    fn interpret_existing_receipt(
+        &self,
+        receipt: &MutationReceipt,
+        request_id: &str,
+        operation: &str,
+        payload_hash: &str,
+        stamp: &MutationStamp,
+    ) -> ComputerResult<ComputerResult<serde_json::Value>> {
+        if !receipt_is_stamped(receipt) {
+            return Ok(Err(ComputerError::new(
+                ComputerErrorCode::UncertainOutcome,
+                "the earlier computer-use mutation has an uncertain outcome and will not be retried",
+            )));
+        }
+        if receipt.request_id != request_id
+            || receipt.operation != operation
+            || receipt.payload_hash != payload_hash
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "request id was reused with a different computer-use mutation",
+            ));
+        }
+        if !receipt_matches_stamp(receipt, stamp) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "idempotency receipt is not bound to this caller and run authority",
+            ));
+        }
+        Ok(match receipt.state {
+            ReceiptState::Claimed => Err(ComputerError::new(
+                ComputerErrorCode::Pending,
+                "an identical computer-use mutation is in progress",
+            )),
+            ReceiptState::Uncertain => Err(ComputerError::new(
+                ComputerErrorCode::UncertainOutcome,
+                "the earlier computer-use mutation has an uncertain outcome and will not be retried",
+            )),
+            ReceiptState::Succeeded => Ok(receipt.result.clone().unwrap_or(serde_json::Value::Null)),
+            ReceiptState::Failed => Err(receipt.error.clone().unwrap_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Internal,
+                    "stored mutation failed without an error",
+                )
+            })),
+        })
     }
 
     pub(crate) fn complete_mutation(
@@ -431,10 +526,34 @@ impl ComputerStore {
             Ok(value) => {
                 receipt.state = ReceiptState::Succeeded;
                 receipt.result = Some(value.clone());
+                if let Ok(run) = serde_json::from_value::<ComputerRun>(value.clone()) {
+                    receipt.run_id.get_or_insert(run.run_id.clone());
+                    if run.surface.is_issued() {
+                        receipt
+                            .surface_id
+                            .get_or_insert(run.surface.surface_id.clone());
+                        receipt
+                            .incarnation
+                            .get_or_insert(run.surface.incarnation.clone());
+                    }
+                    receipt.post_authority_epoch = Some(run.authority_epoch);
+                    receipt.post_control_epoch = Some(run.control_epoch);
+                } else if let Some(run_id) = receipt.run_id.clone() {
+                    if let Ok(Some(run)) = self.load_run_unlocked(&run_id) {
+                        receipt.post_authority_epoch = Some(run.authority_epoch);
+                        receipt.post_control_epoch = Some(run.control_epoch);
+                    }
+                }
             }
             Err(error) => {
                 receipt.state = ReceiptState::Failed;
                 receipt.error = Some(error.clone());
+                if let Some(run_id) = receipt.run_id.clone() {
+                    if let Ok(Some(run)) = self.load_run_unlocked(&run_id) {
+                        receipt.post_authority_epoch = Some(run.authority_epoch);
+                        receipt.post_control_epoch = Some(run.control_epoch);
+                    }
+                }
             }
         }
         atomic_write_json(&path, &receipt).map_err(internal_error)
@@ -445,7 +564,7 @@ impl ComputerStore {
         Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
     }
 
-    fn receipt_path(&self, request_id: &str) -> ComputerResult<PathBuf> {
+    pub(crate) fn receipt_path(&self, request_id: &str) -> ComputerResult<PathBuf> {
         let safe = safe_file_id(request_id)?;
         Ok(self
             .inner
@@ -578,7 +697,7 @@ impl ComputerStore {
 
     fn read_run_path(&self, path: &Path) -> ComputerResult<ComputerRun> {
         let mut run: ComputerRun = read_json(path).map_err(internal_error)?;
-        if migrate_run_record(&mut run) {
+        if migrate_run_record(&mut run)? {
             atomic_write_json(path, &run).map_err(internal_error)?;
         }
         validate_run_record(&run)?;
@@ -604,11 +723,12 @@ impl ComputerStore {
     }
 }
 
-fn migrate_run_record(run: &mut ComputerRun) -> bool {
+fn migrate_run_record(run: &mut ComputerRun) -> ComputerResult<bool> {
+    if run.schema_version != 0 && run.schema_version != COMPUTER_RUN_SCHEMA_VERSION {
+        return Err(invalid_record());
+    }
     let mut changed = false;
-    let unknown_schema =
-        run.schema_version != 0 && run.schema_version != COMPUTER_RUN_SCHEMA_VERSION;
-    let mut untrusted = run.schema_version == 0 || unknown_schema;
+    let mut untrusted = run.schema_version == 0;
 
     if run
         .initiating_principal
@@ -647,7 +767,7 @@ fn migrate_run_record(run: &mut ComputerRun) -> bool {
             run.capability_proof.tier(),
             crate::computer_use::ComputerCapabilityTier::IndependentlyIsolatedVisualInputDomain
                 | crate::computer_use::ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
-        ) && (run.schema_version == 0 || unknown_schema)
+        ) && run.schema_version == 0
     {
         if !matches!(
             run.capability_proof,
@@ -718,7 +838,7 @@ fn migrate_run_record(run: &mut ComputerRun) -> bool {
         run.schema_version = COMPUTER_RUN_SCHEMA_VERSION;
         changed = true;
     }
-    changed
+    Ok(changed)
 }
 
 fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
@@ -805,6 +925,7 @@ fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
             || observation.authority.freshness.incarnation != run.surface.incarnation
             || observation.authority.authority_epoch != run.authority_epoch
             || observation.authority.control_epoch != run.control_epoch
+            || observation.authority.target_generation != run.target.generation
         {
             return Err(invalid_record());
         }
@@ -866,9 +987,10 @@ fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
 }
 
 fn receipt_is_stamped(receipt: &MutationReceipt) -> bool {
-    receipt.caller_kind.is_some()
-        && receipt.authority_epoch.is_some()
-        && receipt.control_epoch.is_some()
+    receipt.schema_version == COMPUTER_RECEIPT_SCHEMA_VERSION
+        && receipt.caller_kind.is_some()
+        && receipt.pre_authority_epoch.is_some()
+        && receipt.pre_control_epoch.is_some()
 }
 
 fn receipt_matches_stamp(receipt: &MutationReceipt, stamp: &MutationStamp) -> bool {
@@ -877,12 +999,16 @@ fn receipt_matches_stamp(receipt: &MutationReceipt, stamp: &MutationStamp) -> bo
         && receipt.caller_agent_id == stamp.agent_id()
         && receipt.caller_agent_spec_revision == stamp.agent_spec_revision()
         && receipt.run_id == stamp.run_id
-        && receipt.authority_epoch == Some(stamp.authority_epoch)
-        && receipt.control_epoch == Some(stamp.control_epoch)
+        && receipt.surface_id == stamp.surface_id
+        && receipt.incarnation == stamp.incarnation
+        && receipt.grant_id == stamp.grant_id
 }
 
 fn validate_receipt(receipt: &MutationReceipt) -> ComputerResult<()> {
     validate_id("request_id", &receipt.request_id)?;
+    if receipt.schema_version != 0 && receipt.schema_version != COMPUTER_RECEIPT_SCHEMA_VERSION {
+        return Err(invalid_record());
+    }
     if receipt.operation.is_empty()
         || receipt.operation.len() > 64
         || receipt.payload_hash.len() != 64
@@ -907,6 +1033,34 @@ fn validate_receipt(receipt: &MutationReceipt) -> ComputerResult<()> {
             .is_some_and(|error| error.message.len() > 512)
     {
         return Err(invalid_record());
+    }
+    if receipt.schema_version == COMPUTER_RECEIPT_SCHEMA_VERSION {
+        if receipt.caller_kind.is_none()
+            || receipt.pre_authority_epoch.is_none()
+            || receipt.pre_control_epoch.is_none()
+        {
+            return Err(invalid_record());
+        }
+        if receipt.run_id.is_some()
+            && (receipt
+                .run_id
+                .as_deref()
+                .is_some_and(|run_id| validate_id("run_id", run_id).is_err())
+                || receipt
+                    .surface_id
+                    .as_deref()
+                    .is_some_and(|surface_id| validate_id("surface_id", surface_id).is_err())
+                || receipt
+                    .incarnation
+                    .as_deref()
+                    .is_some_and(|incarnation| validate_id("incarnation", incarnation).is_err())
+                || receipt
+                    .grant_id
+                    .as_deref()
+                    .is_some_and(|grant_id| validate_id("grant_id", grant_id).is_err()))
+        {
+            return Err(invalid_record());
+        }
     }
     Ok(())
 }
@@ -1318,30 +1472,6 @@ mod tests {
                 }),
             ),
             (
-                "unknown-schema",
-                serde_json::json!({
-                    "runId": "unknown-schema",
-                    "ownerSessionId": owner,
-                    "target": {
-                        "appId": "com.grokptah.demo",
-                        "windowId": "main",
-                        "generation": 1,
-                        "displayName": "Demo",
-                        "sensitivity": "none"
-                    },
-                    "state": "ready",
-                    "version": 1,
-                    "createdAt": now,
-                    "updatedAt": now,
-                    "limits": ComputerUseLimits::default(),
-                    "actionCount": 0,
-                    "evidenceBytes": 0,
-                    "audit": [],
-                    "schemaVersion": 99,
-                    "capabilityProof": { "kind": "unproven" }
-                }),
-            ),
-            (
                 "owner-mismatch-principal",
                 serde_json::json!({
                     "runId": "owner-mismatch-principal",
@@ -1498,6 +1628,83 @@ mod tests {
             let path = store.root().join("runs").join("oversized.json");
             let file = fs::File::create(path).unwrap();
             file.set_len(MAX_RECORD_BYTES + 1).unwrap();
+        }
+        assert!(ComputerStore::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn unknown_future_run_schema_fails_store_open_and_is_not_rewritten() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let persisted_path = {
+            let store = ComputerStore::open(dir.path()).unwrap();
+            let path = store.run_path("future-run").unwrap();
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "runId": "future-run",
+                    "ownerSessionId": Uuid::new_v4(),
+                    "target": {
+                        "appId": "com.grokptah.demo",
+                        "windowId": "main",
+                        "generation": 1,
+                        "displayName": "Demo",
+                        "sensitivity": "none"
+                    },
+                    "state": "ready",
+                    "version": 1,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "limits": ComputerUseLimits::default(),
+                    "actionCount": 0,
+                    "evidenceBytes": 0,
+                    "audit": [],
+                    "schemaVersion": 99,
+                    "capabilityProof": {
+                        "kind": "foreground_semantic",
+                        "backendId": "future_backend",
+                        "observe": true,
+                        "semanticActions": true,
+                        "textEntry": true
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            path
+        };
+        assert!(ComputerStore::open(dir.path()).is_err());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&persisted_path).unwrap()).unwrap();
+        assert_eq!(persisted["schemaVersion"], 99);
+        assert_eq!(persisted["capabilityProof"]["kind"], "foreground_semantic");
+    }
+
+    #[test]
+    fn unknown_future_receipt_schema_fails_store_open() {
+        let dir = tempdir().unwrap();
+        let payload_hash = "c".repeat(64);
+        {
+            let store = ComputerStore::open(dir.path()).unwrap();
+            let path = store.receipt_path("future-receipt").unwrap();
+            fs::write(
+                path,
+                serde_json::to_vec(&serde_json::json!({
+                    "requestId": "future-receipt",
+                    "operation": "act",
+                    "payloadHash": payload_hash,
+                    "state": "succeeded",
+                    "createdAt": Utc::now(),
+                    "updatedAt": Utc::now(),
+                    "result": {"ok": true},
+                    "schemaVersion": 99,
+                    "callerKind": "local_operator_session",
+                    "preAuthorityEpoch": 0,
+                    "preControlEpoch": 0
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         }
         assert!(ComputerStore::open(dir.path()).is_err());
     }

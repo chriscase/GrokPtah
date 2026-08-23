@@ -23,6 +23,7 @@ pub struct SimulatorBackend {
 struct SimulatorState {
     target: ComputerTarget,
     runs: BTreeMap<String, SimulatorRunState>,
+    mutations: u64,
 }
 
 #[derive(Debug, Default)]
@@ -30,6 +31,9 @@ struct SimulatorRunState {
     sequence: u64,
     name: String,
     submitted: bool,
+    content_generation: u64,
+    observed_content_generation: u64,
+    observed_sequence: u64,
 }
 
 impl Default for SimulatorBackend {
@@ -97,6 +101,7 @@ impl SimulatorBackend {
             state: Mutex::new(SimulatorState {
                 target: Self::demo_target(),
                 runs: BTreeMap::new(),
+                mutations: 0,
             }),
             proof,
             domain,
@@ -115,6 +120,18 @@ impl SimulatorBackend {
 
     pub fn submitted(&self) -> bool {
         self.state.lock().runs.values().any(|run| run.submitted)
+    }
+
+    /// Change application content without altering geometry or selected-element
+    /// shape. Host freshness ticks are not advanced; `act_if_current` must deny.
+    pub fn mutate_content_preserving_shape(&self, run_id: &str) {
+        let mut state = self.state.lock();
+        let run = state.runs.entry(run_id.into()).or_default();
+        run.content_generation = run.content_generation.saturating_add(1);
+    }
+
+    pub fn mutation_count(&self) -> u64 {
+        self.state.lock().mutations
     }
 }
 
@@ -145,6 +162,8 @@ impl ComputerBackend for SimulatorBackend {
         let target = state.target.clone();
         let run = state.runs.entry(run_id.into()).or_default();
         run.sequence = run.sequence.saturating_add(1);
+        run.observed_sequence = run.sequence;
+        run.observed_content_generation = run.content_generation;
         let name_id = format!("{observation_id}-name");
         let submit_id = format!("{observation_id}-submit");
         let status_id = format!("{observation_id}-status");
@@ -228,22 +247,57 @@ impl ComputerBackend for SimulatorBackend {
         action: &ComputerAction,
     ) -> ComputerResult<ActionOutcome> {
         let mut state = self.state.lock();
-        if observation.target != state.target {
-            return Err(ComputerError::new(
-                ComputerErrorCode::ForbiddenTarget,
-                "simulator action target is not authorized",
-            ));
-        }
+        simulator_dispatch(&mut state, &self.proof, run_id, observation, action, false)
+    }
+
+    async fn act_if_current(
+        &self,
+        run_id: &str,
+        observation: &ComputerObservation,
+        action: &ComputerAction,
+    ) -> ComputerResult<ActionOutcome> {
+        let mut state = self.state.lock();
+        simulator_dispatch(&mut state, &self.proof, run_id, observation, action, true)
+    }
+
+    async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
+        let _ = run_id;
+        Ok(())
+    }
+}
+
+fn simulator_dispatch(
+    state: &mut SimulatorState,
+    proof: &ComputerCapabilityProof,
+    run_id: &str,
+    observation: &ComputerObservation,
+    action: &ComputerAction,
+    require_current: bool,
+) -> ComputerResult<ActionOutcome> {
+    if observation.target != state.target {
+        return Err(ComputerError::new(
+            ComputerErrorCode::ForbiddenTarget,
+            "simulator action target is not authorized",
+        ));
+    }
+    let mutated = !matches!(action, ComputerAction::Wait { .. });
+    let outcome = {
         let run = state.runs.get_mut(run_id).ok_or_else(|| {
             ComputerError::new(
                 ComputerErrorCode::InvalidState,
                 "simulator run has not been observed",
             )
         })?;
-        if observation.sequence != run.sequence {
+        if observation.sequence != run.sequence || observation.sequence != run.observed_sequence {
             return Err(ComputerError::new(
                 ComputerErrorCode::StaleObservation,
                 "simulator action used a stale observation",
+            ));
+        }
+        if require_current && run.content_generation != run.observed_content_generation {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "simulator action is not attested against the current content generation",
             ));
         }
         match action {
@@ -251,7 +305,7 @@ impl ComputerBackend for SimulatorBackend {
                 if element_id == &format!("{}-name", observation.observation_id) =>
             {
                 run.name = text.clone();
-                Ok(ActionOutcome::bounded("set demo name", Some(true)))
+                ActionOutcome::bounded("set demo name", Some(true))
             }
             ComputerAction::Invoke { element_id }
                 if element_id == &format!("{}-submit", observation.observation_id) =>
@@ -263,38 +317,37 @@ impl ComputerBackend for SimulatorBackend {
                     ));
                 }
                 run.submitted = true;
-                Ok(ActionOutcome::bounded("submitted demo form", Some(true)))
+                ActionOutcome::bounded("submitted demo form", Some(true))
             }
-            ComputerAction::ActivateTarget if self.proof.tier().allows_activate_target() => Ok(
-                ActionOutcome::bounded("simulator action completed", Some(true)),
-            ),
-            ComputerAction::ActivateTarget => Err(ComputerError::new(
-                ComputerErrorCode::ForbiddenAction,
-                "background-safe simulator fixture cannot activate a target",
-            )),
-            ComputerAction::Wait { .. } => Ok(ActionOutcome::bounded(
-                "simulator action completed",
-                Some(true),
-            )),
-            ComputerAction::PointerClick { .. } | ComputerAction::KeyChord { .. }
-                if self.proof.is_simulator_only_isolation() =>
-            {
-                Ok(ActionOutcome::bounded(
-                    "simulator isolated fixture input",
-                    Some(true),
+            ComputerAction::ActivateTarget if proof.tier().allows_activate_target() => {
+                ActionOutcome::bounded("simulator action completed", Some(true))
+            }
+            ComputerAction::ActivateTarget => {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::ForbiddenAction,
+                    "background-safe simulator fixture cannot activate a target",
                 ))
             }
-            _ => Err(ComputerError::new(
-                ComputerErrorCode::ForbiddenAction,
-                "simulator does not support this action",
-            )),
+            ComputerAction::Wait { .. } => {
+                ActionOutcome::bounded("simulator action completed", Some(true))
+            }
+            ComputerAction::PointerClick { .. } | ComputerAction::KeyChord { .. }
+                if proof.is_simulator_only_isolation() =>
+            {
+                ActionOutcome::bounded("simulator isolated fixture input", Some(true))
+            }
+            _ => {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::ForbiddenAction,
+                    "simulator does not support this action",
+                ))
+            }
         }
+    };
+    if mutated {
+        state.mutations = state.mutations.saturating_add(1);
     }
-
-    async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
-        let _ = run_id;
-        Ok(())
-    }
+    Ok(outcome)
 }
 
 #[cfg(test)]

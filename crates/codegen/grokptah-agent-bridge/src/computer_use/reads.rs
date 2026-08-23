@@ -30,7 +30,9 @@ use super::types::{validate_id, ComputerResult, ComputerRun};
 /// The workspace is the exact durable binding string after the control-plane
 /// allowlist and session-cwd gate. Session-only [`super::service::ComputerUseService`]
 /// methods do not accept this type, so a coordinator surface cannot be wired
-/// to those methods without a type error.
+/// to those methods without a type error. Public construction is only from a
+/// host-issued [`crate::orchestration::ComputerReadGrant`]; MCP/UI arguments
+/// cannot mint a binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComputerReadBinding<'a> {
     owner_session_id: Uuid,
@@ -38,7 +40,20 @@ pub struct ComputerReadBinding<'a> {
 }
 
 impl<'a> ComputerReadBinding<'a> {
-    pub fn new(owner_session_id: Uuid, workspace: &'a str) -> Self {
+    /// Bind reads to an immutable credential grant. The grant is the only
+    /// Computer-read scope; caller-supplied session/workspace arguments must
+    /// already have been checked equal to this grant.
+    pub fn from_grant(grant: &'a crate::orchestration::ComputerReadGrant) -> Self {
+        Self {
+            owner_session_id: grant.session_id(),
+            workspace: grant.workspace(),
+        }
+    }
+
+    /// In-crate test constructor for synthetic workspace strings that need
+    /// not exist on disk. Production callers use [`Self::from_grant`].
+    #[cfg(test)]
+    pub(crate) fn new(owner_session_id: Uuid, workspace: &'a str) -> Self {
         Self {
             owner_session_id,
             workspace,

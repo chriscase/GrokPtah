@@ -5,8 +5,9 @@ use std::collections::BTreeSet;
 use chrono::{Duration, Utc};
 #[cfg(target_os = "macos")]
 use grokptah_agent_bridge::{
-    ActionClass, ActionGrant, ComputerAction, ComputerObservation, ComputerObservationPlatform,
-    ComputerRun, ComputerStore, ComputerUseLimits, ComputerUseService, MacOsObservationPlatform,
+    set_grokptah_home_override, ActionClass, ActionGrant, AgentHost, ComputerAction,
+    ComputerAuthorityToken, ComputerObservation, ComputerObservationPlatform, ComputerRun,
+    ComputerStore, ComputerUseLimits, ComputerUseService, HostConfig, MacOsObservationPlatform,
     SemanticAction,
 };
 #[cfg(target_os = "macos")]
@@ -40,6 +41,14 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("repository Computer Use demo window is not running"))?;
     let backend = platform.bind_target(&candidate.selection_token).await?;
     let temp = tempfile::tempdir()?;
+    set_grokptah_home_override(Some(temp.path().join(".grokptah")));
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start()?;
+    let session = host.session_new()?;
+    let caller = host.computer_operator_token(session.id)?;
     let service = ComputerUseService::new(
         backend,
         ComputerStore::open(temp.path().join("computer-use"))?,
@@ -48,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
     // than inventing a workspace from process cwd or the demo bundle path.
     let run = service.create_run(
         &Uuid::new_v4().to_string(),
-        Uuid::new_v4(),
+        &caller,
         None,
         candidate.target,
         ComputerUseLimits {
@@ -59,11 +68,11 @@ async fn main() -> anyhow::Result<()> {
         },
     )?;
 
-    let (ready, observation) = authorize_and_observe(&service, &run).await?;
+    let (ready, observation) = authorize_and_observe(&service, &run, &caller).await?;
     service
         .act(
             &Uuid::new_v4().to_string(),
-            &service.local_operator_token(ready.owner_session_id)?,
+            &caller,
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -72,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let paused = current_run(&service, &ready.run_id)?;
-    let (ready, observation) = authorize_and_observe(&service, &paused).await?;
+    let (ready, observation) = authorize_and_observe(&service, &paused, &caller).await?;
     let field = observation
         .elements
         .iter()
@@ -84,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     service
         .act(
             &Uuid::new_v4().to_string(),
-            &service.local_operator_token(ready.owner_session_id)?,
+            &caller,
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -96,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let paused = current_run(&service, &ready.run_id)?;
-    let (ready, observation) = authorize_and_observe(&service, &paused).await?;
+    let (ready, observation) = authorize_and_observe(&service, &paused, &caller).await?;
     let button = observation
         .elements
         .iter()
@@ -108,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     service
         .act(
             &Uuid::new_v4().to_string(),
-            &service.local_operator_token(ready.owner_session_id)?,
+            &caller,
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -119,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let paused = current_run(&service, &ready.run_id)?;
-    let (_ready, observation) = authorize_and_observe(&service, &paused).await?;
+    let (_ready, observation) = authorize_and_observe(&service, &paused, &caller).await?;
     let submitted = observation.elements.iter().any(|element| {
         element
             .label
@@ -141,11 +150,12 @@ async fn main() -> anyhow::Result<()> {
 async fn authorize_and_observe(
     service: &ComputerUseService,
     run: &ComputerRun,
+    caller: &ComputerAuthorityToken,
 ) -> anyhow::Result<(ComputerRun, ComputerObservation)> {
     let now = Utc::now();
     let authorized = service.authorize(
         &Uuid::new_v4().to_string(),
-        &service.local_operator_token(run.owner_session_id)?,
+        caller,
         &run.run_id,
         run.version,
         ActionGrant::for_run(
@@ -159,7 +169,7 @@ async fn authorize_and_observe(
     let observation = service
         .observe(
             &Uuid::new_v4().to_string(),
-            &service.local_operator_token(authorized.owner_session_id)?,
+            caller,
             &authorized.run_id,
             authorized.version,
         )

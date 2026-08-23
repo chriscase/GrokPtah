@@ -557,10 +557,7 @@ struct ReadinessSnapshot {
 fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
     let payload = state
         .orch
-        .get_capacity(&AuthContext {
-            token_id: "health-probe".into(),
-            owner_id: "health-probe".into(),
-        })
+        .get_capacity(&AuthContext::new("health-probe", "health-probe"))
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
     let ready = [
@@ -3654,8 +3651,8 @@ mod tests {
     use super::*;
     use crate::host::{AgentHost, HostConfig};
     use crate::orchestration::{
-        ContinuationCheckpoint, ContinuationReason, OrchErrorCode, OrchStore, OrchestrationConfig,
-        RunBounds, WorkspaceAllowlist,
+        AuthCredential, ContinuationCheckpoint, ContinuationReason, OrchErrorCode, OrchStore,
+        OrchestrationConfig, RunBounds, WorkspaceAllowlist,
     };
     use crate::{home_override_serial, set_grokptah_home_override};
     use chrono::Utc;
@@ -3847,8 +3844,8 @@ mod tests {
     }
 
     use crate::computer_use::{
-        canonical_workspace_string, ActionClass, ActionGrant, ComputerStore, ComputerUseService,
-        SimulatorBackend,
+        canonical_workspace_string, ActionClass, ActionGrant, ComputerAuthorityToken,
+        ComputerStore, ComputerUseService, SimulatorBackend,
     };
 
     struct ComputerFixture {
@@ -3865,8 +3862,9 @@ mod tests {
         })
     }
 
-    async fn call_tool(
+    async fn call_tool_as(
         fixture: &ComputerFixture,
+        token: &str,
         id: u64,
         name: &str,
         arguments: Value,
@@ -3874,7 +3872,7 @@ mod tests {
         let response = fixture
             .client
             .post(&fixture.url)
-            .header("Authorization", "Bearer computer-token")
+            .header("Authorization", format!("Bearer {token}"))
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -3886,6 +3884,32 @@ mod tests {
             .unwrap();
         let status = response.status();
         (status, response.json().await.unwrap())
+    }
+
+    async fn call_tool(
+        fixture: &ComputerFixture,
+        id: u64,
+        name: &str,
+        arguments: Value,
+    ) -> (reqwest::StatusCode, Value) {
+        call_tool_as(fixture, "computer-token", id, name, arguments).await
+    }
+
+    fn install_computer_read_grant(
+        orch: &OrchestrationService,
+        session_id: Uuid,
+        workspace: &std::path::Path,
+        extra: Vec<AuthCredential>,
+    ) {
+        let mut credentials = vec![AuthCredential::with_computer_read_grant(
+            "primary",
+            "computer-token",
+            session_id,
+            workspace,
+        )
+        .unwrap()];
+        credentials.extend(extra);
+        orch.set_auth_credentials(credentials).unwrap();
     }
 
     fn computer_orch(
@@ -3934,16 +3958,16 @@ mod tests {
         let run_a = computer
             .create_run(
                 "create-a",
-                session_a.id,
+                &ComputerAuthorityToken::local_operator(session_a.id).unwrap(),
                 Some(canon_a.clone()),
                 SimulatorBackend::demo_target(),
                 Default::default(),
             )
             .unwrap();
-        computer
+        let run_b = computer
             .create_run(
                 "create-b",
-                session_b.id,
+                &ComputerAuthorityToken::local_operator(session_b.id).unwrap(),
                 Some(canon_b.clone()),
                 SimulatorBackend::demo_target(),
                 Default::default(),
@@ -3952,7 +3976,7 @@ mod tests {
         let unbound = computer
             .create_run(
                 "create-unbound",
-                session_a.id,
+                &ComputerAuthorityToken::local_operator(session_a.id).unwrap(),
                 None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
@@ -3964,7 +3988,19 @@ mod tests {
             home.path(),
             vec![ws_a.path().to_path_buf(), ws_b.path().to_path_buf()],
         );
-        let srv = start_control_server(orch, 0).await.unwrap();
+        install_computer_read_grant(
+            &orch,
+            session_a.id,
+            ws_a.path(),
+            vec![AuthCredential::with_computer_read_grant(
+                "peer",
+                "computer-token-b",
+                session_b.id,
+                ws_b.path(),
+            )
+            .unwrap()],
+        );
+        let srv = start_control_server(orch.clone(), 0).await.unwrap();
         let fixture = ComputerFixture {
             url: format!("http://{}/mcp", srv.addr),
             srv,
@@ -4106,24 +4142,11 @@ mod tests {
         // Unknown run, another session's run, and an unbound run must produce
         // byte-identical error responses, or the read is an existence oracle.
         let mut error_bodies = Vec::new();
-        for run_id in ["no-such-run", "create-b-run", &unbound.run_id] {
-            let run_id = if run_id == "create-b-run" {
-                // A real run owned by session_b, probed through session_a's scope.
-                let listed = call_tool(
-                    &fixture,
-                    90,
-                    "ptah_list_computer_runs",
-                    json!({"session_id": session_b.id, "workspace": ws_b.path()}),
-                )
-                .await
-                .1;
-                listed["result"]["structuredContent"]["runs"][0]["runId"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
-            } else {
-                run_id.to_string()
-            };
+        for run_id in [
+            "no-such-run",
+            run_b.run_id.as_str(),
+            unbound.run_id.as_str(),
+        ] {
             let (status, body) = call_tool(
                 &fixture,
                 7,
@@ -4255,6 +4278,58 @@ mod tests {
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
+        // Two valid bearers with disjoint Computer-read grants cannot read
+        // one another's known run IDs. Legacy unscoped credentials have no
+        // Computer-read authority even with the correct session/workspace.
+        let (status, peer_cross) = call_tool_as(
+            &fixture,
+            "computer-token-b",
+            7,
+            "ptah_get_computer_run",
+            json!({
+                "session_id": session_a.id,
+                "workspace": ws_a.path(),
+                "run_id": run_a.run_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(peer_cross, error_bodies[0]);
+        let (status, peer_own) = call_tool_as(
+            &fixture,
+            "computer-token-b",
+            21,
+            "ptah_get_computer_run",
+            json!({
+                "session_id": session_b.id,
+                "workspace": ws_b.path(),
+                "run_id": run_b.run_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            peer_own["result"]["structuredContent"]["runId"],
+            run_b.run_id.as_str()
+        );
+        orch.set_auth_credentials(vec![
+            AuthCredential::new("primary", "computer-token").unwrap()
+        ])
+        .unwrap();
+        let (status, unscoped) = call_tool(
+            &fixture,
+            7,
+            "ptah_get_computer_run",
+            json!({
+                "session_id": session_a.id,
+                "workspace": ws_a.path(),
+                "run_id": run_a.run_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(unscoped, error_bodies[0]);
+
         fixture.srv.stop();
         set_grokptah_home_override(None);
     }
@@ -4281,7 +4356,7 @@ mod tests {
         let run = computer
             .create_run(
                 "create-ring",
-                session.id,
+                &ComputerAuthorityToken::local_operator(session.id).unwrap(),
                 Some(canon),
                 SimulatorBackend::demo_target(),
                 Default::default(),
@@ -4299,6 +4374,7 @@ mod tests {
             .unwrap();
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
+        install_computer_read_grant(&orch, session.id, ws.path(), Vec::new());
         let srv = start_control_server(orch, 0).await.unwrap();
         let fixture = ComputerFixture {
             url: format!("http://{}/mcp", srv.addr),
@@ -4387,7 +4463,7 @@ mod tests {
             let run = computer
                 .create_run(
                     "create-restart",
-                    session.id,
+                    &ComputerAuthorityToken::local_operator(session.id).unwrap(),
                     Some(canon.clone()),
                     SimulatorBackend::demo_target(),
                     Default::default(),
@@ -4398,7 +4474,7 @@ mod tests {
             computer
                 .authorize(
                     "grant-restart",
-                    &computer.local_operator_token(run.owner_session_id).unwrap(),
+                    &ComputerAuthorityToken::local_operator(run.owner_session_id).unwrap(),
                     &run.run_id,
                     run.version,
                     ActionGrant::for_run(
@@ -4413,6 +4489,7 @@ mod tests {
         }
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
+        install_computer_read_grant(&orch, session.id, ws.path(), Vec::new());
         let srv = start_control_server(orch, 0).await.unwrap();
         let fixture = ComputerFixture {
             url: format!("http://{}/mcp", srv.addr),

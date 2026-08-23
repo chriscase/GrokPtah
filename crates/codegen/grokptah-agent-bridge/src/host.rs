@@ -3101,6 +3101,31 @@ impl AgentHostHandle {
         Ok(())
     }
 
+    /// Host-owned Computer Use local-operator issuance. Resolves a live
+    /// foreground Lane without promoting workspace chrome. Arbitrary,
+    /// inactive, or background session IDs fail closed; raw
+    /// `ComputerUseService` callers cannot mint this token.
+    pub fn computer_operator_token(
+        &self,
+        session_id: Uuid,
+    ) -> Result<crate::computer_use::ComputerAuthorityToken> {
+        {
+            let g = self.inner.lock();
+            let session = g
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session cannot issue Computer Use authority"))?;
+            if session.archived {
+                bail!("inactive Lane cannot issue Computer Use authority; restore it first");
+            }
+            if g.active_session != Some(session_id) {
+                bail!("background Lane cannot issue Computer Use authority; focus the Lane first");
+            }
+        }
+        crate::computer_use::ComputerAuthorityToken::local_operator(session_id)
+            .map_err(|error| anyhow!(error))
+    }
+
     /// Full transcript for hydrating a session tab (loads JSONL on demand).
     pub fn session_transcript(&self, id: Uuid) -> Result<Vec<TranscriptEntry>> {
         self.ensure_transcript_loaded(id)?;
@@ -11187,6 +11212,48 @@ mod computer_agent_host_tests {
             .expect("model change should release the old reservation");
         host.stop().unwrap();
         assert!(restarted_token.is_cancelled());
+
+        drop(host);
+        crate::set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn computer_operator_token_requires_a_live_foreground_lane() {
+        let _serial = crate::home_override_serial();
+        let home = tempfile::tempdir().unwrap();
+        crate::set_grokptah_home_override(Some(home.path().to_path_buf()));
+
+        let host = AgentHost::create(HostConfig::default());
+        host.start().unwrap();
+        let arbitrary = host.computer_operator_token(Uuid::new_v4()).unwrap_err();
+        assert!(
+            arbitrary.to_string().contains("unknown session"),
+            "arbitrary UUID minting must fail: {arbitrary}"
+        );
+
+        let first = host.session_new().unwrap();
+        let second = host.session_new().unwrap();
+        let background = host.computer_operator_token(first.id).unwrap_err();
+        assert!(
+            background.to_string().contains("background"),
+            "background Lane minting must fail: {background}"
+        );
+
+        host.session_archive(second.id, true).unwrap();
+        let inactive = host.computer_operator_token(second.id).unwrap_err();
+        assert!(
+            inactive.to_string().contains("inactive"),
+            "inactive Lane minting must fail: {inactive}"
+        );
+
+        host.session_load(first.id).unwrap();
+        assert!(host.computer_operator_token(first.id).is_ok());
+        host.session_archive(first.id, true).unwrap();
+        let archived_live = host.computer_operator_token(first.id).unwrap_err();
+        assert!(
+            archived_live.to_string().contains("inactive"),
+            "archiving the live Lane must fail closed: {archived_live}"
+        );
 
         drop(host);
         crate::set_grokptah_home_override(None);

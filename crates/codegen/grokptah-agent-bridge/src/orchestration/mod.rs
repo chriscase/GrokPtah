@@ -17,7 +17,7 @@ mod workload;
 
 pub use authz::{
     authenticate_bearer, canonical_workspace, constant_time_eq, require_bearer, AuthContext,
-    AuthCredential, WorkspaceAllowlist,
+    AuthCredential, ComputerReadGrant, WorkspaceAllowlist,
 };
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,

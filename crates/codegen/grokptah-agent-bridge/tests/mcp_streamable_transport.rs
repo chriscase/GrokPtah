@@ -15,8 +15,8 @@ use grokptah_agent_bridge::orchestration::{
 use grokptah_agent_bridge::{
     canonical_workspace_string, set_grokptah_home_override, start_control_from_env,
     start_control_server, start_control_server_with, ActionClass, ActionGrant, AgentHost,
-    ComputerRun, ComputerUseService, ControlServerLimits, HostConfig, McpControlClient,
-    SessionKind, SimulatorBackend, CONTROL_TOOLS,
+    AuthCredential, ComputerRun, ComputerUseService, ControlServerLimits, HostConfig,
+    McpControlClient, SessionKind, SimulatorBackend, CONTROL_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -2236,10 +2236,12 @@ async fn live_computer_reads_node_smoke() {
     );
 
     // Run A: bound, authorized, observed — projection metadata plus journal.
+    host.session_load(session.id).unwrap();
+    let caller_a = host.computer_operator_token(session.id).unwrap();
     let run_a = computer
         .create_run(
             "smoke-create-a",
-            session.id,
+            &caller_a,
             Some(canon.clone()),
             SimulatorBackend::demo_target(),
             Default::default(),
@@ -2248,31 +2250,24 @@ async fn live_computer_reads_node_smoke() {
     let run_a = computer
         .authorize(
             "smoke-grant-a",
-            &computer
-                .local_operator_token(run_a.owner_session_id)
-                .unwrap(),
+            &caller_a,
             &run_a.run_id,
             run_a.version,
             smoke_grant(&run_a),
         )
         .unwrap();
     computer
-        .observe(
-            "smoke-observe-a",
-            &computer
-                .local_operator_token(run_a.owner_session_id)
-                .unwrap(),
-            &run_a.run_id,
-            run_a.version,
-        )
+        .observe("smoke-observe-a", &caller_a, &run_a.run_id, run_a.version)
         .await
         .unwrap();
 
     // Run B: another session's run in another workspace — the rejection target.
+    host.session_load(other_session.id).unwrap();
+    let caller_b = host.computer_operator_token(other_session.id).unwrap();
     let run_b = computer
         .create_run(
             "smoke-create-b",
-            other_session.id,
+            &caller_b,
             Some(canon_other),
             SimulatorBackend::demo_target(),
             Default::default(),
@@ -2281,10 +2276,12 @@ async fn live_computer_reads_node_smoke() {
 
     // Run C: journal driven past the bounded ring so an early cursor is
     // genuinely evicted on the wire, using only public service operations.
+    host.session_load(session.id).unwrap();
+    let caller_a = host.computer_operator_token(session.id).unwrap();
     let run_c = computer
         .create_run(
             "smoke-create-c",
-            session.id,
+            &caller_a,
             Some(canon.clone()),
             SimulatorBackend::demo_target(),
             Default::default(),
@@ -2293,9 +2290,7 @@ async fn live_computer_reads_node_smoke() {
     let run_c = computer
         .authorize(
             "smoke-grant-c",
-            &computer
-                .local_operator_token(run_c.owner_session_id)
-                .unwrap(),
+            &caller_a,
             &run_c.run_id,
             run_c.version,
             smoke_grant(&run_c),
@@ -2307,9 +2302,7 @@ async fn live_computer_reads_node_smoke() {
         computer
             .observe(
                 &format!("smoke-observe-c-{spins}"),
-                &computer
-                    .local_operator_token(run_c.owner_session_id)
-                    .unwrap(),
+                &caller_a,
                 &run_c.run_id,
                 version,
             )
@@ -2343,6 +2336,15 @@ async fn live_computer_reads_node_smoke() {
         .await
         .expect("desktop env bootstrap must start control server");
     assert!(srv.addr.ip().is_loopback());
+    srv.orchestration_service()
+        .set_auth_credentials(vec![AuthCredential::with_computer_read_grant(
+            "primary",
+            &token,
+            session.id,
+            ws.path(),
+        )
+        .unwrap()])
+        .unwrap();
 
     let url = format!("http://{}/mcp", srv.addr);
     let sdk_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_sdk_interop");

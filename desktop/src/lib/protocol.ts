@@ -1035,7 +1035,7 @@ export type ComputerControlDisposition =
  * outside observer about run state, control disposition, or epoch.
  *
  * Observed element labels, values, and evidence tokens are deliberately
- * absent — those stay on `ComputerRun`, which is local-only. Action summary
+ * absent — those stay on the local approval DTO. Action summary
  * text and error messages are likewise local-only; the projection carries
  * only structured last-outcome / last-error summaries.
  */
@@ -1099,20 +1099,64 @@ export interface ComputerRunProjection {
   eventRange?: { startSeq: number; endSeq: number } | null;
 }
 
+export interface ComputerBackendPublicView {
+  backendId: string;
+  observe: boolean;
+  semanticActions: boolean;
+  textEntry: boolean;
+  keyChords: boolean;
+  pointerFallback: boolean;
+}
+
+export interface ComputerLocalElement {
+  elementId: string;
+  role: string;
+  label?: string | null;
+  value?: string | null;
+  enabled: boolean;
+  actions: string[];
+}
+
+export interface ComputerLocalObservation {
+  observationId: string;
+  sequence: number;
+  capturedAt: string;
+  elements: ComputerLocalElement[];
+}
+
+export interface ComputerLocalApproval {
+  runId: string;
+  state: string;
+  version: number;
+  actionCount: number;
+  limits: { maxActions: number };
+  controlDisposition: ComputerControlDisposition | string;
+  target: { appId: string; displayName: string };
+  observation?: ComputerLocalObservation | null;
+  grant?: {
+    expiresAt: string;
+    revokedAt?: string | null;
+    actionClasses: string[];
+  } | null;
+  audit: Array<{
+    sequence: number;
+    at: string;
+    operation: string;
+    disposition: string;
+    actionClass?: string | null;
+    observationId?: string | null;
+    errorCode?: string | null;
+  }>;
+  lastError?: { code: string } | null;
+}
+
 export interface ComputerCockpitSnapshot {
-  backend: {
-    backendId: string;
-    observe: boolean;
-    semanticActions: boolean;
-    textEntry: boolean;
-    keyChords: boolean;
-    pointerFallback: boolean;
-  };
+  backend: ComputerBackendPublicView;
   origin: "desktop" | "mcp" | string;
-  /** Authoritative projection; prefer this over `run` for status rendering. */
+  /** Authoritative projection; prefer this over `local` for status rendering. */
   projection?: ComputerRunProjection | null;
-  /** Local-only detail retained for approval rendering. */
-  run?: ComputerRun | null;
+  /** Allowlisted local approval/observation DTO. */
+  local?: ComputerLocalApproval | null;
   pendingApproval?: PendingComputerApproval | null;
 }
 
