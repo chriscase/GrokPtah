@@ -911,10 +911,17 @@ fn interrupted_run_with_retry_allowed_requeues_without_resuming() {
     let claim = store
         .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
         .unwrap();
+    let run = run_for_intent(
+        "intent-retry-safe",
+        session,
+        "/tmp/ws",
+        RunState::Interrupted,
+    );
+    store.save_run(&run).unwrap();
     let mut intent = claiming_intent(
         &item,
         Some(claim.attempt.attempt_id.clone()),
-        Some("run-int".into()),
+        Some(run.run_id.clone()),
         session,
     );
     intent.state = ManagedIntentState::Admitted;
@@ -947,6 +954,50 @@ fn interrupted_run_with_retry_allowed_requeues_without_resuming() {
         work.attempt_count + 1,
         ManagedRetryCause::Interrupted
     ));
+    assert!(store
+        .list_provider_attempts_for_run(&run.run_id)
+        .unwrap()
+        .attempts
+        .is_empty());
+}
+
+#[test]
+fn retryable_managed_intent_with_missing_run_fails_closed() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+    enable_managed(&store, "worker-a", true);
+    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    store.save_work_item(&item).unwrap();
+    let claim = store
+        .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+        .unwrap();
+    let mut intent = claiming_intent(
+        &item,
+        Some(claim.attempt.attempt_id),
+        Some("missing-managed-run".into()),
+        session,
+    );
+    intent.state = ManagedIntentState::Admitted;
+    store.save_managed_intent(&intent).unwrap();
+    store
+        .close_managed_attempt(
+            &intent.intent_id,
+            true,
+            ManagedRetryCause::Interrupted,
+            "interrupted",
+            Utc::now(),
+        )
+        .unwrap();
+    let work = store.load_work_item(&item.work_id).unwrap().unwrap();
+    assert_eq!(work.state, WorkState::Blocked);
+    assert!(work
+        .blocked_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("explicit new logical run")));
 }
 
 #[test]

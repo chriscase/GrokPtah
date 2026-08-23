@@ -265,6 +265,10 @@ pub enum ManagedFinalizationOutcome {
     AwaitingApproval,
     Failed,
     RetryQueued,
+    /// The physical provider dispatch may have been accepted and therefore
+    /// cannot be repeated by the managed retry loop. The Work remains
+    /// non-claimable until an operator creates a fresh logical invocation.
+    Parked,
     Cancelled,
 }
 
