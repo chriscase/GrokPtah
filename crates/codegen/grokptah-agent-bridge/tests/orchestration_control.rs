@@ -12,8 +12,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    hash_payload, AgentModelSpec, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
+    hash_payload, AgentModelSpec, AuthCredential, OrchErrorCode, OrchStore, OrchestrationConfig,
+    OrchestrationService, RunBounds, RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     discovered_tool_names, model_selection_key, set_grokptah_home_override, start_control_server,
@@ -1040,6 +1040,144 @@ fn get_run_scoped_matches_symlinked_and_canonical_workspace() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn unknown_and_foreign_runs_are_indistinguishable_before_idempotency_claim() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let allowed = tempdir().unwrap();
+    let foreign = tempdir().unwrap();
+    let allowed_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(allowed_session.id, allowed.path())
+        .unwrap();
+    let foreign_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(foreign_session.id, foreign.path())
+        .unwrap();
+
+    let store = OrchStore::open(home.path().join("orch")).unwrap();
+    let orch = OrchestrationService::new(
+        host,
+        EventBus::new(64),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "primary-secret".into(),
+            allowlist: WorkspaceAllowlist::new([
+                allowed.path().to_path_buf(),
+                foreign.path().to_path_buf(),
+            ]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    orch.set_auth_credentials(vec![AuthCredential::new("primary", "primary-secret")
+        .unwrap()
+        .with_workspace_roots([allowed.path().to_path_buf()])
+        .unwrap()])
+        .unwrap();
+    let auth = orch.auth_header(Some("Bearer primary-secret")).unwrap();
+
+    let now = Utc::now();
+    let foreign_run = RunRecord {
+        run_id: "foreign-run-existence-oracle".into(),
+        session_id: foreign_session.id,
+        workspace: foreign.path().display().to_string(),
+        request_id: "foreign-run-request".into(),
+        client_id: Some("foreign-client".into()),
+        state: RunState::Running,
+        purpose: Default::default(),
+        provider_route: None,
+        agent_id: None,
+        retry_of: None,
+        parent_run_id: None,
+        agent_spec_revision: None,
+        checkpoint_id: None,
+        continuation_context_id: None,
+        continuation_context_hash: None,
+        continuation_fidelity: None,
+        queue_position: None,
+        bounds: RunBounds::default(),
+        prompt_preview: "foreign".into(),
+        start_seq: None,
+        end_seq: None,
+        created_at: now,
+        updated_at: now,
+        terminal_result: None,
+        final_response: None,
+        error_code: None,
+        stop_cause: None,
+        aggregates: Default::default(),
+        progress: None,
+        execution: None,
+        approval: None,
+    };
+    store.save_run(&foreign_run).unwrap();
+
+    let unknown = orch.get_run(&auth, "unknown-run-oracle").unwrap_err();
+    let out_of_grant = orch.get_run(&auth, &foreign_run.run_id).unwrap_err();
+    assert_eq!(unknown.code, OrchErrorCode::ForbiddenScope);
+    assert_eq!(out_of_grant.code, unknown.code);
+    assert_eq!(out_of_grant.message, unknown.message);
+
+    let scoped_unknown = orch
+        .get_run_scoped(
+            &auth,
+            allowed_session.id,
+            allowed.path(),
+            "unknown-run-oracle",
+        )
+        .unwrap_err();
+    let scoped_foreign = orch
+        .get_run_scoped(
+            &auth,
+            allowed_session.id,
+            allowed.path(),
+            &foreign_run.run_id,
+        )
+        .unwrap_err();
+    assert_eq!(scoped_unknown.code, OrchErrorCode::ForbiddenScope);
+    assert_eq!(scoped_foreign.code, scoped_unknown.code);
+    assert_eq!(scoped_foreign.message, scoped_unknown.message);
+
+    let cancel_unknown = orch
+        .cancel(
+            &auth,
+            "cancel-unknown-run",
+            allowed_session.id,
+            allowed.path(),
+            Some("unknown-run-oracle"),
+        )
+        .await
+        .unwrap_err();
+    let cancel_foreign = orch
+        .cancel(
+            &auth,
+            "cancel-foreign-run",
+            allowed_session.id,
+            allowed.path(),
+            Some(&foreign_run.run_id),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(cancel_unknown.code, OrchErrorCode::ForbiddenScope);
+    assert_eq!(cancel_foreign.code, cancel_unknown.code);
+    assert_eq!(cancel_foreign.message, cancel_unknown.message);
+    assert!(
+        store
+            .load_idempotency("cancel-unknown-run")
+            .unwrap()
+            .is_none(),
+        "unknown run refusal must precede the idempotency claim"
+    );
+    assert!(
+        store
+            .load_idempotency("cancel-foreign-run")
+            .unwrap()
+            .is_none(),
+        "foreign run refusal must precede the idempotency claim"
+    );
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn missing_session_workspace_is_not_controllable() {
     let (home, _lock) = setup_home();
     let host = started_host();
@@ -1394,9 +1532,35 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
         .unwrap();
     assert_eq!(unauth.status(), 401);
 
+    let initialized = client
+        .post(&url)
+        .header("Authorization", "Bearer secret-196")
+        .json(&json!({
+            "jsonrpc":"2.0",
+            "id":"initialize",
+            "method":"initialize",
+            "params":{
+                "protocolVersion":"2025-03-26",
+                "capabilities":{},
+                "clientInfo":{"name":"orchestration-control-test","version":"1"}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(initialized.status(), 200);
+    let mcp_session_id = initialized
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
     let list = client
         .post(&url)
         .header("Authorization", "Bearer secret-196")
+        .header("mcp-session-id", &mcp_session_id)
         .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ptah_list_sessions","arguments":{}}}))
         .send()
         .await
@@ -1407,6 +1571,7 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
     let q = client
         .post(&url)
         .header("Authorization", "Bearer secret-196")
+        .header("mcp-session-id", &mcp_session_id)
         .json(&json!({
             "jsonrpc":"2.0","id":3,"method":"tools/call",
             "params":{"name":"ptah_queue_prompt","arguments":{
@@ -1431,6 +1596,7 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
     let bad_ws = client
         .post(&url)
         .header("Authorization", "Bearer secret-196")
+        .header("mcp-session-id", &mcp_session_id)
         .json(&json!({
             "jsonrpc":"2.0","id":4,"method":"tools/call",
             "params":{"name":"ptah_queue_prompt","arguments":{

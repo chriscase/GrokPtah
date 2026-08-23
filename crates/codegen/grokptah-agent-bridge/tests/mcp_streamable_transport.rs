@@ -56,6 +56,15 @@ fn setup() -> (
     (home, guard, host, ws, orch)
 }
 
+async fn initialized_session(addr: std::net::SocketAddr) -> String {
+    let mut client = McpControlClient::new(format!("http://{addr}"), "stream-token-200");
+    client.initialize().await.unwrap();
+    client
+        .session_id()
+        .expect("initialize must bind the transport session")
+        .to_string()
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn streamable_compat_client_session_and_tools() {
@@ -764,6 +773,7 @@ async fn concurrency_cap_returns_429() {
         .unwrap();
     let url = format!("http://{}/mcp", srv.addr);
     let http = reqwest::Client::new();
+    let mcp_session = initialized_session(srv.addr).await;
     let body = json!({
         "jsonrpc":"2.0","id":1,"method":"tools/list","params":{}
     });
@@ -772,9 +782,11 @@ async fn concurrency_cap_returns_429() {
         let http = http.clone();
         let url = url.clone();
         let body = body.clone();
+        let mcp_session = mcp_session.clone();
         tokio::spawn(async move {
             http.post(&url)
                 .header("Authorization", "Bearer stream-token-200")
+                .header("mcp-session-id", &mcp_session)
                 .header("Content-Type", "application/json")
                 .json(&body)
                 .send()
@@ -785,9 +797,11 @@ async fn concurrency_cap_returns_429() {
         let http = http.clone();
         let url = url.clone();
         let body = body.clone();
+        let mcp_session = mcp_session.clone();
         tokio::spawn(async move {
             http.post(&url)
                 .header("Authorization", "Bearer stream-token-200")
+                .header("mcp-session-id", &mcp_session)
                 .header("Content-Type", "application/json")
                 .json(&body)
                 .send()
@@ -800,6 +814,7 @@ async fn concurrency_cap_returns_429() {
     let overflow = http
         .post(&url)
         .header("Authorization", "Bearer stream-token-200")
+        .header("mcp-session-id", &mcp_session)
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -834,9 +849,11 @@ async fn request_timeout_returns_error() {
         .await
         .unwrap();
     let url = format!("http://{}/mcp", srv.addr);
+    let mcp_session = initialized_session(srv.addr).await;
     let resp = reqwest::Client::new()
         .post(&url)
         .header("Authorization", "Bearer stream-token-200")
+        .header("mcp-session-id", mcp_session)
         .header("Content-Type", "application/json")
         .json(&json!({
             "jsonrpc":"2.0","id":42,"method":"tools/list","params":{}
@@ -872,6 +889,7 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
     let srv = start_control_server(orch.clone(), 0).await.unwrap();
     let url = format!("http://{}/mcp", srv.addr);
     let http = reqwest::Client::new();
+    let mcp_session = initialized_session(srv.addr).await;
     for (name, expect_fragment) in [
         ("run_terminal_cmd", "not available"),
         ("ptah_shell", "not available"),
@@ -881,6 +899,7 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
         let resp = http
             .post(&url)
             .header("Authorization", "Bearer stream-token-200")
+            .header("mcp-session-id", &mcp_session)
             .header("Content-Type", "application/json")
             .json(&json!({
                 "jsonrpc":"2.0","id":7,"method":"tools/call",

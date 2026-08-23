@@ -439,6 +439,9 @@ impl McpControlClient {
         if with_auth {
             req = req.header("Authorization", format!("Bearer {}", self.token));
         }
+        if let Some(session_id) = &self.session_id {
+            req = req.header("mcp-session-id", session_id);
+        }
         bounded_non_streaming(self.operation_timeout, async move {
             let resp = req.send().await.map_err(|_| McpTransportError)?;
             let status = resp.status();

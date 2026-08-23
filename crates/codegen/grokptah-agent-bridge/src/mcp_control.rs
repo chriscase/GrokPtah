@@ -623,24 +623,17 @@ async fn streamable_get_handler(
     Query(query): Query<LiveRunQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if session_id.is_empty() || !state.sessions.lock().contains_key(session_id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32600,
-                    "message": "missing or unknown mcp-session-id",
-                    "data": {"code": "unknown_session"}
-                }
-            })),
-        )
-            .into_response();
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let auth = match state.orch.auth_header(auth_header) {
+        Ok(auth) => auth,
+        Err(error) => return json_err(None, StatusCode::UNAUTHORIZED, &error),
+    };
+    if let Err(error) = require_bound_session(&state, &headers, &auth) {
+        return json_err(None, status_for(&error), &error);
     }
+    let session_id = session_id_from_headers(&headers).expect("bound session checked above");
 
     let no_scope =
         query.session_id.is_none() && query.workspace.is_none() && query.run_id.is_none();
@@ -677,13 +670,6 @@ async fn streamable_get_handler(
     let session_scope = query.session_id.expect("checked above");
     let workspace = query.workspace.expect("checked above");
     let run_id = query.run_id.expect("checked above");
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    let auth = match state.orch.auth_header(auth_header) {
-        Ok(auth) => auth,
-        Err(error) => return json_err(None, StatusCode::UNAUTHORIZED, &error),
-    };
     let last_seq = match headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -759,21 +745,25 @@ async fn streamable_get_handler(
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
         .header(axum::http::header::CACHE_CONTROL, "no-cache")
-        .header("mcp-session-id", session_id)
+        .header("mcp-session-id", &session_id)
         .header(axum::http::header::CONNECTION, "keep-alive")
         .body(axum::body::Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn streamable_delete_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if session_id.is_empty() {
-        return StatusCode::BAD_REQUEST.into_response();
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let auth = match state.orch.auth_header(auth_header) {
+        Ok(auth) => auth,
+        Err(error) => return json_err(None, StatusCode::UNAUTHORIZED, &error),
+    };
+    if let Err(error) = require_bound_session(&state, &headers, &auth) {
+        return json_err(None, status_for(&error), &error);
     }
-    state.sessions.lock().remove(session_id);
+    let session_id = session_id_from_headers(&headers).expect("bound session checked above");
+    state.sessions.lock().remove(&session_id);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1582,11 +1572,19 @@ async fn streamable_post_handler(
     // Notifications may omit id.
     let is_notification = req.id.is_none() && method.starts_with("notifications/");
 
+    if method != "initialize" {
+        if let Err(error) = require_bound_session(&state, &headers, &auth) {
+            return json_err(req.id.clone(), status_for(&error), &error);
+        }
+    }
+
     let work_delay = state.inject_work_delay;
     let work = async {
         // Test hook: hold the concurrency permit / trip request timeout without
         // waiting on production 120s or inventing a fake tool.
-        if let Some(delay) = work_delay {
+        if let Some(delay) =
+            work_delay.filter(|_| method != "initialize" && method != "notifications/initialized")
+        {
             tokio::time::sleep(delay).await;
         }
         match method {
@@ -1596,12 +1594,8 @@ async fn streamable_post_handler(
                 Ok((json!({}), None::<String>))
             }
             "ping" => Ok((json!({}), session_id_from_headers(&headers))),
-            "tools/list" => {
-                require_session_if_present(&state, &headers, &auth)?;
-                Ok((tools_list_result(&auth), session_id_from_headers(&headers)))
-            }
+            "tools/list" => Ok((tools_list_result(&auth), session_id_from_headers(&headers))),
             "tools/call" => {
-                require_session_if_present(&state, &headers, &auth)?;
                 let v = tools_call(&state.orch, &auth, &req.params).await?;
                 Ok((v, session_id_from_headers(&headers)))
             }
@@ -1677,7 +1671,7 @@ fn touch_session(
     headers: &HeaderMap,
     auth: &AuthContext,
 ) -> Result<(), OrchError> {
-    require_session_if_present(state, headers, auth)?;
+    require_bound_session(state, headers, auth)?;
     if let Some(sid) = session_id_from_headers(headers) {
         let mut sessions = state.sessions.lock();
         let session = sessions.get_mut(&sid).ok_or_else(|| {
@@ -1688,15 +1682,17 @@ fn touch_session(
     Ok(())
 }
 
-fn require_session_if_present(
+fn require_bound_session(
     state: &AppState,
     headers: &HeaderMap,
     auth: &AuthContext,
 ) -> Result<(), OrchError> {
-    // Stateless clients (legacy McpControlClient) may omit session id.
-    let Some(sid) = session_id_from_headers(headers) else {
-        return Ok(());
-    };
+    let sid = session_id_from_headers(headers).ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::UnknownSession,
+            "a bound mcp-session-id is required after initialize",
+        )
+    })?;
     let mut g = state.sessions.lock();
     let Some(s) = g.get_mut(&sid) else {
         return Err(OrchError::new(
@@ -3774,6 +3770,38 @@ mod tests {
     use chrono::Utc;
     use tempfile::tempdir;
 
+    async fn initialize_test_session(
+        client: &reqwest::Client,
+        url: &str,
+        token: &str,
+        id: u64,
+    ) -> String {
+        let response = client
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": DEFAULT_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "bridge-test", "version": "1"}
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get("mcp-session-id")
+            .expect("initialize must return a bound session")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn e2e_loopback_auth_and_read() {
@@ -3825,10 +3853,12 @@ mod tests {
         );
 
         // valid token
+        let session_id = initialize_test_session(&client, &base, "test-token-196", 2).await;
         let good = client
             .post(&base)
             .header("Authorization", "Bearer test-token-196")
-            .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+            .header("mcp-session-id", session_id)
+            .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}))
             .send()
             .await
             .unwrap();
@@ -4102,6 +4132,94 @@ mod tests {
             .unwrap();
         assert_eq!(swapped.status(), StatusCode::UNAUTHORIZED);
 
+        let swapped_ping = http
+            .post(&url)
+            .header("Authorization", "Bearer observer-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .json(&json!({"jsonrpc":"2.0","id":40,"method":"ping","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped_ping.status(), StatusCode::UNAUTHORIZED);
+
+        let swapped_get = http
+            .get(&url)
+            .header("Authorization", "Bearer observer-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped_get.status(), StatusCode::UNAUTHORIZED);
+
+        let swapped_delete = http
+            .delete(&url)
+            .header("Authorization", "Bearer observer-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped_delete.status(), StatusCode::UNAUTHORIZED);
+
+        let missing_ping = http
+            .post(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .json(&json!({"jsonrpc":"2.0","id":41,"method":"ping","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_ping.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing_ping.json::<Value>().await.unwrap()["error"]["data"]["code"],
+            "unknown_session"
+        );
+
+        let missing_get = http
+            .get(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_get.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing_get.json::<Value>().await.unwrap()["error"]["data"]["code"],
+            "unknown_session"
+        );
+
+        let missing_delete = http
+            .delete(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_delete.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing_delete.json::<Value>().await.unwrap()["error"]["data"]["code"],
+            "unknown_session"
+        );
+
+        let session_survived = http
+            .post(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .json(&json!({"jsonrpc":"2.0","id":42,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(session_survived.status(), StatusCode::OK);
+
+        let missing_session = http
+            .post(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .json(&json!({"jsonrpc":"2.0","id":43,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_session.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing_session.json::<Value>().await.unwrap()["error"]["data"]["code"],
+            "unknown_session"
+        );
+
         let outside_scope = http
             .post(&url)
             .header("Authorization", "Bearer coordinator-secret")
@@ -4250,6 +4368,19 @@ mod tests {
         srv: ControlServerHandle,
         url: String,
         client: reqwest::Client,
+        session_id: String,
+    }
+
+    async fn initialized_computer_fixture(srv: ControlServerHandle) -> ComputerFixture {
+        let url = format!("http://{}/mcp", srv.addr);
+        let client = reqwest::Client::new();
+        let session_id = initialize_test_session(&client, &url, "computer-token", 99).await;
+        ComputerFixture {
+            srv,
+            url,
+            client,
+            session_id,
+        }
     }
 
     fn operator_workspace_snapshot(host: &crate::host::AgentHostHandle) -> Value {
@@ -4270,6 +4401,7 @@ mod tests {
             .client
             .post(&fixture.url)
             .header("Authorization", "Bearer computer-token")
+            .header("mcp-session-id", &fixture.session_id)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -4371,11 +4503,7 @@ mod tests {
             vec![ws_a.path().to_path_buf(), ws_b.path().to_path_buf()],
         );
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = initialized_computer_fixture(srv).await;
 
         // Coordinator reads inspect a Lane; they must never open it in the
         // local operator cockpit. Keep session_b focused while exercising all
@@ -4443,6 +4571,7 @@ mod tests {
             .client
             .post(&fixture.url)
             .header("Authorization", "Bearer computer-token")
+            .header("mcp-session-id", &fixture.session_id)
             .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
             .send()
             .await
@@ -4706,11 +4835,7 @@ mod tests {
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = initialized_computer_fixture(srv).await;
 
         // A cursor below the retained window is a hard 410, mirroring
         // ptah_get_events; the gap is never silently skipped. The retained
@@ -4823,11 +4948,7 @@ mod tests {
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = initialized_computer_fixture(srv).await;
 
         let (status, body) = call_tool(
             &fixture,
@@ -4903,11 +5024,7 @@ mod tests {
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = initialized_computer_fixture(srv).await;
         let (status, body) = call_tool(
             &fixture,
             1,

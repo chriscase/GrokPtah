@@ -88,6 +88,14 @@ hard denials—never bearer values or canonical filesystem paths. An MCP session
 is bound to the credential ID and capability-document hash used at initialize;
 credential swaps or authority changes require a new session.
 
+`initialize` is the only stateless MCP method and the only way to create that
+binding. Every later POST method—including `ping`, `tools/list`, `tools/call`,
+notifications, and typed error paths—plus `GET /mcp` and `DELETE /mcp` requires
+the returned `mcp-session-id`. Missing, unknown, stale, or credential-swapped
+session IDs fail closed before tool dispatch or session deletion. There is no
+legacy bearer-only path after initialization; clients must reinitialize after
+an authority change or reconnect.
+
 Embedders may construct a credential with a narrower set of canonical
 workspace roots. Authentication rejects any credential grant that exceeds the
 service allowlist. The CLI currently applies the service-wide allowlist to its

@@ -2033,8 +2033,20 @@ impl OrchestrationService {
         h.retain(|j| !j.is_finished());
     }
 
-    /// Load run and verify workspace ownership against allowlist + session.
-    fn load_authorized_run(&self, run_id: &str) -> Result<RunRecord, OrchError> {
+    fn run_scope_denied() -> OrchError {
+        OrchError::new(
+            OrchErrorCode::ForbiddenScope,
+            "run is unavailable in the caller's authorized scope",
+        )
+    }
+
+    fn load_run_for_authority(
+        &self,
+        auth: &AuthContext,
+        operation: AuthorityOperation,
+        run_id: &str,
+    ) -> Result<RunRecord, OrchError> {
+        auth.require_operation(operation)?;
         if safe_id_filename(run_id).is_err() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -2045,26 +2057,21 @@ impl OrchestrationService {
             .store
             .load_run(run_id)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
+            .ok_or_else(Self::run_scope_denied)?;
+        let workspace = Path::new(&run.workspace);
         let allowlist = self.config.lock().allowlist.clone();
-        let ws = PathBuf::from(&run.workspace);
-        if !allowlist.contains(&ws) {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "run workspace not authorized",
-            ));
+        if !allowlist.contains(workspace) || auth.require_workspace(operation, workspace).is_err() {
+            return Err(Self::run_scope_denied());
         }
-        // Session must still match claimed workspace when present.
-        if let Ok(session) = self.host.session_inspect(run.session_id) {
-            if !session.cwd.is_empty() {
-                let _ = require_workspace_match(&allowlist, Some(Path::new(&session.cwd)), &ws)
-                    .map_err(|_| {
-                        OrchError::new(
-                            OrchErrorCode::ForbiddenScope,
-                            "run session workspace mismatch",
-                        )
-                    })?;
-            }
+        let session = self
+            .host
+            .session_inspect(run.session_id)
+            .map_err(|_| Self::run_scope_denied())?;
+        if session.cwd.is_empty()
+            || require_workspace_match(&allowlist, Some(Path::new(&session.cwd)), workspace)
+                .is_err()
+        {
+            return Err(Self::run_scope_denied());
         }
         Ok(run)
     }
@@ -5326,9 +5333,7 @@ impl OrchestrationService {
         auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_operation(AuthorityOperation::RunsRead)?;
-        let run = self.load_authorized_run(run_id)?;
-        auth.require_workspace(AuthorityOperation::RunsRead, Path::new(&run.workspace))?;
+        let run = self.load_run_for_authority(auth, AuthorityOperation::RunsRead, run_id)?;
         self.run_value(run)
     }
 
@@ -5353,9 +5358,7 @@ impl OrchestrationService {
         auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_operation(AuthorityOperation::RunsRead)?;
-        let run = self.load_authorized_run(run_id)?;
-        auth.require_workspace(AuthorityOperation::RunsRead, Path::new(&run.workspace))?;
+        let run = self.load_run_for_authority(auth, AuthorityOperation::RunsRead, run_id)?;
         self.progress_value(run)
     }
 
@@ -5464,8 +5467,7 @@ impl OrchestrationService {
                 "run_id is required for get_events",
             )
         })?;
-        let run = self.load_authorized_run(rid)?;
-        auth.require_workspace(AuthorityOperation::RunsEvents, Path::new(&run.workspace))?;
+        let run = self.load_run_for_authority(auth, AuthorityOperation::RunsEvents, rid)?;
         self.events_for_run(run, after_seq, limit)
     }
 
@@ -5723,9 +5725,7 @@ impl OrchestrationService {
         auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_operation(AuthorityOperation::RunsRead)?;
-        let run = self.load_authorized_run(run_id)?;
-        auth.require_workspace(AuthorityOperation::RunsRead, Path::new(&run.workspace))?;
+        let run = self.load_run_for_authority(auth, AuthorityOperation::RunsRead, run_id)?;
         self.changes_for_run(run)
     }
 
@@ -5769,9 +5769,7 @@ impl OrchestrationService {
         auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_operation(AuthorityOperation::RunsRead)?;
-        let run = self.load_authorized_run(run_id)?;
-        auth.require_workspace(AuthorityOperation::RunsRead, Path::new(&run.workspace))?;
+        let run = self.load_run_for_authority(auth, AuthorityOperation::RunsRead, run_id)?;
         self.test_results_for_run(run)
     }
 
@@ -5872,9 +5870,7 @@ impl OrchestrationService {
         auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_operation(AuthorityOperation::RunsRead)?;
-        let run = self.load_authorized_run(run_id)?;
-        auth.require_workspace(AuthorityOperation::RunsRead, Path::new(&run.workspace))?;
+        let run = self.load_run_for_authority(auth, AuthorityOperation::RunsRead, run_id)?;
         self.handoff_for_run(run)
     }
 
@@ -5948,24 +5944,37 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<RunRecord, OrchError> {
-        let run = self.load_authorized_run(run_id)?;
-        if run.session_id != session_id {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "run does not belong to the requested session",
-            ));
-        }
+        self.authorize_run_request_with_claimed(session_id, workspace, run_id)
+            .map(|(run, _)| run)
+    }
+
+    fn authorize_run_request_with_claimed(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<(RunRecord, PathBuf), OrchError> {
         let session = self.require_build_session(session_id)?;
         let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
         let allowlist = self.config.lock().allowlist.clone();
         let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
-        if !super::workspaces_match(&run.workspace, &claimed.display().to_string()) {
+        if safe_id_filename(run_id).is_err() {
             return Err(OrchError::new(
-                OrchErrorCode::WorkspaceMismatch,
-                "run workspace does not match the requested workspace",
+                OrchErrorCode::InvalidRequest,
+                "malformed run_id",
             ));
         }
-        Ok(run)
+        let run = self
+            .store
+            .load_run(run_id)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
+            .ok_or_else(Self::run_scope_denied)?;
+        if run.session_id != session_id
+            || !super::workspaces_match(&run.workspace, &claimed.display().to_string())
+        {
+            return Err(Self::run_scope_denied());
+        }
+        Ok((run, claimed))
     }
 
     fn authorize_persistent_agent_request(
@@ -8127,62 +8136,11 @@ impl OrchestrationService {
             }
         };
 
-        let run = match self.store.load_run(rid) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                return Err(fail(
-                    self,
-                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"),
-                ));
-            }
-            Err(e) => {
-                return Err(fail(
-                    self,
-                    OrchError::new(OrchErrorCode::Internal, e.to_string()),
-                ));
-            }
-        };
-
-        if run.session_id != session_id {
-            return Err(fail(
-                self,
-                OrchError::new(
-                    OrchErrorCode::ForbiddenScope,
-                    "run_id does not belong to session",
-                ),
-            ));
-        }
-        let session = match self.host.session_inspect(session_id) {
-            Ok(s) => s,
-            Err(_) => {
-                return Err(fail(
-                    self,
-                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"),
-                ));
-            }
-        };
-        let cwd = if session.cwd.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(&session.cwd))
-        };
-        let allowlist = self.config.lock().allowlist.clone();
-        let claimed = match require_workspace_match(&allowlist, cwd.as_deref(), workspace) {
-            Ok(c) => c,
-            Err(e) => return Err(fail(self, e)),
-        };
-        // Workspace must match the run record as well.
-        if claimed.display().to_string() != run.workspace
-            && canonical_cmp(&claimed, Path::new(&run.workspace)).is_err()
-        {
-            return Err(fail(
-                self,
-                OrchError::new(
-                    OrchErrorCode::WorkspaceMismatch,
-                    "workspace does not match run",
-                ),
-            ));
-        }
+        let (run, claimed) =
+            match self.authorize_run_request_with_claimed(session_id, workspace, rid) {
+                Ok(value) => value,
+                Err(error) => return Err(fail(self, error)),
+            };
 
         let mut lease = match self
             .begin_idempotency(auth, tool, request_id, &phash, session_id, &claimed)
@@ -8318,16 +8276,6 @@ fn computer_read_error(error: crate::computer_use::ComputerError) -> OrchError {
         _ => OrchErrorCode::Internal,
     };
     OrchError::new(code, error.message)
-}
-
-fn canonical_cmp(a: &Path, b: &Path) -> Result<(), ()> {
-    let ca = dunce::canonicalize(a).map_err(|_| ())?;
-    let cb = dunce::canonicalize(b).map_err(|_| ())?;
-    if ca == cb {
-        Ok(())
-    } else {
-        Err(())
-    }
 }
 
 /// Incrementally persist run-scoped aggregates so journal rollover cannot erase them.
