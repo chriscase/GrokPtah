@@ -1589,6 +1589,7 @@ fn should_reconnect_remote_error(error: &anyhow::Error) -> bool {
             || status.is_some_and(|code| code == 408 || code == 429 || code >= 500);
     }
     if message.starts_with("MCP error:")
+        || message.starts_with("MCP remote error:")
         || message.starts_with("missing required argument ")
         || message.starts_with("unexpected argument ")
         || message.starts_with("unknown tool ")
@@ -1933,7 +1934,16 @@ mod tests {
             "MCP HTTP 401 Unauthorized"
         )));
         assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP HTTP 409 Conflict"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
             "MCP error: invalid request"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: admission_uncertain"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: conflict"
         )));
     }
 

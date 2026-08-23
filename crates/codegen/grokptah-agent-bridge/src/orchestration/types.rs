@@ -1486,6 +1486,8 @@ pub enum OrchErrorCode {
     InvalidRequest,
     Unsupported,
     Conflict,
+    /// Recovery may still commit a partial admission write. Not a zero-effect rejection.
+    AdmissionUncertain,
 }
 
 impl OrchErrorCode {
@@ -1503,6 +1505,7 @@ impl OrchErrorCode {
             Self::InvalidRequest => "invalid_request",
             Self::Unsupported => "unsupported",
             Self::Conflict => "conflict",
+            Self::AdmissionUncertain => "admission_uncertain",
         }
     }
 }

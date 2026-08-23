@@ -1787,7 +1787,9 @@ fn status_for(e: &OrchError) -> StatusCode {
         OrchErrorCode::Unauthenticated => StatusCode::UNAUTHORIZED,
         OrchErrorCode::ForbiddenScope | OrchErrorCode::WorkspaceMismatch => StatusCode::FORBIDDEN,
         OrchErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
-        OrchErrorCode::StaleVersion | OrchErrorCode::Conflict => StatusCode::CONFLICT,
+        OrchErrorCode::StaleVersion
+        | OrchErrorCode::Conflict
+        | OrchErrorCode::AdmissionUncertain => StatusCode::CONFLICT,
         OrchErrorCode::Unsupported => StatusCode::METHOD_NOT_ALLOWED,
         OrchErrorCode::CursorExpired => StatusCode::GONE,
         OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted => StatusCode::CONFLICT,

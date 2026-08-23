@@ -715,9 +715,19 @@ fn append_bounded_response_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> anyhow::R
 
 fn normalize_remote_error_code(value: &str) -> Option<String> {
     match value {
-        "unauthenticated" | "forbidden_scope" | "workspace_mismatch" | "session_busy"
-        | "capacity_exhausted" | "stale_version" | "cursor_expired" | "internal" | "timeout"
-        | "invalid_request" | "unsupported" | "conflict" => Some(value.to_owned()),
+        "unauthenticated"
+        | "forbidden_scope"
+        | "workspace_mismatch"
+        | "session_busy"
+        | "capacity_exhausted"
+        | "stale_version"
+        | "cursor_expired"
+        | "internal"
+        | "timeout"
+        | "invalid_request"
+        | "unsupported"
+        | "conflict"
+        | "admission_uncertain" => Some(value.to_owned()),
         _ => None,
     }
 }
@@ -871,6 +881,10 @@ mod tests {
         assert_eq!(
             normalize_remote_error_code("conflict").as_deref(),
             Some("conflict")
+        );
+        assert_eq!(
+            normalize_remote_error_code("admission_uncertain").as_deref(),
+            Some("admission_uncertain")
         );
         assert!(normalize_remote_error_code("xai_private_token_material_123456789").is_none());
         assert!(normalize_remote_error_code("unknown_future_code").is_none());

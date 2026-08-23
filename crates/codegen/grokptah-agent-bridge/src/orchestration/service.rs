@@ -7165,7 +7165,7 @@ impl OrchestrationService {
                 // Recovery may still commit. Do not release quota/reservation.
                 let e = e.downcast_ref::<OrchError>().cloned().unwrap_or_else(|| {
                     OrchError::new(
-                        OrchErrorCode::Internal,
+                        OrchErrorCode::AdmissionUncertain,
                         format!("durable admission is uncertain: {e}"),
                     )
                 });

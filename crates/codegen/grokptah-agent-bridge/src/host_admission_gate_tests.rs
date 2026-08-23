@@ -9,6 +9,8 @@ use crate::gateway_config::{
     ProviderDialect, ProviderKind, ProviderModel, ProviderProfile, CAPABILITY_QUALIFICATION_SCHEMA,
     XAI_PROVIDER_ID,
 };
+use crate::mcp_control::start_control_server;
+use crate::mcp_control_client::{McpControlClient, McpRemoteError};
 use crate::native_coding_readiness::DESKTOP_OWNER_ID;
 use crate::orchestration::{
     AdmissionPersistCut, AuthContext, OrchError, OrchErrorCode, OrchestrationConfig,
@@ -24,6 +26,7 @@ use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
 use bytes::Bytes;
+use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -897,6 +900,52 @@ async fn uncertain_persist_cut_is_typed_and_does_not_start_provider() {
     assert!(!store.list_quota_reservations().unwrap().is_empty());
     assert_session_unmutated(&host, lane_id, &before_title, &before_transcript, None);
     drain_turn_started(&mut events);
+    host.stop().unwrap();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn mcp_submit_task_uncertain_persist_cut_is_typed() {
+    let (base_url, requests, server) = spawn_xai_sse().await;
+    let mut home = IsolatedHome::enter();
+    home.remove("GROKPTAH_AGENT_OFFLINE");
+    home.set("XAI_API_BASE", &base_url);
+    home.set("XAI_API_KEY", "synthetic-p2-uncertain-mcp-key");
+    save_measured_history(&base_url, "grok-route");
+    let (host, lane_id, workspace) = xai_host("grok-route");
+    let store = host.ensure_orchestration_store().unwrap();
+    store.set_persist_cut(Some(AdmissionPersistCut::AfterQuota));
+    let orch = orch_for(&host, workspace.path());
+    let control = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client =
+        McpControlClient::new(format!("http://{}", control.addr), "p2-admission-token");
+    client.initialize().await.unwrap();
+    let error = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "p2-uncertain-submit",
+                "session_id": lane_id,
+                "workspace": workspace.path().display().to_string(),
+                "prompt": "must not dispatch",
+            }),
+        )
+        .await
+        .unwrap_err();
+    let remote = error
+        .downcast_ref::<McpRemoteError>()
+        .expect("MCP Uncertain must be a typed remote error");
+    assert_eq!(remote.data_code(), Some("admission_uncertain"));
+    assert_eq!(error.to_string(), "MCP remote error: admission_uncertain");
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert!(store.list_provider_attempts().unwrap().is_empty());
+    assert!(
+        !store.list_quota_reservations().unwrap().is_empty(),
+        "Uncertain AfterQuota must retain the reservation"
+    );
+    client.close_session().await.unwrap();
+    orch.stop_background_tasks().await;
     host.stop().unwrap();
     server.abort();
 }

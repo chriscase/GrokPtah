@@ -7,12 +7,12 @@ use axum::routing::post;
 use axum::{Json, Router};
 use grokptah_agent_bridge::orchestration::{
     hash_payload, public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
-    AssignmentStatus, AuthContext, ChangeRecord, IdempotencyClaim, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedIntentState, OrchStore, OrchestrationConfig,
-    OrchestrationService, ProviderAttemptState, ProviderRetryClass, ProviderRoute,
-    ProviderRouteSnapshot, ProviderSendCertainty, PublicRun, QuotaClass, QuotaLimits,
-    QuotaReservation, QuotaReservationState, RunAggregates, RunBounds, RunProgress, RunPurpose,
-    RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
+    safe_id_filename, AssignmentStatus, AuthContext, ChangeRecord, IdempotencyClaim,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedIntentState, OrchStore,
+    OrchestrationConfig, OrchestrationService, ProviderAttemptState, ProviderRetryClass,
+    ProviderRoute, ProviderRouteSnapshot, ProviderSendCertainty, PublicRun, QuotaClass,
+    QuotaLimits, QuotaReservation, QuotaReservationState, RunAggregates, RunBounds, RunProgress,
+    RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
     MANAGED_EXECUTION_SCHEMA_VERSION, PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
     PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
 };
@@ -23,8 +23,10 @@ use grokptah_agent_bridge::{
 };
 use serde_json::json;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -2430,6 +2432,36 @@ fn failing_provider_route(reservation_id: &str) -> ProviderRouteSnapshot {
     route
 }
 
+/// Poison a completed Run with source-route secrets without a missing quota
+/// reservation. `update_run` cannot change `provider_route`.
+fn failing_provider_poison_route() -> ProviderRouteSnapshot {
+    let mut route = failing_provider_route("unused-quota-not-persisted");
+    route.quota_class = None;
+    route.quota_reservation_id = None;
+    let material = json!({
+        "schemaVersion": route.schema_version,
+        "providerId": route.provider_id,
+        "modelId": route.model_id,
+        "wireModelId": route.wire_model_id,
+        "selectionKey": route.selection_key,
+        "kind": route.kind,
+        "dialect": route.dialect,
+        "baseUrl": route.base_url,
+        "endpointFingerprint": route.endpoint_fingerprint,
+        "credentialRef": route.credential_ref,
+        "credentialFingerprint": route.credential_fingerprint,
+        "capabilities": route.capabilities,
+        "deadlineClass": route.deadline_class,
+        "effort": route.effort,
+        "qualificationRecordId": route.qualification_record_id,
+    });
+    route.snapshot_hash = hash_payload(&material);
+    route
+        .validate()
+        .expect("quota-free failing provider route must validate");
+    route
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_and_replay() {
@@ -2661,6 +2693,304 @@ async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_a
     assert!(!discard.is_error, "{:?}", discard.raw);
     assert_public_payload_hides_route(&discard.structured, &discard_route, &[]);
     assert_public_payload_hides_route(&mcp_text_value(&discard.raw), &discard_route, &[]);
+    client.close_session().await.unwrap();
+    orch.stop_background_tasks().await;
+}
+
+fn init_git_workspace(workspace: &Path) {
+    std::fs::write(workspace.join("README.md"), "baseline\n").unwrap();
+    for args in [
+        vec!["init"],
+        vec!["add", "README.md"],
+        vec![
+            "-c",
+            "user.name=GrokPtah Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "baseline",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+fn inject_failing_provider_leak(store: &OrchStore, run_id: &str, route: &ProviderRouteSnapshot) {
+    let mut run = store
+        .load_run(run_id)
+        .unwrap()
+        .expect("completed run must still be durable");
+    run.provider_route = Some(route.clone());
+    run.prompt_preview = format!("retry {}", route.selection_key);
+    run.terminal_result = Some(format!("credential {FAILING_CREDENTIAL_REF} rejected"));
+    run.final_response = Some(format!("failed calling {FAILING_BASE_URL}"));
+    run.aggregates.changes.push(ChangeRecord {
+        path: format!("called {FAILING_BASE_URL}"),
+        summary: format!("ref {FAILING_CREDENTIAL_REF}"),
+    });
+    match run.progress.as_mut() {
+        Some(progress) => {
+            progress.last_tool = Some(format!("mcp:{FAILING_CREDENTIAL_FP}"));
+            progress.detail = format!("upstream {} fingerprint", route.endpoint_fingerprint);
+        }
+        None => {
+            run.progress = Some(RunProgress {
+                round: 1,
+                max_rounds: 4,
+                last_tool: Some(format!("mcp:{FAILING_CREDENTIAL_FP}")),
+                detail: format!("upstream {} fingerprint", route.endpoint_fingerprint),
+                updated_at: run.updated_at,
+            });
+        }
+    }
+    let path = store.root().join("runs").join(format!(
+        "{}.json",
+        safe_id_filename(run_id).expect("run_id must be a safe filename")
+    ));
+    std::fs::write(&path, serde_json::to_vec_pretty(&run).unwrap()).unwrap();
+}
+
+async fn wait_for_mcp_run(
+    client: &mut McpControlClient,
+    session_id: Uuid,
+    workspace: &str,
+    run_id: &str,
+) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..200 {
+        let run = client
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "run_id": run_id
+                }),
+            )
+            .await
+            .unwrap();
+        last = run.structured.clone();
+        if matches!(
+            last["state"].as_str(),
+            Some("completed" | "failed" | "cancelled" | "interrupted" | "limit_reached")
+        ) {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("run {run_id} did not reach a terminal state: {last}");
+}
+
+fn assert_live_public_run_hides_failing_provider(
+    payload: &serde_json::Value,
+    route: &ProviderRouteSnapshot,
+) {
+    assert_public_payload_hides_route(payload, route, &[]);
+    let encoded = payload.to_string();
+    assert!(
+        !encoded.contains(FAILING_BASE_URL),
+        "live MCP payload leaked base_url: {encoded}"
+    );
+    assert!(
+        !encoded.contains(FAILING_CREDENTIAL_REF),
+        "live MCP payload leaked credential ref"
+    );
+    assert_eq!(
+        payload.get("errorCode"),
+        Some(&json!(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)),
+        "live MCP payload must use the typed public error code: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn failing_provider_live_isolated_promote_and_discard_are_scrubbed() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    init_git_workspace(workspace.path());
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(workspace.path()).unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let store = host.ensure_orchestration_store().unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let control = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let workspace_text = workspace.path().display().to_string();
+    let discard_route = failing_provider_poison_route();
+    let discard_submitted = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "native-live-discard-submit",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "prompt": "write mcp-discard.txt: leftover isolated file",
+                "execution_mode": "isolated_worktree"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!discard_submitted.is_error, "{:?}", discard_submitted.raw);
+    let discard_id = discard_submitted.structured["runId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let discard_completed =
+        wait_for_mcp_run(&mut client, lane.id, &workspace_text, &discard_id).await;
+    assert_eq!(
+        discard_completed["state"], "completed",
+        "discard source run: {discard_completed}"
+    );
+    inject_failing_provider_leak(&store, &discard_id, &discard_route);
+    let discard = client
+        .call_tool(
+            "ptah_discard_run",
+            json!({
+                "request_id": "native-live-discard",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": discard_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!discard.is_error, "{:?}", discard.raw);
+    assert_eq!(
+        discard.structured["execution"]["promotionState"],
+        "discarded"
+    );
+    assert_live_public_run_hides_failing_provider(&discard.structured, &discard_route);
+    assert_live_public_run_hides_failing_provider(&mcp_text_value(&discard.raw), &discard_route);
+
+    let promote_route = failing_provider_poison_route();
+    let submitted = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "native-live-promote-submit",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "prompt": "write mcp-approved.txt: hello from isolated run",
+                "execution_mode": "isolated_worktree"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!submitted.is_error, "{:?}", submitted.raw);
+    let promote_id = submitted.structured["runId"].as_str().unwrap().to_string();
+    let completed = wait_for_mcp_run(&mut client, lane.id, &workspace_text, &promote_id).await;
+    assert_eq!(
+        completed["state"], "completed",
+        "promote source run: {completed}"
+    );
+    inject_failing_provider_leak(&store, &promote_id, &promote_route);
+    let poisoned = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": promote_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!poisoned.is_error, "{:?}", poisoned.raw);
+    assert_live_public_run_hides_failing_provider(&poisoned.structured, &promote_route);
+    assert_live_public_run_hides_failing_provider(&mcp_text_value(&poisoned.raw), &promote_route);
+    let review = client
+        .call_tool(
+            "ptah_review_run",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": promote_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!review.is_error, "{:?}", review.raw);
+    let approval = client
+        .call_tool(
+            "ptah_approve_run",
+            json!({
+                "request_id": "native-live-approve",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": promote_id,
+                "source_fingerprint": review.structured["sourceFingerprint"],
+                "final_fingerprint": review.structured["finalFingerprint"],
+                "changed_files": review.structured["changedFiles"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!approval.is_error, "{:?}", approval.raw);
+    let approval_id = approval.structured["approvalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    inject_failing_provider_leak(&store, &promote_id, &promote_route);
+    let promote = client
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": "native-live-promote",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": promote_id,
+                "approval_id": approval_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!promote.is_error, "{:?}", promote.raw);
+    assert_eq!(
+        promote.structured["execution"]["promotionState"],
+        "promoted"
+    );
+    assert_live_public_run_hides_failing_provider(&promote.structured, &promote_route);
+    assert_live_public_run_hides_failing_provider(&mcp_text_value(&promote.raw), &promote_route);
+    let replay = client
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": "native-live-promote",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": promote_id,
+                "approval_id": approval_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.structured["runId"], promote.structured["runId"]);
+    assert_live_public_run_hides_failing_provider(&replay.structured, &promote_route);
     client.close_session().await.unwrap();
     orch.stop_background_tasks().await;
 }
