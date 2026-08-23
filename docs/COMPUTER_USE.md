@@ -82,8 +82,8 @@ measurement IDs.
 This stage does **not** implement an isolated helper process, visual compositor, agent cursor
 UI, background Accessibility execution, pointer/keyboard injection on the real desktop, or
 out-of-band preemptive takeover. Those remain later stages; this contract makes them
-structurally representable without lying that macOS is isolated today. Stage 1 is not stable or
-release-ready. MCP Computer reads still require the separate least-privilege repair, and
+structurally representable without lying that macOS is isolated today. The candidate now applies
+role-scoped bearer authority and immutable session/workspace grants to MCP Computer reads;
 packaged hardware/TCC/takeover remain fail-closed or unverified. The host now does implement the
 durable WorkAttempt surface-lease and physical-dispatch coordinator described below, without
 exposing raw leases or widening MCP mutations.

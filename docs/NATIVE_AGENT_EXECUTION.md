@@ -257,10 +257,13 @@ send.
   session is `session_busy` rather than a second concurrent turn.
 - Permission oneshots are process memory. They are not restart-durable.
   Resolution after restart, cancel, or a dead receiver fails closed.
-- Named control-plane credentials remain **operator-equivalent**: **every
-  configured remote bearer can approve and promote within service scope**.
-  They share one service `owner_id` and are not bound to a single Agent.
-  `LocalOperator` / `RemoteCoordinator` / `Observer` separation is Planned.
+- The candidate now enforces role-scoped control-plane credentials. A default
+  remote credential is a `RemoteCoordinator`; explicit `RemoteOperator` and
+  `Observer` credentials have narrower operation ceilings, and only the
+  trusted local adapter receives `LocalOperator` authority. Worker credentials
+  can additionally bind one durable Agent and canonical workspace roots.
+  Production-shaped issuance/rotation and independent worker evidence remain
+  separate release gates.
 - `maxConcurrentRuns` is bounded to **1–4** (default 1). Live intents in
   `claiming`, `admitted`, `parked`, and `resolving` consume that ceiling.
 
@@ -291,10 +294,11 @@ Shipped since this slice (do not treat as remaining work):
 Still remaining:
 
 - Message-triggered routine activation (`RoutineTrigger::External` adapters remain `unsupported` on create/fire)
-- Per-principal worker credentials bound to one Agent (**every configured
-  remote bearer can currently approve/promote within service scope**;
-  `LocalOperator` / `RemoteCoordinator` / `Observer` are Planned and must
-  precede any production-shaped 72-hour soak)
+- Per-principal worker credentials and role-scoped authority are implemented
+  in the candidate (`LocalOperator` / `RemoteOperator` /
+  `RemoteCoordinator` / `Observer`); production-shaped issuance/rotation,
+  retained evidence, and the independent 72-hour worker campaign remain open
+  and must precede any production-shaped soak.
 - Computer Use for unattended Agents (not in this slice; [#287](https://github.com/chriscase/GrokPtah/issues/287)
   Planned; isolated visual [#288](https://github.com/chriscase/GrokPtah/issues/288)
   is a **mandatory unmet** 100% exit, not an unsupported alternative)

@@ -67,8 +67,9 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 - Complete the named hardware matrix for focus/geometry/display changes and permission revocation.
 - Keep #271 Computer MCP mutations disabled until the shared event/approval contract and its threat
   review are complete.
-- MCP Computer **read** methods still depend on the separate least-privilege bearer-authority
-  repair. Stage 1 is not stable or release-ready until that scoped authority slice lands.
+- The candidate now applies the least-privilege bearer-authority slice to MCP Computer **read**
+  methods: role ceilings, immutable session/workspace grants, and fail-closed scope checks are
+  enforced. Packaged hardware/TCC/takeover and production evidence remain separate release gates.
 - Keep #288 isolated visual execution disabled until a backend provides a genuinely separate input
   surface; hidden windows, separate Spaces, and global `CGEvent` injection do not qualify. Stage 1
   only makes isolation a typed, host-enforced contract. Remaining stages: authenticated isolated
