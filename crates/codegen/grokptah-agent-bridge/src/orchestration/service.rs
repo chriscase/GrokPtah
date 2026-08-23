@@ -3259,12 +3259,20 @@ impl OrchestrationService {
                 .await?;
             work_items.push(response);
         }
+        self.audit(
+            "ptah_create_enterprise_review_work_plan",
+            Some(request_id),
+            Some(session_id),
+            Some(&workspace.display().to_string()),
+            "accepted",
+            None,
+            "enterprise review work plan materialized",
+        );
         Ok(json!({
             "schema": ENTERPRISE_REVIEW_WORK_PLAN_SCHEMA,
             "reviewId": work_plan.review_id,
             "planDigest": work_plan.plan_digest,
             "workPlanDigest": work_plan.work_plan_digest,
-            "parentRequestId": request_id,
             "workItems": work_items,
         }))
     }
