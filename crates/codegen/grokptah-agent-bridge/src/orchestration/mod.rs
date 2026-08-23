@@ -21,10 +21,11 @@ pub use authz::{
 };
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,
-    ContinuationContext, ContinuationFidelity, ContinuationInputSnapshot, ContinuationMemoryFact,
-    ContinuationMemoryInput, ContinuationMemoryScope, ContinuationOmission, ContinuationReasonCode,
-    ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef,
-    CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
+    ContinuationContext, ContinuationFidelity, ContinuationInputSnapshot,
+    ContinuationMemoryConflict, ContinuationMemoryFact, ContinuationMemoryInput,
+    ContinuationMemoryScope, ContinuationOmission, ContinuationReasonCode, ContinuationRunInput,
+    ContinuationTestInput, ContinuationWorkloadRef, CONTINUATION_ASSEMBLER_VERSION,
+    CONTINUATION_SCHEMA_VERSION,
 };
 pub use managed::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,

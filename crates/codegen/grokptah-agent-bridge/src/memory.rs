@@ -15,7 +15,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Weak};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -41,6 +41,7 @@ const MAX_SCOPE_FOOTPRINT_BYTES: usize = 384 * 1024;
 const MAX_SCOPE_FILES: usize = 24;
 const MAX_CRITICAL_FACTS: usize = 16;
 const MAX_CRITICAL_BYTES: usize = 16 * 1024;
+const MAX_REPORTED_CONFLICTS: usize = 16;
 const MAX_INJECT_CHARS: usize = 6_000;
 const MAX_CWD_CHARS: usize = 4_096;
 const MAX_EXPIRED_KEYS: usize = 4_096;
@@ -126,6 +127,7 @@ pub(crate) enum CommitCutpoint {
 std::thread_local! {
     static COMMIT_CUTPOINT: std::cell::Cell<CommitCutpoint> =
         const { std::cell::Cell::new(CommitCutpoint::None) };
+    static RECOVERY_PARENT_FSYNC_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn current_cutpoint() -> CommitCutpoint {
@@ -353,7 +355,7 @@ impl MemoryAddress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum MemoryError {
+pub enum MemoryError {
     #[error("malformed memory write")]
     Malformed,
     #[error("memory idempotency conflict")]
@@ -376,12 +378,28 @@ pub(crate) enum MemoryError {
         revision: u64,
         request_key: String,
     },
+    #[error(
+        "memory recovery is ambiguous (generation={generation} digest={evidence_digest} request={request_key})"
+    )]
+    AmbiguousRecovery {
+        generation: u64,
+        evidence_digest: String,
+        request_key: String,
+    },
+    #[error(
+        "memory recovery is uncertain (generation={generation} digest={evidence_digest} request={request_key})"
+    )]
+    RecoveryUncertain {
+        generation: u64,
+        evidence_digest: String,
+        request_key: String,
+    },
     #[error("durable memory store error")]
     Durable,
 }
 
 impl MemoryError {
-    pub(crate) fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::Malformed => "malformed",
             Self::IdempotencyConflict => "idempotency_conflict",
@@ -392,26 +410,68 @@ impl MemoryError {
             Self::Unauthorized => "unauthorized",
             Self::ReceiptExpired => "receipt_expired",
             Self::Uncertain { .. } => "uncertain",
+            Self::AmbiguousRecovery { .. } => "ambiguous_recovery",
+            Self::RecoveryUncertain { .. } => "recovery_uncertain",
             Self::Durable => "durable",
         }
     }
 
-    pub(crate) fn tool_payload(&self) -> serde_json::Value {
+    pub fn tool_payload(&self) -> serde_json::Value {
         let mut payload = serde_json::json!({
             "ok": false,
             "code": self.code(),
         });
-        if let Self::Uncertain {
-            fact_id,
-            revision,
-            request_key,
-        } = self
-        {
-            payload["fact_id"] = serde_json::json!(fact_id);
-            payload["revision"] = serde_json::json!(revision);
-            payload["request_key"] = serde_json::json!(request_key);
+        match self {
+            Self::Uncertain {
+                fact_id,
+                revision,
+                request_key,
+            } => {
+                payload["fact_id"] = serde_json::json!(fact_id);
+                payload["revision"] = serde_json::json!(revision);
+                payload["request_key"] = serde_json::json!(request_key);
+                payload["status"] = serde_json::json!("uncertain");
+            }
+            Self::AmbiguousRecovery {
+                generation,
+                evidence_digest,
+                request_key,
+            } => {
+                payload["generation"] = serde_json::json!(generation);
+                payload["evidence_digest"] = serde_json::json!(evidence_digest);
+                payload["request_key"] = serde_json::json!(request_key);
+                payload["status"] = serde_json::json!("ambiguous");
+            }
+            Self::RecoveryUncertain {
+                generation,
+                evidence_digest,
+                request_key,
+            } => {
+                payload["generation"] = serde_json::json!(generation);
+                payload["evidence_digest"] = serde_json::json!(evidence_digest);
+                payload["request_key"] = serde_json::json!(request_key);
+                payload["status"] = serde_json::json!("uncertain");
+            }
+            _ => {}
         }
         payload
+    }
+
+    pub fn into_write_ack(self) -> Result<MemoryWriteAck, MemoryError> {
+        match self {
+            Self::Uncertain {
+                fact_id,
+                revision,
+                request_key,
+            } => Ok(MemoryWriteAck {
+                status: MemoryCommitStatus::Uncertain,
+                id: fact_id,
+                revision,
+                request_key,
+                replayed: false,
+            }),
+            other => Err(other),
+        }
     }
 
     fn uncertain(
@@ -514,7 +574,6 @@ impl VersionedWriteRequest {
         Ok(self)
     }
 
-    #[cfg(test)]
     pub(crate) fn superseding(mut self, id: impl Into<String>, revision: u64) -> Self {
         let id = id.into();
         self.supersedes = Some(id.clone());
@@ -524,12 +583,23 @@ impl VersionedWriteRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct VersionedWriteAck {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCommitStatus {
+    Durable,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryWriteAck {
+    pub status: MemoryCommitStatus,
     pub id: String,
     pub revision: u64,
+    pub request_key: String,
     pub replayed: bool,
 }
+
+pub(crate) type VersionedWriteAck = MemoryWriteAck;
 
 #[derive(Debug, Clone)]
 struct Receipt {
@@ -1276,6 +1346,322 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+fn recovery_parent_fsync_should_fail() -> bool {
+    #[cfg(test)]
+    {
+        if std::env::var("GROKPTAH_MEMORY_FSYNC_FAIL").ok().as_deref() == Some("recovery_parent") {
+            return true;
+        }
+        RECOVERY_PARENT_FSYNC_FAIL.with(|cell| cell.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn fsync_dir_for_recovery(dir: &Path) -> std::io::Result<()> {
+    hang_if_requested("recovery_parent_fsync");
+    if recovery_parent_fsync_should_fail() {
+        return Err(std::io::Error::other(
+            "injected recovery parent fsync failure",
+        ));
+    }
+    fsync_dir(dir)
+}
+
+#[cfg(test)]
+fn set_recovery_parent_fsync_fail(fail: bool) {
+    RECOVERY_PARENT_FSYNC_FAIL.with(|cell| cell.set(fail));
+}
+
+const RECOVERY_SCHEMA: &str = "grokptah.memory.recovery.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryJournalState {
+    Ambiguous,
+    FsyncPending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryCandidateRecord {
+    digest: String,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryJournal {
+    schema: String,
+    state: RecoveryJournalState,
+    generation: u64,
+    evidence_digest: String,
+    request_key: String,
+    candidates: Vec<RecoveryCandidateRecord>,
+}
+
+fn recovery_journal_path(canonical: &Path) -> PathBuf {
+    let file = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("memory.json");
+    canonical.with_file_name(format!(".{file}.recovery"))
+}
+
+fn payload_sha256(raw: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(raw))
+}
+
+fn evidence_digest_for(payloads: &mut [Vec<u8>]) -> String {
+    payloads.sort();
+    let mut hasher = Sha256::new();
+    for payload in payloads {
+        hasher.update((payload.len() as u64).to_be_bytes());
+        hasher.update(payload);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn recovery_error(
+    state: RecoveryJournalState,
+    generation: u64,
+    evidence_digest: String,
+    request_key: String,
+) -> MemoryError {
+    match state {
+        RecoveryJournalState::Ambiguous => MemoryError::AmbiguousRecovery {
+            generation,
+            evidence_digest,
+            request_key,
+        },
+        RecoveryJournalState::FsyncPending => MemoryError::RecoveryUncertain {
+            generation,
+            evidence_digest,
+            request_key,
+        },
+    }
+}
+
+fn journal_error(journal: &RecoveryJournal) -> MemoryError {
+    recovery_error(
+        journal.state,
+        journal.generation,
+        journal.evidence_digest.clone(),
+        journal.request_key.clone(),
+    )
+}
+
+fn read_recovery_journal(canonical: &Path) -> Option<RecoveryJournal> {
+    let path = recovery_journal_path(canonical);
+    let raw = read_bounded(&path, MAX_PERSISTED_BYTES).ok()?;
+    let journal: RecoveryJournal = serde_json::from_slice(&raw).ok()?;
+    if journal.schema != RECOVERY_SCHEMA || journal.request_key.is_empty() {
+        return None;
+    }
+    Some(journal)
+}
+
+fn write_recovery_journal(canonical: &Path, journal: &RecoveryJournal) -> Result<(), MemoryError> {
+    let path = recovery_journal_path(canonical);
+    let parent = path.parent().ok_or(MemoryError::Durable)?;
+    let raw = serde_json::to_vec_pretty(journal).map_err(|_| MemoryError::Durable)?;
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("memory.json.recovery")
+    ));
+    fs::write(&tmp, &raw).map_err(|_| MemoryError::Durable)?;
+    if let Ok(file) = File::open(&tmp) {
+        file.sync_all().map_err(|_| MemoryError::Durable)?;
+    }
+    fs::rename(&tmp, &path).map_err(|_| MemoryError::Durable)?;
+    Ok(())
+}
+
+fn make_recovery_journal(
+    state: RecoveryJournalState,
+    generation: u64,
+    payloads: &mut [Vec<u8>],
+    candidates: Vec<RecoveryCandidateRecord>,
+) -> RecoveryJournal {
+    let evidence_digest = evidence_digest_for(payloads);
+    RecoveryJournal {
+        schema: RECOVERY_SCHEMA.into(),
+        state,
+        generation,
+        request_key: format!("recovery:{evidence_digest}"),
+        evidence_digest,
+        candidates,
+    }
+}
+
+fn cleanup_ready_temps(canonical: &Path, keep: Option<&Path>) {
+    for (temp, _) in sibling_temps(canonical) {
+        if keep.is_some_and(|path| path == temp) {
+            continue;
+        }
+        let ready = PathBuf::from(format!("{}.ready", temp.display()));
+        let _ = fs::remove_file(&ready);
+        quarantine(&temp);
+    }
+}
+
+fn finish_existing_journal(canonical: &Path, journal: RecoveryJournal) -> Result<(), MemoryError> {
+    match journal.state {
+        RecoveryJournalState::Ambiguous => Err(journal_error(&journal)),
+        RecoveryJournalState::FsyncPending => {
+            if !canonical.is_file() {
+                return Err(journal_error(&journal));
+            }
+            let parent = canonical.parent().ok_or(MemoryError::Durable)?;
+            if fsync_dir_for_recovery(parent).is_err() {
+                return Err(journal_error(&journal));
+            }
+            let _ = fs::remove_file(recovery_journal_path(canonical));
+            cleanup_ready_temps(canonical, None);
+            enforce_footprint(canonical);
+            Ok(())
+        }
+    }
+}
+
+fn recover_scope(address: &MemoryAddress, canonical: &Path) -> Result<(), MemoryError> {
+    if let Some(journal) = read_recovery_journal(canonical) {
+        return finish_existing_journal(canonical, journal);
+    }
+    let temps = sibling_temps(canonical);
+    let canonical_exists = canonical.is_file();
+    let canonical_ok = canonical_exists
+        && read_bounded(canonical, MAX_PERSISTED_BYTES)
+            .ok()
+            .and_then(|raw| parse_store_bytes(&raw).ok())
+            .and_then(|memory| {
+                verify_workspace_identity(address, canonical, &memory.project_key, &memory.cwd)
+                    .ok()
+                    .map(|_| ())
+            })
+            .is_some();
+    if canonical_exists && !canonical_ok {
+        return Err(MemoryError::Durable);
+    }
+    if canonical_ok {
+        cleanup_ready_temps(canonical, None);
+        enforce_footprint(canonical);
+        return Ok(());
+    }
+    let mut ranked: Vec<(u64, PathBuf, PathBuf, Vec<u8>)> = Vec::new();
+    for (temp, ready) in temps {
+        let ready_path = PathBuf::from(format!("{}.ready", temp.display()));
+        if !ready {
+            let _ = fs::remove_file(&ready_path);
+            quarantine(&temp);
+            continue;
+        }
+        match parse_ready_candidate(address, &temp) {
+            Some((generation, raw)) => ranked.push((generation, temp, ready_path, raw)),
+            None => {
+                let _ = fs::remove_file(&ready_path);
+                quarantine(&temp);
+            }
+        }
+    }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let Some(max_gen) = ranked.first().map(|item| item.0) else {
+        enforce_footprint(canonical);
+        return Ok(());
+    };
+    let winners: Vec<_> = ranked
+        .iter()
+        .filter(|item| item.0 == max_gen)
+        .cloned()
+        .collect();
+    if winners.len() != 1 {
+        let mut payloads: Vec<Vec<u8>> = winners.iter().map(|item| item.3.clone()).collect();
+        let candidates = winners
+            .iter()
+            .map(|item| RecoveryCandidateRecord {
+                digest: payload_sha256(&item.3),
+                generation: item.0,
+            })
+            .collect();
+        let journal = make_recovery_journal(
+            RecoveryJournalState::Ambiguous,
+            max_gen,
+            &mut payloads,
+            candidates,
+        );
+        write_recovery_journal(canonical, &journal)?;
+        for (_, temp, ready_path, _) in ranked {
+            let _ = fs::remove_file(&ready_path);
+            quarantine(&temp);
+        }
+        if let Some(parent) = canonical.parent() {
+            let _ = fsync_dir(parent);
+        }
+        return Err(journal_error(&journal));
+    }
+    let (_, winner, winner_ready, winner_raw) = winners.into_iter().next().unwrap();
+    let mut payloads = vec![winner_raw.clone()];
+    let journal = make_recovery_journal(
+        RecoveryJournalState::FsyncPending,
+        max_gen,
+        &mut payloads,
+        vec![RecoveryCandidateRecord {
+            digest: payload_sha256(&winner_raw),
+            generation: max_gen,
+        }],
+    );
+    write_recovery_journal(canonical, &journal)?;
+    if fs::rename(&winner, canonical).is_err() {
+        quarantine(&winner);
+        let _ = fs::remove_file(&winner_ready);
+        return Err(journal_error(&journal));
+    }
+    let _ = fs::remove_file(&winner_ready);
+    let parent = canonical.parent().ok_or(MemoryError::Durable)?;
+    if fsync_dir_for_recovery(parent).is_err() {
+        return Err(journal_error(&journal));
+    }
+    let _ = fs::remove_file(recovery_journal_path(canonical));
+    for (generation, temp, ready_path, _) in ranked {
+        if generation == max_gen && temp == winner {
+            continue;
+        }
+        let _ = fs::remove_file(&ready_path);
+        quarantine(&temp);
+    }
+    enforce_footprint(canonical);
+    Ok(())
+}
+
+fn load_from_path(
+    address: &MemoryAddress,
+    path: &Path,
+) -> Result<Option<ProjectMemory>, MemoryError> {
+    recover_scope(address, path)?;
+    let raw = match read_bounded(path, MAX_PERSISTED_BYTES) {
+        Ok(raw) => raw,
+        Err(error) => {
+            let io = error.downcast_ref::<std::io::Error>();
+            if io.is_some_and(|e| e.kind() == ErrorKind::NotFound) || !path.exists() {
+                return Ok(None);
+            }
+            return Err(MemoryError::Durable);
+        }
+    };
+    let memory = parse_store_bytes(&raw).map_err(|_| MemoryError::Durable)?;
+    verify_workspace_identity(address, path, &memory.project_key, &memory.cwd)
+        .map_err(|_| MemoryError::Durable)?;
+    let expected_binding = scope_binding(address);
+    for receipt in &memory.receipts {
+        if receipt.scope_binding != expected_binding {
+            return Err(MemoryError::CrossScope);
+        }
+    }
+    Ok(Some(memory))
+}
+
 fn enforce_footprint(canonical: &Path) {
     let Some(parent) = canonical.parent() else {
         return;
@@ -1284,6 +1670,7 @@ fn enforce_footprint(canonical: &Path) {
         return;
     };
     let lock = lock_path_for(canonical);
+    let journal = recovery_journal_path(canonical);
     let mut scratch: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
     let mut total = 0u64;
     let mut count = 0usize;
@@ -1295,7 +1682,10 @@ fn enforce_footprint(canonical: &Path) {
         if !meta.is_file() {
             continue;
         }
-        let owned = path == canonical || path == lock || is_owned_scratch(canonical, &path);
+        let owned = path == canonical
+            || path == lock
+            || path == journal
+            || is_owned_scratch(canonical, &path);
         if !owned {
             continue;
         }
@@ -1323,115 +1713,6 @@ fn parse_ready_candidate(address: &MemoryAddress, temp: &Path) -> Option<(u64, V
     let memory = parse_store_bytes(&raw).ok()?;
     verify_workspace_identity(address, temp, &memory.project_key, &memory.cwd).ok()?;
     Some((memory.generation, raw))
-}
-
-fn recover_scope(address: &MemoryAddress, canonical: &Path) {
-    let temps = sibling_temps(canonical);
-    let canonical_exists = canonical.is_file();
-    let canonical_ok = canonical_exists
-        && read_bounded(canonical, MAX_PERSISTED_BYTES)
-            .ok()
-            .and_then(|raw| parse_store_bytes(&raw).ok())
-            .and_then(|memory| {
-                verify_workspace_identity(address, canonical, &memory.project_key, &memory.cwd)
-                    .ok()
-                    .map(|_| ())
-            })
-            .is_some();
-    if canonical_exists && !canonical_ok {
-        for (temp, _) in &temps {
-            let ready = PathBuf::from(format!("{}.ready", temp.display()));
-            let _ = fs::remove_file(&ready);
-            quarantine(temp);
-        }
-        enforce_footprint(canonical);
-        return;
-    }
-    if canonical_ok {
-        for (temp, _) in temps {
-            let ready = PathBuf::from(format!("{}.ready", temp.display()));
-            let _ = fs::remove_file(&ready);
-            quarantine(&temp);
-        }
-        enforce_footprint(canonical);
-        return;
-    }
-    let mut ranked: Vec<(u64, PathBuf, PathBuf)> = Vec::new();
-    for (temp, ready) in temps {
-        let ready_path = PathBuf::from(format!("{}.ready", temp.display()));
-        if !ready {
-            let _ = fs::remove_file(&ready_path);
-            quarantine(&temp);
-            continue;
-        }
-        match parse_ready_candidate(address, &temp) {
-            Some((generation, _)) => ranked.push((generation, temp, ready_path)),
-            None => {
-                let _ = fs::remove_file(&ready_path);
-                quarantine(&temp);
-            }
-        }
-    }
-    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    let Some(max_gen) = ranked.first().map(|item| item.0) else {
-        enforce_footprint(canonical);
-        return;
-    };
-    let winners: Vec<_> = ranked
-        .iter()
-        .filter(|item| item.0 == max_gen)
-        .cloned()
-        .collect();
-    if winners.len() != 1 {
-        for (_, temp, ready_path) in ranked {
-            let _ = fs::remove_file(&ready_path);
-            quarantine(&temp);
-        }
-        enforce_footprint(canonical);
-        return;
-    }
-    let (_, winner, winner_ready) = winners.into_iter().next().unwrap();
-    if fs::rename(&winner, canonical).is_ok() {
-        let _ = fs::remove_file(&winner_ready);
-        if let Some(parent) = canonical.parent() {
-            let _ = fsync_dir(parent);
-        }
-    } else {
-        quarantine(&winner);
-        let _ = fs::remove_file(&winner_ready);
-    }
-    for (generation, temp, ready_path) in ranked {
-        if generation == max_gen && temp == winner {
-            continue;
-        }
-        let _ = fs::remove_file(&ready_path);
-        quarantine(&temp);
-    }
-    enforce_footprint(canonical);
-}
-
-fn load_from_path(address: &MemoryAddress, path: &Path) -> anyhow::Result<Option<ProjectMemory>> {
-    recover_scope(address, path);
-    let raw = match read_bounded(path, MAX_PERSISTED_BYTES) {
-        Ok(raw) => raw,
-        Err(error) => {
-            let io = error.downcast_ref::<std::io::Error>();
-            if io.is_some_and(|e| e.kind() == ErrorKind::NotFound) || !path.exists() {
-                return Ok(None);
-            }
-            return Err(error).with_context(|| format!("read memory scope {}", path.display()));
-        }
-    };
-    let memory = parse_store_bytes(&raw)
-        .with_context(|| format!("parse memory scope {}", path.display()))?;
-    verify_workspace_identity(address, path, &memory.project_key, &memory.cwd)?;
-    let expected_binding = scope_binding(address);
-    for receipt in &memory.receipts {
-        if receipt.scope_binding != expected_binding {
-            bail!("memory receipt scope binding mismatch");
-        }
-    }
-    Ok(Some(memory))
 }
 
 fn commit_canonical(path: &Path, raw: &[u8]) -> Result<(), MemoryError> {
@@ -1884,7 +2165,7 @@ fn transact<T>(
     let mut memory = match load_from_path(address, &path) {
         Ok(Some(memory)) => memory,
         Ok(None) => empty_memory(address, now),
-        Err(_) => return Err(MemoryError::Durable),
+        Err(error) => return Err(error),
     };
     if address.clock.may_advance_retention() && now >= memory.retention_watermark {
         memory.retention_watermark = now;
@@ -1922,7 +2203,7 @@ fn transact_read<T>(
     let memory = match load_from_path(address, &path) {
         Ok(Some(memory)) => memory,
         Ok(None) => empty_memory(address, now),
-        Err(_) => return Err(MemoryError::Durable),
+        Err(error) => return Err(error),
     };
     read(&memory)
 }
@@ -2011,16 +2292,27 @@ pub(crate) fn remember_from_host_args(
     if let Some(raw) = host_arg_string(args, &["valid_until"])? {
         request = request.with_valid_until(raw);
     }
-    if let Some(raw) = host_arg_string(args, &["supersedes"])? {
-        request.supersedes = Some(raw);
-    }
-    if let Some(raw) = host_arg_string(args, &["expected_head_id"])? {
-        request.expected_head_id = Some(raw);
-    }
-    if let Some(value) = args.get("expected_head_revision") {
-        if !value.is_null() {
-            request.expected_head_revision = Some(value.as_u64().ok_or(MemoryError::Malformed)?);
+    let supersedes = host_arg_string(args, &["supersedes"])?;
+    let expected_head_id = host_arg_string(args, &["expected_head_id"])?;
+    let expected_head_revision = match args.get("expected_head_revision") {
+        Some(value) if !value.is_null() => Some(value.as_u64().ok_or(MemoryError::Malformed)?),
+        _ => None,
+    };
+    if let (Some(id), Some(revision)) = (
+        expected_head_id.clone().or_else(|| supersedes.clone()),
+        expected_head_revision,
+    ) {
+        request = request.superseding(id, revision);
+    } else {
+        if let Some(id) = expected_head_id {
+            request.expected_head_id = Some(id);
         }
+        if let Some(revision) = expected_head_revision {
+            request.expected_head_revision = Some(revision);
+        }
+    }
+    if let Some(raw) = supersedes {
+        request.supersedes = Some(raw);
     }
     request = match args.get("salience") {
         None => request.with_salience_label(None)?,
@@ -2119,8 +2411,10 @@ pub(crate) fn remember_versioned(
                 return Err(MemoryError::IdempotencyConflict);
             }
             return Ok(TxnResult::replay(VersionedWriteAck {
+                status: MemoryCommitStatus::Durable,
                 id: existing.fact_id,
                 revision: existing.revision,
+                request_key: request.idempotency_key.clone(),
                 replayed: true,
             }));
         }
@@ -2242,8 +2536,10 @@ pub(crate) fn remember_versioned(
         });
         Ok(TxnResult::commit(
             VersionedWriteAck {
+                status: MemoryCommitStatus::Durable,
                 id: id.clone(),
                 revision,
+                request_key: request.idempotency_key.clone(),
                 replayed: false,
             },
             id,
@@ -2259,13 +2555,21 @@ pub(crate) fn list_facts(address: &MemoryAddress) -> anyhow::Result<Vec<MemoryFa
         .map_err(|error| anyhow!(error))
 }
 
-pub(crate) struct AuthoritativeRetrieval {
-    pub(crate) at: DateTime<Utc>,
-    pub(crate) current: Vec<MemoryFact>,
-    pub(crate) conflicts: Vec<(String, Vec<MemoryFact>)>,
+#[derive(Debug, Clone)]
+pub struct MemoryConflict {
+    pub claim_key: String,
+    pub heads: Vec<MemoryFact>,
 }
 
-impl AuthoritativeRetrieval {
+#[derive(Debug, Clone)]
+pub struct MemoryRetrieval {
+    pub at: DateTime<Utc>,
+    pub current: Vec<MemoryFact>,
+    pub conflicts: Vec<MemoryConflict>,
+    pub omitted: Vec<String>,
+}
+
+impl MemoryRetrieval {
     pub(crate) fn matching(&self, query: &str) -> Vec<&MemoryFact> {
         if !bounded_chars(query, MAX_QUERY_CHARS) {
             return Vec::new();
@@ -2285,27 +2589,24 @@ impl AuthoritativeRetrieval {
     }
 }
 
-pub(crate) fn inspect(address: &MemoryAddress) -> Result<AuthoritativeRetrieval, MemoryError> {
+pub(crate) fn inspect(address: &MemoryAddress) -> Result<MemoryRetrieval, MemoryError> {
     retrieve_at(address, address.clock.now())
 }
 
 pub(crate) fn inspect_search(
     address: &MemoryAddress,
     query: &str,
-) -> anyhow::Result<AuthoritativeRetrieval> {
+) -> Result<MemoryRetrieval, MemoryError> {
     if !bounded_chars(query, MAX_QUERY_CHARS) {
-        bail!("malformed memory query");
+        return Err(MemoryError::Malformed);
     }
-    let mut retrieved = inspect(address).map_err(|error| anyhow!(error))?;
+    let mut retrieved = inspect(address)?;
     let current = retrieved.matching(query).into_iter().cloned().collect();
     retrieved.current = current;
     Ok(retrieved)
 }
 
-fn retrieve_at(
-    address: &MemoryAddress,
-    at: DateTime<Utc>,
-) -> Result<AuthoritativeRetrieval, MemoryError> {
+fn retrieve_at(address: &MemoryAddress, at: DateTime<Utc>) -> Result<MemoryRetrieval, MemoryError> {
     transact_read(address, |memory| {
         let mut unkeyed = Vec::new();
         let mut claims: BTreeSet<String> = BTreeSet::new();
@@ -2335,16 +2636,28 @@ fn retrieve_at(
                 .collect();
             if heads.len() > 1 {
                 sort_authoritative(&mut heads);
-                conflicts.push((claim, heads));
+                conflicts.push(MemoryConflict {
+                    claim_key: claim,
+                    heads,
+                });
             } else {
                 current.extend(heads);
             }
         }
         sort_authoritative(&mut current);
-        Ok(AuthoritativeRetrieval {
+        let mut omitted = Vec::new();
+        if conflicts.len() > MAX_REPORTED_CONFLICTS {
+            omitted.extend(
+                conflicts
+                    .drain(MAX_REPORTED_CONFLICTS..)
+                    .map(|conflict| conflict.claim_key),
+            );
+        }
+        Ok(MemoryRetrieval {
             at,
             current,
             conflicts,
+            omitted,
         })
     })
 }
@@ -2361,16 +2674,37 @@ pub(crate) fn inject_context(address: &MemoryAddress) -> anyhow::Result<String> 
     );
     let prefix_len = out.len();
     let mut used = prefix_len;
-    for (claim, heads) in &retrieved.conflicts {
-        let ids = heads
+    for conflict in &retrieved.conflicts {
+        let ids = conflict
+            .heads
             .iter()
-            .map(|head| head.id.as_str())
+            .map(|head| {
+                format!(
+                    "{}@{}:{}:{}",
+                    head.id,
+                    head.effective_revision(),
+                    head.valid_from.as_deref().unwrap_or(""),
+                    head.valid_until.as_deref().unwrap_or("")
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
         let line = format!(
             "<memory_conflict claim=\"{}\" heads=\"{}\" at=\"{}\">multiple current heads; not authoritative</memory_conflict>\n",
-            escape_evidence(claim),
+            escape_evidence(&conflict.claim_key),
             escape_evidence(&ids),
+            escape_evidence(&format_timestamp(retrieved.at)),
+        );
+        if used + line.len() > MAX_INJECT_CHARS {
+            break;
+        }
+        out.push_str(&line);
+        used += line.len();
+    }
+    for claim in &retrieved.omitted {
+        let line = format!(
+            "<memory_conflict_omitted claim=\"{}\" at=\"{}\">additional unresolved heads omitted from this snapshot</memory_conflict_omitted>\n",
+            escape_evidence(claim),
             escape_evidence(&format_timestamp(retrieved.at)),
         );
         if used + line.len() > MAX_INJECT_CHARS {
@@ -2427,12 +2761,17 @@ pub(crate) fn declared_bounds_json() -> serde_json::Value {
 }
 
 impl VersionedWriteAck {
-    pub(crate) fn tool_payload(&self) -> serde_json::Value {
+    pub fn tool_payload(&self) -> serde_json::Value {
         serde_json::json!({
-            "ok": true,
-            "code": "ok",
+            "ok": self.status == MemoryCommitStatus::Durable,
+            "code": match self.status {
+                MemoryCommitStatus::Durable => "ok",
+                MemoryCommitStatus::Uncertain => "uncertain",
+            },
+            "status": self.status,
             "id": self.id,
             "revision": self.revision,
+            "request_key": self.request_key,
             "replayed": self.replayed,
             "bounds": declared_bounds_json(),
         })
@@ -2539,6 +2878,19 @@ mod tests {
     fn cut(cut: CommitCutpoint) -> CutGuard {
         set_commit_cutpoint(cut);
         CutGuard
+    }
+
+    struct RecoveryFsyncGuard;
+
+    impl Drop for RecoveryFsyncGuard {
+        fn drop(&mut self) {
+            set_recovery_parent_fsync_fail(false);
+        }
+    }
+
+    fn fail_recovery_parent_fsync() -> RecoveryFsyncGuard {
+        set_recovery_parent_fsync_fail(true);
+        RecoveryFsyncGuard
     }
 
     fn fixture() -> Fixture {
@@ -3118,8 +3470,8 @@ mod tests {
             Some("Use spaces.")
         );
         assert_eq!(retrieved.conflicts.len(), 1);
-        assert_eq!(retrieved.conflicts[0].0, "release-channel");
-        assert_eq!(retrieved.conflicts[0].1.len(), 2);
+        assert_eq!(retrieved.conflicts[0].claim_key, "release-channel");
+        assert_eq!(retrieved.conflicts[0].heads.len(), 2);
     }
 
     #[test]
@@ -3896,13 +4248,25 @@ mod tests {
         }
         let access = MemoryAccess::new(&workspace, Some("horizon-agent".into()));
         let address = access.project();
-        let generation = store_generation(&address);
-        let mut ids: Vec<_> = stored_facts(&address).into_iter().map(|f| f.id).collect();
-        ids.sort();
-        println!(
-            "GROKPTAH_MEMORY_ACK:{}",
-            serde_json::json!({"generation": generation, "ids": ids, "count": ids.len()})
-        );
+        match inspect(&address) {
+            Ok(_) => {
+                let generation = store_generation(&address);
+                let mut ids: Vec<_> = stored_facts(&address).into_iter().map(|f| f.id).collect();
+                ids.sort();
+                println!(
+                    "GROKPTAH_MEMORY_ACK:{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "generation": generation,
+                        "ids": ids,
+                        "count": ids.len()
+                    })
+                );
+            }
+            Err(error) => {
+                println!("GROKPTAH_MEMORY_ACK:{}", error.tool_payload());
+            }
+        }
     }
 
     fn spawn_lib_test(filter: &str, home: &Path, extra: &[(&str, &str)]) -> std::process::Child {
@@ -3913,6 +4277,7 @@ mod tests {
             .env("RUST_TEST_THREADS", "1")
             .env_remove("GROKPTAH_MEMORY_CUTPOINT")
             .env_remove("GROKPTAH_MEMORY_HANG_CUTPOINT")
+            .env_remove("GROKPTAH_MEMORY_FSYNC_FAIL")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (key, value) in extra {
@@ -3960,16 +4325,20 @@ mod tests {
         spawn_lib_test("memory::tests::cross_process_writer_entry", home, &refs)
     }
 
-    fn spawn_reopen(home: &Path, workspace: &Path) -> std::process::Child {
+    fn spawn_reopen(home: &Path, workspace: &Path, extra: &[(&str, &str)]) -> std::process::Child {
         let workspace = workspace.display().to_string();
-        spawn_lib_test(
-            "memory::tests::cross_process_reopen_entry",
-            home,
-            &[
-                ("GROKPTAH_MEMORY_SUBPROC_WORKSPACE", &workspace),
-                ("GROKPTAH_MEMORY_SUBPROC_ROLE", "reopen"),
-            ],
-        )
+        let mut owned: Vec<(String, String)> = vec![
+            ("GROKPTAH_MEMORY_SUBPROC_WORKSPACE".into(), workspace),
+            ("GROKPTAH_MEMORY_SUBPROC_ROLE".into(), "reopen".into()),
+        ];
+        for (key, value) in extra {
+            owned.push(((*key).to_string(), (*value).to_string()));
+        }
+        let refs: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        spawn_lib_test("memory::tests::cross_process_reopen_entry", home, &refs)
     }
 
     fn combined_output(output: &std::process::Output) -> String {
@@ -4135,10 +4504,10 @@ mod tests {
         let out = relaunch.wait_with_output().unwrap();
         let ack = assert_child_executed_exactly_one_test(&out);
         assert_eq!(ack["replayed"], false);
-        let first = spawn_reopen(home.path(), source.path())
+        let first = spawn_reopen(home.path(), source.path(), &[])
             .wait_with_output()
             .unwrap();
-        let second = spawn_reopen(home.path(), source.path())
+        let second = spawn_reopen(home.path(), source.path(), &[])
             .wait_with_output()
             .unwrap();
         let one = assert_child_executed_exactly_one_test(&first);
@@ -4296,11 +4665,11 @@ mod tests {
                 }
             }
             if year == 0 || year + 1 == spec.logical_years {
-                let reopen = spawn_reopen(home.path(), source.path())
+                let reopen = spawn_reopen(home.path(), source.path(), &[])
                     .wait_with_output()
                     .unwrap();
                 let first = assert_child_executed_exactly_one_test(&reopen);
-                let reopen_again = spawn_reopen(home.path(), source.path())
+                let reopen_again = spawn_reopen(home.path(), source.path(), &[])
                     .wait_with_output()
                     .unwrap();
                 let second = assert_child_executed_exactly_one_test(&reopen_again);
@@ -4627,12 +4996,31 @@ mod tests {
         fs::write(format!("{}.ready", tie_a.display()), b"ready").unwrap();
         fs::write(&tie_b, serde_json::to_vec_pretty(&tie).unwrap()).unwrap();
         fs::write(format!("{}.ready", tie_b.display()), b"ready").unwrap();
-        assert!(list_facts(&address).unwrap().is_empty());
+        let err = inspect(&address).unwrap_err();
+        let MemoryError::AmbiguousRecovery {
+            generation,
+            evidence_digest,
+            request_key,
+        } = err.clone()
+        else {
+            panic!("expected AmbiguousRecovery, got {err:?}");
+        };
+        assert_eq!(generation, 12);
+        assert_eq!(request_key, format!("recovery:{evidence_digest}"));
+        assert_eq!(err.tool_payload()["code"], "ambiguous_recovery");
         assert!(!path.exists());
+        let journal = recovery_journal_path(&path);
+        let journal_bytes = fs::read(&journal).expect("ambiguous recovery journal");
+        assert!(!journal_bytes.is_empty());
         assert!(quarantine_dest(&tie_a).unwrap().is_file() || !tie_a.exists());
         assert!(quarantine_dest(&tie_b).unwrap().is_file() || !tie_b.exists());
         assert!(!tie_a.exists());
         assert!(!tie_b.exists());
+        let write_err =
+            remember(&address, "must not overwrite ambiguous history", &[]).unwrap_err();
+        assert!(write_err.to_string().contains("ambiguous"), "{write_err}");
+        assert_eq!(inspect(&address).unwrap_err(), err);
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
     }
 
     #[test]
@@ -4649,10 +5037,10 @@ mod tests {
         let temp = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
         fs::write(&temp, &body).unwrap();
         fs::write(format!("{}.ready", temp.display()), b"ready").unwrap();
-        let first = spawn_reopen(home.path(), source.path())
+        let first = spawn_reopen(home.path(), source.path(), &[])
             .wait_with_output()
             .unwrap();
-        let second = spawn_reopen(home.path(), source.path())
+        let second = spawn_reopen(home.path(), source.path(), &[])
             .wait_with_output()
             .unwrap();
         let one = assert_child_executed_exactly_one_test(&first);
@@ -4660,6 +5048,115 @@ mod tests {
         assert_eq!(one, two);
         assert_eq!(one["count"], 1);
         assert!(!temp.exists());
+    }
+
+    #[test]
+    fn recover_ambiguous_two_fresh_process_reopens_are_noop_and_retain_identity() {
+        let home = IsolatedHome::install();
+        let source = tempfile::tempdir().unwrap();
+        let address = MemoryAccess::new(source.path(), Some("horizon-agent".into())).project();
+        remember(&address, "canonical seed", &[]).unwrap();
+        let path = path_for(&address).unwrap();
+        let parent = path.parent().unwrap();
+        let file = path.file_name().unwrap().to_str().unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut tie = serde_json::from_slice::<serde_json::Value>(&original).unwrap();
+        tie["generation"] = serde_json::json!(12);
+        fs::remove_file(&path).unwrap();
+        let tie_a = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+        let tie_b = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+        fs::write(&tie_a, serde_json::to_vec_pretty(&tie).unwrap()).unwrap();
+        fs::write(format!("{}.ready", tie_a.display()), b"ready").unwrap();
+        fs::write(&tie_b, serde_json::to_vec_pretty(&tie).unwrap()).unwrap();
+        fs::write(format!("{}.ready", tie_b.display()), b"ready").unwrap();
+        let first_err = inspect(&address).unwrap_err();
+        let MemoryError::AmbiguousRecovery {
+            evidence_digest,
+            request_key,
+            generation,
+        } = first_err.clone()
+        else {
+            panic!("expected AmbiguousRecovery, got {first_err:?}");
+        };
+        assert_eq!(generation, 12);
+        assert_eq!(request_key, format!("recovery:{evidence_digest}"));
+        let journal = recovery_journal_path(&path);
+        let journal_bytes = fs::read(&journal).unwrap();
+        let first = spawn_reopen(home.path(), source.path(), &[])
+            .wait_with_output()
+            .unwrap();
+        let second = spawn_reopen(home.path(), source.path(), &[])
+            .wait_with_output()
+            .unwrap();
+        let one = assert_child_executed_exactly_one_test(&first);
+        let two = assert_child_executed_exactly_one_test(&second);
+        assert_eq!(one, two);
+        assert_eq!(one, first_err.tool_payload());
+        assert_eq!(one["code"], "ambiguous_recovery");
+        assert_eq!(one["request_key"], request_key);
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+        assert!(!path.exists());
+        assert_eq!(inspect(&address).unwrap_err(), first_err);
+    }
+
+    #[test]
+    fn recover_parent_fsync_failure_is_uncertain_and_two_reopens_retain_identity() {
+        let home = IsolatedHome::install();
+        let source = tempfile::tempdir().unwrap();
+        let address = MemoryAccess::new(source.path(), Some("horizon-agent".into())).project();
+        remember(&address, "recover me", &[]).unwrap();
+        let path = path_for(&address).unwrap();
+        let parent = path.parent().unwrap();
+        let file = path.file_name().unwrap().to_str().unwrap();
+        let body = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let temp = parent.join(format!(".{file}.{}.tmp", uuid::Uuid::new_v4()));
+        fs::write(&temp, &body).unwrap();
+        fs::write(format!("{}.ready", temp.display()), b"ready").unwrap();
+        let _fail = fail_recovery_parent_fsync();
+        let err = inspect(&address).unwrap_err();
+        let MemoryError::RecoveryUncertain {
+            evidence_digest,
+            request_key,
+            generation,
+        } = err.clone()
+        else {
+            panic!("expected RecoveryUncertain, got {err:?}");
+        };
+        assert!(generation >= 1);
+        assert_eq!(request_key, format!("recovery:{evidence_digest}"));
+        assert!(
+            path.is_file(),
+            "winner must remain at canonical after rename"
+        );
+        let journal = recovery_journal_path(&path);
+        let journal_bytes = fs::read(&journal).expect("fsync-pending recovery journal");
+        let write_err =
+            remember(&address, "must not overwrite uncertain recovery", &[]).unwrap_err();
+        assert!(write_err.to_string().contains("uncertain"), "{write_err}");
+        assert_eq!(inspect(&address).unwrap_err(), err);
+        let first = spawn_reopen(
+            home.path(),
+            source.path(),
+            &[("GROKPTAH_MEMORY_FSYNC_FAIL", "recovery_parent")],
+        )
+        .wait_with_output()
+        .unwrap();
+        let second = spawn_reopen(
+            home.path(),
+            source.path(),
+            &[("GROKPTAH_MEMORY_FSYNC_FAIL", "recovery_parent")],
+        )
+        .wait_with_output()
+        .unwrap();
+        let one = assert_child_executed_exactly_one_test(&first);
+        let two = assert_child_executed_exactly_one_test(&second);
+        assert_eq!(one, two);
+        assert_eq!(one, err.tool_payload());
+        assert_eq!(one["code"], "recovery_uncertain");
+        assert_eq!(one["request_key"], request_key);
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+        assert_eq!(inspect(&address).unwrap_err(), err);
     }
 
     #[test]
