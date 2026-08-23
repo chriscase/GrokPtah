@@ -343,7 +343,8 @@ describe("copy output", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Copy output" }));
     });
-    expect(writeText).toHaveBeenCalledExactlyOnceWith(output);
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith(output);
     expect(
       screen.getByRole("button", { name: "Copied" }),
     ).toBeInTheDocument();
