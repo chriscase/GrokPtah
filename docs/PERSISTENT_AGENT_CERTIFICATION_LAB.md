@@ -81,6 +81,50 @@ cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
   run --repository "$PWD"
 ```
 
+### Exact-head Stage 3 authority campaign
+
+The `authority` command is the deny-unknown integrated exit runner for roadmap
+stage 3. It requires one clean Git checkout and binds the report to that exact
+40-character commit. Six ordered gate families cover the closed role registry,
+credential/workspace/worker narrowing, the read-only Computer Use MCP surface,
+public MCP role filtering and authority-bound idempotency, bound-worker
+impersonation denial, and standalone-service token/session/workspace
+authorization. Together they require 20 exact green tests. The public MCP,
+worker, and service gates require a host that permits loopback listeners.
+
+Run it serially with the mandatory shared compiler cache and external target:
+
+```sh
+export RUSTC_WRAPPER=/opt/homebrew/bin/sccache
+export SCCACHE_DIR=/Users/chriscase/Library/Caches/grokptah/sccache
+export CARGO_TARGET_DIR=/Users/chriscase/Library/Caches/grokptah/targets/rust-1.92.0-stage5-memory-default
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  authority --repository "$PWD"
+```
+
+The target key is shared with Stage 5 because both campaigns use Rust 1.92.0
+and the same bridge/certification-lab default-feature family. It must be owned
+by only one campaign at a time. Record disk, process/open-handle, target-size,
+and sccache evidence before and after the run. Never fall back to an
+in-checkout target.
+
+A failed gate writes one bounded digest checkpoint and leaves the campaign
+incomplete; it cannot write `report.json` or a completion seal. A passing run
+writes beneath `evals/runs/authority-stage3-cert/<campaign-id>/`. Verify it
+independently with:
+
+```sh
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  inspect --campaign "$PWD/evals/runs/authority-stage3-cert/<campaign-id>"
+```
+
+The sealed report binds the four required authority roles, the exact
+RemoteCoordinator/Observer denial contract, authority-bound idempotency,
+worker identity, session/workspace-scoped Computer reads, ordered command
+digests, and exact test cardinalities. It retains no bearer, credential,
+workspace path, raw transcript, or remote body.
+
 ### Exact-head Stage 5 memory campaign
 
 The `memory` command is the deny-unknown integrated exit runner for roadmap

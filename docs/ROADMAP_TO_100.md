@@ -355,6 +355,26 @@ scope** (`ptah_approve_run`, `ptah_promote_run`). Computer MCP **reads** are
 on main; **mutations** remain [#271](https://github.com/chriscase/GrokPtah/issues/271)
 **open**.
 
+The dream candidate has a materially stronger implementation than
+`origin/main`: hosted credentials are role-scoped as `RemoteOperator`,
+`RemoteCoordinator`, or `Observer`; only the trusted local adapter can mint
+`LocalOperator`; credential workspace/Agent grants can only narrow; worker
+credentials are Agent-bound and rotatable; Computer-read grants are immutable
+session/workspace capabilities; and the public capability document is derived
+from the enforced operation set. Candidate
+`fc96aa330a3c26928d9538c6b106de55b602b69c` adds the clean-exact-head
+`authority` campaign and independently sealed verifier. It fixes six ordered
+gate families at 20 tests and now explicitly tests that a bearer cannot mint
+local authority and that Observer lacks the complete named mutation set.
+
+This remains **implementation-complete but not certification-complete** in the
+candidate. The new slice is formatted and statically reviewed, but no build or
+test claim is made from this local sandbox: the mandatory external cached
+target did not exist here, and the loopback gates require a host runner. Stage
+3 exits only after a clean final head passes the campaign and its sealed report
+passes independent inspection. Until that happens, do not begin a
+production-shaped soak and do not describe `origin/main` as least-privilege.
+
 **Exit (all required):**
 
 - Each credential maps to a transport-neutral `AuthorityContext` (principal,
