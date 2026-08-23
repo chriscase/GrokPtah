@@ -6608,7 +6608,7 @@ impl OrchestrationService {
             issued_at,
             expires_at: issued_at + chrono::Duration::milliseconds(ttl as i64),
         };
-        let response = json!({
+        let mut response = json!({
             "runId": run_id,
             "sessionId": session_id,
             "approvalId": approval.approval_id,
@@ -6617,6 +6617,13 @@ impl OrchestrationService {
             "finalFingerprint": approval.final_fingerprint,
             "changedFiles": approval.changed_files,
         });
+        let redacted = super::public_run::scrub_public_json_needles(
+            &mut response,
+            run.provider_route.as_ref(),
+        )?;
+        if redacted {
+            response["errorCode"] = json!(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS);
+        }
         let updated = self.store.update_run(run_id, |current| {
             current.approval = Some(approval.clone());
             current.updated_at = Utc::now();

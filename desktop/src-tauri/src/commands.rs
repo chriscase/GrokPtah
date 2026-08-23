@@ -1560,7 +1560,7 @@ pub async fn run_review(
 ) -> Result<RunReview, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.review_run(id, &run_id).map_err(map_err)).await
+    run_blocking(move || host.review_public_run(id, &run_id).map_err(map_err)).await
 }
 
 /// Persist an exact-scope approval for an MCP-owned isolated run. The desktop

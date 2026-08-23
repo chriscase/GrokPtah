@@ -2533,16 +2533,23 @@ impl AgentHostHandle {
     }
 
     /// Read the bounded Git diff for an isolated terminal run.
+    ///
+    /// This is the exact reviewed scope used by desktop approval matching.
+    /// Display surfaces that leave the host must use [`Self::review_public_run`].
     pub fn review_run(&self, session_id: Uuid, run_id: &str) -> Result<RunReview> {
-        let mut review = self.review_run_internal(session_id, run_id, true)?;
+        self.review_run_internal(session_id, run_id, true)
+    }
+
+    /// Public review payload: same Git scope as [`Self::review_run`], with this
+    /// Run's provider-route needles redacted from paths and the diff.
+    pub fn review_public_run(&self, session_id: Uuid, run_id: &str) -> Result<RunReview> {
+        let mut review = self.review_run(session_id, run_id)?;
         let store = self.ensure_orchestration_store()?;
-        if let Some(run) = store.load_run(run_id)? {
-            crate::orchestration::scrub_route_secret_needles(
-                &mut review,
-                run.provider_route.as_ref(),
-            )
+        let Some(run) = store.load_run(run_id)? else {
+            return Ok(review);
+        };
+        crate::orchestration::scrub_route_secret_needles(&mut review, run.provider_route.as_ref())
             .map_err(|error| anyhow!(error.message))?;
-        }
         Ok(review)
     }
 

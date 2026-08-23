@@ -959,6 +959,12 @@ fn scrub_public_run(
         redacted |= scrub_string(&mut change.path, &needles);
         redacted |= scrub_string(&mut change.summary, &needles);
     }
+    if let Some(approval) = run.approval.as_mut() {
+        for change in &mut approval.changed_files {
+            redacted |= scrub_string(&mut change.path, &needles);
+            redacted |= scrub_string(&mut change.summary, &needles);
+        }
+    }
     for test in &mut run.aggregates.tests {
         redacted |= scrub_opt_string(&mut test.command, &needles);
         redacted |= scrub_string(&mut test.status, &needles);
@@ -1698,6 +1704,47 @@ mod tests {
         assert!(!serde_json::to_string(&review)
             .unwrap()
             .contains(BASE_URL_SENTINEL));
+    }
+
+    #[test]
+    fn public_run_scrubs_approval_changed_files() {
+        use crate::orchestration::ChangeRecord;
+
+        let temp = tempdir().unwrap();
+        let store = OrchStore::open(temp.path()).unwrap();
+        let mut run = leaky_run(leaky_route());
+        run.approval = Some(RunApproval {
+            approval_id: "approval-leak".into(),
+            run_id: run.run_id.clone(),
+            session_id: run.session_id,
+            workspace: run.workspace.clone(),
+            source_fingerprint: "src".into(),
+            final_fingerprint: "fin".into(),
+            changed_files: vec![ChangeRecord {
+                path: format!("called {BASE_URL_SENTINEL}"),
+                summary: format!("ref {CREDENTIAL_REF_SENTINEL}"),
+            }],
+            issued_at: run.created_at,
+            expires_at: run.created_at,
+        });
+        let reservation =
+            QuotaReservation::for_run(&run, "owner-a", QuotaLimits::default(), Utc::now()).unwrap();
+        store
+            .admit_run_with_quota(&run, &reservation)
+            .into_result()
+            .unwrap();
+        let projected =
+            project_public_run(&store, &store.load_run(&run.run_id).unwrap().unwrap()).unwrap();
+        let approval = projected.approval.as_ref().expect("approval must project");
+        assert_eq!(approval.changed_files[0].path, "");
+        assert_eq!(approval.changed_files[0].summary, "");
+        assert_eq!(
+            projected.error_code.as_deref(),
+            Some(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)
+        );
+        let encoded = public_run_to_value(&projected).unwrap();
+        assert!(!encoded.to_string().contains(BASE_URL_SENTINEL));
+        assert!(!encoded.to_string().contains(CREDENTIAL_REF_SENTINEL));
     }
 
     #[test]
