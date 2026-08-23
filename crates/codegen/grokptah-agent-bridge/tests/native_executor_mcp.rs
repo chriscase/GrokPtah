@@ -6,20 +6,27 @@ use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use grokptah_agent_bridge::orchestration::{
-    AssignmentStatus, AuthContext, ManagedExecutionIntent, ManagedExecutionPolicy,
-    ManagedIntentState, OrchStore, OrchestrationConfig, OrchestrationService, ProviderAttemptState,
-    ProviderRetryClass, ProviderRoute, ProviderSendCertainty, QuotaClass, QuotaReservationState,
-    RunBounds, RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState,
-    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
+    hash_payload, public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
+    safe_id_filename, AssignmentStatus, AuthContext, ChangeRecord, IdempotencyClaim,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedIntentState, OrchStore,
+    OrchestrationConfig, OrchestrationService, ProviderAttemptState, ProviderRetryClass,
+    ProviderRoute, ProviderRouteSnapshot, ProviderSendCertainty, PublicRun, QuotaClass,
+    QuotaLimits, QuotaReservation, QuotaReservationState, RunAggregates, RunBounds, RunProgress,
+    RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
+    MANAGED_EXECUTION_SCHEMA_VERSION, PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+    PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
 };
 use grokptah_agent_bridge::{
-    model_selection_key, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
-    McpControlClient, McpRemoteError, SessionKind, SessionUpdate,
+    model_selection_key, set_grokptah_home_override, start_control_server, AgentHost,
+    CapabilitySource, EffortLevel, HostConfig, McpControlClient, McpRemoteError, ModelCapabilities,
+    ProviderDeadlineClass, ProviderDialect, ProviderKind, SessionKind, SessionUpdate,
 };
 use serde_json::json;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -414,6 +421,115 @@ fn auth() -> AuthContext {
     }
 }
 
+fn assert_public_payload_hides_route(
+    payload: &serde_json::Value,
+    route: &ProviderRouteSnapshot,
+    extra_sentinels: &[&str],
+) {
+    fn walk(value: &serde_json::Value, path: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    assert!(
+                        !key.eq_ignore_ascii_case("providerRoute")
+                            && !key.eq_ignore_ascii_case("provider_route"),
+                        "providerRoute leaked at {path}.{key}"
+                    );
+                    walk(child, &format!("{path}.{key}"));
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for (index, child) in values.iter().enumerate() {
+                    walk(child, &format!("{path}[{index}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(payload, "$");
+    let encoded = payload.to_string();
+    let qualification = route.qualification_record_id.as_deref().unwrap_or_default();
+    for sentinel in [route.base_url.as_str(), route.credential_ref.as_str()]
+        .into_iter()
+        .chain([
+            route.credential_fingerprint.as_str(),
+            route.endpoint_fingerprint.as_str(),
+            qualification,
+            route.selection_key.as_str(),
+        ])
+        .chain(extra_sentinels.iter().copied())
+    {
+        if sentinel.is_empty() {
+            continue;
+        }
+        assert!(
+            !encoded.contains(sentinel),
+            "public payload leaked {sentinel}: {encoded}"
+        );
+    }
+    assert!(!public_run_contains_forbidden_fields(payload));
+    if let Some(route_json) = payload
+        .get("providerExecution")
+        .and_then(|value| value.get("route"))
+        .or_else(|| {
+            payload
+                .get("runs")
+                .and_then(|runs| runs.get(0))
+                .and_then(|run| run.get("providerExecution"))
+                .and_then(|value| value.get("route"))
+        })
+    {
+        assert!(route_json.get("quotaReservationId").is_none());
+        assert!(route_json.get("selectionKey").is_none());
+        assert!(route_json.get("qualificationRecordId").is_none());
+        assert!(
+            public_provider_route_keys_are_allowlisted(route_json),
+            "providerExecution.route keys must be exact-allowlisted: {route_json}"
+        );
+    }
+}
+
+fn mcp_text_value(raw: &serde_json::Value) -> serde_json::Value {
+    let text = raw
+        .get("content")
+        .and_then(|content| content.get(0))
+        .and_then(|item| item.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .expect("MCP tool result must include content[0].text");
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({ "text": text }))
+}
+
+fn assert_public_surfaces_hide_route(
+    get_run: &serde_json::Value,
+    list_runs: &serde_json::Value,
+    progress: &serde_json::Value,
+    host_list: &[PublicRun],
+    host_get: &PublicRun,
+    route: &ProviderRouteSnapshot,
+    extra_sentinels: &[&str],
+) {
+    assert_public_payload_hides_route(get_run, route, extra_sentinels);
+    assert_public_payload_hides_route(list_runs, route, extra_sentinels);
+    assert_public_payload_hides_route(&list_runs["runs"][0], route, extra_sentinels);
+    assert_public_payload_hides_route(progress, route, extra_sentinels);
+    let host_list_value = serde_json::to_value(host_list).unwrap();
+    let host_get_value = serde_json::to_value(host_get).unwrap();
+    assert_public_payload_hides_route(&host_list_value, route, extra_sentinels);
+    assert_public_payload_hides_route(&host_get_value, route, extra_sentinels);
+    let decoded: PublicRun = serde_json::from_value(get_run.clone()).unwrap();
+    assert_public_payload_hides_route(
+        &serde_json::to_value(&decoded).unwrap(),
+        route,
+        extra_sentinels,
+    );
+    let decoded_list: Vec<PublicRun> = serde_json::from_value(list_runs["runs"].clone()).unwrap();
+    assert_public_payload_hides_route(
+        &serde_json::to_value(&decoded_list).unwrap(),
+        route,
+        extra_sentinels,
+    );
+}
+
 fn run_record(
     intent_id: &str,
     session: Uuid,
@@ -711,7 +827,7 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         "native",
         "Verify the frozen provider route at native admission",
         lane.id,
-        workspace_text,
+        workspace_text.clone(),
         "operator",
         WorkPolicy::default(),
     )
@@ -816,6 +932,77 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         .get_progress_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
         .unwrap();
     assert_eq!(progress["providerExecution"], *provider_execution);
+    let listed = orch
+        .list_runs_scoped(&auth(), lane.id, workspace.path())
+        .unwrap();
+    let control = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let mcp_get = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    let mcp_list = client
+        .call_tool(
+            "ptah_list_runs",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+            }),
+        )
+        .await
+        .unwrap();
+    let mcp_progress = client
+        .call_tool(
+            "ptah_get_progress",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    let host_list = host.list_public_session_runs(lane.id).unwrap();
+    let host_get = host
+        .get_public_session_run(lane.id, &run.run_id)
+        .unwrap()
+        .expect("desktop get must see the admitted Run");
+    let sentinels = ["synthetic-native-route-key"];
+    assert_public_surfaces_hide_route(
+        &admitted_view,
+        &listed,
+        &progress,
+        &host_list,
+        &host_get,
+        run_route,
+        &sentinels,
+    );
+    assert_public_surfaces_hide_route(
+        &mcp_get.structured,
+        &mcp_list.structured,
+        &mcp_progress.structured,
+        &host_list,
+        &host_get,
+        run_route,
+        &sentinels,
+    );
+    assert_public_surfaces_hide_route(
+        &mcp_text_value(&mcp_get.raw),
+        &mcp_text_value(&mcp_list.raw),
+        &mcp_text_value(&mcp_progress.raw),
+        &host_list,
+        &host_get,
+        run_route,
+        &sentinels,
+    );
     let admitted_capacity = orch.get_capacity(&auth()).unwrap();
     assert_eq!(admitted_capacity["providerQuota"]["activeReservations"], 1);
     assert_eq!(
@@ -2171,4 +2358,803 @@ async fn failed_permission_respond_then_recovery_does_not_unpark() {
     );
     orch.stop_background_tasks().await;
     let _ = workspace;
+}
+
+const FAILING_BASE_URL: &str = "http://127.0.0.1:35201/leak-base-url-sentinel-pr352/v1";
+const FAILING_CREDENTIAL_REF: &str = "keychain:provider/leak-cred-ref-sentinel-pr352";
+const FAILING_CREDENTIAL_FP: &str = "v1-sha256:leak-cred-fp-sentinel-pr352";
+const FAILING_QUOTA: &str = "quota-leak-reservation-sentinel-pr352";
+
+fn failing_provider_route(reservation_id: &str) -> ProviderRouteSnapshot {
+    let mut route = ProviderRouteSnapshot {
+        schema_version: PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
+        provider_id: "env-grokptah".into(),
+        model_id: "leak-model".into(),
+        wire_model_id: "leak-model".into(),
+        selection_key: model_selection_key("env-grokptah", "leak-model"),
+        kind: ProviderKind::OpenAiCompatible,
+        dialect: ProviderDialect::OpenAiChatCompletions,
+        base_url: FAILING_BASE_URL.into(),
+        endpoint_fingerprint: "pending".into(),
+        credential_ref: FAILING_CREDENTIAL_REF.into(),
+        credential_fingerprint: FAILING_CREDENTIAL_FP.into(),
+        capabilities: ModelCapabilities {
+            chat: true,
+            tools: true,
+            stream: true,
+            source: CapabilitySource::Measured,
+            qualification_schema: Some("grokptah.provider-qualification.v1".into()),
+            ..ModelCapabilities::default()
+        },
+        deadline_class: ProviderDeadlineClass::Standard,
+        effort: EffortLevel::Medium,
+        qualification_record_id: None,
+        quota_class: Some(QuotaClass::CodingExecution),
+        quota_reservation_id: Some(reservation_id.into()),
+        snapshot_hash: "pending".into(),
+    };
+    route.endpoint_fingerprint = hash_payload(&json!({
+        "kind": route.kind,
+        "dialect": route.dialect,
+        "baseUrl": route.base_url,
+    }));
+    route.qualification_record_id = Some(hash_payload(&json!({
+        "providerId": route.provider_id,
+        "modelId": route.model_id,
+        "wireModelId": route.wire_model_id,
+        "endpointFingerprint": route.endpoint_fingerprint,
+        "credentialFingerprint": route.credential_fingerprint,
+        "qualificationSchema": route.capabilities.qualification_schema,
+    })));
+    let material = json!({
+        "schemaVersion": route.schema_version,
+        "providerId": route.provider_id,
+        "modelId": route.model_id,
+        "wireModelId": route.wire_model_id,
+        "selectionKey": route.selection_key,
+        "kind": route.kind,
+        "dialect": route.dialect,
+        "baseUrl": route.base_url,
+        "endpointFingerprint": route.endpoint_fingerprint,
+        "credentialRef": route.credential_ref,
+        "credentialFingerprint": route.credential_fingerprint,
+        "capabilities": route.capabilities,
+        "deadlineClass": route.deadline_class,
+        "effort": route.effort,
+        "qualificationRecordId": route.qualification_record_id,
+        "quotaClass": route.quota_class,
+        "quotaReservationId": route.quota_reservation_id,
+    });
+    route.snapshot_hash = hash_payload(&material);
+    route
+        .validate()
+        .expect("failing provider route must validate");
+    route
+}
+
+/// Poison a completed Run with source-route secrets without a missing quota
+/// reservation. `update_run` cannot change `provider_route`.
+fn failing_provider_poison_route() -> ProviderRouteSnapshot {
+    let mut route = failing_provider_route("unused-quota-not-persisted");
+    route.quota_class = None;
+    route.quota_reservation_id = None;
+    let material = json!({
+        "schemaVersion": route.schema_version,
+        "providerId": route.provider_id,
+        "modelId": route.model_id,
+        "wireModelId": route.wire_model_id,
+        "selectionKey": route.selection_key,
+        "kind": route.kind,
+        "dialect": route.dialect,
+        "baseUrl": route.base_url,
+        "endpointFingerprint": route.endpoint_fingerprint,
+        "credentialRef": route.credential_ref,
+        "credentialFingerprint": route.credential_fingerprint,
+        "capabilities": route.capabilities,
+        "deadlineClass": route.deadline_class,
+        "effort": route.effort,
+        "qualificationRecordId": route.qualification_record_id,
+    });
+    route.snapshot_hash = hash_payload(&material);
+    route
+        .validate()
+        .expect("quota-free failing provider route must validate");
+    route
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_and_replay() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let store = host.ensure_orchestration_store().unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let workspace_text = workspace.path().display().to_string();
+    let route = failing_provider_route(FAILING_QUOTA);
+    let now = chrono::Utc::now();
+    let mut run = RunRecord {
+        run_id: "native-failing-provider".into(),
+        session_id: lane.id,
+        workspace: workspace_text.clone(),
+        request_id: "native-failing-req".into(),
+        client_id: Some("mcp".into()),
+        state: RunState::Failed,
+        purpose: RunPurpose::Execution,
+        provider_route: Some(route.clone()),
+        agent_id: None,
+        retry_of: None,
+        parent_run_id: None,
+        agent_spec_revision: None,
+        checkpoint_id: None,
+        continuation_context_id: None,
+        continuation_context_hash: None,
+        continuation_fidelity: None,
+        queue_position: None,
+        bounds: RunBounds {
+            max_total_tokens: Some(8_000),
+            ..RunBounds::default()
+        },
+        prompt_preview: format!("retry {}", route.selection_key),
+        start_seq: Some(1),
+        end_seq: Some(2),
+        created_at: now,
+        updated_at: now,
+        terminal_result: Some(format!("credential {} rejected", FAILING_CREDENTIAL_REF)),
+        final_response: Some(format!("failed calling {FAILING_BASE_URL}")),
+        error_code: Some("provider_failed".into()),
+        stop_cause: None,
+        aggregates: RunAggregates {
+            changes: vec![ChangeRecord {
+                path: format!("called {FAILING_BASE_URL}"),
+                summary: format!("ref {FAILING_CREDENTIAL_REF}"),
+            }],
+            ..RunAggregates::default()
+        },
+        progress: Some(RunProgress {
+            round: 1,
+            max_rounds: 4,
+            last_tool: Some(format!("mcp:{FAILING_CREDENTIAL_FP}")),
+            detail: format!("upstream {} fingerprint", route.endpoint_fingerprint),
+            updated_at: now,
+        }),
+        execution: None,
+        approval: None,
+    };
+    let reservation =
+        QuotaReservation::for_run(&run, "primary", QuotaLimits::default(), now).unwrap();
+    store
+        .admit_run_with_quota(&run, &reservation)
+        .into_result()
+        .unwrap();
+
+    let control = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let scope = json!({
+        "session_id": lane.id,
+        "workspace": workspace_text,
+        "run_id": run.run_id,
+    });
+    let get_run = client
+        .call_tool("ptah_get_run", scope.clone())
+        .await
+        .unwrap();
+    let list_runs = client
+        .call_tool(
+            "ptah_list_runs",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+            }),
+        )
+        .await
+        .unwrap();
+    let progress = client
+        .call_tool("ptah_get_progress", scope.clone())
+        .await
+        .unwrap();
+    assert!(!get_run.is_error, "{:?}", get_run.raw);
+    assert!(!list_runs.is_error, "{:?}", list_runs.raw);
+    assert!(!progress.is_error, "{:?}", progress.raw);
+    for (name, payload) in [
+        ("get-structured", &get_run.structured),
+        ("get-text", &mcp_text_value(&get_run.raw)),
+        ("list-structured", &list_runs.structured["runs"][0]),
+        ("progress-structured", &progress.structured),
+        ("progress-text", &mcp_text_value(&progress.raw)),
+    ] {
+        assert_public_payload_hides_route(payload, &route, &[]);
+        let encoded = payload.to_string();
+        assert!(
+            !encoded.contains(FAILING_BASE_URL),
+            "{name} leaked base_url: {encoded}"
+        );
+        assert!(
+            !encoded.contains(FAILING_CREDENTIAL_REF),
+            "{name} leaked credential ref"
+        );
+        assert_eq!(
+            payload.get("errorCode"),
+            Some(&json!(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)),
+            "{name} must use the typed public error code: {payload}"
+        );
+    }
+    assert_public_payload_hides_route(&list_runs.structured, &route, &[]);
+    assert_public_payload_hides_route(&mcp_text_value(&list_runs.raw), &route, &[]);
+    assert!(!mcp_text_value(&list_runs.raw)
+        .to_string()
+        .contains(FAILING_BASE_URL));
+    assert_eq!(list_runs.structured["totalCount"], 1);
+    assert_eq!(list_runs.structured["truncated"], false);
+
+    let persisted = serde_json::to_value(store.load_run(&run.run_id).unwrap().unwrap()).unwrap();
+    let promote_request = "native-promote-replay";
+    let approval_id = "native-approval-replay";
+    let promote_hash = hash_payload(&json!({
+        "sessionId": lane.id,
+        "workspace": workspace_text,
+        "runId": run.run_id,
+        "approvalId": approval_id,
+    }));
+    assert!(matches!(
+        store
+            .claim_idempotency("ptah_promote_run", promote_request, &promote_hash)
+            .unwrap(),
+        IdempotencyClaim::Perform
+    ));
+    store
+        .complete_idempotency(
+            "ptah_promote_run",
+            promote_request,
+            &promote_hash,
+            Some(run.run_id.clone()),
+            persisted.clone(),
+        )
+        .unwrap();
+    let promote = client
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": promote_request,
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+                "approval_id": approval_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!promote.is_error, "{:?}", promote.raw);
+    assert_public_payload_hides_route(&promote.structured, &route, &[]);
+    assert_public_payload_hides_route(&mcp_text_value(&promote.raw), &route, &[]);
+    let promote_text = mcp_text_value(&promote.raw).to_string();
+    assert!(!promote_text.contains(FAILING_BASE_URL));
+    assert!(!promote_text.contains(FAILING_CREDENTIAL_REF));
+
+    let discard_route = failing_provider_route("quota-leak-discard-sentinel-pr352");
+    run.run_id = "native-failing-discard".into();
+    run.request_id = "native-failing-discard-req".into();
+    run.provider_route = Some(discard_route.clone());
+    let discard_reservation =
+        QuotaReservation::for_run(&run, "primary", QuotaLimits::default(), now).unwrap();
+    store
+        .admit_run_with_quota(&run, &discard_reservation)
+        .into_result()
+        .unwrap();
+    let discard_request = "native-discard-replay";
+    let discard_hash = hash_payload(&json!({
+        "sessionId": lane.id,
+        "workspace": workspace_text,
+        "runId": run.run_id,
+    }));
+    assert!(matches!(
+        store
+            .claim_idempotency("ptah_discard_run", discard_request, &discard_hash)
+            .unwrap(),
+        IdempotencyClaim::Perform
+    ));
+    store
+        .complete_idempotency(
+            "ptah_discard_run",
+            discard_request,
+            &discard_hash,
+            Some(run.run_id.clone()),
+            serde_json::to_value(&run).unwrap(),
+        )
+        .unwrap();
+    let discard = client
+        .call_tool(
+            "ptah_discard_run",
+            json!({
+                "request_id": discard_request,
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!discard.is_error, "{:?}", discard.raw);
+    assert_public_payload_hides_route(&discard.structured, &discard_route, &[]);
+    assert_public_payload_hides_route(&mcp_text_value(&discard.raw), &discard_route, &[]);
+    client.close_session().await.unwrap();
+    orch.stop_background_tasks().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn failing_provider_mcp_events_and_desktop_journal_are_scrubbed() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let store = host.ensure_orchestration_store().unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let workspace_text = workspace.path().display().to_string();
+    let route = failing_provider_route(FAILING_QUOTA);
+    let now = chrono::Utc::now();
+    host.event_bus().publish(SessionUpdate::FileEdit {
+        session_id: lane.id,
+        path: format!("called {FAILING_BASE_URL}"),
+        summary: format!("ref {FAILING_CREDENTIAL_REF}"),
+        unified_diff: format!("--- {FAILING_BASE_URL}\n"),
+    });
+    host.event_bus().publish(SessionUpdate::ShellOutput {
+        session_id: lane.id,
+        call_id: "shell-leak".into(),
+        data: format!("curl {FAILING_BASE_URL}"),
+    });
+    let journal = host.event_bus().read_after(0, 500);
+    let leaked_seqs: Vec<u64> = journal
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.update {
+            SessionUpdate::FileEdit { path, .. } if path.contains(FAILING_BASE_URL) => {
+                Some(entry.seq)
+            }
+            SessionUpdate::ShellOutput { data, .. } if data.contains(FAILING_BASE_URL) => {
+                Some(entry.seq)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(leaked_seqs.len(), 2, "durable journal must retain the leak");
+    let durable = serde_json::to_value(&journal).unwrap();
+    assert!(
+        durable.to_string().contains(FAILING_BASE_URL),
+        "internal journal is not the public surface"
+    );
+    let run = RunRecord {
+        run_id: "native-failing-events".into(),
+        session_id: lane.id,
+        workspace: workspace_text.clone(),
+        request_id: "native-failing-events-req".into(),
+        client_id: Some("mcp".into()),
+        state: RunState::Failed,
+        purpose: RunPurpose::Execution,
+        provider_route: Some(route.clone()),
+        agent_id: None,
+        retry_of: None,
+        parent_run_id: None,
+        agent_spec_revision: None,
+        checkpoint_id: None,
+        continuation_context_id: None,
+        continuation_context_hash: None,
+        continuation_fidelity: None,
+        queue_position: None,
+        bounds: RunBounds {
+            max_total_tokens: Some(8_000),
+            ..RunBounds::default()
+        },
+        prompt_preview: format!("retry {}", route.selection_key),
+        start_seq: Some(leaked_seqs[0]),
+        end_seq: Some(*leaked_seqs.last().unwrap()),
+        created_at: now,
+        updated_at: now,
+        terminal_result: Some(format!("credential {} rejected", FAILING_CREDENTIAL_REF)),
+        final_response: Some(format!("failed calling {FAILING_BASE_URL}")),
+        error_code: Some("provider_failed".into()),
+        stop_cause: None,
+        aggregates: RunAggregates::default(),
+        progress: None,
+        execution: None,
+        approval: None,
+    };
+    let reservation =
+        QuotaReservation::for_run(&run, "primary", QuotaLimits::default(), now).unwrap();
+    store
+        .admit_run_with_quota(&run, &reservation)
+        .into_result()
+        .unwrap();
+
+    let control = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let events = client
+        .call_tool(
+            "ptah_get_events",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": run.run_id,
+                "after_seq": 0,
+                "limit": 100,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!events.is_error, "{:?}", events.raw);
+    let structured = events.structured.to_string();
+    let text = mcp_text_value(&events.raw).to_string();
+    for haystack in [&structured, &text] {
+        assert!(
+            !haystack.contains(FAILING_BASE_URL),
+            "ptah_get_events leaked base_url: {haystack}"
+        );
+        assert!(
+            !haystack.contains(FAILING_CREDENTIAL_REF),
+            "ptah_get_events leaked credential ref: {haystack}"
+        );
+    }
+    assert_eq!(
+        events.structured["errorCode"],
+        json!(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)
+    );
+    assert_eq!(events.structured["entries"].as_array().unwrap().len(), 2);
+
+    let desktop = host
+        .get_session_run_events(lane.id, &run.run_id, 0, 100)
+        .unwrap();
+    let desktop_json = serde_json::to_value(&desktop).unwrap();
+    let desktop_text = desktop_json.to_string();
+    assert!(
+        !desktop_text.contains(FAILING_BASE_URL),
+        "desktop run_events leaked base_url: {desktop_text}"
+    );
+    assert!(!desktop_text.contains(FAILING_CREDENTIAL_REF));
+    assert_eq!(desktop.entries.len(), 2);
+
+    client.close_session().await.unwrap();
+    orch.stop_background_tasks().await;
+}
+
+fn init_git_workspace(workspace: &Path) {
+    std::fs::write(workspace.join("README.md"), "baseline\n").unwrap();
+    for args in [
+        vec!["init"],
+        vec!["add", "README.md"],
+        vec![
+            "-c",
+            "user.name=GrokPtah Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "baseline",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+fn inject_failing_provider_leak(store: &OrchStore, run_id: &str, route: &ProviderRouteSnapshot) {
+    let mut run = store
+        .load_run(run_id)
+        .unwrap()
+        .expect("completed run must still be durable");
+    run.provider_route = Some(route.clone());
+    run.prompt_preview = format!("retry {}", route.selection_key);
+    run.terminal_result = Some(format!("credential {FAILING_CREDENTIAL_REF} rejected"));
+    run.final_response = Some(format!("failed calling {FAILING_BASE_URL}"));
+    run.aggregates.changes.push(ChangeRecord {
+        path: format!("called {FAILING_BASE_URL}"),
+        summary: format!("ref {FAILING_CREDENTIAL_REF}"),
+    });
+    match run.progress.as_mut() {
+        Some(progress) => {
+            progress.last_tool = Some(format!("mcp:{FAILING_CREDENTIAL_FP}"));
+            progress.detail = format!("upstream {} fingerprint", route.endpoint_fingerprint);
+        }
+        None => {
+            run.progress = Some(RunProgress {
+                round: 1,
+                max_rounds: 4,
+                last_tool: Some(format!("mcp:{FAILING_CREDENTIAL_FP}")),
+                detail: format!("upstream {} fingerprint", route.endpoint_fingerprint),
+                updated_at: run.updated_at,
+            });
+        }
+    }
+    let path = store.root().join("runs").join(format!(
+        "{}.json",
+        safe_id_filename(run_id).expect("run_id must be a safe filename")
+    ));
+    std::fs::write(&path, serde_json::to_vec_pretty(&run).unwrap()).unwrap();
+}
+
+async fn wait_for_mcp_run(
+    client: &mut McpControlClient,
+    session_id: Uuid,
+    workspace: &str,
+    run_id: &str,
+) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..200 {
+        let run = client
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "run_id": run_id
+                }),
+            )
+            .await
+            .unwrap();
+        last = run.structured.clone();
+        if matches!(
+            last["state"].as_str(),
+            Some("completed" | "failed" | "cancelled" | "interrupted" | "limit_reached")
+        ) {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("run {run_id} did not reach a terminal state: {last}");
+}
+
+fn assert_live_public_run_hides_failing_provider(
+    payload: &serde_json::Value,
+    route: &ProviderRouteSnapshot,
+) {
+    assert_public_payload_hides_route(payload, route, &[]);
+    let encoded = payload.to_string();
+    assert!(
+        !encoded.contains(FAILING_BASE_URL),
+        "live MCP payload leaked base_url: {encoded}"
+    );
+    assert!(
+        !encoded.contains(FAILING_CREDENTIAL_REF),
+        "live MCP payload leaked credential ref"
+    );
+    assert_eq!(
+        payload.get("errorCode"),
+        Some(&json!(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)),
+        "live MCP payload must use the typed public error code: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn failing_provider_live_isolated_promote_and_discard_are_scrubbed() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    init_git_workspace(workspace.path());
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    host.set_project_cwd(workspace.path()).unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+    let store = host.ensure_orchestration_store().unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "native-token-308".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let control = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
+    client.initialize().await.unwrap();
+    let workspace_text = workspace.path().display().to_string();
+    let discard_route = failing_provider_poison_route();
+    let discard_submitted = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "native-live-discard-submit",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "prompt": "write mcp-discard.txt: leftover isolated file",
+                "execution_mode": "isolated_worktree"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!discard_submitted.is_error, "{:?}", discard_submitted.raw);
+    let discard_id = discard_submitted.structured["runId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let discard_completed =
+        wait_for_mcp_run(&mut client, lane.id, &workspace_text, &discard_id).await;
+    assert_eq!(
+        discard_completed["state"], "completed",
+        "discard source run: {discard_completed}"
+    );
+    inject_failing_provider_leak(&store, &discard_id, &discard_route);
+    let discard = client
+        .call_tool(
+            "ptah_discard_run",
+            json!({
+                "request_id": "native-live-discard",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": discard_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!discard.is_error, "{:?}", discard.raw);
+    assert_eq!(
+        discard.structured["execution"]["promotionState"],
+        "discarded"
+    );
+    assert_live_public_run_hides_failing_provider(&discard.structured, &discard_route);
+    assert_live_public_run_hides_failing_provider(&mcp_text_value(&discard.raw), &discard_route);
+
+    let promote_route = failing_provider_poison_route();
+    let submitted = client
+        .call_tool(
+            "ptah_submit_task",
+            json!({
+                "request_id": "native-live-promote-submit",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "prompt": "write mcp-approved.txt: hello from isolated run",
+                "execution_mode": "isolated_worktree"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!submitted.is_error, "{:?}", submitted.raw);
+    let promote_id = submitted.structured["runId"].as_str().unwrap().to_string();
+    let completed = wait_for_mcp_run(&mut client, lane.id, &workspace_text, &promote_id).await;
+    assert_eq!(
+        completed["state"], "completed",
+        "promote source run: {completed}"
+    );
+    inject_failing_provider_leak(&store, &promote_id, &promote_route);
+    let poisoned = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": promote_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!poisoned.is_error, "{:?}", poisoned.raw);
+    assert_live_public_run_hides_failing_provider(&poisoned.structured, &promote_route);
+    assert_live_public_run_hides_failing_provider(&mcp_text_value(&poisoned.raw), &promote_route);
+    let review = client
+        .call_tool(
+            "ptah_review_run",
+            json!({
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": promote_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!review.is_error, "{:?}", review.raw);
+    let review_text = format!("{}{}", review.structured, mcp_text_value(&review.raw));
+    assert!(
+        !review_text.contains(FAILING_BASE_URL) && !review_text.contains(FAILING_CREDENTIAL_REF),
+        "ptah_review_run leaked route secrets: {review_text}"
+    );
+    let approval = client
+        .call_tool(
+            "ptah_approve_run",
+            json!({
+                "request_id": "native-live-approve",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": promote_id,
+                "source_fingerprint": review.structured["sourceFingerprint"],
+                "final_fingerprint": review.structured["finalFingerprint"],
+                "changed_files": review.structured["changedFiles"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!approval.is_error, "{:?}", approval.raw);
+    let approval_id = approval.structured["approvalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    inject_failing_provider_leak(&store, &promote_id, &promote_route);
+    let promote = client
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": "native-live-promote",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": promote_id,
+                "approval_id": approval_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!promote.is_error, "{:?}", promote.raw);
+    assert_eq!(
+        promote.structured["execution"]["promotionState"],
+        "promoted"
+    );
+    assert_live_public_run_hides_failing_provider(&promote.structured, &promote_route);
+    assert_live_public_run_hides_failing_provider(&mcp_text_value(&promote.raw), &promote_route);
+    let replay = client
+        .call_tool(
+            "ptah_promote_run",
+            json!({
+                "request_id": "native-live-promote",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "run_id": promote_id,
+                "approval_id": approval_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.structured["runId"], promote.structured["runId"]);
+    assert_live_public_run_hides_failing_provider(&replay.structured, &promote_route);
+    client.close_session().await.unwrap();
+    orch.stop_background_tasks().await;
 }

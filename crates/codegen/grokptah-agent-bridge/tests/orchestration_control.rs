@@ -967,6 +967,77 @@ async fn workspace_mismatch_fail_closed() {
     set_grokptah_home_override(None);
 }
 
+#[cfg(unix)]
+#[test]
+#[allow(clippy::await_holding_lock)]
+fn get_run_scoped_matches_symlinked_and_canonical_workspace() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let real = tempdir().unwrap();
+    let links = tempdir().unwrap();
+    let alias = links.path().join("ws");
+    std::os::unix::fs::symlink(real.path(), &alias).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, &alias).unwrap();
+    let store = OrchStore::open(home.path().join("orch")).unwrap();
+    let orch = OrchestrationService::new(
+        host,
+        EventBus::new(64),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([alias.clone()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let now = Utc::now();
+    let run = RunRecord {
+        run_id: "alias-workspace-run".into(),
+        session_id: session.id,
+        workspace: alias.display().to_string(),
+        request_id: "alias-workspace-req".into(),
+        client_id: Some("mcp".into()),
+        state: RunState::Failed,
+        purpose: Default::default(),
+        provider_route: None,
+        agent_id: None,
+        retry_of: None,
+        parent_run_id: None,
+        agent_spec_revision: None,
+        checkpoint_id: None,
+        continuation_context_id: None,
+        continuation_context_hash: None,
+        continuation_fidelity: None,
+        queue_position: None,
+        bounds: RunBounds::default(),
+        prompt_preview: "inspect".into(),
+        start_seq: Some(1),
+        end_seq: Some(2),
+        created_at: now,
+        updated_at: now,
+        terminal_result: None,
+        final_response: None,
+        error_code: None,
+        stop_cause: None,
+        aggregates: Default::default(),
+        progress: None,
+        execution: None,
+        approval: None,
+    };
+    store.save_run(&run).unwrap();
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let via_alias = orch
+        .get_run_scoped(&auth, session.id, &alias, &run.run_id)
+        .expect("alias workspace must authorize get_run");
+    let via_canonical = orch
+        .get_run_scoped(&auth, session.id, real.path(), &run.run_id)
+        .expect("canonical workspace must authorize get_run");
+    assert_eq!(via_alias["runId"], run.run_id);
+    assert_eq!(via_canonical["runId"], run.run_id);
+    set_grokptah_home_override(None);
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn missing_session_workspace_is_not_controllable() {

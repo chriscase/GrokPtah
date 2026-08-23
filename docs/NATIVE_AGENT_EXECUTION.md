@@ -117,10 +117,13 @@ per deployment is deliberate follow-up work, not part of this contract.
 ### Capability and purpose gate
 
 Online autonomous admission validates the frozen route before it reserves
-quota or creates a Run. Unknown capability records are refused. Execution Runs
-require chat generation and native coding-tool capability; ManagerProposal
-Runs require chat generation but do not require tool capability because the
-host denies every tool for that purpose.
+quota or creates a Run. Interactive desktop Build uses the same host-owned
+validator after exact route capture and before Run persistence, provider
+attempts, quota reservation, usage tracking, or network dispatch. Unknown
+capability records are refused. Execution Runs require chat generation and
+native coding-tool capability; ManagerProposal Runs require chat generation
+but do not require tool capability because the host denies every tool for
+that purpose.
 
 Declared capability records remain usable before a model's first measured
 qualification, preserving the existing compatible-provider first-run path.
@@ -249,6 +252,15 @@ reference and fingerprint, bearer material, request/response bodies, and any
 provider error body. The persisted Run remains backward compatible; the
 projection is the safe operator-facing summary rather than a replacement for
 the frozen route contract.
+
+Every public list/get/progress surface serializes one allowlisted `PublicRun`
+(or `PublicRunProgress`) instead of the persistence record. MCP
+`ptah_list_runs` / `ptah_get_run` / `ptah_get_progress`, hosted-service MCP,
+local Tauri `run_list` / `run_get`, and remote-desktop decoding share that
+type. TypeScript omitting `providerRoute` does not remove it from a raw
+`RunRecord` payload, so adapters never serialize `RunRecord` and subtract
+fields afterward. The full frozen `ProviderRouteSnapshot` stays in trusted
+durable storage and internal host logic.
 
 `ptah_get_capacity` adds an owner-scoped `providerQuota` summary. It reports
 reservation counts, token/request totals, and a bounded sorted set of provider

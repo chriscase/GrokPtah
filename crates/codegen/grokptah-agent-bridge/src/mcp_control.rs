@@ -32,11 +32,12 @@ use uuid::Uuid;
 
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    AuthContext, ChangeRecord, ManagerStepSpec, MessageKind, MissedRunPolicy, OrchError,
-    OrchErrorCode, OrchestrationConfig, OrchestrationService, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef,
-    WorkDependency, WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist,
-    CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    scrub_route_secret_needles, AuthContext, ChangeRecord, ManagerStepSpec, MessageKind,
+    MissedRunPolicy, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
+    ProviderRouteSnapshot, RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRetryPolicy,
+    RoutineTrigger, RunExecutionMode, WorkArtifactRef, WorkDependency, WorkPolicy, WorkResult,
+    WorkTemplate, WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -128,6 +129,7 @@ struct LiveStreamState {
     run_id: String,
     start_seq: u64,
     end_seq: Option<u64>,
+    provider_route: Option<ProviderRouteSnapshot>,
     receiver: EventReceiver,
     last_seq: u64,
     replay_cursor: Option<u64>,
@@ -151,7 +153,7 @@ impl LiveStreamState {
         }
     }
 
-    fn queue_entry(&mut self, seq: u64, ts: String, update: SessionUpdate) {
+    fn queue_entry(&mut self, seq: u64, ts: String, mut update: SessionUpdate) {
         if seq <= self.last_seq || seq < self.start_seq {
             return;
         }
@@ -159,6 +161,15 @@ impl LiveStreamState {
             if seq > end_seq {
                 self.done = true;
                 return;
+            }
+        }
+        match scrub_route_secret_needles(&mut update, self.provider_route.as_ref()) {
+            Ok(_) => {}
+            Err(_) => {
+                update = SessionUpdate::Error {
+                    session_id: self.session_id,
+                    message: PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS.to_string(),
+                };
             }
         }
         let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
@@ -618,7 +629,11 @@ async fn streamable_get_handler(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "jsonrpc": "2.0",
-                "error": {"code": -32600, "message": "missing or unknown mcp-session-id"}
+                "error": {
+                    "code": -32600,
+                    "message": "missing or unknown mcp-session-id",
+                    "data": {"code": "unknown_session"}
+                }
             })),
         )
             .into_response();
@@ -721,6 +736,7 @@ async fn streamable_get_handler(
         run_id: scope.run_id,
         start_seq: scope.start_seq,
         end_seq: scope.end_seq,
+        provider_route: scope.provider_route,
         receiver,
         last_seq,
         replay_cursor: None,
@@ -803,6 +819,17 @@ struct PersistentAgentArgs {
 struct SessionWorkspaceArgs {
     session_id: Uuid,
     workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListRunsArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1659,7 +1686,7 @@ fn require_session_if_present(state: &AppState, headers: &HeaderMap) -> Result<(
     let mut g = state.sessions.lock();
     let Some(s) = g.get_mut(&sid) else {
         return Err(OrchError::new(
-            OrchErrorCode::InvalidRequest,
+            OrchErrorCode::UnknownSession,
             "unknown mcp-session-id",
         ));
     };
@@ -1775,8 +1802,10 @@ fn status_for(e: &OrchError) -> StatusCode {
     match e.code {
         OrchErrorCode::Unauthenticated => StatusCode::UNAUTHORIZED,
         OrchErrorCode::ForbiddenScope | OrchErrorCode::WorkspaceMismatch => StatusCode::FORBIDDEN,
-        OrchErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
-        OrchErrorCode::StaleVersion | OrchErrorCode::Conflict => StatusCode::CONFLICT,
+        OrchErrorCode::InvalidRequest | OrchErrorCode::UnknownSession => StatusCode::BAD_REQUEST,
+        OrchErrorCode::StaleVersion
+        | OrchErrorCode::Conflict
+        | OrchErrorCode::AdmissionUncertain => StatusCode::CONFLICT,
         OrchErrorCode::Unsupported => StatusCode::METHOD_NOT_ALLOWED,
         OrchErrorCode::CursorExpired => StatusCode::GONE,
         OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted => StatusCode::CONFLICT,
@@ -1871,7 +1900,9 @@ fn tool_input_schema(name: &str) -> Value {
             "additionalProperties": false,
             "properties": {
                 "session_id": session,
-                "workspace": workspace
+                "workspace": workspace,
+                "cursor": {"type": "string", "minLength": 1, "maxLength": 256},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 128}
             }
         }),
         "ptah_get_persistent_agent" => json!({
@@ -2717,8 +2748,14 @@ async fn dispatch_tool(
             orch.list_persistent_agents(auth)
         }
         "ptah_list_runs" => {
-            let args: SessionWorkspaceArgs = parse_value(args)?;
-            orch.list_runs_scoped(auth, args.session_id, &args.workspace)
+            let args: ListRunsArgs = parse_value(args)?;
+            orch.list_runs_scoped_page(
+                auth,
+                args.session_id,
+                &args.workspace,
+                args.cursor.as_deref(),
+                args.limit,
+            )
         }
         "ptah_get_persistent_agent" => {
             let args: PersistentAgentArgs = parse_value(args)?;

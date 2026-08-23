@@ -4,9 +4,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
-    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, RoutineRecord,
-    RoutineSnapshot, RunExecutionMode, RunRecord, RunScope, RunState, RuntimeConnectionState,
-    RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
+    ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, McpRemoteError,
+    PublicRun, PublicRunPage, RoutineRecord, RoutineSnapshot, RunExecutionMode, RunScope, RunState,
+    RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -296,7 +296,7 @@ impl RemoteServiceState {
         ))
     }
 
-    pub async fn list_runs(&self) -> Result<Option<Vec<RunRecord>>> {
+    pub async fn list_runs(&self) -> Result<Option<PublicRunPage>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
@@ -569,7 +569,7 @@ impl RemoteServiceState {
         session_id: Uuid,
         workspace: String,
         run_id: String,
-    ) -> Result<Option<Value>> {
+    ) -> Result<Option<PublicRun>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
@@ -914,9 +914,9 @@ impl RemoteServiceClient {
             .ok_or_else(|| anyhow::anyhow!("remote resume response omitted response"))
     }
 
-    async fn list_runs(&mut self) -> Result<Vec<RunRecord>> {
+    async fn list_runs(&mut self) -> Result<PublicRunPage> {
         let sessions = self.list_sessions().await?;
-        let mut runs = Vec::new();
+        let mut pages = Vec::with_capacity(sessions.len());
         for session in sessions {
             let value = self
                 .call_tool(
@@ -927,17 +927,9 @@ impl RemoteServiceClient {
                     }),
                 )
                 .await?;
-            let mut scoped: Vec<RunRecord> = serde_json::from_value(
-                value
-                    .get("runs")
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("remote run list omitted runs"))?,
-            )
-            .context("decode remote durable run list")?;
-            runs.append(&mut scoped);
+            pages.push(decode_remote_run_page(value)?);
         }
-        runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        Ok(runs)
+        Ok(merge_remote_run_pages(pages))
     }
 
     async fn list_work(&mut self, session_id: Uuid, workspace: String) -> Result<Vec<WorkItem>> {
@@ -1279,16 +1271,18 @@ impl RemoteServiceClient {
         session_id: Uuid,
         workspace: String,
         run_id: String,
-    ) -> Result<Value> {
-        self.call_tool(
-            "ptah_get_run",
-            json!({
-                "session_id": session_id,
-                "workspace": workspace,
-                "run_id": run_id,
-            }),
-        )
-        .await
+    ) -> Result<PublicRun> {
+        let value = self
+            .call_tool(
+                "ptah_get_run",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "run_id": run_id,
+                }),
+            )
+            .await?;
+        serde_json::from_value(value).context("decode remote durable run")
     }
 
     async fn get_events(
@@ -1582,19 +1576,23 @@ fn normalize_base_url(value: &str) -> Result<String> {
 
 /// Reconnect only for transport failures, retryable HTTP statuses, or a
 /// server-side MCP session that disappeared during a restart. Application
-/// errors such as an invalid request or a terminal run must be returned
-/// directly; replaying those requests can duplicate mutations.
+/// errors such as `invalid_request`, `admission_uncertain`, `conflict`, or a
+/// terminal run must be returned directly; replaying those requests can
+/// duplicate mutations.
 fn should_reconnect_remote_error(error: &anyhow::Error) -> bool {
+    if is_stale_mcp_session_error(error) {
+        return true;
+    }
     let message = error.to_string();
     if let Some(rest) = message.strip_prefix("MCP HTTP ") {
         let status = rest
             .split_whitespace()
             .next()
             .and_then(|value| value.parse::<u16>().ok());
-        return message.contains("unknown mcp-session-id")
-            || status.is_some_and(|code| code == 408 || code == 429 || code >= 500);
+        return status.is_some_and(|code| code == 408 || code == 429 || code >= 500);
     }
     if message.starts_with("MCP error:")
+        || message.starts_with("MCP remote error:")
         || message.starts_with("missing required argument ")
         || message.starts_with("unexpected argument ")
         || message.starts_with("unknown tool ")
@@ -1603,6 +1601,55 @@ fn should_reconnect_remote_error(error: &anyhow::Error) -> bool {
         return false;
     }
     true
+}
+
+fn is_stale_mcp_session_error(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<McpRemoteError>()
+        .and_then(McpRemoteError::data_code)
+        == Some("unknown_session")
+    {
+        return true;
+    }
+    let message = error.to_string();
+    message == "MCP remote error: unknown_session" || message.contains("unknown mcp-session-id")
+}
+
+fn decode_remote_run_page(value: Value) -> Result<PublicRunPage> {
+    serde_json::from_value(value).context("decode remote durable run page")
+}
+
+/// Merge first pages from each remote session without following `nextCursor`.
+///
+/// Counts are summed. The combined first-page list is capped at
+/// [`grokptah_agent_bridge::orchestration::MAX_PUBLIC_RUN_LIST`]. The aggregated
+/// view has no unified cursor, so `next_cursor` is always omitted.
+fn merge_remote_run_pages(pages: Vec<PublicRunPage>) -> PublicRunPage {
+    use grokptah_agent_bridge::orchestration::MAX_PUBLIC_RUN_LIST;
+
+    let mut total_count = 0usize;
+    let mut source_truncated = false;
+    let mut runs = Vec::new();
+    for page in pages {
+        total_count = total_count.saturating_add(page.total_count);
+        source_truncated |= page.truncated;
+        runs.extend(page.runs);
+    }
+    runs.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then(right.run_id.cmp(&left.run_id))
+    });
+    let overflow = runs.len() > MAX_PUBLIC_RUN_LIST;
+    runs.truncate(MAX_PUBLIC_RUN_LIST);
+    let truncated = source_truncated || overflow || total_count > runs.len();
+    PublicRunPage {
+        runs,
+        total_count,
+        truncated,
+        next_cursor: None,
+    }
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -1630,15 +1677,260 @@ mod tests {
     use grokptah_agent_bridge::{
         home_override_serial, set_grokptah_home_override, start_control_server,
         start_control_server_with_bind, AgentHost, ControlServerLimits, HostConfig, OrchStore,
-        OrchestrationConfig, OrchestrationService, RunBounds, RunExecutionMode,
+        OrchestrationConfig, OrchestrationService, PublicRun, RunBounds, RunExecutionMode,
         RuntimeConnectionState, RuntimeTarget, WorkspaceAllowlist,
     };
     use tempfile::tempdir;
 
     use super::{
-        normalize_base_url, runtime_target_for_base_url, should_reconnect_remote_error,
-        RemoteServiceClient, RemoteServiceState,
+        decode_remote_run_page, merge_remote_run_pages, normalize_base_url,
+        runtime_target_for_base_url, should_reconnect_remote_error, RemoteServiceClient,
+        RemoteServiceState,
     };
+
+    #[test]
+    fn remote_run_decode_rejects_leaked_provider_route() {
+        let leaked = serde_json::json!({
+            "runId": "public-run-leak",
+            "sessionId": "11111111-1111-1111-1111-111111111111",
+            "workspace": "/tmp/public-run",
+            "requestId": "public-run-req",
+            "clientId": "mcp",
+            "state": "running",
+            "purpose": "execution",
+            "bounds": {
+                "maxPromptBytes": 1024,
+                "maxRounds": 4,
+                "maxDurationMs": 1000
+            },
+            "promptPreview": "inspect",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "aggregates": {
+                "changes": [],
+                "tests": []
+            },
+            "providerRoute": {
+                "baseUrl": "http://leak-base-url-sentinel-pr352.example/v1",
+                "credentialRef": "keychain:provider/leak-cred-ref-sentinel-pr352",
+                "credentialFingerprint": "v1-sha256:leak-cred-fp-sentinel-pr352",
+                "endpointFingerprint": "v1-sha256:leak-endpoint-fp-sentinel-pr352",
+                "qualificationRecordId": "leak-qualification-record-sentinel-pr352",
+                "selectionKey": "ptah.model.v1:leak-selection-key-sentinel-pr352",
+                "quotaReservationId": "quota-leak-reservation-sentinel-pr352"
+            },
+            "providerExecution": {
+                "route": {
+                    "providerId": "company-gateway",
+                    "kind": "open_ai_compatible",
+                    "dialect": "open_ai_chat_completions",
+                    "modelId": "leak-model",
+                    "wireModelId": "leak-model",
+                    "capabilitySource": "declared",
+                    "deadlineClass": "standard",
+                    "effort": "medium",
+                    "snapshotHash": "keep-public-route-hash"
+                },
+                "quota": null,
+                "attempts": [],
+                "attemptCount": 0,
+                "attemptsTruncated": false,
+                "usageComplete": false,
+                "pendingRequests": 0
+            }
+        });
+        let decoded = serde_json::from_value::<PublicRun>(leaked);
+        assert!(
+            decoded.is_err(),
+            "unknown nested providerRoute must fail remote decode: {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn remote_run_decode_rejects_unknown_nested_usage_keys() {
+        let mut leaked = serde_json::to_value(sample_public_run(
+            "public-run-usage-leak",
+            "2026-01-01T00:00:00Z",
+        ))
+        .unwrap();
+        leaked["aggregates"]["usage"]["credentialRef"] =
+            serde_json::json!("keychain:provider/leak-cred-ref-sentinel-pr352");
+        let decoded = serde_json::from_value::<PublicRun>(leaked);
+        assert!(
+            decoded.is_err(),
+            "unknown nested aggregates.usage keys must fail remote decode: {decoded:?}"
+        );
+    }
+
+    fn sample_public_run(run_id: &str, updated_at: &str) -> PublicRun {
+        serde_json::from_value(serde_json::json!({
+            "runId": run_id,
+            "sessionId": "11111111-1111-1111-1111-111111111111",
+            "workspace": "/tmp/public-run",
+            "requestId": run_id,
+            "clientId": "mcp",
+            "state": "completed",
+            "purpose": "execution",
+            "bounds": {
+                "maxPromptBytes": 1024,
+                "maxRounds": 4,
+                "maxDurationMs": 1000
+            },
+            "promptPreview": "inspect",
+            "startSeq": null,
+            "endSeq": null,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": updated_at,
+            "terminalResult": null,
+            "finalResponse": null,
+            "errorCode": null,
+            "aggregates": {
+                "changes": [],
+                "tests": []
+            }
+        }))
+        .expect("sample PublicRun")
+    }
+
+    #[test]
+    fn remote_run_page_decode_rejects_runs_only_payload() {
+        let runs_only = serde_json::json!({
+            "runs": [sample_public_run("keep-count", "2026-01-01T00:00:01Z")]
+        });
+        let decoded = decode_remote_run_page(runs_only);
+        assert!(
+            decoded.is_err(),
+            "remote list must not drop totalCount/truncated: {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn remote_run_page_decode_preserves_count_and_truncation() {
+        let page = decode_remote_run_page(serde_json::json!({
+            "runs": [sample_public_run("keep-count", "2026-01-01T00:00:01Z")],
+            "totalCount": 200,
+            "truncated": true,
+            "nextCursor": "keep-count"
+        }))
+        .expect("decode public run page");
+        assert_eq!(page.runs.len(), 1);
+        assert_eq!(page.runs[0].run_id, "keep-count");
+        assert_eq!(page.total_count, 200);
+        assert!(page.truncated);
+        assert_eq!(page.next_cursor.as_deref(), Some("keep-count"));
+    }
+
+    #[test]
+    fn remote_run_page_decode_rejects_leaked_provider_route() {
+        let leaked = serde_json::json!({
+            "runs": [{
+                "runId": "public-run-leak",
+                "sessionId": "11111111-1111-1111-1111-111111111111",
+                "workspace": "/tmp/public-run",
+                "requestId": "public-run-req",
+                "clientId": "mcp",
+                "state": "running",
+                "purpose": "execution",
+                "bounds": {
+                    "maxPromptBytes": 1024,
+                    "maxRounds": 4,
+                    "maxDurationMs": 1000
+                },
+                "promptPreview": "inspect",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "aggregates": {
+                    "changes": [],
+                    "tests": []
+                },
+                "providerRoute": {
+                    "baseUrl": "http://leak-base-url-sentinel-pr352.example/v1"
+                }
+            }],
+            "totalCount": 1,
+            "truncated": false
+        });
+        assert!(
+            decode_remote_run_page(leaked).is_err(),
+            "unknown nested providerRoute must fail remote page decode"
+        );
+    }
+
+    #[test]
+    fn merge_remote_run_pages_sums_counts_without_draining_cursors() {
+        let newer = sample_public_run("newer-run", "2026-01-01T00:00:02Z");
+        let older = sample_public_run("older-run", "2026-01-01T00:00:01Z");
+        let merged = merge_remote_run_pages(vec![
+            grokptah_agent_bridge::PublicRunPage {
+                runs: vec![older],
+                total_count: 80,
+                truncated: true,
+                next_cursor: Some("older-run".into()),
+            },
+            grokptah_agent_bridge::PublicRunPage {
+                runs: vec![newer],
+                total_count: 120,
+                truncated: false,
+                next_cursor: Some("newer-run".into()),
+            },
+        ]);
+        assert_eq!(merged.total_count, 200);
+        assert!(merged.truncated);
+        assert_eq!(
+            merged
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer-run", "older-run"]
+        );
+        assert_eq!(merged.next_cursor, None);
+    }
+
+    #[test]
+    fn merge_remote_run_pages_caps_first_pages_at_public_limit() {
+        let pages = (0..129)
+            .map(|index| grokptah_agent_bridge::PublicRunPage {
+                runs: vec![sample_public_run(
+                    &format!("run-{index:03}"),
+                    "2026-01-01T00:00:00Z",
+                )],
+                total_count: 1,
+                truncated: false,
+                next_cursor: None,
+            })
+            .collect();
+        let merged = merge_remote_run_pages(pages);
+        assert_eq!(
+            merged.runs.len(),
+            grokptah_agent_bridge::orchestration::MAX_PUBLIC_RUN_LIST
+        );
+        assert_eq!(merged.total_count, 129);
+        assert!(merged.truncated);
+        assert_eq!(merged.next_cursor, None);
+    }
+
+    #[test]
+    fn tauri_run_surfaces_must_return_public_runs() {
+        // Local run_list / run_get / run_promote / run_discard return
+        // PublicRunPage / PublicRun by their command signatures. Remote list
+        // decode must reject leaked RunRecord keys the same way.
+        let page = decode_remote_run_page(serde_json::json!({
+            "runs": [sample_public_run("keep-page", "2026-01-01T00:00:01Z")],
+            "totalCount": 1,
+            "truncated": false
+        }))
+        .expect("allowlisted public page");
+        assert_eq!(page.runs[0].run_id, "keep-page");
+        let mut leaked = serde_json::to_value(&page).unwrap();
+        leaked["runs"][0]["providerRoute"] = serde_json::json!({
+            "baseUrl": "http://leak-base-url-sentinel-pr352.example/v1"
+        });
+        assert!(
+            decode_remote_run_page(leaked).is_err(),
+            "remote page decode must fail closed on leaked providerRoute"
+        );
+    }
 
     #[test]
     fn local_http_is_allowed_but_remote_http_and_embedded_credentials_are_not() {
@@ -1657,6 +1949,9 @@ mod tests {
             "MCP HTTP 400 Bad Request: unknown mcp-session-id"
         )));
         assert!(should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: unknown_session"
+        )));
+        assert!(should_reconnect_remote_error(&anyhow::anyhow!(
             "MCP HTTP 503 Service Unavailable"
         )));
         assert!(should_reconnect_remote_error(&anyhow::anyhow!(
@@ -1669,7 +1964,25 @@ mod tests {
             "MCP HTTP 401 Unauthorized"
         )));
         assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP HTTP 409 Conflict"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
             "MCP error: invalid request"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: invalid_request"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: admission_uncertain"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: conflict"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: workspace_mismatch"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: capacity_exhausted"
         )));
     }
 
@@ -1758,7 +2071,10 @@ mod tests {
                 .await
                 .unwrap();
         assert!(client.list_persistent_agents().await.unwrap().is_empty());
-        assert!(client.list_runs().await.unwrap().is_empty());
+        let empty_page = client.list_runs().await.unwrap();
+        assert!(empty_page.runs.is_empty());
+        assert_eq!(empty_page.total_count, 0);
+        assert!(!empty_page.truncated);
         let session = client
             .create_session(
                 workspace.path().display().to_string(),
@@ -1782,6 +2098,7 @@ mod tests {
             .list_runs()
             .await
             .unwrap()
+            .runs
             .iter()
             .any(|run| run.run_id == submission.run_id));
         let remote_run = client
@@ -1792,8 +2109,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(remote_run["runId"], submission.run_id);
-        assert!(remote_run.get("providerExecution").is_some());
+        assert_eq!(remote_run.run_id, submission.run_id);
+        let encoded = serde_json::to_value(&remote_run).unwrap();
+        assert!(encoded.get("providerRoute").is_none());
+        assert!(
+            encoded.get("providerExecution").is_some(),
+            "public Run keeps the providerExecution key even when the Run is offline"
+        );
         assert!(RemoteServiceClient::connect(base_url, "wrong-token".into())
             .await
             .is_err());
@@ -1819,6 +2141,7 @@ mod tests {
             .list_runs()
             .await
             .unwrap()
+            .runs
             .iter()
             .any(|run| run.run_id == submission.run_id));
         restarted_server.stop_and_wait().await;

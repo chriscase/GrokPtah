@@ -56,36 +56,11 @@ use super::workload::{
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
 
-fn validate_provider_route_capabilities(
-    route: &super::types::ProviderRouteSnapshot,
-    purpose: RunPurpose,
-    stale_measured_qualification: bool,
-) -> Result<(), OrchError> {
-    route.validate()?;
-    crate::native_coding_readiness::admit_purpose(
-        purpose,
-        route.capabilities.source,
-        route.capabilities.chat,
-        route.capabilities.tools,
-        stale_measured_qualification,
-    )
-    .orch_error()
-    .map_or(Ok(()), Err)
-}
-
 fn validate_provider_route_for_purpose(
     route: &super::types::ProviderRouteSnapshot,
     purpose: RunPurpose,
 ) -> Result<(), OrchError> {
-    let stale_measured_qualification =
-        crate::gateway_config::has_measured_xai_qualification(&route.provider_id, &route.model_id)
-            .map_err(|_| {
-                OrchError::new(
-                    OrchErrorCode::Internal,
-                    "provider qualification ledger is unavailable",
-                )
-            })?;
-    validate_provider_route_capabilities(route, purpose, stale_measured_qualification)
+    crate::native_coding_readiness::validate_provider_route_for_purpose(route, purpose)
 }
 
 fn provider_projection_error(_error: anyhow::Error) -> OrchError {
@@ -183,6 +158,7 @@ pub(crate) struct LiveRunScope {
     pub run_id: String,
     pub start_seq: u64,
     pub end_seq: Option<u64>,
+    pub provider_route: Option<ProviderRouteSnapshot>,
 }
 
 impl Drop for OrchestrationService {
@@ -2111,17 +2087,41 @@ impl OrchestrationService {
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.list_runs_scoped_page(_auth, session_id, workspace, None, None)
+    }
+
+    pub fn list_runs_scoped_page(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, OrchError> {
         let claimed = self.authorize_queue_request(session_id, workspace)?;
-        let runs = self
+        let claimed_workspace = claimed.display().to_string();
+        let page = self
             .store
-            .list_runs()
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .list_runs_for_session_page(session_id, Some(claimed_workspace.as_str()), cursor, limit)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let runs = page
+            .runs
             .into_iter()
-            .filter(|run| {
-                run.session_id == session_id && run.workspace == claimed.display().to_string()
+            .map(|mut run| {
+                self.refresh_queue_position(&mut run);
+                super::project_public_run(&self.store, &run)
             })
-            .collect::<Vec<_>>();
-        Ok(json!({ "runs": runs }))
+            .collect::<Result<Vec<_>, _>>()?;
+        let encoded = runs
+            .iter()
+            .map(super::public_run_to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(json!({
+            "runs": encoded,
+            "totalCount": page.total_count,
+            "truncated": page.truncated,
+            "nextCursor": page.next_cursor,
+        }))
     }
 
     // ── durable workloads ----------------------------------------------
@@ -5175,11 +5175,7 @@ impl OrchestrationService {
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
-        let provider_execution = self.provider_execution_projection(&run)?;
-        let mut value = serde_json::to_value(run)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-        value["providerExecution"] = provider_execution;
-        Ok(value)
+        super::public_run_to_value(&super::project_public_run(&self.store, &run)?)
     }
 
     pub fn get_progress(
@@ -5203,125 +5199,11 @@ impl OrchestrationService {
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
-        let provider_execution = self.provider_execution_projection(&run)?;
-        Ok(json!({
-            "runId": run.run_id,
-            "sessionId": run.session_id,
-            "state": run.state,
-            "queuePosition": run.queue_position,
-            "busy": busy,
-            "startSeq": run.start_seq,
-            "endSeq": run.end_seq,
-            "promptPreview": run.prompt_preview,
-            "progress": run.progress,
-            "createdAt": run.created_at,
-            "updatedAt": run.updated_at,
-            "terminalResult": run.terminal_result,
-            "stopCause": run.stop_cause,
-            "bounds": run.bounds,
-            "errorCode": run.error_code,
-            "providerExecution": provider_execution,
-        }))
-    }
-
-    fn provider_execution_projection(
-        &self,
-        run: &RunRecord,
-    ) -> Result<serde_json::Value, OrchError> {
-        let Some(route) = run.provider_route.as_ref() else {
-            return Ok(serde_json::Value::Null);
-        };
-        route.validate()?;
-        let quota = match route.quota_reservation_id.as_deref() {
-            Some(reservation_id) => {
-                let reservation = self
-                    .store
-                    .load_quota_reservation(reservation_id)
-                    .map_err(provider_projection_error)?
-                    .ok_or_else(|| {
-                        OrchError::new(
-                            OrchErrorCode::Internal,
-                            "provider quota reservation is missing",
-                        )
-                    })?;
-                if reservation.run_id != run.run_id
-                    || reservation.route_snapshot_hash != route.snapshot_hash
-                    || reservation.pool.provider_id != route.provider_id
-                {
-                    return Err(OrchError::new(
-                        OrchErrorCode::Internal,
-                        "provider quota reservation does not match the Run",
-                    ));
-                }
-                json!({
-                    "reservationId": reservation.reservation_id,
-                    "poolId": reservation.pool_id,
-                    "class": reservation.pool.class,
-                    "state": reservation.state,
-                    "tokensReserved": reservation.tokens_reserved,
-                    "tokensConsumed": reservation.tokens_consumed,
-                    "requestsReserved": reservation.requests_reserved,
-                    "requestsConsumed": reservation.requests_consumed,
-                    "windowStartedAt": reservation.window_started_at,
-                    "limits": reservation.limits,
-                    "updatedAt": reservation.updated_at,
-                })
-            }
-            None => serde_json::Value::Null,
-        };
-        let mut attempts = self
-            .store
-            .list_provider_attempts()
-            .map_err(provider_projection_error)?
-            .into_iter()
-            .filter(|attempt| attempt.run_id == run.run_id)
-            .collect::<Vec<_>>();
-        attempts.sort_by(|left, right| {
-            left.ordinal
-                .cmp(&right.ordinal)
-                .then(left.attempt_id.cmp(&right.attempt_id))
-        });
-        let attempt_count = attempts.len();
-        const MAX_PROJECTED_PROVIDER_ATTEMPTS: usize = 128;
-        let truncated = attempt_count > MAX_PROJECTED_PROVIDER_ATTEMPTS;
-        attempts.truncate(MAX_PROJECTED_PROVIDER_ATTEMPTS);
-        let attempts = attempts
-            .into_iter()
-            .map(|attempt| {
-                json!({
-                    "attemptId": attempt.attempt_id,
-                    "ordinal": attempt.ordinal,
-                    "state": attempt.state,
-                    "sendCertainty": attempt.send_certainty,
-                    "retryClass": attempt.retry_class,
-                    "httpStatus": attempt.http_status,
-                    "usage": attempt.usage,
-                    "createdAt": attempt.created_at,
-                    "updatedAt": attempt.updated_at,
-                    "finishedAt": attempt.finished_at,
-                })
-            })
-            .collect::<Vec<_>>();
-        Ok(json!({
-            "route": {
-                "providerId": route.provider_id,
-                "kind": route.kind,
-                "dialect": route.dialect,
-                "modelId": route.model_id,
-                "wireModelId": route.wire_model_id,
-                "capabilitySource": route.capabilities.source,
-                "qualificationSchema": route.capabilities.qualification_schema,
-                "deadlineClass": route.deadline_class,
-                "effort": route.effort,
-                "snapshotHash": route.snapshot_hash,
-            },
-            "quota": quota,
-            "attempts": attempts,
-            "attemptCount": attempt_count,
-            "attemptsTruncated": truncated,
-            "usageComplete": run.aggregates.usage_complete,
-            "pendingRequests": run.aggregates.usage_pending_requests,
-        }))
+        super::public_run_progress_to_value(&super::project_public_run_progress(
+            &self.store,
+            &run,
+            busy,
+        )?)
     }
 
     fn provider_quota_capacity_projection(
@@ -5342,7 +5224,7 @@ impl OrchestrationService {
         let mut providers = std::collections::BTreeSet::new();
         for reservation in reservations
             .into_iter()
-            .filter(|reservation| reservation.pool.owner_id == auth.owner_id)
+            .filter(|reservation| reservation.owner_id == auth.owner_id)
         {
             providers.insert(reservation.pool.provider_id.clone());
             match reservation.state {
@@ -5450,8 +5332,9 @@ impl OrchestrationService {
             run_id: run.run_id.clone(),
             start_seq,
             end_seq: run.end_seq,
+            provider_route: run.provider_route.clone(),
         };
-        let page = self.events_page_for_run(run, after_seq, limit)?;
+        let (page, _) = self.events_page_for_run(run, after_seq, limit)?;
         Ok((scope, page))
     }
 
@@ -5606,8 +5489,16 @@ impl OrchestrationService {
         after_seq: u64,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
-        serde_json::to_value(self.events_page_for_run(run, after_seq, limit)?)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
+        let projected = super::project_public_run(&self.store, &run)?;
+        let (page, redacted) = self.events_page_for_run(run, after_seq, limit)?;
+        let mut payload = serde_json::to_value(page)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        if redacted
+            || projected.error_code.as_deref() == Some(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)
+        {
+            payload["errorCode"] = json!(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS);
+        }
+        Ok(payload)
     }
 
     fn events_page_for_run(
@@ -5615,7 +5506,7 @@ impl OrchestrationService {
         run: RunRecord,
         after_seq: u64,
         limit: usize,
-    ) -> Result<JournalPage, OrchError> {
+    ) -> Result<(JournalPage, bool), OrchError> {
         // Read the bounded run range before applying the caller's page limit.
         // Applying `limit` to the global journal first can return a page made
         // entirely of other sessions and advance the cursor past this run's
@@ -5636,11 +5527,13 @@ impl OrchestrationService {
         });
         entries.truncate(limit.clamp(1, 500));
         let next_cursor = entries.last().map(|e| e.seq);
-        Ok(JournalPage {
+        let mut page = JournalPage {
             entries,
             next_cursor,
             cursor_expired: false,
-        })
+        };
+        let redacted = super::scrub_route_secret_needles(&mut page, run.provider_route.as_ref())?;
+        Ok((page, redacted))
     }
 
     pub fn get_changes(
@@ -5662,12 +5555,12 @@ impl OrchestrationService {
     }
 
     fn changes_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
-        // Prefer durable aggregates (survive journal rollover).
-        let mut paths: Vec<serde_json::Value> = run
+        let projected = super::project_public_run(&self.store, &run)?;
+        let mut paths: Vec<serde_json::Value> = projected
             .aggregates
             .changes
             .iter()
-            .map(|c| json!({ "path": c.path, "summary": c.summary }))
+            .map(|change| json!({ "path": change.path, "summary": change.summary }))
             .collect();
         if let Ok(entries) = self.scoped_events_complete(&run) {
             for e in entries {
@@ -5678,7 +5571,11 @@ impl OrchestrationService {
                 }
             }
         }
-        Ok(json!({ "runId": run.run_id, "changes": paths }))
+        self.scrub_run_tool_payload(
+            &run,
+            projected.error_code.as_deref(),
+            json!({ "runId": projected.run_id, "changes": paths }),
+        )
     }
 
     pub fn get_test_results(
@@ -5700,18 +5597,18 @@ impl OrchestrationService {
     }
 
     fn test_results_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
+        let projected = super::project_public_run(&self.store, &run)?;
         let mut by_id: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
-        // Seed from durable aggregates.
-        for t in &run.aggregates.tests {
+        for test in &projected.aggregates.tests {
             by_id.insert(
-                t.call_id.clone(),
+                test.call_id.clone(),
                 json!({
-                    "callId": t.call_id,
-                    "command": t.command,
-                    "status": t.status,
-                    "exitCode": t.exit_code,
-                    "cancelled": t.cancelled,
+                    "callId": test.call_id,
+                    "command": test.command,
+                    "status": test.status,
+                    "exitCode": test.exit_code,
+                    "cancelled": test.cancelled,
                 }),
             );
         }
@@ -5750,19 +5647,34 @@ impl OrchestrationService {
             }
         }
         let observed: Vec<_> = by_id.into_values().collect();
-        if observed.is_empty() {
-            Ok(json!({
-                "runId": run.run_id,
+        let payload = if observed.is_empty() {
+            json!({
+                "runId": projected.run_id,
                 "status": "not_observed",
                 "results": [],
-            }))
+            })
         } else {
-            Ok(json!({
-                "runId": run.run_id,
+            json!({
+                "runId": projected.run_id,
                 "status": "observed",
                 "results": observed,
-            }))
+            })
+        };
+        self.scrub_run_tool_payload(&run, projected.error_code.as_deref(), payload)
+    }
+
+    fn scrub_run_tool_payload(
+        &self,
+        run: &RunRecord,
+        error_code: Option<&str>,
+        mut payload: serde_json::Value,
+    ) -> Result<serde_json::Value, OrchError> {
+        let redacted =
+            super::public_run::scrub_public_json(&mut payload, run.provider_route.as_ref())?;
+        if redacted || error_code == Some(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS) {
+            payload["errorCode"] = json!(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS);
         }
+        Ok(payload)
     }
 
     pub fn get_handoff(
@@ -5784,23 +5696,7 @@ impl OrchestrationService {
     }
 
     fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
-        Ok(json!({
-            "runId": run.run_id,
-            "sessionId": run.session_id,
-            "state": run.state,
-            "finalResponse": run.final_response,
-            "terminalResult": run.terminal_result,
-            "stopCause": run.stop_cause,
-            "startSeq": run.start_seq,
-            "endSeq": run.end_seq,
-            "bounds": run.bounds,
-            "changes": run.aggregates.changes,
-            "tests": run.aggregates.tests,
-            "verification": run.aggregates.verification,
-            "usage": run.aggregates.usage,
-            "usageComplete": run.aggregates.usage_complete,
-            "usagePendingRequests": run.aggregates.usage_pending_requests,
-        }))
+        super::public_run_handoff_value(&super::project_public_run(&self.store, &run)?)
     }
 
     fn scoped_events_complete(
@@ -5869,7 +5765,7 @@ impl OrchestrationService {
         let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
         let allowlist = self.config.lock().allowlist.clone();
         let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
-        if claimed.display().to_string() != run.workspace {
+        if !super::workspaces_match(&run.workspace, &claimed.display().to_string()) {
             return Err(OrchError::new(
                 OrchErrorCode::WorkspaceMismatch,
                 "run workspace does not match the requested workspace",
@@ -6570,8 +6466,10 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let (run, review) = self.isolated_review(session_id, workspace, run_id)?;
-        Ok(json!({
+        let (run, mut review) = self.isolated_review(session_id, workspace, run_id)?;
+        let projected = super::project_public_run(&self.store, &run)?;
+        let redacted = super::scrub_route_secret_needles(&mut review, run.provider_route.as_ref())?;
+        let mut payload = json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
             "sourceFingerprint": run.execution.as_ref().map(|e| e.source_fingerprint.clone()),
@@ -6580,7 +6478,13 @@ impl OrchestrationService {
             "diff": review.diff,
             "diffTruncated": review.diff_truncated,
             "promotionState": run.execution.as_ref().map(|e| e.promotion_state),
-        }))
+        });
+        if redacted
+            || projected.error_code.as_deref() == Some(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS)
+        {
+            payload["errorCode"] = json!(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS);
+        }
+        Ok(payload)
     }
 
     #[allow(clippy::too_many_arguments)] // Keeps the approval scope explicit at the control boundary.
@@ -6704,7 +6608,7 @@ impl OrchestrationService {
             issued_at,
             expires_at: issued_at + chrono::Duration::milliseconds(ttl as i64),
         };
-        let response = json!({
+        let mut response = json!({
             "runId": run_id,
             "sessionId": session_id,
             "approvalId": approval.approval_id,
@@ -6713,6 +6617,13 @@ impl OrchestrationService {
             "finalFingerprint": approval.final_fingerprint,
             "changedFiles": approval.changed_files,
         });
+        let redacted = super::public_run::scrub_public_json_needles(
+            &mut response,
+            run.provider_route.as_ref(),
+        )?;
+        if redacted {
+            response["errorCode"] = json!(super::PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS);
+        }
         let updated = self.store.update_run(run_id, |current| {
             current.approval = Some(approval.clone());
             current.updated_at = Utc::now();
@@ -6772,7 +6683,9 @@ impl OrchestrationService {
             )
             .await?
         {
-            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Replay(value) => {
+                return super::public_run_from_receipt(&self.store, value)
+            }
             IdempotencyStart::Perform(lease) => lease,
         };
         let promoted =
@@ -6791,9 +6704,12 @@ impl OrchestrationService {
                     ))
                 }
             };
-        let response = serde_json::to_value(promoted)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        lease.complete(Some(run_id.to_string()), response.clone())?;
+        let projected = super::project_public_run(&self.store, &promoted)?;
+        let response = super::public_run_to_value(&projected)?;
+        lease.complete(
+            Some(run_id.to_string()),
+            super::encode_public_run_receipt(&projected)?,
+        )?;
         Ok(response)
     }
 
@@ -6829,7 +6745,9 @@ impl OrchestrationService {
             )
             .await?
         {
-            IdempotencyStart::Replay(value) => return Ok(value),
+            IdempotencyStart::Replay(value) => {
+                return super::public_run_from_receipt(&self.store, value)
+            }
             IdempotencyStart::Perform(lease) => lease,
         };
         let discarded = match self.host.discard_run(session_id, run_id) {
@@ -6844,9 +6762,12 @@ impl OrchestrationService {
                 ))
             }
         };
-        let response = serde_json::to_value(discarded)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        lease.complete(Some(run_id.to_string()), response.clone())?;
+        let projected = super::project_public_run(&self.store, &discarded)?;
+        let response = super::public_run_to_value(&projected)?;
+        lease.complete(
+            Some(run_id.to_string()),
+            super::encode_public_run_receipt(&projected)?,
+        )?;
         Ok(response)
     }
 
@@ -7241,27 +7162,42 @@ impl OrchestrationService {
             None => None,
         };
         let persisted = match (queued, quota_reservation.as_ref()) {
-            (true, Some(reservation)) => self.store.save_run_with_quota(&run, reservation),
-            (false, Some(reservation)) => self.store.save_run_and_activate_agent_with_quota(
+            (true, Some(reservation)) => self.store.admit_run_with_quota(&run, reservation),
+            (false, Some(reservation)) => self.store.admit_run_and_activate_agent(
                 &run,
                 run.agent_id.as_deref().expect("Run Agent"),
-                reservation,
+                Some(reservation),
             ),
-            (true, None) => self.store.save_run(&run),
-            (false, None) => self
-                .store
-                .save_run_and_activate_agent(&run, run.agent_id.as_deref().expect("Run Agent")),
+            (true, None) => self.store.admit_run(&run),
+            (false, None) => self.store.admit_run_and_activate_agent(
+                &run,
+                run.agent_id.as_deref().expect("Run Agent"),
+                None,
+            ),
         };
-        if let Err(e) = persisted {
-            if !queued {
-                self.host.release_turn_reservation(session_id, &run_id);
-                self.release_capacity(&run_id);
+        match persisted {
+            crate::orchestration::DurableAdmission::Committed => {}
+            crate::orchestration::DurableAdmission::DefinitelyNotCommitted(e) => {
+                if !queued {
+                    self.host.release_turn_reservation(session_id, &run_id);
+                    self.release_capacity(&run_id);
+                }
+                let e = e
+                    .downcast_ref::<OrchError>()
+                    .cloned()
+                    .unwrap_or_else(|| OrchError::new(OrchErrorCode::Internal, e.to_string()));
+                return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
             }
-            let e = e
-                .downcast_ref::<OrchError>()
-                .cloned()
-                .unwrap_or_else(|| OrchError::new(OrchErrorCode::Internal, e.to_string()));
-            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
+            crate::orchestration::DurableAdmission::Uncertain(e) => {
+                // Recovery may still commit. Do not release quota/reservation.
+                let e = e.downcast_ref::<OrchError>().cloned().unwrap_or_else(|| {
+                    OrchError::new(
+                        OrchErrorCode::AdmissionUncertain,
+                        format!("durable admission is uncertain: {e}"),
+                    )
+                });
+                return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
+            }
         }
 
         let queued_position = if queued {
@@ -8304,87 +8240,5 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | SteeringInjected { session_id, .. }
         | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
-    }
-}
-
-#[cfg(test)]
-mod provider_route_policy_tests {
-    use super::*;
-    use crate::gateway_config::{
-        CapabilitySource, ModelCapabilities, ProviderDeadlineClass, ProviderDialect, ProviderKind,
-        CAPABILITY_QUALIFICATION_SCHEMA,
-    };
-    use crate::types::EffortLevel;
-
-    fn route(
-        source: CapabilitySource,
-        chat: bool,
-        tools: bool,
-    ) -> super::super::types::ProviderRouteSnapshot {
-        super::super::types::ProviderRouteSnapshot {
-            schema_version: super::super::types::PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
-            provider_id: "env-grokptah".into(),
-            model_id: "policy-model".into(),
-            wire_model_id: "policy-model".into(),
-            selection_key: crate::gateway_config::model_selection_key(
-                "env-grokptah",
-                "policy-model",
-            ),
-            kind: ProviderKind::OpenAiCompatible,
-            dialect: ProviderDialect::OpenAiChatCompletions,
-            base_url: "http://127.0.0.1:41111/v1".into(),
-            endpoint_fingerprint: String::new(),
-            credential_ref: "env:GROKPTAH_API_KEY".into(),
-            credential_fingerprint: "v1-sha256:policy-credential".into(),
-            capabilities: ModelCapabilities {
-                chat,
-                tools,
-                source,
-                qualification_schema: (source == CapabilitySource::Measured)
-                    .then(|| CAPABILITY_QUALIFICATION_SCHEMA.into()),
-                ..ModelCapabilities::default()
-            },
-            deadline_class: ProviderDeadlineClass::Standard,
-            effort: EffortLevel::Medium,
-            qualification_record_id: None,
-            quota_class: None,
-            quota_reservation_id: None,
-            snapshot_hash: String::new(),
-        }
-        .seal()
-        .unwrap()
-    }
-
-    #[test]
-    fn unknown_capabilities_never_enter_autonomous_runs() {
-        let route = route(CapabilitySource::Unknown, true, true);
-        for purpose in [RunPurpose::Execution, RunPurpose::ManagerProposal] {
-            let error = validate_provider_route_capabilities(&route, purpose, false).unwrap_err();
-            assert_eq!(error.code, OrchErrorCode::Conflict);
-            assert!(error.message.contains("qualified or explicitly declared"));
-        }
-    }
-
-    #[test]
-    fn stale_measured_history_blocks_declared_execution_but_not_chat_only_proposals() {
-        let route = route(CapabilitySource::Declared, true, true);
-        validate_provider_route_capabilities(&route, RunPurpose::Execution, false).unwrap();
-        let error =
-            validate_provider_route_capabilities(&route, RunPurpose::Execution, true).unwrap_err();
-        assert!(error.message.contains("requalify"));
-        validate_provider_route_capabilities(&route, RunPurpose::ManagerProposal, true).unwrap();
-    }
-
-    #[test]
-    fn execution_requires_measured_or_declared_coding_tools_while_proposals_need_chat_only() {
-        let chat_only = route(CapabilitySource::Measured, true, false);
-        validate_provider_route_capabilities(&chat_only, RunPurpose::ManagerProposal, false)
-            .unwrap();
-        let error = validate_provider_route_capabilities(&chat_only, RunPurpose::Execution, false)
-            .unwrap_err();
-        assert!(error.message.contains("native coding tools"));
-
-        let coding = route(CapabilitySource::Measured, true, true);
-        validate_provider_route_capabilities(&coding, RunPurpose::Execution, false).unwrap();
     }
 }

@@ -1484,8 +1484,14 @@ pub enum OrchErrorCode {
     /// Wall-clock / transport request deadline exceeded (maps to HTTP 504).
     Timeout,
     InvalidRequest,
+    /// Streamable HTTP MCP session is missing after restart or eviction.
+    /// Distinct from `InvalidRequest` so desktop can reconnect without retrying
+    /// application-level invalid tool arguments.
+    UnknownSession,
     Unsupported,
     Conflict,
+    /// Recovery may still commit a partial admission write. Not a zero-effect rejection.
+    AdmissionUncertain,
 }
 
 impl OrchErrorCode {
@@ -1501,8 +1507,10 @@ impl OrchErrorCode {
             Self::Internal => "internal",
             Self::Timeout => "timeout",
             Self::InvalidRequest => "invalid_request",
+            Self::UnknownSession => "unknown_session",
             Self::Unsupported => "unsupported",
             Self::Conflict => "conflict",
+            Self::AdmissionUncertain => "admission_uncertain",
         }
     }
 }

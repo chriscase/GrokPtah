@@ -109,6 +109,22 @@ describe("RunInspector", () => {
     expect(screen.getByText("Shared workspace", { selector: ".run-execution-mode" })).toBeTruthy();
   });
 
+  it("announces truncated durable Run pages", () => {
+    render(
+      <RunInspector
+        runs={[run()]}
+        truncated
+        totalCount={200}
+        onRefresh={vi.fn()}
+        {...actions}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Showing 1 of 200 durable Runs. Older Runs are omitted from this page.",
+    );
+  });
+
   it("shows the complete Lane scope for Run actions", () => {
     render(
       <RunInspector

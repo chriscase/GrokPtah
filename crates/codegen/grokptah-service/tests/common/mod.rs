@@ -2,6 +2,10 @@
 //!
 //! Starts a real loopback listener against a disposable home and workspace.
 //! Tests talk MCP over HTTP and never require model credentials.
+//! Each integration binary includes this module independently, so helpers
+//! used by only some suites are not dead code in those binaries.
+
+#![allow(dead_code)]
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
