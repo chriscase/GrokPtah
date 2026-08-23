@@ -7,9 +7,9 @@ use axum::routing::post;
 use axum::{Json, Router};
 use grokptah_agent_bridge::orchestration::{
     hash_payload, public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
-    safe_id_filename, AssignmentStatus, AuthContext, ChangeRecord, IdempotencyClaim,
-    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedIntentState, OrchStore,
-    OrchestrationConfig, OrchestrationService, ProviderAttemptState, ProviderRetryClass,
+    safe_id_filename, AssignmentStatus, AuthContext, AuthCredential, ChangeRecord,
+    IdempotencyClaim, ManagedExecutionIntent, ManagedExecutionPolicy, ManagedIntentState,
+    OrchStore, OrchestrationConfig, OrchestrationService, ProviderAttemptState, ProviderRetryClass,
     ProviderRoute, ProviderRouteSnapshot, ProviderSendCertainty, PublicRun, QuotaClass,
     QuotaLimits, QuotaReservation, QuotaReservationState, RunAggregates, RunBounds, RunProgress,
     RunPurpose, RunRecord, RunState, WorkItem, WorkPolicy, WorkState, WorkspaceAllowlist,
@@ -86,23 +86,20 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
             bounds: RunBounds::default(),
         },
     );
+    enable_explicit_operator_bearer(&orch);
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
 
-    client
-        .call_tool(
-            "ptah_set_managed_execution",
-            json!({
-                "session_id": lane.id,
-                "workspace": workspace_text,
-                "agent_id": agent.agent_id,
-                "policy": enabled_policy()
-            }),
-        )
-        .await
-        .unwrap();
+    orch.set_managed_execution(
+        &auth(&orch),
+        lane.id,
+        workspace.path(),
+        &agent.agent_id,
+        enabled_policy(),
+    )
+    .unwrap();
 
     let created = client
         .call_tool(
@@ -309,22 +306,19 @@ async fn approval_required_work_pauses_before_success() {
             bounds: RunBounds::default(),
         },
     );
+    enable_explicit_operator_bearer(&orch);
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
-    client
-        .call_tool(
-            "ptah_set_managed_execution",
-            json!({
-                "session_id": lane.id,
-                "workspace": workspace_text,
-                "agent_id": agent.agent_id,
-                "policy": enabled_policy()
-            }),
-        )
-        .await
-        .unwrap();
+    orch.set_managed_execution(
+        &auth(&orch),
+        lane.id,
+        workspace.path(),
+        &agent.agent_id,
+        enabled_policy(),
+    )
+    .unwrap();
     let created = client
         .call_tool(
             "ptah_create_work",
@@ -414,11 +408,18 @@ fn retry_policy(retry_eligible: bool) -> ManagedExecutionPolicy {
     }
 }
 
-fn auth() -> AuthContext {
-    AuthContext {
-        token_id: "native-token-308".into(),
-        owner_id: "primary".into(),
-    }
+fn auth(orch: &OrchestrationService) -> AuthContext {
+    enable_explicit_operator_bearer(orch);
+    orch.auth_header(Some("Bearer native-token-308")).unwrap()
+}
+
+fn enable_explicit_operator_bearer(orch: &OrchestrationService) {
+    orch.set_auth_credentials(vec![AuthCredential::operator(
+        "primary",
+        "native-token-308",
+    )
+    .unwrap()])
+        .unwrap();
 }
 
 fn assert_public_payload_hides_route(
@@ -674,7 +675,7 @@ async fn boot_native(
     );
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -811,7 +812,7 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
     );
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -904,7 +905,7 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
     assert_eq!(admitted_attempts[0].state, ProviderAttemptState::Admitted);
     assert_eq!(admitted_attempts[0].send_certainty, None);
     let admitted_view = orch
-        .get_run_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
+        .get_run_scoped(&auth(&orch), lane.id, workspace.path(), &run.run_id)
         .unwrap();
     let provider_execution = &admitted_view["providerExecution"];
     assert_eq!(provider_execution["route"]["providerId"], "env-grokptah");
@@ -929,12 +930,13 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
     assert!(!projection_text.contains(&run_route.credential_fingerprint));
     assert!(!projection_text.contains(&run_route.base_url));
     let progress = orch
-        .get_progress_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
+        .get_progress_scoped(&auth(&orch), lane.id, workspace.path(), &run.run_id)
         .unwrap();
     assert_eq!(progress["providerExecution"], *provider_execution);
     let listed = orch
-        .list_runs_scoped(&auth(), lane.id, workspace.path())
+        .list_runs_scoped(&auth(&orch), lane.id, workspace.path())
         .unwrap();
+    enable_explicit_operator_bearer(&orch);
     let control = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
     client.initialize().await.unwrap();
@@ -1003,20 +1005,23 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         run_route,
         &sentinels,
     );
-    let admitted_capacity = orch.get_capacity(&auth()).unwrap();
+    let admitted_capacity = orch.get_capacity(&auth(&orch)).unwrap();
     assert_eq!(admitted_capacity["providerQuota"]["activeReservations"], 1);
     assert_eq!(
         admitted_capacity["providerQuota"]["providers"][0],
         "env-grokptah"
     );
-    let foreign_capacity = orch
-        .get_capacity(&AuthContext {
-            token_id: "foreign-token".into(),
-            owner_id: "foreign-owner".into(),
-        })
-        .unwrap();
+    orch.set_agent_owner_id("foreign-owner".into()).unwrap();
+    orch.set_auth_credentials(vec![
+        AuthCredential::new("primary", "foreign-token").unwrap()
+    ])
+    .unwrap();
+    let foreign_auth = orch.auth_header(Some("Bearer foreign-token")).unwrap();
+    let foreign_capacity = orch.get_capacity(&foreign_auth).unwrap();
     assert_eq!(foreign_capacity["providerQuota"]["activeReservations"], 0);
     assert_eq!(foreign_capacity["providerQuota"]["providerCount"], 0);
+    orch.set_agent_owner_id("primary".into()).unwrap();
+    enable_explicit_operator_bearer(&orch);
 
     release.add_permits(1);
     let settle_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -1060,7 +1065,7 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
     );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     let settled_view = orch
-        .get_run_scoped(&auth(), lane.id, workspace.path(), &run.run_id)
+        .get_run_scoped(&auth(&orch), lane.id, workspace.path(), &run.run_id)
         .unwrap();
     assert_eq!(
         settled_view["providerExecution"]["quota"]["state"],
@@ -1074,7 +1079,7 @@ async fn native_admission_freezes_the_same_provider_route_on_intent_and_run() {
         settled_view["providerExecution"]["attempts"][0]["retryClass"],
         "explicit_new_run_only"
     );
-    let settled_capacity = orch.get_capacity(&auth()).unwrap();
+    let settled_capacity = orch.get_capacity(&auth(&orch)).unwrap();
     assert_eq!(settled_capacity["providerQuota"]["activeReservations"], 0);
     assert_eq!(settled_capacity["providerQuota"]["consumedReservations"], 1);
     assert_eq!(settled_capacity["providerQuota"]["tokensConsumed"], 10);
@@ -1132,7 +1137,7 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
     let agent_id = agent.agent_id;
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         session,
         workspace.path(),
         &agent_id,
@@ -1251,7 +1256,7 @@ async fn manager_decision_native_admission_has_durable_proposal_purpose() {
         .unwrap();
     let retry = orch
         .retry_run(
-            &auth(),
+            &auth(&orch),
             "manager-proposal-retry",
             session,
             Path::new(&workspace_text),
@@ -1511,12 +1516,13 @@ async fn resolve_work_input_requires_parked_scope() {
             bounds: RunBounds::default(),
         },
     );
+    enable_explicit_operator_bearer(&orch);
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -1768,12 +1774,13 @@ async fn resolve_work_input_uses_real_host_pending() {
             bounds: RunBounds::default(),
         },
     );
+    enable_explicit_operator_bearer(&orch);
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -2025,12 +2032,13 @@ async fn native_skips_manual_retry_without_mutating() {
             bounds: RunBounds::default(),
         },
     );
+    enable_explicit_operator_bearer(&orch);
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
     client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
     orch.set_managed_execution(
-        &auth(),
+        &auth(&orch),
         lane.id,
         workspace.path(),
         &agent.agent_id,
@@ -2191,6 +2199,7 @@ async fn native_skips_manual_retry_without_mutating() {
 async fn resolve_work_input_fails_after_restart_without_host_pending() {
     let (_env, _home, workspace, host, orch, session, agent_id, workspace_text) =
         boot_native(false).await;
+    enable_explicit_operator_bearer(&orch);
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "native-token-308");
     client.initialize().await.unwrap();
@@ -2231,7 +2240,7 @@ async fn resolve_work_input_fails_after_restart_without_host_pending() {
         },
     );
     let missing = orch
-        .resolve_work_input(&auth(), session, workspace.path(), req.id, true)
+        .resolve_work_input(&auth(&orch), session, workspace.path(), req.id, true)
         .unwrap_err();
     assert_eq!(
         missing.code,
@@ -2489,7 +2498,10 @@ async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_a
             bounds: RunBounds::default(),
         },
     );
-    let workspace_text = workspace.path().display().to_string();
+    let workspace_text = dunce::canonicalize(workspace.path())
+        .unwrap()
+        .display()
+        .to_string();
     let route = failing_provider_route(FAILING_QUOTA);
     let now = chrono::Utc::now();
     let mut run = RunRecord {
@@ -2547,6 +2559,16 @@ async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_a
         .into_result()
         .unwrap();
 
+    enable_explicit_operator_bearer(&orch);
+    let operator_auth = orch.auth_header(Some("Bearer native-token-308")).unwrap();
+    operator_auth
+        .require_workspace(
+            grokptah_agent_bridge::orchestration::AuthorityOperation::RunsRead,
+            workspace.path(),
+        )
+        .unwrap();
+    orch.get_run_scoped(&operator_auth, lane.id, workspace.path(), &run.run_id)
+        .unwrap();
     let control = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
     client.initialize().await.unwrap();
@@ -2643,13 +2665,8 @@ async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_a
             }),
         )
         .await
-        .unwrap();
-    assert!(!promote.is_error, "{:?}", promote.raw);
-    assert_public_payload_hides_route(&promote.structured, &route, &[]);
-    assert_public_payload_hides_route(&mcp_text_value(&promote.raw), &route, &[]);
-    let promote_text = mcp_text_value(&promote.raw).to_string();
-    assert!(!promote_text.contains(FAILING_BASE_URL));
-    assert!(!promote_text.contains(FAILING_CREDENTIAL_REF));
+        .unwrap_err();
+    assert_remote_error(promote, "conflict");
 
     let discard_route = failing_provider_route("quota-leak-discard-sentinel-pr352");
     run.run_id = "native-failing-discard".into();
@@ -2693,10 +2710,8 @@ async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_a
             }),
         )
         .await
-        .unwrap();
-    assert!(!discard.is_error, "{:?}", discard.raw);
-    assert_public_payload_hides_route(&discard.structured, &discard_route, &[]);
-    assert_public_payload_hides_route(&mcp_text_value(&discard.raw), &discard_route, &[]);
+        .unwrap_err();
+    assert_remote_error(discard, "conflict");
     client.close_session().await.unwrap();
     orch.stop_background_tasks().await;
 }
@@ -2996,6 +3011,7 @@ async fn failing_provider_live_isolated_promote_and_discard_are_scrubbed() {
             bounds: RunBounds::default(),
         },
     );
+    enable_explicit_operator_bearer(&orch);
     let control = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
     client.initialize().await.unwrap();

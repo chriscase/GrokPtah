@@ -1023,7 +1023,19 @@ async fn hosted_service_exposes_worker_and_message_state() {
 async fn hosted_service_exposes_native_executor_controls() {
     let env = ServiceEnv::new();
     let workspace = env.workspace_path();
-    let handle = start_isolated(&env, vec![workspace.clone()], 2).await;
+    let mut config = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TOKEN,
+        vec![workspace.clone()],
+        false,
+        2,
+        Duration::from_secs(8),
+    )
+    .unwrap()
+    .with_runtime_home(env._home.path())
+    .unwrap();
+    config.client_credentials = vec![AuthCredential::operator("primary", TOKEN).unwrap()];
+    let handle = start_service(config).await.unwrap();
     let mut client = mcp_client(handle.addr).await;
     let session_id = create_build_session(&mut client, &workspace, "Native executor").await;
     let agent = handle

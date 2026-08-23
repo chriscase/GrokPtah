@@ -211,11 +211,13 @@ fn orch_for(host: &AgentHostHandle, workspace: &std::path::Path) -> Arc<Orchestr
     )
 }
 
-fn auth() -> AuthContext {
-    AuthContext {
-        token_id: "p2-admission-token".into(),
-        owner_id: crate::native_coding_readiness::DESKTOP_OWNER_ID.into(),
-    }
+fn auth(workspace: &std::path::Path) -> AuthContext {
+    AuthContext::remote_coordinator(
+        "p2-admission-token",
+        crate::native_coding_readiness::DESKTOP_OWNER_ID,
+        &WorkspaceAllowlist::new([workspace.to_path_buf()]),
+    )
+    .unwrap()
 }
 
 fn assert_requalify(error: &OrchError) {
@@ -341,7 +343,7 @@ async fn declared_fallback_after_measured_xai_history_refuses_desktop_build() {
 
     let mcp_error = orch
         .submit_task(
-            &auth(),
+            &auth(workspace.path()),
             "p2-mcp-stale",
             lane_id,
             workspace.path(),

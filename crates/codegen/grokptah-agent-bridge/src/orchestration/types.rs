@@ -1462,6 +1462,12 @@ fn default_receipt_status() -> String {
 pub struct AuditEntry {
     pub ts: DateTime<Utc>,
     pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_document_hash: Option<String>,
     pub request_id: Option<String>,
     pub session_id: Option<Uuid>,
     pub workspace: Option<String>,
@@ -1654,6 +1660,7 @@ pub fn is_recognized_test_command(command: &str) -> bool {
 
 /// Tools exposed by the control plane (schema snapshot source of truth).
 pub const CONTROL_TOOLS: &[&str] = &[
+    "ptah_get_authority_capabilities",
     "ptah_list_sessions",
     "ptah_create_session",
     "ptah_list_persistent_agents",

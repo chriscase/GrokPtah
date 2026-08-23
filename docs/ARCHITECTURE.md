@@ -97,7 +97,8 @@ Cargo workspace so we do not require regenerating the monorepo root.
 The desktop can host a local home or connect to the standalone service running
 locally or behind TLS on a private host. One process owns each
 `GROKPTAH_HOME`; all other devices are protocol clients of that owner.
-The remote path reuses the scoped MCP contract: persistent-agent runs are
+The remote path reuses the scoped MCP contract and its closed authority
+registry: persistent-agent runs are
 discovered from the allowlisted service, durable event pages provide cursor
 catch-up, and the run-scoped live channel provides low-latency updates. Tauri
 holds the bearer token in backend memory and owns reconnect/session recovery;
@@ -106,10 +107,17 @@ the React layer receives only typed run events and recovery notices.
 For non-loopback use, TLS, a trusted encrypted tunnel, or a trusted TLS
 terminator is mandatory, and the service runs under a dedicated account with
 host-level filesystem/process confinement. The workspace allowlist selects
-exact authorized project identities; it is not an OS sandbox. The current
-single service bearer is operator-equivalent for the full MCP surface,
-including isolated-run approval and promotion; scoped principal tiers are a
-required boundary before durable worker leases ship.
+exact authorized project identities; it is not an OS sandbox. Named bearer
+credentials are bound at initialize to a secret-free capability document and
+one of three remote tiers: observer, coordinator, or operator. Coordinators can
+drive ordinary Runs, Work, Managers, workers, and routines but cannot
+approve/promote/discard, administer managed-execution authority, or access
+Computer Use. Explicit remote operators add protected orchestration actions
+but still cannot access Computer Use. Trusted local-operator authority is
+minted only by the in-process desktop adapter and cannot be requested by a
+bearer. Idempotency keys and transport audit entries are bound to the
+initiating principal, credential, grant revision, and capability-document
+hash.
 
 ```sh
 # CLI / TUI (root workspace)

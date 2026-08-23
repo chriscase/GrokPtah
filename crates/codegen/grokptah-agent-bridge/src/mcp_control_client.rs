@@ -439,6 +439,9 @@ impl McpControlClient {
         if with_auth {
             req = req.header("Authorization", format!("Bearer {}", self.token));
         }
+        if let Some(session_id) = &self.session_id {
+            req = req.header("mcp-session-id", session_id);
+        }
         bounded_non_streaming(self.operation_timeout, async move {
             let resp = req.send().await.map_err(|_| McpTransportError)?;
             let status = resp.status();
@@ -785,7 +788,8 @@ mod tests {
     use crate::host::{AgentHost, HostConfig};
     use crate::mcp_control::start_control_server;
     use crate::orchestration::{
-        OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+        AuthCredential, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
+        WorkspaceAllowlist,
     };
     use crate::{home_override_serial, set_grokptah_home_override};
     use axum::body::Body;
@@ -871,6 +875,57 @@ mod tests {
         assert!(body.get("result").and_then(|r| r.get("tools")).is_none());
 
         srv.stop();
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rpc_raw_attaches_established_session_id() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let ws = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            OrchStore::open(home.path().join("orch")).unwrap(),
+            OrchestrationConfig {
+                bearer_token: "unused-primary".into(),
+                allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        orch.set_auth_credentials(vec![
+            AuthCredential::new("primary", "rpc-raw-a").unwrap(),
+            AuthCredential::new("secondary", "rpc-raw-b").unwrap(),
+        ])
+        .unwrap();
+        let server = start_control_server(orch, 0).await.unwrap();
+        let mut client = McpControlClient::new(format!("http://{}", server.addr), "rpc-raw-a");
+        client.initialize().await.unwrap();
+        let session_id = client.session_id().unwrap().to_string();
+
+        let (status, _) = client
+            .rpc_raw("2.0", "ping", json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK);
+
+        client.token = "rpc-raw-b".into();
+        assert_eq!(client.session_id(), Some(session_id.as_str()));
+        let (status, body) = client
+            .rpc_raw("2.0", "ping", json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["data"]["code"], "unauthenticated");
+
+        server.stop();
         set_grokptah_home_override(None);
     }
 

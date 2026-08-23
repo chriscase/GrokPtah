@@ -8055,6 +8055,9 @@ mod tests {
         let entry = AuditEntry {
             ts: Utc::now(),
             tool: "ptah_get_capacity".into(),
+            principal_id: None,
+            credential_id: None,
+            authority_document_hash: None,
             request_id: None,
             session_id: None,
             workspace: None,
@@ -8077,6 +8080,9 @@ mod tests {
             .enqueue_audit(AuditEntry {
                 ts: Utc::now(),
                 tool: "auth".into(),
+                principal_id: None,
+                credential_id: None,
+                authority_document_hash: None,
                 request_id: None,
                 session_id: None,
                 workspace: None,
