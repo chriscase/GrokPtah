@@ -22,6 +22,21 @@ may attach a new WorkItem to the same Agent and Lane without changing this
 ownership model. See [DURABLE_ROUTINES.md](DURABLE_ROUTINES.md) and
 [COORDINATOR_WORKERS.md](COORDINATOR_WORKERS.md).
 
+## Enterprise review materialization
+
+An admitted company-gateway review is decomposed into seven independent
+specialist passes. `EnterpriseReviewPlan::work_plan()` projects those passes
+into a secret-free `EnterpriseReviewWorkPlan`; each item carries a stable
+plan-bound work key and a bounded `WorkTemplate`. The host-authorized
+`OrchestrationService::create_enterprise_review_work_plan` helper materializes
+the projection through the ordinary durable-work path, using those keys as
+per-pass idempotency request IDs. If a broker or host restarts after only some
+passes were stored, retrying the same plan replays the completed WorkItems and
+creates only the remainder. This is the execution foundation for the
+enterprise review lane, not live provider or quality certification; admission,
+worker credential binding, gateway attestation, and the paired campaign remain
+separate gates.
+
 ## State and lease contract
 
 Work starts in `queued`. Missing or unsuccessful dependencies make it
