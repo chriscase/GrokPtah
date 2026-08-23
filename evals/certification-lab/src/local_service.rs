@@ -8,14 +8,16 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::provider_observation::ProviderObservationSession;
 use grokptah_agent_bridge::{
     home_override_serial, start_control_server_with, AgentHost, AgentHostHandle,
     ControlServerHandle, ControlServerLimits, HostConfig, McpControlClient, OrchestrationConfig,
-    OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist,
+    OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist, FORBIDDEN_TOOLS,
 };
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const OFFLINE_ENV: &str = "GROKPTAH_AGENT_OFFLINE";
@@ -299,6 +301,245 @@ fn generated_token() -> String {
     )
 }
 
+/// Live enterprise-gateway attach for the code-review benchmark.
+///
+/// The current host does not issue a disposable enterprise-gateway lease,
+/// a gateway-signed modest-tier deployment attestation, or an external
+/// egress-firewall attestation. Compatible-gateway ambient routes remain
+/// refused; this API never installs a bypass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnterpriseReviewLiveGap {
+    pub disposable_lease: bool,
+    pub gateway_signed_deployment_attestation: bool,
+    pub egress_firewall_attestation: bool,
+}
+
+pub fn enterprise_review_live_attach() -> Result<(), EnterpriseReviewLiveGap> {
+    Err(EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })
+}
+
+/// Observed denials from the public MCP control-plane allowlist.
+///
+/// This is not a GrokPtah Agent review turn and does not observe a live
+/// provider. It records that scripted malicious wire names were refused by
+/// the first real control-plane authorization boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewControlPlaneEvidence {
+    pub listed_tool_count: u32,
+    pub forbidden_tools_listed: u32,
+    pub denied_wire_calls: u32,
+    pub successful_denied_wire_calls: u32,
+    pub restart_count: u32,
+}
+
+/// Whether this process can bind a loopback listener for the isolated control plane.
+pub(crate) fn loopback_bind_available() -> bool {
+    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => {
+            drop(listener);
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(error) => panic!("unexpected loopback availability failure: {error}"),
+    }
+}
+
+/// Drive scripted malicious wire names through [`LocalService`] + [`McpControlClient`].
+///
+/// `always_approve` stays false. Successful dispatch of a denied wire name is a
+/// contract failure. Restart reopens the same durable home and must still omit
+/// [`FORBIDDEN_TOOLS`].
+pub async fn exercise_review_control_plane(
+    workspace: &Path,
+    runtime_home: &Path,
+    wire_names: &[String],
+) -> Result<ReviewControlPlaneEvidence> {
+    if !loopback_bind_available() {
+        bail!("review_loopback_bind_unavailable");
+    }
+    if wire_names.is_empty() {
+        bail!("review control plane requires scripted malicious wire names");
+    }
+    let config = LocalServiceConfig::new(
+        runtime_home,
+        vec![workspace.to_path_buf()],
+        LocalServiceMode::Offline,
+        1,
+        3,
+        60_000,
+        8_000,
+    );
+    let mut service = LocalService::start(config).await?;
+    let mut client = service.client();
+    client
+        .initialize()
+        .await
+        .context("initialize review control-plane client")?;
+    let listed = client
+        .list_tools()
+        .await
+        .context("list review control-plane tools")?;
+    let listed_names: HashSet<&str> = listed.iter().map(|tool| tool.name.as_str()).collect();
+    let mut forbidden_tools_listed = 0u32;
+    for forbidden in FORBIDDEN_TOOLS {
+        if listed_names.contains(*forbidden) {
+            forbidden_tools_listed = forbidden_tools_listed.saturating_add(1);
+        }
+    }
+    if forbidden_tools_listed > 0 {
+        service.stop().await;
+        bail!("forbidden tool listed on the review control plane");
+    }
+    let mut denied_wire_calls = 0u32;
+    let mut successful_denied_wire_calls = 0u32;
+    for name in wire_names {
+        match client.call_tool(name, serde_json::json!({})).await {
+            Ok(result) if !result.is_error => {
+                successful_denied_wire_calls = successful_denied_wire_calls.saturating_add(1);
+            }
+            Ok(_) | Err(_) => {
+                denied_wire_calls = denied_wire_calls.saturating_add(1);
+            }
+        }
+    }
+    service
+        .restart()
+        .await
+        .context("restart review control plane")?;
+    let mut client = service.client();
+    client
+        .initialize()
+        .await
+        .context("reinitialize review control-plane client")?;
+    let listed_after = client
+        .list_tools()
+        .await
+        .context("list review control-plane tools after restart")?;
+    for forbidden in FORBIDDEN_TOOLS {
+        if listed_after.iter().any(|tool| tool.name == *forbidden) {
+            service.stop().await;
+            bail!("forbidden tool listed on the review control plane after restart");
+        }
+    }
+    let listed_tool_count =
+        u32::try_from(listed_after.len()).context("listed tool count overflow")?;
+    service.stop().await;
+    if successful_denied_wire_calls > 0 {
+        bail!("malicious control-plane call succeeded");
+    }
+    if denied_wire_calls != u32::try_from(wire_names.len()).context("wire name count")? {
+        bail!("control plane did not deny every scripted malicious wire name");
+    }
+    Ok(ReviewControlPlaneEvidence {
+        listed_tool_count,
+        forbidden_tools_listed: 0,
+        denied_wire_calls,
+        successful_denied_wire_calls: 0,
+        restart_count: 1,
+    })
+}
+
+/// Merkle root over a directory tree. Symbolic links fail closed. Relative
+/// paths are mixed into the digest but never returned.
+pub fn workspace_merkle_root(root: &Path) -> Result<String> {
+    let mut entries = Vec::new();
+    collect_merkle_entries(root, root, &mut entries)?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, digest, bytes) in entries {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(digest.as_bytes());
+        hasher.update(bytes.to_le_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRefSnapshot {
+    pub head_digest: String,
+    pub refs_digest: String,
+    pub remote_publication_count: u32,
+}
+
+/// Snapshot git HEAD, refs, and remote-tracking publication count. The raw
+/// refs never leave this function; only SHA-256 fingerprints are returned.
+pub fn git_ref_snapshot(root: &Path) -> Result<GitRefSnapshot> {
+    let head = git_stdout(root, &["rev-parse", "HEAD"])?;
+    let refs = git_stdout(root, &["show-ref", "--head"])?;
+    let remotes = git_stdout(
+        root,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+    )?;
+    let remote_publication_count =
+        u32::try_from(remotes.lines().filter(|line| !line.is_empty()).count())
+            .context("remote publication count overflow")?;
+    Ok(GitRefSnapshot {
+        head_digest: format!("{:x}", Sha256::digest(head.as_bytes())),
+        refs_digest: format!("{:x}", Sha256::digest(refs.as_bytes())),
+        remote_publication_count,
+    })
+}
+
+fn collect_merkle_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<(String, String, u64)>,
+) -> Result<()> {
+    let mut children = Vec::new();
+    for child in std::fs::read_dir(directory).context("read workspace tree")? {
+        children.push(child.context("read workspace entry")?);
+    }
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let path = child.path();
+        let metadata = std::fs::symlink_metadata(&path).context("stat workspace entry")?;
+        if metadata.file_type().is_symlink() {
+            bail!("workspace tree contains a symbolic link");
+        }
+        if child.file_name() == ".git" {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .context("workspace path escaped its root")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if metadata.is_dir() {
+            collect_merkle_entries(root, &path, entries)?;
+        } else if metadata.is_file() {
+            let bytes = std::fs::read(&path).context("read workspace file")?;
+            entries.push((
+                relative,
+                format!("{:x}", Sha256::digest(&bytes)),
+                bytes.len() as u64,
+            ));
+        } else {
+            bail!("workspace tree contains a non-regular entry");
+        }
+    }
+    Ok(())
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .context("invoke git for workspace snapshot")?;
+    if !output.status.success() {
+        bail!("git workspace snapshot failed");
+    }
+    String::from_utf8(output.stdout).context("git snapshot was not UTF-8")
+}
+
 pub(crate) fn validate_public_model(model: &str) -> Result<()> {
     if !(6..=80).contains(&model.len())
         || !model.starts_with("grok-")
@@ -351,16 +592,11 @@ impl Drop for ProcessEnvironment {
 
 #[cfg(test)]
 pub(crate) fn loopback_test_available() -> bool {
-    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) {
-        Ok(listener) => {
-            drop(listener);
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("loopback integration skipped: execution sandbox forbids listeners");
-            false
-        }
-        Err(error) => panic!("unexpected loopback availability failure: {error}"),
+    if loopback_bind_available() {
+        true
+    } else {
+        eprintln!("loopback integration skipped: execution sandbox forbids listeners");
+        false
     }
 }
 
@@ -452,5 +688,26 @@ mod tests {
         );
         assert!(config.clone().with_model("opaque-private-route").is_err());
         assert!(config.with_model("grok-build").is_ok());
+    }
+
+    #[test]
+    fn enterprise_review_live_attach_is_unimplemented() {
+        let error = enterprise_review_live_attach().unwrap_err();
+        assert!(!error.disposable_lease);
+        assert!(!error.gateway_signed_deployment_attestation);
+        assert!(!error.egress_firewall_attestation);
+    }
+
+    #[test]
+    fn workspace_merkle_is_stable_and_rejects_symlinks() {
+        let root = tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), b"one").unwrap();
+        let first = workspace_merkle_root(&workspace).unwrap();
+        let second = workspace_merkle_root(&workspace).unwrap();
+        assert_eq!(first, second);
+        std::fs::write(workspace.join("a.txt"), b"two").unwrap();
+        assert_ne!(first, workspace_merkle_root(&workspace).unwrap());
     }
 }
