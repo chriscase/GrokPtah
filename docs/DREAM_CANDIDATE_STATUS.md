@@ -29,6 +29,11 @@ complete or that the product has reached 100%.
   requests fail closed. The published authority capability document carries
   the same Agent scope and a recomputed evidence hash. Production
   issuance/rotation and independent long-running evidence are still open.
+- The host now has a least-privilege worker-credential issuance seam: it creates
+  an Agent-bound credential with canonical workspace roots and can rotate the
+  bearer while preserving the worker identity and scope. The constructor and
+  rotation denial/continuity checks pass; runtime installation, durable
+  rotation evidence, and the independent worker campaign remain open.
 - Computer Use observation now re-checks the durable conflict-domain poison
   fence even for an already-granted Agent, so an uncertain sibling dispatch
   cannot be bypassed by a stale grant.
