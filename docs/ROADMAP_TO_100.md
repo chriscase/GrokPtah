@@ -91,11 +91,11 @@ may remain Explicitly unsupported.
 no shipped binary named Grokbot. Shipped `ManagerSupervisor` is not hosted
 Grokbot certification.
 
-**Current configured remote bearers can approve and promote within service
-scope.** Possession of any `--token` / `--client` bearer is operator-equivalent
-for the full `CONTROL_TOOLS` surface, including `ptah_approve_run` and
-`ptah_promote_run`. Bearer authentication must not imply that authority once
-least-privilege ships.
+**On the `origin/main` roadmap base, configured remote bearers can approve and
+promote within service scope.** Possession of any `--token` / `--client`
+bearer there is operator-equivalent for the full `CONTROL_TOOLS` surface. The
+dream candidate replaces that model with explicit tiers, but it is not a
+shipped claim until the Stage 3 campaign passes and the result is integrated.
 
 **Company-approved OpenAI-compatible gateway quota is not Grok Build quota.**
 Compatible-profile requests consume that company’s provider quota. That is
@@ -392,9 +392,10 @@ production-shaped soak and do not describe `origin/main` as least-privilege.
 - [#271](https://github.com/chriscase/GrokPtah/issues/271) mutations stay
   disabled until this authority model and the threat review both pass.
 
-**Must not claim:** “scoped tokens” while every `--client` bearer still
-receives `CONTROL_TOOLS` in full. **Must not start** a production-shaped
-72-hour soak on operator-equivalent bearers.
+**Must not claim on `origin/main`:** “scoped tokens” while every `--client`
+bearer still receives `CONTROL_TOOLS` in full. **Must not start** a
+production-shaped 72-hour soak on operator-equivalent bearers; the candidate
+tier implementation must first pass the exact Stage 3 gate.
 
 ## Stage 4 — Desktop / hosted shared parity
 
@@ -517,10 +518,14 @@ coordinator/worker slices
 Those first slices are **not** the independent long-running multi-worker 100%
 exit. Grokbot is not a binary. Unattended Computer Use is Explicitly
 unsupported. Certification-lab smoke checks that managed execution is
-**disabled by default**. No 72-hour soak report exists. The runtime now has
-an opt-in per-principal worker-credential binding, but production issuance,
-rotation, and retained multi-worker evidence are not yet certified; unbound
-remote bearers remain coordinator-scoped.
+**disabled by default**. No 72-hour soak report exists. The dream candidate
+now accepts externally managed, Agent-bound worker credentials, scopes them to
+the final service workspace allowlist, rejects token reuse, and has a real
+service-process harness that holds two independent worker leases across the
+manager crash fence, rotates both credentials, rejects both retired bearers,
+and emits the v2 secret-free evidence record only after a clean-head 72-hour
+run. That harness is formatted but uncompiled and unexecuted; it is not a
+retained campaign. Unbound remote bearers remain coordinator-scoped.
 
 **Exit (all required):**
 
@@ -561,6 +566,10 @@ remote bearers remain coordinator-scoped.
   [`WORKER_CERTIFICATION_EVIDENCE.md`](WORKER_CERTIFICATION_EVIDENCE.md) and
   enforced by `worker_certification_evidence.rs`; it does not substitute for
   the dated production-shaped campaign.
+  Candidate runner: `tests/always_on_grokbot.rs`
+  `certify_stage6_multi_worker_72h`. It rejects a duration override other than
+  259200 seconds, requires a clean unchanged HEAD, keeps one service-owned
+  home, and writes the secret-free report outside the repository.
   Documented #305 **non-goals** may remain Explicitly unsupported: scheduler
   or webhook adapters, model-based prioritizer, automatic permission
   approval/promotion, distributed consensus or multi-node scheduler, public

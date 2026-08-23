@@ -11,11 +11,11 @@ have identical host capabilities, and a declared capability document is not
 on `origin/main`. Hosted-service CI (`.github/workflows/hosted-service.yml`)
 exists only on draft [PR #352](https://github.com/chriscase/GrokPtah/pull/352)
 and is **Pending — not shipped**. Stage 1 cannot pass while that PR remains
-draft. **Every configured remote bearer can approve and promote within
-service scope** (`ptah_approve_run`, `ptah_promote_run`). That is not
-least-privilege `LocalOperator` / `RemoteCoordinator` / `Observer`
-separation; those tiers must ship before any production-shaped 72-hour soak.
-Shipped ManagerSupervisor is not hosted Grokbot certification.
+draft. The dream candidate has explicit `operator`, `coordinator`, `observer`,
+and Agent-bound `worker` bearer tiers; only an explicit remote operator may
+approve or promote, and no bearer can inherit local Computer Use. This remains
+candidate state until the exact-head authority and hosted qualification gates
+pass. Shipped ManagerSupervisor is not hosted Grokbot certification.
 See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) and
 [`ROADMAP_TO_100.md`](ROADMAP_TO_100.md). Always-on “Grokbot” language in
 ADR-002 / [#301](https://github.com/chriscase/GrokPtah/issues/301) is not a
@@ -194,15 +194,14 @@ multi-node coordinator is a later storage boundary, not an implicit property of
 the current service. Durable Agents now carry the service owner account, while
 frequently archived Lanes remain separate presentation/workspace projections.
 
-**Every configured remote bearer can approve and promote within service
-scope.** `--token` and each `--client ID=TOKEN` credential currently receive
-the full `CONTROL_TOOLS` surface, including `ptah_approve_run` and
-`ptah_promote_run`. Bearer authentication is not an Observer role. Planned
-least-privilege tiers (`LocalOperator`, `RemoteCoordinator`, `Observer`) must
-ship **before** any production-shaped 72-hour autonomous soak
-([`ROADMAP_TO_100.md`](ROADMAP_TO_100.md) stage 3). A remote client still
-cannot inherit **desktop** Computer Use, keychain, PTY, or local TCC grants
-from the service host.
+Each bearer receives only the tools in its versioned authority document.
+Coordinator and Agent-bound worker credentials cannot approve Work or Runs,
+promote/discard Runs, administer managed execution, or access Computer Use;
+observer is read-only; protected mutations require the explicit `operator`
+prefix. No remote client can inherit **desktop** Computer Use, keychain, PTY,
+or local TCC grants from the service host. These candidate contracts must pass
+the stage 3 authority campaign before the stage 6 production-shaped soak may
+be treated as eligible.
 
 ## Supervised VM deployment
 

@@ -144,11 +144,13 @@ returns the original Work or message and creates no duplicate.
 
 ## Follow-up
 
-- **Production-shaped worker credential issuance.** The runtime now supports
-  host-issued, workspace-scoped credentials bound to one Agent, in-place
-  rotation, and rejection of cross-identity worker and message operations.
-  A deployment still needs retained issuance/rotation evidence plus an
-  independent multi-worker campaign before this is a release claim.
+- **Production-shaped worker credential issuance.** The runtime supports
+  host-issued credentials and service configuration supports externally
+  managed credentials bound to one Agent and scoped to the final workspace
+  allowlist. In-process and restart-based rotation reject the retired bearer.
+  The candidate Stage 6 process runner exercises issuance, restart rotation,
+  cross-identity denial, two simultaneous leases, and retained records, but a
+  completed 72-hour exact-head artifact is still required before release.
 - **Coordinator-only versus worker-only tools.** Keep the current
   explicit credential set and scope; the primary bearer remains the
   coordinator path while issued worker bearers are narrower.

@@ -31,3 +31,19 @@ retained.
 
 This contract does not manufacture live evidence. The release gate still
 requires an independently executed, production-shaped campaign.
+
+The candidate process runner is
+`crates/codegen/grokptah-service/tests/always_on_grokbot.rs`
+`certify_stage6_multi_worker_72h`. It uses the shipped service binary and one
+service-owned durable home, bootstraps two distinct durable worker Agents,
+installs separate Agent-bound credentials, holds both leases across the real
+manager SIGKILL fence, completes them with the recovered lease secrets,
+rotates both credentials across another restart, rejects the old bearers,
+and continues bounded parent/child worker cycles for the measured window. The
+runner creates the unique
+`<platform-temp>/always-on-grokbot-workers-<sha>-<campaign-id>.json` artifact
+only after
+the clean candidate remains unchanged for the full campaign and the v2
+validator marks the record claim-eligible. Create-once persistence refuses to
+overwrite an earlier campaign. This is implemented candidate behavior, not a
+claim that the 72-hour command has run.

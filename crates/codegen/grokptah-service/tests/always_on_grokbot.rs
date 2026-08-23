@@ -10,23 +10,44 @@
 
 mod always_on_support;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use grokptah_agent_bridge::orchestration::hash_payload;
-use grokptah_agent_bridge::McpControlClient;
+use grokptah_agent_bridge::{
+    expected_worker_evidence_digest, LongRunningWorkerEvidence, McpControlClient,
+    WorkerCheckEvidence, WorkerCredentialLifecycleEvidence, REQUIRED_RESTARTS,
+    REQUIRED_SOAK_SECONDS, REQUIRED_WORKERS, REQUIRED_WORKER_CHECKS,
+    WORKER_CERTIFICATION_EVIDENCE_SCHEMA,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use always_on_support::{
     call, call_expect_error, causal_join, certify, clear_assertions, fingerprint_tree,
-    intents_array, mcp, parse_fixture, pending_usage, plans_len, poll_json, recorded_assertions,
-    repository_commit, require_causal_join, require_unique_step_work, rid, runs_array,
-    scan_service_artifacts, scan_text, serial_lock, sessions_len, try_mcp, work_for_step,
-    work_items, work_kind_count, CausalJoin, EntityCardinalities, FakeProvider, Fixture,
-    ProviderDisposition, ProviderScript, ResourceSample, ServiceProcess, FIXTURE_BYTES,
+    intents_array, mcp, mcp_with_token, parse_fixture, pending_usage, plans_len, poll_json,
+    recorded_assertions, repository_commit, require_causal_join, require_unique_step_work, rid,
+    runs_array, scan_service_artifacts, scan_text, serial_lock, sessions_len, try_mcp,
+    work_for_step, work_items, work_kind_count, CausalJoin, EntityCardinalities, FakeProvider,
+    Fixture, ProviderDisposition, ProviderScript, ResourceSample, ServiceProcess, FIXTURE_BYTES,
     FIXTURE_SCHEMA, TOKEN,
 };
+
+const STAGE6_WORKER_LABELS: [&str; REQUIRED_WORKERS] = ["worker-a", "worker-b"];
+const STAGE6_WORKER_CREDENTIAL_IDS: [&str; REQUIRED_WORKERS] =
+    ["stage6-worker-a", "stage6-worker-b"];
+const STAGE6_INITIAL_TOKENS: [&str; REQUIRED_WORKERS] = [
+    "grok-worker-stage6-a-old-0123456789abcdef0123456789abcdef",
+    "grok-worker-stage6-b-old-fedcba9876543210fedcba9876543210",
+];
+const STAGE6_ROTATED_TOKENS: [&str; REQUIRED_WORKERS] = [
+    "grok-worker-stage6-a-new-00112233445566778899aabbccddeeff",
+    "grok-worker-stage6-b-new-ffeeddccbbaa99887766554433221100",
+];
+const STAGE6_WORK_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 
 fn managed_policy() -> Value {
     json!({
@@ -200,6 +221,77 @@ async fn bootstrap_agent(client: &mut McpControlClient, workspace: &Path) -> (Uu
         }),
     )
     .await;
+    (session, agent_id)
+}
+
+async fn bootstrap_worker_agent(
+    client: &mut McpControlClient,
+    workspace: &Path,
+    label: &str,
+) -> (Uuid, String) {
+    let created = call(
+        client,
+        "ptah_create_session",
+        json!({
+            "workspace": workspace,
+            "title": format!("always-on {label}")
+        }),
+    )
+    .await;
+    let session = Uuid::parse_str(created["sessionId"].as_str().expect("worker sessionId"))
+        .expect("worker session UUID");
+    let submitted = call(
+        client,
+        "ptah_submit_task",
+        json!({
+            "request_id": rid(&format!("setup-{label}")),
+            "session_id": session,
+            "workspace": workspace,
+            "prompt": format!("GROKBOT_SETUP materialize independent {label}")
+        }),
+    )
+    .await;
+    let run_id = submitted["runId"]
+        .as_str()
+        .expect("worker setup runId")
+        .to_string();
+    let _ = poll_json(
+        client,
+        "ptah_get_run",
+        json!({
+            "session_id": session,
+            "workspace": workspace,
+            "run_id": run_id
+        }),
+        |value| is_terminal_run(value["state"].as_str()),
+    )
+    .await;
+    let session_text = session.to_string();
+    let agents = poll_json(client, "ptah_list_persistent_agents", json!({}), |value| {
+        value["agents"].as_array().is_some_and(|agents| {
+            agents
+                .iter()
+                .filter(|agent| agent["sessionId"].as_str() == Some(session_text.as_str()))
+                .count()
+                == 1
+        })
+    })
+    .await;
+    let matching = agents["agents"]
+        .as_array()
+        .expect("worker agents array")
+        .iter()
+        .filter(|agent| agent["sessionId"].as_str() == Some(session_text.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "worker setup must materialize exactly one session-owned Agent: {agents}"
+    );
+    let agent_id = matching[0]["agentId"]
+        .as_str()
+        .expect("worker agentId")
+        .to_string();
     (session, agent_id)
 }
 
@@ -592,6 +684,576 @@ impl Campaign {
     fn scan(&self) {
         scan_service_artifacts(&self.service);
         self.provider.assert_route_and_auth();
+    }
+}
+
+struct Stage6WorkerLane {
+    label: &'static str,
+    credential_id: &'static str,
+    session: Uuid,
+    agent_id: String,
+    token: String,
+}
+
+struct Stage6WorkerLease {
+    lane_index: usize,
+    parent_work_id: String,
+    work_id: String,
+    attempt_id: String,
+    lease_token: String,
+    complete_request_id: String,
+}
+
+struct Stage6WorkerPool {
+    lanes: Vec<Stage6WorkerLane>,
+    clients: Vec<McpControlClient>,
+    authority_baselines: Vec<Value>,
+    credential_lifecycle: Vec<WorkerCredentialLifecycleEvidence>,
+    retained_work_ids: Vec<(usize, String)>,
+}
+
+impl Stage6WorkerPool {
+    async fn bootstrap(campaign: &mut Campaign) -> Self {
+        let mut lanes = Vec::with_capacity(REQUIRED_WORKERS);
+        for index in 0..REQUIRED_WORKERS {
+            let (session, agent_id) = bootstrap_worker_agent(
+                &mut campaign.client,
+                &campaign.workspace,
+                STAGE6_WORKER_LABELS[index],
+            )
+            .await;
+            lanes.push(Stage6WorkerLane {
+                label: STAGE6_WORKER_LABELS[index],
+                credential_id: STAGE6_WORKER_CREDENTIAL_IDS[index],
+                session,
+                agent_id,
+                token: STAGE6_INITIAL_TOKENS[index].to_string(),
+            });
+        }
+        assert_eq!(lanes.len(), REQUIRED_WORKERS);
+        assert_ne!(lanes[0].agent_id, lanes[1].agent_id);
+        assert_ne!(lanes[0].session, lanes[1].session);
+
+        let mut pool = Self {
+            lanes,
+            clients: Vec::new(),
+            authority_baselines: Vec::new(),
+            credential_lifecycle: Vec::new(),
+            retained_work_ids: Vec::new(),
+        };
+        campaign.service.replace_client_specs(pool.client_specs());
+        campaign.reopen().await;
+        pool.connect_and_capture_authority(campaign).await;
+        pool
+    }
+
+    fn client_specs(&self) -> Vec<String> {
+        self.lanes
+            .iter()
+            .map(|lane| {
+                format!(
+                    "worker:{}/{}={}",
+                    lane.credential_id, lane.agent_id, lane.token
+                )
+            })
+            .collect()
+    }
+
+    async fn authority_document(client: &mut McpControlClient, lane: &Stage6WorkerLane) -> Value {
+        let authority = call(client, "ptah_get_authority_capabilities", json!({})).await;
+        assert_eq!(
+            authority["principal"]["credentialId"].as_str(),
+            Some(lane.credential_id)
+        );
+        assert_eq!(
+            authority["principal"]["role"].as_str(),
+            Some("remote_coordinator")
+        );
+        assert_eq!(
+            authority["scopes"]["agentIds"],
+            json!([lane.agent_id.clone()])
+        );
+        let tools = client.list_tools().await.expect("worker list_tools");
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        for required in [
+            "ptah_get_work",
+            "ptah_accept_work",
+            "ptah_claim_work",
+            "ptah_heartbeat_worker",
+            "ptah_report_work_progress",
+            "ptah_complete_work",
+            "ptah_send_message",
+        ] {
+            assert!(
+                names.contains(&required),
+                "{} is missing worker tool {required}",
+                lane.label
+            );
+        }
+        for denied in [
+            "ptah_approve_work",
+            "ptah_approve_run",
+            "ptah_promote_run",
+            "ptah_discard_run",
+            "ptah_set_managed_execution",
+            "ptah_authorize_work_execution",
+            "ptah_list_computer_runs",
+            "ptah_get_computer_run",
+            "ptah_get_computer_run_events",
+            "ptah_get_computer_capacity",
+        ] {
+            assert!(
+                !names.contains(&denied),
+                "{} received forbidden worker tool {denied}",
+                lane.label
+            );
+        }
+        authority
+    }
+
+    async fn connect_and_capture_authority(&mut self, campaign: &Campaign) {
+        self.clients.clear();
+        self.authority_baselines.clear();
+        for lane in &self.lanes {
+            let mut client = mcp_with_token(&campaign.service.addr, &lane.token).await;
+            let authority = Self::authority_document(&mut client, lane).await;
+            self.clients.push(client);
+            self.authority_baselines.push(authority);
+        }
+    }
+
+    async fn reconnect_and_assert_authority(&mut self, campaign: &Campaign) {
+        self.clients.clear();
+        for (index, lane) in self.lanes.iter().enumerate() {
+            let mut client = mcp_with_token(&campaign.service.addr, &lane.token).await;
+            let authority = Self::authority_document(&mut client, lane).await;
+            assert_eq!(
+                serde_json::to_vec(&authority).expect("worker authority bytes"),
+                serde_json::to_vec(&self.authority_baselines[index])
+                    .expect("baseline worker authority bytes"),
+                "{} authority changed across restart",
+                lane.label
+            );
+            self.clients.push(client);
+        }
+    }
+
+    async fn begin_leases(
+        &mut self,
+        campaign: &mut Campaign,
+        cycle: u64,
+    ) -> Vec<Stage6WorkerLease> {
+        let mut leases = Vec::with_capacity(self.lanes.len());
+        for index in 0..self.lanes.len() {
+            let lane = &self.lanes[index];
+            let parent = call(
+                &mut campaign.client,
+                "ptah_create_work",
+                json!({
+                    "request_id": format!("stage6-{cycle}-{}-parent", lane.label),
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "kind": "stage6-parent",
+                    "objective": format!("Bounded parent for {} cycle {cycle}", lane.label),
+                    "policy": {
+                        "bounds": {
+                            "maxPromptBytes": 16384,
+                            "maxRounds": 4,
+                            "maxDurationMs": 45000,
+                            "maxTotalTokens": 8000
+                        },
+                        "retry": {
+                            "maxAttempts": 1,
+                            "retryFailed": false,
+                            "retryExpired": false,
+                            "backoffMs": 0
+                        },
+                        "requiresApproval": false,
+                        "maxConcurrentAttempts": 1
+                    }
+                }),
+            )
+            .await;
+            let parent_work_id = parent["work"]["workId"]
+                .as_str()
+                .expect("stage6 parent workId")
+                .to_string();
+            let child = call(
+                &mut campaign.client,
+                "ptah_create_work",
+                json!({
+                    "request_id": format!("stage6-{cycle}-{}-child", lane.label),
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "kind": "stage6-child",
+                    "objective": format!("Independent work for {} cycle {cycle}", lane.label),
+                    "parent_work_id": parent_work_id,
+                    "policy": {
+                        "bounds": {
+                            "maxPromptBytes": 16384,
+                            "maxRounds": 4,
+                            "maxDurationMs": 45000,
+                            "maxTotalTokens": 8000
+                        },
+                        "retry": {
+                            "maxAttempts": 1,
+                            "retryFailed": false,
+                            "retryExpired": false,
+                            "backoffMs": 0
+                        },
+                        "requiresApproval": false,
+                        "maxConcurrentAttempts": 1
+                    }
+                }),
+            )
+            .await;
+            let work_id = child["work"]["workId"]
+                .as_str()
+                .expect("stage6 child workId")
+                .to_string();
+            assert_eq!(
+                child["work"]["parentWorkId"].as_str(),
+                Some(parent_work_id.as_str())
+            );
+            let _ = call(
+                &mut campaign.client,
+                "ptah_offer_work",
+                json!({
+                    "request_id": format!("stage6-{cycle}-{}-offer", lane.label),
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "work_id": work_id,
+                    "agent_id": lane.agent_id,
+                    "reason": "exact bound worker"
+                }),
+            )
+            .await;
+            let _ = call(
+                &mut self.clients[index],
+                "ptah_heartbeat_worker",
+                json!({
+                    "request_id": format!("stage6-{cycle}-{}-heartbeat", lane.label),
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "agent_id": lane.agent_id,
+                    "host_kind": "service"
+                }),
+            )
+            .await;
+            let _ = call(
+                &mut self.clients[index],
+                "ptah_accept_work",
+                json!({
+                    "request_id": format!("stage6-{cycle}-{}-accept", lane.label),
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "work_id": work_id,
+                    "agent_id": lane.agent_id,
+                    "reason": "bounded worker accepted"
+                }),
+            )
+            .await;
+            let claim_args = json!({
+                "request_id": format!("stage6-{cycle}-{}-claim", lane.label),
+                "session_id": lane.session,
+                "workspace": &campaign.workspace,
+                "work_id": work_id,
+                "agent_id": lane.agent_id,
+                "lease_ms": 3_600_000
+            });
+            let claimed = call(
+                &mut self.clients[index],
+                "ptah_claim_work",
+                claim_args.clone(),
+            )
+            .await;
+            let replayed = call(&mut self.clients[index], "ptah_claim_work", claim_args).await;
+            assert_eq!(claimed, replayed, "claim replay must be identical");
+            let attempt_id = claimed["attempt"]["attemptId"]
+                .as_str()
+                .expect("stage6 attemptId")
+                .to_string();
+            let lease_token = claimed["leaseToken"]
+                .as_str()
+                .expect("stage6 leaseToken")
+                .to_string();
+            let _ = call(
+                &mut self.clients[index],
+                "ptah_report_work_progress",
+                json!({
+                    "request_id": format!("stage6-{cycle}-{}-progress", lane.label),
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "work_id": work_id,
+                    "attempt_id": attempt_id,
+                    "lease_token": lease_token,
+                    "summary": format!("{} is active", lane.label),
+                    "percent": 50
+                }),
+            )
+            .await;
+            let _ = call(
+                &mut self.clients[index],
+                "ptah_send_message",
+                json!({
+                    "request_id": format!("stage6-{cycle}-{}-message", lane.label),
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "kind": "status",
+                    "from_agent_id": lane.agent_id,
+                    "to_agent_id": lane.agent_id,
+                    "work_id": work_id,
+                    "attempt_id": attempt_id,
+                    "body": format!("{} retained progress for cycle {cycle}", lane.label)
+                }),
+            )
+            .await;
+            leases.push(Stage6WorkerLease {
+                lane_index: index,
+                parent_work_id,
+                work_id,
+                attempt_id,
+                lease_token,
+                complete_request_id: format!("stage6-{cycle}-{}-complete", lane.label),
+            });
+        }
+
+        let target = &leases[0];
+        let attacker = &self.lanes[1];
+        let cross_claim = call_expect_error(
+            &mut self.clients[1],
+            "ptah_claim_work",
+            json!({
+                "request_id": format!("stage6-{cycle}-cross-worker-claim"),
+                "session_id": self.lanes[0].session,
+                "workspace": &campaign.workspace,
+                "work_id": target.work_id,
+                "agent_id": attacker.agent_id,
+                "lease_ms": 3_600_000
+            }),
+        )
+        .await;
+        assert!(
+            cross_claim.contains("forbidden_scope")
+                || cross_claim.contains("conflict")
+                || cross_claim.contains("403")
+                || cross_claim.contains("409"),
+            "second worker must not obtain the active lease: {cross_claim}"
+        );
+        leases
+    }
+
+    async fn assert_leases_recovered(&self, campaign: &mut Campaign, leases: &[Stage6WorkerLease]) {
+        for lease in leases {
+            let lane = &self.lanes[lease.lane_index];
+            let snapshot = call(
+                &mut campaign.client,
+                "ptah_get_work",
+                json!({
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "work_id": lease.work_id
+                }),
+            )
+            .await;
+            assert_eq!(snapshot["work"]["state"].as_str(), Some("leased"));
+            assert_eq!(
+                snapshot["work"]["parentWorkId"].as_str(),
+                Some(lease.parent_work_id.as_str())
+            );
+            let attempts = snapshot["attempts"]
+                .as_array()
+                .expect("recovered attempts array");
+            assert_eq!(attempts.len(), 1, "restart introduced a duplicate attempt");
+            assert_eq!(
+                attempts[0]["attemptId"].as_str(),
+                Some(lease.attempt_id.as_str())
+            );
+        }
+    }
+
+    async fn complete_leases(
+        &mut self,
+        campaign: &mut Campaign,
+        leases: &[Stage6WorkerLease],
+    ) -> u32 {
+        let mut duplicate_execution_count = 0u32;
+        for lease in leases {
+            let lane = &self.lanes[lease.lane_index];
+            let complete_args = json!({
+                "request_id": lease.complete_request_id,
+                "session_id": lane.session,
+                "workspace": &campaign.workspace,
+                "work_id": lease.work_id,
+                "attempt_id": lease.attempt_id,
+                "lease_token": lease.lease_token,
+                "summary": format!("{} completed bounded work", lane.label),
+                "evidence": ["service-process worker lease completed"]
+            });
+            let completed = call(
+                &mut self.clients[lease.lane_index],
+                "ptah_complete_work",
+                complete_args.clone(),
+            )
+            .await;
+            let replayed = call(
+                &mut self.clients[lease.lane_index],
+                "ptah_complete_work",
+                complete_args,
+            )
+            .await;
+            assert_eq!(completed, replayed, "completion replay must be identical");
+            assert_eq!(completed["work"]["state"].as_str(), Some("succeeded"));
+            let snapshot = call(
+                &mut campaign.client,
+                "ptah_get_work",
+                json!({
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "work_id": lease.work_id
+                }),
+            )
+            .await;
+            let attempts = snapshot["attempts"]
+                .as_array()
+                .expect("terminal attempts array");
+            duplicate_execution_count = duplicate_execution_count
+                .saturating_add(u32::try_from(attempts.len().saturating_sub(1)).unwrap());
+            assert_eq!(attempts.len(), 1, "worker Work gained duplicate attempts");
+            assert_eq!(
+                attempts[0]["attemptId"].as_str(),
+                Some(lease.attempt_id.as_str())
+            );
+            if self.retained_work_ids.len() < REQUIRED_WORKERS {
+                self.retained_work_ids
+                    .push((lease.lane_index, lease.work_id.clone()));
+            }
+        }
+        duplicate_execution_count
+    }
+
+    async fn rotate_credentials(&mut self, campaign: &mut Campaign) {
+        let old_tokens = self
+            .lanes
+            .iter()
+            .map(|lane| lane.token.clone())
+            .collect::<Vec<_>>();
+        for (index, lane) in self.lanes.iter_mut().enumerate() {
+            lane.token = STAGE6_ROTATED_TOKENS[index].to_string();
+        }
+        self.clients.clear();
+        campaign.service.replace_client_specs(self.client_specs());
+        campaign.reopen().await;
+
+        for old_token in &old_tokens {
+            assert!(
+                try_mcp(&campaign.service.addr, old_token).await.is_err(),
+                "retired worker credential survived rotation"
+            );
+        }
+        self.reconnect_and_assert_authority(campaign).await;
+
+        self.credential_lifecycle.clear();
+        for index in 0..self.lanes.len() {
+            let lane = &self.lanes[index];
+            let old_fingerprint = hash_payload(&json!(old_tokens[index].as_str()));
+            let new_fingerprint = hash_payload(&json!(lane.token.as_str()));
+            let evidence_digest = hash_payload(&json!({
+                "credentialId": lane.credential_id,
+                "boundAgentId": lane.agent_id,
+                "oldFingerprint": old_fingerprint.clone(),
+                "newFingerprint": new_fingerprint.clone(),
+                "authorityDocumentHash": self.authority_baselines[index]["documentHash"],
+                "oldRejected": true,
+                "newAccepted": true
+            }));
+            self.credential_lifecycle
+                .push(WorkerCredentialLifecycleEvidence {
+                    bound_agent_id: lane.agent_id.clone(),
+                    credential_fingerprint: new_fingerprint,
+                    issued: true,
+                    least_privilege: true,
+                    rotation_observed: true,
+                    old_credential_rejected: true,
+                    new_credential_accepted: true,
+                    evidence_digest,
+                });
+        }
+    }
+
+    async fn retained_audit_entries(&mut self, campaign: &mut Campaign) -> u64 {
+        let mut retained = 0u64;
+        for (lane_index, work_id) in &self.retained_work_ids {
+            let lane = &self.lanes[*lane_index];
+            let snapshot = call(
+                &mut campaign.client,
+                "ptah_get_work",
+                json!({
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "work_id": work_id
+                }),
+            )
+            .await;
+            assert_eq!(snapshot["work"]["state"].as_str(), Some("succeeded"));
+            let attempts = snapshot["attempts"]
+                .as_array()
+                .expect("retained attempts array");
+            assert_eq!(attempts.len(), 1);
+            retained = retained.saturating_add(attempts.len() as u64);
+
+            let decisions = call(
+                &mut campaign.client,
+                "ptah_list_work_decisions",
+                json!({
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "work_id": work_id
+                }),
+            )
+            .await;
+            let decisions = decisions["decisions"]
+                .as_array()
+                .expect("retained decisions array");
+            assert!(
+                decisions.len() >= 2,
+                "offer and accept decisions must remain"
+            );
+            let decision_ids = decisions
+                .iter()
+                .filter_map(|decision| decision["decisionId"].as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(decision_ids.len(), decisions.len());
+            retained = retained.saturating_add(decisions.len() as u64);
+
+            let outbox = call(
+                &mut campaign.client,
+                "ptah_list_outbox",
+                json!({
+                    "session_id": lane.session,
+                    "workspace": &campaign.workspace,
+                    "agent_id": lane.agent_id,
+                    "after_seq": 0
+                }),
+            )
+            .await;
+            let messages = outbox["messages"]
+                .as_array()
+                .expect("retained outbox array");
+            assert!(!messages.is_empty(), "worker status message must remain");
+            let mut sequences = messages
+                .iter()
+                .filter_map(|message| message["seq"].as_u64())
+                .collect::<Vec<_>>();
+            let ordered = sequences.clone();
+            sequences.sort_unstable();
+            assert_eq!(ordered, sequences, "message cursor order changed");
+            retained = retained.saturating_add(messages.len() as u64);
+        }
+        retained
     }
 }
 
@@ -1991,6 +2653,265 @@ async fn soak_loop(mode: &str, default_secs: u64) {
     report["sha256"] = json!(digest);
     persist_soak_report(&report);
     eprintln!("{report}");
+}
+
+fn stage6_worker_check(check_id: &str, duration_ms: u64, facts: Value) -> WorkerCheckEvidence {
+    assert!(REQUIRED_WORKER_CHECKS.contains(&check_id));
+    WorkerCheckEvidence {
+        check_id: check_id.to_string(),
+        passed: true,
+        duration_ms: duration_ms.max(1),
+        evidence_digest: hash_payload(&json!({
+            "checkId": check_id,
+            "facts": facts
+        })),
+    }
+}
+
+fn persist_stage6_worker_report(evidence: &LongRunningWorkerEvidence) {
+    evidence.validate().expect("valid Stage 6 worker evidence");
+    assert!(evidence.certification_ready());
+    let encoded = serde_json::to_vec_pretty(evidence).expect("Stage 6 report bytes");
+    let text = String::from_utf8(encoded.clone()).expect("Stage 6 report UTF-8");
+    scan_text("stage6-worker-report", &text);
+    for secret in STAGE6_INITIAL_TOKENS
+        .iter()
+        .chain(STAGE6_ROTATED_TOKENS.iter())
+    {
+        assert!(
+            !text.contains(secret),
+            "Stage 6 report persisted a worker credential"
+        );
+    }
+    let path = std::env::temp_dir().join(format!(
+        "always-on-grokbot-workers-{}-{}.json",
+        evidence.candidate_sha, evidence.campaign_id
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("create unique Stage 6 report");
+    file.write_all(&encoded).expect("persist Stage 6 report");
+    file.sync_all().expect("fsync Stage 6 report");
+    let roundtrip: LongRunningWorkerEvidence =
+        serde_json::from_slice(&std::fs::read(&path).expect("read Stage 6 report"))
+            .expect("Stage 6 report roundtrip");
+    assert_eq!(&roundtrip, evidence);
+    roundtrip.validate().expect("roundtrip Stage 6 report");
+    eprintln!("stage6_worker_evidence={}", path.display());
+}
+
+fn assert_stage6_candidate_unchanged(expected_sha: Option<&str>) -> String {
+    let candidate_sha = repository_commit();
+    if let Some(expected_sha) = expected_sha {
+        assert_eq!(
+            candidate_sha, expected_sha,
+            "Stage 6 repository HEAD changed during the campaign"
+        );
+    }
+    let status = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .expect("git status for Stage 6 candidate");
+    assert!(status.status.success(), "git status failed");
+    assert!(
+        status.stdout.is_empty(),
+        "Stage 6 certification requires a clean exact candidate: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    candidate_sha
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage6_multi_worker_restart_rotation_smoke() {
+    let _serial = serial_lock();
+    let mut campaign = Campaign::start().await;
+    let mut workers = Stage6WorkerPool::bootstrap(&mut campaign).await;
+    let leases = workers.begin_leases(&mut campaign, 0).await;
+
+    campaign.reopen().await;
+    workers.reconnect_and_assert_authority(&campaign).await;
+    workers
+        .assert_leases_recovered(&mut campaign, &leases)
+        .await;
+    assert_eq!(workers.complete_leases(&mut campaign, &leases).await, 0);
+
+    workers.rotate_credentials(&mut campaign).await;
+    let retained = workers.retained_audit_entries(&mut campaign).await;
+    assert!(
+        retained >= 8,
+        "worker attempt/decision/message evidence missing"
+    );
+    assert_eq!(workers.credential_lifecycle.len(), REQUIRED_WORKERS);
+    campaign.scan();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn certify_stage6_multi_worker_72h() {
+    let _serial = serial_lock();
+    let requested_seconds = soak_seconds_for_mode("72h", REQUIRED_SOAK_SECONDS);
+    assert_eq!(requested_seconds, REQUIRED_SOAK_SECONDS);
+    let candidate_sha = assert_stage6_candidate_unchanged(None);
+
+    let started_at = Utc::now();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(requested_seconds);
+    let mut campaign = Campaign::start().await;
+    let baseline = campaign.service.sample_tree();
+    let mut max = baseline.clone();
+    let mut restart_count = 0u32;
+    let mut duplicate_execution_count = 0u32;
+    let mut cycles = 0u64;
+    let mut max_cycle_latency_ms = 0u64;
+
+    let mut workers = Stage6WorkerPool::bootstrap(&mut campaign).await;
+    max.max_with(&campaign.service.sample_tree());
+    restart_count = restart_count.saturating_add(1);
+    let leases = workers.begin_leases(&mut campaign, cycles).await;
+    max.max_with(&campaign.service.sample_tree());
+    cycles = cycles.saturating_add(1);
+
+    let _ = barrier_restart_on_campaign(&mut campaign).await;
+    max.max_with(&campaign.service.sample_tree());
+    restart_count = restart_count.saturating_add(2);
+    workers.reconnect_and_assert_authority(&campaign).await;
+    workers
+        .assert_leases_recovered(&mut campaign, &leases)
+        .await;
+    duplicate_execution_count = duplicate_execution_count
+        .saturating_add(workers.complete_leases(&mut campaign, &leases).await);
+    max.max_with(&campaign.service.sample_tree());
+
+    workers.rotate_credentials(&mut campaign).await;
+    restart_count = restart_count.saturating_add(1);
+    assert!(restart_count >= REQUIRED_RESTARTS);
+    max.max_with(&campaign.service.sample_tree());
+
+    while Instant::now() < deadline {
+        let cycle_started = Instant::now();
+        max.max_with(&campaign.service.sample_tree());
+        let leases = workers.begin_leases(&mut campaign, cycles).await;
+        max.max_with(&campaign.service.sample_tree());
+        duplicate_execution_count = duplicate_execution_count
+            .saturating_add(workers.complete_leases(&mut campaign, &leases).await);
+        cycles = cycles.saturating_add(1);
+        max.max_with(&campaign.service.sample_tree());
+        max_cycle_latency_ms = max_cycle_latency_ms.max(cycle_started.elapsed().as_millis() as u64);
+        campaign.scan();
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(STAGE6_WORK_INTERVAL.min(remaining)).await;
+    }
+
+    let finished_at = Utc::now();
+    let elapsed_wall_seconds = finished_at
+        .signed_duration_since(started_at)
+        .num_seconds()
+        .max(0) as u64;
+    let soak_seconds = started.elapsed().as_secs().min(elapsed_wall_seconds);
+    assert!(
+        soak_seconds >= REQUIRED_SOAK_SECONDS,
+        "Stage 6 campaign ended before 72 measured hours"
+    );
+    let growth = max.growth_from(&baseline);
+    assert_resource_ceilings(&max, &growth, &campaign.fixture);
+    assert!(
+        campaign.provider.live_threads() <= campaign.fixture.ceilings.max_threads,
+        "provider live threads exceed Stage 6 ceiling"
+    );
+    assert!(
+        max_cycle_latency_ms <= campaign.fixture.ceilings.max_cycle_latency_ms,
+        "Stage 6 worker cycle latency {max_cycle_latency_ms} exceeds {}",
+        campaign.fixture.ceilings.max_cycle_latency_ms
+    );
+    assert_eq!(duplicate_execution_count, 0);
+
+    let retained_audit_entries = workers.retained_audit_entries(&mut campaign).await;
+    assert!(retained_audit_entries > 0);
+    assert_eq!(workers.credential_lifecycle.len(), REQUIRED_WORKERS);
+    assert_stage6_candidate_unchanged(Some(&candidate_sha));
+    let worker_ids = workers
+        .lanes
+        .iter()
+        .map(|lane| lane.agent_id.clone())
+        .collect::<Vec<_>>();
+    let proof_duration_ms = started.elapsed().as_millis() as u64;
+    let operational_duration_ms = soak_seconds.saturating_mul(1000);
+    let lifecycle_value = serde_json::to_value(&workers.credential_lifecycle)
+        .expect("credential lifecycle evidence value");
+    let checks = vec![
+        stage6_worker_check(
+            "multi_worker_leases",
+            proof_duration_ms,
+            json!({"workers": worker_ids.clone(), "cycles": cycles}),
+        ),
+        stage6_worker_check(
+            "crash_restart_recovery",
+            proof_duration_ms,
+            json!({"restarts": restart_count, "recoveredLeases": REQUIRED_WORKERS}),
+        ),
+        stage6_worker_check(
+            "no_duplicate_execution",
+            proof_duration_ms,
+            json!({"duplicateExecutionCount": duplicate_execution_count}),
+        ),
+        stage6_worker_check(
+            "credential_issuance",
+            proof_duration_ms,
+            lifecycle_value.clone(),
+        ),
+        stage6_worker_check("credential_rotation", proof_duration_ms, lifecycle_value),
+        stage6_worker_check(
+            "retained_audit",
+            proof_duration_ms,
+            json!({"retainedAuditEntries": retained_audit_entries}),
+        ),
+        stage6_worker_check(
+            "operational_soak",
+            operational_duration_ms,
+            json!({
+                "soakSeconds": soak_seconds,
+                "cycles": cycles,
+                "maxRssBytes": max.rss_bytes,
+                "maxFdCount": max.fd_count,
+                "maxThreads": max.threads,
+                "maxDiskBytes": max.disk_bytes,
+                "maxCycleLatencyMs": max_cycle_latency_ms
+            }),
+        ),
+    ];
+    let check_ids = checks
+        .iter()
+        .map(|check| check.check_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(check_ids.as_slice(), REQUIRED_WORKER_CHECKS.as_slice());
+
+    let mut evidence = LongRunningWorkerEvidence {
+        schema: WORKER_CERTIFICATION_EVIDENCE_SCHEMA.to_string(),
+        certification_id: format!("stage6-workers-{}", &candidate_sha[..12]),
+        candidate_sha,
+        campaign_id: format!("stage6-72h-{}", started_at.timestamp()),
+        started_at,
+        finished_at,
+        workers: worker_ids,
+        checks,
+        credential_lifecycle: workers.credential_lifecycle,
+        restart_count,
+        duplicate_execution_count,
+        retained_audit_entries,
+        soak_seconds,
+        secret_free: true,
+        claim_eligible: true,
+        evidence_digest: String::new(),
+    };
+    evidence.evidence_digest = expected_worker_evidence_digest(&evidence);
+    persist_stage6_worker_report(&evidence);
+    campaign.scan();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

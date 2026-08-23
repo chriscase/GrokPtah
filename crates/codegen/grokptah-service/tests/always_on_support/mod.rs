@@ -34,6 +34,7 @@ const AMBIENT_CREDENTIAL_ENV: &[&str] = &[
     "XAI_API_BASE",
     "GROKPTAH_TOKEN_COMMAND",
     "GROKPTAH_AGENT_OFFLINE",
+    "GROKPTAH_SERVICE_CLIENTS",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
 ];
@@ -1239,6 +1240,7 @@ pub struct ServiceProcess {
     pub workspace: PathBuf,
     stderr: Arc<Mutex<StderrCapture>>,
     artifact_scan: ArtifactScan,
+    client_specs: Vec<String>,
     _home_dir: TempDir,
     _workspace_dir: TempDir,
 }
@@ -1254,7 +1256,8 @@ impl ServiceProcess {
             fixture.artifact_scan.stderr_head_bytes,
             fixture.artifact_scan.stderr_tail_bytes,
         )));
-        let mut child = spawn_service(provider_base, &home, &workspace, &stderr);
+        let client_specs = Vec::new();
+        let mut child = spawn_service(provider_base, &home, &workspace, &client_specs, &stderr);
         let addr = wait_child_ready(&mut child, &stderr);
         Self {
             addr,
@@ -1265,6 +1268,7 @@ impl ServiceProcess {
             workspace,
             stderr,
             artifact_scan: fixture.artifact_scan,
+            client_specs,
             _home_dir: home_dir,
             _workspace_dir: workspace_dir,
         }
@@ -1326,7 +1330,13 @@ impl ServiceProcess {
                 self.artifact_scan.stderr_head_bytes,
                 self.artifact_scan.stderr_tail_bytes,
             )));
-            self.child = spawn_service(provider_base, &self.home, &self.workspace, &self.stderr);
+            self.child = spawn_service(
+                provider_base,
+                &self.home,
+                &self.workspace,
+                &self.client_specs,
+                &self.stderr,
+            );
             match wait_child_ready_result(&mut self.child, &self.stderr) {
                 Ok(listen) => {
                     self.addr = listen;
@@ -1347,6 +1357,22 @@ impl ServiceProcess {
         panic!("respawn grokptah-service never became ready: {last}");
     }
 
+    /// Replace the named non-primary credentials installed on the next
+    /// process start. Specs are kept only in this in-memory process harness;
+    /// the service receives them through its documented environment input.
+    pub fn replace_client_specs(&mut self, specs: Vec<String>) {
+        assert!(
+            specs.iter().all(|spec| {
+                !spec.trim().is_empty()
+                    && !spec.contains(',')
+                    && !spec.contains('\n')
+                    && !spec.contains('\r')
+            }),
+            "service client specs must be non-empty single entries"
+        );
+        self.client_specs = specs;
+    }
+
     pub fn durable_home_entries(&self) -> Vec<(String, String, u64)> {
         fingerprint_entries(&self.home, &self.artifact_scan)
             .unwrap_or_else(|error| panic!("home fingerprint entries: {error}"))
@@ -1364,12 +1390,18 @@ fn spawn_service(
     provider_base: &str,
     home: &Path,
     workspace: &Path,
+    client_specs: &[String],
     stderr_buf: &Arc<Mutex<StderrCapture>>,
 ) -> Child {
     let bin = env!("CARGO_BIN_EXE_grokptah-service");
     let mut command = Command::new(bin);
     for key in AMBIENT_CREDENTIAL_ENV {
         command.env_remove(key);
+    }
+    if client_specs.is_empty() {
+        command.env_remove("GROKPTAH_SERVICE_CLIENTS");
+    } else {
+        command.env("GROKPTAH_SERVICE_CLIENTS", client_specs.join(","));
     }
     let mut child = command
         .env("GROKPTAH_HOME", home)

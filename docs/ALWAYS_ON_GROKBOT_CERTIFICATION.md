@@ -2,7 +2,10 @@
 
 This campaign proves a **bounded process smoke and one accepted-request restart fence** on a real standalone `grokptah-service` process, driven only through authenticated MCP, with a loopback fake provider that can hold a POST after acceptance. It does not call live xAI. `GROKPTAH_AGENT_OFFLINE` is not a substitute for the scripted provider.
 
-It does **not** certify durable always-on operation, `UncertainAccept`, quota reservation, provider-attempt projection, or soak.
+The default short campaign does **not** certify durable always-on operation,
+`UncertainAccept`, quota reservation, provider-attempt projection, or soak.
+The dream candidate also contains a separate ignored Stage 6 runner; its
+presence is not evidence that the required 72-hour campaign has executed.
 
 Base SHA: `67e29bd34dc64049432c715c93c2cef2185c63ea`.
 
@@ -92,3 +95,50 @@ GROKBOT_SOAK_SECS=600 cargo test --locked --manifest-path crates/codegen/grokpta
 GROKBOT_SOAK_SECS=86400 cargo test --locked --manifest-path crates/codegen/grokptah-service/Cargo.toml \
   --test always_on_grokbot soak_always_on_grokbot_24h -- --ignored --nocapture
 ```
+
+## Stage 6 multi-worker candidate runner (not yet executed)
+
+`stage6_multi_worker_restart_rotation_smoke` and the ignored
+`certify_stage6_multi_worker_72h` use the same shipped service process and one
+durable home. They bootstrap two independent Agent-owned Lanes, install two
+distinct Agent-bound worker credentials through the documented service
+configuration, and hold simultaneous one-hour leases. The second worker is
+denied the first worker's active lease. Claims and terminal completions are
+replayed with the same request IDs and must return the exact same records with
+one attempt each.
+
+The 72-hour runner then holds both leases across the real manager provider
+barrier and two SIGKILL recoveries, completes them with the recovered lease
+secrets, rotates both credentials across another service restart, rejects both
+retired tokens, and verifies that the replacement sessions have byte-equal
+authority documents. Two-hour bounded parent/child cycles retain attempts,
+offer/accept decisions, and ordered status messages. The runner enforces a
+clean unchanged candidate HEAD, exactly 259200 requested seconds, resource
+ceilings, at least three restarts, zero duplicate attempts, and the secret-free
+v2 evidence validator. Only then may it create the unique, non-overwriting
+`<platform-temp>/always-on-grokbot-workers-<sha>-<campaign-id>.json`
+artifact (`$TMPDIR` on macOS; typically `/tmp` on Linux). The runner prints
+the exact retained path.
+
+Use the repository-family cache and compatibility-keyed target; do not create
+an in-checkout target or run concurrently against the same target:
+
+```bash
+export RUSTC_WRAPPER=/opt/homebrew/bin/sccache
+export SCCACHE_DIR=/Users/chriscase/Library/Caches/grokptah/sccache
+export CARGO_TARGET_DIR=/Users/chriscase/Library/Caches/grokptah/targets/rust-1.92.0-stage5-memory-default
+
+# Bounded compile/runtime gate; not a 72-hour claim.
+cargo test --locked --manifest-path crates/codegen/grokptah-service/Cargo.toml \
+  --test always_on_grokbot stage6_multi_worker_restart_rotation_smoke -- --test-threads=1 --nocapture
+
+# Release campaign. Must run from the clean frozen candidate and retain the report.
+GROKBOT_SOAK_SECS=259200 cargo test --locked \
+  --manifest-path crates/codegen/grokptah-service/Cargo.toml \
+  --test always_on_grokbot certify_stage6_multi_worker_72h -- \
+  --ignored --test-threads=1 --nocapture
+```
+
+Current status: implemented, formatted, and statically reviewed; not compiled,
+not run, and not release-eligible. Stage 3–5 exact-head certification must
+finish first, and the Stage 6 report still requires independent inspection.
