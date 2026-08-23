@@ -1749,6 +1749,28 @@ impl OrchestrationService {
         res
     }
 
+    /// Check whether an already-open transport still has the exact authority
+    /// document that is currently installed for its credential. This avoids
+    /// allowing long-lived streams to outlive token rotation or scope changes.
+    pub fn auth_context_is_current(&self, auth: &AuthContext) -> bool {
+        let credentials = self.auth_credentials.lock().clone();
+        let Some(credential) = credentials
+            .iter()
+            .find(|credential| credential.id == auth.authority_stamp().credential_id)
+        else {
+            return false;
+        };
+        let header = format!("Bearer {}", credential.token());
+        let owner_id = self.agent_owner_id();
+        let allowlist = self.config.lock().allowlist.clone();
+        authenticate_bearer(Some(&header), &credentials, &owner_id, &allowlist)
+            .ok()
+            .is_some_and(|current| {
+                current.authority_stamp() == auth.authority_stamp()
+                    && current.credential_fingerprint() == auth.credential_fingerprint()
+            })
+    }
+
     pub(crate) fn trusted_local_auth(&self, owner_id: &str) -> Result<AuthContext, OrchError> {
         let allowlist = self.config.lock().allowlist.clone();
         AuthContext::trusted_local_operator(owner_id.to_string(), &allowlist)

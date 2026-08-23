@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::authority::{
@@ -9,6 +10,17 @@ use super::authority::{
     EffectiveAuthority,
 };
 use super::types::{OrchError, OrchErrorCode};
+
+fn credential_fingerprint(secret: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"grokptah.auth-context.v1\0");
+    hasher.update(secret.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// Immutable Computer-read capability bound to one credential.
 ///
@@ -44,6 +56,9 @@ pub struct AuthContext {
     /// Optional worker identity binding for least-privilege bearer tokens.
     /// When present, worker-scoped requests may address only this identity.
     bound_agent_id: Option<String>,
+    /// Secret-free version of the bearer used to invalidate long-lived
+    /// transports after token rotation.
+    credential_fingerprint: String,
 }
 
 impl std::fmt::Debug for AuthContext {
@@ -64,13 +79,15 @@ impl AuthContext {
         owner_id: impl Into<String>,
         allowlist: &WorkspaceAllowlist,
     ) -> Result<Self, OrchError> {
+        let token_id = token_id.into();
         Self::remote_with_role(
-            token_id,
+            token_id.clone(),
             owner_id,
             allowlist,
             AuthorityRole::RemoteCoordinator,
             None,
             None,
+            &token_id,
         )
     }
 
@@ -81,6 +98,7 @@ impl AuthContext {
         role: AuthorityRole,
         computer_read: Option<ComputerReadGrant>,
         bound_agent_id: Option<String>,
+        credential_material: &str,
     ) -> Result<Self, OrchError> {
         let token_id = token_id.into();
         let owner_id = owner_id.into();
@@ -101,6 +119,7 @@ impl AuthContext {
             authority,
             computer_read,
             bound_agent_id,
+            credential_fingerprint: credential_fingerprint(credential_material),
         })
     }
 
@@ -113,12 +132,14 @@ impl AuthContext {
         let token_id = token_id.into();
         let owner_id = owner_id.into();
         let authority = EffectiveAuthority::trusted_local_operator(&owner_id, allowlist.roots())?;
+        let credential_fingerprint = credential_fingerprint(&token_id);
         Ok(Self {
             token_id,
             owner_id,
             authority,
             computer_read: None,
             bound_agent_id: None,
+            credential_fingerprint,
         })
     }
 
@@ -134,6 +155,7 @@ impl AuthContext {
             authority,
             computer_read: None,
             bound_agent_id: None,
+            credential_fingerprint: credential_fingerprint("trusted-local-adapter"),
         })
     }
 
@@ -167,6 +189,10 @@ impl AuthContext {
 
     pub fn bound_agent_id(&self) -> Option<&str> {
         self.bound_agent_id.as_deref()
+    }
+
+    pub(crate) fn credential_fingerprint(&self) -> &str {
+        &self.credential_fingerprint
     }
 
     /// Enforce an optional per-worker credential binding. Unbound coordinator
@@ -529,6 +555,7 @@ pub(crate) fn authenticate_bearer(
         credential.role,
         credential.computer_read.clone(),
         credential.bound_agent_id.clone(),
+        credential.token(),
     )
 }
 

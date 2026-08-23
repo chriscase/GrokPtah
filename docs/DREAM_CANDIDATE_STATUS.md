@@ -156,6 +156,10 @@ unrelated signal.
   The unauthenticated-malformed regression is in the host-only loopback suite;
   this sandbox still denies loopback bind, so no live transport result is
   claimed here.
+- Long-lived Streamable-MCP event streams now revalidate a secret-free bearer
+  fingerprint and authority stamp before emitting frames. Token rotation or
+  scope changes terminate the stale stream with a reconnect/recovery signal;
+  the worker rotation integration test covers the invalidation path.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.

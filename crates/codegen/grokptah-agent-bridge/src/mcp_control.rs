@@ -219,6 +219,9 @@ impl LiveStreamState {
 
     async fn next_frame(&mut self) -> Option<Bytes> {
         loop {
+            if !self.done && !self.orch.auth_context_is_current(&self.auth) {
+                self.queue_recovery("authority changed; reconnect with the current credential");
+            }
             if let Some(frame) = self.pending.pop_front() {
                 return Some(frame);
             }

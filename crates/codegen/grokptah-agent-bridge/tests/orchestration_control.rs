@@ -67,9 +67,10 @@ async fn host_issued_worker_credential_is_installed_and_rotated_in_place() {
         .issue_worker_credential("worker-runtime", [workspace.path().to_path_buf()])
         .unwrap();
     let old_token = issued.token().to_string();
-    assert!(orch
+    let old_auth = orch
         .auth_header(Some(&format!("Bearer {old_token}")))
-        .is_ok());
+        .unwrap();
+    assert!(orch.auth_context_is_current(&old_auth));
 
     let rotated = orch.rotate_worker_credential(&issued.id).unwrap();
     assert_eq!(rotated.id, issued.id);
@@ -78,9 +79,11 @@ async fn host_issued_worker_credential_is_installed_and_rotated_in_place() {
     assert!(orch
         .auth_header(Some(&format!("Bearer {old_token}")))
         .is_err());
-    assert!(orch
+    assert!(!orch.auth_context_is_current(&old_auth));
+    let new_auth = orch
         .auth_header(Some(&format!("Bearer {}", rotated.token())))
-        .is_ok());
+        .unwrap();
+    assert!(orch.auth_context_is_current(&new_auth));
 
     orch.stop_background_tasks().await;
     set_grokptah_home_override(None);
