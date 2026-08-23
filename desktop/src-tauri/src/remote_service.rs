@@ -5,8 +5,8 @@ use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::WorkPolicy;
 use grokptah_agent_bridge::{
     ActivationRecord, AgentRecord, AgentResumePlan, JournalPage, McpControlClient, PublicRun,
-    RoutineRecord, RoutineSnapshot, RunExecutionMode, RunScope, RunState, RuntimeConnectionState,
-    RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
+    PublicRunPage, RoutineRecord, RoutineSnapshot, RunExecutionMode, RunScope, RunState,
+    RuntimeConnectionState, RuntimeTarget, SessionUpdate, WorkAttemptView, WorkItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -296,7 +296,7 @@ impl RemoteServiceState {
         ))
     }
 
-    pub async fn list_runs(&self) -> Result<Option<Vec<PublicRun>>> {
+    pub async fn list_runs(&self) -> Result<Option<PublicRunPage>> {
         let mut client = self.client.lock().await;
         let Some(client) = client.as_mut() else {
             return Ok(None);
@@ -914,9 +914,9 @@ impl RemoteServiceClient {
             .ok_or_else(|| anyhow::anyhow!("remote resume response omitted response"))
     }
 
-    async fn list_runs(&mut self) -> Result<Vec<PublicRun>> {
+    async fn list_runs(&mut self) -> Result<PublicRunPage> {
         let sessions = self.list_sessions().await?;
-        let mut runs = Vec::new();
+        let mut pages = Vec::with_capacity(sessions.len());
         for session in sessions {
             let value = self
                 .call_tool(
@@ -927,17 +927,9 @@ impl RemoteServiceClient {
                     }),
                 )
                 .await?;
-            let mut scoped: Vec<PublicRun> = serde_json::from_value(
-                value
-                    .get("runs")
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("remote run list omitted runs"))?,
-            )
-            .context("decode remote durable run list")?;
-            runs.append(&mut scoped);
+            pages.push(decode_remote_run_page(value)?);
         }
-        runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        Ok(runs)
+        Ok(merge_remote_run_pages(pages))
     }
 
     async fn list_work(&mut self, session_id: Uuid, workspace: String) -> Result<Vec<WorkItem>> {
@@ -1607,6 +1599,43 @@ fn should_reconnect_remote_error(error: &anyhow::Error) -> bool {
     true
 }
 
+fn decode_remote_run_page(value: Value) -> Result<PublicRunPage> {
+    serde_json::from_value(value).context("decode remote durable run page")
+}
+
+/// Merge first pages from each remote session without following `nextCursor`.
+///
+/// Counts are summed. The combined first-page list is capped at
+/// [`grokptah_agent_bridge::orchestration::MAX_PUBLIC_RUN_LIST`]. The aggregated
+/// view has no unified cursor, so `next_cursor` is always omitted.
+fn merge_remote_run_pages(pages: Vec<PublicRunPage>) -> PublicRunPage {
+    use grokptah_agent_bridge::orchestration::MAX_PUBLIC_RUN_LIST;
+
+    let mut total_count = 0usize;
+    let mut source_truncated = false;
+    let mut runs = Vec::new();
+    for page in pages {
+        total_count = total_count.saturating_add(page.total_count);
+        source_truncated |= page.truncated;
+        runs.extend(page.runs);
+    }
+    runs.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then(right.run_id.cmp(&left.run_id))
+    });
+    let overflow = runs.len() > MAX_PUBLIC_RUN_LIST;
+    runs.truncate(MAX_PUBLIC_RUN_LIST);
+    let truncated = source_truncated || overflow || total_count > runs.len();
+    PublicRunPage {
+        runs,
+        total_count,
+        truncated,
+        next_cursor: None,
+    }
+}
+
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
@@ -1638,8 +1667,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        normalize_base_url, runtime_target_for_base_url, should_reconnect_remote_error,
-        RemoteServiceClient, RemoteServiceState,
+        decode_remote_run_page, merge_remote_run_pages, normalize_base_url,
+        runtime_target_for_base_url, should_reconnect_remote_error, RemoteServiceClient,
+        RemoteServiceState,
     };
 
     #[test]
@@ -1700,6 +1730,154 @@ mod tests {
         );
     }
 
+    fn sample_public_run(run_id: &str, updated_at: &str) -> PublicRun {
+        serde_json::from_value(serde_json::json!({
+            "runId": run_id,
+            "sessionId": "11111111-1111-1111-1111-111111111111",
+            "workspace": "/tmp/public-run",
+            "requestId": run_id,
+            "clientId": "mcp",
+            "state": "completed",
+            "purpose": "execution",
+            "bounds": {
+                "maxPromptBytes": 1024,
+                "maxRounds": 4,
+                "maxDurationMs": 1000
+            },
+            "promptPreview": "inspect",
+            "startSeq": null,
+            "endSeq": null,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": updated_at,
+            "terminalResult": null,
+            "finalResponse": null,
+            "errorCode": null,
+            "aggregates": {
+                "changes": [],
+                "tests": []
+            }
+        }))
+        .expect("sample PublicRun")
+    }
+
+    #[test]
+    fn remote_run_page_decode_rejects_runs_only_payload() {
+        let runs_only = serde_json::json!({
+            "runs": [sample_public_run("keep-count", "2026-01-01T00:00:01Z")]
+        });
+        let decoded = decode_remote_run_page(runs_only);
+        assert!(
+            decoded.is_err(),
+            "remote list must not drop totalCount/truncated: {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn remote_run_page_decode_preserves_count_and_truncation() {
+        let page = decode_remote_run_page(serde_json::json!({
+            "runs": [sample_public_run("keep-count", "2026-01-01T00:00:01Z")],
+            "totalCount": 200,
+            "truncated": true,
+            "nextCursor": "keep-count"
+        }))
+        .expect("decode public run page");
+        assert_eq!(page.runs.len(), 1);
+        assert_eq!(page.runs[0].run_id, "keep-count");
+        assert_eq!(page.total_count, 200);
+        assert!(page.truncated);
+        assert_eq!(page.next_cursor.as_deref(), Some("keep-count"));
+    }
+
+    #[test]
+    fn remote_run_page_decode_rejects_leaked_provider_route() {
+        let leaked = serde_json::json!({
+            "runs": [{
+                "runId": "public-run-leak",
+                "sessionId": "11111111-1111-1111-1111-111111111111",
+                "workspace": "/tmp/public-run",
+                "requestId": "public-run-req",
+                "clientId": "mcp",
+                "state": "running",
+                "purpose": "execution",
+                "bounds": {
+                    "maxPromptBytes": 1024,
+                    "maxRounds": 4,
+                    "maxDurationMs": 1000
+                },
+                "promptPreview": "inspect",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "aggregates": {
+                    "changes": [],
+                    "tests": []
+                },
+                "providerRoute": {
+                    "baseUrl": "http://leak-base-url-sentinel-pr352.example/v1"
+                }
+            }],
+            "totalCount": 1,
+            "truncated": false
+        });
+        assert!(
+            decode_remote_run_page(leaked).is_err(),
+            "unknown nested providerRoute must fail remote page decode"
+        );
+    }
+
+    #[test]
+    fn merge_remote_run_pages_sums_counts_without_draining_cursors() {
+        let newer = sample_public_run("newer-run", "2026-01-01T00:00:02Z");
+        let older = sample_public_run("older-run", "2026-01-01T00:00:01Z");
+        let merged = merge_remote_run_pages(vec![
+            grokptah_agent_bridge::PublicRunPage {
+                runs: vec![older],
+                total_count: 80,
+                truncated: true,
+                next_cursor: Some("older-run".into()),
+            },
+            grokptah_agent_bridge::PublicRunPage {
+                runs: vec![newer],
+                total_count: 120,
+                truncated: false,
+                next_cursor: Some("newer-run".into()),
+            },
+        ]);
+        assert_eq!(merged.total_count, 200);
+        assert!(merged.truncated);
+        assert_eq!(
+            merged
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer-run", "older-run"]
+        );
+        assert_eq!(merged.next_cursor, None);
+    }
+
+    #[test]
+    fn merge_remote_run_pages_caps_first_pages_at_public_limit() {
+        let pages = (0..129)
+            .map(|index| grokptah_agent_bridge::PublicRunPage {
+                runs: vec![sample_public_run(
+                    &format!("run-{index:03}"),
+                    "2026-01-01T00:00:00Z",
+                )],
+                total_count: 1,
+                truncated: false,
+                next_cursor: None,
+            })
+            .collect();
+        let merged = merge_remote_run_pages(pages);
+        assert_eq!(
+            merged.runs.len(),
+            grokptah_agent_bridge::orchestration::MAX_PUBLIC_RUN_LIST
+        );
+        assert_eq!(merged.total_count, 129);
+        assert!(merged.truncated);
+        assert_eq!(merged.next_cursor, None);
+    }
+
     #[test]
     fn tauri_run_surfaces_must_return_public_runs() {
         let commands = include_str!("commands.rs");
@@ -1712,11 +1890,14 @@ mod tests {
         assert!(!commands.contains("host.get_session_run("));
         assert!(!commands.contains("host.promote_run("));
         assert!(!commands.contains("host.discard_run("));
+        assert!(!commands.contains("Result<Vec<grokptah_agent_bridge::PublicRun>"));
         let remote = include_str!("remote_service.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
-        assert!(remote.contains("Vec<PublicRun>"));
+        assert!(remote.contains("Result<PublicRunPage>"));
+        assert!(remote.contains("decode_remote_run_page"));
+        assert!(remote.contains("merge_remote_run_pages"));
         assert!(
             !remote.contains("RunRecord"),
             "remote list/get must decode PublicRun instead of RunRecord"
@@ -1841,7 +2022,10 @@ mod tests {
                 .await
                 .unwrap();
         assert!(client.list_persistent_agents().await.unwrap().is_empty());
-        assert!(client.list_runs().await.unwrap().is_empty());
+        let empty_page = client.list_runs().await.unwrap();
+        assert!(empty_page.runs.is_empty());
+        assert_eq!(empty_page.total_count, 0);
+        assert!(!empty_page.truncated);
         let session = client
             .create_session(
                 workspace.path().display().to_string(),
@@ -1865,6 +2049,7 @@ mod tests {
             .list_runs()
             .await
             .unwrap()
+            .runs
             .iter()
             .any(|run| run.run_id == submission.run_id));
         let remote_run = client
@@ -1907,6 +2092,7 @@ mod tests {
             .list_runs()
             .await
             .unwrap()
+            .runs
             .iter()
             .any(|run| run.run_id == submission.run_id));
         restarted_server.stop_and_wait().await;

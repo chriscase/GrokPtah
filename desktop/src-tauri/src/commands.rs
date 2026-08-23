@@ -146,9 +146,7 @@ pub async fn remote_service_task_submit(
 }
 
 #[tauri::command]
-pub async fn remote_service_run_list(
-    state: State<'_, AppState>,
-) -> Result<Vec<grokptah_agent_bridge::PublicRun>, String> {
+pub async fn remote_service_run_list(state: State<'_, AppState>) -> Result<PublicRunPage, String> {
     state
         .remote_service
         .list_runs()

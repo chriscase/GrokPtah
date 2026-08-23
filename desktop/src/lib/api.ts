@@ -76,7 +76,7 @@ export const api = {
       allowQueue,
     }),
   remoteServiceRunList: () =>
-    invoke<DurableRun[]>("remote_service_run_list"),
+    invoke<DurableRunPage>("remote_service_run_list"),
   remoteServiceWorkList: (sessionId: string, workspace: string) =>
     invoke<DurableWorkItem[]>("remote_service_work_list", {
       sessionId,

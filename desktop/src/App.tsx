@@ -352,6 +352,8 @@ export default function App() {
   const [bgTasks, setBgTasks] = useState<any[]>([]);
   const [runs, setRuns] = useState<DurableRun[]>([]);
   const [runsSessionId, setRunsSessionId] = useState<string | null>(null);
+  const [runsTotalCount, setRunsTotalCount] = useState(0);
+  const [runsTruncated, setRunsTruncated] = useState(false);
   const [runsError, setRunsError] = useState<string | null>(null);
   const [runsBusy, setRunsBusy] = useState(false);
   const [runsWatching, setRunsWatching] = useState(true);
@@ -452,6 +454,8 @@ export default function App() {
       runsRefreshInFlight.current = null;
       setRuns([]);
       setRunsSessionId(null);
+      setRunsTotalCount(0);
+      setRunsTruncated(false);
       setRunsError(null);
       setRunsBusy(false);
       return;
@@ -463,14 +467,15 @@ export default function App() {
         ? await api.remoteServiceRunList()
         : await api.runList(sessionId!);
       if (!runsRefreshGuard.isCurrent(request)) return;
-      const nextRuns = Array.isArray(nextPage) ? nextPage : nextPage.runs;
-      setRuns(nextRuns);
+      setRuns(nextPage.runs);
+      setRunsTotalCount(nextPage.totalCount);
+      setRunsTruncated(nextPage.truncated);
       setRunsSessionId(scopeKey);
       setRunsError(null);
       if (remote) {
         void api
           .remoteServiceWatchRuns(
-            nextRuns
+            nextPage.runs
               .filter((run) => run.startSeq != null && (run.state === "running" || run.state === "queued"))
               .map((run) => ({
                 sessionId: run.sessionId,
@@ -484,6 +489,8 @@ export default function App() {
       if (!runsRefreshGuard.isCurrent(request)) return;
       setRuns([]);
       setRunsSessionId(scopeKey);
+      setRunsTotalCount(0);
+      setRunsTruncated(false);
       setRunsError(`Could not refresh durable runs: ${String(error)}`);
       if (remote) {
         const message = String(error);
@@ -869,7 +876,9 @@ export default function App() {
           : ("connected" as const)),
       workspacePath: runScopeLane?.cwd ?? activeSummary?.cwd ?? activeTab?.cwd,
       runLabel: runs.length
-        ? `${runs.length} durable Run${runs.length === 1 ? "" : "s"}`
+        ? runsTruncated
+          ? `${runs.length} of ${runsTotalCount} durable Runs`
+          : `${runs.length} durable Run${runs.length === 1 ? "" : "s"}`
         : "No active Run",
     }),
     [
@@ -880,6 +889,8 @@ export default function App() {
       remoteServiceStatus.connectionState,
       runScopeLane,
       runs.length,
+      runsTotalCount,
+      runsTruncated,
     ],
   );
   const workScopeLane =
@@ -4522,6 +4533,15 @@ export default function App() {
                   : runsSessionId === activeSessionId
                     ? runs
                     : []
+              }
+              totalCount={
+                runsSessionId === "__remote__" || runsSessionId === activeSessionId
+                  ? runsTotalCount
+                  : 0
+              }
+              truncated={
+                (runsSessionId === "__remote__" || runsSessionId === activeSessionId)
+                && runsTruncated
               }
               error={
                 runsSessionId === "__remote__"
