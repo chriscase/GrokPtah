@@ -361,11 +361,12 @@ The dream candidate has a materially stronger implementation than
 `LocalOperator`; credential workspace/Agent grants can only narrow; worker
 credentials are Agent-bound and rotatable; Computer-read grants are immutable
 session/workspace capabilities; and the public capability document is derived
-from the enforced operation set. Candidate
-`fc96aa330a3c26928d9538c6b106de55b602b69c` adds the clean-exact-head
-`authority` campaign and independently sealed verifier. It fixes six ordered
-gate families at 20 tests and now explicitly tests that a bearer cannot mint
-local authority and that Observer lacks the complete named mutation set.
+from the enforced operation set. The current dream candidate adds the
+clean-exact-head `authority` campaign and independently sealed verifier. It
+fixes seven ordered gate families at 21 tests and now explicitly tests that a
+bearer cannot mint
+local authority, Observer lacks the complete named mutation set, and Computer
+reads deny cross-session/cross-workspace access indistinguishably.
 
 This remains **implementation-complete but not certification-complete** in the
 candidate. The new slice is formatted and statically reviewed, but no build or

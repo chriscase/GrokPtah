@@ -85,12 +85,13 @@ cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
 
 The `authority` command is the deny-unknown integrated exit runner for roadmap
 stage 3. It requires one clean Git checkout and binds the report to that exact
-40-character commit. Six ordered gate families cover the closed role registry,
+40-character commit. Seven ordered gate families cover the closed role registry,
 credential/workspace/worker narrowing, the read-only Computer Use MCP surface,
-public MCP role filtering and authority-bound idempotency, bound-worker
-impersonation denial, and standalone-service token/session/workspace
-authorization. Together they require 20 exact green tests. The public MCP,
-worker, and service gates require a host that permits loopback listeners.
+behavioral Computer-read session/workspace isolation, public MCP role filtering
+and authority-bound idempotency, bound-worker impersonation denial, and
+standalone-service token/session/workspace authorization. Together they
+require 21 exact green tests. The behavioral Computer-read, public MCP, worker,
+and service gates require a host that permits loopback listeners.
 
 Run it serially with the mandatory shared compiler cache and external target:
 

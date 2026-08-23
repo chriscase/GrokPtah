@@ -174,6 +174,21 @@ const GATES: &[GateSpec] = &[
         expected_passed_tests: 1,
     },
     GateSpec {
+        id: "authority-computer-read-scope-v1",
+        args: &[
+            "test",
+            "--locked",
+            "--manifest-path",
+            "crates/codegen/grokptah-agent-bridge/Cargo.toml",
+            "--lib",
+            "mcp_control::tests::computer_read_tools_are_scoped_and_fail_indistinguishably",
+            "--",
+            "--exact",
+            "--test-threads=1",
+        ],
+        expected_passed_tests: 1,
+    },
+    GateSpec {
         id: "authority-public-mcp-role-filter-v1",
         args: &[
             "test",

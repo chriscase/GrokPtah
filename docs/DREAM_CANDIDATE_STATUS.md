@@ -42,14 +42,16 @@ complete or that the product has reached 100%.
   session/workspace-bound grant; no bearer can widen it through MCP arguments.
   Production-shaped credential issuance and the retained worker campaign are
   still open.
-- Candidate `fc96aa330a3c26928d9538c6b106de55b602b69c` adds the exact-head
-  Stage 3 `authority` campaign. Its deny-unknown report binds the four-role
+- The current dream candidate adds the exact-head Stage 3 `authority`
+  campaign. Its deny-unknown report binds the four-role
   contract, explicit RemoteCoordinator/Observer denials, authority-bound
   idempotency, Agent-bound worker identity, immutable scoped Computer reads,
-  and the public capability document to six ordered gate families / 20 tests
-  on one clean SHA. Failed gates retain only a bounded digest checkpoint and
-  cannot seal. The product tests now directly prove that bearer credentials
-  cannot mint `LocalOperator` and that Observer lacks the named mutation set.
+  and the public capability document to seven ordered gate families / 21 tests
+  on one clean SHA. The added behavioral MCP gate proves authorized reads and
+  indistinguishable cross-session/cross-workspace/unknown-run denial. Failed
+  gates retain only a bounded digest checkpoint and cannot seal. The product
+  tests now directly prove that bearer credentials cannot mint
+  `LocalOperator` and that Observer lacks the named mutation set.
   This slice is formatted and statically reviewed but deliberately **not
   claimed tested or certified** until the mandatory external sccache/target
   runner executes it, including its loopback gates.
