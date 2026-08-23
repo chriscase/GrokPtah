@@ -149,7 +149,9 @@ impl SafeOutputRoot {
         validate_budget(artifact_budget_bytes)?;
 
         let repository_root = canonical_directory(repository_root.as_ref(), "repository root")?;
-        let root = absolute_lexical_path(root.as_ref()).context("output root")?;
+        let root = normalize_platform_root_alias(
+            absolute_lexical_path(root.as_ref()).context("output root")?,
+        )?;
         validate_root_relationships(&root, &repository_root, active_workspace)?;
 
         create_directory_chain_without_symlinks(&root)
@@ -611,6 +613,35 @@ fn absolute_lexical_path(path: &Path) -> Result<PathBuf> {
         bail!("filesystem root is not a safe output path");
     }
     Ok(normalized)
+}
+
+/// macOS exposes three root-level compatibility aliases backed by immutable
+/// system symlinks. `tempfile` commonly returns `/var/folders/...`, whose
+/// canonical spelling is `/private/var/folders/...`. Normalize only these
+/// exact OS aliases after proving their installed targets; every other
+/// symbolic-link component remains forbidden by the path walker below.
+fn normalize_platform_root_alias(path: PathBuf) -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        for (alias, expected) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            if path == alias || path.starts_with(alias) {
+                let installed = dunce::canonicalize(alias)
+                    .with_context(|| format!("canonicalizing macOS alias {}", alias.display()))?;
+                if installed != expected {
+                    bail!("macOS root alias has an unexpected target");
+                }
+                let suffix = path
+                    .strip_prefix(alias)
+                    .context("stripping verified macOS root alias")?;
+                return Ok(expected.join(suffix));
+            }
+        }
+    }
+    Ok(path)
 }
 
 fn validate_root_relationships(
@@ -1428,6 +1459,27 @@ mod tests {
         )
         .unwrap();
         assert!(campaign.bounded_read("linked.json", 64).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verified_macos_var_alias_is_normalized_without_allowing_user_symlinks() {
+        let temp = tempfile::Builder::new()
+            .prefix("grokptah-macos-alias-")
+            .tempdir_in("/private/var/tmp")
+            .unwrap();
+        let canonical = dunce::canonicalize(temp.path()).unwrap();
+        let suffix = canonical
+            .strip_prefix("/private/var")
+            .expect("macOS temporary directories live under /private/var");
+        let aliased = Path::new("/var").join(suffix);
+        let repository = aliased.join("repo");
+        let output = aliased.join("cert-output");
+        fs::create_dir(&repository).unwrap();
+
+        let root = SafeOutputRoot::open(&output, &repository, None, BUDGET).unwrap();
+        assert_eq!(root.path(), canonical.join("cert-output"));
+        assert_eq!(root.repository_root(), canonical.join("repo"));
     }
 
     #[test]
