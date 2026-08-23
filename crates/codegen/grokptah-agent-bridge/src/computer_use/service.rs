@@ -1507,8 +1507,10 @@ impl ComputerUseService {
     /// Yields durable operator control. Authorization is evaluated against the
     /// current durable Run while the store is locked, never a client-held Run
     /// version. This is bookkeeping-safe takeover: it revokes grants, bumps
-    /// epochs, and cancels later backend work. It is not physically preemptive
-    /// once an action is already inside the native action gate.
+    /// epochs, and signals backend cancellation without relying on the caller's
+    /// stale version. The macOS backend can now preempt its native preflight and
+    /// activation wait; an atomic Accessibility call already entered into the
+    /// operating system remains uncertain because it cannot be rolled back.
     pub async fn take_over(
         &self,
         request_id: &str,

@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -129,6 +130,66 @@ pub(crate) struct RawMacActionRequest {
     pub element_index: Option<usize>,
     pub expected_element: Option<RawMacSemanticNode>,
     pub action: ComputerAction,
+    pub cancellation: MacActionCancellation,
+}
+
+pub(crate) trait MacActionCancellationSignal: Send + Sync + std::fmt::Debug {
+    fn cancel(&self);
+    fn is_cancelled(&self) -> bool;
+
+    /// Opaque pointer used only by the native shim while this signal's `Arc`
+    /// is held across the blocking FFI call. Non-native fixtures return null.
+    fn native_context(&self) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+}
+
+#[derive(Debug, Default)]
+struct LocalMacActionCancellation {
+    cancelled: AtomicBool,
+}
+
+impl MacActionCancellationSignal for LocalMacActionCancellation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MacActionCancellation {
+    signal: Arc<dyn MacActionCancellationSignal>,
+}
+
+impl Default for MacActionCancellation {
+    fn default() -> Self {
+        Self::new(Arc::new(LocalMacActionCancellation::default()))
+    }
+}
+
+impl MacActionCancellation {
+    pub(crate) fn new(signal: Arc<dyn MacActionCancellationSignal>) -> Self {
+        Self { signal }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.signal.cancel();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.signal.is_cancelled()
+    }
+
+    pub(crate) fn native_context(&self) -> *mut c_void {
+        self.signal.native_context()
+    }
+
+    fn same_signal(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.signal, &other.signal)
+    }
 }
 
 #[async_trait]
@@ -150,6 +211,10 @@ pub(crate) trait MacObservationSource: Send + Sync + std::fmt::Debug {
         identity: &MacNativeIdentity,
         limits: &ComputerUseLimits,
     ) -> ComputerResult<RawMacObservation>;
+
+    fn action_cancellation(&self) -> ComputerResult<MacActionCancellation> {
+        Ok(MacActionCancellation::default())
+    }
 
     async fn act(
         &self,
@@ -223,8 +288,9 @@ impl MacOsObservationPlatform {
             sequence: Mutex::new(0),
             observation_gate: tokio::sync::Mutex::new(()),
             last_capture_started: Mutex::new(None),
-            cancellation_epoch: AtomicU64::new(0),
+            cancellation_epochs: Mutex::new(HashMap::new()),
             action_gate: tokio::sync::Mutex::new(()),
+            active_action_cancellation: Mutex::new(None),
             action_snapshot: Mutex::new(None),
             evidence: EvidenceVault::default(),
         }))
@@ -332,6 +398,7 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
 
 #[derive(Debug, Clone)]
 struct MacActionSnapshot {
+    run_id: String,
     observation_id: String,
     target_frame: ObservationGeometry,
     nodes: Vec<RawMacSemanticNode>,
@@ -349,8 +416,9 @@ struct MacOsObservationBackend {
     sequence: Mutex<u64>,
     observation_gate: tokio::sync::Mutex<()>,
     last_capture_started: Mutex<Option<Instant>>,
-    cancellation_epoch: AtomicU64,
+    cancellation_epochs: Mutex<HashMap<String, u64>>,
     action_gate: tokio::sync::Mutex<()>,
+    active_action_cancellation: Mutex<Option<(String, MacActionCancellation)>>,
     action_snapshot: Mutex<Option<MacActionSnapshot>>,
     evidence: EvidenceVault,
 }
@@ -388,9 +456,9 @@ impl ComputerBackend for MacOsObservationBackend {
             tokio::time::sleep(wait).await;
         }
         *self.last_capture_started.lock() = Some(Instant::now());
-        let epoch = self.cancellation_epoch.load(Ordering::SeqCst);
+        let epoch = self.cancellation_epoch(run_id);
         let raw = self.source.observe(&self.native_identity, limits).await?;
-        if self.cancellation_epoch.load(Ordering::SeqCst) != epoch {
+        if self.cancellation_epoch(run_id) != epoch {
             return Err(ComputerError::new(
                 ComputerErrorCode::Interrupted,
                 "macOS observation was cancelled",
@@ -403,6 +471,7 @@ impl ComputerBackend for MacOsObservationBackend {
             ));
         }
         let action_snapshot = MacActionSnapshot {
+            run_id: run_id.to_string(),
             observation_id: String::new(),
             target_frame: raw.frame,
             nodes: raw.nodes.clone(),
@@ -420,7 +489,7 @@ impl ComputerBackend for MacOsObservationBackend {
             &self.sequence,
             &self.evidence,
         )?;
-        if self.cancellation_epoch.load(Ordering::SeqCst) != epoch {
+        if self.cancellation_epoch(run_id) != epoch {
             self.evidence.remove_run(run_id);
             return Err(ComputerError::new(
                 ComputerErrorCode::Interrupted,
@@ -445,7 +514,7 @@ impl ComputerBackend for MacOsObservationBackend {
 
     async fn act_if_current(
         &self,
-        _run_id: &str,
+        run_id: &str,
         observation: &ComputerObservation,
         action: &ComputerAction,
     ) -> ComputerResult<ActionOutcome> {
@@ -462,12 +531,14 @@ impl ComputerBackend for MacOsObservationBackend {
             ));
         }
         let _action_guard = self.action_gate.lock().await;
-        let epoch = self.cancellation_epoch.load(Ordering::SeqCst);
+        let epoch = self.cancellation_epoch(run_id);
         let snapshot = self
             .action_snapshot
             .lock()
             .clone()
-            .filter(|snapshot| snapshot.observation_id == observation.observation_id)
+            .filter(|snapshot| {
+                snapshot.run_id == run_id && snapshot.observation_id == observation.observation_id
+            })
             .ok_or_else(|| {
                 ComputerError::new(
                     ComputerErrorCode::Conflict,
@@ -510,26 +581,33 @@ impl ComputerBackend for MacOsObservationBackend {
         }
         let (element_index, expected_element) =
             action_element(snapshot.nodes.as_slice(), observation, action)?;
+        let cancellation = self.source.action_cancellation()?;
         let request = RawMacActionRequest {
             target_frame: snapshot.target_frame,
             element_index,
             expected_element,
             action: action.clone(),
+            cancellation: cancellation.clone(),
         };
-        if self.cancellation_epoch.load(Ordering::SeqCst) != epoch {
+        *self.active_action_cancellation.lock() = Some((run_id.to_string(), cancellation.clone()));
+        if self.cancellation_epoch(run_id) != epoch {
+            cancellation.cancel();
+            self.clear_action_cancellation(run_id, &cancellation);
             return Err(ComputerError::new(
                 ComputerErrorCode::Interrupted,
                 "macOS action was cancelled before dispatch",
             ));
         }
         *self.action_snapshot.lock() = None;
-        let outcome = self.source.act(&self.native_identity, &request).await?;
-        if self.cancellation_epoch.load(Ordering::SeqCst) != epoch {
+        let outcome = self.source.act(&self.native_identity, &request).await;
+        self.clear_action_cancellation(run_id, &cancellation);
+        if cancellation.is_cancelled() || self.cancellation_epoch(run_id) != epoch {
             return Err(ComputerError::new(
                 ComputerErrorCode::Interrupted,
                 "macOS action completion lost to local takeover",
             ));
         }
+        let outcome = outcome?;
         if outcome.expected_postcondition_met == Some(false) {
             return Err(ComputerError::new(
                 ComputerErrorCode::BackendFailure,
@@ -547,11 +625,49 @@ impl ComputerBackend for MacOsObservationBackend {
     }
 
     async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
-        let _action_guard = self.action_gate.lock().await;
-        self.cancellation_epoch.fetch_add(1, Ordering::SeqCst);
-        *self.action_snapshot.lock() = None;
+        self.bump_cancellation_epoch(run_id);
+        if let Some((_, cancellation)) = self
+            .active_action_cancellation
+            .lock()
+            .as_ref()
+            .filter(|(active_run_id, _)| active_run_id == run_id)
+        {
+            cancellation.cancel();
+        }
+        let mut snapshot = self.action_snapshot.lock();
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.run_id == run_id)
+        {
+            *snapshot = None;
+        }
         self.evidence.remove_run(run_id);
         Ok(())
+    }
+}
+
+impl MacOsObservationBackend {
+    fn cancellation_epoch(&self, run_id: &str) -> u64 {
+        *self
+            .cancellation_epochs
+            .lock()
+            .entry(run_id.to_string())
+            .or_default()
+    }
+
+    fn bump_cancellation_epoch(&self, run_id: &str) {
+        let mut epochs = self.cancellation_epochs.lock();
+        let epoch = epochs.entry(run_id.to_string()).or_default();
+        *epoch = epoch.saturating_add(1);
+    }
+
+    fn clear_action_cancellation(&self, run_id: &str, completed: &MacActionCancellation) {
+        let mut active = self.active_action_cancellation.lock();
+        if active.as_ref().is_some_and(|(active_run_id, current)| {
+            active_run_id == run_id && current.same_signal(completed)
+        }) {
+            *active = None;
+        }
     }
 }
 
@@ -1027,6 +1143,9 @@ mod tests {
         action_postcondition: Mutex<Option<bool>>,
         action_requests: Mutex<Vec<RawMacActionRequest>>,
         content_label: Mutex<String>,
+        block_action_before_dispatch: AtomicBool,
+        action_entered: tokio::sync::Notify,
+        release_action: tokio::sync::Notify,
     }
 
     impl FixtureSource {
@@ -1057,6 +1176,9 @@ mod tests {
                 action_postcondition: Mutex::new(None),
                 action_requests: Mutex::new(Vec::new()),
                 content_label: Mutex::new("Continue".into()),
+                block_action_before_dispatch: AtomicBool::new(false),
+                action_entered: tokio::sync::Notify::new(),
+                release_action: tokio::sync::Notify::new(),
             }
         }
     }
@@ -1171,6 +1293,12 @@ mod tests {
             identity: &MacNativeIdentity,
             request: &RawMacActionRequest,
         ) -> ComputerResult<ActionOutcome> {
+            if request.cancellation.is_cancelled() {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Interrupted,
+                    "fixture action was cancelled before dispatch",
+                ));
+            }
             if let Some(code) = *self.action_error.lock() {
                 return Err(ComputerError::new(code, "fixture action failed"));
             }
@@ -1190,6 +1318,16 @@ mod tests {
                 ));
             }
             drop(targets);
+            if self.block_action_before_dispatch.load(Ordering::SeqCst) {
+                self.action_entered.notify_one();
+                self.release_action.notified().await;
+            }
+            if request.cancellation.is_cancelled() {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Interrupted,
+                    "fixture action was cancelled before dispatch",
+                ));
+            }
             self.action_requests.lock().push(request.clone());
             if let Some(postcondition) = *self.action_postcondition.lock() {
                 return Ok(ActionOutcome::bounded(
@@ -1262,6 +1400,208 @@ mod tests {
             platform.bind_target("forged-token").await.unwrap_err().code,
             ComputerErrorCode::Unauthorized
         );
+    }
+
+    #[tokio::test]
+    async fn native_cancel_signals_inflight_action_without_waiting_for_action_gate() {
+        let source = Arc::new(FixtureSource::granted());
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let backend = platform
+            .bind_target(&candidate.selection_token)
+            .await
+            .unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        let observation = backend
+            .observe(
+                &run_id,
+                "cancel-observation",
+                &candidate.target,
+                &ComputerUseLimits::default(),
+            )
+            .await
+            .unwrap();
+        source
+            .block_action_before_dispatch
+            .store(true, Ordering::SeqCst);
+        let action_backend = backend.clone();
+        let action_run_id = run_id.clone();
+        let action_observation = observation.clone();
+        let action = tokio::spawn(async move {
+            action_backend
+                .act_if_current(
+                    &action_run_id,
+                    &action_observation,
+                    &ComputerAction::Invoke {
+                        element_id: action_observation.elements[0].element_id.clone(),
+                    },
+                )
+                .await
+        });
+        source.action_entered.notified().await;
+
+        tokio::time::timeout(StdDuration::from_secs(1), backend.cancel(&run_id))
+            .await
+            .expect("cancel must not wait behind the native action gate")
+            .unwrap();
+        assert!(
+            !action.is_finished(),
+            "the source remains blocked so cancel returning proves an out-of-band signal"
+        );
+        source.release_action.notify_one();
+        assert_eq!(
+            action.await.unwrap().unwrap_err().code,
+            ComputerErrorCode::Interrupted
+        );
+        assert!(source.action_requests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_cancel_is_scoped_to_the_exact_run() {
+        let source = Arc::new(FixtureSource::granted());
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let backend = platform
+            .bind_target(&candidate.selection_token)
+            .await
+            .unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        let unrelated_run_id = Uuid::new_v4().to_string();
+        let observation = backend
+            .observe(
+                &run_id,
+                "scoped-cancel-observation",
+                &candidate.target,
+                &ComputerUseLimits::default(),
+            )
+            .await
+            .unwrap();
+        source
+            .block_action_before_dispatch
+            .store(true, Ordering::SeqCst);
+        let action_backend = backend.clone();
+        let action_run_id = run_id.clone();
+        let action_observation = observation.clone();
+        let action = tokio::spawn(async move {
+            action_backend
+                .act_if_current(
+                    &action_run_id,
+                    &action_observation,
+                    &ComputerAction::Invoke {
+                        element_id: action_observation.elements[0].element_id.clone(),
+                    },
+                )
+                .await
+        });
+        source.action_entered.notified().await;
+
+        tokio::time::timeout(StdDuration::from_secs(1), backend.cancel(&unrelated_run_id))
+            .await
+            .expect("unrelated cancellation must remain out of band")
+            .unwrap();
+        assert!(!action.is_finished());
+        source.release_action.notify_one();
+        action.await.unwrap().unwrap();
+        assert_eq!(source.action_requests.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_service_takeover_returns_before_blocked_source_action() {
+        let source = Arc::new(FixtureSource::granted());
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let directory = tempfile::tempdir().unwrap();
+        let service = Arc::new(
+            platform
+                .bind_target_service(
+                    &candidate.selection_token,
+                    ComputerStore::open(directory.path().join("computer-use")).unwrap(),
+                )
+                .await
+                .unwrap(),
+        );
+        let owner_session_id = Uuid::new_v4();
+        let caller =
+            crate::computer_use::ComputerAuthorityToken::local_operator(owner_session_id).unwrap();
+        let run = service
+            .create_run(
+                "create-native-takeover",
+                &caller,
+                None,
+                candidate.target,
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
+        let now = Utc::now();
+        let run = service
+            .authorize(
+                "authorize-native-takeover",
+                &caller,
+                &run.run_id,
+                run.version,
+                crate::computer_use::ActionGrant::for_run(
+                    &run,
+                    BTreeSet::from([crate::computer_use::ActionClass::Semantic]),
+                    now,
+                    now + chrono::Duration::minutes(5),
+                    Some(1),
+                ),
+            )
+            .unwrap();
+        let observation = service
+            .observe("observe-native-takeover", &caller, &run.run_id, run.version)
+            .await
+            .unwrap();
+        let current = service.get_run(&run.run_id).unwrap().unwrap();
+        source
+            .block_action_before_dispatch
+            .store(true, Ordering::SeqCst);
+        let action_service = service.clone();
+        let action_caller = caller.clone();
+        let action_run_id = run.run_id.clone();
+        let action_observation = observation.clone();
+        let action = tokio::spawn(async move {
+            action_service
+                .act(
+                    "act-native-takeover",
+                    &action_caller,
+                    &action_run_id,
+                    current.version,
+                    &action_observation.observation_id,
+                    ComputerAction::Invoke {
+                        element_id: action_observation.elements[0].element_id.clone(),
+                    },
+                )
+                .await
+        });
+        source.action_entered.notified().await;
+
+        let taken_over = tokio::time::timeout(
+            StdDuration::from_secs(1),
+            service.take_over("take-over-native-action", &caller, &run.run_id),
+        )
+        .await
+        .expect("takeover must not wait for the blocked native source")
+        .unwrap();
+        assert_eq!(
+            taken_over.control_disposition,
+            crate::computer_use::ComputerControlDisposition::OperatorTakeover
+        );
+        assert_eq!(taken_over.action_count, 0);
+        assert!(!action.is_finished());
+
+        source.release_action.notify_one();
+        assert_eq!(
+            action.await.unwrap().unwrap_err().code,
+            ComputerErrorCode::Interrupted
+        );
+        let final_run = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            final_run.control_disposition,
+            crate::computer_use::ComputerControlDisposition::OperatorTakeover
+        );
+        assert_eq!(final_run.action_count, 0);
+        assert!(source.action_requests.lock().is_empty());
     }
 
     #[tokio::test]

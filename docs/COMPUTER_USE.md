@@ -19,7 +19,10 @@ Computer Use treats observation and action as separate privileged operations:
    bookkeeping-safe (revokes grants, bumps epochs, cancels later work). The stacked emergency
    control candidate removes the UI mutation-busy gate and stale client-version gate from Pause,
    Stop, and Take over; stable keyboard paths remain available while a backend call is unresolved.
-   It is not physically preemptive once an action is already inside the native action gate.
+   The stacked native-cancellation successor gives each macOS action an exact Run-scoped monotonic
+   signal: emergency control no longer waits behind the action mutex, and native preflight plus the
+   bounded activation loop poll that signal before dispatch. An Accessibility call that has already
+   entered one atomic OS API cannot be undone; cancellation at or after that boundary remains uncertain.
 6. Successful actions invalidate the observation, forcing the caller to observe again.
 
 Authorization is fail-closed. Grants do not survive restart, pause, cancellation, completion,
@@ -155,7 +158,14 @@ the store is locked, and no client-held Run version can make the control lose to
 action. The cockpit does not disable Stop or Take over behind its ordinary mutation busy flag and
 advertises `Control+Shift+S` / `Control+Shift+T` keyboard paths. These changes close the known
 surface reachability and stale-version race only. The native backend still needs a genuinely
-out-of-band cancellation channel before takeover is physically preemptive.
+out-of-band cancellation channel before takeover is physically preemptive. The stacked native-
+cancellation successor supplies that channel for work waiting in Rust/native preflight and for the
+bounded activation wait: a C11-atomic per-action signal is tripped immediately, only for the exact
+Run, and without taking the action gate. It is checked before Accessibility dispatch and again
+before accepting completion.
+This closes the mutex inversion; it does not pretend that macOS can roll back a synchronous AX call
+after the call has entered the operating system. That narrow boundary stays `uncertain` and must
+never be replayed automatically.
 
 The app-owned surface candidate binds every open cockpit and shell control to an exact durable
 Run ID. An unbound lookup is used only to discover a unique non-terminal Run and fails closed when
@@ -395,10 +405,10 @@ attestation, packaging requirements, and disposable smoke fixture.
 | Isolation contract | stage 1 | Host-enforced tier, sealed token, interned surface, exact freshness, typed proof. Native macOS is a singleton host-global-foreground conflict domain (capacity 1). Not isolated or preemptive. |
 | macOS observe | #269 | Consented target selection, capture, redaction, semantic snapshots |
 | Operator UX and model proof | #273, #272 | Visible runs/approvals and capability-based provider conformance |
-| macOS act | #270 | Bounded semantic actions with durable bookkeeping-safe local takeover (not physically preemptive inside the native action gate) |
+| macOS act | #270 | Bounded semantic actions with durable bookkeeping-safe local takeover |
 | Coordinator interoperability | #271 | Scoped Computer Run MCP tools and event visibility |
 | WorkAttempt surface coordination | current stacked draft | Host-resolved Agent/Work/spec authority, deterministic per-domain queue, exact-current frame fence, durable dispatch identity, restart/expiry outcomes, secret-free local queue/owner projection |
-| Out-of-band native cancellation channel | later | Physically preempt work that has already entered the native action gate |
+| Out-of-band native cancellation channel | stacked candidate | Exact per-action atomic signal; Stop/Take over no longer wait on the action gate and preempt native preflight/activation waits. An atomic AX call already entered remains uncertain and non-replayable; external Rust/native qualification pending |
 | Isolated helper / input domain | later | Host-native independently isolated visual input, not a simulator fixture |
 | Semantic-first isolated visual fallback | later | Isolated visual input after semantic miss, never boolean-upgraded native AX |
 | App-owned exact Run surface / always-available Stop | stacked candidate | Exact binding, per-Run approvals, persistent shell controls; external Rust qualification pending |

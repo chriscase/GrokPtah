@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include <dlfcn.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
@@ -32,7 +33,39 @@ enum {
     GPT_MAC_BACKEND_FAILURE = 7,
     GPT_MAC_INVALID_REQUEST = 8,
     GPT_MAC_FORBIDDEN_ACTION = 9,
+    GPT_MAC_INTERRUPTED = 10,
 };
+
+typedef struct {
+    atomic_bool signalled;
+} GPTMacActionCancellation;
+
+void *gpt_macos_cancellation_create(void) {
+    GPTMacActionCancellation *cancellation = malloc(sizeof(GPTMacActionCancellation));
+    if (cancellation != NULL) {
+        atomic_init(&cancellation->signalled, false);
+    }
+    return cancellation;
+}
+
+void gpt_macos_cancellation_signal(void *context) {
+    if (context != NULL) {
+        GPTMacActionCancellation *cancellation = context;
+        atomic_store_explicit(&cancellation->signalled, true, memory_order_seq_cst);
+    }
+}
+
+bool gpt_macos_cancellation_is_signalled(const void *context) {
+    if (context == NULL) {
+        return true;
+    }
+    const GPTMacActionCancellation *cancellation = context;
+    return atomic_load_explicit(&cancellation->signalled, memory_order_seq_cst);
+}
+
+void gpt_macos_cancellation_free(void *context) {
+    free(context);
+}
 
 static const NSUInteger GPT_MAX_AX_DEPTH = 32;
 static const NSUInteger GPT_MAX_NATIVE_SCREENSHOT_DIMENSION = 4096;
@@ -873,8 +906,15 @@ static GPTMacNativeResult GPTActionResult(NSString *summary, id postcondition) {
         nil);
 }
 
-static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t requestLength) {
+static GPTMacNativeResult GPTActImpl(
+    const uint8_t *requestBytes,
+    size_t requestLength,
+    const void *cancellation) {
     @autoreleasepool {
+        if (gpt_macos_cancellation_is_signalled(cancellation)) {
+            return GPTErrorResult(
+                GPT_MAC_INTERRUPTED, @"macOS action was cancelled before native preflight");
+        }
         if (requestBytes == NULL || requestLength == 0 || requestLength > 64 * 1024) {
             return GPTErrorResult(GPT_MAC_INVALID_REQUEST, @"invalid macOS action request size");
         }
@@ -919,6 +959,10 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
             pid_t processID = processNumber.intValue;
             uint32_t windowID = windowNumber.unsignedIntValue;
             SCShareableContent *content = GPTShareableContent();
+            if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                return GPTErrorResult(
+                    GPT_MAC_INTERRUPTED, @"macOS action was cancelled during native preflight");
+            }
             SCWindow *window = GPTFindWindow(content, windowID, processID, bundleID);
             if (window == nil) {
                 return GPTErrorResult(GPT_MAC_TARGET_CLOSED, @"selected macOS window closed");
@@ -937,6 +981,11 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
                     GPT_MAC_TARGET_CHANGED,
                     @"selected macOS window has no exact Accessibility match");
             }
+            if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_INTERRUPTED, @"macOS action was cancelled before Accessibility dispatch");
+            }
 
             if ([kind isEqualToString:@"activate"]) {
                 if (request[@"elementIndex"] != [NSNull null] ||
@@ -945,17 +994,34 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
                     return GPTErrorResult(
                         GPT_MAC_INVALID_REQUEST, @"activation must not carry an element");
                 }
+                if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_INTERRUPTED, @"macOS activation was cancelled before dispatch");
+                }
                 NSRunningApplication *application =
                     [NSRunningApplication runningApplicationWithProcessIdentifier:processID];
                 BOOL requested = application != nil &&
                     [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
                 BOOL focused = NO;
                 for (NSUInteger attempt = 0; requested && attempt < 40; attempt++) {
+                    if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                        CFRelease(axWindow);
+                        return GPTErrorResult(
+                            GPT_MAC_INTERRUPTED,
+                            @"macOS activation completion lost to local takeover");
+                    }
                     if (GPTTargetIsFocused(processID, bundleID, axWindow)) {
                         focused = YES;
                         break;
                     }
                     [NSThread sleepForTimeInterval:0.025];
+                }
+                if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_INTERRUPTED,
+                        @"macOS activation completion lost to local takeover");
                 }
                 CFRelease(axWindow);
                 return focused
@@ -1000,6 +1066,12 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
                 return GPTErrorResult(
                     GPT_MAC_TARGET_CHANGED,
                     @"authorized macOS target lost focus at dispatch boundary");
+            }
+            if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                CFRelease(element);
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_INTERRUPTED, @"macOS semantic action was cancelled before dispatch");
             }
 
             AXError actionError = kAXErrorActionUnsupported;
@@ -1063,7 +1135,15 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
                 summary = @"Scrolled the authorized macOS element into view";
             }
 
+            BOOL cancellationAfterDispatch =
+                gpt_macos_cancellation_is_signalled(cancellation);
             CFRelease(element);
+            if (cancellationAfterDispatch) {
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_INTERRUPTED,
+                    @"macOS semantic action completion lost to local takeover");
+            }
             if (actionError != kAXErrorSuccess) {
                 CFRelease(axWindow);
                 return GPTErrorResult(
@@ -1092,9 +1172,12 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
     }
 }
 
-GPTMacNativeResult gpt_macos_act(const uint8_t *requestBytes, size_t requestLength) {
+GPTMacNativeResult gpt_macos_act(
+    const uint8_t *requestBytes,
+    size_t requestLength,
+    const void *cancellation) {
     @try {
-        return GPTActImpl(requestBytes, requestLength);
+        return GPTActImpl(requestBytes, requestLength, cancellation);
     } @catch (NSException *exception) {
         (void)exception;
         return GPTErrorResult(

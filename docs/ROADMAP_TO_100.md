@@ -610,8 +610,13 @@ current observation. It uses normalized in-surface coordinates, never moves or
 impersonates the operating-system pointer, emits no marker for a manual proposal,
 and refuses to invent a position for missing/out-of-surface geometry. It is still a
 candidate pending external Rust and visual qualification. It does **not** add a
-physically preemptive native cancellation channel, a background-safe backend, or
-an isolated visual input domain.
+background-safe backend or an isolated visual input domain. Its stacked native-
+cancellation successor closes the action-mutex inversion with an exact Run-scoped,
+per-action atomic signal and native checkpoints before Accessibility dispatch and throughout
+the bounded activation wait. This is out-of-band preemption of work that has not
+entered an atomic AX call; an AX call already inside macOS remains uncertain and
+non-replayable. External Rust/native qualification and the remaining #286 packaged
+takeover evidence are still required.
 [#286](https://github.com/chriscase/GrokPtah/issues/286) **open**.
 
 **Exit:** every [#286](https://github.com/chriscase/GrokPtah/issues/286)
