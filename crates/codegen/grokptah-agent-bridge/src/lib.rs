@@ -32,6 +32,7 @@ mod mcp_runtime;
 mod memory;
 mod models_catalog;
 mod native_coding_readiness;
+pub mod operations_drill;
 pub mod orchestration;
 mod permission;
 mod process_tree;
@@ -97,6 +98,10 @@ pub use live_attestation::{
     LiveEndpointClass, LiveIssuerClass, LiveSafetyError, OverrideState, RedirectPolicyClass,
     RefreshEndpointPolicyState, GROK_BUILD_ENDPOINT, MAX_AUTH_JSON_BYTES, XAI_OIDC_ISSUER,
     XAI_OIDC_TOKEN_ENDPOINT,
+};
+pub use operations_drill::{
+    BuildTargetCleanupEvidence, OperationsDrillCheck, OperationsDrillEnvironment,
+    OperationsDrillError, OperationsDrillKind, OperationsDrillReport, OPERATIONS_DRILL_SCHEMA,
 };
 pub use prompt_combine::{combine_prefix_len, join_texts, CombineGate};
 pub use prompt_queue::{

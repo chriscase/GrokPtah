@@ -50,6 +50,10 @@ complete or that the product has reached 100%.
   exhaustion observations. Digests, ordering, schema, and secret-free output
   fail closed; this remains a contract for future live evidence, not a live
   quota receipt.
+- The operations drill contract now requires all 14 Stage 11 categories,
+  combined packaged-desktop/hosted-service evidence, measured RTO/RPO, backup
+  confidentiality, and explicit active-target deletion refusal. It remains a
+  runbook/report shape, not a dated production-like drill.
 - Shared desktop/hosted black-box parity is present as a fail-closed fixture.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
@@ -107,6 +111,9 @@ unrelated signal.
 - Provider-quota receipt suite: 4 passed, covering bound-pair readiness,
   route/credential drift, ordering, non-429 exhaustion, tampered digests, and
   unknown fields.
+- Operations drill suite: 4 passed, covering combined-environment readiness,
+  failed/partial drill denial, duplicate/missing checks, cleanup safety, and
+  unknown or malformed evidence.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.
